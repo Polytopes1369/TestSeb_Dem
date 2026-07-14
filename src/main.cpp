@@ -46,7 +46,7 @@ int main() {
         static float azimuth = 0.0f;
         azimuth += 0.05f;
         // Orbit around 0,0,0 at a distance of 3.5m to see the 1m radius sphere
-        camera.CameraOrbit({ 0.0f, 0.0f, 0.0f }, 3.5f, azimuth, 20.0f);
+        camera.CameraOrbit({ 0.0f, 0.0f, 0.0f }, 5.5f, azimuth, 20.0f);
 
         // Update aspect ratio
         float aspect = static_cast<float>(vkContext.GetSwapchainExtent().width) /

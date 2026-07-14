@@ -181,13 +181,9 @@ void VulkanContext::CreateLogicalDevice() {
     queueCreateInfo.queueCount = 1;
     queueCreateInfo.pQueuePriorities = &queuePriority;
 
-    // Feature enablement structures chain
-    VkPhysicalDeviceDynamicRenderingFeatures dynamicRenderingFeatures{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES };
-    dynamicRenderingFeatures.dynamicRendering = VK_TRUE;
-
     VkPhysicalDeviceVulkan13Features features13{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES };
     features13.synchronization2 = VK_TRUE;
-    features13.pNext = &dynamicRenderingFeatures;
+    features13.dynamicRendering = VK_TRUE;
 
     VkPhysicalDeviceFeatures2 deviceFeatures2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
     deviceFeatures2.pNext = &features13;
@@ -390,7 +386,7 @@ void VulkanContext::CreatePipelinesAndDescriptors() {
         throw std::runtime_error("Failed to create Compute Pipeline Layout!");
     }
 
-    auto computeCode = ReadShaderFile("shaders/geom_icosphere.spv");
+    auto computeCode = ReadShaderFile("shaders/geom_icosphere.comp.spv");
     VkShaderModule computeModule = VulkanPipeline::CreateShaderModule(m_Device, computeCode);
 
     VkComputePipelineCreateInfo computePipelineInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
@@ -464,9 +460,19 @@ void VulkanContext::GenerateGeometry() {
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_ComputePipeline);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_ComputePipelineLayout, 0, 1, &m_GeometryDescriptorSet, 0, nullptr);
 
-    uint32_t groupsX = (params.subdiv + 7) / 8;
-    uint32_t groupsY = (params.subdiv + 7) / 8;
-    vkCmdDispatch(cmd, groupsX, groupsY, 20);
+    // Correct way to dispatch based on local_size_x = 64
+    uint32_t ringCount = params.subdiv - 2u;
+    uint32_t ringStride = params.subdiv + 1u;
+    uint32_t vertCount = ringCount * ringStride + 2u;
+
+    // We only use the X dimension for the dispatch
+    uint32_t groupCount = (vertCount + 63) / 64;
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_ComputePipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_ComputePipelineLayout, 0, 1, &m_GeometryDescriptorSet, 0, nullptr);
+
+    // Dispatch strictly on X
+    vkCmdDispatch(cmd, groupCount, 1, 1);
 
     // Memory layout safe transition barrier execution
     VkMemoryBarrier2 memBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };

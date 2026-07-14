@@ -61,13 +61,13 @@ if(Vulkan_GLSLC_EXECUTABLE)
 
     set(SHADER_TARGETS "")
     set(SHADER_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src/shaders")
-
     foreach(SHADER_SRC ${SHADERS_TO_COMPILE})
-        # Extract filename without extensions to simplify output naming (draw.comp -> draw)
-        get_filename_component(SHADER_NAME ${SHADER_SRC} NAME_WE)
+        # Garder l'extension pour éviter les collisions (ex: draw.vert -> draw.vert.spv)
+        get_filename_component(SHADER_NAME ${SHADER_SRC} NAME)
         
         # Intermediate .spv target inside the build tree
         set(SHADER_SPV "${CMAKE_CURRENT_BINARY_DIR}/shaders_gen/${SHADER_NAME}.spv")
+        
         get_filename_component(SHADER_OUT_DIR ${SHADER_SPV} DIRECTORY)
         file(MAKE_DIRECTORY ${SHADER_OUT_DIR})
 
