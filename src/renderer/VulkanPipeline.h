@@ -9,7 +9,7 @@ public:
     static VkPipelineLayout CreatePipelineLayout(VkDevice device, VkDescriptorSetLayout bindlessLayout);
 
     // Simplification : pas besoin de RenderPass, on utilise PipelineRenderingCreateInfo
-    static VkPipeline CreateGraphicsPipeline(VkDevice device, VkPipelineLayout layout, VkShaderModule meshShader, VkShaderModule fragShader);
+    static VkPipeline CreateGraphicsPipeline(VkDevice device, VkPipelineLayout layout, VkShaderModule vertShader, VkShaderModule fragShader, VkFormat colorFormat);
 
     static VkShaderModule CreateShaderModule(VkDevice device, const std::vector<char>& code);
 
