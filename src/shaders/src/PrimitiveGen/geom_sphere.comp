@@ -19,6 +19,11 @@ layout(std140, binding = 2) uniform Params
     float materialID;
     uint  vertexOffset;
     uint  indexOffset;
+    // World-space translation baked into the generated geometry, used to place multiple
+    // instances of this primitive at different grid slots without a separate transform stage.
+    float worldOffsetX;
+    float worldOffsetY;
+    float worldOffsetZ;
 };
 
 void main()
@@ -59,11 +64,12 @@ void main()
 
     v.normal = normalize(v.position);
     v.uv2 = v.uv;
+
+    // Translate the generated vertex to its grid slot in world space before writing it out.
+    v.position += vec3(worldOffsetX, worldOffsetY, worldOffsetZ);
     vertices[vertexOffset + id] = v;
 
     // --- Indices ---
-    uint nbTriangles = ((ringCount * sideSegs) + sideSegs) * 2u;
-
     if (id < sideSegs) // top cap fan
     {
         uint lon = id;
@@ -91,8 +97,13 @@ void main()
 
     if (id < sideSegs) // bottom cap fan
     {
+        // Packed densely right after the top-cap-fan block (sideSegs*3 indices) and the
+        // middle-quads block ((ringCount-1)*sideSegs*6 indices): the previous formula based
+        // on nbTriangles left a 6*sideSegs-index gap of uninitialized GPU_ONLY memory between
+        // the middle-quads block and this one, which would have rasterized as a garbage/
+        // degenerate triangle. This starts exactly where the middle-quads block ends.
         uint lon = id;
-        uint tIdx = indexOffset + nbTriangles * 3u - (sideSegs - lon) * 3u;
+        uint tIdx = indexOffset + sideSegs * 3u + (ringCount - 1u) * sideSegs * 6u + lon * 3u;
         indices[tIdx + 0u] = vertexOffset + vertCount - 1u;
         indices[tIdx + 1u] = vertexOffset + vertCount - (lon + 2u) - 1u;
         indices[tIdx + 2u] = vertexOffset + vertCount - (lon + 1u) - 1u;

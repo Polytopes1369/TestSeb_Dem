@@ -25,6 +25,11 @@ layout(std140, binding = 2) uniform Params
     float materialID;
     uint  vertexOffset;
     uint  indexOffset;
+    // World-space translation baked into the generated geometry, used to place multiple
+    // instances of this primitive at different grid slots without a separate transform stage.
+    float worldOffsetX;
+    float worldOffsetY;
+    float worldOffsetZ;
 };
 
 const vec3 ICO_VERTS[12] = vec3[12](
@@ -43,10 +48,15 @@ const ivec3 ICO_FACES[20] = ivec3[20](
     ivec3(4,9,5),   ivec3(2,4,11),  ivec3(6,2,10),  ivec3(8,6,7),   ivec3(9,8,1)
 );
 
-// Row-major index of grid point (i,j) within a triangular face grid of edge resolution N
+// Row-major index of grid point (i,j) within a triangular face grid of edge resolution N.
+// Row i holds (N - i + 1) points (j in [0, N-i]), so rowStart(i) = sum_{k=0}^{i-1} (N - k + 1)
+// = i*(N+1) - i*(i-1)/2. Using (N+2) here instead of (N+1) was off by "i" per row: it left an
+// unwritten vertex slot at the start of every row after the first, and for the last row of a
+// face it overran past that face's vertsPerFace allocation, corrupting the following face's
+// vertex data — the source of the misplaced vertices / broken triangles.
 uint gridIndex(uint i, uint j, uint N)
 {
-    uint rowStart = i * (N + 2u) - (i * (i - 1u)) / 2u;
+    uint rowStart = i * (N + 1u) - (i * (i - 1u)) / 2u;
     return rowStart + j;
 }
 
@@ -82,6 +92,9 @@ void main()
     vtx.uv2        = vtx.uv;
     vtx.meshID     = meshID;
     vtx.materialID = materialID;
+
+    // Translate the generated vertex to its grid slot in world space before writing it out.
+    vtx.position += vec3(worldOffsetX, worldOffsetY, worldOffsetZ);
     vertices[globalIdx] = vtx;
 
     // --- Indices : 2 triangles per (i,j) cell ---

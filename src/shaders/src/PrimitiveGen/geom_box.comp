@@ -35,6 +35,11 @@ layout(push_constant) uniform Params
     float materialID;
     uint  vertexOffset;  // running vertex count from previously-dispatched faces
     uint  indexOffset;
+    // World-space translation baked into the generated geometry, used to place multiple
+    // instances of this primitive at different grid slots without a separate transform stage.
+    float worldOffsetX;
+    float worldOffsetY;
+    float worldOffsetZ;
 };
 
 void setComp(inout vec3 v, int axis, float val)
@@ -83,7 +88,8 @@ void main()
     }
 
     Vertex v;
-    v.position   = pos;
+    // Translate the generated vertex to its grid slot in world space before writing it out.
+    v.position   = pos + vec3(worldOffsetX, worldOffsetY, worldOffsetZ);
     v.normal     = nrm;
     v.uv         = uv;
     v.uv2        = uv;

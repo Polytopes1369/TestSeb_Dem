@@ -24,7 +24,7 @@ VkPipelineLayout VulkanPipeline::CreatePipelineLayout(VkDevice device, VkDescrip
     return layout;
 }
 
-VkPipeline VulkanPipeline::CreateGraphicsPipeline(VkDevice device, VkPipelineLayout layout, VkShaderModule vertShader, VkShaderModule fragShader, VkFormat colorFormat) {
+VkPipeline VulkanPipeline::CreateGraphicsPipeline(VkDevice device, VkPipelineLayout layout, VkShaderModule vertShader, VkShaderModule fragShader, VkFormat colorFormat, VkFormat depthFormat) {
     VkPipelineShaderStageCreateInfo stages[2]{};
     stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT; // Using standard Vertex stage for now
@@ -50,8 +50,12 @@ VkPipeline VulkanPipeline::CreateGraphicsPipeline(VkDevice device, VkPipelineLay
     viewportState.viewportCount = 1;
     viewportState.scissorCount = 1;
 
-    // Rasterization: Crucial for a sphere without a Depth Buffer. 
+    // Rasterization: Crucial for a sphere without a Depth Buffer.
     // Back-face culling ensures we don't render triangles behind the sphere.
+    // NOTE: PerspectiveVulkan() negates the Y scale (m[5] = -g) to correct for Vulkan's
+    // Y-down NDC convention. That Y flip reverses the apparent 2D winding of every triangle
+    // in framebuffer space, so front-facing (CCW in object/world space, verified consistent
+    // across all 20 icosahedron base faces) triangles arrive as CLOCKWISE on screen.
     VkPipelineRasterizationStateCreateInfo rasterizer{};
     rasterizer.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
     rasterizer.depthClampEnable = VK_FALSE;
@@ -87,6 +91,15 @@ VkPipeline VulkanPipeline::CreateGraphicsPipeline(VkDevice device, VkPipelineLay
     pipelineRendering.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
     pipelineRendering.colorAttachmentCount = 1;
     pipelineRendering.pColorAttachmentFormats = &colorFormat;
+    pipelineRendering.depthAttachmentFormat = depthFormat;
+
+    VkPipelineDepthStencilStateCreateInfo depthStencil{};
+    depthStencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+    depthStencil.depthTestEnable = (depthFormat != VK_FORMAT_UNDEFINED) ? VK_TRUE : VK_FALSE;
+    depthStencil.depthWriteEnable = (depthFormat != VK_FORMAT_UNDEFINED) ? VK_TRUE : VK_FALSE;
+    depthStencil.depthCompareOp = VK_COMPARE_OP_LESS;
+    depthStencil.depthBoundsTestEnable = VK_FALSE;
+    depthStencil.stencilTestEnable = VK_FALSE;
 
     VkGraphicsPipelineCreateInfo pipelineInfo{};
     pipelineInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
@@ -98,6 +111,7 @@ VkPipeline VulkanPipeline::CreateGraphicsPipeline(VkDevice device, VkPipelineLay
     pipelineInfo.pRasterizationState = &rasterizer;
     pipelineInfo.pMultisampleState = &multisampling;
     pipelineInfo.pColorBlendState = &colorBlending;
+    pipelineInfo.pDepthStencilState = &depthStencil;
     pipelineInfo.pDynamicState = &dynamicState;
     pipelineInfo.layout = layout;
     pipelineInfo.pNext = &pipelineRendering;

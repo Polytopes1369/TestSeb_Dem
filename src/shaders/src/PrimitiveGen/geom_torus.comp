@@ -25,6 +25,11 @@ layout(std140, binding = 2) uniform Params
     float materialID;
     uint  vertexOffset;
     uint  indexOffset;
+    // World-space translation baked into the generated geometry, used to place multiple
+    // instances of this primitive at different grid slots without a separate transform stage.
+    float worldOffsetX;
+    float worldOffsetY;
+    float worldOffsetZ;
 };
 
 void main()
@@ -52,6 +57,9 @@ void main()
     v.uv2        = v.uv;
     v.meshID     = meshID;
     v.materialID = materialID;
+
+    // Translate the generated vertex to its grid slot in world space before writing it out.
+    v.position += vec3(worldOffsetX, worldOffsetY, worldOffsetZ);
     vertices[vertexOffset + id] = v;
 
     if (seg < nbRadSeg && sideI < nbSides) // one thread per quad

@@ -9,6 +9,7 @@
 #include <stdexcept>
 #include <vector>
 #include <cstring>
+#include <cstddef>
 #include <cmath>
 #include <algorithm>
 #include <format>
@@ -17,6 +18,146 @@
 const std::vector<const char*> validationLayers = {
     "VK_LAYER_KHRONOS_validation"
 };
+
+namespace {
+    // --- Per-shader Params blocks, mirrored 1:1 from their geom_*.comp UBO/push-constant
+    // declarations (all fields are 4-byte scalars, so std140 layout == plain C++ struct
+    // layout here: no vec3 members means no extra padding to account for). worldOffsetX/Y/Z
+    // are appended at the end of every block and translate the generated geometry to its
+    // grid slot directly on the GPU, avoiding a separate per-instance transform stage.
+
+    struct ConeParams {
+        float height;
+        float bottomRadius;
+        float topRadius;
+        uint32_t nbSides;
+        uint32_t meshID;
+        float materialID;
+        uint32_t vertexOffset;
+        uint32_t indexOffset;
+        float worldOffsetX;
+        float worldOffsetY;
+        float worldOffsetZ;
+    };
+
+    struct IcosphereParams {
+        float radius;
+        uint32_t subdiv;
+        uint32_t meshID;
+        float materialID;
+        uint32_t vertexOffset;
+        uint32_t indexOffset;
+        float worldOffsetX;
+        float worldOffsetY;
+        float worldOffsetZ;
+    };
+
+    struct PlaneParams {
+        float width;
+        float length_;
+        uint32_t widthSegs;
+        uint32_t lengthSegs;
+        uint32_t meshID;
+        float materialID;
+        uint32_t vertexOffset;
+        uint32_t indexOffset;
+        float worldOffsetX;
+        float worldOffsetY;
+        float worldOffsetZ;
+    };
+
+    struct SphereParams {
+        float radius;
+        uint32_t sideSegs;
+        uint32_t heightSegs;
+        uint32_t meshID;
+        float materialID;
+        uint32_t vertexOffset;
+        uint32_t indexOffset;
+        float worldOffsetX;
+        float worldOffsetY;
+        float worldOffsetZ;
+    };
+
+    struct TorusParams {
+        float radius1;
+        float radius2;
+        uint32_t nbRadSeg;
+        uint32_t nbSides;
+        uint32_t meshID;
+        float materialID;
+        uint32_t vertexOffset;
+        uint32_t indexOffset;
+        float worldOffsetX;
+        float worldOffsetY;
+        float worldOffsetZ;
+    };
+
+    struct TubeParams {
+        float height;
+        uint32_t nbSides;
+        float bottomRadius1;
+        float bottomRadius2;
+        float topRadius1;
+        float topRadius2;
+        uint32_t meshID;
+        float materialID;
+        uint32_t vertexOffset;
+        uint32_t indexOffset;
+        float worldOffsetX;
+        float worldOffsetY;
+        float worldOffsetZ;
+    };
+
+    // geom_box.comp reads its Params via push constants (not the shared UBO), because each
+    // of its 6 face dispatches also needs distinct specialization constants baked per-pipeline.
+    struct BoxPushConstants {
+        float faceWidth;
+        float faceHeight;
+        float lengthOffset; // constant coordinate along wAxis (±half box size)
+        uint32_t uSegsCount;
+        uint32_t vSegsCount;
+        uint32_t meshID;
+        float materialID;
+        uint32_t vertexOffset;
+        uint32_t indexOffset;
+        float worldOffsetX;
+        float worldOffsetY;
+        float worldOffsetZ;
+    };
+
+    // Specialization constants for geom_box.comp's 6 face dispatches (constant_id 0..5:
+    // uAxis, vAxis, wAxis, faceMode, udir, vdir — axis indices 0=x,1=y,2=z, matching the
+    // shader's setComp() convention). Each face's (uAxis,vAxis,wAxis,udir,vdir) is chosen so
+    // that the shader's (a,b,d) triangle — built from vectors vAxis*(segH*vdir) and
+    // uAxis*(segW*udir) — satisfies cross(b-a, d-a) == wSign * wAxisVector, which is the
+    // condition for consistently outward normals with the winding VulkanPipeline expects
+    // (front faces wind CCW in object space, becoming CLOCKWISE on screen after the
+    // projection's Y-flip). Derivation: cross(b-a,d-a) = -segH*segW*udir*vdir*P*wAxisVector,
+    // where P = +1 if (uAxis,vAxis,wAxis) is an even permutation of (x,y,z) and -1 if odd —
+    // so the required condition reduces to udir*vdir*P == -wSign (solved here with vdir=1
+    // fixed, udir = -wSign*P).
+    struct BoxFaceSpecConstants {
+        int32_t uAxis;
+        int32_t vAxis;
+        int32_t wAxis;
+        int32_t faceMode; // 0: w==z, 1: w==y, 2: w==x (selects the shader's UV formula branch)
+        float   udir;
+        float   vdir;
+    };
+
+    constexpr BoxFaceSpecConstants kBoxFaceSpecs[6] = {
+        { 0, 1, 2, 0, -1.0f, 1.0f }, // +Z  (u=x,v=y,w=z, P=+1, wSign=+1)
+        { 0, 1, 2, 0,  1.0f, 1.0f }, // -Z  (wSign=-1)
+        { 0, 2, 1, 1,  1.0f, 1.0f }, // +Y  (u=x,v=z,w=y, P=-1, wSign=+1)
+        { 0, 2, 1, 1, -1.0f, 1.0f }, // -Y  (wSign=-1)
+        { 1, 2, 0, 2, -1.0f, 1.0f }, // +X  (u=y,v=z,w=x, P=+1, wSign=+1)
+        { 1, 2, 0, 2,  1.0f, 1.0f }, // -X  (wSign=-1)
+    };
+
+    // lengthOffset sign per face, matching kBoxFaceSpecs order: +Z,-Z,+Y,-Y,+X,-X.
+    constexpr float kBoxFaceLengthOffsetSign[6] = { 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f };
+}
 
 static VKAPI_ATTR VkBool32 VKAPI_CALL DebugCallback(
     VkDebugUtilsMessageSeverityFlagBitsEXT messageSeverity,
@@ -99,10 +240,45 @@ void VulkanContext::Init(std::string_view appName, GLFWwindow* window) {
 
     CreateSwapchain(window);
     CreateImageViews();
+
+    // Create Depth Image
+    VkImageCreateInfo depthImageInfo{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+    depthImageInfo.imageType = VK_IMAGE_TYPE_2D;
+    depthImageInfo.format = m_DepthFormat;
+    depthImageInfo.extent = { m_SwapchainExtent.width, m_SwapchainExtent.height, 1 };
+    depthImageInfo.mipLevels = 1;
+    depthImageInfo.arrayLayers = 1;
+    depthImageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+    depthImageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+    depthImageInfo.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+    depthImageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+    VmaAllocationCreateInfo depthAllocInfo{};
+    depthAllocInfo.usage = VMA_MEMORY_USAGE_GPU_ONLY;
+
+    if (vmaCreateImage(m_Allocator, &depthImageInfo, &depthAllocInfo, &m_DepthImage, &m_DepthAllocation, nullptr) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to create depth image!");
+    }
+
+    // Create Depth Image View
+    VkImageViewCreateInfo depthViewInfo{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+    depthViewInfo.image = m_DepthImage;
+    depthViewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    depthViewInfo.format = m_DepthFormat;
+    depthViewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+    depthViewInfo.subresourceRange.baseMipLevel = 0;
+    depthViewInfo.subresourceRange.levelCount = 1;
+    depthViewInfo.subresourceRange.baseArrayLayer = 0;
+    depthViewInfo.subresourceRange.layerCount = 1;
+
+    if (vkCreateImageView(m_Device, &depthViewInfo, nullptr, &m_DepthImageView) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to create depth image view!");
+    }
+
     CreateSyncObjects();
 
     CreatePipelinesAndDescriptors();
-    GenerateGeometry(); // Dispatches the Icosphere generator compute shader once at startup
+    GenerateGeometry(); // Dispatches all 7 procedural primitive generators once at startup
 }
 
 void VulkanContext::CreateInstance(std::string_view appName) {
@@ -384,7 +560,8 @@ void VulkanContext::CreatePipelinesAndDescriptors() {
 
     vkUpdateDescriptorSets(m_Device, 3, writes, 0, nullptr);
 
-    // Compute layout setup
+    // Compute layout setup: shared by all non-box primitive generators, which read their
+    // per-dispatch parameters from the Params UBO (binding = 2) bound in m_GeometryDescriptorSet.
     VkPipelineLayoutCreateInfo computeLayoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
     computeLayoutInfo.setLayoutCount = 1;
     computeLayoutInfo.pSetLayouts = &m_GeometryLayout;
@@ -392,20 +569,90 @@ void VulkanContext::CreatePipelinesAndDescriptors() {
         throw std::runtime_error("Failed to create Compute Pipeline Layout!");
     }
 
-    auto computeCode = ReadShaderFile("shaders/geom_icosphere.comp.spv");
-    VkShaderModule computeModule = VulkanPipeline::CreateShaderModule(m_Device, computeCode);
+    // Box push-constant layout: geom_box.comp reads its Params via push constants instead of
+    // the shared UBO (see BoxPushConstants above), since each face dispatch also needs its
+    // own specialization constants baked at pipeline-creation time.
+    VkPushConstantRange boxPushConstantRange{};
+    boxPushConstantRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    boxPushConstantRange.offset = 0;
+    boxPushConstantRange.size = sizeof(BoxPushConstants);
 
-    VkComputePipelineCreateInfo computePipelineInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
-    computePipelineInfo.layout = m_ComputePipelineLayout;
-    computePipelineInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    computePipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-    computePipelineInfo.stage.module = computeModule;
-    computePipelineInfo.stage.pName = "main";
-
-    if (vkCreateComputePipelines(m_Device, VK_NULL_HANDLE, 1, &computePipelineInfo, nullptr, &m_ComputePipeline) != VK_SUCCESS) {
-        throw std::runtime_error("Failed to generate Icosphere Compute Pipeline!");
+    VkPipelineLayoutCreateInfo boxComputeLayoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+    boxComputeLayoutInfo.setLayoutCount = 1;
+    boxComputeLayoutInfo.pSetLayouts = &m_GeometryLayout;
+    boxComputeLayoutInfo.pushConstantRangeCount = 1;
+    boxComputeLayoutInfo.pPushConstantRanges = &boxPushConstantRange;
+    if (vkCreatePipelineLayout(m_Device, &boxComputeLayoutInfo, nullptr, &m_BoxComputePipelineLayout) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to create Box Compute Pipeline Layout!");
     }
-    vkDestroyShaderModule(m_Device, computeModule, nullptr);
+
+    // One compute pipeline per non-box primitive: same descriptor-set-only layout, each with
+    // its own shader module generating its own topology into the shared Vertex/Index SSBOs.
+    struct SimplePrimitivePipelineDesc {
+        const char* shaderFile;
+        VkPipeline* outPipeline;
+    };
+    const SimplePrimitivePipelineDesc simplePrimitives[] = {
+        { "shaders/geom_cone.comp.spv",      &m_ConePipeline },
+        { "shaders/geom_icosphere.comp.spv", &m_IcospherePipeline },
+        { "shaders/geom_plane.comp.spv",     &m_PlanePipeline },
+        { "shaders/geom_sphere.comp.spv",    &m_SpherePipeline },
+        { "shaders/geom_torus.comp.spv",     &m_TorusPipeline },
+        { "shaders/geom_tube.comp.spv",      &m_TubePipeline },
+    };
+    for (const auto& desc : simplePrimitives) {
+        auto code = ReadShaderFile(desc.shaderFile);
+        VkShaderModule module = VulkanPipeline::CreateShaderModule(m_Device, code);
+
+        VkComputePipelineCreateInfo pipelineInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
+        pipelineInfo.layout = m_ComputePipelineLayout;
+        pipelineInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        pipelineInfo.stage.module = module;
+        pipelineInfo.stage.pName = "main";
+
+        if (vkCreateComputePipelines(m_Device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, desc.outPipeline) != VK_SUCCESS) {
+            throw std::runtime_error(std::string("Failed to create compute pipeline for ") + desc.shaderFile);
+        }
+        vkDestroyShaderModule(m_Device, module, nullptr);
+    }
+
+    // Box: 6 compute pipelines built from the same shader module, one per cube face,
+    // differentiated only by VkSpecializationInfo (axis mapping + winding, see kBoxFaceSpecs).
+    {
+        auto boxCode = ReadShaderFile("shaders/geom_box.comp.spv");
+        VkShaderModule boxModule = VulkanPipeline::CreateShaderModule(m_Device, boxCode);
+
+        VkSpecializationMapEntry mapEntries[6] = {
+            { 0, offsetof(BoxFaceSpecConstants, uAxis),    sizeof(int32_t) },
+            { 1, offsetof(BoxFaceSpecConstants, vAxis),    sizeof(int32_t) },
+            { 2, offsetof(BoxFaceSpecConstants, wAxis),    sizeof(int32_t) },
+            { 3, offsetof(BoxFaceSpecConstants, faceMode), sizeof(int32_t) },
+            { 4, offsetof(BoxFaceSpecConstants, udir),     sizeof(float) },
+            { 5, offsetof(BoxFaceSpecConstants, vdir),     sizeof(float) },
+        };
+
+        for (uint32_t face = 0; face < 6u; ++face) {
+            VkSpecializationInfo specInfo{};
+            specInfo.mapEntryCount = 6;
+            specInfo.pMapEntries = mapEntries;
+            specInfo.dataSize = sizeof(BoxFaceSpecConstants);
+            specInfo.pData = &kBoxFaceSpecs[face];
+
+            VkComputePipelineCreateInfo pipelineInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
+            pipelineInfo.layout = m_BoxComputePipelineLayout;
+            pipelineInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+            pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+            pipelineInfo.stage.module = boxModule;
+            pipelineInfo.stage.pName = "main";
+            pipelineInfo.stage.pSpecializationInfo = &specInfo;
+
+            if (vkCreateComputePipelines(m_Device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_BoxFacePipelines[face]) != VK_SUCCESS) {
+                throw std::runtime_error("Failed to create Box face compute pipeline!");
+            }
+        }
+        vkDestroyShaderModule(m_Device, boxModule, nullptr);
+    }
 
     // Graphics layout setup with custom PushConstant sizing matching CameraPushConstants
     VkPushConstantRange pushConstantRange{};
@@ -427,39 +674,34 @@ void VulkanContext::CreatePipelinesAndDescriptors() {
     VkShaderModule vertModule = VulkanPipeline::CreateShaderModule(m_Device, vertCode);
     VkShaderModule fragModule = VulkanPipeline::CreateShaderModule(m_Device, fragCode);
 
-    m_GraphicsPipeline = VulkanPipeline::CreateGraphicsPipeline(m_Device, m_GraphicsPipelineLayout, vertModule, fragModule, m_SwapchainImageFormat);
+    m_GraphicsPipeline = VulkanPipeline::CreateGraphicsPipeline(m_Device, m_GraphicsPipelineLayout, vertModule, fragModule, m_SwapchainImageFormat, m_DepthFormat);
 
     vkDestroyShaderModule(m_Device, vertModule, nullptr);
     vkDestroyShaderModule(m_Device, fragModule, nullptr);
 }
 
-void VulkanContext::GenerateGeometry() {
-    struct Params {
-        float radius = 1.0f;
-        uint32_t subdiv = 16;
-        uint32_t meshID = 0;
-        float materialID = 0.0f;
-        uint32_t vertexOffset = 0;
-        uint32_t indexOffset = 0;
-    } params;
-
-    void* data;
-    if (vmaMapMemory(m_Allocator, m_ParamsAllocation, &data) == VK_SUCCESS) {
-        std::memcpy(data, &params, sizeof(Params));
+void VulkanContext::DispatchGeometryCompute(
+    VkPipeline pipeline,
+    VkPipelineLayout layout,
+    const void* uboParamsData,
+    size_t uboParamsSize,
+    const void* pushConstantData,
+    size_t pushConstantSize,
+    uint32_t groupCountX,
+    uint32_t groupCountY,
+    uint32_t groupCountZ)
+{
+    // Every primitive except the box drives geom_*.comp through the shared Params UBO
+    // (binding = 2): overwrite it with this dispatch's parameters before recording the
+    // command buffer that reads it.
+    if (uboParamsData != nullptr) {
+        void* mapped = nullptr;
+        if (vmaMapMemory(m_Allocator, m_ParamsAllocation, &mapped) != VK_SUCCESS) {
+            throw std::runtime_error("Failed to map Params UBO for geometry dispatch!");
+        }
+        std::memcpy(mapped, uboParamsData, uboParamsSize);
         vmaUnmapMemory(m_Allocator, m_ParamsAllocation);
     }
-
-    // --- DEBUG: log the geometry parameters actually uploaded to the compute shader,
-    // and the vertex/index counts the icosphere generator is expected to produce. ---
-    constexpr uint32_t kIcosphereFaceCount = 20u;
-    uint32_t vertsPerFace = (params.subdiv + 1u) * (params.subdiv + 2u) / 2u;
-    uint32_t expectedVertexCount = vertsPerFace * kIcosphereFaceCount;
-    uint32_t expectedIndexCount = kIcosphereFaceCount * params.subdiv * params.subdiv * 6u;
-    Logger::Log(LogLevel::Info, std::format(
-        "[GenerateGeometry] radius={} subdiv={} vertexOffset={} indexOffset={} -> expectedVertexCount={} expectedIndexCount={} (buffers hold {} verts / {} indices max)",
-        params.radius, params.subdiv, params.vertexOffset, params.indexOffset,
-        expectedVertexCount, expectedIndexCount,
-        (512u * 1024u) / sizeof(renderer::Vertex), (128u * 1024u) / sizeof(uint32_t)));
 
     VkCommandBufferAllocateInfo allocInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
     allocInfo.commandPool = m_CommandPool;
@@ -475,28 +717,17 @@ void VulkanContext::GenerateGeometry() {
     beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(cmd, &beginInfo);
 
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_ComputePipeline);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_ComputePipelineLayout, 0, 1, &m_GeometryDescriptorSet, 0, nullptr);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &m_GeometryDescriptorSet, 0, nullptr);
 
-    // Dispatch sizing must match geom_icosphere.comp's local_size = (8, 8, 1):
-    // X and Y cover the triangular grid coordinates (i, j) in [0, subdiv],
-    // Z covers the 20 base icosahedron faces (one face per Z-invocation since local_size_z = 1).
-    constexpr uint32_t kLocalSizeXY = 8u;
+    if (pushConstantData != nullptr) {
+        vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, static_cast<uint32_t>(pushConstantSize), pushConstantData);
+    }
 
-    uint32_t gridExtent = params.subdiv + 1u; // valid i,j range is [0, subdiv] inclusive
-    uint32_t groupCountXY = (gridExtent + kLocalSizeXY - 1u) / kLocalSizeXY;
-    uint32_t groupCountZ = kIcosphereFaceCount;
+    vkCmdDispatch(cmd, groupCountX, groupCountY, groupCountZ);
 
-    // --- DEBUG: log the actual dispatch dimensions and resulting invocation coverage. ---
-    Logger::Log(LogLevel::Info, std::format(
-        "[GenerateGeometry] Dispatching compute: groupCount=({}, {}, {}) -> covers invocations x,y in [0,{}) z in [0,{})",
-        groupCountXY, groupCountXY, groupCountZ,
-        groupCountXY * kLocalSizeXY, groupCountZ));
-
-    // Dispatch across the (i, j, face) domain
-    vkCmdDispatch(cmd, groupCountXY, groupCountXY, groupCountZ);
-
-    // Memory layout safe transition barrier execution
+    // Memory layout safe transition barrier execution: compute writes to the shared
+    // Vertex/Index SSBOs must be visible to the vertex shader stage that reads them at draw time.
     VkMemoryBarrier2 memBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
     memBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
     memBarrier.srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT;
@@ -515,14 +746,268 @@ void VulkanContext::GenerateGeometry() {
     submitInfo.pCommandBuffers = &cmd;
     vkQueueSubmit(m_GraphicsQueue, 1, &submitInfo, VK_NULL_HANDLE);
 
+    // Blocking wait between dispatches: this is a one-time startup pass (not a per-frame
+    // path), so trading dispatch-level parallelism for simplicity is an explicit, deliberate
+    // choice here — it also guarantees the next dispatch's Params UBO overwrite (above) never
+    // races a still-in-flight read of the previous dispatch's parameters.
     vkQueueWaitIdle(m_GraphicsQueue);
     vkFreeCommandBuffers(m_Device, m_CommandPool, 1, &cmd);
+}
 
-    Logger::Log(LogLevel::Info, "GPU Geometry generated successfully during bootstrap context phase.");
+void VulkanContext::GenerateGeometry() {
+    // --- Grid layout: 7 primitives arranged on a 3-column grid centered on (0,0,0), in the
+    // XZ plane (Y = 0 ground level), spaced kGridSpacing apart. Generation order below is
+    // Icosphere-first (so it lands at vertexOffset/indexOffset 0, keeping
+    // DebugReadbackGeometrySample's fixed sampling window — designed around a single
+    // icosphere living at the start of the buffers — valid unchanged); each primitive's grid
+    // *position* is independent of generation order and set via gridSlot(slotIndex) below.
+    constexpr float kGridSpacing = 3.0f;
+    auto gridSlot = [](int slotIndex) -> maths::vec2 {
+        int col = slotIndex % 3;
+        int row = slotIndex / 3;
+        return maths::vec2{ (col - 1) * kGridSpacing, (row - 1) * kGridSpacing };
+        };
 
-    // --- DEBUG: read back a sample of generated vertices/indices to verify the compute
-    // shader actually wrote valid data across multiple icosahedron faces (not just face 0). ---
-    DebugReadbackGeometrySample(vertsPerFace, expectedIndexCount);
+    uint32_t runningVertexOffset = 0;
+    uint32_t runningIndexOffset = 0;
+
+    Logger::Log(LogLevel::Info, "[GenerateGeometry] Generating 7 procedural primitives on a 3x3 grid...");
+
+    // ---------------------------------------------------------------------------------
+    // ICOSPHERE (slot 2 visually) — generated first so it occupies buffer offset 0.
+    // ---------------------------------------------------------------------------------
+    uint32_t icosphereVertsPerFace = 0;
+    uint32_t icosphereIndexCount = 0;
+    {
+        maths::vec2 slot = gridSlot(2);
+        IcosphereParams params{};
+        params.radius = 0.8f;
+        params.subdiv = 8u;
+        params.meshID = 2u;
+        params.materialID = 0.0f;
+        params.vertexOffset = runningVertexOffset;
+        params.indexOffset = runningIndexOffset;
+        params.worldOffsetX = slot.x;
+        params.worldOffsetY = 0.0f;
+        params.worldOffsetZ = slot.y;
+
+        // Dispatch sizing must match geom_icosphere.comp's local_size = (8, 8, 1): X and Y
+        // cover the triangular grid coordinates (i, j) in [0, subdiv], Z covers the 20 base
+        // icosahedron faces (one face per Z-invocation since local_size_z = 1).
+        constexpr uint32_t kIcosphereFaceCount = 20u;
+        constexpr uint32_t kLocalSizeXY = 8u;
+        uint32_t gridExtent = params.subdiv + 1u; // valid i,j range is [0, subdiv] inclusive
+        uint32_t groupCountXY = (gridExtent + kLocalSizeXY - 1u) / kLocalSizeXY;
+
+        DispatchGeometryCompute(m_IcospherePipeline, m_ComputePipelineLayout,
+            &params, sizeof(params), nullptr, 0,
+            groupCountXY, groupCountXY, kIcosphereFaceCount);
+
+        icosphereVertsPerFace = (params.subdiv + 1u) * (params.subdiv + 2u) / 2u;
+        uint32_t totalVerts = icosphereVertsPerFace * kIcosphereFaceCount;
+        // Each face writes subdiv*subdiv triangles (barycentric subdivision), 3 indices each —
+        // NOT subdiv*subdiv*6 as an earlier debug estimate assumed for the single-primitive case.
+        icosphereIndexCount = kIcosphereFaceCount * params.subdiv * params.subdiv * 3u;
+
+        runningVertexOffset += totalVerts;
+        runningIndexOffset += icosphereIndexCount;
+    }
+    // DEBUG: sample-readback the icosphere geometry, exactly as before this feature, to catch
+    // regressions in the (still buffer-offset-0) icosphere generation.
+    DebugReadbackGeometrySample(icosphereVertsPerFace, icosphereIndexCount);
+
+    // ---------------------------------------------------------------------------------
+    // BOX (slot 0) — 6 compute dispatches, one per cube face, chained onto the same meshID.
+    // ---------------------------------------------------------------------------------
+    {
+        maths::vec2 slot = gridSlot(0);
+        constexpr float kHalfSize = 0.7f;
+        constexpr uint32_t kSegs = 2u; // a flat face only needs its 4 corners
+
+        for (uint32_t face = 0; face < 6u; ++face) {
+            BoxPushConstants params{};
+            params.faceWidth = kHalfSize * 2.0f;
+            params.faceHeight = kHalfSize * 2.0f;
+            params.lengthOffset = kBoxFaceLengthOffsetSign[face] * kHalfSize;
+            params.uSegsCount = kSegs;
+            params.vSegsCount = kSegs;
+            params.meshID = 0u;
+            params.materialID = 0.0f;
+            params.vertexOffset = runningVertexOffset;
+            params.indexOffset = runningIndexOffset;
+            params.worldOffsetX = slot.x;
+            params.worldOffsetY = 0.0f;
+            params.worldOffsetZ = slot.y;
+
+            constexpr uint32_t kLocalSizeXY = 8u; // geom_box.comp local_size = (8, 8, 1)
+            uint32_t groupCount = (kSegs + kLocalSizeXY - 1u) / kLocalSizeXY;
+
+            DispatchGeometryCompute(m_BoxFacePipelines[face], m_BoxComputePipelineLayout,
+                nullptr, 0, &params, sizeof(params),
+                groupCount, groupCount, 1);
+
+            runningVertexOffset += kSegs * kSegs;
+            runningIndexOffset += (kSegs - 1u) * (kSegs - 1u) * 6u;
+        }
+    }
+
+    // ---------------------------------------------------------------------------------
+    // CONE (slot 1)
+    // ---------------------------------------------------------------------------------
+    {
+        maths::vec2 slot = gridSlot(1);
+        ConeParams params{};
+        params.height = 1.4f;
+        params.bottomRadius = 0.7f;
+        params.topRadius = 0.0f; // true cone (no flat top)
+        params.nbSides = 32u;
+        params.meshID = 1u;
+        params.materialID = 0.0f;
+        params.vertexOffset = runningVertexOffset;
+        params.indexOffset = runningIndexOffset;
+        params.worldOffsetX = slot.x;
+        params.worldOffsetY = -params.height * 0.5f; // recenter: geometry spans y=[0,height]
+        params.worldOffsetZ = slot.y;
+
+        uint32_t totalVerts = 4u * (params.nbSides + 1u); // geom_cone.comp local_size_x = 64
+        constexpr uint32_t kLocalSizeX = 64u;
+        uint32_t groupCount = (totalVerts + kLocalSizeX - 1u) / kLocalSizeX;
+
+        DispatchGeometryCompute(m_ConePipeline, m_ComputePipelineLayout,
+            &params, sizeof(params), nullptr, 0, groupCount, 1, 1);
+
+        runningVertexOffset += totalVerts;
+        runningIndexOffset += 12u * params.nbSides;
+    }
+
+    // ---------------------------------------------------------------------------------
+    // PLANE (slot 3)
+    // ---------------------------------------------------------------------------------
+    {
+        maths::vec2 slot = gridSlot(3);
+        PlaneParams params{};
+        params.width = 1.4f;
+        params.length_ = 1.4f;
+        params.widthSegs = 2u; // flat surface: 4 corners is all that's needed
+        params.lengthSegs = 2u;
+        params.meshID = 3u;
+        params.materialID = 0.0f;
+        params.vertexOffset = runningVertexOffset;
+        params.indexOffset = runningIndexOffset;
+        params.worldOffsetX = slot.x;
+        params.worldOffsetY = 0.0f;
+        params.worldOffsetZ = slot.y;
+
+        constexpr uint32_t kLocalSizeXY = 8u; // geom_plane.comp local_size = (8, 8, 1)
+        uint32_t groupCountX = (params.widthSegs + kLocalSizeXY - 1u) / kLocalSizeXY;
+        uint32_t groupCountY = (params.lengthSegs + kLocalSizeXY - 1u) / kLocalSizeXY;
+
+        DispatchGeometryCompute(m_PlanePipeline, m_ComputePipelineLayout,
+            &params, sizeof(params), nullptr, 0, groupCountX, groupCountY, 1);
+
+        runningVertexOffset += params.widthSegs * params.lengthSegs;
+        runningIndexOffset += 6u * (params.widthSegs - 1u) * (params.lengthSegs - 1u);
+    }
+
+    // ---------------------------------------------------------------------------------
+    // SPHERE / UV sphere (slot 4)
+    // ---------------------------------------------------------------------------------
+    {
+        maths::vec2 slot = gridSlot(4);
+        SphereParams params{};
+        params.radius = 0.8f;
+        params.sideSegs = 24u;
+        params.heightSegs = 16u;
+        params.meshID = 4u;
+        params.materialID = 0.0f;
+        params.vertexOffset = runningVertexOffset;
+        params.indexOffset = runningIndexOffset;
+        params.worldOffsetX = slot.x;
+        params.worldOffsetY = 0.0f;
+        params.worldOffsetZ = slot.y;
+
+        uint32_t ringCount = params.heightSegs - 2u; // interior latitude rings (excludes poles)
+        uint32_t ringStride = params.sideSegs + 1u;
+        uint32_t vertCount = ringCount * ringStride + 2u;
+        constexpr uint32_t kLocalSizeX = 64u; // geom_sphere.comp local_size_x = 64
+        uint32_t groupCount = (vertCount + kLocalSizeX - 1u) / kLocalSizeX;
+
+        DispatchGeometryCompute(m_SpherePipeline, m_ComputePipelineLayout,
+            &params, sizeof(params), nullptr, 0, groupCount, 1, 1);
+
+        runningVertexOffset += vertCount;
+        // Dense packing after the geom_sphere.comp bottom-cap fix: sideSegs*3 (top fan) +
+        // (ringCount-1)*sideSegs*6 (middle quads) + sideSegs*3 (bottom fan) = 6*sideSegs*ringCount.
+        runningIndexOffset += 6u * params.sideSegs * ringCount;
+    }
+
+    // ---------------------------------------------------------------------------------
+    // TORUS (slot 5)
+    // ---------------------------------------------------------------------------------
+    {
+        maths::vec2 slot = gridSlot(5);
+        TorusParams params{};
+        params.radius1 = 0.7f; // major (ring) radius
+        params.radius2 = 0.22f; // minor (tube) radius
+        params.nbRadSeg = 32u;
+        params.nbSides = 16u;
+        params.meshID = 5u;
+        params.materialID = 0.0f;
+        params.vertexOffset = runningVertexOffset;
+        params.indexOffset = runningIndexOffset;
+        params.worldOffsetX = slot.x;
+        params.worldOffsetY = 0.0f;
+        params.worldOffsetZ = slot.y;
+
+        uint32_t vertCount = (params.nbRadSeg + 1u) * (params.nbSides + 1u);
+        constexpr uint32_t kLocalSizeX = 64u; // geom_torus.comp local_size_x = 64
+        uint32_t groupCount = (vertCount + kLocalSizeX - 1u) / kLocalSizeX;
+
+        DispatchGeometryCompute(m_TorusPipeline, m_ComputePipelineLayout,
+            &params, sizeof(params), nullptr, 0, groupCount, 1, 1);
+
+        runningVertexOffset += vertCount;
+        runningIndexOffset += 6u * params.nbRadSeg * params.nbSides;
+    }
+
+    // ---------------------------------------------------------------------------------
+    // TUBE (slot 6) — hollow cylinder (pipe): outer/inner wall + top/bottom rings.
+    // ---------------------------------------------------------------------------------
+    {
+        maths::vec2 slot = gridSlot(6);
+        TubeParams params{};
+        params.height = 1.4f;
+        params.nbSides = 24u;
+        params.bottomRadius1 = 0.7f;
+        params.bottomRadius2 = 0.18f; // wall thickness
+        params.topRadius1 = 0.7f;
+        params.topRadius2 = 0.18f;
+        params.meshID = 6u;
+        params.materialID = 0.0f;
+        params.vertexOffset = runningVertexOffset;
+        params.indexOffset = runningIndexOffset;
+        params.worldOffsetX = slot.x;
+        params.worldOffsetY = -params.height * 0.5f; // recenter: geometry spans y=[0,height]
+        params.worldOffsetZ = slot.y;
+
+        uint32_t capCount = params.nbSides * 2u + 2u;
+        uint32_t totalVerts = capCount * 4u; // geom_tube.comp local_size_x = 64
+        constexpr uint32_t kLocalSizeX = 64u;
+        uint32_t groupCount = (totalVerts + kLocalSizeX - 1u) / kLocalSizeX;
+
+        DispatchGeometryCompute(m_TubePipeline, m_ComputePipelineLayout,
+            &params, sizeof(params), nullptr, 0, groupCount, 1, 1);
+
+        runningVertexOffset += totalVerts;
+        runningIndexOffset += 24u * params.nbSides;
+    }
+
+    m_TotalIndexCount = runningIndexOffset;
+    Logger::Log(LogLevel::Info, std::format(
+        "[GenerateGeometry] All 7 primitives generated: totalVertexCount={} totalIndexCount={} "
+        "(buffers hold {} verts / {} indices max)",
+        runningVertexOffset, runningIndexOffset,
+        (512u * 1024u) / sizeof(renderer::Vertex), (128u * 1024u) / sizeof(uint32_t)));
 }
 
 void VulkanContext::DebugReadbackGeometrySample(uint32_t vertsPerFace, uint32_t expectedIndexCount) {
@@ -658,6 +1143,16 @@ void VulkanContext::Shutdown() {
         vkDeviceWaitIdle(m_Device);
     }
 
+    if (m_DepthImageView != VK_NULL_HANDLE) {
+        vkDestroyImageView(m_Device, m_DepthImageView, nullptr);
+        m_DepthImageView = VK_NULL_HANDLE;
+    }
+    if (m_DepthImage != VK_NULL_HANDLE) {
+        vmaDestroyImage(m_Allocator, m_DepthImage, m_DepthAllocation);
+        m_DepthImage = VK_NULL_HANDLE;
+        m_DepthAllocation = VK_NULL_HANDLE;
+    }
+
     if (m_VertexBuffer != VK_NULL_HANDLE) {
         vmaDestroyBuffer(m_Allocator, m_VertexBuffer, m_VertexAllocation);
     }
@@ -678,8 +1173,16 @@ void VulkanContext::Shutdown() {
         vkDestroySemaphore(m_Device, m_RenderFinishedSemaphore, nullptr);
     }
 
-    if (m_ComputePipeline != VK_NULL_HANDLE) {
-        vkDestroyPipeline(m_Device, m_ComputePipeline, nullptr);
+    for (VkPipeline pipeline : { m_ConePipeline, m_IcospherePipeline, m_PlanePipeline,
+                                  m_SpherePipeline, m_TorusPipeline, m_TubePipeline }) {
+        if (pipeline != VK_NULL_HANDLE) {
+            vkDestroyPipeline(m_Device, pipeline, nullptr);
+        }
+    }
+    for (VkPipeline facePipeline : m_BoxFacePipelines) {
+        if (facePipeline != VK_NULL_HANDLE) {
+            vkDestroyPipeline(m_Device, facePipeline, nullptr);
+        }
     }
     if (m_GraphicsPipeline != VK_NULL_HANDLE) {
         vkDestroyPipeline(m_Device, m_GraphicsPipeline, nullptr);
@@ -690,6 +1193,9 @@ void VulkanContext::Shutdown() {
     }
     if (m_ComputePipelineLayout != VK_NULL_HANDLE) {
         vkDestroyPipelineLayout(m_Device, m_ComputePipelineLayout, nullptr);
+    }
+    if (m_BoxComputePipelineLayout != VK_NULL_HANDLE) {
+        vkDestroyPipelineLayout(m_Device, m_BoxComputePipelineLayout, nullptr);
     }
     if (m_GraphicsPipelineLayout != VK_NULL_HANDLE) {
         vkDestroyPipelineLayout(m_Device, m_GraphicsPipelineLayout, nullptr);

@@ -26,6 +26,11 @@ layout(std140, binding = 2) uniform Params
     float materialID;
     uint  vertexOffset;
     uint  indexOffset;
+    // World-space translation baked into the generated geometry, used to place multiple
+    // instances of this primitive at different grid slots without a separate transform stage.
+    float worldOffsetX;
+    float worldOffsetY;
+    float worldOffsetZ;
 };
 
 // Layout: [0] bottom center, [1..nbSides] bottom rim,
@@ -94,6 +99,9 @@ void main()
     }
 
     v.uv2 = v.uv;
+
+    // Translate the generated vertex to its grid slot in world space before writing it out.
+    v.position += vec3(worldOffsetX, worldOffsetY, worldOffsetZ);
     vertices[vertexOffset + id] = v;
 
     // --- Indices ---

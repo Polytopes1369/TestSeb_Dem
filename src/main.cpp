@@ -33,7 +33,8 @@ int main() {
 
     Logger::Log(LogLevel::Info, "Entering main loop.");
 
-    // Instantiate camera closer to 0,0,0 to see the generated sphere clearly
+    // Instantiate the camera looking at the origin; CameraOrbit() below repositions it every
+    // frame, so the initial position/target here only seed the pitch/yaw derivation.
     Camera camera({ 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f });
 
     while (!glfwWindowShouldClose(window)) {
@@ -46,8 +47,11 @@ int main() {
         // Orbit azimuth evolution
         static float azimuth = 0.0f;
         azimuth += 0.05f;
-        // Orbit around 0,0,0 at a distance of 3.5m to see the 1m radius sphere
-        camera.CameraOrbit({ 0.0f, 0.0f, 0.0f }, 5.5f, azimuth, 20.0f);
+        // Orbit around 0,0,0 at a distance sized to keep the whole 7-primitive grid
+        // (roughly a 6m x 6m footprint centered on the origin) in view: bounding radius from
+        // the farthest grid corner (~4.3m) plus primitive half-extent (~0.8m) is ~5.1m, so a
+        // distance of 14m at a 45° FOV leaves a comfortable margin.
+        camera.CameraOrbit({ 0.0f, 0.0f, 0.0f }, 14.0f, azimuth, 28.0f);
 
         // Update aspect ratio
         float aspect = static_cast<float>(vkContext.GetSwapchainExtent().width) /
@@ -113,20 +117,34 @@ int main() {
         VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
         vkBeginCommandBuffer(vkContext.GetCommandBuffer(), &beginInfo);
 
-        // --- BARRIER 1: Transition to COLOR_ATTACHMENT_OPTIMAL for Rasterization ---
-        VkImageMemoryBarrier2 acquireBarrier{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
-        acquireBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
-        acquireBarrier.srcAccessMask = 0;
-        acquireBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
-        acquireBarrier.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
-        acquireBarrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        acquireBarrier.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-        acquireBarrier.image = vkContext.GetSwapchainImages()[imageIndex];
-        acquireBarrier.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+        // --- BARRIER 1: Transition to COLOR_ATTACHMENT_OPTIMAL and DEPTH_ATTACHMENT_OPTIMAL ---
+        VkImageMemoryBarrier2 barriers[2]{};
+        
+        // Color barrier
+        barriers[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+        barriers[0].srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+        barriers[0].srcAccessMask = 0;
+        barriers[0].dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+        barriers[0].dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+        barriers[0].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        barriers[0].newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        barriers[0].image = vkContext.GetSwapchainImages()[imageIndex];
+        barriers[0].subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+
+        // Depth barrier
+        barriers[1].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+        barriers[1].srcStageMask = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
+        barriers[1].srcAccessMask = 0;
+        barriers[1].dstStageMask = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
+        barriers[1].dstAccessMask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        barriers[1].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        barriers[1].newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        barriers[1].image = vkContext.GetDepthImage();
+        barriers[1].subresourceRange = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1 };
 
         VkDependencyInfo acquireDependencyInfo{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-        acquireDependencyInfo.imageMemoryBarrierCount = 1;
-        acquireDependencyInfo.pImageMemoryBarriers = &acquireBarrier;
+        acquireDependencyInfo.imageMemoryBarrierCount = 2;
+        acquireDependencyInfo.pImageMemoryBarriers = barriers;
         vkCmdPipelineBarrier2(vkContext.GetCommandBuffer(), &acquireDependencyInfo);
 
         // --- 3. DYNAMIC RENDERING PASS (Graphics Pipeline) ---
@@ -138,11 +156,19 @@ int main() {
         // Dark blue background (Demoscene style)
         colorAttachment.clearValue.color = { 0.05f, 0.05f, 0.1f, 1.0f };
 
+        VkRenderingAttachmentInfo depthAttachment{ VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
+        depthAttachment.imageView = vkContext.GetDepthImageView();
+        depthAttachment.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        depthAttachment.clearValue.depthStencil = { 1.0f, 0 };
+
         VkRenderingInfo renderingInfo{ VK_STRUCTURE_TYPE_RENDERING_INFO };
         renderingInfo.renderArea = { 0, 0, vkContext.GetSwapchainExtent().width, vkContext.GetSwapchainExtent().height };
         renderingInfo.layerCount = 1;
         renderingInfo.colorAttachmentCount = 1;
         renderingInfo.pColorAttachments = &colorAttachment;
+        renderingInfo.pDepthAttachment = &depthAttachment;
 
         vkCmdBeginRendering(vkContext.GetCommandBuffer(), &renderingInfo);
 
@@ -176,8 +202,11 @@ int main() {
         vkCmdSetScissor(vkContext.GetCommandBuffer(), 0, 1, &scissor);
 
         // GPU-Driven Draw Call : No VertexBuffer bound via CPU!
-        // 20 faces of icosahedron * (16 * 16 * 3) indices = 15360 indices.
-        vkCmdDraw(vkContext.GetCommandBuffer(), 15360, 1, 0, 0);
+        // All 7 procedural primitives (box, cone, icosphere, plane, sphere, torus, tube)
+        // live contiguously in the shared Vertex/Index SSBOs (see GenerateGeometry()), each
+        // shader having written *absolute* vertex indices — so a single sequential draw over
+        // the combined index count renders the whole grid in one call.
+        vkCmdDraw(vkContext.GetCommandBuffer(), vkContext.GetTotalIndexCount(), 1, 0, 0);
 
         vkCmdEndRendering(vkContext.GetCommandBuffer());
 
