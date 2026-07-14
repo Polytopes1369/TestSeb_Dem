@@ -3,11 +3,15 @@
 #include "core/Logger.h"
 #include "core/EntityData.h"
 #include "core/EngineConfig.h" // Centralized engine configurations (config::WINDOW_WIDTH, etc.)
+#include "renderer/RenderTypes.h" // renderer::Vertex, used to interpret the DEBUG readback bytes
 #include <iostream>
 #include <fstream>
 #include <stdexcept>
 #include <vector>
 #include <cstring>
+#include <cmath>
+#include <algorithm>
+#include <format>
 
 // Validation Layers array definition
 const std::vector<const char*> validationLayers = {
@@ -70,7 +74,8 @@ void VulkanContext::Init(std::string_view appName, GLFWwindow* window) {
     // Allocate Procedural Geometry Buffers (512KB vertices, 128KB indices, 256B for internal parameters)
     VkBufferCreateInfo vInfo{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
     vInfo.size = 512 * 1024;
-    vInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+    // TRANSFER_SRC_BIT is required for the DEBUG readback (vkCmdCopyBuffer) in DebugReadbackGeometrySample()
+    vInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
     VmaAllocationCreateInfo vAlloc{ .usage = VMA_MEMORY_USAGE_GPU_ONLY };
     if (vmaCreateBuffer(m_Allocator, &vInfo, &vAlloc, &m_VertexBuffer, &m_VertexAllocation, nullptr) != VK_SUCCESS) {
         throw std::runtime_error("Failed to allocate vertex SSBO!");
@@ -78,7 +83,8 @@ void VulkanContext::Init(std::string_view appName, GLFWwindow* window) {
 
     VkBufferCreateInfo iInfo{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
     iInfo.size = 128 * 1024;
-    iInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
+    // TRANSFER_SRC_BIT is required for the DEBUG readback (vkCmdCopyBuffer) in DebugReadbackGeometrySample()
+    iInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
     if (vmaCreateBuffer(m_Allocator, &iInfo, &vAlloc, &m_IndexBuffer, &m_IndexAllocation, nullptr) != VK_SUCCESS) {
         throw std::runtime_error("Failed to allocate index SSBO!");
     }
@@ -443,6 +449,18 @@ void VulkanContext::GenerateGeometry() {
         vmaUnmapMemory(m_Allocator, m_ParamsAllocation);
     }
 
+    // --- DEBUG: log the geometry parameters actually uploaded to the compute shader,
+    // and the vertex/index counts the icosphere generator is expected to produce. ---
+    constexpr uint32_t kIcosphereFaceCount = 20u;
+    uint32_t vertsPerFace = (params.subdiv + 1u) * (params.subdiv + 2u) / 2u;
+    uint32_t expectedVertexCount = vertsPerFace * kIcosphereFaceCount;
+    uint32_t expectedIndexCount = kIcosphereFaceCount * params.subdiv * params.subdiv * 6u;
+    Logger::Log(LogLevel::Info, std::format(
+        "[GenerateGeometry] radius={} subdiv={} vertexOffset={} indexOffset={} -> expectedVertexCount={} expectedIndexCount={} (buffers hold {} verts / {} indices max)",
+        params.radius, params.subdiv, params.vertexOffset, params.indexOffset,
+        expectedVertexCount, expectedIndexCount,
+        (512u * 1024u) / sizeof(renderer::Vertex), (128u * 1024u) / sizeof(uint32_t)));
+
     VkCommandBufferAllocateInfo allocInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
     allocInfo.commandPool = m_CommandPool;
     allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
@@ -460,19 +478,23 @@ void VulkanContext::GenerateGeometry() {
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_ComputePipeline);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_ComputePipelineLayout, 0, 1, &m_GeometryDescriptorSet, 0, nullptr);
 
-    // Correct way to dispatch based on local_size_x = 64
-    uint32_t ringCount = params.subdiv - 2u;
-    uint32_t ringStride = params.subdiv + 1u;
-    uint32_t vertCount = ringCount * ringStride + 2u;
+    // Dispatch sizing must match geom_icosphere.comp's local_size = (8, 8, 1):
+    // X and Y cover the triangular grid coordinates (i, j) in [0, subdiv],
+    // Z covers the 20 base icosahedron faces (one face per Z-invocation since local_size_z = 1).
+    constexpr uint32_t kLocalSizeXY = 8u;
 
-    // We only use the X dimension for the dispatch
-    uint32_t groupCount = (vertCount + 63) / 64;
+    uint32_t gridExtent = params.subdiv + 1u; // valid i,j range is [0, subdiv] inclusive
+    uint32_t groupCountXY = (gridExtent + kLocalSizeXY - 1u) / kLocalSizeXY;
+    uint32_t groupCountZ = kIcosphereFaceCount;
 
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_ComputePipeline);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_ComputePipelineLayout, 0, 1, &m_GeometryDescriptorSet, 0, nullptr);
+    // --- DEBUG: log the actual dispatch dimensions and resulting invocation coverage. ---
+    Logger::Log(LogLevel::Info, std::format(
+        "[GenerateGeometry] Dispatching compute: groupCount=({}, {}, {}) -> covers invocations x,y in [0,{}) z in [0,{})",
+        groupCountXY, groupCountXY, groupCountZ,
+        groupCountXY * kLocalSizeXY, groupCountZ));
 
-    // Dispatch strictly on X
-    vkCmdDispatch(cmd, groupCount, 1, 1);
+    // Dispatch across the (i, j, face) domain
+    vkCmdDispatch(cmd, groupCountXY, groupCountXY, groupCountZ);
 
     // Memory layout safe transition barrier execution
     VkMemoryBarrier2 memBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
@@ -497,6 +519,125 @@ void VulkanContext::GenerateGeometry() {
     vkFreeCommandBuffers(m_Device, m_CommandPool, 1, &cmd);
 
     Logger::Log(LogLevel::Info, "GPU Geometry generated successfully during bootstrap context phase.");
+
+    // --- DEBUG: read back a sample of generated vertices/indices to verify the compute
+    // shader actually wrote valid data across multiple icosahedron faces (not just face 0). ---
+    DebugReadbackGeometrySample(vertsPerFace, expectedIndexCount);
+}
+
+void VulkanContext::DebugReadbackGeometrySample(uint32_t vertsPerFace, uint32_t expectedIndexCount) {
+    // Sample window: covers the tail of face 0 and the head of face 1, so the log proves
+    // (or disproves) that the compute dispatch wrote data past the first face.
+    const uint32_t maxVertsInBuffer = (512u * 1024u) / sizeof(renderer::Vertex);
+    const uint32_t sampleVertexCount = std::min<uint32_t>(vertsPerFace + 8u, maxVertsInBuffer);
+    const uint32_t sampleIndexCount = std::min<uint32_t>(12u, expectedIndexCount);
+
+    const VkDeviceSize vertexSampleBytes = static_cast<VkDeviceSize>(sampleVertexCount) * sizeof(renderer::Vertex);
+    const VkDeviceSize indexSampleBytes = static_cast<VkDeviceSize>(sampleIndexCount) * sizeof(uint32_t);
+
+    VkBuffer stagingVertexBuffer = VK_NULL_HANDLE;
+    VmaAllocation stagingVertexAlloc = VK_NULL_HANDLE;
+    VkBufferCreateInfo stagingVertexInfo{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+    stagingVertexInfo.size = vertexSampleBytes;
+    stagingVertexInfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    VmaAllocationCreateInfo stagingAllocInfo{ .usage = VMA_MEMORY_USAGE_GPU_TO_CPU };
+    if (vmaCreateBuffer(m_Allocator, &stagingVertexInfo, &stagingAllocInfo, &stagingVertexBuffer, &stagingVertexAlloc, nullptr) != VK_SUCCESS) {
+        Logger::Log(LogLevel::Error, "[DebugReadback] Failed to allocate vertex staging buffer!");
+        return;
+    }
+
+    VkBuffer stagingIndexBuffer = VK_NULL_HANDLE;
+    VmaAllocation stagingIndexAlloc = VK_NULL_HANDLE;
+    VkBufferCreateInfo stagingIndexInfo{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+    stagingIndexInfo.size = indexSampleBytes;
+    stagingIndexInfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    if (vmaCreateBuffer(m_Allocator, &stagingIndexInfo, &stagingAllocInfo, &stagingIndexBuffer, &stagingIndexAlloc, nullptr) != VK_SUCCESS) {
+        Logger::Log(LogLevel::Error, "[DebugReadback] Failed to allocate index staging buffer!");
+        vmaDestroyBuffer(m_Allocator, stagingVertexBuffer, stagingVertexAlloc);
+        return;
+    }
+
+    VkCommandBufferAllocateInfo cmdAllocInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+    cmdAllocInfo.commandPool = m_CommandPool;
+    cmdAllocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cmdAllocInfo.commandBufferCount = 1;
+
+    VkCommandBuffer cmd;
+    if (vkAllocateCommandBuffers(m_Device, &cmdAllocInfo, &cmd) != VK_SUCCESS) {
+        Logger::Log(LogLevel::Error, "[DebugReadback] Failed allocating readback command buffer!");
+        vmaDestroyBuffer(m_Allocator, stagingVertexBuffer, stagingVertexAlloc);
+        vmaDestroyBuffer(m_Allocator, stagingIndexBuffer, stagingIndexAlloc);
+        return;
+    }
+
+    VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cmd, &beginInfo);
+
+    // GenerateGeometry() already vkQueueWaitIdle'd after the compute dispatch before calling
+    // this function, so the compute writes are complete and visible: a plain copy is safe here.
+    VkBufferCopy vertexCopyRegion{ 0, 0, vertexSampleBytes };
+    vkCmdCopyBuffer(cmd, m_VertexBuffer, stagingVertexBuffer, 1, &vertexCopyRegion);
+
+    VkBufferCopy indexCopyRegion{ 0, 0, indexSampleBytes };
+    vkCmdCopyBuffer(cmd, m_IndexBuffer, stagingIndexBuffer, 1, &indexCopyRegion);
+
+    vkEndCommandBuffer(cmd);
+
+    VkSubmitInfo submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &cmd;
+    vkQueueSubmit(m_GraphicsQueue, 1, &submitInfo, VK_NULL_HANDLE);
+    vkQueueWaitIdle(m_GraphicsQueue);
+    vkFreeCommandBuffers(m_Device, m_CommandPool, 1, &cmd);
+
+    // Log a handful of representative vertices: the first vertex of face 0, the last vertex
+    // of face 0, and the first vertex of face 1 (proves writes actually crossed a face boundary).
+    void* mappedVerts = nullptr;
+    if (vmaMapMemory(m_Allocator, stagingVertexAlloc, &mappedVerts) == VK_SUCCESS) {
+        const renderer::Vertex* verts = reinterpret_cast<const renderer::Vertex*>(mappedVerts);
+
+        auto logVertex = [](const char* label, const renderer::Vertex& v) {
+            float len = std::sqrt(v.position.x * v.position.x + v.position.y * v.position.y + v.position.z * v.position.z);
+            Logger::Log(LogLevel::Info, std::format(
+                "[DebugReadback] {} pos=({:.4f}, {:.4f}, {:.4f}) |pos|={:.4f} meshID={} materialID={}",
+                label, v.position.x, v.position.y, v.position.z, len, v.meshID, v.materialID));
+            };
+
+        logVertex("vertex[0] (face 0 head)", verts[0]);
+
+        uint32_t faceZeroLastIdx = vertsPerFace - 1u;
+        if (faceZeroLastIdx < sampleVertexCount) {
+            logVertex("vertex[faceZeroLast] (face 0 tail)", verts[faceZeroLastIdx]);
+        }
+
+        uint32_t faceOneFirstIdx = vertsPerFace;
+        if (faceOneFirstIdx < sampleVertexCount) {
+            logVertex("vertex[faceOneFirst] (face 1 head)", verts[faceOneFirstIdx]);
+        }
+
+        vmaUnmapMemory(m_Allocator, stagingVertexAlloc);
+    }
+    else {
+        Logger::Log(LogLevel::Error, "[DebugReadback] Failed to map vertex staging buffer for readback!");
+    }
+
+    void* mappedIndices = nullptr;
+    if (vmaMapMemory(m_Allocator, stagingIndexAlloc, &mappedIndices) == VK_SUCCESS) {
+        const uint32_t* idx = reinterpret_cast<const uint32_t*>(mappedIndices);
+        std::string idxDump;
+        for (uint32_t i = 0; i < sampleIndexCount; ++i) {
+            idxDump += std::format("{} ", idx[i]);
+        }
+        Logger::Log(LogLevel::Info, std::format("[DebugReadback] First {} indices: {}", sampleIndexCount, idxDump));
+        vmaUnmapMemory(m_Allocator, stagingIndexAlloc);
+    }
+    else {
+        Logger::Log(LogLevel::Error, "[DebugReadback] Failed to map index staging buffer for readback!");
+    }
+
+    vmaDestroyBuffer(m_Allocator, stagingVertexBuffer, stagingVertexAlloc);
+    vmaDestroyBuffer(m_Allocator, stagingIndexBuffer, stagingIndexAlloc);
 }
 
 std::vector<char> VulkanContext::ReadShaderFile(const std::string& filename) {

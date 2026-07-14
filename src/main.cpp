@@ -6,6 +6,7 @@
 #include "core/Camera.h"
 #include "core/EntityData.h"
 #include "core/EngineConfig.h"
+#include <format>
 
 int main() {
     Logger::Init("demo_log.txt");
@@ -52,6 +53,51 @@ int main() {
         float aspect = static_cast<float>(vkContext.GetSwapchainExtent().width) /
             static_cast<float>(vkContext.GetSwapchainExtent().height);
         camera.Update(aspect);
+
+        // --- DEBUG: dump the camera position and the resulting view/proj matrices on the
+        // very first frame only, to rule out a degenerate/NaN transform hiding the sphere. ---
+        static bool loggedFirstFrame = false;
+        if (!loggedFirstFrame) {
+            loggedFirstFrame = true;
+            maths::vec3 pos = camera.GetPosition();
+            const maths::mat4& view = camera.GetPushConstants().view;
+            const maths::mat4& proj = camera.GetPushConstants().proj;
+
+            Logger::Log(LogLevel::Info, std::format(
+                "[Frame0] aspect={:.4f} cameraPos=({:.3f}, {:.3f}, {:.3f}) pitch={:.2f} yaw={:.2f}",
+                aspect, pos.x, pos.y, pos.z, camera.GetPitch(), camera.GetYaw()));
+
+            Logger::Log(LogLevel::Info, std::format(
+                "[Frame0] view = [{:.3f} {:.3f} {:.3f} {:.3f}] [{:.3f} {:.3f} {:.3f} {:.3f}] [{:.3f} {:.3f} {:.3f} {:.3f}] [{:.3f} {:.3f} {:.3f} {:.3f}]",
+                view.m[0], view.m[4], view.m[8], view.m[12],
+                view.m[1], view.m[5], view.m[9], view.m[13],
+                view.m[2], view.m[6], view.m[10], view.m[14],
+                view.m[3], view.m[7], view.m[11], view.m[15]));
+
+            Logger::Log(LogLevel::Info, std::format(
+                "[Frame0] proj = [{:.3f} {:.3f} {:.3f} {:.3f}] [{:.3f} {:.3f} {:.3f} {:.3f}] [{:.3f} {:.3f} {:.3f} {:.3f}] [{:.3f} {:.3f} {:.3f} {:.3f}]",
+                proj.m[0], proj.m[4], proj.m[8], proj.m[12],
+                proj.m[1], proj.m[5], proj.m[9], proj.m[13],
+                proj.m[2], proj.m[6], proj.m[10], proj.m[14],
+                proj.m[3], proj.m[7], proj.m[11], proj.m[15]));
+
+            // Manually project the sphere's center (0,0,0) and a point on its surface (0,0,1)
+            // to sanity-check that clip.w ends up positive (required for the point to be visible).
+            auto projectPoint = [&](maths::vec3 worldPos) {
+                maths::mat4 vp = proj * view;
+                float x = vp.m[0] * worldPos.x + vp.m[4] * worldPos.y + vp.m[8] * worldPos.z + vp.m[12];
+                float y = vp.m[1] * worldPos.x + vp.m[5] * worldPos.y + vp.m[9] * worldPos.z + vp.m[13];
+                float z = vp.m[2] * worldPos.x + vp.m[6] * worldPos.y + vp.m[10] * worldPos.z + vp.m[14];
+                float w = vp.m[3] * worldPos.x + vp.m[7] * worldPos.y + vp.m[11] * worldPos.z + vp.m[15];
+                Logger::Log(LogLevel::Info, std::format(
+                    "[Frame0] project({:.2f},{:.2f},{:.2f}) -> clip=({:.3f}, {:.3f}, {:.3f}, {:.3f}) ndc=({:.3f}, {:.3f}, {:.3f}) {}",
+                    worldPos.x, worldPos.y, worldPos.z, x, y, z, w,
+                    (w != 0.0f) ? x / w : 0.0f, (w != 0.0f) ? y / w : 0.0f, (w != 0.0f) ? z / w : 0.0f,
+                    (w <= 0.0f) ? "<-- w<=0: CLIPPED, WILL NOT RENDER" : ""));
+                };
+            projectPoint({ 0.0f, 0.0f, 0.0f });
+            projectPoint({ 0.0f, 0.0f, 1.0f });
+        }
 
         // Retrieve synchronization semaphores
         VkSemaphore imgAvailable = vkContext.GetImageAvailableSemaphore();

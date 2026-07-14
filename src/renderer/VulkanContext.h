@@ -95,5 +95,9 @@ private:
     void CreatePipelinesAndDescriptors();
     void GenerateGeometry();
 
+    // DEBUG: copies back a small sample of the generated vertex/index SSBOs to host memory
+    // and logs it via Logger, to verify the compute dispatch actually produced valid geometry.
+    void DebugReadbackGeometrySample(uint32_t vertsPerFace, uint32_t expectedIndexCount);
+
     std::vector<char> ReadShaderFile(const std::string& filename);
 };

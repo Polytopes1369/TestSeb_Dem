@@ -116,8 +116,10 @@ namespace maths {
 
             result.m[0] = g / aspect;
             result.m[5] = -g;
-            result.m[10] = zFar / (zFar - zNear);
-            result.m[11] = 1.0f;
+            // View space looks down -Z (LookAt produces negative z_view in front of the camera),
+            // so w must equal -z_view (positive) for in-view points to survive clipping.
+            result.m[10] = zFar / (zNear - zFar);
+            result.m[11] = -1.0f;
             result.m[14] = -(zFar * zNear) / (zFar - zNear);
             return result;
         }
