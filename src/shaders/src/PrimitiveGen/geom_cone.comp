@@ -1,0 +1,131 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+
+// Inclure tes structures partagées
+#include "include/struct_custo.glsl"
+#include "include/math_utils.glsl"
+
+// Covers GeometryCone and GeometryCylinder (cylinder == this kernel with bottomRadius == topRadius,
+// matching GeometryCylinder's delegation to GeometryCone in the C# source).
+// nbHeightSeg is not implemented on the CPU side either ("not implemented yet"), so it's omitted here.
+// Uses a true center vertex per cap (fan), unlike the CPU version where vertices[0] is immediately
+// overwritten by the first rim sample — replicated here as a clean fan instead of that edge case.
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) writeonly buffer VertexBuffer { Vertex vertices[]; };
+layout(std430, binding = 1) writeonly buffer IndexBuffer  { uint indices[]; };
+
+layout(std140, binding = 2) uniform Params
+{
+    float height;
+    float bottomRadius;
+    float topRadius;
+    uint  nbSides;
+    uint  meshID;
+    float materialID;
+    uint  vertexOffset;
+    uint  indexOffset;
+};
+
+// Layout: [0] bottom center, [1..nbSides] bottom rim,
+// [nbSides+1] top center, [nbSides+2..2*nbSides+1] top rim,
+// [2*nbSides+2 .. 3*nbSides+2] side bottom row, [3*nbSides+3 .. 4*nbSides+3] side top row
+void main()
+{
+    uint id = gl_GlobalInvocationID.x;
+    uint capCount   = nbSides + 1u;
+    uint sideCount  = nbSides + 1u;
+    uint totalVerts = capCount * 2u + sideCount * 2u;
+    if (id >= totalVerts) return;
+
+    Vertex v;
+    v.meshID = meshID;
+    v.materialID = materialID;
+
+    if (id < capCount) // bottom cap
+    {
+        if (id == 0u)
+        {
+            v.position = vec3(0.0);
+            v.uv = vec2(0.5, 0.5);
+        }
+        else
+        {
+            float rad = float(id - 1u) / float(nbSides) * TAU;
+            v.position = vec3(cos(rad) * bottomRadius, 0.0, sin(rad) * bottomRadius);
+            v.uv = vec2(cos(rad) * 0.5 + 0.5, sin(rad) * 0.5 + 0.5);
+        }
+        v.normal = vec3(0.0, -1.0, 0.0);
+    }
+    else if (id < capCount * 2u) // top cap
+    {
+        uint local = id - capCount;
+        if (local == 0u)
+        {
+            v.position = vec3(0.0, height, 0.0);
+            v.uv = vec2(0.5, 0.5);
+        }
+        else
+        {
+            float rad = float(local - 1u) / float(nbSides) * TAU;
+            v.position = vec3(cos(rad) * topRadius, height, sin(rad) * topRadius);
+            v.uv = vec2(cos(rad) * 0.5 + 0.5, sin(rad) * 0.5 + 0.5);
+        }
+        v.normal = vec3(0.0, 1.0, 0.0);
+    }
+    else if (id < capCount * 2u + sideCount) // side, bottom row
+    {
+        uint local = id - capCount * 2u;
+        float rad = float(local) / float(nbSides) * TAU;
+        float slope = (bottomRadius - topRadius) / height;
+        v.position = vec3(cos(rad) * bottomRadius, 0.0, sin(rad) * bottomRadius);
+        v.normal   = normalize(vec3(cos(rad), slope, sin(rad)));
+        v.uv       = vec2(float(local) / float(nbSides), 0.0);
+    }
+    else // side, top row
+    {
+        uint local = id - capCount * 2u - sideCount;
+        float rad = float(local) / float(nbSides) * TAU;
+        float slope = (bottomRadius - topRadius) / height;
+        v.position = vec3(cos(rad) * topRadius, height, sin(rad) * topRadius);
+        v.normal   = normalize(vec3(cos(rad), slope, sin(rad)));
+        v.uv       = vec2(float(local) / float(nbSides), 1.0);
+    }
+
+    v.uv2 = v.uv;
+    vertices[vertexOffset + id] = v;
+
+    // --- Indices ---
+    if (id >= capCount * 2u && id < capCount * 2u + nbSides) // side quads
+    {
+        uint side  = id - capCount * 2u;
+        uint bBase = vertexOffset + capCount * 2u;
+        uint tBase = bBase + sideCount;
+
+        uint b0 = bBase + side, b1 = bBase + side + 1u;
+        uint t0 = tBase + side, t1 = tBase + side + 1u;
+
+        uint tIdx = indexOffset + side * 6u;
+        indices[tIdx + 0u] = b0; indices[tIdx + 1u] = t0; indices[tIdx + 2u] = t1;
+        indices[tIdx + 3u] = b0; indices[tIdx + 4u] = t1; indices[tIdx + 5u] = b1;
+    }
+    if (id >= 1u && id < capCount) // bottom cap fan
+    {
+        uint rim  = id - 1u;
+        uint next = (rim + 1u) % nbSides;
+        uint tIdx = indexOffset + nbSides * 6u + rim * 3u;
+        indices[tIdx + 0u] = vertexOffset;
+        indices[tIdx + 1u] = vertexOffset + 1u + next;
+        indices[tIdx + 2u] = vertexOffset + 1u + rim;
+    }
+    if (id >= capCount + 1u && id < capCount * 2u) // top cap fan
+    {
+        uint rim  = id - capCount - 1u;
+        uint next = (rim + 1u) % nbSides;
+        uint tIdx = indexOffset + nbSides * 9u + rim * 3u;
+        indices[tIdx + 0u] = vertexOffset + capCount;
+        indices[tIdx + 1u] = vertexOffset + capCount + 1u + rim;
+        indices[tIdx + 2u] = vertexOffset + capCount + 1u + next;
+    }
+}

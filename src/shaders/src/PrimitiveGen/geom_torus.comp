@@ -1,0 +1,70 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+
+// Inclure tes structures partagées
+#include "include/struct_custo.glsl"
+#include "include/math_utils.glsl"
+
+// The C# version rotates the tube cross-section with a quaternion around Y by -t1; since that
+// vector's z-component is always 0, the rotated result reduces to the closed-form below
+// (same output, no quaternion needed). Ring seam duplicated (nbRadSeg+1 rows) for clean UVs;
+// quads generated only for seg < nbRadSeg (no wraparound modulo needed).
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) writeonly buffer VertexBuffer { Vertex vertices[]; };
+layout(std430, binding = 1) writeonly buffer IndexBuffer  { uint indices[]; };
+
+layout(std140, binding = 2) uniform Params
+{
+    float radius1;
+    float radius2;
+    uint  nbRadSeg;
+    uint  nbSides;
+    uint  meshID;
+    float materialID;
+    uint  vertexOffset;
+    uint  indexOffset;
+};
+
+void main()
+{
+    uint id = gl_GlobalInvocationID.x;
+    uint stride    = nbSides + 1u;
+    uint vertCount = (nbRadSeg + 1u) * stride;
+    if (id >= vertCount) return;
+
+    uint seg   = id / stride;
+    uint sideI = id % stride;
+
+    float t1 = float(seg) / float(nbRadSeg) * TAU;
+    float t2 = float(sideI) / float(nbSides) * TAU;
+    float c1 = cos(t1), s1 = sin(t1);
+    float c2 = cos(t2), s2 = sin(t2);
+
+    vec3 ringCenter = vec3(c1 * radius1, 0.0, s1 * radius1);
+    vec3 pos = vec3(c1 * (radius1 + s2 * radius2), c2 * radius2, s1 * (radius1 + s2 * radius2));
+
+    Vertex v;
+    v.position   = pos;
+    v.normal     = normalize(pos - ringCenter);
+    v.uv         = vec2(float(seg) / float(nbRadSeg), float(sideI) / float(nbSides));
+    v.uv2        = v.uv;
+    v.meshID     = meshID;
+    v.materialID = materialID;
+    vertices[vertexOffset + id] = v;
+
+    if (seg < nbRadSeg && sideI < nbSides) // one thread per quad
+    {
+        uint current = id;
+        uint next    = current + stride;
+
+        uint tIdx = indexOffset + (seg * nbSides + sideI) * 6u;
+        indices[tIdx + 0u] = vertexOffset + current;
+        indices[tIdx + 1u] = vertexOffset + next;
+        indices[tIdx + 2u] = vertexOffset + next + 1u;
+        indices[tIdx + 3u] = vertexOffset + current;
+        indices[tIdx + 4u] = vertexOffset + next + 1u;
+        indices[tIdx + 5u] = vertexOffset + current + 1u;
+    }
+}

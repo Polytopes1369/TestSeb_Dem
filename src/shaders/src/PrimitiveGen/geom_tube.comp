@@ -1,0 +1,122 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+
+// Inclure tes structures partagées
+#include "include/struct_custo.glsl"
+#include "include/math_utils.glsl"
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) writeonly buffer VertexBuffer { Vertex vertices[]; };
+layout(std430, binding = 1) writeonly buffer IndexBuffer  { uint indices[]; };
+
+layout(std140, binding = 2) uniform Params
+{
+    float height;
+    uint  nbSides;
+    float bottomRadius1;
+    float bottomRadius2;
+    float topRadius1;
+    float topRadius2;
+    uint  meshID;
+    float materialID;
+    uint  vertexOffset;
+    uint  indexOffset;
+};
+
+void main()
+{
+    uint id = gl_GlobalInvocationID.x;
+    uint capCount   = nbSides * 2u + 2u;
+    uint sideCount  = nbSides * 2u + 2u;
+    uint totalVerts = capCount * 2u + sideCount * 2u;
+    if (id >= totalVerts) return;
+
+    uint side  = (id % capCount) / 2u;
+    float t    = float(side) / float(nbSides);
+    float rad  = t * TAU;
+    float c = cos(rad), s = sin(rad);
+    bool outer = (id % 2u) == 1u;
+
+    Vertex v;
+    v.meshID = meshID;
+    v.materialID = materialID;
+
+    if (id < capCount) // bottom cap
+    {
+        float r = bottomRadius1 + (outer ? 1.0 : -1.0) * bottomRadius2 * 0.5;
+        v.position = vec3(c * r, 0.0, s * r);
+        v.normal   = vec3(0.0, -1.0, 0.0);
+        v.uv       = vec2(outer ? 1.0 : 0.0, t);
+    }
+    else if (id < capCount * 2u) // top cap
+    {
+        float r = topRadius1 + (outer ? 1.0 : -1.0) * topRadius2 * 0.5;
+        v.position = vec3(c * r, height, s * r);
+        v.normal   = vec3(0.0, 1.0, 0.0);
+        v.uv       = vec2(outer ? 1.0 : 0.0, t);
+    }
+    else if (id < capCount * 2u + sideCount) // side (out)
+    {
+        float rTop = topRadius1 + topRadius2 * 0.5;
+        float rBot = bottomRadius1 + bottomRadius2 * 0.5;
+        bool isTop = ((id - capCount * 2u) % 2u) == 0u;
+        v.position = isTop ? vec3(c * rTop, height, s * rTop) : vec3(c * rBot, 0.0, s * rBot);
+        v.normal   = vec3(c, 0.0, s);
+        v.uv       = vec2(t, isTop ? 1.0 : 0.0);
+    }
+    else // side (in)
+    {
+        float rTop = topRadius1 - topRadius2 * 0.5;
+        float rBot = bottomRadius1 - bottomRadius2 * 0.5;
+        bool isTop = ((id - capCount * 2u - sideCount) % 2u) == 0u;
+        v.position = isTop ? vec3(c * rTop, height, s * rTop) : vec3(c * rBot, 0.0, s * rBot);
+        v.normal   = -vec3(c, 0.0, s);
+        v.uv       = vec2(t, isTop ? 1.0 : 0.0);
+    }
+
+    v.uv2 = v.uv;
+    vertices[vertexOffset + id] = v;
+
+    // --- Indices : one thread per side-quad (id < nbSides), covers all 4 sections ---
+    if (id < nbSides)
+    {
+        uint cur  = id * 2u;
+        uint next = id * 2u + 2u;
+
+        uint b0 = indexOffset + id * 6u;
+        indices[b0 + 0u] = vertexOffset + next + 1u;
+        indices[b0 + 1u] = vertexOffset + next;
+        indices[b0 + 2u] = vertexOffset + cur;
+        indices[b0 + 3u] = vertexOffset + cur + 1u;
+        indices[b0 + 4u] = vertexOffset + next + 1u;
+        indices[b0 + 5u] = vertexOffset + cur;
+
+        uint tOff = capCount;
+        uint t0 = indexOffset + nbSides * 6u + id * 6u;
+        indices[t0 + 0u] = vertexOffset + tOff + cur;
+        indices[t0 + 1u] = vertexOffset + tOff + next;
+        indices[t0 + 2u] = vertexOffset + tOff + next + 1u;
+        indices[t0 + 3u] = vertexOffset + tOff + cur;
+        indices[t0 + 4u] = vertexOffset + tOff + next + 1u;
+        indices[t0 + 5u] = vertexOffset + tOff + cur + 1u;
+
+        uint oOff = capCount * 2u;
+        uint o0 = indexOffset + nbSides * 12u + id * 6u;
+        indices[o0 + 0u] = vertexOffset + oOff + cur;
+        indices[o0 + 1u] = vertexOffset + oOff + next;
+        indices[o0 + 2u] = vertexOffset + oOff + next + 1u;
+        indices[o0 + 3u] = vertexOffset + oOff + cur;
+        indices[o0 + 4u] = vertexOffset + oOff + next + 1u;
+        indices[o0 + 5u] = vertexOffset + oOff + cur + 1u;
+
+        uint iOff = capCount * 2u + sideCount;
+        uint i0 = indexOffset + nbSides * 18u + id * 6u;
+        indices[i0 + 0u] = vertexOffset + iOff + next + 1u;
+        indices[i0 + 1u] = vertexOffset + iOff + next;
+        indices[i0 + 2u] = vertexOffset + iOff + cur;
+        indices[i0 + 3u] = vertexOffset + iOff + cur + 1u;
+        indices[i0 + 4u] = vertexOffset + iOff + next + 1u;
+        indices[i0 + 5u] = vertexOffset + iOff + cur;
+    }
+}

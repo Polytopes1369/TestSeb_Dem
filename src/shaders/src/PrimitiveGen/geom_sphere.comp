@@ -1,0 +1,100 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+
+// Inclure tes structures partagées
+#include "include/struct_custo.glsl"
+#include "include/math_utils.glsl"
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) writeonly buffer VertexBuffer { Vertex vertices[]; };
+layout(std430, binding = 1) writeonly buffer IndexBuffer  { uint indices[]; };
+
+layout(std140, binding = 2) uniform Params
+{
+    float radius;
+    uint  sideSegs;
+    uint  heightSegs;
+    uint  meshID;
+    float materialID;
+    uint  vertexOffset;
+    uint  indexOffset;
+};
+
+void main()
+{
+    uint id = gl_GlobalInvocationID.x;
+    uint ringCount  = heightSegs - 2u;   // interior latitude rings
+    uint ringStride = sideSegs + 1u;
+    uint vertCount  = ringCount * ringStride + 2u;
+    if (id >= vertCount) return;
+
+    Vertex v;
+    v.meshID = meshID;
+    v.materialID = materialID;
+
+    if (id == 0u) // top pole
+    {
+        v.position = vec3(0.0, radius, 0.0);
+        v.uv = vec2(0.0, 1.0);
+    }
+    else if (id == vertCount - 1u) // bottom pole
+    {
+        v.position = vec3(0.0, -radius, 0.0);
+        v.uv = vec2(0.0, 0.0);
+    }
+    else
+    {
+        uint local = id - 1u;
+        uint lat = local / ringStride;
+        uint lon = local % ringStride;
+
+        float a1 = PI * float(lat + 1u) / float(heightSegs - 1u);
+        float sin1 = sin(a1), cos1 = cos(a1);
+        float a2 = TAU * float(lon == sideSegs ? 0u : lon) / float(sideSegs);
+
+        v.position = vec3(sin1 * cos(a2), cos1, sin1 * sin(a2)) * radius;
+        v.uv = vec2(float(lon) / float(sideSegs), 1.0 - float(lat + 1u) / float(heightSegs - 1u));
+    }
+
+    v.normal = normalize(v.position);
+    v.uv2 = v.uv;
+    vertices[vertexOffset + id] = v;
+
+    // --- Indices ---
+    uint nbTriangles = ((ringCount * sideSegs) + sideSegs) * 2u;
+
+    if (id < sideSegs) // top cap fan
+    {
+        uint lon = id;
+        uint tIdx = indexOffset + lon * 3u;
+        indices[tIdx + 0u] = vertexOffset + lon + 2u;
+        indices[tIdx + 1u] = vertexOffset + lon + 1u;
+        indices[tIdx + 2u] = vertexOffset;
+    }
+
+    if (ringCount > 1u && id < (ringCount - 1u) * sideSegs) // middle quads
+    {
+        uint lat = id / sideSegs;
+        uint lon = id % sideSegs;
+        uint current = lon + lat * ringStride + 1u;
+        uint next    = current + ringStride;
+
+        uint tIdx = indexOffset + sideSegs * 3u + (lat * sideSegs + lon) * 6u;
+        indices[tIdx + 0u] = vertexOffset + current;
+        indices[tIdx + 1u] = vertexOffset + current + 1u;
+        indices[tIdx + 2u] = vertexOffset + next + 1u;
+        indices[tIdx + 3u] = vertexOffset + current;
+        indices[tIdx + 4u] = vertexOffset + next + 1u;
+        indices[tIdx + 5u] = vertexOffset + next;
+    }
+
+    if (id < sideSegs) // bottom cap fan
+    {
+        uint lon = id;
+        uint tIdx = indexOffset + nbTriangles * 3u - (sideSegs - lon) * 3u;
+        indices[tIdx + 0u] = vertexOffset + vertCount - 1u;
+        indices[tIdx + 1u] = vertexOffset + vertCount - (lon + 2u) - 1u;
+        indices[tIdx + 2u] = vertexOffset + vertCount - (lon + 1u) - 1u;
+    }
+}

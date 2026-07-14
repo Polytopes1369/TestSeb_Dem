@@ -1,0 +1,61 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+
+// Inclure tes structures partagées
+#include "include/struct_custo.glsl"
+
+// Binding convention shared by all geom_*.comp.glsl files:
+// binding 0 = output vertex buffer, binding 1 = output index buffer (uint32, was ushort on CPU side),
+// binding 2 = per-dispatch Params UBO. vertexOffset/indexOffset let multiple primitives share one buffer.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(std430, binding = 0) writeonly buffer VertexBuffer { Vertex vertices[]; };
+layout(std430, binding = 1) writeonly buffer IndexBuffer  { uint indices[]; };
+
+layout(std140, binding = 2) uniform Params
+{
+    float width;
+    float length_;
+    uint  widthSegs;   // clamp(widthSegs, 2, 512) on CPU before dispatch
+    uint  lengthSegs;
+    uint  meshID;
+    float materialID;
+    uint  vertexOffset;
+    uint  indexOffset;
+};
+
+void main()
+{
+    uint x = gl_GlobalInvocationID.x;
+    uint z = gl_GlobalInvocationID.y;
+    if (x >= widthSegs || z >= lengthSegs) return;
+
+    float xPos = (float(x) / float(widthSegs - 1u) - 0.5) * width;
+    float zPos = (float(z) / float(lengthSegs - 1u) - 0.5) * length_;
+
+    uint vIdx = x + z * widthSegs;
+
+    Vertex v;
+    v.position   = vec3(xPos, 0.0, zPos);
+    v.normal     = vec3(0.0, 1.0, 0.0);
+    v.uv         = vec2(float(x) / float(widthSegs - 1u), float(z) / float(lengthSegs - 1u));
+    v.uv2        = v.uv;
+    v.meshID     = meshID;
+    v.materialID = materialID;
+    vertices[vertexOffset + vIdx] = v;
+
+    if (x < widthSegs - 1u && z < lengthSegs - 1u)
+    {
+        uint i = vIdx; // lower-left corner of the quad
+        uint t = indexOffset + (z * (widthSegs - 1u) + x) * 6u;
+
+        indices[t + 0u] = i + widthSegs;
+        indices[t + 1u] = i + 1u;
+        indices[t + 2u] = i;
+
+        indices[t + 3u] = i + widthSegs;
+        indices[t + 4u] = i + widthSegs + 1u;
+        indices[t + 5u] = i + 1u;
+    }
+}

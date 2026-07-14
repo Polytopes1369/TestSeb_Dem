@@ -1,0 +1,111 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+
+// Inclure tes structures partagées
+#include "include/struct_custo.glsl"
+
+// Generic BuildPlane equivalent, specialized per box face via SPIR-V spec constants.
+// CPU builds 6 pipelines from this single module (px, nx, py, ny, pz, nz), each with its
+// own VkSpecializationInfo for constant_id 0..5 — matching the 6 BuildPlane() call-sites
+// in GeometryBox(). uAxis/vAxis/wAxis: 0=x, 1=y, 2=z. faceMode selects which of the 3
+// original branches (w==z / w==y / w==x) governs the UV formula, since the C# code swaps
+// ix/iy roles specifically for the w=='x' case.
+// All spec-constant branches below are resolved at pipeline creation, not at draw time.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(std430, binding = 0) writeonly buffer VertexBuffer { Vertex vertices[]; };
+layout(std430, binding = 1) writeonly buffer IndexBuffer  { uint indices[]; };
+
+layout(constant_id = 0) const int   uAxis    = 0;
+layout(constant_id = 1) const int   vAxis    = 1;
+layout(constant_id = 2) const int   wAxis    = 2;
+layout(constant_id = 3) const int   faceMode = 0;  // 0: w==z, 1: w==y, 2: w==x
+layout(constant_id = 4) const float udir     = 1.0;
+layout(constant_id = 5) const float vdir     = 1.0;
+
+layout(push_constant) uniform Params
+{
+    float faceWidth;
+    float faceHeight;
+    float lengthOffset; // constant coordinate along wAxis (the BuildPlane "length" param)
+    uint  uSegsCount;    // gridX1
+    uint  vSegsCount;    // gridY1
+    uint  meshID;
+    float materialID;
+    uint  vertexOffset;  // running vertex count from previously-dispatched faces
+    uint  indexOffset;
+};
+
+void setComp(inout vec3 v, int axis, float val)
+{
+    if (axis == 0)      v.x = val;
+    else if (axis == 1) v.y = val;
+    else                v.z = val;
+}
+
+void main()
+{
+    uint ix = gl_GlobalInvocationID.x;
+    uint iy = gl_GlobalInvocationID.y;
+    if (ix >= uSegsCount || iy >= vSegsCount) return;
+
+    uint gridX = uSegsCount - 1u;
+    uint gridY = vSegsCount - 1u;
+    float widthHalf  = faceWidth  * 0.5;
+    float heightHalf = faceHeight * 0.5;
+    float segW = faceWidth  / float(gridX);
+    float segH = faceHeight / float(gridY);
+
+    float uCoord = (float(ix) * segW - widthHalf)  * udir;
+    float vCoord = (float(iy) * segH - heightHalf) * vdir;
+
+    vec3 pos = vec3(0.0);
+    setComp(pos, uAxis, uCoord);
+    setComp(pos, vAxis, vCoord);
+    setComp(pos, wAxis, lengthOffset);
+
+    vec3 nrm = vec3(0.0);
+    setComp(nrm, wAxis, lengthOffset > 0.0 ? 1.0 : -1.0);
+
+    vec2 uv;
+    if (faceMode == 2) // w == x : U/V roles swapped vs the other two branches
+    {
+        uv = (lengthOffset > 0.0)
+            ? vec2(float(iy) / float(gridY) * -udir, float(ix) / float(gridX) *  vdir)
+            : vec2(float(iy) / float(gridY) * -udir, float(ix) / float(gridX) * -vdir);
+    }
+    else
+    {
+        uv = (lengthOffset > 0.0)
+            ? vec2(float(ix) / float(gridX) * udir, float(iy) / float(gridY) * -vdir)
+            : vec2(float(ix) / float(gridX) * udir, float(iy) / float(gridY) *  vdir);
+    }
+
+    Vertex v;
+    v.position   = pos;
+    v.normal     = nrm;
+    v.uv         = uv;
+    v.uv2        = uv;
+    v.meshID     = meshID;
+    v.materialID = materialID;
+
+    uint vIdx = vertexOffset + ix + iy * uSegsCount;
+    vertices[vIdx] = v;
+
+    if (ix < gridX && iy < gridY)
+    {
+        uint a = ix + uSegsCount * iy;
+        uint b = ix + uSegsCount * (iy + 1u);
+        uint c = (ix + 1u) + uSegsCount * (iy + 1u);
+        uint d = (ix + 1u) + uSegsCount * iy;
+
+        uint t = indexOffset + (iy * gridX + ix) * 6u;
+        indices[t + 0u] = vertexOffset + a;
+        indices[t + 1u] = vertexOffset + b;
+        indices[t + 2u] = vertexOffset + d;
+        indices[t + 3u] = vertexOffset + b;
+        indices[t + 4u] = vertexOffset + c;
+        indices[t + 5u] = vertexOffset + d;
+    }
+}

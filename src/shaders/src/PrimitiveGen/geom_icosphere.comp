@@ -1,0 +1,110 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+
+// Inclure tes structures partagées
+#include "include/struct_custo.glsl"
+#include "include/math_utils.glsl"
+
+// GPU strategy replacing the CPU recursive-subdivision + midpoint dedup cache:
+// each of the 20 base icosahedron faces is subdivided independently into a barycentric
+// triangular grid of edge resolution N = 2^recursionLevel, computed fully in parallel
+// (dispatch dimensions: x,y = grid coords i,j in [0,N], z = face index in [0,20)).
+// Trade-off: no vertex welding across face edges (a few extra seam vertices vs the CPU
+// version), in exchange for zero sequential/CPU-side dependency.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(std430, binding = 0) writeonly buffer VertexBuffer { Vertex vertices[]; };
+layout(std430, binding = 1) writeonly buffer IndexBuffer  { uint indices[]; };
+
+layout(std140, binding = 2) uniform Params
+{
+    float radius;
+    uint  subdiv;   // N = 2^recursionLevel, edge resolution per face
+    uint  meshID;
+    float materialID;
+    uint  vertexOffset;
+    uint  indexOffset;
+};
+
+const vec3 ICO_VERTS[12] = vec3[12](
+    normalize(vec3(-1.0,  INVERSE_GOLDEN_RATIO, 0.0)), normalize(vec3( 1.0,  INVERSE_GOLDEN_RATIO, 0.0)),
+    normalize(vec3(-1.0, -INVERSE_GOLDEN_RATIO, 0.0)), normalize(vec3( 1.0, -INVERSE_GOLDEN_RATIO, 0.0)),
+    normalize(vec3(0.0, -1.0,  INVERSE_GOLDEN_RATIO)), normalize(vec3(0.0,  1.0,  INVERSE_GOLDEN_RATIO)),
+    normalize(vec3(0.0, -1.0, -INVERSE_GOLDEN_RATIO)), normalize(vec3(0.0,  1.0, -INVERSE_GOLDEN_RATIO)),
+    normalize(vec3( INVERSE_GOLDEN_RATIO, 0.0, -1.0)), normalize(vec3( INVERSE_GOLDEN_RATIO, 0.0,  1.0)),
+    normalize(vec3(-INVERSE_GOLDEN_RATIO, 0.0, -1.0)), normalize(vec3(-INVERSE_GOLDEN_RATIO, 0.0,  1.0))
+);
+
+const ivec3 ICO_FACES[20] = ivec3[20](
+    ivec3(0,11,5),  ivec3(0,5,1),   ivec3(0,1,7),   ivec3(0,7,10),  ivec3(0,10,11),
+    ivec3(1,5,9),   ivec3(5,11,4),  ivec3(11,10,2), ivec3(10,7,6),  ivec3(7,1,8),
+    ivec3(3,9,4),   ivec3(3,4,2),   ivec3(3,2,6),   ivec3(3,6,8),   ivec3(3,8,9),
+    ivec3(4,9,5),   ivec3(2,4,11),  ivec3(6,2,10),  ivec3(8,6,7),   ivec3(9,8,1)
+);
+
+// Row-major index of grid point (i,j) within a triangular face grid of edge resolution N
+uint gridIndex(uint i, uint j, uint N)
+{
+    uint rowStart = i * (N + 2u) - (i * (i - 1u)) / 2u;
+    return rowStart + j;
+}
+
+uint triBeforeRow(uint i, uint N) { return i * (2u * N - i); }
+
+void main()
+{
+    uint i    = gl_GlobalInvocationID.x;
+    uint j    = gl_GlobalInvocationID.y;
+    uint face = gl_GlobalInvocationID.z;
+    if (face >= 20u || i > subdiv || j > subdiv - i) return;
+
+    ivec3 f = ICO_FACES[face];
+    vec3 v1 = ICO_VERTS[f.x];
+    vec3 v2 = ICO_VERTS[f.y];
+    vec3 v3 = ICO_VERTS[f.z];
+
+    float N = float(subdiv);
+    float a = (N - float(i) - float(j)) / N;
+    float b = float(i) / N;
+    float c = float(j) / N;
+
+    vec3 pos = normalize(a * v1 + b * v2 + c * v3);
+
+    uint vertsPerFace = (subdiv + 1u) * (subdiv + 2u) / 2u;
+    uint faceVertBase = vertexOffset + face * vertsPerFace;
+    uint globalIdx     = faceVertBase + gridIndex(i, j, subdiv);
+
+    Vertex vtx;
+    vtx.position   = pos * radius;
+    vtx.normal     = pos;
+    vtx.uv         = vec2(b, c);
+    vtx.uv2        = vtx.uv;
+    vtx.meshID     = meshID;
+    vtx.materialID = materialID;
+    vertices[globalIdx] = vtx;
+
+    // --- Indices : 2 triangles per (i,j) cell ---
+    if (i < subdiv && j < subdiv - i)
+    {
+        uint a0 = gridIndex(i, j, subdiv);
+        uint a1 = gridIndex(i + 1u, j, subdiv);
+        uint a2 = gridIndex(i, j + 1u, subdiv);
+
+        uint faceTriBase = indexOffset + face * subdiv * subdiv * 3u;
+        uint upIdx = faceTriBase + (triBeforeRow(i, subdiv) + 2u * j) * 3u;
+
+        indices[upIdx + 0u] = faceVertBase + a0;
+        indices[upIdx + 1u] = faceVertBase + a1;
+        indices[upIdx + 2u] = faceVertBase + a2;
+
+        if (j < subdiv - i - 1u)
+        {
+            uint a3 = gridIndex(i + 1u, j + 1u, subdiv);
+            uint downIdx = faceTriBase + (triBeforeRow(i, subdiv) + 2u * j + 1u) * 3u;
+            indices[downIdx + 0u] = faceVertBase + a1;
+            indices[downIdx + 1u] = faceVertBase + a3;
+            indices[downIdx + 2u] = faceVertBase + a2;
+        }
+    }
+}
