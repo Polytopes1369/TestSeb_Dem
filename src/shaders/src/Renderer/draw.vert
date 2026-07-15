@@ -22,6 +22,10 @@ layout(push_constant) uniform CameraPushConstants {
 // Output to Fragment Shader
 layout(location = 0) out vec3 outNormal;
 layout(location = 1) out vec3 outWorldPos;
+// meshID must be "flat" (no interpolation) since it is an integer identifier,
+// not an interpolable quantity. It lets the fragment shader derive a
+// per-primitive procedural color without needing an extra CPU-uploaded buffer.
+layout(location = 2) flat out uint outMeshID;
 
 void main() {
     // 1. Fetch the index from the Index Buffer
@@ -45,6 +49,7 @@ void main() {
     // 4. Pass data to Fragment Shader
     outWorldPos = worldPos;
     outNormal = worldNormal;
+    outMeshID = v.meshID;
 
     // 5. Transform position
     gl_Position = camera.proj * camera.view * vec4(worldPos, 1.0);
