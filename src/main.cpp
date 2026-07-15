@@ -47,6 +47,11 @@ int main() {
         // Orbit azimuth evolution
         static float azimuth = 0.0f;
         azimuth += 0.05f;
+
+        // Scene time evolution: drives each entity's self-rotation (see UpdateEntityRotations).
+        static float sceneTime = 0.0f;
+        sceneTime += 0.016f;
+        vkContext.UpdateEntityRotations(sceneTime);
         // Orbit around 0,0,0 at a distance sized to keep the whole 7-primitive grid
         // (roughly a 6m x 6m footprint centered on the origin) in view: bounding radius from
         // the farthest grid corner (~4.3m) plus primitive half-extent (~0.8m) is ~5.1m, so a

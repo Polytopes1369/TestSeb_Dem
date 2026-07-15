@@ -31,9 +31,14 @@ public:
     VkPipelineLayout GetGraphicsPipelineLayout() const { return m_GraphicsPipelineLayout; }
     VkDescriptorSet GetGeometryDescriptorSet() const { return m_GeometryDescriptorSet; }
 
-    // Total number of indices written across all 7 procedurally-generated primitives; the
+    // Total number of indices written across all 9 procedurally-generated primitives; the
     // single scene draw call in main.cpp draws exactly this many indices in one vkCmdDraw.
     uint32_t GetTotalIndexCount() const { return m_TotalIndexCount; }
+
+    // Recomputes every entity's self-rotation (tumbling on all 3 axes) from elapsed scene
+    // time and re-uploads the whole EntityTransform array to the GPU. Must be called once per
+    // frame, before recording the draw, so the vertex shader picks up this frame's rotation.
+    void UpdateEntityRotations(float timeSeconds);
 
 private:
     VkInstance m_Instance = VK_NULL_HANDLE;
@@ -73,6 +78,11 @@ private:
     VkBuffer m_ParamsBuffer = VK_NULL_HANDLE;
     VmaAllocation m_ParamsAllocation = VK_NULL_HANDLE;
 
+    // Per-entity self-rotation array (one EntityTransform per meshID, see struct_custo.glsl),
+    // host-visible so UpdateEntityRotations() can re-upload it every frame with a plain memcpy.
+    VkBuffer m_EntityTransformBuffer = VK_NULL_HANDLE;
+    VmaAllocation m_EntityTransformAllocation = VK_NULL_HANDLE;
+
     VkImage m_DepthImage = VK_NULL_HANDLE;
     VmaAllocation m_DepthAllocation = VK_NULL_HANDLE;
     VkImageView m_DepthImageView = VK_NULL_HANDLE;
@@ -86,6 +96,8 @@ private:
     VkPipeline m_SpherePipeline = VK_NULL_HANDLE;
     VkPipeline m_TorusPipeline = VK_NULL_HANDLE;
     VkPipeline m_TubePipeline = VK_NULL_HANDLE;
+    VkPipeline m_CapsulePipeline = VK_NULL_HANDLE;
+    VkPipeline m_CylinderPipeline = VK_NULL_HANDLE;
 
     // The box is generated via 6 dispatches (one per cube face) of the same geom_box.comp
     // module, each specialized with a different VkSpecializationInfo (axis mapping / winding)
@@ -102,8 +114,11 @@ private:
     VkPipelineLayout m_ComputePipelineLayout = VK_NULL_HANDLE;
     VkPipelineLayout m_GraphicsPipelineLayout = VK_NULL_HANDLE;
 
-    // Running total of indices written by GenerateGeometry() across all 7 primitives.
+    // Running total of indices written by GenerateGeometry() across all 9 primitives.
     uint32_t m_TotalIndexCount = 0;
+
+    // One EntityTransform slot per primitive meshID (box=0 .. cylinder=8); see struct_custo.glsl.
+    static constexpr uint32_t kEntityCount = 9;
 
     const bool m_EnableValidationLayers = true;
 
@@ -123,6 +138,11 @@ private:
 
     void CreatePipelinesAndDescriptors();
     void GenerateGeometry();
+
+    // Single source of truth for the 3x3 world-space grid layout (also used by
+    // UpdateEntityRotations() to recover each entity's rotation pivot): column-major slot
+    // index in [0, 8], returns the (X, Z) world position of that slot's center (Y = 0).
+    maths::vec2 GridSlot(int slotIndex) const;
 
     // Records, submits, and blocks on a single one-shot compute dispatch that generates one
     // primitive (or one box face) into the shared Vertex/Index SSBOs. Exactly one of

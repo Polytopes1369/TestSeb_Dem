@@ -95,6 +95,36 @@ namespace maths {
             return result;
         }
 
+        // Pure rotation matrices around the principal axes (column-major, angle in radians).
+        // Used to build per-entity "tumble" transforms (RotateY * RotateX * RotateZ) so a
+        // procedural primitive can be seen from every angle without touching its baked geometry.
+        static inline mat4 RotateX(float angleRadians) {
+            mat4 result;
+            float c = std::cos(angleRadians);
+            float s = std::sin(angleRadians);
+            result.m[5] = c;  result.m[6] = s;
+            result.m[9] = -s; result.m[10] = c;
+            return result;
+        }
+
+        static inline mat4 RotateY(float angleRadians) {
+            mat4 result;
+            float c = std::cos(angleRadians);
+            float s = std::sin(angleRadians);
+            result.m[0] = c;  result.m[2] = -s;
+            result.m[8] = s;  result.m[10] = c;
+            return result;
+        }
+
+        static inline mat4 RotateZ(float angleRadians) {
+            mat4 result;
+            float c = std::cos(angleRadians);
+            float s = std::sin(angleRadians);
+            result.m[0] = c; result.m[1] = s;
+            result.m[4] = -s; result.m[5] = c;
+            return result;
+        }
+
         static inline mat4 LookAt(const vec3& eye, const vec3& center, const vec3& up) {
             vec3 f = (center - eye).Normalize();
             vec3 s = f.Cross(up).Normalize();

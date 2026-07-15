@@ -1,0 +1,228 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+
+#include "include/struct_custo.glsl"
+#include "include/math_utils.glsl"
+
+// Capsule = cylindrical body + two hemispheres (bottom and top).
+//
+// Parameters:
+//   radius       : radius of both hemispheres and the cylinder
+//   height       : total height (distance between hemisphere centers, i.e. cylinder body length)
+//   nbSides      : number of longitudinal slices (≥ 3)
+//   nbHeightSegs : number of quad rings along the cylindrical body (≥ 1)
+//   nbCapSegs    : number of latitude rings per hemisphere (≥ 1)
+//
+// Vertex layout (total is 1D, one thread per vertex):
+//   [0 .. bottomHemiVerts-1]   : bottom hemisphere
+//   [bottomHemiVerts .. +bodyVerts-1] : cylinder body
+//   [bodyVertBase+bodyVerts .. ] : top hemisphere
+//
+// Hemisphere layout per cap:
+//   rows: nbCapSegs+1 latitude rows (from pole at row 0 to equator at row nbCapSegs)
+//   cols: nbSides+1  (seam duplicate)
+//
+// Body: nbHeightSegs+1 rows x nbSides+1 cols
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) writeonly buffer VertexBuffer { Vertex vertices[]; };
+layout(std430, binding = 1) writeonly buffer IndexBuffer  { uint indices[]; };
+
+layout(std140, binding = 2) uniform Params
+{
+    float radius;
+    float height;       // cylindrical body length (= total height - 2*radius)
+    uint  nbSides;      // longitudinal slices (≥ 3)
+    uint  nbHeightSegs; // body quad rows (≥ 1)
+    uint  nbCapSegs;    // hemisphere latitude rings per cap (≥ 1)
+    uint  meshID;
+    float materialID;
+    uint  vertexOffset;
+    uint  indexOffset;
+    float worldOffsetX;
+    float worldOffsetY;
+    float worldOffsetZ;
+};
+
+void main()
+{
+    uint id = gl_GlobalInvocationID.x;
+
+    uint sideColumns = nbSides + 1u;
+
+    // Hemisphere: (nbCapSegs+1) rows x sideColumns cols
+    uint hemiVerts = (nbCapSegs + 1u) * sideColumns;
+
+    // Body: (nbHeightSegs+1) rows x sideColumns cols
+    uint bodyVerts = (nbHeightSegs + 1u) * sideColumns;
+
+    uint totalVerts = hemiVerts * 2u + bodyVerts;
+    if (id >= totalVerts) return;
+
+    Vertex v;
+    v.meshID     = meshID;
+    v.materialID = materialID;
+
+    // Bottom hemisphere center at y = 0; top hemisphere center at y = height.
+    // The full capsule spans y in [−radius, height + radius]; worldOffsetY recenters it.
+
+    uint bodyBase    = hemiVerts;
+    uint topHemiBase = hemiVerts + bodyVerts;
+
+    // =========================================================================
+    // BOTTOM HEMISPHERE  [0 .. hemiVerts-1]
+    //   Row 0 = south pole (bottom), Row nbCapSegs = equator
+    //   Theta goes from PI (south) to PI/2 (equator)
+    // =========================================================================
+    if (id < hemiVerts)
+    {
+        uint row = id / sideColumns;
+        uint col = id % sideColumns;
+
+        float phi = PI * (1.0 - 0.5 * float(row) / float(nbCapSegs)); // PI→PI/2
+        float sinPhi = sin(phi), cosPhi = cos(phi);
+
+        float t   = float(col == nbSides ? 0u : col) / float(nbSides);
+        float ang = t * TAU;
+
+        v.position = vec3(sinPhi * cos(ang), cosPhi, sinPhi * sin(ang)) * radius;
+        // Translate: bottom hemisphere center at world y = 0
+        // (cosPhi is negative for phi>PI/2, ranging from -1 at pole to 0 at equator)
+        // We want the pole at y = -radius and the equator at y = 0.
+        // vec3(...) already gives us that (pos.y = cosPhi*radius).
+        v.normal   = normalize(v.position);
+        v.uv       = vec2(float(col) / float(nbSides),
+                          1.0 - (phi - PI * 0.5) / (PI * 0.5)); // 0 at equator, 1 at pole
+    }
+    // =========================================================================
+    // BODY  [bodyBase .. bodyBase + bodyVerts - 1]
+    //   Row 0 = bottom equator (y=0), Row nbHeightSegs = top equator (y=height)
+    // =========================================================================
+    else if (id < bodyBase + bodyVerts)
+    {
+        uint local = id - bodyBase;
+        uint row   = local / sideColumns;
+        uint col   = local % sideColumns;
+
+        float t   = float(col == nbSides ? 0u : col) / float(nbSides);
+        float ang = t * TAU;
+        float y   = float(row) / float(nbHeightSegs) * height;
+
+        v.position = vec3(cos(ang) * radius, y, sin(ang) * radius);
+        v.normal   = vec3(cos(ang), 0.0, sin(ang));
+        v.uv       = vec2(float(col) / float(nbSides),
+                          float(row) / float(nbHeightSegs));
+    }
+    // =========================================================================
+    // TOP HEMISPHERE  [topHemiBase .. totalVerts-1]
+    //   Row 0 = north equator, Row nbCapSegs = north pole (top)
+    //   Theta goes from PI/2 (equator) to 0 (north)
+    // =========================================================================
+    else
+    {
+        uint local = id - topHemiBase;
+        uint row   = local / sideColumns;
+        uint col   = local % sideColumns;
+
+        float phi = PI * 0.5 * (1.0 - float(row) / float(nbCapSegs)); // PI/2→0
+        float sinPhi = sin(phi), cosPhi = cos(phi);
+
+        float t   = float(col == nbSides ? 0u : col) / float(nbSides);
+        float ang = t * TAU;
+
+        vec3 localPos = vec3(sinPhi * cos(ang), cosPhi, sinPhi * sin(ang)) * radius;
+        // Translate to sit on top of the body (center at y = height)
+        v.position = localPos + vec3(0.0, height, 0.0);
+        v.normal   = normalize(localPos);
+        v.uv       = vec2(float(col) / float(nbSides),
+                          phi / (PI * 0.5)); // 1 at equator, 0 at pole
+    }
+
+    v.uv2 = v.uv;
+    v.position += vec3(worldOffsetX, worldOffsetY, worldOffsetZ);
+    vertices[vertexOffset + id] = v;
+
+    // =========================================================================
+    // INDEX GENERATION
+    // =========================================================================
+    // Reuse thread id for index writes (with range guards).
+    // Index packing order:
+    //   1. Bottom hemisphere quads : nbCapSegs * nbSides * 6
+    //   2. Body quads              : nbHeightSegs * nbSides * 6
+    //   3. Top hemisphere quads    : nbCapSegs * nbSides * 6
+
+    uint hemiQuads = nbCapSegs * nbSides;
+    uint bodyQuads = nbHeightSegs * nbSides;
+
+    // --- Bottom hemisphere quads ---
+    // Row 0 (pole row) has degenerate quads, which we skip for correctness:
+    // we write nbCapSegs rings but the first (innermost) ring fans to the pole.
+    // For simplicity, treat the pole as a degenerate quad (collapsed triangle).
+    if (id < hemiQuads)
+    {
+        uint ring = id / nbSides; // 0 = innermost (pole→first ring)
+        uint col  = id % nbSides;
+
+        uint tIdx = indexOffset + id * 6u;
+
+        // Bottom hemisphere: rows go bottom pole (row 0) → equator (row nbCapSegs).
+        // Ring r spans vertex rows r and r+1.
+        uint r0  = ring       * sideColumns + col;
+        uint r0n = ring       * sideColumns + col + 1u;
+        uint r1  = (ring + 1u) * sideColumns + col;
+        uint r1n = (ring + 1u) * sideColumns + col + 1u;
+
+        // Bottom cap normal is downward → winding must appear CW from below = CCW from outside.
+        indices[tIdx + 0u] = vertexOffset + r0;
+        indices[tIdx + 1u] = vertexOffset + r1;
+        indices[tIdx + 2u] = vertexOffset + r1n;
+        indices[tIdx + 3u] = vertexOffset + r0;
+        indices[tIdx + 4u] = vertexOffset + r1n;
+        indices[tIdx + 5u] = vertexOffset + r0n;
+    }
+
+    // --- Body quads ---
+    if (id < bodyQuads)
+    {
+        uint row = id / nbSides;
+        uint col = id % nbSides;
+
+        uint b0 = bodyBase + row       * sideColumns + col;
+        uint b1 = bodyBase + row       * sideColumns + col + 1u;
+        uint t0 = bodyBase + (row + 1u) * sideColumns + col;
+        uint t1 = bodyBase + (row + 1u) * sideColumns + col + 1u;
+
+        uint tIdx = indexOffset + hemiQuads * 6u + id * 6u;
+        indices[tIdx + 0u] = vertexOffset + b0;
+        indices[tIdx + 1u] = vertexOffset + t0;
+        indices[tIdx + 2u] = vertexOffset + t1;
+        indices[tIdx + 3u] = vertexOffset + b0;
+        indices[tIdx + 4u] = vertexOffset + t1;
+        indices[tIdx + 5u] = vertexOffset + b1;
+    }
+
+    // --- Top hemisphere quads ---
+    if (id < hemiQuads)
+    {
+        uint ring = id / nbSides;
+        uint col  = id % nbSides;
+
+        uint r0  = topHemiBase + ring       * sideColumns + col;
+        uint r0n = topHemiBase + ring       * sideColumns + col + 1u;
+        uint r1  = topHemiBase + (ring + 1u) * sideColumns + col;
+        uint r1n = topHemiBase + (ring + 1u) * sideColumns + col + 1u;
+
+        // Top cap: outward normals.
+        // Parametric proof: -(T_phi×T_theta) = outward, so we need cross(v1-v0,v2-v0) = outward.
+        // T1 (r0,r1n,r0n): cross ≈ step*dt*(outward) ✓
+        // T2 (r0,r1, r1n): cross ≈ step*dt*(outward) ✓
+        uint tIdx = indexOffset + (hemiQuads + bodyQuads) * 6u + id * 6u;
+        indices[tIdx + 0u] = vertexOffset + r0;
+        indices[tIdx + 1u] = vertexOffset + r1n;
+        indices[tIdx + 2u] = vertexOffset + r0n;
+        indices[tIdx + 3u] = vertexOffset + r0;
+        indices[tIdx + 4u] = vertexOffset + r1;
+        indices[tIdx + 5u] = vertexOffset + r1n;
+    }
+}

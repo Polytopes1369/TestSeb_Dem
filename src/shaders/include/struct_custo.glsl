@@ -26,12 +26,21 @@ bool GetFlag(uint flags, uint f) {
 struct Vertex {
     vec3 position;
     float materialID; // Padding 1
-    
+
     vec3 normal;
     uint meshID;      // Padding 2
-    
+
     vec2 uv;
     vec2 uv2;         // Padding 3 (complet)
+};
+
+// EntityTransform : 80 octets. Per-entity self-rotation, uploaded from the CPU every frame
+// and indexed by Vertex.meshID in the vertex shader. "center" is the entity's world-space
+// pivot (its grid slot position); "rotation" is a pure rotation matrix with no scale/translation.
+struct EntityTransform {
+    mat4 rotation;
+    vec3 center;
+    float _pad0;
 };
 
 #endif // STRUCT_CUSTO_GLSL

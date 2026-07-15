@@ -109,6 +109,47 @@ namespace {
         float worldOffsetZ;
     };
 
+    struct CapsuleParams {
+        float radius;
+        float height;       // cylindrical body length (= total height - 2*radius)
+        uint32_t nbSides;
+        uint32_t nbHeightSegs;
+        uint32_t nbCapSegs;
+        uint32_t meshID;
+        float materialID;
+        uint32_t vertexOffset;
+        uint32_t indexOffset;
+        float worldOffsetX;
+        float worldOffsetY;
+        float worldOffsetZ;
+    };
+
+    struct CylinderParams {
+        float radius;
+        float height;
+        uint32_t nbSides;
+        uint32_t nbHeightSegs;
+        uint32_t nbCapSegs;
+        uint32_t meshID;
+        float materialID;
+        uint32_t vertexOffset;
+        uint32_t indexOffset;
+        float worldOffsetX;
+        float worldOffsetY;
+        float worldOffsetZ;
+    };
+
+    // CPU mirror of the GLSL EntityTransform struct (struct_custo.glsl): must match its
+    // std430 layout exactly (mat4 = 64 bytes, vec3 + pad = 16 bytes) since it is memcpy'd
+    // wholesale into m_EntityTransformBuffer every frame.
+    struct EntityTransform {
+        maths::mat4 rotation;
+        float centerX;
+        float centerY;
+        float centerZ;
+        float _pad0;
+    };
+
     // geom_box.comp reads its Params via push constants (not the shared UBO), because each
     // of its 6 face dispatches also needs distinct specialization constants baked per-pipeline.
     struct BoxPushConstants {
@@ -236,6 +277,16 @@ void VulkanContext::Init(std::string_view appName, GLFWwindow* window) {
     VmaAllocationCreateInfo pAlloc{ .usage = VMA_MEMORY_USAGE_CPU_TO_GPU };
     if (vmaCreateBuffer(m_Allocator, &pInfo, &pAlloc, &m_ParamsBuffer, &m_ParamsAllocation, nullptr) != VK_SUCCESS) {
         throw std::runtime_error("Failed to allocate compute uniform block!");
+    }
+
+    // Per-entity rotation buffer: host-visible so UpdateEntityRotations() can re-upload the
+    // whole array with a plain memcpy every frame (mirrors the m_ParamsBuffer update pattern).
+    VkBufferCreateInfo etInfo{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+    etInfo.size = sizeof(EntityTransform) * kEntityCount;
+    etInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    VmaAllocationCreateInfo etAlloc{ .usage = VMA_MEMORY_USAGE_CPU_TO_GPU };
+    if (vmaCreateBuffer(m_Allocator, &etInfo, &etAlloc, &m_EntityTransformBuffer, &m_EntityTransformAllocation, nullptr) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to allocate entity transform buffer!");
     }
 
     CreateSwapchain(window);
@@ -498,7 +549,7 @@ void VulkanContext::CreateSyncObjects() {
 
 void VulkanContext::CreatePipelinesAndDescriptors() {
     VkDescriptorPoolSize poolSizes[] = {
-        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 },
+        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3 },
         { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 }
     };
     VkDescriptorPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
@@ -509,7 +560,7 @@ void VulkanContext::CreatePipelinesAndDescriptors() {
         throw std::runtime_error("Failed to create Geometry Descriptor Pool!");
     }
 
-    VkDescriptorSetLayoutBinding bindings[3] = {};
+    VkDescriptorSetLayoutBinding bindings[4] = {};
     bindings[0].binding = 0; // Vertices SSBO
     bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     bindings[0].descriptorCount = 1;
@@ -525,8 +576,13 @@ void VulkanContext::CreatePipelinesAndDescriptors() {
     bindings[2].descriptorCount = 1;
     bindings[2].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
+    bindings[3].binding = 3; // Per-entity rotation SSBO (read only by the vertex shader)
+    bindings[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    bindings[3].descriptorCount = 1;
+    bindings[3].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+
     VkDescriptorSetLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-    layoutInfo.bindingCount = 3;
+    layoutInfo.bindingCount = 4;
     layoutInfo.pBindings = bindings;
     if (vkCreateDescriptorSetLayout(m_Device, &layoutInfo, nullptr, &m_GeometryLayout) != VK_SUCCESS) {
         throw std::runtime_error("Failed to create Geometry Descriptor Layout!");
@@ -543,9 +599,10 @@ void VulkanContext::CreatePipelinesAndDescriptors() {
     VkDescriptorBufferInfo vertInfo{ m_VertexBuffer, 0, VK_WHOLE_SIZE };
     VkDescriptorBufferInfo indexInfo{ m_IndexBuffer, 0, VK_WHOLE_SIZE };
     VkDescriptorBufferInfo paramsInfo{ m_ParamsBuffer, 0, VK_WHOLE_SIZE };
+    VkDescriptorBufferInfo entityTransformInfo{ m_EntityTransformBuffer, 0, VK_WHOLE_SIZE };
 
-    VkWriteDescriptorSet writes[3] = {};
-    for (int i = 0; i < 3; i++) {
+    VkWriteDescriptorSet writes[4] = {};
+    for (int i = 0; i < 4; i++) {
         writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[i].dstSet = m_GeometryDescriptorSet;
         writes[i].dstBinding = i;
@@ -557,8 +614,10 @@ void VulkanContext::CreatePipelinesAndDescriptors() {
     writes[1].pBufferInfo = &indexInfo;
     writes[2].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     writes[2].pBufferInfo = &paramsInfo;
+    writes[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[3].pBufferInfo = &entityTransformInfo;
 
-    vkUpdateDescriptorSets(m_Device, 3, writes, 0, nullptr);
+    vkUpdateDescriptorSets(m_Device, 4, writes, 0, nullptr);
 
     // Compute layout setup: shared by all non-box primitive generators, which read their
     // per-dispatch parameters from the Params UBO (binding = 2) bound in m_GeometryDescriptorSet.
@@ -599,6 +658,8 @@ void VulkanContext::CreatePipelinesAndDescriptors() {
         { "shaders/geom_sphere.comp.spv",    &m_SpherePipeline },
         { "shaders/geom_torus.comp.spv",     &m_TorusPipeline },
         { "shaders/geom_tube.comp.spv",      &m_TubePipeline },
+        { "shaders/geom_capsule.comp.spv",   &m_CapsulePipeline },
+        { "shaders/geom_cylinder.comp.spv",  &m_CylinderPipeline },
     };
     for (const auto& desc : simplePrimitives) {
         auto code = ReadShaderFile(desc.shaderFile);
@@ -754,24 +815,29 @@ void VulkanContext::DispatchGeometryCompute(
     vkFreeCommandBuffers(m_Device, m_CommandPool, 1, &cmd);
 }
 
+maths::vec2 VulkanContext::GridSlot(int slotIndex) const {
+    // 3x3 grid centered on (0,0,0), in the XZ plane (Y = 0 ground level), spaced
+    // kGridSpacing apart. Used both by GenerateGeometry() (to bake each primitive's world
+    // position at generation time) and UpdateEntityRotations() (to recover each entity's
+    // rotation pivot), so this is the single source of truth for the layout.
+    constexpr float kGridSpacing = 3.0f;
+    int col = slotIndex % 3;
+    int row = slotIndex / 3;
+    return maths::vec2{ (col - 1) * kGridSpacing, (row - 1) * kGridSpacing };
+}
+
 void VulkanContext::GenerateGeometry() {
-    // --- Grid layout: 7 primitives arranged on a 3-column grid centered on (0,0,0), in the
-    // XZ plane (Y = 0 ground level), spaced kGridSpacing apart. Generation order below is
-    // Icosphere-first (so it lands at vertexOffset/indexOffset 0, keeping
+    // --- Grid layout: 9 primitives arranged on a 3x3 grid (see GridSlot()). Generation order
+    // below is Icosphere-first (so it lands at vertexOffset/indexOffset 0, keeping
     // DebugReadbackGeometrySample's fixed sampling window — designed around a single
     // icosphere living at the start of the buffers — valid unchanged); each primitive's grid
-    // *position* is independent of generation order and set via gridSlot(slotIndex) below.
-    constexpr float kGridSpacing = 3.0f;
-    auto gridSlot = [](int slotIndex) -> maths::vec2 {
-        int col = slotIndex % 3;
-        int row = slotIndex / 3;
-        return maths::vec2{ (col - 1) * kGridSpacing, (row - 1) * kGridSpacing };
-        };
+    // *position* is independent of generation order and set via GridSlot(slotIndex) below.
+    auto gridSlot = [this](int slotIndex) -> maths::vec2 { return GridSlot(slotIndex); };
 
     uint32_t runningVertexOffset = 0;
     uint32_t runningIndexOffset = 0;
 
-    Logger::Log(LogLevel::Info, "[GenerateGeometry] Generating 7 procedural primitives on a 3x3 grid...");
+    Logger::Log(LogLevel::Info, "[GenerateGeometry] Generating 9 procedural primitives on a 3x3 grid...");
 
     // ---------------------------------------------------------------------------------
     // ICOSPHERE (slot 2 visually) — generated first so it occupies buffer offset 0.
@@ -1002,12 +1068,121 @@ void VulkanContext::GenerateGeometry() {
         runningIndexOffset += 24u * params.nbSides;
     }
 
+    // ---------------------------------------------------------------------------------
+    // CAPSULE (slot 7) — cylindrical body + two hemispherical caps.
+    // ---------------------------------------------------------------------------------
+    {
+        maths::vec2 slot = gridSlot(7);
+        CapsuleParams params{};
+        params.radius = 0.5f;
+        params.height = 0.8f; // cylindrical body length; full shape spans y=[-radius, height+radius]
+        params.nbSides = 24u;
+        params.nbHeightSegs = 4u;
+        params.nbCapSegs = 8u;
+        params.meshID = 7u;
+        params.materialID = 0.0f;
+        params.vertexOffset = runningVertexOffset;
+        params.indexOffset = runningIndexOffset;
+        params.worldOffsetX = slot.x;
+        params.worldOffsetY = -params.height * 0.5f; // recenter: shape's vertical midpoint is height/2
+        params.worldOffsetZ = slot.y;
+
+        uint32_t sideColumns = params.nbSides + 1u;
+        uint32_t hemiVerts = (params.nbCapSegs + 1u) * sideColumns;
+        uint32_t bodyVerts = (params.nbHeightSegs + 1u) * sideColumns;
+        uint32_t totalVerts = hemiVerts * 2u + bodyVerts;
+        constexpr uint32_t kLocalSizeX = 64u; // geom_capsule.comp local_size_x = 64
+        uint32_t groupCount = (totalVerts + kLocalSizeX - 1u) / kLocalSizeX;
+
+        DispatchGeometryCompute(m_CapsulePipeline, m_ComputePipelineLayout,
+            &params, sizeof(params), nullptr, 0, groupCount, 1, 1);
+
+        runningVertexOffset += totalVerts;
+        // 2 hemispheres (nbCapSegs*nbSides quads each) + body (nbHeightSegs*nbSides quads), 6 indices/quad.
+        runningIndexOffset += 6u * params.nbSides * (2u * params.nbCapSegs + params.nbHeightSegs);
+    }
+
+    // ---------------------------------------------------------------------------------
+    // CYLINDER (slot 8) — flat top/bottom caps (unlike TUBE, which is hollow).
+    // ---------------------------------------------------------------------------------
+    {
+        maths::vec2 slot = gridSlot(8);
+        CylinderParams params{};
+        params.radius = 0.7f;
+        params.height = 1.4f;
+        params.nbSides = 24u;
+        params.nbHeightSegs = 4u;
+        params.nbCapSegs = 4u;
+        params.meshID = 8u;
+        params.materialID = 0.0f;
+        params.vertexOffset = runningVertexOffset;
+        params.indexOffset = runningIndexOffset;
+        params.worldOffsetX = slot.x;
+        params.worldOffsetY = -params.height * 0.5f; // recenter: geometry spans y=[0,height]
+        params.worldOffsetZ = slot.y;
+
+        uint32_t sideColumns = params.nbSides + 1u;
+        uint32_t sideVertCount = sideColumns * (params.nbHeightSegs + 1u);
+        uint32_t capVertCount = 1u + params.nbCapSegs * sideColumns; // center + rings
+        uint32_t totalVerts = sideVertCount + 2u * capVertCount;
+        constexpr uint32_t kLocalSizeX = 64u; // geom_cylinder.comp local_size_x = 64
+        uint32_t groupCount = (totalVerts + kLocalSizeX - 1u) / kLocalSizeX;
+
+        DispatchGeometryCompute(m_CylinderPipeline, m_ComputePipelineLayout,
+            &params, sizeof(params), nullptr, 0, groupCount, 1, 1);
+
+        runningVertexOffset += totalVerts;
+        // Side quads (nbHeightSegs*nbSides) + 2 caps (nbCapSegs*nbSides each), 6 indices/quad.
+        runningIndexOffset += 6u * params.nbSides * (params.nbHeightSegs + 2u * params.nbCapSegs);
+    }
+
     m_TotalIndexCount = runningIndexOffset;
     Logger::Log(LogLevel::Info, std::format(
-        "[GenerateGeometry] All 7 primitives generated: totalVertexCount={} totalIndexCount={} "
+        "[GenerateGeometry] All 9 primitives generated: totalVertexCount={} totalIndexCount={} "
         "(buffers hold {} verts / {} indices max)",
         runningVertexOffset, runningIndexOffset,
         (512u * 1024u) / sizeof(renderer::Vertex), (128u * 1024u) / sizeof(uint32_t)));
+}
+
+void VulkanContext::UpdateEntityRotations(float timeSeconds) {
+    // Distinct per-axis angular speeds (radians/sec) and a per-entity phase offset so the 9
+    // primitives tumble out of sync with each other rather than spinning in lockstep.
+    constexpr float kSpeedX = 0.7f;
+    constexpr float kSpeedY = 1.1f;
+    constexpr float kSpeedZ = 0.5f;
+    constexpr float kPhaseStep = 0.6f; // radians of extra offset per meshID
+
+    std::array<EntityTransform, kEntityCount> transforms{};
+
+    for (uint32_t meshID = 0; meshID < kEntityCount; ++meshID) {
+        float phase = static_cast<float>(meshID) * kPhaseStep;
+
+        maths::mat4 rotation =
+            maths::mat4::RotateY(timeSeconds * kSpeedY + phase) *
+            maths::mat4::RotateX(timeSeconds * kSpeedX + phase) *
+            maths::mat4::RotateZ(timeSeconds * kSpeedZ + phase);
+
+        // Every primitive's baked world-space center coincides exactly with its grid slot
+        // position at Y=0: each geom_*.comp shader either generates a shape already centered
+        // on its own local origin (icosphere/box/sphere/torus/plane), or one that spans
+        // y=[0,height] recentered via worldOffsetY=-height/2 in GenerateGeometry() (cone/tube/
+        // cylinder/capsule) — both cases land the shape's true vertical midpoint at Y=0.
+        maths::vec2 slot = GridSlot(static_cast<int>(meshID));
+
+        EntityTransform& xform = transforms[meshID];
+        xform.rotation = rotation;
+        xform.centerX = slot.x;
+        xform.centerY = 0.0f;
+        xform.centerZ = slot.y;
+        xform._pad0 = 0.0f;
+    }
+
+    void* mapped = nullptr;
+    if (vmaMapMemory(m_Allocator, m_EntityTransformAllocation, &mapped) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to map Entity Transform buffer for per-frame update!");
+    }
+    std::memcpy(mapped, transforms.data(), sizeof(EntityTransform) * kEntityCount);
+    vmaUnmapMemory(m_Allocator, m_EntityTransformAllocation);
 }
 
 void VulkanContext::DebugReadbackGeometrySample(uint32_t vertsPerFace, uint32_t expectedIndexCount) {
@@ -1162,6 +1337,9 @@ void VulkanContext::Shutdown() {
     if (m_ParamsBuffer != VK_NULL_HANDLE) {
         vmaDestroyBuffer(m_Allocator, m_ParamsBuffer, m_ParamsAllocation);
     }
+    if (m_EntityTransformBuffer != VK_NULL_HANDLE) {
+        vmaDestroyBuffer(m_Allocator, m_EntityTransformBuffer, m_EntityTransformAllocation);
+    }
     if (m_EntityBuffer != VK_NULL_HANDLE) {
         vmaDestroyBuffer(m_Allocator, m_EntityBuffer, m_EntityAllocation);
     }
@@ -1174,7 +1352,8 @@ void VulkanContext::Shutdown() {
     }
 
     for (VkPipeline pipeline : { m_ConePipeline, m_IcospherePipeline, m_PlanePipeline,
-                                  m_SpherePipeline, m_TorusPipeline, m_TubePipeline }) {
+                                  m_SpherePipeline, m_TorusPipeline, m_TubePipeline,
+                                  m_CapsulePipeline, m_CylinderPipeline }) {
         if (pipeline != VK_NULL_HANDLE) {
             vkDestroyPipeline(m_Device, pipeline, nullptr);
         }
