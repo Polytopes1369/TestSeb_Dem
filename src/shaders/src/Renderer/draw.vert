@@ -9,6 +9,9 @@ layout(std430, binding = 0) readonly buffer VertexBuffer { Vertex vertices[]; };
 layout(std430, binding = 1) readonly buffer IndexBuffer  { uint indices[]; };
 // Per-entity self-rotation (one entry per meshID), re-uploaded from the CPU every frame.
 layout(std430, binding = 3) readonly buffer EntityTransformBuffer { EntityTransform entityTransforms[]; };
+// CPU-authored entity records (meshID assigned via core::IDManager, see BuildEntityData() /
+// UploadEntityData() in VulkanContext.cpp), uploaded once at startup.
+layout(std430, binding = 4) readonly buffer EntityDataBuffer { EntityData entityData[]; };
 
 // Camera matrices via Push Constants
 layout(push_constant) uniform CameraPushConstants {
@@ -27,11 +30,13 @@ void main() {
     // 2. Fetch the corresponding Vertex from the Bindless Vertex Buffer
     Vertex v = vertices[vertexIndex];
 
-    // 3. Spin the entity around its own world-space center on all 3 axes: the compute
-    // generators already baked each primitive's position around its grid-slot center, so
-    // recovering the pre-baked local offset (v.position - center) and re-applying it after
-    // rotation keeps the entity pinned in place while it tumbles.
-    EntityTransform xform = entityTransforms[v.meshID];
+    // 3. Look up this vertex's entity record (CPU-authored, meshID assigned by IDManager),
+    // then spin it around its own world-space center on all 3 axes: the compute generators
+    // already baked each primitive's position around its grid-slot center, so recovering the
+    // pre-baked local offset (v.position - center) and re-applying it after rotation keeps
+    // the entity pinned in place while it tumbles.
+    EntityData ed = entityData[v.meshID];
+    EntityTransform xform = entityTransforms[ed.meshID];
     mat3 rotation = mat3(xform.rotation);
     vec3 localPos = v.position - xform.center;
     vec3 worldPos = xform.center + rotation * localPos;

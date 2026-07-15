@@ -243,6 +243,10 @@ void VulkanContext::Init(std::string_view appName, GLFWwindow* window) {
         throw std::runtime_error("Failed to create VMA allocator!");
     }
 
+    // Author entity data on the CPU (meshID assigned via core::IDManager) before any GPU
+    // buffer exists for it, per the engine's CPU-authored / GPU-generated architecture.
+    BuildEntityData();
+
     // Allocate Entity Tracking Buffer
     VkBufferCreateInfo bufferInfo{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
     bufferInfo.size = sizeof(core::EntityData) * 10000;
@@ -252,6 +256,10 @@ void VulkanContext::Init(std::string_view appName, GLFWwindow* window) {
     if (vmaCreateBuffer(m_Allocator, &bufferInfo, &allocInfo, &m_EntityBuffer, &m_EntityAllocation, nullptr) != VK_SUCCESS) {
         throw std::runtime_error("Failed to allocate entity buffer!");
     }
+
+    // Upload the CPU-authored entity records now that both m_EntityBuffer and the command
+    // pool (created above, CreateCommandPool()/AllocateCommandBuffer()) exist.
+    UploadEntityData();
 
     // Allocate Procedural Geometry Buffers (512KB vertices, 128KB indices, 256B for internal parameters)
     VkBufferCreateInfo vInfo{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
@@ -549,7 +557,7 @@ void VulkanContext::CreateSyncObjects() {
 
 void VulkanContext::CreatePipelinesAndDescriptors() {
     VkDescriptorPoolSize poolSizes[] = {
-        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3 },
+        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4 },
         { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 }
     };
     VkDescriptorPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
@@ -560,7 +568,7 @@ void VulkanContext::CreatePipelinesAndDescriptors() {
         throw std::runtime_error("Failed to create Geometry Descriptor Pool!");
     }
 
-    VkDescriptorSetLayoutBinding bindings[4] = {};
+    VkDescriptorSetLayoutBinding bindings[5] = {};
     bindings[0].binding = 0; // Vertices SSBO
     bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     bindings[0].descriptorCount = 1;
@@ -581,8 +589,13 @@ void VulkanContext::CreatePipelinesAndDescriptors() {
     bindings[3].descriptorCount = 1;
     bindings[3].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
 
+    bindings[4].binding = 4; // Entity data SSBO (CPU-authored, IDManager-assigned meshID; read only by the vertex shader)
+    bindings[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    bindings[4].descriptorCount = 1;
+    bindings[4].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+
     VkDescriptorSetLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-    layoutInfo.bindingCount = 4;
+    layoutInfo.bindingCount = 5;
     layoutInfo.pBindings = bindings;
     if (vkCreateDescriptorSetLayout(m_Device, &layoutInfo, nullptr, &m_GeometryLayout) != VK_SUCCESS) {
         throw std::runtime_error("Failed to create Geometry Descriptor Layout!");
@@ -600,9 +613,10 @@ void VulkanContext::CreatePipelinesAndDescriptors() {
     VkDescriptorBufferInfo indexInfo{ m_IndexBuffer, 0, VK_WHOLE_SIZE };
     VkDescriptorBufferInfo paramsInfo{ m_ParamsBuffer, 0, VK_WHOLE_SIZE };
     VkDescriptorBufferInfo entityTransformInfo{ m_EntityTransformBuffer, 0, VK_WHOLE_SIZE };
+    VkDescriptorBufferInfo entityDataInfo{ m_EntityBuffer, 0, VK_WHOLE_SIZE };
 
-    VkWriteDescriptorSet writes[4] = {};
-    for (int i = 0; i < 4; i++) {
+    VkWriteDescriptorSet writes[5] = {};
+    for (int i = 0; i < 5; i++) {
         writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[i].dstSet = m_GeometryDescriptorSet;
         writes[i].dstBinding = i;
@@ -616,8 +630,10 @@ void VulkanContext::CreatePipelinesAndDescriptors() {
     writes[2].pBufferInfo = &paramsInfo;
     writes[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[3].pBufferInfo = &entityTransformInfo;
+    writes[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[4].pBufferInfo = &entityDataInfo;
 
-    vkUpdateDescriptorSets(m_Device, 4, writes, 0, nullptr);
+    vkUpdateDescriptorSets(m_Device, 5, writes, 0, nullptr);
 
     // Compute layout setup: shared by all non-box primitive generators, which read their
     // per-dispatch parameters from the Params UBO (binding = 2) bound in m_GeometryDescriptorSet.
@@ -826,6 +842,91 @@ maths::vec2 VulkanContext::GridSlot(int slotIndex) const {
     return maths::vec2{ (col - 1) * kGridSpacing, (row - 1) * kGridSpacing };
 }
 
+void VulkanContext::BuildEntityData() {
+    // Context 0: this is currently the only "factory" allocating entity IDs in the engine.
+    // Sequence starts at 0, so the 9 sequential GetNextID() calls below deterministically
+    // produce 0..8 in the low 32 bits, matching kEntityCount's dense-index requirement.
+    core::IDManager::Init(0);
+
+    for (uint32_t i = 0; i < kEntityCount; ++i) {
+        core::EntityID id = core::IDManager::GetNextID();
+
+        core::EntityData& entity = m_EntityData[i];
+        entity.meshID = static_cast<uint32_t>(id & 0xFFFFFFFFu);
+        entity.materialID = 0u;
+        entity.cellID = 0u;
+        entity.flags = 0u;
+        core::SetFlag(entity.flags, core::EntityFlags::CastShadows, true);
+    }
+}
+
+void VulkanContext::UploadEntityData() {
+    // m_EntityBuffer is VMA_MEMORY_USAGE_GPU_ONLY (not host-visible), so uploading the
+    // CPU-authored m_EntityData requires a temporary host-visible staging buffer plus an
+    // explicit GPU-side copy, mirroring the one-time-submit pattern used elsewhere in Init().
+    VkDeviceSize uploadSize = sizeof(core::EntityData) * kEntityCount;
+
+    VkBufferCreateInfo stagingInfo{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+    stagingInfo.size = uploadSize;
+    stagingInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+
+    VmaAllocationCreateInfo stagingAllocInfo{};
+    stagingAllocInfo.usage = VMA_MEMORY_USAGE_CPU_ONLY;
+    stagingAllocInfo.flags = VMA_ALLOCATION_CREATE_MAPPED_BIT;
+
+    VkBuffer stagingBuffer = VK_NULL_HANDLE;
+    VmaAllocation stagingAllocation = VK_NULL_HANDLE;
+    VmaAllocationInfo stagingAllocResultInfo{};
+    if (vmaCreateBuffer(m_Allocator, &stagingInfo, &stagingAllocInfo, &stagingBuffer, &stagingAllocation, &stagingAllocResultInfo) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to allocate entity data staging buffer!");
+    }
+    std::memcpy(stagingAllocResultInfo.pMappedData, m_EntityData.data(), static_cast<size_t>(uploadSize));
+
+    VkCommandBufferAllocateInfo cmdAllocInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+    cmdAllocInfo.commandPool = m_CommandPool;
+    cmdAllocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cmdAllocInfo.commandBufferCount = 1;
+
+    VkCommandBuffer cmd;
+    if (vkAllocateCommandBuffers(m_Device, &cmdAllocInfo, &cmd) != VK_SUCCESS) {
+        throw std::runtime_error("Failed allocating single submit command buffer for entity data upload!");
+    }
+
+    VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cmd, &beginInfo);
+
+    VkBufferCopy copyRegion{};
+    copyRegion.srcOffset = 0;
+    copyRegion.dstOffset = 0;
+    copyRegion.size = uploadSize;
+    vkCmdCopyBuffer(cmd, stagingBuffer, m_EntityBuffer, 1, &copyRegion);
+
+    // Explicit layout/ownership-free memory barrier: the copy's writes must be visible to the
+    // vertex shader's storage-buffer reads (draw.vert, binding = 4) before any draw call.
+    VkMemoryBarrier2 memBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+    memBarrier.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+    memBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    memBarrier.dstStageMask = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT;
+    memBarrier.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
+
+    VkDependencyInfo depInfo{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+    depInfo.memoryBarrierCount = 1;
+    depInfo.pMemoryBarriers = &memBarrier;
+    vkCmdPipelineBarrier2(cmd, &depInfo);
+
+    vkEndCommandBuffer(cmd);
+
+    VkSubmitInfo submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &cmd;
+    vkQueueSubmit(m_GraphicsQueue, 1, &submitInfo, VK_NULL_HANDLE);
+    vkQueueWaitIdle(m_GraphicsQueue);
+
+    vkFreeCommandBuffers(m_Device, m_CommandPool, 1, &cmd);
+    vmaDestroyBuffer(m_Allocator, stagingBuffer, stagingAllocation);
+}
+
 void VulkanContext::GenerateGeometry() {
     // --- Grid layout: 9 primitives arranged on a 3x3 grid (see GridSlot()). Generation order
     // below is Icosphere-first (so it lands at vertexOffset/indexOffset 0, keeping
@@ -849,7 +950,7 @@ void VulkanContext::GenerateGeometry() {
         IcosphereParams params{};
         params.radius = 0.8f;
         params.subdiv = 8u;
-        params.meshID = 2u;
+        params.meshID = m_EntityData[2].meshID;
         params.materialID = 0.0f;
         params.vertexOffset = runningVertexOffset;
         params.indexOffset = runningIndexOffset;
@@ -897,7 +998,7 @@ void VulkanContext::GenerateGeometry() {
             params.lengthOffset = kBoxFaceLengthOffsetSign[face] * kHalfSize;
             params.uSegsCount = kSegs;
             params.vSegsCount = kSegs;
-            params.meshID = 0u;
+            params.meshID = m_EntityData[0].meshID;
             params.materialID = 0.0f;
             params.vertexOffset = runningVertexOffset;
             params.indexOffset = runningIndexOffset;
@@ -925,9 +1026,9 @@ void VulkanContext::GenerateGeometry() {
         ConeParams params{};
         params.height = 1.4f;
         params.bottomRadius = 0.7f;
-        params.topRadius = 0.0f; // true cone (no flat top)
+        params.topRadius = 0.35f;
         params.nbSides = 32u;
-        params.meshID = 1u;
+        params.meshID = m_EntityData[1].meshID;
         params.materialID = 0.0f;
         params.vertexOffset = runningVertexOffset;
         params.indexOffset = runningIndexOffset;
@@ -956,7 +1057,7 @@ void VulkanContext::GenerateGeometry() {
         params.length_ = 1.4f;
         params.widthSegs = 2u; // flat surface: 4 corners is all that's needed
         params.lengthSegs = 2u;
-        params.meshID = 3u;
+        params.meshID = m_EntityData[3].meshID;
         params.materialID = 0.0f;
         params.vertexOffset = runningVertexOffset;
         params.indexOffset = runningIndexOffset;
@@ -984,7 +1085,7 @@ void VulkanContext::GenerateGeometry() {
         params.radius = 0.8f;
         params.sideSegs = 24u;
         params.heightSegs = 16u;
-        params.meshID = 4u;
+        params.meshID = m_EntityData[4].meshID;
         params.materialID = 0.0f;
         params.vertexOffset = runningVertexOffset;
         params.indexOffset = runningIndexOffset;
@@ -1017,7 +1118,7 @@ void VulkanContext::GenerateGeometry() {
         params.radius2 = 0.22f; // minor (tube) radius
         params.nbRadSeg = 32u;
         params.nbSides = 16u;
-        params.meshID = 5u;
+        params.meshID = m_EntityData[5].meshID;
         params.materialID = 0.0f;
         params.vertexOffset = runningVertexOffset;
         params.indexOffset = runningIndexOffset;
@@ -1048,7 +1149,7 @@ void VulkanContext::GenerateGeometry() {
         params.bottomRadius2 = 0.18f; // wall thickness
         params.topRadius1 = 0.7f;
         params.topRadius2 = 0.18f;
-        params.meshID = 6u;
+        params.meshID = m_EntityData[6].meshID;
         params.materialID = 0.0f;
         params.vertexOffset = runningVertexOffset;
         params.indexOffset = runningIndexOffset;
@@ -1079,7 +1180,7 @@ void VulkanContext::GenerateGeometry() {
         params.nbSides = 24u;
         params.nbHeightSegs = 4u;
         params.nbCapSegs = 8u;
-        params.meshID = 7u;
+        params.meshID = m_EntityData[7].meshID;
         params.materialID = 0.0f;
         params.vertexOffset = runningVertexOffset;
         params.indexOffset = runningIndexOffset;
@@ -1113,7 +1214,7 @@ void VulkanContext::GenerateGeometry() {
         params.nbSides = 24u;
         params.nbHeightSegs = 4u;
         params.nbCapSegs = 4u;
-        params.meshID = 8u;
+        params.meshID = m_EntityData[8].meshID;
         params.materialID = 0.0f;
         params.vertexOffset = runningVertexOffset;
         params.indexOffset = runningIndexOffset;

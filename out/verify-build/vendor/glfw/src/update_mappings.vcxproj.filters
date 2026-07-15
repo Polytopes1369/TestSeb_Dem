@@ -1,0 +1,24 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="18.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <CustomBuild Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\out\verify-build\CMakeFiles\c42cde5450b6c177ab38eab71e87d94a\update_mappings.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\vendor\glfw\src\CMakeLists.txt" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\vendor\glfw\src\mappings.h.in">
+      <Filter>Header Files</Filter>
+    </None>
+    <None Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\vendor\glfw\CMake\GenerateMappings.cmake" />
+    <None Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\out\verify-build\vendor\glfw\src\CMakeFiles\update_mappings" />
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="CMake Rules">
+      <UniqueIdentifier>{5F8795E5-3601-3C45-AC08-F1D53F747BDB}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Header Files">
+      <UniqueIdentifier>{742F5B46-9E52-3BF4-93AF-12350E39E0C3}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+</Project>

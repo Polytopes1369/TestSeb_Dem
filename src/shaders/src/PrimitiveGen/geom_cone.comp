@@ -124,8 +124,8 @@ void main()
         uint next = (rim + 1u) % nbSides;
         uint tIdx = indexOffset + nbSides * 6u + rim * 3u;
         indices[tIdx + 0u] = vertexOffset;
-        indices[tIdx + 1u] = vertexOffset + 1u + next;
-        indices[tIdx + 2u] = vertexOffset + 1u + rim;
+        indices[tIdx + 1u] = vertexOffset + 1u + rim;
+        indices[tIdx + 2u] = vertexOffset + 1u + next;
     }
     if (id >= capCount + 1u && id < capCount * 2u) // top cap fan
     {
@@ -133,7 +133,7 @@ void main()
         uint next = (rim + 1u) % nbSides;
         uint tIdx = indexOffset + nbSides * 9u + rim * 3u;
         indices[tIdx + 0u] = vertexOffset + capCount;
-        indices[tIdx + 1u] = vertexOffset + capCount + 1u + rim;
-        indices[tIdx + 2u] = vertexOffset + capCount + 1u + next;
+        indices[tIdx + 1u] = vertexOffset + capCount + 1u + next;
+        indices[tIdx + 2u] = vertexOffset + capCount + 1u + rim;
     }
 }

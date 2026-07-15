@@ -1,0 +1,13 @@
+ninja_dyndep_version = 1.0
+build CMakeFiles\DemoSceneVK.dir\src\core\Camera.cpp.obj: dyndep
+
+build CMakeFiles\DemoSceneVK.dir\src\core\Logger.cpp.obj: dyndep
+
+build CMakeFiles\DemoSceneVK.dir\src\main.cpp.obj: dyndep
+
+build CMakeFiles\DemoSceneVK.dir\src\renderer\VmaUsage.cpp.obj: dyndep
+
+build CMakeFiles\DemoSceneVK.dir\src\renderer\VulkanContext.cpp.obj: dyndep
+
+build CMakeFiles\DemoSceneVK.dir\src\renderer\VulkanPipeline.cpp.obj: dyndep
+

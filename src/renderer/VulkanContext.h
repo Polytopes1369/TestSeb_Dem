@@ -4,6 +4,8 @@
 #include <GLFW/glfw3.h>
 #include <vk_mem_alloc.h>
 #include "core/Camera.h"
+#include "core/EntityData.h"
+#include "core/IDManager.h"
 #include <array>
 #include <string_view>
 #include <vector>
@@ -120,6 +122,11 @@ private:
     // One EntityTransform slot per primitive meshID (box=0 .. cylinder=8); see struct_custo.glsl.
     static constexpr uint32_t kEntityCount = 9;
 
+    // CPU-authoritative entity records: built once by BuildEntityData() (meshID assigned via
+    // core::IDManager) before GenerateGeometry() runs, then copied to m_EntityBuffer by
+    // UploadEntityData(). One entry per primitive (box=0 .. cylinder=8), see struct_custo.glsl.
+    std::array<core::EntityData, kEntityCount> m_EntityData{};
+
     const bool m_EnableValidationLayers = true;
 
     void CreateInstance(std::string_view appName);
@@ -138,6 +145,17 @@ private:
 
     void CreatePipelinesAndDescriptors();
     void GenerateGeometry();
+
+    // Authors m_EntityData on the CPU: assigns each of the kEntityCount entities a meshID via
+    // core::IDManager::GetNextID() (instead of a hardcoded literal). Must run before
+    // GenerateGeometry(), which reads m_EntityData[i].meshID into each primitive's push
+    // constants / Params UBO.
+    void BuildEntityData();
+
+    // One-shot upload of m_EntityData to the GPU-only m_EntityBuffer via a temporary staging
+    // buffer + vkCmdCopyBuffer, matching DispatchGeometryCompute's blocking one-time-submit
+    // pattern. Must run after m_EntityBuffer is allocated and before it is bound for reading.
+    void UploadEntityData();
 
     // Single source of truth for the 3x3 world-space grid layout (also used by
     // UpdateEntityRotations() to recover each entity's rotation pivot): column-major slot

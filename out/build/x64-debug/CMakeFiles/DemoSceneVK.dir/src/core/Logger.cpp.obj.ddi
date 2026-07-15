@@ -1,0 +1,14 @@
+{
+    "version": 1,
+    "revision": 0,
+    "rules": [
+        {
+            "primary-output": "CMakeFiles\\DemoSceneVK.dir\\src\\core\\Logger.cpp.obj",
+            "outputs": [
+                "D:\\DemoScene\\DemoScene_Vulkan2026_BaseArchi\\DemoScene_2026\\out\\build\\x64-debug\\vc140.pdb",
+                "CMakeFiles\\DemoSceneVK.dir\\src\\core\\Logger.cpp.obj.ddi"
+            ],
+            "requires": []
+        }
+    ]
+}
