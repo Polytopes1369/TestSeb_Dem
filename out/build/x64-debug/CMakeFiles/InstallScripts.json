@@ -1,9 +1,0 @@
-{
-	"InstallScripts" : 
-	[
-		"D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/out/build/x64-debug/cmake_install.cmake",
-		"D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/out/build/x64-debug/vendor/glfw/cmake_install.cmake",
-		"D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/out/build/x64-debug/vendor/glfw/src/cmake_install.cmake"
-	],
-	"Parallel" : false
-}
