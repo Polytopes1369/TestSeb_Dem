@@ -1,6 +1,7 @@
 #include "geometry/VirtualGeometryCacheTest.h"
 
 #include "geometry/CacheFileManager.h"
+#include "geometry/ClusterDAG.h"
 #include "geometry/ClusterFormat.h"
 #include "geometry/GeometryEncoding.h"
 #include "core/Logger.h"
@@ -13,7 +14,7 @@
 #include <format>
 #include <future>
 #include <limits>
-#include <unordered_map>
+#include <string>
 #include <vector>
 
 namespace geometry {
@@ -119,144 +120,128 @@ namespace geometry {
         }
 
         // -------------------------------------------------------------------------------------
-        // Greedy per-entity meshlet builder: walks the entity's triangles (identified via the
-        // per-vertex Vertex::meshID field the compute shaders already stamp on every vertex) and
-        // buckets them into clusters of at most kMaxClusterVertices unique vertices / at most
-        // kMaxClusterTriangles triangles, exactly as ClusterData's fixed-size arrays require.
-        //
-        // This does not attempt spatial-locality-aware meshlet construction (à la meshoptimizer)
-        // — it only needs to produce *valid, decodable* clusters to prove the on-disk format and
-        // CacheFileManager round-trip correctly. A real DAG/LOD simplification pass is a
-        // separate, future piece of work; every cluster produced here is accordingly marked as
-        // both a leaf and a DAG root (clusterError = 0, parentError = +infinity).
+        // Computes area-weighted per-vertex normals directly from a DAG node's own triangle
+        // geometry. Needed because SimplifiableMesh (ClusterGrouping/MeshSimplifier/ClusterDAG's
+        // shared working type) only tracks vertex positions -- carrying real per-vertex normals
+        // and UVs through cluster grouping and QEM simplification is a separate, larger piece of
+        // work (attribute-aware quadrics, à la Hoppe) than this .cache-format pass. Recomputing a
+        // face-derived normal here is correct and complete for every DAG level (leaf or
+        // simplified); UVs have no equivalent purely-geometric fallback, so every cluster gets an
+        // explicit (0,0) placeholder instead (see EncodeClusterData below) rather than silently
+        // reusing stale, potentially wrong original-mesh UVs.
         // -------------------------------------------------------------------------------------
-        struct EntityClusterBuildResult {
-            std::vector<Page> pages;
-            uint32_t totalVertexCount = 0;
-            uint32_t totalTriangleCount = 0;
-        };
+        std::vector<maths::vec3> ComputeVertexNormals(const SimplifiableMesh& mesh) {
+            std::vector<maths::vec3> normals(mesh.positions.size(), maths::vec3{ 0.0f, 0.0f, 0.0f });
+            for (size_t t = 0; t + 2 < mesh.triangles.size(); t += 3) {
+                uint32_t i0 = mesh.triangles[t + 0];
+                uint32_t i1 = mesh.triangles[t + 1];
+                uint32_t i2 = mesh.triangles[t + 2];
+                maths::vec3 faceNormal = (mesh.positions[i1] - mesh.positions[i0]).Cross(mesh.positions[i2] - mesh.positions[i0]);
+                normals[i0] = normals[i0] + faceNormal;
+                normals[i1] = normals[i1] + faceNormal;
+                normals[i2] = normals[i2] + faceNormal;
+            }
+            for (maths::vec3& n : normals) {
+                n = n.Normalize();
+            }
+            return normals;
+        }
 
-        EntityClusterBuildResult BuildClustersForEntity(
-            uint32_t targetMeshID,
-            const std::vector<renderer::Vertex>& allVertices,
-            const std::vector<uint32_t>& allIndices) {
+        // Encodes one DAG node's geometry into a fixed-size, quantized ClusterData block. Returns
+        // false (after logging why) if the node's vertex/index count would overflow the
+        // fixed-size on-disk arrays: SimplifyMeshQEM only targets a triangle-count budget today
+        // (see MeshSimplifier.h), so a pathological group can in principle end up with more
+        // surviving vertices than kMaxClusterVertices allows. Refusing to encode it -- rather than
+        // silently truncating or overrunning the fixed arrays -- is the explicit-failure contract
+        // this fixed-capacity format requires.
+        bool EncodeClusterData(const ClusterDAGNode& node, ClusterData& outData) {
+            uint32_t vertexCount = static_cast<uint32_t>(node.mesh.positions.size());
+            uint32_t indexCount = static_cast<uint32_t>(node.mesh.triangles.size());
+            if (vertexCount > kMaxClusterVertices || indexCount > kMaxClusterIndices) {
+                Logger::Log(LogLevel::Error, std::format(
+                    "[GeometryCacheTest] DAG node (level {}) exceeds the fixed cluster capacity: "
+                    "{} vertices (max {}), {} indices (max {}).",
+                    node.level, vertexCount, kMaxClusterVertices, indexCount, kMaxClusterIndices));
+                return false;
+            }
 
-            EntityClusterBuildResult result;
+            std::vector<maths::vec3> normals = ComputeVertexNormals(node.mesh);
 
-            std::unordered_map<uint32_t, uint8_t> globalToLocal;
-            std::vector<uint32_t> localToGlobal;
-            std::vector<uint8_t> localIndices;
+            outData = ClusterData{};
+            for (uint32_t v = 0; v < vertexCount; ++v) {
+                outData.positions[v] = QuantizePosition(node.mesh.positions[v], node.boundsMin, node.boundsMax);
+                outData.normals[v] = EncodeOctNormal24(normals[v]);
+                outData.uvs[v] = EncodeUV(maths::vec2{ 0.0f, 0.0f });
+            }
+            for (uint32_t i = 0; i < indexCount; ++i) {
+                outData.indices[i] = static_cast<uint8_t>(node.mesh.triangles[i]);
+            }
+            return true;
+        }
 
-            auto flushCluster = [&]() {
-                if (localToGlobal.empty()) {
-                    return;
-                }
+        // Builds the cluster index table entry for one DAG node: bounds/sphere/cone metadata for
+        // coarse CPU/GPU-side culling, kept resident even while the node's own geometry block may
+        // not be streamed in. virtualAddress/blockSizeBytes are left zeroed -- CacheFileManager::
+        // WriteCacheFile fills them in once it has computed the file's physical layout.
+        ClusterIndexEntry BuildIndexEntry(uint32_t globalClusterID, uint32_t entityID, const ClusterDAGNode& node) {
+            std::vector<maths::vec3> normals = ComputeVertexNormals(node.mesh);
 
-                maths::vec3 boundsMin{ std::numeric_limits<float>::max(), std::numeric_limits<float>::max(), std::numeric_limits<float>::max() };
-                maths::vec3 boundsMax{ std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest() };
-                for (uint32_t globalIdx : localToGlobal) {
-                    const maths::vec3& p = allVertices[globalIdx].position;
-                    boundsMin.x = std::min(boundsMin.x, p.x); boundsMin.y = std::min(boundsMin.y, p.y); boundsMin.z = std::min(boundsMin.z, p.z);
-                    boundsMax.x = std::max(boundsMax.x, p.x); boundsMax.y = std::max(boundsMax.y, p.y); boundsMax.z = std::max(boundsMax.z, p.z);
-                }
+            maths::vec3 axisAccum{ 0.0f, 0.0f, 0.0f };
+            for (const maths::vec3& n : normals) {
+                axisAccum = axisAccum + n;
+            }
+            maths::vec3 coneAxis = axisAccum.Normalize();
+            float coneCutoff = 1.0f;
+            for (const maths::vec3& n : normals) {
+                coneCutoff = std::min(coneCutoff, coneAxis.Dot(n));
+            }
+            coneCutoff = std::clamp(coneCutoff, -1.0f, 1.0f);
 
-                maths::vec3 sphereCenter = (boundsMin + boundsMax) * 0.5f;
-                float sphereRadius = (boundsMax - boundsMin).Length() * 0.5f;
+            ClusterIndexEntry entry{};
+            entry.clusterID = globalClusterID;
+            entry.entityID = entityID;
+            entry.virtualAddress = 0;
+            entry.blockSizeBytes = 0;
+            entry.vertexCount = static_cast<uint32_t>(node.mesh.positions.size());
+            entry.indexCount = static_cast<uint32_t>(node.mesh.triangles.size());
+            entry.boundsMin[0] = node.boundsMin.x; entry.boundsMin[1] = node.boundsMin.y; entry.boundsMin[2] = node.boundsMin.z;
+            entry.boundsMax[0] = node.boundsMax.x; entry.boundsMax[1] = node.boundsMax.y; entry.boundsMax[2] = node.boundsMax.z;
+            entry.sphereCenter[0] = node.sphereCenter.x; entry.sphereCenter[1] = node.sphereCenter.y; entry.sphereCenter[2] = node.sphereCenter.z;
+            entry.sphereRadius = node.sphereRadius;
+            entry.coneAxisX = static_cast<int8_t>(std::lround(coneAxis.x * 127.0f));
+            entry.coneAxisY = static_cast<int8_t>(std::lround(coneAxis.y * 127.0f));
+            entry.coneAxisZ = static_cast<int8_t>(std::lround(coneAxis.z * 127.0f));
+            entry.coneCutoff = static_cast<int8_t>(std::lround(coneCutoff * 127.0f));
+            return entry;
+        }
 
-                // Average normal direction defines the cluster's normal-cone axis; the cutoff is
-                // the worst-case (minimum) dot product between the axis and any member normal.
-                maths::vec3 axisAccum{ 0.0f, 0.0f, 0.0f };
-                for (uint32_t globalIdx : localToGlobal) {
-                    axisAccum = axisAccum + allVertices[globalIdx].normal;
-                }
-                maths::vec3 coneAxis = axisAccum.Normalize();
-                float coneCutoff = 1.0f;
-                for (uint32_t globalIdx : localToGlobal) {
-                    maths::vec3 n = allVertices[globalIdx].normal.Normalize();
-                    coneCutoff = std::min(coneCutoff, coneAxis.Dot(n));
-                }
-                coneCutoff = std::clamp(coneCutoff, -1.0f, 1.0f);
-
-                ClusterHeader header{};
-                header.boundsMin = boundsMin;
-                header.boundsMax = boundsMax;
-                header.sphereCenter = sphereCenter;
-                header.sphereRadius = sphereRadius;
-                header.coneAxisX = static_cast<int8_t>(std::lround(coneAxis.x * 127.0f));
-                header.coneAxisY = static_cast<int8_t>(std::lround(coneAxis.y * 127.0f));
-                header.coneAxisZ = static_cast<int8_t>(std::lround(coneAxis.z * 127.0f));
-                header.coneCutoff = static_cast<int8_t>(std::lround(coneCutoff * 127.0f));
-                // Single-LOD export: every cluster here is simultaneously a leaf and a DAG root
-                // (no simplification pass exists yet to build coarser parents).
-                header.clusterError = 0.0f;
-                header.parentError = std::numeric_limits<float>::infinity();
-                header.vertexCount = static_cast<uint16_t>(localToGlobal.size());
-                header.indexCount = static_cast<uint16_t>(localIndices.size());
-                header.parentID = kInvalidClusterID;
-                header.clusterID = static_cast<uint32_t>(result.pages.size());
-
-                ClusterData data{};
-                for (size_t local = 0; local < localToGlobal.size(); ++local) {
-                    const renderer::Vertex& v = allVertices[localToGlobal[local]];
-                    data.positions[local] = QuantizePosition(v.position, boundsMin, boundsMax);
-                    data.normals[local] = EncodeOctNormal24(v.normal);
-                    data.uvs[local] = EncodeUV(v.uv);
-                }
-                std::copy(localIndices.begin(), localIndices.end(), data.indices.begin());
-
-                Page page{};
-                page.clusterCount = 1;
-                page.reserved = 0;
-                page.headers[0] = header;
-                page.data[0] = data;
-                result.pages.push_back(page);
-
-                result.totalVertexCount += header.vertexCount;
-                result.totalTriangleCount += header.indexCount / 3u;
-
-                globalToLocal.clear();
-                localToGlobal.clear();
-                localIndices.clear();
-                };
-
-            for (size_t tri = 0; tri + 2 < allIndices.size(); tri += 3) {
-                uint32_t i0 = allIndices[tri + 0];
-                uint32_t i1 = allIndices[tri + 1];
-                uint32_t i2 = allIndices[tri + 2];
-
-                if (allVertices[i0].meshID != targetMeshID) {
-                    continue; // This triangle belongs to a different entity.
-                }
-
-                uint32_t newVertsNeeded = 0;
-                for (uint32_t g : { i0, i1, i2 }) {
-                    if (globalToLocal.find(g) == globalToLocal.end()) {
-                        ++newVertsNeeded;
+        // Reconstructs an (geometry-less) in-memory ClusterDAG purely from an on-disk DAG table,
+        // so ValidateClusterDAG can be re-run *after* a write+read round trip -- proving the
+        // on-disk bytes, not just the pre-write in-memory structure, encode a structurally and
+        // error-monotonically valid DAG. Relies on this file's own invariant that clusterID is
+        // always assigned as a simple 0-based running index matching array position exactly (see
+        // the clusterID assignment loop in RunVirtualGeometryCacheTest below), so
+        // parentClusterID/childClusterID values translate directly into node array indices.
+        ClusterDAG ReconstructDAGFromTable(const std::vector<DAGNodeEntry>& entries) {
+            ClusterDAG dag;
+            dag.nodes.resize(entries.size());
+            for (size_t i = 0; i < entries.size(); ++i) {
+                const DAGNodeEntry& entry = entries[i];
+                ClusterDAGNode& node = dag.nodes[i];
+                node.level = entry.level;
+                node.clusterError = entry.clusterError;
+                node.parentError = entry.parentError;
+                node.parentIndex = (entry.parentClusterID == kInvalidClusterID) ? kInvalidDAGNodeIndex : entry.parentClusterID;
+                for (uint32_t childID : entry.childClusterID) {
+                    if (childID != kInvalidClusterID) {
+                        node.childIndices.push_back(childID);
                     }
                 }
-                bool wouldOverflowVerts = (localToGlobal.size() + newVertsNeeded) > kMaxClusterVertices;
-                bool wouldOverflowTris = (localIndices.size() / 3u + 1u) > kMaxClusterTriangles;
-                if (wouldOverflowVerts || wouldOverflowTris) {
-                    flushCluster();
-                }
-
-                for (uint32_t g : { i0, i1, i2 }) {
-                    auto it = globalToLocal.find(g);
-                    uint8_t local;
-                    if (it == globalToLocal.end()) {
-                        local = static_cast<uint8_t>(localToGlobal.size());
-                        globalToLocal.emplace(g, local);
-                        localToGlobal.push_back(g);
-                    }
-                    else {
-                        local = it->second;
-                    }
-                    localIndices.push_back(local);
+                if (node.parentIndex == kInvalidDAGNodeIndex) {
+                    dag.rootIndices.push_back(static_cast<uint32_t>(i));
                 }
             }
-            flushCluster(); // Flush the final, possibly-partial cluster.
-
-            return result;
+            return dag;
         }
 
     } // namespace
@@ -280,80 +265,147 @@ namespace geometry {
         CacheFileManager cacheManager;
         cacheManager.PurgeExistingCacheFiles(".");
 
-        bool allPassed = true;
+        // --- Build every entity's DAG and flatten them into one global, index-aligned set -------
+        std::vector<ClusterIndexEntry> indexEntries;
+        std::vector<DAGNodeEntry> dagEntries;
+        std::vector<ClusterData> clusterData;
+
+        bool allEntitiesOk = true;
+        uint32_t entitiesWithGeometry = 0;
 
         for (uint32_t entityIdx = 0; entityIdx < entityCount; ++entityIdx) {
             uint32_t meshID = entityData[entityIdx].meshID;
 
-            EntityClusterBuildResult built = BuildClustersForEntity(meshID, allVertices, allIndices);
-            if (built.pages.empty()) {
+            ClusterDAG dag = BuildClusterDAG(meshID, allVertices, allIndices);
+            if (dag.nodes.empty()) {
                 Logger::Log(LogLevel::Warning, std::format(
-                    "[GeometryCacheTest] Entity meshID={} produced zero clusters (no matching triangles); skipping.",
-                    meshID));
+                    "[GeometryCacheTest] Entity meshID={} produced zero clusters (no matching triangles); skipping.", meshID));
+                continue;
+            }
+            ++entitiesWithGeometry;
+
+            // Validate the in-memory DAG *before* persisting it, so a builder bug is caught here
+            // rather than silently baked into the .cache file.
+            std::vector<std::string> dagErrors;
+            if (!ValidateClusterDAG(dag, dagErrors)) {
+                for (const std::string& err : dagErrors) {
+                    Logger::Log(LogLevel::Error, std::format("[GeometryCacheTest] entity meshID={} DAG: {}", meshID, err));
+                }
+                allEntitiesOk = false;
                 continue;
             }
 
-            CacheHeader header{};
-            header.magic = CacheHeader::kMagic;
-            header.version = CacheHeader::kVersion;
-            header.pageCount = static_cast<uint32_t>(built.pages.size());
-            header.pageSizeBytes = Page::kPageSizeBytes;
-            // BuildEntityData() always allocates entity IDs via core::IDManager::Init(0), which
-            // zeroes the context's upper 16 bits — so for this engine's single-factory setup,
-            // the full 64-bit EntityID and the 32-bit meshID are numerically identical.
-            header.entityID = static_cast<uint64_t>(meshID);
-            header.meshID = meshID;
-            header.materialID = entityData[entityIdx].materialID;
-            header.rootClusterIndex = 0; // No DAG hierarchy yet: cluster 0 stands in as the single "root".
-            header.totalVertexCount = built.totalVertexCount;
-            header.totalTriangleCount = built.totalTriangleCount;
-            for (uint32_t p = 0; p < header.pageCount; ++p) {
-                header.pageOffsets[p] = static_cast<uint64_t>(p + 1u) * Page::kPageSizeBytes;
+            uint32_t baseGlobalID = static_cast<uint32_t>(indexEntries.size());
+            std::vector<uint32_t> localToGlobal(dag.nodes.size());
+            for (size_t i = 0; i < dag.nodes.size(); ++i) {
+                localToGlobal[i] = baseGlobalID + static_cast<uint32_t>(i);
             }
 
-            std::filesystem::path filePath = std::filesystem::path(".") / std::format("entity_{}.cache", meshID);
+            for (size_t i = 0; i < dag.nodes.size(); ++i) {
+                const ClusterDAGNode& node = dag.nodes[i];
+                uint32_t globalID = localToGlobal[i];
 
-            if (!cacheManager.WriteCacheFile(filePath, header, built.pages)) {
-                Logger::Log(LogLevel::Error, std::format("[GeometryCacheTest] WriteCacheFile failed for entity meshID={}.", meshID));
-                allPassed = false;
-                continue;
+                ClusterData data{};
+                if (!EncodeClusterData(node, data)) {
+                    allEntitiesOk = false; // Logged inside EncodeClusterData; keep bookkeeping aligned below.
+                }
+                clusterData.push_back(data);
+                indexEntries.push_back(BuildIndexEntry(globalID, meshID, node));
+
+                DAGNodeEntry dagEntry{};
+                dagEntry.clusterID = globalID;
+                dagEntry.parentClusterID = (node.parentIndex == kInvalidDAGNodeIndex) ? kInvalidClusterID : localToGlobal[node.parentIndex];
+                dagEntry.childClusterID[0] = (node.childIndices.size() > 0) ? localToGlobal[node.childIndices[0]] : kInvalidClusterID;
+                dagEntry.childClusterID[1] = (node.childIndices.size() > 1) ? localToGlobal[node.childIndices[1]] : kInvalidClusterID;
+                dagEntry.level = node.level;
+                dagEntry.clusterError = node.clusterError;
+                dagEntry.parentError = node.parentError;
+                dagEntries.push_back(dagEntry);
             }
-
-            std::error_code sizeEc;
-            uint64_t fileSizeBytes = std::filesystem::file_size(filePath, sizeEc);
-            uint64_t expectedSizeBytes = static_cast<uint64_t>(1u + built.pages.size()) * Page::kPageSizeBytes;
-            bool sizeOk = !sizeEc && fileSizeBytes == expectedSizeBytes && (fileSizeBytes % Page::kPageSizeBytes) == 0;
-            if (!sizeOk) {
-                Logger::Log(LogLevel::Error, std::format(
-                    "[GeometryCacheTest] '{}' size mismatch: got {} bytes, expected {} (must be a multiple of {}).",
-                    filePath.string(), fileSizeBytes, expectedSizeBytes, Page::kPageSizeBytes));
-            }
-
-            // Read an arbitrary (not just the first) page back to make sure the allocation-table
-            // math and unbuffered/overlapped I/O both handle a non-zero page offset correctly.
-            uint32_t samplePageIndex = static_cast<uint32_t>(built.pages.size() / 2);
-            Page readBackPage{};
-            std::future<bool> readFuture = cacheManager.ReadPageAsync(filePath, samplePageIndex, readBackPage);
-            bool readOk = readFuture.get();
-
-            bool integrityOk = readOk && std::memcmp(&readBackPage, &built.pages[samplePageIndex], sizeof(Page)) == 0;
-            if (!integrityOk) {
-                Logger::Log(LogLevel::Error, std::format(
-                    "[GeometryCacheTest] '{}' page[{}] failed to round-trip byte-for-byte through disk.",
-                    filePath.string(), samplePageIndex));
-            }
-
-            Logger::Log((sizeOk && integrityOk) ? LogLevel::Info : LogLevel::Error, std::format(
-                "[GeometryCacheTest] Entity meshID={} '{}': {} page(s), {} vertices, {} triangles. "
-                "Size check: {}. Page[{}] round-trip integrity: {}.",
-                meshID, filePath.string(), built.pages.size(), built.totalVertexCount, built.totalTriangleCount,
-                sizeOk ? "OK" : "FAIL", samplePageIndex, integrityOk ? "OK" : "FAIL"));
-
-            allPassed = allPassed && sizeOk && integrityOk;
         }
 
+        if (!allEntitiesOk) {
+            Logger::Log(LogLevel::Error,
+                "[GeometryCacheTest] Aborting before write: one or more entities failed DAG validation or cluster encoding (see errors above).");
+            return false;
+        }
+        if (indexEntries.empty()) {
+            Logger::Log(LogLevel::Error, "[GeometryCacheTest] Aborting: no entity produced any cluster.");
+            return false;
+        }
+
+        // --- Write the whole scene's clusters into ONE consolidated .cache file -----------------
+        std::filesystem::path filePath = std::filesystem::path(".") / "scene.cache";
+        if (!cacheManager.WriteCacheFile(filePath, indexEntries, dagEntries, clusterData, entitiesWithGeometry)) {
+            Logger::Log(LogLevel::Error, std::format("[GeometryCacheTest] WriteCacheFile failed for '{}'.", filePath.string()));
+            return false;
+        }
+
+        // --- Read everything back and verify a byte-exact round trip ----------------------------
+        bool allPassed = true;
+
+        CacheFileHeader readHeader{};
+        if (!cacheManager.ReadHeader(filePath, readHeader)) {
+            Logger::Log(LogLevel::Error, "[GeometryCacheTest] Failed to read back the CacheFileHeader.");
+            return false;
+        }
+        bool headerOk = readHeader.clusterCount == indexEntries.size() && readHeader.entityCount == entitiesWithGeometry;
+        allPassed = allPassed && headerOk;
+        Logger::Log(headerOk ? LogLevel::Info : LogLevel::Error, std::format(
+            "[GeometryCacheTest] Header round-trip: {} (clusterCount={}, entityCount={}).",
+            headerOk ? "OK" : "FAIL", readHeader.clusterCount, readHeader.entityCount));
+
+        std::vector<ClusterIndexEntry> readIndexEntries;
+        bool indexTableOk = cacheManager.ReadClusterIndexTable(filePath, readHeader, readIndexEntries)
+            && readIndexEntries.size() == indexEntries.size()
+            && std::memcmp(readIndexEntries.data(), indexEntries.data(), indexEntries.size() * sizeof(ClusterIndexEntry)) == 0;
+        allPassed = allPassed && indexTableOk;
+        Logger::Log(indexTableOk ? LogLevel::Info : LogLevel::Error, std::format(
+            "[GeometryCacheTest] Cluster index table round-trip: {}.", indexTableOk ? "OK" : "FAIL"));
+
+        std::vector<DAGNodeEntry> readDagEntries;
+        bool dagTableOk = cacheManager.ReadDAGTable(filePath, readHeader, readDagEntries)
+            && readDagEntries.size() == dagEntries.size()
+            && std::memcmp(readDagEntries.data(), dagEntries.data(), dagEntries.size() * sizeof(DAGNodeEntry)) == 0;
+        allPassed = allPassed && dagTableOk;
+        Logger::Log(dagTableOk ? LogLevel::Info : LogLevel::Error, std::format(
+            "[GeometryCacheTest] DAG table round-trip: {}.", dagTableOk ? "OK" : "FAIL"));
+
+        // Re-validate the DAG *as reconstructed from the on-disk table*, proving the persisted
+        // bytes (not just the pre-write in-memory structure) still satisfy every structural and
+        // error-monotonicity invariant.
+        bool onDiskDagValid = false;
+        if (dagTableOk) {
+            ClusterDAG reconstructed = ReconstructDAGFromTable(readDagEntries);
+            std::vector<std::string> reconstructedErrors;
+            onDiskDagValid = ValidateClusterDAG(reconstructed, reconstructedErrors);
+            for (const std::string& err : reconstructedErrors) {
+                Logger::Log(LogLevel::Error, std::format("[GeometryCacheTest] on-disk DAG: {}", err));
+            }
+        }
+        allPassed = allPassed && onDiskDagValid;
+        Logger::Log(onDiskDagValid ? LogLevel::Info : LogLevel::Error, std::format(
+            "[GeometryCacheTest] On-disk DAG re-validation: {}.", onDiskDagValid ? "OK" : "FAIL"));
+
+        // Sample one arbitrary (not just the first) cluster's geometry block and verify it
+        // decodes byte-exact, exercising the unbuffered/overlapped read path and the page
+        // alignment/zero-padding CacheFileManager::WriteCacheFile is responsible for.
+        uint32_t sampleClusterIndex = static_cast<uint32_t>(indexEntries.size() / 2);
+        bool clusterReadOk = false;
+        if (readIndexEntries.size() > sampleClusterIndex) {
+            ClusterData readClusterData{};
+            std::future<bool> readFuture = cacheManager.ReadClusterDataAsync(
+                filePath, readIndexEntries[sampleClusterIndex].virtualAddress, readClusterData);
+            clusterReadOk = readFuture.get()
+                && std::memcmp(&readClusterData, &clusterData[sampleClusterIndex], sizeof(ClusterData)) == 0;
+        }
+        allPassed = allPassed && clusterReadOk;
+        Logger::Log(clusterReadOk ? LogLevel::Info : LogLevel::Error, std::format(
+            "[GeometryCacheTest] Sample cluster [{}] geometry block round-trip: {}.", sampleClusterIndex, clusterReadOk ? "OK" : "FAIL"));
+
         Logger::Log(allPassed ? LogLevel::Info : LogLevel::Error, std::format(
-            "[GeometryCacheTest] Virtual geometry cache round-trip test {}.", allPassed ? "PASSED" : "FAILED"));
+            "[GeometryCacheTest] Virtual geometry cache round-trip test {} -- '{}': {} cluster(s) across {} entit(y/ies).",
+            allPassed ? "PASSED" : "FAILED", filePath.string(), indexEntries.size(), entitiesWithGeometry));
 
         return allPassed;
     }

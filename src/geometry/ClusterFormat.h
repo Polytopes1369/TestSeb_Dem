@@ -1,42 +1,119 @@
 #pragma once
 // Binary on-disk (and, eventually, GPU-streamed) format for the virtual geometry cache
-// (Nanite-style clustered geometry). Every structure in this file is a trivial, standard-layout
-// POD so it can be memcpy'd directly to/from disk via CacheFileManager (including unbuffered,
-// sector-aligned I/O) with no serialization/deserialization pass beyond what the GPU shaders
-// eventually decode themselves (quantized positions, oct-encoded normals, half-float UVs...).
+// (Nanite-style clustered geometry). The whole scene's clusters -- every entity, every DAG level
+// -- are consolidated into ONE .cache file, laid out as four 4096-byte-aligned sections so a
+// future GPU-driven streamer can page any section in with unbuffered, sector-aligned I/O:
+//
+//   [0]                      CacheFileHeader                  (exactly kPageSizeBytes bytes)
+//   [clusterIndexTableOffset] ClusterIndexEntry[clusterCount]  (zero-padded up to a page boundary)
+//   [dagTableOffset]          DAGNodeEntry[clusterCount]       (zero-padded up to a page boundary)
+//   [geometryDataBaseOffset]  ClusterData[clusterCount]        (each entry individually page-aligned)
+//
+// Every structure below is `#pragma pack(push, 1)`-ed: no compiler-inserted inter-member padding
+// is ever relied upon, so the layout is identical byte-for-byte across compilers/platforms (a
+// requirement for a format a separate GPU-side loader must decode without pulling in this C++
+// struct definition). Where a section must additionally land on a page boundary (the header
+// itself, and the start of each geometry block), that alignment is guaranteed by the *writer*
+// (CacheFileManager::WriteCacheFile) explicitly zero-filling the gap -- not by struct-level
+// alignas/padding tricks, so the byte-for-byte zero-fill is visible in the write path itself.
+//
+// clusterIndexTableOffset/dagTableOffset/geometryDataBaseOffset are always multiples of
+// kPageSizeBytes; clusterIndexTableSizeBytes/dagTableSizeBytes are the *unpadded* table sizes
+// (clusterCount * sizeof(entry)) -- a reader uses those to know how many real entries to parse,
+// while the writer separately pads the file up to the next page boundary afterwards.
 
-#include <array>
-#include <cstddef>
 #include <cstdint>
 #include "core/maths/Maths.h"
 
 namespace geometry {
 
-    // Sentinel used by ClusterHeader::parentID to mean "this cluster is a DAG root: it has no
-    // coarser parent to collapse into".
+    // Sentinel used by DAGNodeEntry::parentClusterID/childClusterID to mean "no such cluster" --
+    // this is a DAG root (no parent) or a leaf (no children).
     constexpr uint32_t kInvalidClusterID = 0xFFFFFFFFu;
 
-    // Maximum vertices/triangles a single cluster (meshlet) can hold. Chosen to match common
-    // GPU mesh-shader meshlet limits (VK_EXT_mesh_shader) and to keep ClusterData a fixed,
-    // page-friendly size (see the static_asserts below).
-    constexpr uint32_t kMaxClusterVertices = 128u;
+    // Maximum vertices/triangles a single cluster (meshlet) can hold. Chosen to match common GPU
+    // mesh-shader meshlet limits (VK_EXT_mesh_shader) and to keep ClusterData a fixed size.
+    constexpr uint32_t kMaxClusterVertices = 64u;
     constexpr uint32_t kMaxClusterTriangles = 128u;
     constexpr uint32_t kMaxClusterIndices = kMaxClusterTriangles * 3u;
 
+    // The atomic disk I/O / section-alignment granularity: every major section of the file (the
+    // header, and the start of each cluster's geometry block) begins on a multiple of this many
+    // bytes, matching a real storage device's 4K sector size for FILE_FLAG_NO_BUFFERING streaming.
+    constexpr uint32_t kPageSizeBytes = 4096u;
+
+#pragma pack(push, 1)
+
     // -----------------------------------------------------------------------------------------
-    // ClusterHeader — one per cluster. Exactly 64 bytes (one CPU cache line) so an array of
-    // headers can be scanned/culled on the CPU, or copied verbatim into a GPU SSBO, with zero
-    // padding waste.
+    // CacheFileHeader — the very first bytes of a .cache file. Its own on-disk footprint is
+    // exactly kPageSizeBytes (the struct itself is much smaller; CacheFileManager::WriteCacheFile
+    // explicitly zero-fills the remainder of the page, see kCacheFileHeaderPaddedSizeBytes below).
     // -----------------------------------------------------------------------------------------
-    struct alignas(64) ClusterHeader {
+    struct CacheFileHeader {
+        static constexpr uint32_t kMagic = 0x4F45474Cu;   // "LGEO" little-endian ("Local GEOmetry cache")
+        static constexpr uint32_t kVersion = 2u;           // Bumped from the single-entity-per-file v1 format.
+
+        uint32_t magic;
+        uint32_t version;
+
+        uint32_t clusterCount; // Total clusters across every entity and every DAG level in this file.
+        uint32_t entityCount;  // Number of distinct entities (meshID values) contributing clusters.
+
+        // Cluster index table: ClusterIndexEntry[clusterCount], one entry per cluster, giving its
+        // virtual address (byte offset) and block size in the geometry data section, plus enough
+        // metadata (bounds, sphere, cone) for CPU/GPU-side coarse culling without touching the
+        // (potentially not-yet-streamed-in) geometry block itself.
+        uint64_t clusterIndexTableOffset;
+        uint64_t clusterIndexTableSizeBytes; // == clusterCount * sizeof(ClusterIndexEntry), unpadded.
+
+        // DAG table: DAGNodeEntry[clusterCount], index-aligned 1:1 with the cluster index table
+        // (DAGNodeEntry[i] describes the same cluster as ClusterIndexEntry[i]) -- parent/child
+        // links and the e_local/e_parent error pair used for a runtime LOD cut.
+        uint64_t dagTableOffset;
+        uint64_t dagTableSizeBytes; // == clusterCount * sizeof(DAGNodeEntry), unpadded.
+
+        // Geometry data section: ClusterData[clusterCount], NOT necessarily index-aligned with
+        // the tables above (a cluster's actual byte offset is ClusterIndexEntry::virtualAddress,
+        // since a future variable-resolution cluster could reserve more than one page here) --
+        // this field only marks where the section as a whole begins.
+        uint64_t geometryDataBaseOffset;
+
+        uint64_t totalFileSizeBytes; // Full file size, for a reader's sanity check against fstat.
+    };
+
+    // How many bytes CacheFileHeader itself occupies on disk once page-aligned (the writer zero-
+    // fills [sizeof(CacheFileHeader), kCacheFileHeaderPaddedSizeBytes) -- see file header comment).
+    constexpr uint32_t kCacheFileHeaderPaddedSizeBytes = kPageSizeBytes;
+    static_assert(sizeof(CacheFileHeader) <= kCacheFileHeaderPaddedSizeBytes,
+        "CacheFileHeader must fit within one page so it can be zero-padded up to kPageSizeBytes");
+    static_assert(sizeof(CacheFileHeader) == 64, "CacheFileHeader size drifted from the expected 64 bytes");
+
+    // -----------------------------------------------------------------------------------------
+    // ClusterIndexEntry — one per cluster, in the cluster index table.
+    // -----------------------------------------------------------------------------------------
+    struct ClusterIndexEntry {
+        uint32_t clusterID; // Unique across the whole file; matches the same-index DAGNodeEntry::clusterID.
+        uint32_t entityID;  // The owning entity's meshID.
+
+        uint64_t virtualAddress; // Byte offset from the start of the file where this cluster's
+                                  // ClusterData block begins. Always a multiple of kPageSizeBytes.
+        uint32_t blockSizeBytes; // Size in bytes reserved for this cluster's geometry block.
+                                  // Always a multiple of kPageSizeBytes; currently always exactly
+                                  // kPageSizeBytes (one cluster == one page), but stored explicitly
+                                  // rather than assumed so a future variable-resolution cluster
+                                  // spanning multiple pages needs no format change.
+
+        uint32_t vertexCount; // Valid entries in the referenced ClusterData (<= kMaxClusterVertices).
+        uint32_t indexCount;  // Valid entries in ClusterData::indices (<= kMaxClusterIndices).
+
         // Axis-aligned bounding box, in the owning entity's local space. Doubles as the decode
         // range for this cluster's ClusterData quantized vertex positions (see GeometryEncoding.h).
-        maths::vec3 boundsMin;
-        maths::vec3 boundsMax;
+        float boundsMin[3];
+        float boundsMax[3];
 
         // Bounding sphere: redundant with the AABB but cheaper to test for coarse frustum /
         // hierarchical-LOD-cut culling (one distance check instead of six plane tests).
-        maths::vec3 sphereCenter;
+        float sphereCenter[3];
         float sphereRadius;
 
         // Normal cone (meshopt_Bounds-style), signed-8-bit quantized: every triangle normal in
@@ -46,30 +123,36 @@ namespace geometry {
         int8_t coneAxisY;
         int8_t coneAxisZ;
         int8_t coneCutoff;
-
-        // DAG-based hierarchical LOD error metrics (Nanite-style): clusterError is the world-
-        // space geometric error introduced by simplifying down to this cluster; parentError is
-        // the error that would be introduced if the renderer collapsed this cluster into its DAG
-        // parent instead. A view-dependent cut of the DAG selects the coarsest cluster whose
-        // projected screen-space error is still below threshold.
-        float clusterError;
-        float parentError;
-
-        uint16_t vertexCount; // Valid entries in the associated ClusterData (<= kMaxClusterVertices)
-        uint16_t indexCount;  // Valid entries in ClusterData::indices (<= kMaxClusterIndices), = triangleCount * 3
-
-        uint32_t parentID;  // Index of the parent cluster in the DAG, or kInvalidClusterID if this is a root
-        uint32_t clusterID; // This cluster's own index within its owning entity's DAG
     };
-    static_assert(sizeof(ClusterHeader) == 64, "ClusterHeader must be exactly 64 bytes (one cache line)");
-    static_assert(alignof(ClusterHeader) == 64, "ClusterHeader must be 64-byte aligned");
+    static_assert(sizeof(ClusterIndexEntry) == 72, "ClusterIndexEntry size drifted from the expected 72 bytes");
 
     // -----------------------------------------------------------------------------------------
-    // ClusterData — quantized vertex attributes + local triangle list for one cluster.
+    // DAGNodeEntry — one per cluster, in the DAG table, index-aligned with the cluster index
+    // table (DAGNodeEntry[i] and ClusterIndexEntry[i] describe the same cluster).
+    // -----------------------------------------------------------------------------------------
+    struct DAGNodeEntry {
+        uint32_t clusterID;         // Matches the same-index ClusterIndexEntry::clusterID.
+        uint32_t parentClusterID;   // kInvalidClusterID if this cluster is a DAG root.
+        uint32_t childClusterID[2]; // kInvalidClusterID for unused slots (a leaf has both unused).
+        uint32_t level;             // 0 = leaf (exact geometry); +1 per grouping/simplification pass above that.
+
+        // e_local / e_parent (see ClusterDAG.h): the geometric error introduced by this cluster,
+        // and the error its own parent introduces. A runtime LOD cut compares a view-dependent
+        // threshold against these to pick the coarsest acceptable cluster along each DAG path.
+        // parentError is +infinity for a root; clusterError is exactly 0 for a leaf.
+        float clusterError;
+        float parentError;
+    };
+    static_assert(sizeof(DAGNodeEntry) == 28, "DAGNodeEntry size drifted from the expected 28 bytes");
+
+    // -----------------------------------------------------------------------------------------
+    // ClusterData — quantized vertex attributes + local triangle list for one cluster. This is
+    // the payload written at each cluster's ClusterIndexEntry::virtualAddress, zero-padded up to
+    // ClusterIndexEntry::blockSizeBytes by the writer.
     // -----------------------------------------------------------------------------------------
 
     // Vertex position quantized to 16 bits/channel, normalized against the owning
-    // ClusterHeader's [boundsMin, boundsMax] range (see GeometryEncoding::QuantizePosition).
+    // ClusterIndexEntry's [boundsMin, boundsMax] range (see GeometryEncoding::QuantizePosition).
     struct ClusterVertexPosition {
         uint16_t x;
         uint16_t y;
@@ -92,114 +175,17 @@ namespace geometry {
     static_assert(sizeof(ClusterVertexUV) == 4, "ClusterVertexUV must be 4 bytes");
 
     struct ClusterData {
-        std::array<ClusterVertexPosition, kMaxClusterVertices> positions;
-        std::array<ClusterVertexNormal, kMaxClusterVertices> normals;
-        std::array<ClusterVertexUV, kMaxClusterVertices> uvs;
+        ClusterVertexPosition positions[kMaxClusterVertices];
+        ClusterVertexNormal normals[kMaxClusterVertices];
+        ClusterVertexUV uvs[kMaxClusterVertices];
         // Local (cluster-relative) triangle-list indices, in [0, kMaxClusterVertices), indexing
         // into the arrays above.
-        std::array<uint8_t, kMaxClusterIndices> indices;
+        uint8_t indices[kMaxClusterIndices];
     };
-    static_assert(sizeof(ClusterData) == 2048, "ClusterData size drifted from the expected 2048 bytes");
+    static_assert(sizeof(ClusterData) == 1216, "ClusterData size drifted from the expected 1216 bytes");
+    static_assert(kPageSizeBytes >= sizeof(ClusterData),
+        "ClusterData must fit within one page so a cluster's geometry block can be a single page");
 
-    // With ClusterHeader = 64B and ClusterData = 2048B, one cluster occupies 2112B; two such
-    // clusters (4224B) would overflow a 4KB page, so exactly one cluster fits per page at this
-    // configuration. The array-based layout below still generalizes to N clusters/page if
-    // kMaxClusterVertices or kPageSizeBytes are retuned later.
-    constexpr uint32_t kPageSizeBytes = 4096u;
-    constexpr uint32_t kMaxClustersPerPage = 1u;
-
-    namespace detail {
-        // Mirrors Page's members (minus the tail padding) so its sizeof can be used to compute
-        // that padding below. MSVC rejects `offsetof(Page, padding)` from inside Page's own
-        // definition (the type is still incomplete at that point) even though GCC/Clang accept
-        // that self-referential pattern, so the byte count has to come from a standalone type
-        // with an identical, alignas-free member sequence instead.
-        struct PageBody {
-            uint32_t clusterCount;
-            uint32_t reserved;
-            std::array<ClusterHeader, kMaxClustersPerPage> headers;
-            std::array<ClusterData, kMaxClustersPerPage> data;
-        };
-    }
-
-    // -----------------------------------------------------------------------------------------
-    // Page — the atomic disk I/O unit: exactly 4096 bytes so it maps 1:1 onto a 4K storage
-    // sector/OS page, letting CacheFileManager stream it with FILE_FLAG_NO_BUFFERING.
-    // -----------------------------------------------------------------------------------------
-    struct alignas(4096) Page {
-        static constexpr uint32_t kPageSizeBytes = geometry::kPageSizeBytes;
-        static constexpr uint32_t kMaxClustersPerPage = geometry::kMaxClustersPerPage;
-
-        uint32_t clusterCount; // Valid entries in headers/data (<= kMaxClustersPerPage)
-        uint32_t reserved;     // Reserved for future per-page flags (compression, version...)
-        std::array<ClusterHeader, kMaxClustersPerPage> headers;
-        std::array<ClusterData, kMaxClustersPerPage> data;
-
-        // Explicit tail padding, sized from detail::PageBody's size (identical member layout)
-        // so the struct's total size always lands on exactly kPageSizeBytes regardless of future
-        // edits above (also absorbs the compiler-inserted padding needed to 64-byte-align the
-        // `headers` array).
-        uint8_t padding[kPageSizeBytes - sizeof(detail::PageBody)];
-    };
-    static_assert(sizeof(Page) == Page::kPageSizeBytes, "Page must be exactly 4096 bytes");
-    static_assert(alignof(Page) == 4096, "Page must be 4096-byte aligned");
-
-    constexpr uint32_t kCacheHeaderSizeBytes = 4096u;
-    // Sized so the allocation table below occupies most of the header, then self-pads (via the
-    // trailing `padding` member) to exactly kCacheHeaderSizeBytes.
-    constexpr uint32_t kMaxPageEntries = 500u;
-
-    namespace detail {
-        // Mirrors CacheHeader's members (minus the tail padding); see PageBody above for why this
-        // indirection is needed instead of a self-referential offsetof(CacheHeader, padding).
-        struct CacheHeaderBody {
-            uint32_t magic;
-            uint32_t version;
-            uint32_t pageCount;
-            uint32_t pageSizeBytes;
-
-            uint64_t entityID;
-            uint32_t meshID;
-            uint32_t materialID;
-            uint32_t rootClusterIndex;
-            uint32_t totalVertexCount;
-            uint32_t totalTriangleCount;
-
-            std::array<uint64_t, kMaxPageEntries> pageOffsets;
-        };
-    }
-
-    // -----------------------------------------------------------------------------------------
-    // CacheHeader — present once at the very start of a .cache file. Exactly 4096 bytes (one
-    // Page's worth) so pages always start at a page-aligned file offset: (1 + pageIndex) * 4096.
-    // -----------------------------------------------------------------------------------------
-    struct alignas(4096) CacheHeader {
-        static constexpr uint32_t kMagic = 0x48434143u; // "CACH" little-endian
-        static constexpr uint32_t kVersion = 1u;
-        static constexpr uint32_t kHeaderSizeBytes = geometry::kCacheHeaderSizeBytes;
-        static constexpr uint32_t kMaxPageEntries = geometry::kMaxPageEntries;
-
-        uint32_t magic;
-        uint32_t version;
-        uint32_t pageCount;     // Number of valid entries in pageOffsets (<= kMaxPageEntries)
-        uint32_t pageSizeBytes; // = Page::kPageSizeBytes; lets a reader sanity-check format compatibility
-
-        uint64_t entityID; // core::EntityID this cache file describes
-        uint32_t meshID;
-        uint32_t materialID;
-        uint32_t rootClusterIndex;   // Index into pageOffsets of the DAG root cluster's page
-        uint32_t totalVertexCount;   // Sum of vertexCount across every cluster, for stats/debug
-        uint32_t totalTriangleCount; // Sum of (indexCount / 3) across every cluster
-
-        // Global page allocation table: pageOffsets[i] is the absolute byte offset from the
-        // start of the file where page i begins. Always a multiple of Page::kPageSizeBytes,
-        // since pages are written back-to-back immediately after this header
-        // (see CacheFileManager::WriteCacheFile).
-        std::array<uint64_t, kMaxPageEntries> pageOffsets;
-
-        uint8_t padding[kHeaderSizeBytes - sizeof(detail::CacheHeaderBody)];
-    };
-    static_assert(sizeof(CacheHeader) == CacheHeader::kHeaderSizeBytes, "CacheHeader must be exactly 4096 bytes");
-    static_assert(alignof(CacheHeader) == 4096, "CacheHeader must be 4096-byte aligned");
+#pragma pack(pop)
 
 }

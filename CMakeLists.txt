@@ -41,6 +41,50 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
 )
 
 # ==============================================================================
+# UNIT TESTS (native C++, no external framework, no Vulkan/GLFW dependency)
+# ==============================================================================
+enable_testing()
+
+add_executable(ClusterPartitionerTests
+    src/geometry/ClusterPartitioner.cpp
+    tests/ClusterPartitionerTests.cpp
+)
+target_include_directories(ClusterPartitionerTests PRIVATE src)
+add_test(NAME ClusterPartitionerTests COMMAND ClusterPartitionerTests)
+
+add_executable(ClusterSimplificationTests
+    src/geometry/ClusterPartitioner.cpp
+    src/geometry/ClusterGrouping.cpp
+    src/geometry/MeshSimplifier.cpp
+    src/geometry/ObjExport.cpp
+    tests/ClusterSimplificationTests.cpp
+)
+target_include_directories(ClusterSimplificationTests PRIVATE src)
+add_test(NAME ClusterSimplificationTests COMMAND ClusterSimplificationTests)
+
+add_executable(ClusterDAGTests
+    src/geometry/ClusterPartitioner.cpp
+    src/geometry/ClusterGrouping.cpp
+    src/geometry/MeshSimplifier.cpp
+    src/geometry/ClusterDAG.cpp
+    tests/ClusterDAGTests.cpp
+)
+target_include_directories(ClusterDAGTests PRIVATE src)
+add_test(NAME ClusterDAGTests COMMAND ClusterDAGTests)
+
+add_executable(CacheFileFormatTests
+    src/geometry/ClusterPartitioner.cpp
+    src/geometry/ClusterGrouping.cpp
+    src/geometry/MeshSimplifier.cpp
+    src/geometry/ClusterDAG.cpp
+    src/geometry/CacheFileManager.cpp
+    src/core/Logger.cpp
+    tests/CacheFileFormatTests.cpp
+)
+target_include_directories(CacheFileFormatTests PRIVATE src ${Vulkan_INCLUDE_DIRS})
+add_test(NAME CacheFileFormatTests COMMAND CacheFileFormatTests)
+
+# ==============================================================================
 # AUTOMATIZED SHADER COMPILATION & POST-BUILD COPY
 # ==============================================================================
 

@@ -1,8 +1,12 @@
 #pragma once
 // End-to-end validation test for the virtual geometry .cache format (ClusterFormat.h) and its
 // I/O layer (CacheFileManager). Reads back the *real* procedurally-generated Vertex/Index SSBOs
-// currently living on the GPU, partitions them per spawned entity into clusters, writes one
-// .cache file per entity, then re-reads a page from disk and checks it round-trips exactly.
+// currently living on the GPU, builds a full cluster DAG (ClusterDAG.h) per spawned entity,
+// consolidates every entity's clusters into ONE .cache file (header + cluster index table + DAG
+// table + page-aligned geometry blocks, see ClusterFormat.h), then re-reads the header, both
+// tables, and a sample cluster back from disk and checks everything round-trips byte-exact --
+// including re-validating the on-disk DAG table's structural/error-monotonicity invariants via
+// ValidateClusterDAG after the round trip, not just before writing.
 
 #include <cstdint>
 #include <vulkan/vulkan.h>
@@ -20,9 +24,10 @@ namespace geometry {
     // readback). entityData/entityCount describe the spawned entities exactly as authored by
     // VulkanContext::BuildEntityData() (meshID, materialID, ...).
     //
-    // Returns true iff every entity's cache file was written, has a size that is a strict
-    // multiple of 4096 bytes, and an arbitrary page read back from disk decodes to byte-exact
-    // the same cluster data that was written.
+    // Returns true iff every entity produced a structurally valid DAG, every cluster encoded
+    // within the fixed-size on-disk format's capacity, the consolidated .cache file was written,
+    // and reading the header/tables/a sample cluster back from disk reproduces byte-exact the
+    // same data that was written (with the on-disk DAG table re-validated after the round trip).
     bool RunVirtualGeometryCacheTest(
         VkDevice device,
         VmaAllocator allocator,
