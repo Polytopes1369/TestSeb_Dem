@@ -37,10 +37,24 @@ public:
     // single scene draw call in main.cpp draws exactly this many indices in one vkCmdDraw.
     uint32_t GetTotalIndexCount() const { return m_TotalIndexCount; }
 
+    // Total number of vertices written across all 9 procedurally-generated primitives.
+    uint32_t GetTotalVertexCount() const { return m_TotalVertexCount; }
+
     // Recomputes every entity's self-rotation (tumbling on all 3 axes) from elapsed scene
     // time and re-uploads the whole EntityTransform array to the GPU. Must be called once per
     // frame, before recording the draw, so the vertex shader picks up this frame's rotation.
     void UpdateEntityRotations(float timeSeconds);
+
+    // --- Accessors exposing the raw GPU handles needed by geometry::RunVirtualGeometryCacheTest
+    // to read back the live procedural Vertex/Index SSBOs for the virtual geometry cache test.
+    // Kept minimal (handles + counts only) so the geometry/ module never needs to include this
+    // header's private implementation details.
+    VmaAllocator GetAllocator() const { return m_Allocator; }
+    VkCommandPool GetCommandPool() const { return m_CommandPool; }
+    VkBuffer GetVertexBuffer() const { return m_VertexBuffer; }
+    VkBuffer GetIndexBuffer() const { return m_IndexBuffer; }
+    const core::EntityData* GetEntityData() const { return m_EntityData.data(); }
+    uint32_t GetEntityCount() const { return kEntityCount; }
 
 private:
     VkInstance m_Instance = VK_NULL_HANDLE;
@@ -116,7 +130,8 @@ private:
     VkPipelineLayout m_ComputePipelineLayout = VK_NULL_HANDLE;
     VkPipelineLayout m_GraphicsPipelineLayout = VK_NULL_HANDLE;
 
-    // Running total of indices written by GenerateGeometry() across all 9 primitives.
+    // Running total of vertices/indices written by GenerateGeometry() across all 9 primitives.
+    uint32_t m_TotalVertexCount = 0;
     uint32_t m_TotalIndexCount = 0;
 
     // One EntityTransform slot per primitive meshID (box=0 .. cylinder=8); see struct_custo.glsl.

@@ -1237,6 +1237,7 @@ void VulkanContext::GenerateGeometry() {
         runningIndexOffset += 6u * params.nbSides * (params.nbHeightSegs + 2u * params.nbCapSegs);
     }
 
+    m_TotalVertexCount = runningVertexOffset;
     m_TotalIndexCount = runningIndexOffset;
     Logger::Log(LogLevel::Info, std::format(
         "[GenerateGeometry] All 9 primitives generated: totalVertexCount={} totalIndexCount={} "

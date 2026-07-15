@@ -6,6 +6,7 @@
 #include "core/Camera.h"
 #include "core/EntityData.h"
 #include "core/EngineConfig.h"
+#include "geometry/VirtualGeometryCacheTest.h"
 #include <format>
 
 int main() {
@@ -30,6 +31,19 @@ int main() {
     // Initialize Vulkan Context (Instance, GPU, Logic Device, Surface, Swapchain, Pipelines, VMA)
     VulkanContext vkContext;
     vkContext.Init("DemoScene", window);
+
+    // One-shot validation of the virtual geometry .cache format: reads back the 9 spawned
+    // entities' live procedural geometry from the GPU, writes one .cache file per entity, then
+    // re-reads a page from disk and checks it round-trips byte-exact. Purely diagnostic — does
+    // not affect rendering — so a failure here is logged, not fatal.
+    bool geometryCacheTestPassed = geometry::RunVirtualGeometryCacheTest(
+        vkContext.GetDevice(), vkContext.GetAllocator(), vkContext.GetGraphicsQueue(), vkContext.GetCommandPool(),
+        vkContext.GetVertexBuffer(), vkContext.GetIndexBuffer(),
+        vkContext.GetTotalVertexCount(), vkContext.GetTotalIndexCount(),
+        vkContext.GetEntityData(), vkContext.GetEntityCount());
+    if (!geometryCacheTestPassed) {
+        Logger::Log(LogLevel::Error, "[Main] Virtual geometry cache round-trip test FAILED — see [GeometryCacheTest] log entries above.");
+    }
 
     Logger::Log(LogLevel::Info, "Entering main loop.");
 
