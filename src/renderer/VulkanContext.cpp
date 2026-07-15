@@ -139,6 +139,51 @@ namespace {
         float worldOffsetZ;
     };
 
+    struct PyramidParams {
+        float height;
+        float radius;
+        uint32_t nbSides;
+        uint32_t meshID;
+        float materialID;
+        uint32_t vertexOffset;
+        uint32_t indexOffset;
+        float worldOffsetX;
+        float worldOffsetY;
+        float worldOffsetZ;
+    };
+
+    struct TorusKnotParams {
+        float radius;
+        float tube;
+        uint32_t p;
+        uint32_t q;
+        uint32_t nbRadSeg;
+        uint32_t nbSides;
+        uint32_t meshID;
+        float materialID;
+        uint32_t vertexOffset;
+        uint32_t indexOffset;
+        float worldOffsetX;
+        float worldOffsetY;
+        float worldOffsetZ;
+    };
+
+    struct ChamferBoxParams {
+        float width;
+        float height;
+        float depth;
+        uint32_t sideSegs;
+        uint32_t heightSegs;
+        float chamferPower;
+        uint32_t meshID;
+        float materialID;
+        uint32_t vertexOffset;
+        uint32_t indexOffset;
+        float worldOffsetX;
+        float worldOffsetY;
+        float worldOffsetZ;
+    };
+
     // CPU mirror of the GLSL EntityTransform struct (struct_custo.glsl): must match its
     // std430 layout exactly (mat4 = 64 bytes, vec3 + pad = 16 bytes) since it is memcpy'd
     // wholesale into m_EntityTransformBuffer every frame.
@@ -676,6 +721,9 @@ void VulkanContext::CreatePipelinesAndDescriptors() {
         { "shaders/geom_tube.comp.spv",      &m_TubePipeline },
         { "shaders/geom_capsule.comp.spv",   &m_CapsulePipeline },
         { "shaders/geom_cylinder.comp.spv",  &m_CylinderPipeline },
+        { "shaders/geom_pyramide.comp.spv",   &m_PyramidPipeline },
+        { "shaders/geom_TorusKnot.comp.spv",  &m_TorusKnotPipeline },
+        { "shaders/geom_chamferBox.comp.spv", &m_ChamferBoxPipeline },
     };
     for (const auto& desc : simplePrimitives) {
         auto code = ReadShaderFile(desc.shaderFile);
@@ -832,10 +880,11 @@ void VulkanContext::DispatchGeometryCompute(
 }
 
 maths::vec2 VulkanContext::GridSlot(int slotIndex) const {
-    // 3x3 grid centered on (0,0,0), in the XZ plane (Y = 0 ground level), spaced
-    // kGridSpacing apart. Used both by GenerateGeometry() (to bake each primitive's world
-    // position at generation time) and UpdateEntityRotations() (to recover each entity's
-    // rotation pivot), so this is the single source of truth for the layout.
+    // 3-wide grid (as many rows as needed) centered on (0,0,0), in the XZ plane (Y = 0 ground
+    // level), spaced kGridSpacing apart; with kEntityCount = 12 this fills exactly 4 rows.
+    // Used both by GenerateGeometry() (to bake each primitive's world position at generation
+    // time) and UpdateEntityRotations() (to recover each entity's rotation pivot), so this is
+    // the single source of truth for the layout.
     constexpr float kGridSpacing = 3.0f;
     int col = slotIndex % 3;
     int row = slotIndex / 3;
@@ -844,8 +893,8 @@ maths::vec2 VulkanContext::GridSlot(int slotIndex) const {
 
 void VulkanContext::BuildEntityData() {
     // Context 0: this is currently the only "factory" allocating entity IDs in the engine.
-    // Sequence starts at 0, so the 9 sequential GetNextID() calls below deterministically
-    // produce 0..8 in the low 32 bits, matching kEntityCount's dense-index requirement.
+    // Sequence starts at 0, so the 12 sequential GetNextID() calls below deterministically
+    // produce 0..11 in the low 32 bits, matching kEntityCount's dense-index requirement.
     core::IDManager::Init(0);
 
     for (uint32_t i = 0; i < kEntityCount; ++i) {
@@ -928,7 +977,7 @@ void VulkanContext::UploadEntityData() {
 }
 
 void VulkanContext::GenerateGeometry() {
-    // --- Grid layout: 9 primitives arranged on a 3x3 grid (see GridSlot()). Generation order
+    // --- Grid layout: 12 primitives arranged on a 3-wide grid (see GridSlot()). Generation order
     // below is Icosphere-first (so it lands at vertexOffset/indexOffset 0, keeping
     // DebugReadbackGeometrySample's fixed sampling window — designed around a single
     // icosphere living at the start of the buffers — valid unchanged); each primitive's grid
@@ -938,7 +987,7 @@ void VulkanContext::GenerateGeometry() {
     uint32_t runningVertexOffset = 0;
     uint32_t runningIndexOffset = 0;
 
-    Logger::Log(LogLevel::Info, "[GenerateGeometry] Generating 9 procedural primitives on a 3x3 grid...");
+    Logger::Log(LogLevel::Info, "[GenerateGeometry] Generating 12 procedural primitives on a 3-wide grid...");
 
     // ---------------------------------------------------------------------------------
     // ICOSPHERE (slot 2 visually) — generated first so it occupies buffer offset 0.
@@ -1237,10 +1286,105 @@ void VulkanContext::GenerateGeometry() {
         runningIndexOffset += 6u * params.nbSides * (params.nbHeightSegs + 2u * params.nbCapSegs);
     }
 
+    // ---------------------------------------------------------------------------------
+    // PYRAMID (slot 9) — square (4-sided) flat-shaded pyramid.
+    // ---------------------------------------------------------------------------------
+    {
+        maths::vec2 slot = gridSlot(9);
+        PyramidParams params{};
+        params.height = 1.2f;
+        params.radius = 0.85f;
+        params.nbSides = 4u;
+        params.meshID = m_EntityData[9].meshID;
+        params.materialID = 0.0f;
+        params.vertexOffset = runningVertexOffset;
+        params.indexOffset = runningIndexOffset;
+        params.worldOffsetX = slot.x;
+        params.worldOffsetY = -params.height * 0.5f; // recenter: geometry spans y=[0,height]
+        params.worldOffsetZ = slot.y;
+
+        uint32_t capCount = params.nbSides + 1u;
+        uint32_t totalVerts = capCount + params.nbSides * 3u; // geom_pyramide.comp local_size_x = 64
+        constexpr uint32_t kLocalSizeX = 64u;
+        uint32_t groupCount = (totalVerts + kLocalSizeX - 1u) / kLocalSizeX;
+
+        DispatchGeometryCompute(m_PyramidPipeline, m_ComputePipelineLayout,
+            &params, sizeof(params), nullptr, 0, groupCount, 1, 1);
+
+        runningVertexOffset += totalVerts;
+        runningIndexOffset += 6u * params.nbSides; // base fan (nbSides tris) + side faces (nbSides tris)
+    }
+
+    // ---------------------------------------------------------------------------------
+    // TORUS KNOT (slot 10) — (p,q) knotted tube.
+    // ---------------------------------------------------------------------------------
+    {
+        maths::vec2 slot = gridSlot(10);
+        TorusKnotParams params{};
+        params.radius = 0.5f;
+        params.tube = 0.15f;
+        params.p = 2u;
+        params.q = 3u;
+        params.nbRadSeg = 128u;
+        params.nbSides = 12u;
+        params.meshID = m_EntityData[10].meshID;
+        params.materialID = 0.0f;
+        params.vertexOffset = runningVertexOffset;
+        params.indexOffset = runningIndexOffset;
+        params.worldOffsetX = slot.x;
+        params.worldOffsetY = 0.0f; // shape is already centered on its own local origin
+        params.worldOffsetZ = slot.y;
+
+        uint32_t vertCount = (params.nbRadSeg + 1u) * (params.nbSides + 1u);
+        constexpr uint32_t kLocalSizeX = 64u; // geom_TorusKnot.comp local_size_x = 64
+        uint32_t groupCount = (vertCount + kLocalSizeX - 1u) / kLocalSizeX;
+
+        DispatchGeometryCompute(m_TorusKnotPipeline, m_ComputePipelineLayout,
+            &params, sizeof(params), nullptr, 0, groupCount, 1, 1);
+
+        runningVertexOffset += vertCount;
+        runningIndexOffset += 6u * params.nbRadSeg * params.nbSides;
+    }
+
+    // ---------------------------------------------------------------------------------
+    // CHAMFER BOX (slot 11) — rounded/chamfered box built as a superellipsoid.
+    // ---------------------------------------------------------------------------------
+    {
+        maths::vec2 slot = gridSlot(11);
+        ChamferBoxParams params{};
+        params.width = 1.4f;
+        params.height = 1.4f;
+        params.depth = 1.4f;
+        params.sideSegs = 24u;
+        params.heightSegs = 16u;
+        params.chamferPower = 6.0f; // > 2 required (see geom_chamferBox.comp); higher = sharper edges
+        params.meshID = m_EntityData[11].meshID;
+        params.materialID = 0.0f;
+        params.vertexOffset = runningVertexOffset;
+        params.indexOffset = runningIndexOffset;
+        params.worldOffsetX = slot.x;
+        params.worldOffsetY = 0.0f;
+        params.worldOffsetZ = slot.y;
+
+        uint32_t ringCount = params.heightSegs - 2u; // interior latitude rings (excludes poles)
+        uint32_t ringStride = params.sideSegs + 1u;
+        uint32_t vertCount = ringCount * ringStride + 2u;
+        constexpr uint32_t kLocalSizeX = 64u; // geom_chamferBox.comp local_size_x = 64
+        uint32_t groupCount = (vertCount + kLocalSizeX - 1u) / kLocalSizeX;
+
+        DispatchGeometryCompute(m_ChamferBoxPipeline, m_ComputePipelineLayout,
+            &params, sizeof(params), nullptr, 0, groupCount, 1, 1);
+
+        runningVertexOffset += vertCount;
+        // Same index topology as geom_sphere.comp: sideSegs*3 (top fan) + (ringCount-1)*sideSegs*6
+        // (middle quads) + sideSegs*3 (bottom fan) = 6*sideSegs*ringCount.
+        runningIndexOffset += 6u * params.sideSegs * ringCount;
+    }
+
     m_TotalVertexCount = runningVertexOffset;
     m_TotalIndexCount = runningIndexOffset;
     Logger::Log(LogLevel::Info, std::format(
-        "[GenerateGeometry] All 9 primitives generated: totalVertexCount={} totalIndexCount={} "
+        "[GenerateGeometry] All 12 primitives generated: totalVertexCount={} totalIndexCount={} "
         "(buffers hold {} verts / {} indices max)",
         runningVertexOffset, runningIndexOffset,
         (512u * 1024u) / sizeof(renderer::Vertex), (128u * 1024u) / sizeof(uint32_t)));
@@ -1266,9 +1410,10 @@ void VulkanContext::UpdateEntityRotations(float timeSeconds) {
 
         // Every primitive's baked world-space center coincides exactly with its grid slot
         // position at Y=0: each geom_*.comp shader either generates a shape already centered
-        // on its own local origin (icosphere/box/sphere/torus/plane), or one that spans
-        // y=[0,height] recentered via worldOffsetY=-height/2 in GenerateGeometry() (cone/tube/
-        // cylinder/capsule) — both cases land the shape's true vertical midpoint at Y=0.
+        // on its own local origin (icosphere/box/sphere/torus/plane/torusKnot/chamferBox), or one
+        // that spans y=[0,height] recentered via worldOffsetY=-height/2 in GenerateGeometry()
+        // (cone/tube/cylinder/capsule/pyramid) — both cases land the shape's true vertical
+        // midpoint at Y=0.
         maths::vec2 slot = GridSlot(static_cast<int>(meshID));
 
         EntityTransform& xform = transforms[meshID];
@@ -1455,7 +1600,8 @@ void VulkanContext::Shutdown() {
 
     for (VkPipeline pipeline : { m_ConePipeline, m_IcospherePipeline, m_PlanePipeline,
                                   m_SpherePipeline, m_TorusPipeline, m_TubePipeline,
-                                  m_CapsulePipeline, m_CylinderPipeline }) {
+                                  m_CapsulePipeline, m_CylinderPipeline,
+                                  m_PyramidPipeline, m_TorusKnotPipeline, m_ChamferBoxPipeline }) {
         if (pipeline != VK_NULL_HANDLE) {
             vkDestroyPipeline(m_Device, pipeline, nullptr);
         }

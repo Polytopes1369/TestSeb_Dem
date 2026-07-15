@@ -33,11 +33,11 @@ public:
     VkPipelineLayout GetGraphicsPipelineLayout() const { return m_GraphicsPipelineLayout; }
     VkDescriptorSet GetGeometryDescriptorSet() const { return m_GeometryDescriptorSet; }
 
-    // Total number of indices written across all 9 procedurally-generated primitives; the
+    // Total number of indices written across all 12 procedurally-generated primitives; the
     // single scene draw call in main.cpp draws exactly this many indices in one vkCmdDraw.
     uint32_t GetTotalIndexCount() const { return m_TotalIndexCount; }
 
-    // Total number of vertices written across all 9 procedurally-generated primitives.
+    // Total number of vertices written across all 12 procedurally-generated primitives.
     uint32_t GetTotalVertexCount() const { return m_TotalVertexCount; }
 
     // Recomputes every entity's self-rotation (tumbling on all 3 axes) from elapsed scene
@@ -114,6 +114,9 @@ private:
     VkPipeline m_TubePipeline = VK_NULL_HANDLE;
     VkPipeline m_CapsulePipeline = VK_NULL_HANDLE;
     VkPipeline m_CylinderPipeline = VK_NULL_HANDLE;
+    VkPipeline m_PyramidPipeline = VK_NULL_HANDLE;
+    VkPipeline m_TorusKnotPipeline = VK_NULL_HANDLE;
+    VkPipeline m_ChamferBoxPipeline = VK_NULL_HANDLE;
 
     // The box is generated via 6 dispatches (one per cube face) of the same geom_box.comp
     // module, each specialized with a different VkSpecializationInfo (axis mapping / winding)
@@ -130,16 +133,16 @@ private:
     VkPipelineLayout m_ComputePipelineLayout = VK_NULL_HANDLE;
     VkPipelineLayout m_GraphicsPipelineLayout = VK_NULL_HANDLE;
 
-    // Running total of vertices/indices written by GenerateGeometry() across all 9 primitives.
+    // Running total of vertices/indices written by GenerateGeometry() across all 12 primitives.
     uint32_t m_TotalVertexCount = 0;
     uint32_t m_TotalIndexCount = 0;
 
-    // One EntityTransform slot per primitive meshID (box=0 .. cylinder=8); see struct_custo.glsl.
-    static constexpr uint32_t kEntityCount = 9;
+    // One EntityTransform slot per primitive meshID (box=0 .. chamferBox=11); see struct_custo.glsl.
+    static constexpr uint32_t kEntityCount = 12;
 
     // CPU-authoritative entity records: built once by BuildEntityData() (meshID assigned via
     // core::IDManager) before GenerateGeometry() runs, then copied to m_EntityBuffer by
-    // UploadEntityData(). One entry per primitive (box=0 .. cylinder=8), see struct_custo.glsl.
+    // UploadEntityData(). One entry per primitive (box=0 .. chamferBox=11), see struct_custo.glsl.
     std::array<core::EntityData, kEntityCount> m_EntityData{};
 
     const bool m_EnableValidationLayers = true;

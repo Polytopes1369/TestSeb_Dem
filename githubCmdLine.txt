@@ -8,4 +8,4 @@ git add .
 git commit -m "Mise à jour et transfert vers TestSeb_Dem"
 
 # 4. Envoie le tout sur le nouveau dépôt en écrasant l'historique distant si nécessaire
-git push -u origin main --forces
+git push -u origin main -f

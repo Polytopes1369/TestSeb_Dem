@@ -1,0 +1,123 @@
+// geom_pyramide.comp
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+
+// Inclure tes structures partagées
+#include "include/struct_custo.glsl"
+#include "include/math_utils.glsl"
+
+// N-sided pyramid: a flat-shaded polygonal base (circumradius, nbSides corners, fan-triangulated
+// like geom_cone.comp's caps) extruded to a single apex point. nbSides = 4 gives the classic
+// square (Egyptian) pyramid; any N is supported. Differs from geom_cone.comp's topRadius = 0
+// case by using one hard per-face normal per side triangle instead of a smooth radial normal —
+// that hard edge between faces is what reads as a faceted pyramid rather than a smooth cone tip.
+//
+// Vertex layout: [0] base fan center, [1 .. nbSides] base fan rim (no seam duplicate, matching
+// geom_cone.comp's cap convention), [nbSides+1 .. nbSides+1+3*nbSides-1] side faces (3 unique
+// vertices per face so each face gets its own flat normal: left base corner, apex, right base
+// corner).
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) writeonly buffer VertexBuffer { Vertex vertices[]; };
+layout(std430, binding = 1) writeonly buffer IndexBuffer  { uint indices[]; };
+
+layout(std140, binding = 2) uniform Params
+{
+    float height;
+    float radius;    // base circumradius
+    uint  nbSides;   // 4 = square pyramid; supports any N-gon base
+    uint  meshID;
+    float materialID;
+    uint  vertexOffset;
+    uint  indexOffset;
+    // World-space translation baked into the generated geometry, used to place multiple
+    // instances of this primitive at different grid slots without a separate transform stage.
+    float worldOffsetX;
+    float worldOffsetY;
+    float worldOffsetZ;
+};
+
+void main()
+{
+    uint id = gl_GlobalInvocationID.x;
+
+    uint capCount   = nbSides + 1u; // base fan: center + nbSides rim points
+    uint sideVerts  = nbSides * 3u; // 3 unique verts per side face (hard-edged / flat shaded)
+    uint totalVerts = capCount + sideVerts;
+    if (id >= totalVerts) return;
+
+    Vertex v;
+    v.meshID = meshID;
+    v.materialID = materialID;
+
+    if (id == 0u) // base fan center
+    {
+        v.position = vec3(0.0);
+        v.normal   = vec3(0.0, -1.0, 0.0);
+        v.uv       = vec2(0.5, 0.5);
+    }
+    else if (id < capCount) // base fan rim
+    {
+        uint rim = id - 1u;
+        float rad = float(rim) / float(nbSides) * TAU;
+        v.position = vec3(cos(rad) * radius, 0.0, sin(rad) * radius);
+        v.normal   = vec3(0.0, -1.0, 0.0);
+        v.uv       = vec2(cos(rad) * 0.5 + 0.5, sin(rad) * 0.5 + 0.5);
+    }
+    else // side face: 3 unique verts (left base corner, apex, right base corner)
+    {
+        uint local = id - capCount;
+        uint face  = local / 3u;
+        uint slot  = local % 3u;
+
+        float rad0 = float(face) / float(nbSides) * TAU;
+        float rad1 = float(face + 1u) / float(nbSides) * TAU;
+        vec3 p0   = vec3(cos(rad0) * radius, 0.0, sin(rad0) * radius);
+        vec3 p1   = vec3(cos(rad1) * radius, 0.0, sin(rad1) * radius);
+        vec3 apex = vec3(0.0, height, 0.0);
+
+        // Flat face normal shared by all 3 verts of this face (hard edges between faces).
+        // Vertex order (p0, apex, p1) mirrors geom_cone.comp's side-quad winding (b0, t0, t1)
+        // with the top ring collapsed to a single apex (t0 == t1 == apex), so the outward-facing
+        // winding that shader relies on carries over unchanged here.
+        vec3 faceNormal = normalize(cross(apex - p0, p1 - p0));
+
+        if (slot == 0u)      { v.position = p0;   v.uv = vec2(float(face) / float(nbSides), 0.0); }
+        else if (slot == 1u) { v.position = apex; v.uv = vec2((float(face) + 0.5) / float(nbSides), 1.0); }
+        else                 { v.position = p1;   v.uv = vec2(float(face + 1u) / float(nbSides), 0.0); }
+
+        v.normal = faceNormal;
+    }
+
+    v.uv2 = v.uv;
+
+    // Translate the generated vertex to its grid slot in world space before writing it out.
+    v.position += vec3(worldOffsetX, worldOffsetY, worldOffsetZ);
+    vertices[vertexOffset + id] = v;
+
+    // --- Indices ---
+    if (id >= 1u && id < capCount) // base fan triangle
+    {
+        uint rim  = id - 1u;
+        uint next = (rim + 1u) % nbSides;
+        uint tIdx = indexOffset + rim * 3u;
+        indices[tIdx + 0u] = vertexOffset;
+        indices[tIdx + 1u] = vertexOffset + 1u + rim;
+        indices[tIdx + 2u] = vertexOffset + 1u + next;
+    }
+    if (id >= capCount) // side face triangle (emitted once per face, on its first vertex)
+    {
+        uint local = id - capCount;
+        uint face  = local / 3u;
+        uint slot  = local % 3u;
+        if (slot == 0u)
+        {
+            uint tIdx = indexOffset + nbSides * 3u + face * 3u;
+            uint base = vertexOffset + capCount + face * 3u;
+            indices[tIdx + 0u] = base + 0u;
+            indices[tIdx + 1u] = base + 1u;
+            indices[tIdx + 2u] = base + 2u;
+        }
+    }
+}

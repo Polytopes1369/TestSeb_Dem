@@ -1,0 +1,104 @@
+// geom_TorusKnot.comp
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+
+// Inclure tes structures partagées
+#include "include/struct_custo.glsl"
+#include "include/math_utils.glsl"
+
+// (p,q) torus knot tube: sweeps a circular cross-section (radius = tube) around the knot curve
+//   C(u) = radius * (2 + cos(q/p * u)) * 0.5 * (cos(u), sin(u), tan-like z term), u in [0, p*TAU]
+// which is the standard three.js TorusKnotGeometry construction. Compute shaders have no
+// dFdx/dFdy, so the curve's local frame (N, B) is estimated the same way three.js does it: probe
+// a second point P2 = C(u + EPS) slightly further along the curve, build a tangent T = P2 - P1,
+// then derive (N, B) from T via cross products rather than an analytic Frenet frame.
+// Same (seg, sideI) grid, stride, and index-buffer layout as geom_torus.comp, so its confirmed
+// quad winding carries over unchanged (P1 here plays the role of geom_torus.comp's ringCenter).
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) writeonly buffer VertexBuffer { Vertex vertices[]; };
+layout(std430, binding = 1) writeonly buffer IndexBuffer  { uint indices[]; };
+
+layout(std140, binding = 2) uniform Params
+{
+    float radius;    // overall knot scale (three.js TorusKnotGeometry "radius")
+    float tube;      // cross-section (tube) radius
+    uint  p;         // winds around the torus's rotational axis
+    uint  q;         // winds around the torus's core circle
+    uint  nbRadSeg;  // segments along the knot curve (tubularSegments)
+    uint  nbSides;   // segments around the tube cross-section (radialSegments)
+    uint  meshID;
+    float materialID;
+    uint  vertexOffset;
+    uint  indexOffset;
+    // World-space translation baked into the generated geometry, used to place multiple
+    // instances of this primitive at different grid slots without a separate transform stage.
+    float worldOffsetX;
+    float worldOffsetY;
+    float worldOffsetZ;
+};
+
+vec3 KnotCurvePoint(float u)
+{
+    float quOverP = float(q) / float(p) * u;
+    float cs = cos(quOverP);
+    return vec3(
+        radius * (2.0 + cs) * 0.5 * cos(u),
+        radius * (2.0 + cs) * 0.5 * sin(u),
+        radius * sin(quOverP) * 0.5);
+}
+
+void main()
+{
+    uint id = gl_GlobalInvocationID.x;
+    uint stride    = nbSides + 1u;
+    uint vertCount = (nbRadSeg + 1u) * stride;
+    if (id >= vertCount) return;
+
+    uint seg   = id / stride;
+    uint sideI = id % stride;
+
+    // Finite-difference tangent probe (see header comment) to build a local (N, B, T) frame.
+    const float EPS = 0.01;
+    float u = float(seg) / float(nbRadSeg) * float(p) * TAU;
+    vec3 P1 = KnotCurvePoint(u);
+    vec3 P2 = KnotCurvePoint(u + EPS);
+
+    vec3 T    = normalize(P2 - P1);
+    vec3 Braw = cross(T, P2 + P1);
+    vec3 B    = normalize(Braw);
+    vec3 N    = normalize(cross(B, T));
+
+    float crossAngle = float(sideI) / float(nbSides) * TAU;
+    float cx = -tube * cos(crossAngle);
+    float cy =  tube * sin(crossAngle);
+
+    vec3 pos = P1 + cx * N + cy * B;
+
+    Vertex vert;
+    vert.position   = pos;
+    vert.normal     = normalize(pos - P1);
+    vert.uv         = vec2(float(seg) / float(nbRadSeg), float(sideI) / float(nbSides));
+    vert.uv2        = vert.uv;
+    vert.meshID     = meshID;
+    vert.materialID = materialID;
+
+    // Translate the generated vertex to its grid slot in world space before writing it out.
+    vert.position += vec3(worldOffsetX, worldOffsetY, worldOffsetZ);
+    vertices[vertexOffset + id] = vert;
+
+    if (seg < nbRadSeg && sideI < nbSides) // one thread per quad
+    {
+        uint current = id;
+        uint next    = current + stride;
+
+        uint tIdx = indexOffset + (seg * nbSides + sideI) * 6u;
+        indices[tIdx + 0u] = vertexOffset + current;
+        indices[tIdx + 1u] = vertexOffset + next;
+        indices[tIdx + 2u] = vertexOffset + next + 1u;
+        indices[tIdx + 3u] = vertexOffset + current;
+        indices[tIdx + 4u] = vertexOffset + next + 1u;
+        indices[tIdx + 5u] = vertexOffset + current + 1u;
+    }
+}

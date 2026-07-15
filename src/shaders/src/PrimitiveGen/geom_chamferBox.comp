@@ -1,0 +1,134 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+
+// Inclure tes structures partagées
+#include "include/struct_custo.glsl"
+#include "include/math_utils.glsl"
+
+// Chamfered (rounded-edge) box, built as a superellipsoid: same UV-sphere ring/pole grid and
+// index topology as geom_sphere.comp (unit-sphere direction d per (lat, lon) sample), but each
+// axis of d is reshaped towards a box with the classic "squircle" mapping
+//   p_i = sign(d_i) * |d_i|^(2/n) * halfExtent_i
+// where n = chamferPower controls how sharp the edges are (n = 2 reproduces a plain ellipsoid;
+// larger n pushes the corners outward until the shape reads as a box with rounded/chamfered
+// edges — n in [4, 10] gives a good chamfered-box look). Since Sum(|d_i|^2) = 1 (d is a unit
+// vector), this parametrization exactly satisfies the superellipsoid implicit surface
+// Sum(|p_i / halfExtent_i|^n) = 1, so its normal (the surface gradient) has the closed form
+//   normal_i ∝ d_i * |d_i|^(1 - 2/n) / halfExtent_i
+// derived analytically below — no dFdx/dFdy (fragment-only, invalid in a compute shader) needed.
+// Requires chamferPower > 2 (pow(0, <=0) is undefined per the GLSL spec; the exponent used in
+// the normal formula is 1 - 2/chamferPower, which is only guaranteed > 0 for chamferPower > 2).
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) writeonly buffer VertexBuffer { Vertex vertices[]; };
+layout(std430, binding = 1) writeonly buffer IndexBuffer  { uint indices[]; };
+
+layout(std140, binding = 2) uniform Params
+{
+    float width;
+    float height;
+    float depth;
+    uint  sideSegs;
+    uint  heightSegs;
+    float chamferPower; // superellipsoid exponent n; must be > 2 (see header comment)
+    uint  meshID;
+    float materialID;
+    uint  vertexOffset;
+    uint  indexOffset;
+    // World-space translation baked into the generated geometry, used to place multiple
+    // instances of this primitive at different grid slots without a separate transform stage.
+    float worldOffsetX;
+    float worldOffsetY;
+    float worldOffsetZ;
+};
+
+void main()
+{
+    uint id = gl_GlobalInvocationID.x;
+    uint ringCount  = heightSegs - 2u;   // interior latitude rings
+    uint ringStride = sideSegs + 1u;
+    uint vertCount  = ringCount * ringStride + 2u;
+    if (id >= vertCount) return;
+
+    vec3 halfExtents = vec3(width, height, depth) * 0.5;
+
+    Vertex v;
+    v.meshID = meshID;
+    v.materialID = materialID;
+
+    vec3 d; // unit-sphere direction for this (lat, lon) sample, reshaped into the box below
+    if (id == 0u) // top pole
+    {
+        d = vec3(0.0, 1.0, 0.0);
+        v.uv = vec2(0.0, 1.0);
+    }
+    else if (id == vertCount - 1u) // bottom pole
+    {
+        d = vec3(0.0, -1.0, 0.0);
+        v.uv = vec2(0.0, 0.0);
+    }
+    else
+    {
+        uint local = id - 1u;
+        uint lat = local / ringStride;
+        uint lon = local % ringStride;
+
+        float a1 = PI * float(lat + 1u) / float(heightSegs - 1u);
+        float sin1 = sin(a1), cos1 = cos(a1);
+        float a2 = TAU * float(lon == sideSegs ? 0u : lon) / float(sideSegs);
+
+        d = vec3(sin1 * cos(a2), cos1, sin1 * sin(a2));
+        v.uv = vec2(float(lon) / float(sideSegs), 1.0 - float(lat + 1u) / float(heightSegs - 1u));
+    }
+
+    float invN = 2.0 / chamferPower;
+    vec3 absD = abs(d);
+    v.position = sign(d) * pow(absD, vec3(invN)) * halfExtents;
+
+    float normExp = 1.0 - invN;
+    vec3 rawNormal = d * pow(absD, vec3(normExp)) / halfExtents;
+    v.normal = normalize(rawNormal);
+
+    v.uv2 = v.uv;
+
+    // Translate the generated vertex to its grid slot in world space before writing it out.
+    v.position += vec3(worldOffsetX, worldOffsetY, worldOffsetZ);
+    vertices[vertexOffset + id] = v;
+
+    // --- Indices: identical topology to geom_sphere.comp (top cap fan, middle quads, bottom
+    // cap fan), since reshaping d into a box only changes vertex positions, not the grid. ---
+    if (id < sideSegs) // top cap fan
+    {
+        uint lon = id;
+        uint tIdx = indexOffset + lon * 3u;
+        indices[tIdx + 0u] = vertexOffset + lon + 2u;
+        indices[tIdx + 1u] = vertexOffset + lon + 1u;
+        indices[tIdx + 2u] = vertexOffset;
+    }
+
+    if (ringCount > 1u && id < (ringCount - 1u) * sideSegs) // middle quads
+    {
+        uint lat = id / sideSegs;
+        uint lon = id % sideSegs;
+        uint current = lon + lat * ringStride + 1u;
+        uint next    = current + ringStride;
+
+        uint tIdx = indexOffset + sideSegs * 3u + (lat * sideSegs + lon) * 6u;
+        indices[tIdx + 0u] = vertexOffset + current;
+        indices[tIdx + 1u] = vertexOffset + current + 1u;
+        indices[tIdx + 2u] = vertexOffset + next + 1u;
+        indices[tIdx + 3u] = vertexOffset + current;
+        indices[tIdx + 4u] = vertexOffset + next + 1u;
+        indices[tIdx + 5u] = vertexOffset + next;
+    }
+
+    if (id < sideSegs) // bottom cap fan
+    {
+        uint lon = id;
+        uint tIdx = indexOffset + sideSegs * 3u + (ringCount - 1u) * sideSegs * 6u + lon * 3u;
+        indices[tIdx + 0u] = vertexOffset + vertCount - 1u;
+        indices[tIdx + 1u] = vertexOffset + vertCount - (lon + 2u) - 1u;
+        indices[tIdx + 2u] = vertexOffset + vertCount - (lon + 1u) - 1u;
+    }
+}
