@@ -1,6 +1,8 @@
 #version 460
 #extension GL_GOOGLE_include_directive : enable
 
+#include "include/cluster_entity_transform.glsl"
+
 // GPU-side DAG LOD cut evaluation for cluster-level screen-space error. The shader consumes a
 // compact per-node payload that mirrors the runtime DAG semantics already used by the CPU-side
 // geometry::ClusterDAG and geometry::DAGNodeEntry data model: each node carries its own
@@ -27,10 +29,10 @@
 
 // Field order is deliberate: sphereCenter (the only vec3) comes first so it naturally lands at
 // offset 0 (already a multiple of its own 16-byte std430 base alignment) -- every field after it
-// is a plain 4-byte scalar with no alignment needs of its own, so the whole struct packs to
-// exactly 48 bytes (already a multiple of 16) with zero implicit padding anywhere, letting the
-// C++ mirror (renderer::DAGNodePayload, ClusterLODSelectionPass.h) match it field-for-field with
-// no manual padding either. See renderer::ClusterLODSelectionPass for the driver that populates
+// is a plain 4-byte scalar with no alignment needs of its own. entityID's trailing 3-word pad
+// rounds the struct up to 64 bytes (its actual std430 array stride) -- the C++ mirror
+// (renderer::DAGNodePayload, ClusterLODSelectionPass.h) matches it field-for-field, declaring that
+// same padding explicitly. See renderer::ClusterLODSelectionPass for the driver that populates
 // this SSBO from geometry::ClusterIndexEntry / DAGNodeEntry.
 struct DAGNodePayload {
     vec3 sphereCenter;
@@ -51,6 +53,14 @@ struct DAGNodePayload {
     // than its true (displaced) on-screen error would allow. 0 for any non-swaying cluster, making
     // the inflation below an exact no-op for them.
     float maxWPOAmplitude;
+
+    // geometry::ClusterIndexEntry::entityID -- the owning entity's meshID, used below to rotate
+    // sphereCenter into its current (not rest-pose) world position before projecting error to
+    // pixels -- see cluster_entity_transform.glsl's own comment for why this matters.
+    uint entityID;
+    uint _pad0;
+    uint _pad1;
+    uint _pad2;
 };
 
 struct DAGScreenErrorViewParams {
@@ -83,6 +93,10 @@ layout(std140, set = 0, binding = 4) uniform DAGViewParamsUBO {
     DAGScreenErrorViewParams data;
 } g_ViewParams;
 
+layout(std430, set = 0, binding = 5) readonly buffer EntityTransformBuffer {
+    EntityTransform entityTransforms[];
+};
+
 layout(local_size_x = 64) in;
 
 float ProjectedErrorToPixels(float geometricError, vec3 worldPosition) {
@@ -112,8 +126,13 @@ void main() {
     float clusterError = node.clusterError + node.maxWPOAmplitude;
     float parentError = node.parentError + node.maxWPOAmplitude;
 
-    float localPixelError = ProjectedErrorToPixels(clusterError, node.sphereCenter);
-    float parentPixelError = ProjectedErrorToPixels(parentError, node.sphereCenter);
+    // Rotate the rest-pose sphere center into its current world position before projecting: a
+    // rotating entity's clusters would otherwise have their on-screen size estimated from a stale
+    // position, drifting further out of sync with the actual render every frame it keeps spinning.
+    vec3 currentSphereCenter = TransformClusterCenterByEntity(node.sphereCenter, entityTransforms[node.entityID]);
+
+    float localPixelError = ProjectedErrorToPixels(clusterError, currentSphereCenter);
+    float parentPixelError = ProjectedErrorToPixels(parentError, currentSphereCenter);
 
     uint decision = DAG_DECISION_SKIP;
     if (localPixelError < g_ViewParams.data.pixelThreshold && parentPixelError >= g_ViewParams.data.pixelThreshold) {

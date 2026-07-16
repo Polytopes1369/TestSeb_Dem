@@ -150,8 +150,9 @@ bool ClusterRenderPipeline::Init(
   // index/DAG tables read in STEP 1.
   m_LODSelection.Init(createInfo.device, createInfo.allocator,
                       createInfo.commandPool, createInfo.queue,
-                      m_PagePool.GetPageTableBuffer(), leafCount, indexEntries,
-                      dagEntries);
+                      m_PagePool.GetPageTableBuffer(),
+                      createInfo.entityTransformBuffer, leafCount,
+                      indexEntries, dagEntries);
 
   // Wires the async streaming stack for real -- see GeometryStreamingCoordinator's own class
   // comment. Needs only the cache file path (re-opened for unbuffered/overlapped reads,
@@ -164,6 +165,7 @@ bool ClusterRenderPipeline::Init(
                           totalClusterCount,
                           m_LODSelection.GetCandidateMetadataBuffer(),
                           m_LODSelection.GetCandidateCountBuffer(),
+                          createInfo.entityTransformBuffer,
                           m_HZB.GetFullView(), m_HZB.GetMipExtent(0),
                           m_HZB.GetMipLevelCount());
 
