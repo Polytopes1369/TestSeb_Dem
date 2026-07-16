@@ -39,6 +39,8 @@
 
 namespace renderer {
 
+    class ClusterShadingBinPass; // Phase 1b: see InitBinnedResolve()/RecordResolveBinned()'s own comments.
+
     class ClusterResolvePass {
     public:
         ClusterResolvePass() = default;
@@ -108,6 +110,34 @@ namespace renderer {
         // previous frame exists yet).
         void RecordResolve(VkCommandBuffer cmd, const maths::mat4& viewProj, const maths::mat4& prevViewProj, uint32_t debugViewMode = 0);
 
+        // --- Phase 1b: binned resolve path (renderer::ClusterShadingBinPass) ---
+        // Second-phase init, called once after BOTH Init() above AND `shadingBinPass.Init()` have
+        // already run -- a genuine ordering dependency, not an arbitrary split: this method's own
+        // descriptor set needs `shadingBinPass`'s sorted-pixel-list/bin-offsets/bin-histogram
+        // buffers, while `shadingBinPass.Init()` itself needs THIS class's 5 output image views
+        // (its own Classify stage writes background pixels directly into them) -- the two classes'
+        // Init() calls cannot be ordered as a single linear dependency chain, so this second phase
+        // exists specifically to break the cycle. Reuses every resource the first Init() already
+        // received/created (cluster metadata buffer, compressed pool buffer, mask image infos, WPO
+        // globals buffer, view-params UBO, material params SSBO, output images) -- retained as
+        // members after the first Init() call specifically so this method needs no duplicate
+        // parameters for any of them.
+        void InitBinnedResolve(VkDevice device, VkCommandPool commandPool, VkQueue queue,
+            const ClusterShadingBinPass& shadingBinPass);
+
+        // Uploads `viewProj` into the SAME ResolveViewParamsUBO RecordResolve() uses (prevViewProj
+        // left at whatever RecordResolve() last wrote -- this path never reads it, since it never
+        // serves DEBUG_VIEW_MOTION_VECTORS), then issues MaterialParameterTable::kMaxMaterials
+        // indirect dispatches (one per material bin, `binIndex` a push constant) against
+        // `shadingBinPass`'s own GetBinDispatchArgsBuffer(). Caller must have already recorded
+        // `shadingBinPass.RecordClassifyAndSort()` earlier this frame (this method only reads that
+        // work's output) -- see renderer::ClusterRenderPipeline::RecordFrame's own call site for
+        // the exact per-frame ordering (this path replaces RecordResolve() entirely whenever
+        // `camera.debugViewMode == 0`; Release always takes this path, see that field's own
+        // Debug-only gating in core/Camera.h). Ends with the identical trailing barrier
+        // RecordResolve() itself ends with.
+        void RecordResolveBinned(VkCommandBuffer cmd, const maths::mat4& viewProj, const ClusterShadingBinPass& shadingBinPass);
+
         VkImage GetOutputColorImage() const { return m_OutputColorImage; }
         VkImageView GetOutputColorView() const { return m_OutputColorView; }
         VkImageView GetOutputNormalView() const { return m_OutputNormalView; }
@@ -152,6 +182,24 @@ namespace renderer {
         VkDescriptorSet m_DescriptorSet = VK_NULL_HANDLE;
         VkPipelineLayout m_PipelineLayout = VK_NULL_HANDLE;
         VkPipeline m_Pipeline = VK_NULL_HANDLE;
+
+        // --- Phase 1b: resources retained from Init() purely so InitBinnedResolve() needs no
+        // duplicate parameters for them (see that method's own comment). ---
+        static constexpr uint32_t kResolveBinnedWorkgroupSize = 64; // Matches ClusterResolveBinned.comp's local_size_x.
+        VkBuffer m_ClusterMetadataBuffer = VK_NULL_HANDLE; // Borrowed, same handle Init() received.
+        VkBuffer m_CompressedPoolBuffer = VK_NULL_HANDLE;  // Borrowed, same handle Init() received.
+        VkBuffer m_WPOGlobalsBuffer = VK_NULL_HANDLE;      // Borrowed, same handle Init() received.
+        std::vector<VkDescriptorImageInfo> m_MaskImageInfos; // Copy of Init()'s own `maskImageInfos` parameter.
+
+        VkDescriptorSetLayout m_ResolveBinnedSetLayout = VK_NULL_HANDLE;
+        // Separate pool from m_DescriptorPool above (sized for exactly the 1 extra set below)
+        // rather than recomputing m_DescriptorPool's own pool sizes to cover both sets -- keeps
+        // this Phase 1b addition from touching Init()'s already-working, already-verified pool
+        // sizing at all.
+        VkDescriptorPool m_ResolveBinnedDescriptorPool = VK_NULL_HANDLE;
+        VkDescriptorSet m_ResolveBinnedSet = VK_NULL_HANDLE;
+        VkPipelineLayout m_ResolveBinnedPipelineLayout = VK_NULL_HANDLE;
+        VkPipeline m_ResolveBinnedPipeline = VK_NULL_HANDLE;
     };
 
 }

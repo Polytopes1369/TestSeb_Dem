@@ -68,6 +68,7 @@
 #include "renderer/ClusterLODSelectionPass.h"
 #include "renderer/ClusterOcclusionCullingPass.h"
 #include "renderer/ClusterResolvePass.h"
+#include "renderer/ClusterShadingBinPass.h"
 #include "renderer/ClusterSoftwareRasterPass.h"
 #include "renderer/GeometryDecompressionPass.h"
 #include "renderer/GeometryStreamingCoordinator.h"
@@ -259,6 +260,15 @@ namespace renderer {
         ClusterHardwareRasterPass m_HardwareRaster;
         ClusterSoftwareRasterPass m_SoftwareRaster;
         ClusterResolvePass m_Resolve;
+        // Phase 1b (UE5.8 parity roadmap): the 3-stage GPU counting sort that buckets VisBuffer
+        // pixels by materialID, feeding m_Resolve's own RecordResolveBinned() -- see
+        // renderer::ClusterShadingBinPass's own class comment for the full pipeline. Recorded
+        // between [11] and [12] below (after the VisBuffer/depth hand-off, before shading), unlike
+        // m_Resolve which stays unconditional/always-initialized -- this pass is likewise always
+        // initialized (not Debug-only), matching CLAUDE.md's build-separation rule: only the
+        // NUMPAD-DRIVEN DEBUG VIEW SWITCHING that picks between this path and m_Resolve's original
+        // RecordResolve() is Debug-only, not the pass itself (Release always uses this path).
+        ClusterShadingBinPass m_ShadingBin;
 
         // Lumen-style GI infrastructure -- unlike the debug-only stats/overlay block below, these
         // are real (if not yet light-transport-consuming) systems, not visualization tools, so

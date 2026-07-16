@@ -51,6 +51,7 @@
 #include "include/octahedral.glsl"
 #include "include/wpo_deformation.glsl"
 #include "include/material_params.glsl"
+#include "include/visbuffer_arbitration.glsl"
 
 #define MASK_ARRAY_SET 0
 #define MASK_ARRAY_BINDING 8
@@ -61,11 +62,9 @@ layout(std430, set = 0, binding = 0) readonly buffer ClusterCullMetadataSSBO {
 } g_Clusters;
 
 // binding 1 == g_CompressedClusterPool, declared by cluster_vertex_decode.glsl.
+// bindings 2-5 == g_HWClusterIDImage/g_HWTriangleIDImage/g_HWDepthTexture/g_SWVisBufferAtomic,
+// declared by visbuffer_arbitration.glsl.
 
-layout(r32ui, set = 0, binding = 2) uniform readonly uimage2D g_HWClusterIDImage;
-layout(r32ui, set = 0, binding = 3) uniform readonly uimage2D g_HWTriangleIDImage;
-layout(set = 0, binding = 4) uniform sampler2D g_HWDepthTexture;
-layout(r64ui, set = 0, binding = 5) uniform readonly u64image2D g_SWVisBufferAtomic;
 layout(rgba8, set = 0, binding = 6) uniform writeonly image2D g_OutputColor;
 
 layout(std140, set = 0, binding = 7) uniform ResolveViewParamsUBO {
@@ -163,43 +162,15 @@ void main() {
         return;
     }
 
-    // --- Step 1: hardware vs software, whichever is nearer ---
-    uint hwClusterSlot = imageLoad(g_HWClusterIDImage, pixel).r;
-    uint hwTriangleOrdinal = imageLoad(g_HWTriangleIDImage, pixel).r;
-    float hwDepth = texelFetch(g_HWDepthTexture, pixel, 0).r; // NDC [0,1], reversed-Z -- LARGER is nearer.
-    bool hwHasData = hwClusterSlot != 0xFFFFFFFFu; // Matches main.cpp's VisBuffer clear value (kInvalidClusterID).
-
-    uint64_t swPacked = imageLoad(g_SWVisBufferAtomic, pixel).x;
-    bool swHasData = swPacked != 0uL; // Matches ClearVisBufferAtomic.comp's clear value.
-    uint swDepthBits = uint(swPacked >> 32);
-    uint swVisibilityID = uint(swPacked & 0xFFFFFFFFuL);
-    // Direct decode, reversed-Z (see cluster_software_raster_core.glsl's own encoding comment --
-    // no more "1.0 -" inversion, larger swDepthBits already means nearer).
-    float swDepth = float(swDepthBits) / 4294967295.0;
-
-    // Epsilon-tolerant, single source of truth for "which path wins," reused by every consumer
-    // below (arbitration, GBuffer depth capture, and the OVERDRAWS/DEPTH debug views) so they can
-    // never disagree with each other. The epsilon absorbs the residual hw-vs-sw depth disagreement
-    // documented in ClusterSoftwareRasterPass's own class comment (independent rasterizers, no
-    // shared depth buffer, plus per-cluster position requantization at cluster boundaries) instead
-    // of a zero-tolerance `>=` compare picking a winner based on sub-ULP floating-point noise that
-    // shifts every frame as the camera moves -- a real, if partial, mitigation for the z-fighting
-    // this codebase's own bug reports describe at hw/sw cluster-routing boundaries.
-    const float kDepthArbitrationEpsilon = 1.0e-6;
-    bool hwWins = hwHasData && (!swHasData || hwDepth >= swDepth - kDepthArbitrationEpsilon);
-
-    uint clusterSlotIndex;
-    uint triangleOrdinal;
-    bool hasAnyData = hwHasData || swHasData;
-
-    if (hwWins) {
-        clusterSlotIndex = hwClusterSlot;
-        triangleOrdinal = hwTriangleOrdinal;
-    } else {
-        // swHasData is guaranteed true here (hasAnyData covers the all-false case below).
-        clusterSlotIndex = swVisibilityID >> 7;
-        triangleOrdinal = swVisibilityID & 0x7Fu;
-    }
+    // --- Step 1: hardware vs software, whichever is nearer (see visbuffer_arbitration.glsl,
+    // shared verbatim with ClusterShadingBinClassify.comp) ---
+    VisibilityArbitration vis = ArbitrateVisibility(pixel);
+    bool hwWins = vis.hwWins;
+    uint clusterSlotIndex = vis.clusterSlotIndex;
+    uint triangleOrdinal = vis.triangleOrdinal;
+    bool hasAnyData = vis.hasAnyData;
+    float hwDepth = vis.hwDepth;
+    float swDepth = vis.swDepth;
 
     vec3 finalColor = vec3(0.05, 0.05, 0.1);
     // GBuffer defaults for a background (no-geometry) pixel: depth = 0.0 (the far plane, reversed-Z

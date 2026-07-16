@@ -283,6 +283,22 @@ bool ClusterRenderPipeline::Init(
       m_MaskGenerator.GetMaskImageInfos(),
       m_WPOGlobalsBuffer.Handle());
 
+  // Phase 1b: the shading-bin sort pass needs m_Resolve's own 5 output image views (its Classify
+  // stage writes background pixels directly into them, see ClusterShadingBinPass's own class
+  // comment) -- must run after m_Resolve.Init() above for exactly that reason. m_Resolve's own
+  // InitBinnedResolve() then runs AFTER m_ShadingBin.Init(), for the opposite reason (its
+  // descriptor set needs m_ShadingBin's sorted-pixel-list/bin-offsets/bin-histogram buffers) --
+  // see that method's own comment for why these two calls cannot be collapsed into one ordering.
+  m_ShadingBin.Init(createInfo.device, createInfo.allocator, createInfo.commandPool,
+                    createInfo.queue, createInfo.renderExtent,
+                    m_OcclusionCulling.GetClusterMetadataBuffer(),
+                    createInfo.visBufferClusterIDView, createInfo.visBufferTriangleIDView,
+                    createInfo.depthImageView, m_SoftwareRaster.GetVisBufferAtomicView(),
+                    m_Resolve.GetOutputColorView(), m_Resolve.GetOutputNormalView(),
+                    m_Resolve.GetOutputDepthView(), m_Resolve.GetOutputAlbedoView(),
+                    m_Resolve.GetOutputRoughnessMetallicView());
+  m_Resolve.InitBinnedResolve(createInfo.device, createInfo.commandPool, createInfo.queue, m_ShadingBin);
+
   // =========================================================================================
   // STEP 7 -- Lumen-style GI infrastructure: sun shadow map, Surface Cache, Global SDF clipmap
   // (see ClusterRenderPipeline.h's own class-comment addendum on why these are unconditional,
@@ -433,6 +449,7 @@ void ClusterRenderPipeline::Shutdown() {
   m_DebugTraceMode = 0;
 #endif
 
+  m_ShadingBin.Shutdown();
   m_Resolve.Shutdown();
   m_SoftwareRaster.Shutdown();
   m_HardwareRaster.Shutdown();
@@ -989,17 +1006,32 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
   }
 
   // =========================================================================================
-  // [12] Resolve: per-pixel hardware-vs-software arbitration + barycentric
-  // reconstruction + material evaluation into the resolve pass's own RGBA8
-  // output image. The software rasterizer's atomic writes are already visible
-  // (RecordRaster's trailing COMPUTE -> COMPUTE barrier).
+  // [11b] Phase 1b: shading-bin classify + sort (renderer::ClusterShadingBinPass), only for the
+  // normal (non-debug-visualization) view path -- every debug view (DEBUG_VIEW_NANITE_TRIANGLES,
+  // DEBUG_VIEW_LUMEN, etc.) instead falls back to [12] Resolve's original full-screen dispatch
+  // unchanged, since duplicating 15 debug-view branches into the leaner binned shader
+  // (ClusterResolveBinned.comp) would only maintain two copies of the same visualization code for
+  // no benefit -- see renderer::ClusterResolvePass::RecordResolveBinned's own comment. Release has
+  // no debug view switch at all (camera.debugViewMode does not exist as a field, see
+  // core/Camera.h), so Release always takes the binned path -- zero runtime branch, matching
+  // CLAUDE.md's build-separation rule.
+  // [12] Resolve: per-pixel hardware-vs-software arbitration + barycentric reconstruction +
+  // material evaluation into the resolve pass's own RGBA8 output image (either path). The
+  // software rasterizer's atomic writes are already visible (RecordRaster's trailing COMPUTE ->
+  // COMPUTE barrier).
   // =========================================================================================
-  maths::mat4 prevViewProjForResolve = m_HasPrevViewProj ? m_PrevViewProj : viewProj;
-  m_Resolve.RecordResolve(cmd, viewProj, prevViewProjForResolve
 #ifndef NDEBUG
-    , camera.debugViewMode
+  if (camera.debugViewMode == DEBUG_VIEW_NORMAL) {
+    m_ShadingBin.RecordClassifyAndSort(cmd, m_RenderExtent);
+    m_Resolve.RecordResolveBinned(cmd, viewProj, m_ShadingBin);
+  } else {
+    maths::mat4 prevViewProjForResolve = m_HasPrevViewProj ? m_PrevViewProj : viewProj;
+    m_Resolve.RecordResolve(cmd, viewProj, prevViewProjForResolve, camera.debugViewMode);
+  }
+#else
+  m_ShadingBin.RecordClassifyAndSort(cmd, m_RenderExtent);
+  m_Resolve.RecordResolveBinned(cmd, viewProj, m_ShadingBin);
 #endif
-  );
 
   // [12b] Screen Space Probe GI: trace -> temporal reprojection/accumulation -> bilateral
   // gather, read-modify-writing m_Resolve's own output color image directly (see
