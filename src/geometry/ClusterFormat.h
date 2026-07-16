@@ -34,6 +34,7 @@
 
 #include <cstdint>
 #include "core/maths/Maths.h"
+#include "core/EngineConfig.h"
 
 namespace geometry {
 
@@ -43,14 +44,14 @@ namespace geometry {
 
     // Maximum vertices/triangles a single cluster (meshlet) can hold. Chosen to match common GPU
     // mesh-shader meshlet limits (VK_EXT_mesh_shader) and to keep ClusterData a fixed size.
-    constexpr uint32_t kMaxClusterVertices = 64u;
-    constexpr uint32_t kMaxClusterTriangles = 128u;
+    constexpr uint32_t kMaxClusterVertices = config::nanite::MAX_CLUSTER_VERTICES;
+    constexpr uint32_t kMaxClusterTriangles = config::nanite::MAX_CLUSTER_TRIANGLES;
     constexpr uint32_t kMaxClusterIndices = kMaxClusterTriangles * 3u;
 
     // The atomic disk I/O / section-alignment granularity: every major section of the file (the
     // header, and the start of each cluster's geometry block) begins on a multiple of this many
     // bytes, matching a real storage device's 4K sector size for FILE_FLAG_NO_BUFFERING streaming.
-    constexpr uint32_t kPageSizeBytes = 4096u;
+    constexpr uint32_t kPageSizeBytes = config::nanite::PAGE_SIZE_BYTES;
 
 #pragma pack(push, 1)
 

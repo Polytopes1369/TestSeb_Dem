@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <vulkan/vulkan.h>
 #include <vk_mem_alloc.h>
+#include "core/EngineConfig.h"
 
 namespace renderer {
 
@@ -27,7 +28,7 @@ namespace renderer {
         // Mirrors renderer::SurfaceCachePass::kCardsPerFrameBudget's own budgeting rationale --
         // GI injection is at least as expensive per card as capture (sampleCount hemisphere
         // traces per texel vs. one rasterized fragment), so the same small per-call slice applies.
-        static constexpr uint32_t kCardsPerFrameBudget = 4;
+        static constexpr uint32_t kCardsPerFrameBudget = config::lumen::CARDS_PER_FRAME_BUDGET;
         static constexpr uint32_t kSampleCountPerTexel = 8;
 
         // `traceContext`, `surfaceCache` and `rtPass` must all already be Init'd and must outlive

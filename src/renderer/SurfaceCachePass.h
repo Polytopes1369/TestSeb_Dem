@@ -61,6 +61,7 @@
 #include <vk_mem_alloc.h>
 
 #include "core/maths/Maths.h"
+#include "core/EngineConfig.h"
 #include "geometry/CardGenerator.h" // geometry::kSurfaceCacheAtlasSize
 #include "geometry/ClusterFormat.h"
 #include "geometry/SurfaceCacheAtlasAllocator.h"
@@ -107,13 +108,13 @@ namespace renderer {
         // How many cards RecordCapture() (re-)captures per call -- see the class comment's
         // "asynchronous" note. Small enough that even a full command buffer's worth of capture
         // draws costs a handful of tiny (card-sized, not full-screen) rasterization scopes.
-        static constexpr uint32_t kCardsPerFrameBudget = 4;
+        static constexpr uint32_t kCardsPerFrameBudget = config::lumen::CARDS_PER_FRAME_BUDGET;
 
         // How many consecutive UpdateVisibility() calls a resident card is allowed to go unwanted
         // before its atlas page is actually freed -- see UpdateVisibility()'s own comment. A short
         // grace period absorbs a card flickering in and out of the frustum (e.g. an entity near
         // the screen edge) without paying a re-capture every single time it comes back.
-        static constexpr uint32_t kEvictionFrameDelay = 120;
+        static constexpr uint32_t kEvictionFrameDelay = config::lumen::EVICTION_FRAME_DELAY;
 
         // Reads the surface-cache card table + every fallback mesh's geometry from
         // `cacheFilePath` (written by geometry::CacheFileManager::WriteCacheFile), uploads one

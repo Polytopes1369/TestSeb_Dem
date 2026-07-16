@@ -44,8 +44,8 @@ namespace {
 // writing) since GenerateGeometry() asserts against these below -- growing a
 // primitive's segment counts past this ceiling now fails loudly at startup
 // instead of silently overflowing into adjacent GPU memory.
-constexpr VkDeviceSize kVertexBufferBytes = 128 * 1024 * 1024;
-constexpr VkDeviceSize kIndexBufferBytes = 64 * 1024 * 1024;
+constexpr VkDeviceSize kVertexBufferBytes = config::nanite::VERTEX_BUFFER_BYTES;
+constexpr VkDeviceSize kIndexBufferBytes = config::nanite::INDEX_BUFFER_BYTES;
 
 // --- Per-shader Params blocks, mirrored 1:1 from their geom_*.comp
 // UBO/push-constant declarations (all fields are 4-byte scalars, so std140

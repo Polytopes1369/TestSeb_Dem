@@ -62,6 +62,7 @@
 #include <vk_mem_alloc.h>
 
 #include "core/Camera.h"
+#include "core/EngineConfig.h"
 #include "core/maths/Maths.h"
 #include "renderer/ATrousDenoisePass.h"
 #include "renderer/ClusterHardwareRasterPass.h"
@@ -131,13 +132,13 @@ namespace renderer {
 
         // Average estimated triangle screen size (pixels) below which a cluster is routed to the
         // software rasterizer -- see ClusterHZBOcclusionCull.comp's ShouldUseSoftwareRaster().
-        static constexpr float kSoftwareRasterThresholdPixels = 6.0f;
+        static constexpr float kSoftwareRasterThresholdPixels = config::nanite::SOFTWARE_RASTER_THRESHOLD_PIXELS;
 
         // Target on-screen geometric error (pixels) for the LOD DAG cut -- see
         // ClusterDAGScreenError.comp's pixelThreshold. A node draws once its own projected error
         // drops below this value while its parent's still exceeds it; typical Nanite-style engines
         // target roughly 1 pixel.
-        static constexpr float kLODPixelErrorThreshold = 1.0f;
+        static constexpr float kLODPixelErrorThreshold = config::nanite::LOD_PIXEL_ERROR_THRESHOLD;
 
         // Number of consecutive SurfaceCacheGIInjectPass::RecordInject calls made THIS frame (see
         // RecordFrame()'s own [1z] block). Each call advances m_GIInject's own round-robin cursor by
