@@ -220,6 +220,11 @@ namespace renderer {
         // EmitLateDraw) is this buffer's own array index for that cluster.
         VkBuffer GetClusterMetadataBuffer() const { return m_ClusterMetadataBuffer.Handle(); }
         uint32_t GetMaxClusters() const { return m_MaxClusters; }
+        // DEBUG (temporary): binding 11, uint[maxClusters], one outcome code per cluster slot --
+        // see ClusterHZBOcclusionCull.comp's DebugOutcomeSSBO for the encoding. Not cleared per
+        // frame (each frame's early/late passes unconditionally overwrite every candidate's entry
+        // they touch), read back once via ClusterRenderPipeline's debug histogram dump.
+        VkBuffer GetDebugOutcomeBuffer() const { return m_DebugOutcomeBuffer.Handle(); }
 
     private:
         static constexpr uint32_t kWorkgroupSize = 64; // Matches ClusterHZBOcclusionCull.comp's local_size_x.
@@ -251,6 +256,7 @@ namespace renderer {
         GpuBuffer m_LateIndirectCommandBuffer;  // binding 8: VkDrawIndexedIndirectCommand[maxClusters], std430, GPU_ONLY.
         GpuBuffer m_LateDrawCountBuffer;        // binding 9: single uint32 atomic counter, GPU_ONLY.
         GpuBuffer m_SoftwareClusterListBuffer;  // binding 10: { uint count; uint clusterIndex[maxClusters]; }, std430, GPU_ONLY.
+        GpuBuffer m_DebugOutcomeBuffer;         // binding 11 (DEBUG, temporary): uint[maxClusters], std430, GPU_ONLY.
 
         GpuBuffer m_LateDispatchArgsBuffer; // VkDispatchIndirectCommand (3x uint32), GPU_ONLY, written by BuildDispatchIndirectArgs.comp.
 

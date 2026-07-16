@@ -94,6 +94,15 @@ namespace renderer {
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
             VMA_MEMORY_USAGE_GPU_ONLY);
 
+        // DEBUG (temporary): one outcome code per cluster slot, overwritten every frame by whichever
+        // decision point in ClusterHZBOcclusionCull.comp last touched that cluster -- needs
+        // TRANSFER_SRC_BIT so ClusterRenderPipeline can read it back for the diagnostic histogram.
+        m_DebugOutcomeBuffer.Create(
+            allocator,
+            static_cast<VkDeviceSize>(sizeof(uint32_t)) * maxClusters,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            VMA_MEMORY_USAGE_GPU_ONLY);
+
         m_EarlyIndirectCommandBuffer.Create(
             allocator,
             static_cast<VkDeviceSize>(sizeof(VkDrawIndexedIndirectCommand)) * maxClusters,
@@ -143,10 +152,10 @@ namespace renderer {
         samplerInfo.unnormalizedCoordinates = VK_FALSE;
         VK_CHECK(vkCreateSampler(m_Device, &samplerInfo, nullptr, &m_HZBSampler));
 
-        // --- Main descriptor set layout: 11 bindings, all compute-visible, matching
-        // ClusterHZBOcclusionCull.comp's set = 0 bindings 0..10 exactly. Shared by both the early
+        // --- Main descriptor set layout: 12 bindings, all compute-visible, matching
+        // ClusterHZBOcclusionCull.comp's set = 0 bindings 0..11 exactly. Shared by both the early
         // and late pipelines. ---
-        VkDescriptorSetLayoutBinding bindings[11]{};
+        VkDescriptorSetLayoutBinding bindings[12]{};
         bindings[0] = { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };          // ClusterCullMetadataSSBO
         bindings[1] = { 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };          // CullingViewParamsUBO
         bindings[2] = { 2, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };          // HZBOcclusionViewParamsUBO
@@ -158,9 +167,10 @@ namespace renderer {
         bindings[8] = { 8, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };         // LateIndirectCommandsSSBO
         bindings[9] = { 9, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };         // LateDrawCountSSBO
         bindings[10] = { 10, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };       // SoftwareClusterListSSBO
+        bindings[11] = { 11, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };       // DEBUG: DebugOutcomeSSBO
 
         VkDescriptorSetLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-        layoutInfo.bindingCount = 11;
+        layoutInfo.bindingCount = 12;
         layoutInfo.pBindings = bindings;
         VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &layoutInfo, nullptr, &m_SetLayout));
 
@@ -176,7 +186,7 @@ namespace renderer {
 
         // --- One shared descriptor pool for both sets ---
         VkDescriptorPoolSize poolSizes[3]{};
-        poolSizes[0] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8 + 2 };       // Main set's 8 SSBOs + BuildArgs set's 2 SSBOs.
+        poolSizes[0] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 9 + 2 };       // Main set's 8 SSBOs + DEBUG DebugOutcomeSSBO + BuildArgs set's 2 SSBOs.
         poolSizes[1] = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2 };
         poolSizes[2] = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1 };
 
@@ -209,6 +219,7 @@ namespace renderer {
         VkDescriptorBufferInfo lateIndirectInfo{ m_LateIndirectCommandBuffer.Handle(), 0, m_LateIndirectCommandBuffer.Size() };
         VkDescriptorBufferInfo lateDrawCountInfo{ m_LateDrawCountBuffer.Handle(), 0, m_LateDrawCountBuffer.Size() };
         VkDescriptorBufferInfo softwareClusterListInfo{ m_SoftwareClusterListBuffer.Handle(), 0, m_SoftwareClusterListBuffer.Size() };
+        VkDescriptorBufferInfo debugOutcomeInfo{ m_DebugOutcomeBuffer.Handle(), 0, m_DebugOutcomeBuffer.Size() };
 
         VkDescriptorImageInfo hzbImageInfo{};
         hzbImageInfo.sampler = m_HZBSampler;
@@ -217,7 +228,7 @@ namespace renderer {
         // an attachment or a sampled-only resource) -- see HZBPass.h's class comment.
         hzbImageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
-        VkWriteDescriptorSet writes[11]{};
+        VkWriteDescriptorSet writes[12]{};
         writes[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_DescriptorSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &clusterInfo, nullptr };
         writes[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_DescriptorSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &viewParamsInfo, nullptr };
         writes[2] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_DescriptorSet, 2, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &hzbParamsInfo, nullptr };
@@ -229,7 +240,8 @@ namespace renderer {
         writes[8] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_DescriptorSet, 8, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &lateIndirectInfo, nullptr };
         writes[9] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_DescriptorSet, 9, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &lateDrawCountInfo, nullptr };
         writes[10] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_DescriptorSet, 10, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &softwareClusterListInfo, nullptr };
-        vkUpdateDescriptorSets(m_Device, 11, writes, 0, nullptr);
+        writes[11] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_DescriptorSet, 11, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &debugOutcomeInfo, nullptr };
+        vkUpdateDescriptorSets(m_Device, 12, writes, 0, nullptr);
 
         // --- BuildDispatchIndirectArgs set descriptor writes -- binding 0 aliases the pending
         // list buffer, reading only its leading count word (see BuildDispatchIndirectArgs.comp's
@@ -382,6 +394,7 @@ namespace renderer {
         m_LateIndirectCommandBuffer.Destroy();
         m_LateDrawCountBuffer.Destroy();
         m_SoftwareClusterListBuffer.Destroy();
+        m_DebugOutcomeBuffer.Destroy();
         m_LateDispatchArgsBuffer.Destroy();
 
         m_MaxClusters = 0;

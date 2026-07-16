@@ -165,7 +165,10 @@ void main()
     uint sideZ1_IndexOffset = baseQuads * 6u;
     if (id < sideZQuads)
     {
-        // +Z Side Face Indices (wind CCW in X-Y projection for +Z normal)
+        // +Z Side Face Indices (wound so (v1-v0) x (v2-v0) matches the stored +Z-face normal,
+        // normalize(vec3(0, depth*0.5, height)) above -- b0/t0/t1/b1's actual winding order below
+        // was previously producing the negated (inward-facing) cross product; see the fix in this
+        // same commit for -Z/+X/-X below, which had the identical inversion.)
         uint col = id % widthSegs;
         uint row = id / widthSegs;
         uint baseOffset = baseVertCount;
@@ -175,17 +178,18 @@ void main()
         uint t1 = t0 + 1u;
         uint tIdx = indexOffset + sideZ1_IndexOffset + id * 6u;
         indices[tIdx + 0u] = vertexOffset + b0;
-        indices[tIdx + 1u] = vertexOffset + t0;
-        indices[tIdx + 2u] = vertexOffset + t1;
+        indices[tIdx + 1u] = vertexOffset + t1;
+        indices[tIdx + 2u] = vertexOffset + t0;
         indices[tIdx + 3u] = vertexOffset + b0;
-        indices[tIdx + 4u] = vertexOffset + t1;
-        indices[tIdx + 5u] = vertexOffset + b1;
+        indices[tIdx + 4u] = vertexOffset + b1;
+        indices[tIdx + 5u] = vertexOffset + t1;
     }
 
     uint sideZ2_IndexOffset = sideZ1_IndexOffset + sideZQuads * 6u;
     if (id < sideZQuads)
     {
-        // -Z Side Face Indices (wind CW in X-Y projection for -Z normal)
+        // -Z Side Face Indices (wound to match normalize(vec3(0, depth*0.5, -height)) -- same fix
+        // as +Z above.)
         uint col = id % widthSegs;
         uint row = id / widthSegs;
         uint baseOffset = baseVertCount + sideZVerts;
@@ -195,17 +199,18 @@ void main()
         uint t1 = t0 + 1u;
         uint tIdx = indexOffset + sideZ2_IndexOffset + id * 6u;
         indices[tIdx + 0u] = vertexOffset + b0;
-        indices[tIdx + 1u] = vertexOffset + t1;
-        indices[tIdx + 2u] = vertexOffset + b1;
+        indices[tIdx + 1u] = vertexOffset + b1;
+        indices[tIdx + 2u] = vertexOffset + t1;
         indices[tIdx + 3u] = vertexOffset + b0;
-        indices[tIdx + 4u] = vertexOffset + t0;
-        indices[tIdx + 5u] = vertexOffset + t1;
+        indices[tIdx + 4u] = vertexOffset + t1;
+        indices[tIdx + 5u] = vertexOffset + t0;
     }
 
     uint sideX1_IndexOffset = sideZ2_IndexOffset + sideZQuads * 6u;
     if (id < sideXQuads)
     {
-        // +X Side Face Indices (wind CCW in Z-Y projection for +X normal)
+        // +X Side Face Indices (wound to match normalize(vec3(height, width*0.5, 0)) -- same fix
+        // as +Z above.)
         uint col = id % depthSegs;
         uint row = id / depthSegs;
         uint baseOffset = baseVertCount + 2u * sideZVerts;
@@ -215,17 +220,18 @@ void main()
         uint t1 = t0 + 1u;
         uint tIdx = indexOffset + sideX1_IndexOffset + id * 6u;
         indices[tIdx + 0u] = vertexOffset + b0;
-        indices[tIdx + 1u] = vertexOffset + t0;
-        indices[tIdx + 2u] = vertexOffset + t1;
+        indices[tIdx + 1u] = vertexOffset + t1;
+        indices[tIdx + 2u] = vertexOffset + t0;
         indices[tIdx + 3u] = vertexOffset + b0;
-        indices[tIdx + 4u] = vertexOffset + t1;
-        indices[tIdx + 5u] = vertexOffset + b1;
+        indices[tIdx + 4u] = vertexOffset + b1;
+        indices[tIdx + 5u] = vertexOffset + t1;
     }
 
     uint sideX2_IndexOffset = sideX1_IndexOffset + sideXQuads * 6u;
     if (id < sideXQuads)
     {
-        // -X Side Face Indices (wind CW in Z-Y projection for -X normal)
+        // -X Side Face Indices (wound to match normalize(vec3(-height, width*0.5, 0)) -- same fix
+        // as +Z above.)
         uint col = id % depthSegs;
         uint row = id / depthSegs;
         uint baseOffset = baseVertCount + 2u * sideZVerts + sideXVerts;
@@ -235,10 +241,10 @@ void main()
         uint t1 = t0 + 1u;
         uint tIdx = indexOffset + sideX2_IndexOffset + id * 6u;
         indices[tIdx + 0u] = vertexOffset + b0;
-        indices[tIdx + 1u] = vertexOffset + t1;
-        indices[tIdx + 2u] = vertexOffset + b1;
+        indices[tIdx + 1u] = vertexOffset + b1;
+        indices[tIdx + 2u] = vertexOffset + t1;
         indices[tIdx + 3u] = vertexOffset + b0;
-        indices[tIdx + 4u] = vertexOffset + t0;
-        indices[tIdx + 5u] = vertexOffset + t1;
+        indices[tIdx + 4u] = vertexOffset + t1;
+        indices[tIdx + 5u] = vertexOffset + t0;
     }
 }

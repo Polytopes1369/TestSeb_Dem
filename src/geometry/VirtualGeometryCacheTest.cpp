@@ -185,15 +185,35 @@ namespace geometry {
         // not be streamed in. virtualAddress/blockSizeBytes are left zeroed -- CacheFileManager::
         // WriteCacheFile fills them in once it has computed the file's physical layout.
         ClusterIndexEntry BuildIndexEntry(uint32_t globalClusterID, uint32_t entityID, const ClusterDAGNode& node) {
-            std::vector<maths::vec3> normals = ComputeVertexNormals(node.mesh);
+            // The cone must bound each triangle's flat FACE normal -- what IsClusterBackFacing
+            // (cluster_culling_tests.glsl) actually tests against -- not smoothed per-vertex
+            // normals. Vertex normals average together neighboring face normals, which narrows
+            // the apparent spread and pushes coneCutoff higher (more aggressive) than the true
+            // bound, wrongly rejecting still-front-facing clusters on high-curvature/twisted
+            // geometry (torus knot) or near hard edges/tips (cone's cap rim and apex). Degenerate
+            // (near-zero-area) triangles -- e.g. geom_cone.comp/geom_cylinder.comp's innermost
+            // cap-ring index padding -- are skipped since they have no well-defined orientation
+            // and would otherwise skew the bound toward an artificially wide (but harmless) cone.
+            std::vector<maths::vec3> faceNormals;
+            faceNormals.reserve(node.mesh.triangles.size() / 3);
+            for (size_t t = 0; t + 2 < node.mesh.triangles.size(); t += 3) {
+                uint32_t i0 = node.mesh.triangles[t + 0];
+                uint32_t i1 = node.mesh.triangles[t + 1];
+                uint32_t i2 = node.mesh.triangles[t + 2];
+                maths::vec3 rawNormal = (node.mesh.positions[i1] - node.mesh.positions[i0]).Cross(node.mesh.positions[i2] - node.mesh.positions[i0]);
+                if (rawNormal.Length() < 1.0e-12f) {
+                    continue;
+                }
+                faceNormals.push_back(rawNormal.Normalize());
+            }
 
             maths::vec3 axisAccum{ 0.0f, 0.0f, 0.0f };
-            for (const maths::vec3& n : normals) {
+            for (const maths::vec3& n : faceNormals) {
                 axisAccum = axisAccum + n;
             }
-            maths::vec3 coneAxis = axisAccum.Normalize();
+            maths::vec3 coneAxis = faceNormals.empty() ? maths::vec3{ 0.0f, 1.0f, 0.0f } : axisAccum.Normalize();
             float coneCutoff = 1.0f;
-            for (const maths::vec3& n : normals) {
+            for (const maths::vec3& n : faceNormals) {
                 coneCutoff = std::min(coneCutoff, coneAxis.Dot(n));
             }
             coneCutoff = std::clamp(coneCutoff, -1.0f, 1.0f);
@@ -355,6 +375,32 @@ namespace geometry {
                 dagEntry.clusterError = node.clusterError;
                 dagEntry.parentError = node.parentError;
                 dagEntries.push_back(dagEntry);
+            }
+        }
+
+        // --- DIAGNOSTIC: per-entity coneCutoff range (sanity check for the backface-cone fix) ----
+        // coneCutoff close to +1.0 means a very narrow/aggressive cone (culls unless the camera is
+        // almost perfectly aligned with the axis); close to -1.0 means a near-omnidirectional cone
+        // (rarely culls). High-curvature/twisted meshes (torus knot) and hard-edged tips (cone)
+        // should show low (wide) cutoffs -- a value hovering near 1.0 for those would indicate the
+        // per-cluster normal cone is still too narrow and would over-cull.
+        {
+            std::unordered_map<uint32_t, float> minCutoffByEntity;
+            std::unordered_map<uint32_t, float> maxCutoffByEntity;
+            std::unordered_map<uint32_t, uint32_t> countByEntity;
+            for (const ClusterIndexEntry& e : indexEntries) {
+                float cutoff = static_cast<float>(e.coneCutoff) / 127.0f;
+                auto itMin = minCutoffByEntity.find(e.entityID);
+                if (itMin == minCutoffByEntity.end() || cutoff < itMin->second) minCutoffByEntity[e.entityID] = cutoff;
+                auto itMax = maxCutoffByEntity.find(e.entityID);
+                if (itMax == maxCutoffByEntity.end() || cutoff > itMax->second) maxCutoffByEntity[e.entityID] = cutoff;
+                ++countByEntity[e.entityID];
+            }
+            Logger::Log(LogLevel::Info, "[GeometryCacheTest] Per-entity coneCutoff range (all DAG levels, not just leaves):");
+            for (const auto& [id, count] : countByEntity) {
+                Logger::Log(LogLevel::Info, std::format(
+                    "[GeometryCacheTest]   meshID={}: clusters={} coneCutoff min={:.3f} max={:.3f}",
+                    id, count, minCutoffByEntity[id], maxCutoffByEntity[id]));
             }
         }
 

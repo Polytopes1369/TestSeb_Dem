@@ -6,6 +6,7 @@
 #include <format>
 #include <fstream>
 #include <stdexcept>
+#include <string>
 
 #include "core/Logger.h"
 #include "geometry/CacheFileManager.h"
@@ -19,6 +20,9 @@ namespace renderer {
 
         m_Device = createInfo.device;
         m_RenderExtent = createInfo.renderExtent;
+        m_Allocator = createInfo.allocator;
+        m_CommandPool = createInfo.commandPool;
+        m_Queue = createInfo.queue;
         m_VisBufferClusterIDImage = createInfo.visBufferClusterIDImage;
         m_VisBufferClusterIDView = createInfo.visBufferClusterIDView;
         m_VisBufferTriangleIDImage = createInfo.visBufferTriangleIDImage;
@@ -166,6 +170,12 @@ namespace renderer {
         // =========================================================================================
         std::vector<ClusterCullMetadata> metadata;
         metadata.reserve(leafCount);
+        // DEBUG (temporary): ClusterCullMetadata deliberately has no entity ID field (the GPU
+        // culling/routing code never needs one), so this CPU-side shadow array -- index-aligned
+        // with `metadata`/the GPU cluster-slot indices -- is how the debug outcome histogram
+        // (see RecordFrame's periodic dump) maps a cluster slot back to which primitive it came
+        // from, using the same ClusterIndexEntry::entityID already read from disk.
+        m_ClusterSlotToEntityID.reserve(leafCount);
         for (size_t i = 0; i < indexEntries.size(); ++i) {
             if (dagEntries[i].level != 0) {
                 continue;
@@ -188,6 +198,7 @@ namespace renderer {
             meta.vertexOffset = physicalPage * geometry::kMaxClusterVertices;
             meta.clusterID = entry.clusterID;
             metadata.push_back(meta);
+            m_ClusterSlotToEntityID.push_back(entry.entityID);
         }
         m_ClusterCount = static_cast<uint32_t>(metadata.size());
 
@@ -229,6 +240,12 @@ namespace renderer {
         m_PagePool.Shutdown();
 
         m_ClusterCount = 0;
+        m_ClusterSlotToEntityID.clear();
+        m_FrameCounter = 0;
+        m_DebugOutcomeDumped = false;
+        m_Allocator = VK_NULL_HANDLE;
+        m_CommandPool = VK_NULL_HANDLE;
+        m_Queue = VK_NULL_HANDLE;
         m_VisBufferClusterIDImage = VK_NULL_HANDLE;
         m_VisBufferClusterIDView = VK_NULL_HANDLE;
         m_VisBufferTriangleIDImage = VK_NULL_HANDLE;
@@ -274,9 +291,97 @@ namespace renderer {
         vkCmdBeginRendering(cmd, &renderingInfo);
     }
 
+    // DEBUG (temporary): see the class comment above RecordFrame()'s trigger site.
+    void ClusterRenderPipeline::DumpDebugOutcomeHistogram(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue) const {
+        VkDeviceSize readbackSize = static_cast<VkDeviceSize>(sizeof(uint32_t)) * m_ClusterCount;
+
+        GpuBuffer stagingBuffer;
+        stagingBuffer.Create(allocator, readbackSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_GPU_TO_CPU, /*mapped=*/true);
+
+        VkCommandBufferAllocateInfo cmdAllocInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+        cmdAllocInfo.commandPool = commandPool;
+        cmdAllocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        cmdAllocInfo.commandBufferCount = 1;
+
+        VkCommandBuffer cmd;
+        VK_CHECK(vkAllocateCommandBuffers(device, &cmdAllocInfo, &cmd));
+
+        VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+        beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        vkBeginCommandBuffer(cmd, &beginInfo);
+
+        // Make the previous frame's culling-shader writes to the debug outcome buffer visible to
+        // this copy -- see RecordFrame()'s trigger comment for why this is guaranteed complete.
+        VkMemoryBarrier2 preCopyBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+        preCopyBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        preCopyBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+        preCopyBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+        preCopyBarrier.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+
+        VkDependencyInfo preCopyDependency{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+        preCopyDependency.memoryBarrierCount = 1;
+        preCopyDependency.pMemoryBarriers = &preCopyBarrier;
+        vkCmdPipelineBarrier2(cmd, &preCopyDependency);
+
+        VkBufferCopy copyRegion{};
+        copyRegion.srcOffset = 0;
+        copyRegion.dstOffset = 0;
+        copyRegion.size = readbackSize;
+        vkCmdCopyBuffer(cmd, m_OcclusionCulling.GetDebugOutcomeBuffer(), stagingBuffer.Handle(), 1, &copyRegion);
+
+        vkEndCommandBuffer(cmd);
+
+        VkSubmitInfo submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
+        submitInfo.commandBufferCount = 1;
+        submitInfo.pCommandBuffers = &cmd;
+        VK_CHECK(vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE));
+        VK_CHECK(vkQueueWaitIdle(queue));
+        vkFreeCommandBuffers(device, commandPool, 1, &cmd);
+
+        const uint32_t* outcomes = static_cast<const uint32_t*>(stagingBuffer.MappedData());
+
+        static constexpr const char* kOutcomeNames[8] = {
+            "frustum-rejected", "backface-rejected", "occluded-early(pending)", "occluded-late(final)",
+            "drawn-hw-early", "drawn-hw-late", "drawn-sw-early", "drawn-sw-late"
+        };
+
+        // Fixed 12 entities x 8 outcome codes -- see ClusterHZBOcclusionCull.comp's DebugOutcomeSSBO
+        // encoding comment for the code list.
+        uint32_t countsByEntityAndOutcome[12][8] = {};
+        for (uint32_t slot = 0; slot < m_ClusterCount; ++slot) {
+            uint32_t entityID = m_ClusterSlotToEntityID[slot];
+            uint32_t outcome = outcomes[slot];
+            if (entityID < 12 && outcome < 8) {
+                ++countsByEntityAndOutcome[entityID][outcome];
+            }
+        }
+
+        Logger::Log(LogLevel::Info, std::format("[ClusterRenderPipeline] DEBUG per-entity culling outcome histogram (frame {}):", m_FrameCounter));
+        for (uint32_t entityID = 0; entityID < 12; ++entityID) {
+            std::string line = std::format("[ClusterRenderPipeline]   meshID={}: ", entityID);
+            for (uint32_t outcome = 0; outcome < 8; ++outcome) {
+                uint32_t count = countsByEntityAndOutcome[entityID][outcome];
+                if (count > 0) {
+                    line += std::format("{}={} ", kOutcomeNames[outcome], count);
+                }
+            }
+            Logger::Log(LogLevel::Info, line);
+        }
+    }
+
     void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd, const CameraPushConstants& camera,
         const maths::vec3& cameraPositionWorld, VkImage swapchainImage) {
         assert(m_ClusterCount > 0 && "RecordFrame called before a successful Init");
+
+        // DEBUG (temporary): dump a per-entity culling-outcome histogram once, after the scene has
+        // reached steady state (frame 60). Safe to do here, before this frame's own `cmd` is
+        // recorded/submitted: main.cpp's single-frame-in-flight loop already waited on the previous
+        // frame's fence before calling RecordFrame(), so the previous frame's debugOutcome writes
+        // are guaranteed complete and this blocking readback cannot race anything.
+        ++m_FrameCounter;
+        if (m_FrameCounter >= 55 && m_FrameCounter <= 65) {
+            DumpDebugOutcomeHistogram(m_Device, m_Allocator, m_CommandPool, m_Queue);
+        }
 
         // Every stage of this frame consumes the SAME combined matrix -- this is what makes the
         // resolve pass's screen-space triangle re-projection bit-identical to the rasterizers'.

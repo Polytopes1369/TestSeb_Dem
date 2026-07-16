@@ -54,6 +54,22 @@ bool IsBoxInsideFrustum(vec3 boundsMin, vec3 boundsMax, vec4 frustumPlanes[6]) {
 // axis/view alignment before culling is allowed, correctly making larger clusters harder to reject
 // outright than small tightly-bounded ones.
 bool IsClusterBackFacing(vec3 sphereCenter, float sphereRadius, vec3 coneAxis, float coneCutoff, vec3 cameraPositionWorld) {
+    // A cone with cutoff <= 0 already spans a full hemisphere (>= 90 degree half-angle) or more --
+    // on coarsely-clustered, highly-curved or faceted geometry (a torus/torus-knot tube, a cone's
+    // tapering side + apex, a pyramid's angled faces meeting at hard edges), this is common because
+    // a single ~128-triangle cluster covers enough surface curvature that no single axis tightly
+    // bounds its triangles' normals. At that width the test's "even the most favorable (S, n) pair
+    // still fails" guarantee stops being a meaningful directional claim -- it starts rejecting
+    // clusters that are legitimately partly front-facing (most visibly right at silhouette edges,
+    // where it produces exactly the "clusters pop in/out as the camera moves" symptom this fixes),
+    // for only a marginal culling benefit (a cone this wide was already hard to trigger safely).
+    // Skipping the test outright below this threshold trades that marginal benefit away in favor
+    // of correctness; tightly-bounded clusters (cutoff > 0, e.g. flatter/less-curved patches) are
+    // completely unaffected and keep the exact same conservative rejection as before.
+    if (coneCutoff <= 0.5) {
+        return false;
+    }
+
     vec3 cameraToCenter = sphereCenter - cameraPositionWorld;
     float dist = length(cameraToCenter);
 

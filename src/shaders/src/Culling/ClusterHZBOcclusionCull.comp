@@ -131,6 +131,24 @@ layout(std430, set = 0, binding = 10) buffer SoftwareClusterListSSBO {
     uint clusterIndex[];
 } g_SoftwareClusterList;
 
+// DEBUG (temporary): one outcome code per cluster slot, overwritten unconditionally at every
+// decision point below. Encoding: 0=frustum-rejected, 1=backface-rejected,
+// 2=occluded-early(pending), 3=occluded-late(final), 4=drawn-hw-early, 5=drawn-hw-late,
+// 6=drawn-sw-early, 7=drawn-sw-late. Read back once by renderer::ClusterRenderPipeline's debug
+// histogram dump -- see ClusterOcclusionCullingPass::GetDebugOutcomeBuffer().
+#define DEBUG_OUTCOME_FRUSTUM_REJECTED  0u
+#define DEBUG_OUTCOME_BACKFACE_REJECTED 1u
+#define DEBUG_OUTCOME_OCCLUDED_EARLY    2u
+#define DEBUG_OUTCOME_OCCLUDED_LATE     3u
+#define DEBUG_OUTCOME_DRAWN_HW_EARLY    4u
+#define DEBUG_OUTCOME_DRAWN_HW_LATE     5u
+#define DEBUG_OUTCOME_DRAWN_SW_EARLY    6u
+#define DEBUG_OUTCOME_DRAWN_SW_LATE     7u
+
+layout(std430, set = 0, binding = 11) buffer DebugOutcomeSSBO {
+    uint outcome[];
+} g_DebugOutcome;
+
 layout(push_constant) uniform ClusterOcclusionPushConstants {
     uint clusterCount; // Total candidate count in g_Clusters -- only consulted by the EARLY specialization.
     // Average estimated triangle screen size (pixels) below which a cluster is routed to the
@@ -222,9 +240,13 @@ void main() {
         if (!occluded) {
             if (ShouldUseSoftwareRaster(cluster)) {
                 EmitSoftwareCluster(clusterIndex);
+                g_DebugOutcome.outcome[clusterIndex] = DEBUG_OUTCOME_DRAWN_SW_LATE;
             } else {
                 EmitLateDraw(cluster, clusterIndex);
+                g_DebugOutcome.outcome[clusterIndex] = DEBUG_OUTCOME_DRAWN_HW_LATE;
             }
+        } else {
+            g_DebugOutcome.outcome[clusterIndex] = DEBUG_OUTCOME_OCCLUDED_LATE;
         }
 
         // Final word on this cluster's visibility for this frame -- next frame's early pass reads
@@ -245,6 +267,7 @@ void main() {
         bool backFacing = IsClusterBackFacing(cluster.sphereCenter, cluster.sphereRadius, cluster.coneAxis, cluster.coneCutoff, g_ViewParams.data.cameraPositionWorld);
         if (!inFrustum || backFacing) {
             g_VisibleLastFrame.visible[clusterIndex] = 0u;
+            g_DebugOutcome.outcome[clusterIndex] = inFrustum ? DEBUG_OUTCOME_BACKFACE_REJECTED : DEBUG_OUTCOME_FRUSTUM_REJECTED;
             return;
         }
 
@@ -257,8 +280,10 @@ void main() {
             // spend a late-pass re-test on it.
             if (ShouldUseSoftwareRaster(cluster)) {
                 EmitSoftwareCluster(clusterIndex);
+                g_DebugOutcome.outcome[clusterIndex] = DEBUG_OUTCOME_DRAWN_SW_EARLY;
             } else {
                 EmitEarlyDraw(cluster, clusterIndex);
+                g_DebugOutcome.outcome[clusterIndex] = DEBUG_OUTCOME_DRAWN_HW_EARLY;
             }
             g_VisibleLastFrame.visible[clusterIndex] = 1u;
         } else {
@@ -267,6 +292,7 @@ void main() {
             // geometry that itself might be about to get overdrawn this frame. Defer to the late
             // pass rather than guessing -- g_VisibleLastFrame is deliberately left untouched here;
             // the late pass writes its final value once the fresh HZB is available.
+            g_DebugOutcome.outcome[clusterIndex] = DEBUG_OUTCOME_OCCLUDED_EARLY;
             uint slot = atomicAdd(g_PendingList.count, 1u);
             if (slot < g_PendingList.clusterIndex.length()) {
                 g_PendingList.clusterIndex[slot] = clusterIndex;

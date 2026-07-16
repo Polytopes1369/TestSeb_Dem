@@ -134,6 +134,12 @@ namespace renderer {
         VkDevice m_Device = VK_NULL_HANDLE;
         VkExtent2D m_RenderExtent{ 0, 0 };
 
+        // DEBUG (temporary): borrowed handles retained only for DumpDebugOutcomeHistogram()'s
+        // one-shot readback command buffer -- not used by any other steady-state per-frame path.
+        VmaAllocator m_Allocator = VK_NULL_HANDLE;
+        VkCommandPool m_CommandPool = VK_NULL_HANDLE;
+        VkQueue m_Queue = VK_NULL_HANDLE;
+
         // Borrowed attachment handles (owned by VulkanContext).
         VkImage m_VisBufferClusterIDImage = VK_NULL_HANDLE;
         VkImageView m_VisBufferClusterIDView = VK_NULL_HANDLE;
@@ -144,6 +150,18 @@ namespace renderer {
 
         // Number of leaf clusters in the culling candidate set (== metadata entries uploaded).
         uint32_t m_ClusterCount = 0;
+
+        // DEBUG (temporary): index-aligned with the GPU cluster-slot indices -- see Init()'s comment
+        // above the loop that populates it. Used only by RecordFrame()'s periodic debug outcome dump.
+        std::vector<uint32_t> m_ClusterSlotToEntityID;
+        uint32_t m_FrameCounter = 0;
+        bool m_DebugOutcomeDumped = false;
+
+        // DEBUG (temporary): reads back ClusterOcclusionCullingPass::GetDebugOutcomeBuffer() and
+        // logs a per-entity histogram of outcome codes -- see ClusterHZBOcclusionCull.comp's
+        // DebugOutcomeSSBO encoding. Blocking (queue wait idle), so only ever called once, well
+        // after steady state (see RecordFrame()).
+        void DumpDebugOutcomeHistogram(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue) const;
 
         // Owned pipeline stages, in rough execution order.
         GpuGeometryPagePool m_PagePool;
