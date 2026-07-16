@@ -3,6 +3,7 @@
 #include "core/EngineConfig.h" // Centralized engine configurations (config::WINDOW_WIDTH, etc.)
 #include "core/EntityData.h"
 #include "core/Logger.h"
+#include "renderer/MaterialParameterTable.h" // renderer::kAuthoredMaterialRecipeCount, for BuildEntityData()'s materialID assignment
 #include "renderer/RenderTypes.h" // renderer::Vertex, used to interpret the DEBUG readback bytes
 #include "renderer/RayTracingFunctions.h"
 #include "VulkanUtils.h"
@@ -730,6 +731,16 @@ void VulkanContext::CreateLogicalDevice() {
   deviceFeatures2.features.geometryShader = VK_TRUE;
   // shaderInt64: see imageAtomicInt64Features's comment above.
   deviceFeatures2.features.shaderInt64 = VK_TRUE;
+  // fragmentStoresAndAtomics (Phase 3, UE5.8 parity roadmap): SurfaceCacheCapture.frag -- a
+  // fragment shader -- calls shadow_feedback.glsl's RequestShadowPageResidency(), which does an
+  // atomicAdd + indexed write into a writable STORAGE_BUFFER (renderer::VirtualShadowMapPass's
+  // feedback buffer). Per the Vulkan spec, ANY writable storage buffer/image/texel-buffer
+  // variable in the fragment stage requires this feature enabled, or vkCreateGraphicsPipelines
+  // fails validation (VUID-RuntimeSpirv-NonWritable-06340) -- a near-universally-supported core
+  // Vulkan 1.0 feature bit on desktop GPUs (every GPU capable of this project's own mandatory
+  // ray tracing / Int64 image atomics requirements already supports it), so enabled
+  // unconditionally here, matching geometryShader's own enablement rigor above.
+  deviceFeatures2.features.fragmentStoresAndAtomics = VK_TRUE;
 
   VkDeviceCreateInfo createInfo{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
   createInfo.pNext = &deviceFeatures2;
@@ -1223,7 +1234,12 @@ void VulkanContext::BuildEntityData() {
 
     core::EntityData &entity = m_EntityData[i];
     entity.meshID = static_cast<uint32_t>(id & 0xFFFFFFFFu);
-    entity.materialID = 0u;
+    // Cycles through renderer::kMaterialParameterTable's authored recipes (renderer::
+    // MaterialParameterTable.h) so this demo grid actually exercises multiple materials -- was
+    // hardcoded to 0u before real PBR materials existed, which would otherwise leave Phase 1a
+    // compiling clean but visually indistinguishable from the old procedural-hash shading (every
+    // entity resolving to the same single default material).
+    entity.materialID = i % renderer::kAuthoredMaterialRecipeCount;
     entity.cellID = 0u;
     entity.flags = 0u;
     core::SetFlag(entity.flags, core::EntityFlags::CastShadows, true);

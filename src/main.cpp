@@ -34,6 +34,11 @@ struct DebugState {
     // live consumer yet (see that setter's own comment), so it defaults to true here only to keep
     // it exercisable in Debug -- Release hardcodes it off regardless of this default.
     bool worldProbesEnabled = true;
+    // renderer::ClusterRenderPipeline::SetDebugReflectionsEnabled -- gates the Phase 2 (UE5.8
+    // parity roadmap) specular reflections trace/temporal/gather trio ([12b2] in RecordFrame) so
+    // its cost/contribution can be A/B'd, same as ssrtEnabled above (this pass has a real live
+    // consumer from its first frame, unlike worldProbesEnabled).
+    bool reflectionsEnabled = true;
 };
 static DebugState g_DebugState;
 
@@ -117,6 +122,17 @@ static void KeyCallback(GLFWwindow* window, int key, int scancode, int action, i
         // A/B its GPU cost while it's being built out, not to compare a real visual contribution.
         g_DebugState.worldProbesEnabled = !g_DebugState.worldProbesEnabled;
         LOG_INFO(std::format("[Debug] World Probe Grid (not yet sampled by shading): {}", g_DebugState.worldProbesEnabled ? "ON" : "OFF"));
+        break;
+    case GLFW_KEY_R:
+        g_DebugState.reflectionsEnabled = !g_DebugState.reflectionsEnabled;
+        LOG_INFO(std::format("[Debug] Specular Reflections: {}", g_DebugState.reflectionsEnabled ? "ON" : "OFF"));
+        break;
+    case GLFW_KEY_M:
+        // Phase 3 (UE5.8 parity roadmap): every NUMPAD key is already claimed by an existing view
+        // mode/toggle (see the cases above), so this one new view mode gets a plain letter key
+        // instead -- 'M' for shadow "Map" cascades.
+        g_DebugState.viewMode = DEBUG_VIEW_SHADOW_CASCADES;
+        LOG_INFO("[Debug] View Mode: SHADOW CASCADES");
         break;
     default:
         break;
@@ -257,6 +273,7 @@ int main() {
         clusterPipeline.SetDebugRadiosityEnabled(g_DebugState.radiosityEnabled);
         clusterPipeline.SetDebugSSRTEnabled(g_DebugState.ssrtEnabled);
         clusterPipeline.SetDebugWorldProbesEnabled(g_DebugState.worldProbesEnabled);
+        clusterPipeline.SetDebugReflectionsEnabled(g_DebugState.reflectionsEnabled);
 #endif
 
         // --- DEBUG: dump the camera position and the resulting view/proj matrices on the

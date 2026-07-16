@@ -1,0 +1,75 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+
+// Phase 2 (UE5.8 parity roadmap), stage C of 3 (Trace -> Temporal -> Gather -- see
+// renderer::ReflectionPass' own class comment for the full pipeline). One invocation per output
+// pixel. Unlike ScreenProbeGather.comp (which must reconstruct a bilateral 4-probe neighborhood
+// because its probes sit on an 8x8-coarser grid than the output), this pass' own radiance buffer is
+// ALREADY pixel-aligned with the output image -- Stage A/B ran at full resolution -- so this is a
+// direct 1:1 tap, no neighborhood search or bilateral weighting needed. Reads this pixel's
+// albedo/normal/roughness-metallic from renderer::ClusterResolvePass's GBuffer, computes the Schlick
+// Fresnel term at this pixel's own view angle (F0 = mix(0.04, albedo, metallic), the standard
+// metallic-workflow reflectance-at-normal-incidence split), and additively read-modify-writes
+// `F * accumulatedRadiance` into renderer::ClusterResolvePass's own output color image -- the exact
+// same direct-RMW compositing convention ScreenProbeGather.comp already uses for diffuse GI, just
+// with a Fresnel-weighted specular term instead of an albedo-weighted diffuse irradiance term. This
+// is a deliberately simplified single-sample "Lumen Performance mode" weighting (Fresnel only, no
+// D/G microfacet terms in the composite -- see include/ggx_brdf.glsl's own header comment), matching
+// this phase's approved plan.
+
+#include "include/octahedral.glsl"
+#include "include/ggx_brdf.glsl"
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(rgba16f, set = 0, binding = 0) uniform readonly image2D g_ReflectionRadiance;
+layout(rg16f, set = 0, binding = 1) uniform readonly image2D g_GBufferNormal;
+layout(r32f, set = 0, binding = 2) uniform readonly image2D g_GBufferDepth;
+layout(rgba8, set = 0, binding = 3) uniform readonly image2D g_GBufferAlbedo;
+layout(rg8, set = 0, binding = 4) uniform readonly image2D g_GBufferRoughnessMetallic;
+layout(rgba8, set = 0, binding = 5) uniform image2D g_OutputColor; // Read-modify-write.
+
+layout(std140, set = 0, binding = 6) uniform ReflectionViewParamsUBO {
+    mat4 invViewProj;
+    mat4 prevViewProj; // Unused here.
+    vec3 cameraPositionWorld;
+    float _pad0;
+    vec2 viewportSize;
+    float _pad1;
+    float _pad2;
+} g_ViewParams;
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (pixel.x >= int(g_ViewParams.viewportSize.x) || pixel.y >= int(g_ViewParams.viewportSize.y)) {
+        return;
+    }
+
+    float depth = imageLoad(g_GBufferDepth, pixel).r;
+    if (depth <= 0.0) {
+        return; // Sky/background (reversed-Z: 0.0 == far/background sentinel) -- nothing to add.
+    }
+
+    vec4 reflection = imageLoad(g_ReflectionRadiance, pixel);
+    if (reflection.a < 0.5) {
+        return; // Stage A/B marked this pixel invalid (shouldn't happen once depth>0, kept for safety).
+    }
+
+    vec3 normal = OctDecode(imageLoad(g_GBufferNormal, pixel).rg);
+    vec3 albedo = imageLoad(g_GBufferAlbedo, pixel).rgb;
+    vec2 roughnessMetallic = imageLoad(g_GBufferRoughnessMetallic, pixel).rg;
+    float metallic = roughnessMetallic.g;
+
+    vec2 ndcXY = ((vec2(pixel) + 0.5) / g_ViewParams.viewportSize) * 2.0 - 1.0;
+    vec4 worldPos4 = g_ViewParams.invViewProj * vec4(ndcXY, depth, 1.0);
+    vec3 worldPos = worldPos4.xyz / worldPos4.w;
+    vec3 viewDir = normalize(g_ViewParams.cameraPositionWorld - worldPos);
+    float NdotV = max(dot(normal, viewDir), 0.0);
+
+    vec3 F0 = mix(vec3(0.04), albedo, metallic);
+    vec3 fresnel = F_Schlick(F0, NdotV);
+
+    vec4 baseColor = imageLoad(g_OutputColor, pixel);
+    vec3 finalColor = baseColor.rgb + fresnel * reflection.rgb;
+    imageStore(g_OutputColor, pixel, vec4(finalColor, baseColor.a));
+}

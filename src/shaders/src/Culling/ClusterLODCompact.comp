@@ -82,6 +82,7 @@ void main() {
     meta.maxWPOAmplitude = node.maxWPOAmplitude;
     meta.maskTextureIndex = node.maskTextureIndex;
     meta.entityID = node.entityID;
+    meta.materialID = node.materialID;
 
     uint slot = atomicAdd(g_CandidateCount.count, 1u);
     if (slot < g_CandidateMetadata.clusters.length()) {

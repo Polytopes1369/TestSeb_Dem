@@ -1,0 +1,56 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+
+// Phase 1b, stage B of 3 (Classify -> Prefix-sum -> Scatter, see renderer::ClusterShadingBinPass's
+// own class comment for the full pipeline). Turns stage A's per-bin histogram into: (1) each bin's
+// exclusive prefix-sum offset into the single shared g_SortedPixelList buffer stage C will scatter
+// into, (2) a running write cursor per bin (initialized to that same offset, atomically advanced by
+// stage C), and (3) the VkDispatchIndirectCommand each of ClusterResolveBinned.comp's 32 indirect
+// dispatches (stage D) will read.
+//
+// A single-invocation (local_size_x = 1) serial loop over MATERIAL_TABLE_SIZE (32) bins is the
+// right tool here, not a parallel scan algorithm (Hillis-Steele/Blelloch etc.) -- those exist to
+// keep a scan over thousands-to-millions of elements off the sequential critical path, which does
+// not apply to 32 elements: a single thread finishes 32 iterations of trivial scalar work far
+// faster than the fixed dispatch/barrier overhead a parallel scan would add on top of it.
+
+#include "include/shading_bin_common.glsl"
+
+layout(std430, set = 0, binding = 0) readonly buffer BinHistogramSSBO {
+    uint counts[]; // MATERIAL_TABLE_SIZE entries, written by ClusterShadingBinClassify.comp.
+} g_BinHistogram;
+
+layout(std430, set = 0, binding = 1) writeonly buffer BinOffsetsSSBO {
+    uint offsets[]; // MATERIAL_TABLE_SIZE entries -- exclusive prefix-sum of g_BinHistogram.
+} g_BinOffsets;
+
+layout(std430, set = 0, binding = 2) writeonly buffer BinCursorSSBO {
+    uint cursors[]; // MATERIAL_TABLE_SIZE entries -- initialized to g_BinOffsets, atomically advanced by stage C.
+} g_BinCursor;
+
+layout(std430, set = 0, binding = 3) writeonly buffer BinDispatchArgsSSBO {
+    BinDispatchArgs args[]; // MATERIAL_TABLE_SIZE entries -- one VkDispatchIndirectCommand per bin.
+} g_BinDispatchArgs;
+
+layout(local_size_x = 1) in;
+
+void main() {
+    uint runningOffset = 0u;
+    for (uint bin = 0u; bin < MATERIAL_TABLE_SIZE; ++bin) {
+        uint binCount = g_BinHistogram.counts[bin];
+
+        g_BinOffsets.offsets[bin] = runningOffset;
+        g_BinCursor.cursors[bin] = runningOffset;
+
+        // ceil(binCount / SHADING_BIN_RESOLVE_WORKGROUP_SIZE), matching the exact rounding
+        // BuildDispatchIndirectArgs.comp itself already uses for every other indirect dispatch in
+        // this codebase -- stage D's own shader bails out any thread past binCount (its own last
+        // workgroup may be only partially valid).
+        uint groupCountX = (binCount + SHADING_BIN_RESOLVE_WORKGROUP_SIZE - 1u) / SHADING_BIN_RESOLVE_WORKGROUP_SIZE;
+        g_BinDispatchArgs.args[bin].groupCountX = groupCountX;
+        g_BinDispatchArgs.args[bin].groupCountY = 1u;
+        g_BinDispatchArgs.args[bin].groupCountZ = 1u;
+
+        runningOffset += binCount;
+    }
+}

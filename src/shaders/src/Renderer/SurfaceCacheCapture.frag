@@ -12,12 +12,14 @@
 // value-noise modulation so a captured card is not perfectly flat-shaded.
 //
 // --- Direct lighting ---
-// outDirectLighting accumulates the sun (shadowed, via renderer::ShadowMapPass's depth map, PCF-
-// filtered) plus every active point light (unshadowed, distance-attenuated -- see renderer::
-// LightingTypes.h's PointLight comment for why) contribution, in radiance units (NOT yet
-// multiplied by albedo -- that multiply happens in whatever future pass reads this atlas, exactly
-// like a deferred-lighting G-buffer keeps albedo and lighting separate so lighting alone can be
-// re-used/blurred/probed without re-deriving material color).
+// outDirectLighting accumulates the sun (shadowed via renderer::VirtualShadowMapPass's 3-level
+// clipmap, see shadow_sun_sampling.glsl) plus every active point light (ALSO shadowed, Phase 3
+// onward -- via that same pass's per-light 6-face cube, see shadow_point_sampling.glsl; this was
+// unshadowed pre-Phase-3, see renderer::LightingTypes.h's PointLight comment for the historical
+// reason), in radiance units (NOT yet multiplied by albedo -- that multiply happens in whatever
+// future pass reads this atlas, exactly like a deferred-lighting G-buffer keeps albedo and
+// lighting separate so lighting alone can be re-used/blurred/probed without re-deriving material
+// color).
 //
 // --- Radiance + world position ---
 // outRadiance is exactly that "future pass": the albedo-multiplied direct lighting plus emissive,
@@ -32,6 +34,22 @@
 #include "include/procedural_material.glsl"
 #include "include/math_utils.glsl"
 
+#define SHADOW_ATLAS_SET 0
+#define SHADOW_ATLAS_BINDING 1
+#define SHADOW_PAGE_TABLE_SET 0
+#define SHADOW_PAGE_TABLE_BINDING 2
+#define SHADOW_FEEDBACK_SET 0
+#define SHADOW_FEEDBACK_BINDING 3
+#define SHADOW_SUN_LEVELS_SET 0
+#define SHADOW_SUN_LEVELS_BINDING 4
+#define SHADOW_POINT_FACES_SET 0
+#define SHADOW_POINT_FACES_BINDING 5
+#include "include/shadow_page_table.glsl"
+#include "include/shadow_feedback.glsl"
+#include "include/shadow_atlas_sampling.glsl"
+#include "include/shadow_sun_sampling.glsl"
+#include "include/shadow_point_sampling.glsl"
+
 struct PointLightGPU {
     vec4 positionAndRadius; // xyz = world position, w = radius (attenuation reaches ~0 here).
     vec4 colorAndIntensity; // rgb = color, a = intensity.
@@ -40,16 +58,15 @@ struct PointLightGPU {
 // Mirrors renderer::SurfaceCacheLightingUBO byte-for-byte (SurfaceCachePass.cpp) -- flat vec4/mat4
 // fields and an explicit padding field throughout, matching this codebase's existing convention
 // for CPU/GPU struct pairs (see GlobalSDFCompositePC's own comment) so std140 layout is unambiguous.
+// No longer carries a lightViewProj (Phase 3) -- shadow_sun_sampling.glsl / shadow_point_sampling
+// .glsl read renderer::VirtualShadowMapPass's own dedicated UBOs (bindings 4/5 above) directly.
 layout(set = 0, binding = 0, std140) uniform SurfaceCacheLightingUBO {
-    mat4 lightViewProj;
     vec4 sunDirectionAndIntensity; // xyz = direction (points FROM the light TOWARD the scene), w = intensity.
     vec4 sunColor;                 // rgb = color, a unused.
     uint pointLightCount;
     uvec3 _pad0;
     PointLightGPU pointLights[8]; // Must match renderer::kMaxPointLights.
 } uLighting;
-
-layout(set = 0, binding = 1) uniform sampler2D uShadowMap;
 
 layout(location = 0) in vec3 inWorldPos;
 layout(location = 1) in vec3 inWorldNormal;
@@ -78,44 +95,10 @@ vec2 OctEncode(vec3 n) {
     return p * 0.5 + 0.5;
 }
 
-// Manual PCF (3x3 box filter) shadow test against uShadowMap -- a plain (non-comparison) sampler,
-// matching this codebase's existing convention (see HZBPass.cpp's own "Plain sampler2D, not
-// shadow/compare sampler" note), so the depth comparison happens explicitly here instead of via
-// VK_COMPARE_OP on the sampler. Returns 1.0 (fully lit) for a world position that projects outside
-// the light's orthographic frustum entirely (see renderer::ShadowMapPass's class comment on its
-// single whole-scene-fit map: a card position can legitimately fall outside it only through
-// floating-point edge cases at the very boundary of the scene's bounding sphere).
-float SampleSunShadow(vec3 worldPos) {
-    vec4 lightClip = uLighting.lightViewProj * vec4(worldPos, 1.0);
-    vec3 lightNDC = lightClip.xyz / lightClip.w;
-    vec2 shadowUV = lightNDC.xy * 0.5 + 0.5;
-
-    if (shadowUV.x < 0.0 || shadowUV.x > 1.0 || shadowUV.y < 0.0 || shadowUV.y > 1.0 ||
-        lightNDC.z < 0.0 || lightNDC.z > 1.0) {
-        return 1.0;
-    }
-
-    // Fixed depth bias: constant (not slope-scaled) is sufficient here because every occluder is
-    // the exact same Fallback Mesh geometry the shadow map itself rasterized, at the exact same
-    // static (local == world) positions -- there is no skinning/animation jitter to compensate for,
-    // only ordinary depth-precision self-shadowing acne, which a small constant bias already fixes.
-    const float kDepthBias = 0.0015;
-    const float currentDepth = lightNDC.z;
-
-    vec2 texelSize = 1.0 / vec2(textureSize(uShadowMap, 0));
-    float shadow = 0.0;
-    for (int y = -1; y <= 1; ++y) {
-        for (int x = -1; x <= 1; ++x) {
-            float closestDepth = texture(uShadowMap, shadowUV + vec2(x, y) * texelSize).r;
-            shadow += (currentDepth - kDepthBias <= closestDepth) ? 1.0 : 0.0;
-        }
-    }
-    return shadow / 9.0;
-}
-
-// Direct lighting for one captured texel: the sun (shadowed, Lambertian) plus every active point
-// light (unshadowed, Lambertian with a smooth distance-squared windowed falloff -- see
-// renderer::LightingTypes.h's PointLight comment for why point lights are not shadowed here).
+// Direct lighting for one captured texel: the sun (shadowed via SampleSunShadowVSM,
+// shadow_sun_sampling.glsl) plus every active point light (Phase 3 onward: ALSO shadowed, via
+// SamplePointShadowVSM, shadow_point_sampling.glsl -- both Lambertian, point lights additionally
+// windowed by a smooth distance-squared falloff).
 vec3 ComputeDirectLighting(vec3 worldPos, vec3 n) {
     vec3 lighting = vec3(0.0);
 
@@ -125,7 +108,7 @@ vec3 ComputeDirectLighting(vec3 worldPos, vec3 n) {
     vec3 sunDir = normalize(-uLighting.sunDirectionAndIntensity.xyz);
     float sunNdotL = max(dot(n, sunDir), 0.0);
     if (sunNdotL > 0.0) {
-        float visibility = SampleSunShadow(worldPos);
+        float visibility = SampleSunShadowVSM(worldPos);
         lighting += uLighting.sunColor.rgb * uLighting.sunDirectionAndIntensity.w * sunNdotL * visibility;
     }
 
@@ -149,9 +132,11 @@ vec3 ComputeDirectLighting(vec3 worldPos, vec3 n) {
         float windowed = clamp(1.0 - (distSq * distSq) / (radius * radius * radius * radius), 0.0, 1.0);
         float atten = (windowed * windowed) / max(distSq, 1.0e-4);
 
+        float visibility = SamplePointShadowVSM(i, lightPos, worldPos);
+
         vec3 lightColor = uLighting.pointLights[i].colorAndIntensity.rgb;
         float intensity = uLighting.pointLights[i].colorAndIntensity.a;
-        lighting += lightColor * intensity * ndotl * atten;
+        lighting += lightColor * intensity * ndotl * atten * visibility;
     }
 
     return lighting;

@@ -1,0 +1,93 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+
+// Phase 2 (UE5.8 parity roadmap), stage B of 3 (Trace -> Temporal -> Gather -- see
+// renderer::ReflectionPass' own class comment for the full pipeline). One invocation per pixel
+// (full resolution). Reprojects THIS pixel's own world position (just written by
+// ReflectionTrace.comp into the CURRENT ping-pong slot) through the PREVIOUS frame's view-
+// projection matrix, bilinearly samples the HISTORY slot's radiance/world-position/normal at that
+// reprojected UV (renderer::ReflectionPass's shared linear/clamp sampler), runs the same two-term
+// disocclusion test ScreenProbeTemporal.comp uses (world-space position delta + normal cosine),
+// and exponentially blends the new raw sample toward the history -- writing the result back into
+// the SAME (current) slot's radiance image, overwriting the raw sample RecordTrace() just wrote
+// there. Unlike ScreenProbeTemporal.comp's fixed kTemporalAlpha, the blend factor here depends on
+// this pixel's own roughness: a near-mirror surface (roughness -> 0) trusts the fresh sample almost
+// entirely (a long history would smear a sharp reflection across camera motion), while a rough
+// surface (roughness -> 1) keeps a long history for stability (its reflection lobe is already wide
+// and low-frequency, so temporal noise reduction matters far more than responsiveness).
+
+#include "include/octahedral.glsl"
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+// Blend factor at the two roughness extremes -- see this file's own header comment for the
+// rationale. Interpolated linearly by roughness in between (no precedent in this codebase for a
+// non-linear roughness remap here, and none is needed: this is a stability/responsiveness trade-off,
+// not a physically-derived curve).
+const float kTemporalAlphaMirror = 0.5;  // roughness -> 0.
+const float kTemporalAlphaRough = 0.05;  // roughness -> 1 (matches ScreenProbeTemporal.comp's own kTemporalAlpha).
+
+// Same ~14m scene-scale assumption as ScreenProbeTemporal.comp's own kDisocclusionDistanceThreshold.
+const float kDisocclusionDistanceThreshold = 0.5;
+const float kDisocclusionCosThreshold = 0.5; // ~60 degrees.
+
+layout(rgba16f, set = 0, binding = 0) uniform image2D g_ReflectionRadiance;        // Current slot, read-modify-write.
+layout(rgba32f, set = 0, binding = 1) uniform readonly image2D g_ReflectionWorldPos; // Current slot -- already final for this frame.
+layout(rg16f, set = 0, binding = 2) uniform readonly image2D g_ReflectionNormal;     // Current slot.
+layout(set = 0, binding = 3) uniform sampler2D g_HistoryRadiance;
+layout(set = 0, binding = 4) uniform sampler2D g_HistoryWorldPos;
+layout(set = 0, binding = 5) uniform sampler2D g_HistoryNormal;
+layout(rg8, set = 0, binding = 6) uniform readonly image2D g_GBufferRoughnessMetallic; // .r = roughness.
+
+layout(std140, set = 0, binding = 7) uniform ReflectionViewParamsUBO {
+    mat4 invViewProj; // Unused here.
+    mat4 prevViewProj;
+    vec3 cameraPositionWorld; // Unused here.
+    float _pad0;
+    vec2 viewportSize;
+    float _pad1;
+    float _pad2;
+} g_ViewParams;
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (pixel.x >= int(g_ViewParams.viewportSize.x) || pixel.y >= int(g_ViewParams.viewportSize.y)) {
+        return;
+    }
+
+    vec4 newWorldPos = imageLoad(g_ReflectionWorldPos, pixel);
+    if (newWorldPos.a < 0.5) {
+        // Background pixel (see ReflectionTrace.comp's own comment) -- radiance is already zero
+        // from the trace pass, nothing to reproject/blend.
+        return;
+    }
+    vec3 newNormal = OctDecode(imageLoad(g_ReflectionNormal, pixel).rg);
+    vec4 newRadiance = imageLoad(g_ReflectionRadiance, pixel);
+    float roughness = imageLoad(g_GBufferRoughnessMetallic, pixel).r;
+
+    vec4 prevClip = g_ViewParams.prevViewProj * vec4(newWorldPos.xyz, 1.0);
+
+    float alpha = 1.0; // Default: full reset (disocclusion / no valid history to blend against).
+    vec4 historyRadiance = vec4(0.0);
+
+    if (prevClip.w > 1.0e-4) {
+        vec2 prevNDC = prevClip.xy / prevClip.w;
+        vec2 prevUV = prevNDC * 0.5 + 0.5;
+
+        if (all(greaterThanEqual(prevUV, vec2(0.0))) && all(lessThanEqual(prevUV, vec2(1.0)))) {
+            vec4 historyWorldPos = texture(g_HistoryWorldPos, prevUV);
+            vec3 historyNormal = OctDecode(texture(g_HistoryNormal, prevUV).rg);
+
+            bool disoccluded = historyWorldPos.a < 0.5
+                || distance(historyWorldPos.xyz, newWorldPos.xyz) > kDisocclusionDistanceThreshold
+                || dot(historyNormal, newNormal) < kDisocclusionCosThreshold;
+
+            if (!disoccluded) {
+                historyRadiance = texture(g_HistoryRadiance, prevUV);
+                alpha = mix(kTemporalAlphaMirror, kTemporalAlphaRough, roughness);
+            }
+        }
+    }
+
+    imageStore(g_ReflectionRadiance, pixel, mix(historyRadiance, newRadiance, alpha));
+}

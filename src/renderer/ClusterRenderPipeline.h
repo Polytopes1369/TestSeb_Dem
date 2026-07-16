@@ -69,6 +69,7 @@
 #include "renderer/ClusterLODSelectionPass.h"
 #include "renderer/ClusterOcclusionCullingPass.h"
 #include "renderer/ClusterResolvePass.h"
+#include "renderer/ClusterShadingBinPass.h"
 #include "renderer/ClusterSoftwareRasterPass.h"
 #include "renderer/GeometryDecompressionPass.h"
 #include "renderer/GeometryStreamingCoordinator.h"
@@ -78,12 +79,13 @@
 #include "renderer/HZBPass.h"
 #include "renderer/LightingTypes.h"
 #include "renderer/ProceduralMaskGenerator.h"
+#include "renderer/ReflectionPass.h"
 #include "renderer/ScreenProbeGIPass.h"
-#include "renderer/ShadowMapPass.h"
 #include "renderer/SurfaceCacheGIInjectPass.h"
 #include "renderer/SurfaceCachePass.h"
 #include "renderer/SurfaceCacheRayTracingPass.h"
 #include "renderer/SurfaceCacheTraceContext.h"
+#include "renderer/VirtualShadowMapPass.h"
 #include "renderer/WorldProbeGridPass.h"
 #ifndef NDEBUG
 #include "renderer/debug/ClusterTriangleStatsPass.h"
@@ -212,6 +214,15 @@ namespace renderer {
         // default to true once a live consumer samples this grid (e.g. dynamic or off-screen
         // objects with no Surface Cache Card of their own).
         void SetDebugWorldProbesEnabled(bool enabled) { m_DebugWorldProbesEnabled = enabled; }
+
+        // Independently gates RecordFrame()'s [12b2] m_Reflection RecordTrace/RecordTemporal/
+        // RecordGather trio -- see main.cpp's 'R' key. UNLIKE SetDebugWorldProbesEnabled above,
+        // this pass has a real live consumer from its very first frame (m_Resolve's own output
+        // color image, via the same direct-RMW convention as m_ScreenProbeGI), so it defaults to
+        // true here AND Release hardcodes it permanently on (no toggle exists in Release, matching
+        // SetDebugSSRTEnabled/SetDebugRadiosityEnabled's own Release-always-on convention, not
+        // SetDebugWorldProbesEnabled's Release-always-off one).
+        void SetDebugReflectionsEnabled(bool enabled) { m_DebugReflectionsEnabled = enabled; }
 #endif
 
     private:
@@ -264,6 +275,15 @@ namespace renderer {
         ClusterHardwareRasterPass m_HardwareRaster;
         ClusterSoftwareRasterPass m_SoftwareRaster;
         ClusterResolvePass m_Resolve;
+        // Phase 1b (UE5.8 parity roadmap): the 3-stage GPU counting sort that buckets VisBuffer
+        // pixels by materialID, feeding m_Resolve's own RecordResolveBinned() -- see
+        // renderer::ClusterShadingBinPass's own class comment for the full pipeline. Recorded
+        // between [11] and [12] below (after the VisBuffer/depth hand-off, before shading), unlike
+        // m_Resolve which stays unconditional/always-initialized -- this pass is likewise always
+        // initialized (not Debug-only), matching CLAUDE.md's build-separation rule: only the
+        // NUMPAD-DRIVEN DEBUG VIEW SWITCHING that picks between this path and m_Resolve's original
+        // RecordResolve() is Debug-only, not the pass itself (Release always uses this path).
+        ClusterShadingBinPass m_ShadingBin;
 
         // Lumen-style GI infrastructure -- unlike the debug-only stats/overlay block below, these
         // are real (if not yet light-transport-consuming) systems, not visualization tools, so
@@ -271,12 +291,20 @@ namespace renderer {
         // likewise unconditional; only the NUMPAD-DRIVEN DEBUG VIEW SWITCHING is Debug-only, per
         // CLAUDE.md's build-separation rule). Recorded every frame in RecordFrame() regardless of
         // camera.debugViewMode.
-        ShadowMapPass m_ShadowMap;
+        // Phase 3 (UE5.8 parity roadmap): replaces the pre-Phase-3 ShadowMapPass (a single
+        // whole-scene-fit 2048x2048 orthographic map, fully redrawn every frame, sun only) with a
+        // genuine page-table-virtualized system -- a 3-level clipmap of Virtual Shadow Maps for the
+        // sun plus a per-point-light 6-face cube, sharing one physical page pool, incrementally
+        // updated (bounded pages rendered per frame) instead of a full redraw -- see
+        // VirtualShadowMapPass's own class comment for the full per-frame contract.
+        // ShadowMapPass.h/.cpp remain in the repo (file deletion blocked, see memory
+        // feedback_file_deletion_blocked) but are no longer instantiated here.
+        VirtualShadowMapPass m_VirtualShadowMap;
         SurfaceCachePass m_SurfaceCache;
         GlobalSDFPass m_GlobalSDF;
-        // Fixed sun-only lighting for now (default-constructed SceneLights: no point lights) --
-        // see renderer::LightingTypes.h's own comment; a future scene-authoring system would
-        // populate this instead of leaving it default.
+        // Sun direction is fixed by default; one point light is authored in Init() specifically to
+        // exercise/verify Phase 3's point-light Virtual Shadow Maps (see Init()'s own comment) --
+        // see renderer::LightingTypes.h's own comment for the full field-by-field default.
         SceneLights m_SceneLights;
 
         // Shared trace-scene descriptor sets (mesh SDF trace + Surface Cache sampling, see
@@ -297,6 +325,15 @@ namespace renderer {
         // m_SurfaceCacheRT), temporally accumulates, and gathers the result back into m_Resolve's
         // output color image -- see ScreenProbeGIPass's own class comment.
         ScreenProbeGIPass m_ScreenProbeGI;
+
+        // Phase 2 (UE5.8 parity roadmap): specular reflections / GI -- traces ONE GGX-VNDF-
+        // importance-sampled ray per pixel per frame (full resolution, unlike m_ScreenProbeGI's
+        // coarser 8x8-tile probes -- a sharp reflection cannot survive that coarseness), sampling
+        // the same m_SurfaceCache radiance atlas at each hit, and Fresnel-weighted read-modify-
+        // writes the result into m_Resolve's own output color image -- see ReflectionPass's own
+        // class comment for the full pipeline and why its storage is raw RGBA16F radiance, not
+        // m_ScreenProbeGI's spherical harmonics (physically incapable of a narrow specular lobe).
+        ReflectionPass m_Reflection;
 
         // World Probe grid (Lumen "Translucency Volume" / global illumination volume): a low-
         // resolution, camera-centered 3D grid of ambient irradiance probes, fully rebuilt every
@@ -340,6 +377,10 @@ namespace renderer {
         // See SetDebugWorldProbesEnabled()'s own comment for why this defaults to true in Debug
         // while Release hardcodes the equivalent local to false (opposite of the two toggles above).
         bool m_DebugWorldProbesEnabled = true;
+        // See SetDebugReflectionsEnabled()'s own comment: unlike m_DebugWorldProbesEnabled above,
+        // Release hardcodes the equivalent local to true (matching m_DebugSSRTEnabled's own
+        // Release-always-on convention), since this pass has a real live consumer already.
+        bool m_DebugReflectionsEnabled = true;
 #endif
 
 #ifndef NDEBUG

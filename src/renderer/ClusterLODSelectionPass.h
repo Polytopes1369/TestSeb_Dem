@@ -84,7 +84,12 @@ namespace renderer {
         // LOD cut so ClusterLODCompact.comp can copy it verbatim into ClusterCullMetadata::entityID
         // (see that struct's own comment) for the resolve pass's NANITE_INSTANCES debug view.
         uint32_t entityID = 0;
-        float _padTrailing[1] = { 0.0f };
+        // geometry::ClusterIndexEntry::materialID, carried through the LOD cut the same way as
+        // entityID above so ClusterLODCompact.comp can copy it verbatim into
+        // ClusterCullMetadata::materialID for ClusterResolve.comp's real PBR material lookup.
+        // Occupies what used to be this struct's trailing padding float -- same 96-byte std430
+        // stride, no size change.
+        uint32_t materialID = 0;
     };
     static_assert(sizeof(LODNodeMetadata) == 96,
         "LODNodeMetadata must match LODNodeMetadata in cluster_lod_node_metadata.glsl exactly (std430 layout)");
