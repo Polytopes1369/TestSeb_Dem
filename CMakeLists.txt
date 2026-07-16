@@ -111,6 +111,13 @@ add_executable(ClusterMaskSplitTests
 target_include_directories(ClusterMaskSplitTests PRIVATE src ${Vulkan_INCLUDE_DIRS})
 add_test(NAME ClusterMaskSplitTests COMMAND ClusterMaskSplitTests)
 
+add_executable(LoadingManagerTests
+    src/core/LoadingManager.cpp
+    tests/LoadingManagerTests.cpp
+)
+target_include_directories(LoadingManagerTests PRIVATE src ${Vulkan_INCLUDE_DIRS})
+add_test(NAME LoadingManagerTests COMMAND LoadingManagerTests)
+
 # ==============================================================================
 # AUTOMATIZED SHADER COMPILATION & POST-BUILD COPY
 # ==============================================================================

@@ -353,7 +353,7 @@ bool ClusterRenderPipeline::Init(
 
   if (!m_GlobalSDF.Init(createInfo.device, createInfo.allocator,
                         createInfo.commandPool, createInfo.queue,
-                        createInfo.cacheFilePath)) {
+                        createInfo.cacheFilePath, m_LoadingManager)) {
     LOG_ERROR("[ClusterRenderPipeline] Failed to initialize GlobalSDFPass.");
     return false;
   }
@@ -482,6 +482,14 @@ void ClusterRenderPipeline::Shutdown() {
   m_SurfaceCacheRT.Shutdown();
   m_TraceContext.Shutdown();
   m_GlobalSDF.Shutdown();
+  // Deliberately NOT calling m_LoadingManager.Shutdown() here: this Shutdown() method runs
+  // defensively as the very first line of Init() too (see the top of this function), and
+  // core::LoadingManager's worker threads are meant to live for this whole pipeline object's
+  // lifetime, not be torn down and left dead on every Init() reset -- doing so once caused a real
+  // hang (GlobalSDFPass::Init()'s WaitIdle() blocking forever on a pool whose workers had already
+  // been joined and cleared before it ever submitted a job). core::LoadingManager's own destructor
+  // joins its threads exactly once, when this pipeline object (and its m_LoadingManager member)
+  // is itself destructed -- that is the only point its worker pool should ever die.
   m_SurfaceCache.Shutdown();
   m_VirtualShadowMap.Shutdown();
   m_PrevViewProj = maths::mat4{};
