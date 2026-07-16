@@ -2,41 +2,17 @@
 
 #include <algorithm>
 #include <cassert>
-#include <fstream>
+#include <format>
 #include <stdexcept>
-#include <vector>
 
 #include "core/Logger.h"
+#include "renderer/VulkanPipeline.h"
+#include "renderer/VulkanUtils.h"
+#include "GpuImage.h"
 
 namespace renderer {
 
     namespace {
-
-        // Mirrors VulkanContext::ReadShaderFile / GeometryDecompressionPass's own copy -- duplicated
-        // rather than shared because this class is deliberately self-contained (no VulkanContext
-        // dependency), matching this codebase's existing per-pass convention.
-        std::vector<char> ReadShaderFile(const std::string& filename) {
-            std::ifstream file(filename, std::ios::ate | std::ios::binary);
-            if (!file.is_open()) {
-                throw std::runtime_error("HZBPass: failed to open SPIR-V file: " + filename);
-            }
-            size_t fileSize = static_cast<size_t>(file.tellg());
-            std::vector<char> buffer(fileSize);
-            file.seekg(0);
-            file.read(buffer.data(), static_cast<std::streamsize>(fileSize));
-            file.close();
-            return buffer;
-        }
-
-        VkShaderModule CreateShaderModule(VkDevice device, const std::vector<char>& code) {
-            VkShaderModuleCreateInfo createInfo{ VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
-            createInfo.codeSize = code.size();
-            createInfo.pCode = reinterpret_cast<const uint32_t*>(code.data());
-
-            VkShaderModule module;
-            VK_CHECK(vkCreateShaderModule(device, &createInfo, nullptr, &module));
-            return module;
-        }
 
         // Byte-for-byte layout match for HZBPushConstants in HZBBuildInit.comp / HZBReduce.comp:
         // two uvec2 (srcSize, dstSize), 16 bytes total, no padding needed since uint32_t x 4 is
@@ -138,15 +114,12 @@ namespace renderer {
         imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
         imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
-        VmaAllocationCreateInfo allocInfo{};
-        allocInfo.usage = VMA_MEMORY_USAGE_GPU_ONLY;
-
-        VK_CHECK(vmaCreateImage(allocator, &imageInfo, &allocInfo, &m_Image, &m_Allocation, nullptr));
+        m_HZBImage.Create(allocator, device, imageInfo, VMA_MEMORY_USAGE_GPU_ONLY, VK_IMAGE_ASPECT_COLOR_BIT);
 
         m_MipViews.resize(mipCount);
         for (uint32_t level = 0; level < mipCount; ++level) {
             VkImageViewCreateInfo viewInfo{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
-            viewInfo.image = m_Image;
+            viewInfo.image = m_HZBImage.Image();
             viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
             viewInfo.format = kFormat;
             viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
@@ -157,33 +130,10 @@ namespace renderer {
             VK_CHECK(vkCreateImageView(m_Device, &viewInfo, nullptr, &m_MipViews[level]));
         }
 
-        VkImageViewCreateInfo fullViewInfo{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
-        fullViewInfo.image = m_Image;
-        fullViewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-        fullViewInfo.format = kFormat;
-        fullViewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        fullViewInfo.subresourceRange.baseMipLevel = 0;
-        fullViewInfo.subresourceRange.levelCount = mipCount;
-        fullViewInfo.subresourceRange.baseArrayLayer = 0;
-        fullViewInfo.subresourceRange.layerCount = 1;
-        VK_CHECK(vkCreateImageView(m_Device, &fullViewInfo, nullptr, &m_FullView));
-
         // --- One-time UNDEFINED -> GENERAL transition, covering every mip level at once. The HZB
         // image never leaves GENERAL after this (see the class comment), so this is the only
         // layout transition it will ever undergo. ---
-        {
-            VkCommandBufferAllocateInfo cmdAllocInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
-            cmdAllocInfo.commandPool = commandPool;
-            cmdAllocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-            cmdAllocInfo.commandBufferCount = 1;
-
-            VkCommandBuffer cmd;
-            VK_CHECK(vkAllocateCommandBuffers(m_Device, &cmdAllocInfo, &cmd));
-
-            VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-            beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-            vkBeginCommandBuffer(cmd, &beginInfo);
-
+        VulkanUtils::ExecuteOneShotCommands(m_Device, commandPool, queue, [&](VkCommandBuffer cmd) {
             VkImageMemoryBarrier2 barrier{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
             barrier.srcStageMask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
             barrier.srcAccessMask = 0;
@@ -193,24 +143,14 @@ namespace renderer {
             barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
             barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
             barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            barrier.image = m_Image;
+            barrier.image = m_HZBImage.Image();
             barrier.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, mipCount, 0, 1 };
 
             VkDependencyInfo depInfo{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
             depInfo.imageMemoryBarrierCount = 1;
             depInfo.pImageMemoryBarriers = &barrier;
             vkCmdPipelineBarrier2(cmd, &depInfo);
-
-            vkEndCommandBuffer(cmd);
-
-            VkSubmitInfo submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
-            submitInfo.commandBufferCount = 1;
-            submitInfo.pCommandBuffers = &cmd;
-            VK_CHECK(vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE));
-            VK_CHECK(vkQueueWaitIdle(queue));
-
-            vkFreeCommandBuffers(m_Device, commandPool, 1, &cmd);
-        }
+        });
 
         // --- Sampler used to read the source depth buffer in HZBBuildInit.comp. Nearest filtering
         // and clamp-to-edge: the shader always reads exact integer texels via texelFetch (no
@@ -373,8 +313,7 @@ namespace renderer {
         reducePipelineLayoutInfo.pPushConstantRanges = &pushConstantRange;
         VK_CHECK(vkCreatePipelineLayout(m_Device, &reducePipelineLayoutInfo, nullptr, &m_ReducePipelineLayout));
 
-        std::vector<char> initShaderCode = ReadShaderFile("shaders/HZBBuildInit.comp.spv");
-        VkShaderModule initShaderModule = CreateShaderModule(m_Device, initShaderCode);
+        VkShaderModule initShaderModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/HZBBuildInit.comp.spv");
 
         VkComputePipelineCreateInfo initPipelineInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
         initPipelineInfo.layout = m_InitPipelineLayout;
@@ -385,8 +324,8 @@ namespace renderer {
         VK_CHECK(vkCreateComputePipelines(m_Device, VK_NULL_HANDLE, 1, &initPipelineInfo, nullptr, &m_InitPipeline));
         vkDestroyShaderModule(m_Device, initShaderModule, nullptr);
 
-        std::vector<char> reduceShaderCode = ReadShaderFile("shaders/HZBReduce.comp.spv");
-        VkShaderModule reduceShaderModule = CreateShaderModule(m_Device, reduceShaderCode);
+        VkShaderModule reduceShaderModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/HZBReduce.comp.spv");
+
 
         VkComputePipelineCreateInfo reducePipelineInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
         reducePipelineInfo.layout = m_ReducePipelineLayout;
@@ -396,10 +335,14 @@ namespace renderer {
         reducePipelineInfo.stage.pName = "main";
         VK_CHECK(vkCreateComputePipelines(m_Device, VK_NULL_HANDLE, 1, &reducePipelineInfo, nullptr, &m_ReducePipeline));
         vkDestroyShaderModule(m_Device, reduceShaderModule, nullptr);
+
+        LOG_INFO(std::format("[HZBPass] Initialized HZB pass: sourceDepth={}x{}, mip0={}x{}, mipCount={}",
+            sourceDepthExtent.width, sourceDepthExtent.height, mip0.width, mip0.height, mipCount));
     }
 
     void HZBPass::Shutdown() {
         if (m_Device != VK_NULL_HANDLE) {
+            LOG_INFO("[HZBPass] Shutting down HZB pass...");
             if (m_InitPipeline != VK_NULL_HANDLE) {
                 vkDestroyPipeline(m_Device, m_InitPipeline, nullptr);
             }
@@ -426,9 +369,6 @@ namespace renderer {
             if (m_DepthSampler != VK_NULL_HANDLE) {
                 vkDestroySampler(m_Device, m_DepthSampler, nullptr);
             }
-            if (m_FullView != VK_NULL_HANDLE) {
-                vkDestroyImageView(m_Device, m_FullView, nullptr);
-            }
             for (VkImageView view : m_MipViews) {
                 vkDestroyImageView(m_Device, view, nullptr);
             }
@@ -444,18 +384,11 @@ namespace renderer {
         m_InitSet = VK_NULL_HANDLE;
         m_ReduceSets.clear();
         m_DepthSampler = VK_NULL_HANDLE;
-        m_FullView = VK_NULL_HANDLE;
         m_MipViews.clear();
         m_MipExtents.clear();
         m_SourceExtent = { 0, 0 };
 
-        // vmaDestroyImage tolerates VK_NULL_HANDLE for both handle arguments (no-op), matching
-        // GpuBuffer::Destroy()'s own null-safe convention.
-        if (m_Allocator != VK_NULL_HANDLE) {
-            vmaDestroyImage(m_Allocator, m_Image, m_Allocation);
-        }
-        m_Image = VK_NULL_HANDLE;
-        m_Allocation = VK_NULL_HANDLE;
+        m_HZBImage.Destroy();
         m_Allocator = VK_NULL_HANDLE;
         m_Device = VK_NULL_HANDLE;
     }
@@ -473,7 +406,7 @@ namespace renderer {
         barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
         barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        barrier.image = m_Image;
+        barrier.image = m_HZBImage.Image();
         barrier.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, mipLevel, 1, 0, 1 };
 
         VkDependencyInfo depInfo{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };

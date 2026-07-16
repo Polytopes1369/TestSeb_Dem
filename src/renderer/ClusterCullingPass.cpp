@@ -3,40 +3,16 @@
 #include <cassert>
 #include <cmath>
 #include <cstring>
-#include <fstream>
+#include <format>
 #include <stdexcept>
 
 #include "core/Logger.h"
+#include "renderer/VulkanPipeline.h"
+#include "renderer/VulkanUtils.h"
 
 namespace renderer {
 
     namespace {
-
-        // Mirrors HZBPass::ReadShaderFile / GeometryDecompressionPass's own copy -- duplicated
-        // rather than shared because this class is deliberately self-contained (no VulkanContext
-        // dependency), matching this codebase's existing per-pass convention.
-        std::vector<char> ReadShaderFile(const std::string& filename) {
-            std::ifstream file(filename, std::ios::ate | std::ios::binary);
-            if (!file.is_open()) {
-                throw std::runtime_error("ClusterCullingPass: failed to open SPIR-V file: " + filename);
-            }
-            size_t fileSize = static_cast<size_t>(file.tellg());
-            std::vector<char> buffer(fileSize);
-            file.seekg(0);
-            file.read(buffer.data(), static_cast<std::streamsize>(fileSize));
-            file.close();
-            return buffer;
-        }
-
-        VkShaderModule CreateShaderModule(VkDevice device, const std::vector<char>& code) {
-            VkShaderModuleCreateInfo createInfo{ VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
-            createInfo.codeSize = code.size();
-            createInfo.pCode = reinterpret_cast<const uint32_t*>(code.data());
-
-            VkShaderModule module;
-            VK_CHECK(vkCreateShaderModule(device, &createInfo, nullptr, &module));
-            return module;
-        }
 
         constexpr uint32_t kWorkgroupSize = 64; // Matches ClusterFrustumCull.comp's local_size_x.
 
@@ -98,6 +74,8 @@ namespace renderer {
         m_Device = device;
         m_Allocator = allocator;
         m_MaxClusters = maxClusters;
+
+        LOG_INFO(std::format("[ClusterCullingPass] Initializing pass: maxClusters={}", maxClusters));
 
         // --- Buffers ---
         // Cluster metadata: filled by UploadClusterMetadata() via a staged copy, so it needs
@@ -226,8 +204,7 @@ namespace renderer {
         pipelineLayoutInfo.pPushConstantRanges = &pushConstantRange;
         VK_CHECK(vkCreatePipelineLayout(m_Device, &pipelineLayoutInfo, nullptr, &m_PipelineLayout));
 
-        std::vector<char> shaderCode = ReadShaderFile("shaders/ClusterFrustumCull.comp.spv");
-        VkShaderModule shaderModule = CreateShaderModule(m_Device, shaderCode);
+        VkShaderModule shaderModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/ClusterFrustumCull.comp.spv");
 
         VkComputePipelineCreateInfo pipelineInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
         pipelineInfo.layout = m_PipelineLayout;
@@ -241,6 +218,7 @@ namespace renderer {
 
     void ClusterCullingPass::Shutdown() {
         if (m_Device != VK_NULL_HANDLE) {
+            LOG_INFO("[ClusterCullingPass] Shutting down pass...");
             if (m_Pipeline != VK_NULL_HANDLE) {
                 vkDestroyPipeline(m_Device, m_Pipeline, nullptr);
             }
@@ -299,46 +277,27 @@ namespace renderer {
         VK_CHECK(vmaCreateBuffer(m_Allocator, &stagingInfo, &stagingAllocInfo, &stagingBuffer, &stagingAllocation, &stagingAllocResultInfo));
         std::memcpy(stagingAllocResultInfo.pMappedData, clusters.data(), static_cast<size_t>(uploadSize));
 
-        VkCommandBufferAllocateInfo cmdAllocInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
-        cmdAllocInfo.commandPool = commandPool;
-        cmdAllocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        cmdAllocInfo.commandBufferCount = 1;
+        VulkanUtils::ExecuteOneShotCommands(m_Device, commandPool, queue, [&](VkCommandBuffer cmd) {
+            VkBufferCopy copyRegion{};
+            copyRegion.srcOffset = 0;
+            copyRegion.dstOffset = 0;
+            copyRegion.size = uploadSize;
+            vkCmdCopyBuffer(cmd, stagingBuffer, m_ClusterMetadataBuffer.Handle(), 1, &copyRegion);
 
-        VkCommandBuffer cmd;
-        VK_CHECK(vkAllocateCommandBuffers(m_Device, &cmdAllocInfo, &cmd));
+            // The copy's writes must be visible to the culling shader's readonly SSBO reads before its
+            // next dispatch.
+            VkMemoryBarrier2 memBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+            memBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+            memBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+            memBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+            memBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
 
-        VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-        beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        vkBeginCommandBuffer(cmd, &beginInfo);
+            VkDependencyInfo depInfo{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+            depInfo.memoryBarrierCount = 1;
+            depInfo.pMemoryBarriers = &memBarrier;
+            vkCmdPipelineBarrier2(cmd, &depInfo);
+        });
 
-        VkBufferCopy copyRegion{};
-        copyRegion.srcOffset = 0;
-        copyRegion.dstOffset = 0;
-        copyRegion.size = uploadSize;
-        vkCmdCopyBuffer(cmd, stagingBuffer, m_ClusterMetadataBuffer.Handle(), 1, &copyRegion);
-
-        // The copy's writes must be visible to the culling shader's readonly SSBO reads before its
-        // next dispatch.
-        VkMemoryBarrier2 memBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
-        memBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
-        memBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-        memBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-        memBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
-
-        VkDependencyInfo depInfo{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-        depInfo.memoryBarrierCount = 1;
-        depInfo.pMemoryBarriers = &memBarrier;
-        vkCmdPipelineBarrier2(cmd, &depInfo);
-
-        vkEndCommandBuffer(cmd);
-
-        VkSubmitInfo submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
-        submitInfo.commandBufferCount = 1;
-        submitInfo.pCommandBuffers = &cmd;
-        VK_CHECK(vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE));
-        VK_CHECK(vkQueueWaitIdle(queue));
-
-        vkFreeCommandBuffers(m_Device, commandPool, 1, &cmd);
         vmaDestroyBuffer(m_Allocator, stagingBuffer, stagingAllocation);
     }
 

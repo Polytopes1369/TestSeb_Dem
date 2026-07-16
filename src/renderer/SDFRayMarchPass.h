@@ -39,11 +39,11 @@
 // SetGlobalSDFViews()'s own comment); RecordRayMarch() reads its per-level voxel size/window every
 // call, since those can change every frame as the camera moves.
 //
-// --- Debug-only (whole file compiled out in Release) ---
+// debug-only (whole file compiled out in Release) ---
 // This pass's entire output is, by its own class comment, "a full-screen debug-visualization
 // image" -- it never feeds production lighting, unlike renderer::SurfaceCachePass/GlobalSDFPass
 // (real GI infrastructure that stays compiled in Release). Matches CLAUDE.md's build-separation
-// rule for "modes de visualisation (Lumen/Nanite)" and this codebase's existing convention for
+// rule for "visualization modes (Lumen/Nanite)" and this codebase's existing convention for
 // debug-only passes (see renderer::debug::ClusterTriangleStatsPass's own identical guard).
 
 #ifndef NDEBUG

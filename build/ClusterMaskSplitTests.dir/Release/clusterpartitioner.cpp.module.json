@@ -1,0 +1,13 @@
+{
+    "version": 1,
+    "revision": 0,
+    "rules": [
+        {
+            "primary-output": "ClusterMaskSplitTests.dir\\Release\\ClusterPartitioner.obj",
+            "outputs": [
+                "ClusterMaskSplitTests.dir\\Release\\"
+            ],
+            "requires": []
+        }
+    ]
+}

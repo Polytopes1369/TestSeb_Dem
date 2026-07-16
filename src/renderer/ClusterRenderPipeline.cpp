@@ -13,6 +13,7 @@
 #include "geometry/ClusterFormat.h"
 #include "io/CacheFileManager.h"
 #include "renderer/GpuBuffer.h"
+#include "renderer/VulkanUtils.h"
 
 namespace renderer {
 
@@ -174,21 +175,7 @@ bool ClusterRenderPipeline::Init(
   // blocking submit, at startup only -- the per-frame path never submits or
   // waits mid-frame.
   // =========================================================================================
-  {
-    VkCommandBufferAllocateInfo cmdAllocInfo{
-        VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-    cmdAllocInfo.commandPool = createInfo.commandPool;
-    cmdAllocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    cmdAllocInfo.commandBufferCount = 1;
-
-    VkCommandBuffer cmd;
-    VK_CHECK(vkAllocateCommandBuffers(m_Device, &cmdAllocInfo, &cmd));
-
-    VkCommandBufferBeginInfo beginInfo{
-        VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(cmd, &beginInfo);
-
+  VulkanUtils::ExecuteOneShotCommands(m_Device, createInfo.commandPool, createInfo.queue, [&](VkCommandBuffer cmd) {
     m_PagePool.ClearPageTable(cmd);
 
     for (const geometry::ClusterIndexEntry &entry : indexEntries) {
@@ -200,9 +187,7 @@ bool ClusterRenderPipeline::Init(
         LOG_ERROR(std::format(
             "[ClusterRenderPipeline] BindPage failed for cluster {}.",
             entry.clusterID));
-        vkEndCommandBuffer(cmd);
-        vkFreeCommandBuffers(m_Device, createInfo.commandPool, 1, &cmd);
-        return false;
+        throw std::runtime_error("ClusterRenderPipeline: BindPage failed during initialization");
       }
 
       // The logical->physical mapping is CPU-side bookkeeping, valid the moment
@@ -219,16 +204,7 @@ bool ClusterRenderPipeline::Init(
     }
 
     m_OcclusionCulling.ClearPersistedVisibility(cmd);
-
-    vkEndCommandBuffer(cmd);
-
-    VkSubmitInfo submitInfo{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-    submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers = &cmd;
-    VK_CHECK(vkQueueSubmit(createInfo.queue, 1, &submitInfo, VK_NULL_HANDLE));
-    VK_CHECK(vkQueueWaitIdle(createInfo.queue));
-    vkFreeCommandBuffers(m_Device, createInfo.commandPool, 1, &cmd);
-  }
+  });
 
   stagingBuffer.Destroy();
   LOG_INFO(
@@ -407,6 +383,9 @@ bool ClusterRenderPipeline::Init(
 }
 
 void ClusterRenderPipeline::Shutdown() {
+  if (m_Device != VK_NULL_HANDLE) {
+    LOG_INFO("[ClusterRenderPipeline] Shutting down cluster render pipeline...");
+  }
   // Reverse initialization order; each Shutdown() is null-safe on a
   // never-initialized pass.
 #ifndef NDEBUG

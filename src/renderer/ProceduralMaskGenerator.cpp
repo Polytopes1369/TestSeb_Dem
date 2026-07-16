@@ -1,33 +1,13 @@
 #include "renderer/ProceduralMaskGenerator.h"
 
 #include <format>
-#include <fstream>
-#include <stdexcept>
 
 #include "core/Logger.h"
 #include "renderer/VulkanPipeline.h"
+#include "renderer/VulkanUtils.h"
 
 namespace renderer {
 
-    namespace {
-
-        // Mirrors HZBPass::ReadShaderFile / every other pass's own copy -- duplicated rather than
-        // shared because this class is deliberately self-contained, matching this codebase's
-        // existing per-pass convention.
-        std::vector<char> ReadShaderFile(const std::string& filename) {
-            std::ifstream file(filename, std::ios::ate | std::ios::binary);
-            if (!file.is_open()) {
-                throw std::runtime_error("ProceduralMaskGenerator: failed to open SPIR-V file: " + filename);
-            }
-            size_t fileSize = static_cast<size_t>(file.tellg());
-            std::vector<char> buffer(fileSize);
-            file.seekg(0);
-            file.read(buffer.data(), static_cast<std::streamsize>(fileSize));
-            file.close();
-            return buffer;
-        }
-
-    } // namespace
 
     void ProceduralMaskGenerator::Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue) {
         Shutdown();
@@ -125,8 +105,7 @@ namespace renderer {
         genPipelineLayoutInfo.pSetLayouts = &genSetLayout;
         VK_CHECK(vkCreatePipelineLayout(m_Device, &genPipelineLayoutInfo, nullptr, &genPipelineLayout));
 
-        std::vector<char> genShaderCode = ReadShaderFile("shaders/ProceduralMaskGenerate.comp.spv");
-        VkShaderModule genShaderModule = VulkanPipeline::CreateShaderModule(m_Device, genShaderCode);
+        VkShaderModule genShaderModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/ProceduralMaskGenerate.comp.spv");
         VkPipeline genPipeline = VulkanPipeline::CreateComputePipeline(m_Device, genPipelineLayout, genShaderModule);
         vkDestroyShaderModule(m_Device, genShaderModule, nullptr);
 
@@ -135,19 +114,7 @@ namespace renderer {
         // SHADER_READ_ONLY_OPTIMAL (for every consumer's sampled read afterward). Blocking submit,
         // startup-only -- mirrors HZBPass::Init's / ClusterSoftwareRasterPass::Init's own one-shot
         // transition pattern. ---
-        {
-            VkCommandBufferAllocateInfo cmdAllocInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
-            cmdAllocInfo.commandPool = commandPool;
-            cmdAllocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-            cmdAllocInfo.commandBufferCount = 1;
-
-            VkCommandBuffer cmd;
-            VK_CHECK(vkAllocateCommandBuffers(m_Device, &cmdAllocInfo, &cmd));
-
-            VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-            beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-            vkBeginCommandBuffer(cmd, &beginInfo);
-
+        VulkanUtils::ExecuteOneShotCommands(m_Device, commandPool, queue, [&](VkCommandBuffer cmd) {
             std::vector<VkImageMemoryBarrier2> toGeneral(kMaxMaskTextures);
             for (uint32_t i = 0; i < kMaxMaskTextures; ++i) {
                 toGeneral[i] = VkImageMemoryBarrier2{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
@@ -190,16 +157,7 @@ namespace renderer {
             toReadOnlyDep.imageMemoryBarrierCount = kMaxMaskTextures;
             toReadOnlyDep.pImageMemoryBarriers = toShaderReadOnly.data();
             vkCmdPipelineBarrier2(cmd, &toReadOnlyDep);
-
-            vkEndCommandBuffer(cmd);
-
-            VkSubmitInfo submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
-            submitInfo.commandBufferCount = 1;
-            submitInfo.pCommandBuffers = &cmd;
-            VK_CHECK(vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE));
-            VK_CHECK(vkQueueWaitIdle(queue));
-            vkFreeCommandBuffers(m_Device, commandPool, 1, &cmd);
-        }
+        });
 
         // --- Generation-only resources: no longer needed once every slot is populated. ---
         vkDestroyPipeline(m_Device, genPipeline, nullptr);

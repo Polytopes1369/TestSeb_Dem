@@ -4,6 +4,9 @@
     <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\geometry\MeshSDFGenerator.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\core\Logger.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\tests\MeshSDFTests.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>

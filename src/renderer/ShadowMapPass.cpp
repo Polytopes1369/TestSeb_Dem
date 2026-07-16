@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
-#include <fstream>
 #include <format>
 #include <limits>
 #include <stdexcept>
@@ -11,34 +10,12 @@
 #include "core/Logger.h"
 #include "geometry/ClusterFormat.h"
 #include "io/CacheFileManager.h"
+#include "renderer/VulkanPipeline.h"
+#include "renderer/VulkanUtils.h"
 
 namespace renderer {
 
     namespace {
-
-        // Mirrors SurfaceCachePass::ReadShaderFile / every other pass's own copy -- duplicated
-        // rather than shared, see this class's own header comment on self-containment.
-        std::vector<char> ReadShaderFile(const std::string& filename) {
-            std::ifstream file(filename, std::ios::ate | std::ios::binary);
-            if (!file.is_open()) {
-                throw std::runtime_error("ShadowMapPass: failed to open SPIR-V file: " + filename);
-            }
-            size_t fileSize = static_cast<size_t>(file.tellg());
-            std::vector<char> buffer(fileSize);
-            file.seekg(0);
-            file.read(buffer.data(), static_cast<std::streamsize>(fileSize));
-            file.close();
-            return buffer;
-        }
-
-        VkShaderModule CreateShaderModule(VkDevice device, const std::vector<char>& code) {
-            VkShaderModuleCreateInfo createInfo{ VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
-            createInfo.codeSize = code.size();
-            createInfo.pCode = reinterpret_cast<const uint32_t*>(code.data());
-            VkShaderModule module;
-            VK_CHECK(vkCreateShaderModule(device, &createInfo, nullptr, &module));
-            return module;
-        }
 
         struct ShadowCaptureConstants {
             maths::mat4 lightViewProj;
@@ -46,26 +23,7 @@ namespace renderer {
         static_assert(sizeof(ShadowCaptureConstants) == 64,
             "ShadowCaptureConstants must match ShadowMapCapture.vert's push_constant block exactly");
 
-        void TransitionImageLayout(VkCommandBuffer cmd, VkImage image, VkImageAspectFlags aspect,
-            VkImageLayout oldLayout, VkImageLayout newLayout,
-            VkPipelineStageFlags2 srcStage, VkAccessFlags2 srcAccess,
-            VkPipelineStageFlags2 dstStage, VkAccessFlags2 dstAccess) {
-            VkImageMemoryBarrier2 barrier{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
-            barrier.srcStageMask = srcStage;
-            barrier.srcAccessMask = srcAccess;
-            barrier.dstStageMask = dstStage;
-            barrier.dstAccessMask = dstAccess;
-            barrier.oldLayout = oldLayout;
-            barrier.newLayout = newLayout;
-            barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            barrier.image = image;
-            barrier.subresourceRange = { aspect, 0, 1, 0, 1 };
-            VkDependencyInfo depInfo{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-            depInfo.imageMemoryBarrierCount = 1;
-            depInfo.pImageMemoryBarriers = &barrier;
-            vkCmdPipelineBarrier2(cmd, &depInfo);
-        }
+
 
     } // namespace
 
@@ -214,56 +172,39 @@ namespace renderer {
                 std::memcpy(static_cast<char*>(stagingAllocResultInfo.pMappedData) + vertexBytes, hostIndices.data(), static_cast<size_t>(indexBytes));
             }
 
-            VkCommandBufferAllocateInfo cmdAllocInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
-            cmdAllocInfo.commandPool = commandPool;
-            cmdAllocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-            cmdAllocInfo.commandBufferCount = 1;
-            VkCommandBuffer cmd;
-            VK_CHECK(vkAllocateCommandBuffers(m_Device, &cmdAllocInfo, &cmd));
+            VulkanUtils::ExecuteOneShotCommands(m_Device, commandPool, queue, [&](VkCommandBuffer cmd) {
+                if (stagingSize > 0) {
+                    VkBufferCopy vertexCopy{ 0, 0, vertexBytes };
+                    vkCmdCopyBuffer(cmd, stagingBuffer, m_VertexBuffer.Handle(), 1, &vertexCopy);
+                    VkBufferCopy indexCopy{ vertexBytes, 0, indexBytes };
+                    vkCmdCopyBuffer(cmd, stagingBuffer, m_IndexBuffer.Handle(), 1, &indexCopy);
 
-            VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-            beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-            vkBeginCommandBuffer(cmd, &beginInfo);
+                    VkMemoryBarrier2 uploadBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+                    uploadBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+                    uploadBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+                    uploadBarrier.dstStageMask = VK_PIPELINE_STAGE_2_VERTEX_INPUT_BIT;
+                    uploadBarrier.dstAccessMask = VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_2_INDEX_READ_BIT;
+                    VkDependencyInfo uploadDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+                    uploadDep.memoryBarrierCount = 1;
+                    uploadDep.pMemoryBarriers = &uploadBarrier;
+                    vkCmdPipelineBarrier2(cmd, &uploadDep);
+                }
 
-            if (stagingSize > 0) {
-                VkBufferCopy vertexCopy{ 0, 0, vertexBytes };
-                vkCmdCopyBuffer(cmd, stagingBuffer, m_VertexBuffer.Handle(), 1, &vertexCopy);
-                VkBufferCopy indexCopy{ vertexBytes, 0, indexBytes };
-                vkCmdCopyBuffer(cmd, stagingBuffer, m_IndexBuffer.Handle(), 1, &indexCopy);
+                // GENERAL, not DEPTH_ATTACHMENT_OPTIMAL: this image is sampled by a LATER, completely
+                // separate render pass (SurfaceCacheCapture.frag's shadow lookup), and DEPTH_ATTACHMENT_
+                // OPTIMAL is not a valid layout for a sampled-image descriptor. GENERAL is valid for
+                // BOTH depth-attachment read/write AND a sampled read, so this image never needs to
+                // ping-pong layouts between the two uses -- the exact same trade renderer::
+                // SurfaceCachePass's own 3 atlas color images already make (see that class's own
+                // "Atlas layout convention" comment).
+                VulkanUtils::TransitionImageLayout(cmd, m_ShadowImage,
+                    VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                    VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
+                    VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+                    VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                    VK_IMAGE_ASPECT_DEPTH_BIT);
+            });
 
-                VkMemoryBarrier2 uploadBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
-                uploadBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
-                uploadBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-                uploadBarrier.dstStageMask = VK_PIPELINE_STAGE_2_VERTEX_INPUT_BIT;
-                uploadBarrier.dstAccessMask = VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_2_INDEX_READ_BIT;
-                VkDependencyInfo uploadDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-                uploadDep.memoryBarrierCount = 1;
-                uploadDep.pMemoryBarriers = &uploadBarrier;
-                vkCmdPipelineBarrier2(cmd, &uploadDep);
-            }
-
-            // GENERAL, not DEPTH_ATTACHMENT_OPTIMAL: this image is sampled by a LATER, completely
-            // separate render pass (SurfaceCacheCapture.frag's shadow lookup), and DEPTH_ATTACHMENT_
-            // OPTIMAL is not a valid layout for a sampled-image descriptor. GENERAL is valid for
-            // BOTH depth-attachment read/write AND a sampled read, so this image never needs to
-            // ping-pong layouts between the two uses -- the exact same trade renderer::
-            // SurfaceCachePass's own 3 atlas color images already make (see that class's own
-            // "Atlas layout convention" comment).
-            TransitionImageLayout(cmd, m_ShadowImage, VK_IMAGE_ASPECT_DEPTH_BIT,
-                VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
-                VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
-                VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
-                VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
-
-            vkEndCommandBuffer(cmd);
-
-            VkSubmitInfo submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
-            submitInfo.commandBufferCount = 1;
-            submitInfo.pCommandBuffers = &cmd;
-            VK_CHECK(vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE));
-            VK_CHECK(vkQueueWaitIdle(queue));
-
-            vkFreeCommandBuffers(m_Device, commandPool, 1, &cmd);
             if (stagingBuffer != VK_NULL_HANDLE) {
                 vmaDestroyBuffer(allocator, stagingBuffer, stagingAllocation);
             }
@@ -286,8 +227,7 @@ namespace renderer {
         layoutInfo.pPushConstantRanges = &pushConstantRange;
         VK_CHECK(vkCreatePipelineLayout(m_Device, &layoutInfo, nullptr, &m_PipelineLayout));
 
-        std::vector<char> vertCode = ReadShaderFile("shaders/ShadowMapCapture.vert.spv");
-        VkShaderModule vertModule = CreateShaderModule(m_Device, vertCode);
+        VkShaderModule vertModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/ShadowMapCapture.vert.spv");
 
         VkPipelineShaderStageCreateInfo stage{ VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO };
         stage.stage = VK_SHADER_STAGE_VERTEX_BIT;

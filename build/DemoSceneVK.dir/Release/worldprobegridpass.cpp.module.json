@@ -1,0 +1,13 @@
+{
+    "version": 1,
+    "revision": 0,
+    "rules": [
+        {
+            "primary-output": "DemoSceneVK.dir\\Release\\WorldProbeGridPass.obj",
+            "outputs": [
+                "DemoSceneVK.dir\\Release\\"
+            ],
+            "requires": []
+        }
+    ]
+}

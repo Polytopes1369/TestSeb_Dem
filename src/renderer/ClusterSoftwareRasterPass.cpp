@@ -1,33 +1,16 @@
 #include "renderer/ClusterSoftwareRasterPass.h"
 
 #include <cassert>
-#include <fstream>
-#include <stdexcept>
-#include <vector>
+#include <format>
 
 #include "core/Logger.h"
 #include "geometry/ClusterFormat.h" // geometry::kMaxClusterTriangles
 #include "renderer/VulkanPipeline.h"
+#include "renderer/VulkanUtils.h"
 
 namespace renderer {
 
     namespace {
-
-        // Mirrors HZBPass::ReadShaderFile / every other pass's own copy -- duplicated rather than
-        // shared because this class is deliberately self-contained (no VulkanContext dependency),
-        // matching this codebase's existing per-pass convention.
-        std::vector<char> ReadShaderFile(const std::string& filename) {
-            std::ifstream file(filename, std::ios::ate | std::ios::binary);
-            if (!file.is_open()) {
-                throw std::runtime_error("ClusterSoftwareRasterPass: failed to open SPIR-V file: " + filename);
-            }
-            size_t fileSize = static_cast<size_t>(file.tellg());
-            std::vector<char> buffer(fileSize);
-            file.seekg(0);
-            file.read(buffer.data(), static_cast<std::streamsize>(fileSize));
-            file.close();
-            return buffer;
-        }
 
         // Byte-for-byte mirror of SoftwareRasterViewParamsUBO in ClusterSoftwareRaster.comp
         // (std140): mat4 (64 bytes) + vec2 (8 bytes, 8-byte aligned) + 2 pad floats to round the
@@ -102,19 +85,7 @@ namespace renderer {
         // --- One-time UNDEFINED -> GENERAL transition (mirrors HZBPass::Init's own one-shot
         // pattern) -- the image stays in GENERAL for its entire lifetime, touched only by compute
         // shaders (imageStore/imageAtomicMax), never an attachment or sampled resource. ---
-        {
-            VkCommandBufferAllocateInfo cmdAllocInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
-            cmdAllocInfo.commandPool = commandPool;
-            cmdAllocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-            cmdAllocInfo.commandBufferCount = 1;
-
-            VkCommandBuffer cmd;
-            VK_CHECK(vkAllocateCommandBuffers(m_Device, &cmdAllocInfo, &cmd));
-
-            VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-            beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-            vkBeginCommandBuffer(cmd, &beginInfo);
-
+        VulkanUtils::ExecuteOneShotCommands(m_Device, commandPool, queue, [&](VkCommandBuffer cmd) {
             VkImageMemoryBarrier2 barrier{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
             barrier.srcStageMask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
             barrier.srcAccessMask = 0;
@@ -131,17 +102,7 @@ namespace renderer {
             depInfo.imageMemoryBarrierCount = 1;
             depInfo.pImageMemoryBarriers = &barrier;
             vkCmdPipelineBarrier2(cmd, &depInfo);
-
-            vkEndCommandBuffer(cmd);
-
-            VkSubmitInfo submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
-            submitInfo.commandBufferCount = 1;
-            submitInfo.pCommandBuffers = &cmd;
-            VK_CHECK(vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE));
-            VK_CHECK(vkQueueWaitIdle(queue));
-
-            vkFreeCommandBuffers(m_Device, commandPool, 1, &cmd);
-        }
+        });
 
         // --- Descriptor set layouts ---
         VkDescriptorSetLayoutBinding rasterBindings[7]{};
@@ -305,8 +266,7 @@ namespace renderer {
         rasterPipelineLayoutInfo.pPushConstantRanges = &rasterPushConstantRange;
         VK_CHECK(vkCreatePipelineLayout(m_Device, &rasterPipelineLayoutInfo, nullptr, &m_RasterPipelineLayout));
 
-        std::vector<char> rasterShaderCode = ReadShaderFile("shaders/ClusterSoftwareRaster.comp.spv");
-        VkShaderModule rasterShaderModule = VulkanPipeline::CreateShaderModule(m_Device, rasterShaderCode);
+        VkShaderModule rasterShaderModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/ClusterSoftwareRaster.comp.spv");
         m_RasterPipeline = VulkanPipeline::CreateComputePipeline(m_Device, m_RasterPipelineLayout, rasterShaderModule);
         vkDestroyShaderModule(m_Device, rasterShaderModule, nullptr);
 
@@ -320,8 +280,7 @@ namespace renderer {
         opaqueRasterPipelineLayoutInfo.pPushConstantRanges = &opaqueRasterPushConstantRange;
         VK_CHECK(vkCreatePipelineLayout(m_Device, &opaqueRasterPipelineLayoutInfo, nullptr, &m_OpaqueRasterPipelineLayout));
 
-        std::vector<char> opaqueRasterShaderCode = ReadShaderFile("shaders/ClusterSoftwareRasterOpaque.comp.spv");
-        VkShaderModule opaqueRasterShaderModule = VulkanPipeline::CreateShaderModule(m_Device, opaqueRasterShaderCode);
+        VkShaderModule opaqueRasterShaderModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/ClusterSoftwareRasterOpaque.comp.spv");
         m_OpaqueRasterPipeline = VulkanPipeline::CreateComputePipeline(m_Device, m_OpaqueRasterPipelineLayout, opaqueRasterShaderModule);
         vkDestroyShaderModule(m_Device, opaqueRasterShaderModule, nullptr);
 
@@ -337,8 +296,7 @@ namespace renderer {
         clearPipelineLayoutInfo.pPushConstantRanges = &clearPushConstantRange;
         VK_CHECK(vkCreatePipelineLayout(m_Device, &clearPipelineLayoutInfo, nullptr, &m_ClearPipelineLayout));
 
-        std::vector<char> clearShaderCode = ReadShaderFile("shaders/ClearVisBufferAtomic.comp.spv");
-        VkShaderModule clearShaderModule = VulkanPipeline::CreateShaderModule(m_Device, clearShaderCode);
+        VkShaderModule clearShaderModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/ClearVisBufferAtomic.comp.spv");
         m_ClearPipeline = VulkanPipeline::CreateComputePipeline(m_Device, m_ClearPipelineLayout, clearShaderModule);
         vkDestroyShaderModule(m_Device, clearShaderModule, nullptr);
 
@@ -354,14 +312,17 @@ namespace renderer {
         buildArgsPipelineLayoutInfo.pPushConstantRanges = &buildArgsPushConstantRange;
         VK_CHECK(vkCreatePipelineLayout(m_Device, &buildArgsPipelineLayoutInfo, nullptr, &m_BuildArgsPipelineLayout));
 
-        std::vector<char> buildArgsShaderCode = ReadShaderFile("shaders/BuildDispatchIndirectArgs.comp.spv");
-        VkShaderModule buildArgsShaderModule = VulkanPipeline::CreateShaderModule(m_Device, buildArgsShaderCode);
+        VkShaderModule buildArgsShaderModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/BuildDispatchIndirectArgs.comp.spv");
         m_BuildArgsPipeline = VulkanPipeline::CreateComputePipeline(m_Device, m_BuildArgsPipelineLayout, buildArgsShaderModule);
         vkDestroyShaderModule(m_Device, buildArgsShaderModule, nullptr);
+
+        LOG_INFO(std::format("[ClusterSoftwareRasterPass] Initialized software raster pass: size={}x{}, maskTextures={}",
+            renderExtent.width, renderExtent.height, maskTextureCount));
     }
 
     void ClusterSoftwareRasterPass::Shutdown() {
         if (m_Device != VK_NULL_HANDLE) {
+            LOG_INFO("[ClusterSoftwareRasterPass] Shutting down software raster pass...");
             if (m_RasterPipeline != VK_NULL_HANDLE) vkDestroyPipeline(m_Device, m_RasterPipeline, nullptr);
             if (m_OpaqueRasterPipeline != VK_NULL_HANDLE) vkDestroyPipeline(m_Device, m_OpaqueRasterPipeline, nullptr);
             if (m_ClearPipeline != VK_NULL_HANDLE) vkDestroyPipeline(m_Device, m_ClearPipeline, nullptr);

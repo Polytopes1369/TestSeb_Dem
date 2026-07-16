@@ -1,39 +1,13 @@
 #include "renderer/GICompositePass.h"
 
-#include <fstream>
-#include <stdexcept>
-#include <vector>
-
 #include "core/Logger.h"
+#include "renderer/VulkanPipeline.h"
+#include "renderer/VulkanUtils.h"
 #include "renderer/WorldProbeGridPass.h"
 
 namespace renderer {
 
     namespace {
-
-        // Mirrors every other pass' own copy of these two helpers -- see GlobalSDFPass.cpp's own
-        // comment on this codebase's per-pass self-containment convention.
-        std::vector<char> ReadShaderFile(const std::string& filename) {
-            std::ifstream file(filename, std::ios::ate | std::ios::binary);
-            if (!file.is_open()) {
-                throw std::runtime_error("GICompositePass: failed to open SPIR-V file: " + filename);
-            }
-            size_t fileSize = static_cast<size_t>(file.tellg());
-            std::vector<char> buffer(fileSize);
-            file.seekg(0);
-            file.read(buffer.data(), static_cast<std::streamsize>(fileSize));
-            file.close();
-            return buffer;
-        }
-
-        VkShaderModule CreateShaderModule(VkDevice device, const std::vector<char>& code) {
-            VkShaderModuleCreateInfo createInfo{ VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
-            createInfo.codeSize = code.size();
-            createInfo.pCode = reinterpret_cast<const uint32_t*>(code.data());
-            VkShaderModule module;
-            VK_CHECK(vkCreateShaderModule(device, &createInfo, nullptr, &module));
-            return module;
-        }
 
 #ifndef NDEBUG
         // Byte-for-byte mirror of GICompositeViewParamsUBO in GIComposite.comp (std140, debug-only).
@@ -105,19 +79,7 @@ namespace renderer {
         // one-shot pattern) -- GENERAL is both a valid storage-image layout (this pass' own
         // imageStore) and a valid transfer-source layout (renderer::ClusterRenderPipeline's final
         // blit), so it stays GENERAL for this image's entire lifetime with no further transitions.
-        {
-            VkCommandBufferAllocateInfo cmdAllocInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
-            cmdAllocInfo.commandPool = commandPool;
-            cmdAllocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-            cmdAllocInfo.commandBufferCount = 1;
-
-            VkCommandBuffer cmd;
-            VK_CHECK(vkAllocateCommandBuffers(m_Device, &cmdAllocInfo, &cmd));
-
-            VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-            beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-            vkBeginCommandBuffer(cmd, &beginInfo);
-
+        VulkanUtils::ExecuteOneShotCommands(m_Device, commandPool, queue, [&](VkCommandBuffer cmd) {
             VkImageMemoryBarrier2 barrier{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
             barrier.srcStageMask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
             barrier.srcAccessMask = 0;
@@ -134,17 +96,7 @@ namespace renderer {
             depInfo.imageMemoryBarrierCount = 1;
             depInfo.pImageMemoryBarriers = &barrier;
             vkCmdPipelineBarrier2(cmd, &depInfo);
-
-            vkEndCommandBuffer(cmd);
-
-            VkSubmitInfo submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
-            submitInfo.commandBufferCount = 1;
-            submitInfo.pCommandBuffers = &cmd;
-            VK_CHECK(vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE));
-            VK_CHECK(vkQueueWaitIdle(queue));
-
-            vkFreeCommandBuffers(m_Device, commandPool, 1, &cmd);
-        }
+        });
 
         VkSamplerCreateInfo samplerInfo{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
         samplerInfo.magFilter = VK_FILTER_NEAREST;
@@ -250,7 +202,7 @@ namespace renderer {
 #endif
         VK_CHECK(vkCreatePipelineLayout(m_Device, &layoutInfo, nullptr, &m_PipelineLayout));
 
-        VkShaderModule shaderModule = CreateShaderModule(m_Device, ReadShaderFile("shaders/GIComposite.comp.spv"));
+        VkShaderModule shaderModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/GIComposite.comp.spv");
         VkComputePipelineCreateInfo pipelineInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
         pipelineInfo.layout = m_PipelineLayout;
         pipelineInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;

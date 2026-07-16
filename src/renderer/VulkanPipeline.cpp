@@ -1,6 +1,24 @@
 #include "VulkanPipeline.h"
 #include "core/Logger.h"
+#include <format>
 #include <fstream>
+#include <stdexcept>
+
+std::vector<char> VulkanPipeline::ReadShaderFile(const std::string& path) {
+    std::ifstream file(path, std::ios::ate | std::ios::binary);
+    if (!file.is_open()) {
+        throw std::runtime_error(std::format("VulkanPipeline: failed to open SPIR-V file: {}", path));
+    }
+    const size_t fileSize = static_cast<size_t>(file.tellg());
+    std::vector<char> buffer(fileSize);
+    file.seekg(0);
+    file.read(buffer.data(), static_cast<std::streamsize>(fileSize));
+    return buffer;
+}
+
+VkShaderModule VulkanPipeline::LoadShaderModule(VkDevice device, const std::string& path) {
+    return CreateShaderModule(device, ReadShaderFile(path));
+}
 
 VkShaderModule VulkanPipeline::CreateShaderModule(VkDevice device, const std::vector<char>& code) {
     VkShaderModuleCreateInfo createInfo{};

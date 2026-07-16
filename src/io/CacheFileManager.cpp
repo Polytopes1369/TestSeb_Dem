@@ -53,8 +53,8 @@ namespace geometry {
         }
 
         // Writes `dataSizeBytes` bytes from `data`, followed by explicit zero bytes, so exactly
-        // `paddedSizeBytes` bytes land in the file -- the "remplit les espaces vides (padding)
-        // avec des zéros" requirement, made visible directly in the write path rather than relying
+        // `paddedSizeBytes` bytes land in the file -- the "fills empty spaces (padding)
+        // with zeros" requirement, made visible directly in the write path rather than relying
         // on the caller's struct having already been zero-initialized. `paddedSizeBytes` must be a
         // multiple of kPageSizeBytes and >= dataSizeBytes.
         bool WriteZeroPaddedSection(HANDLE fileHandle, const void* data, size_t dataSizeBytes, size_t paddedSizeBytes) {

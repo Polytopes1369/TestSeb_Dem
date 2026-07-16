@@ -1,7 +1,6 @@
 #include "renderer/ClusterHardwareRasterPass.h"
 
-#include <fstream>
-#include <stdexcept>
+#include <format>
 
 #include "core/Logger.h"
 #include "renderer/GeometryDecompressionPass.h" // kDecompressedIndexType
@@ -9,25 +8,6 @@
 
 namespace renderer {
 
-    namespace {
-
-        // Mirrors HZBPass::ReadShaderFile / every other pass's own copy -- duplicated rather than
-        // shared because this class is deliberately self-contained (no VulkanContext dependency),
-        // matching this codebase's existing per-pass convention.
-        std::vector<char> ReadShaderFile(const std::string& filename) {
-            std::ifstream file(filename, std::ios::ate | std::ios::binary);
-            if (!file.is_open()) {
-                throw std::runtime_error("ClusterHardwareRasterPass: failed to open SPIR-V file: " + filename);
-            }
-            size_t fileSize = static_cast<size_t>(file.tellg());
-            std::vector<char> buffer(fileSize);
-            file.seekg(0);
-            file.read(buffer.data(), static_cast<std::streamsize>(fileSize));
-            file.close();
-            return buffer;
-        }
-
-    } // namespace
 
     void ClusterHardwareRasterPass::Init(VkDevice device, VkBuffer clusterMetadataBuffer, VkBuffer compressedPhysicalPoolBuffer,
         VkBuffer wpoGlobalsBuffer, const std::vector<VkDescriptorImageInfo>& maskImageInfos,
@@ -132,12 +112,9 @@ namespace renderer {
         pipelineLayoutInfo.pPushConstantRanges = &pushConstantRange;
         VK_CHECK(vkCreatePipelineLayout(m_Device, &pipelineLayoutInfo, nullptr, &m_PipelineLayout));
 
-        std::vector<char> vertCode = ReadShaderFile("shaders/ClusterRaster.vert.spv");
-        std::vector<char> maskedFragCode = ReadShaderFile("shaders/ClusterRaster.frag.spv");
-        std::vector<char> opaqueFragCode = ReadShaderFile("shaders/ClusterRasterOpaque.frag.spv");
-        VkShaderModule vertModule = VulkanPipeline::CreateShaderModule(m_Device, vertCode);
-        VkShaderModule maskedFragModule = VulkanPipeline::CreateShaderModule(m_Device, maskedFragCode);
-        VkShaderModule opaqueFragModule = VulkanPipeline::CreateShaderModule(m_Device, opaqueFragCode);
+        VkShaderModule vertModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/ClusterRaster.vert.spv");
+        VkShaderModule maskedFragModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/ClusterRaster.frag.spv");
+        VkShaderModule opaqueFragModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/ClusterRasterOpaque.frag.spv");
 
         m_MaskedPipeline = VulkanPipeline::CreateGraphicsPipeline(m_Device, m_PipelineLayout, vertModule, maskedFragModule, visBufferColorFormats, depthFormat);
         m_OpaquePipeline = VulkanPipeline::CreateGraphicsPipeline(m_Device, m_PipelineLayout, vertModule, opaqueFragModule, visBufferColorFormats, depthFormat);
@@ -145,10 +122,13 @@ namespace renderer {
         vkDestroyShaderModule(m_Device, vertModule, nullptr);
         vkDestroyShaderModule(m_Device, maskedFragModule, nullptr);
         vkDestroyShaderModule(m_Device, opaqueFragModule, nullptr);
+
+        LOG_INFO(std::format("[ClusterHardwareRasterPass] Initialized hardware raster pass: maskTextures={}", maskTextureCount));
     }
 
     void ClusterHardwareRasterPass::Shutdown() {
         if (m_Device != VK_NULL_HANDLE) {
+            LOG_INFO("[ClusterHardwareRasterPass] Shutting down hardware raster pass...");
             if (m_OpaquePipeline != VK_NULL_HANDLE) {
                 vkDestroyPipeline(m_Device, m_OpaquePipeline, nullptr);
             }

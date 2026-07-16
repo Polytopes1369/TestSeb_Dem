@@ -22,6 +22,8 @@ set(OLD_GLOB
   "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/io/ObjExport.cpp"
   "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/io/StreamingRequestQueue.cpp"
   "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/main.cpp"
+  "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/renderer/ATrousDenoisePass.cpp"
+  "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/renderer/AccelerationStructure.cpp"
   "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/renderer/ClusterCullingPass.cpp"
   "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/renderer/ClusterHardwareRasterPass.cpp"
   "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/renderer/ClusterLODSelectionPass.cpp"
@@ -30,19 +32,30 @@ set(OLD_GLOB
   "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/renderer/ClusterResolvePass.cpp"
   "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/renderer/ClusterSoftwareRasterPass.cpp"
   "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/renderer/FeedbackBuffer.cpp"
+  "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/renderer/GICompositePass.cpp"
   "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/renderer/GeometryDecompressionPass.cpp"
   "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/renderer/GeometryStreamingCoordinator.cpp"
   "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/renderer/GlobalSDFPass.cpp"
   "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/renderer/GpuBuffer.cpp"
   "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/renderer/GpuGeometryPagePool.cpp"
+  "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/renderer/GpuImage.cpp"
   "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/renderer/HZBPass.cpp"
   "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/renderer/ProceduralMaskGenerator.cpp"
+  "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/renderer/RayTracingFunctions.cpp"
   "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/renderer/SDFRayMarchPass.cpp"
+  "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/renderer/ScreenProbeGIPass.cpp"
+  "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/renderer/ScreenTracePass.cpp"
   "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/renderer/ShadowMapPass.cpp"
+  "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/renderer/SurfaceCacheGIInjectPass.cpp"
   "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/renderer/SurfaceCachePass.cpp"
+  "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/renderer/SurfaceCacheRayTracingPass.cpp"
+  "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/renderer/SurfaceCacheSWRTPass.cpp"
+  "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/renderer/SurfaceCacheTraceContext.cpp"
   "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/renderer/VmaUsage.cpp"
   "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/renderer/VulkanContext.cpp"
   "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/renderer/VulkanPipeline.cpp"
+  "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/renderer/VulkanUtils.cpp"
+  "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/renderer/WorldProbeGridPass.cpp"
   "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/renderer/debug/ClusterTriangleStatsPass.cpp"
   "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/renderer/debug/DebugTextOverlay.cpp"
   )
@@ -95,6 +108,8 @@ set(OLD_GLOB
   "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/io/CacheFileManager.h"
   "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/io/ObjExport.h"
   "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/io/StreamingRequestQueue.h"
+  "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/renderer/ATrousDenoisePass.h"
+  "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/renderer/AccelerationStructure.h"
   "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/renderer/ClusterCullingPass.h"
   "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/renderer/ClusterHardwareRasterPass.h"
   "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/renderer/ClusterLODSelectionPass.h"
@@ -103,20 +118,31 @@ set(OLD_GLOB
   "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/renderer/ClusterResolvePass.h"
   "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/renderer/ClusterSoftwareRasterPass.h"
   "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/renderer/FeedbackBuffer.h"
+  "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/renderer/GICompositePass.h"
   "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/renderer/GeometryDecompressionPass.h"
   "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/renderer/GeometryStreamingCoordinator.h"
   "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/renderer/GlobalSDFPass.h"
   "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/renderer/GpuBuffer.h"
   "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/renderer/GpuGeometryPagePool.h"
+  "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/renderer/GpuImage.h"
   "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/renderer/HZBPass.h"
   "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/renderer/LightingTypes.h"
   "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/renderer/ProceduralMaskGenerator.h"
+  "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/renderer/RayTracingFunctions.h"
   "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/renderer/RenderTypes.h"
   "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/renderer/SDFRayMarchPass.h"
+  "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/renderer/ScreenProbeGIPass.h"
+  "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/renderer/ScreenTracePass.h"
   "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/renderer/ShadowMapPass.h"
+  "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/renderer/SurfaceCacheGIInjectPass.h"
   "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/renderer/SurfaceCachePass.h"
+  "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/renderer/SurfaceCacheRayTracingPass.h"
+  "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/renderer/SurfaceCacheSWRTPass.h"
+  "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/renderer/SurfaceCacheTraceContext.h"
   "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/renderer/VulkanContext.h"
   "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/renderer/VulkanPipeline.h"
+  "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/renderer/VulkanUtils.h"
+  "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/renderer/WorldProbeGridPass.h"
   "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/renderer/debug/BitmapFont8x8.h"
   "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/renderer/debug/ClusterTriangleStatsPass.h"
   "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/renderer/debug/DebugTextOverlay.h"
@@ -167,7 +193,7 @@ if(NOT "${NEW_GLOB}" STREQUAL "${OLD_GLOB}")
   file(TOUCH_NOCREATE "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/CMakeFiles/cmake.verify_globs")
 endif()
 
-# SHADERS_TO_COMPILE at CMakeLists.txt:122 (file)
+# SHADERS_TO_COMPILE at CMakeLists.txt:127 (file)
 file(GLOB_RECURSE NEW_GLOB LIST_DIRECTORIES false "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/shaders/*.comp")
 set(OLD_GLOB
   "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/shaders/src/Culling/BuildDispatchIndirectArgs.comp"
@@ -183,8 +209,17 @@ set(OLD_GLOB
   "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/shaders/src/Culling/HZBBuildInit.comp"
   "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/shaders/src/Culling/HZBReduce.comp"
   "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/shaders/src/Debug/ComputeTriangleStats.comp"
+  "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/shaders/src/GI/ATrousDenoise.comp"
+  "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/shaders/src/GI/GIComposite.comp"
   "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/shaders/src/GI/GlobalSDFComposite.comp"
   "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/shaders/src/GI/SDFRayMarch.comp"
+  "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/shaders/src/GI/ScreenProbeGather.comp"
+  "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/shaders/src/GI/ScreenProbeTemporal.comp"
+  "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/shaders/src/GI/ScreenProbeTrace.comp"
+  "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/shaders/src/GI/ScreenTrace.comp"
+  "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/shaders/src/GI/SurfaceCacheGIInject.comp"
+  "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/shaders/src/GI/SurfaceCacheTraceSWRT.comp"
+  "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/shaders/src/GI/WorldProbeInject.comp"
   "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/shaders/src/PrimitiveGen/draw.comp"
   "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/shaders/src/PrimitiveGen/geom_TorusKnot.comp"
   "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/shaders/src/PrimitiveGen/geom_box.comp"
@@ -224,7 +259,7 @@ if(NOT "${NEW_GLOB}" STREQUAL "${OLD_GLOB}")
   file(TOUCH_NOCREATE "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/CMakeFiles/cmake.verify_globs")
 endif()
 
-# SHADERS_TO_COMPILE at CMakeLists.txt:122 (file)
+# SHADERS_TO_COMPILE at CMakeLists.txt:127 (file)
 file(GLOB_RECURSE NEW_GLOB LIST_DIRECTORIES false "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/shaders/*.frag")
 set(OLD_GLOB
   "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/shaders/src/Debug/DebugText.frag"
@@ -254,7 +289,7 @@ if(NOT "${NEW_GLOB}" STREQUAL "${OLD_GLOB}")
   file(TOUCH_NOCREATE "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/CMakeFiles/cmake.verify_globs")
 endif()
 
-# SHADERS_TO_COMPILE at CMakeLists.txt:122 (file)
+# SHADERS_TO_COMPILE at CMakeLists.txt:127 (file)
 file(GLOB_RECURSE NEW_GLOB LIST_DIRECTORIES false "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/shaders/*.mesh")
 set(OLD_GLOB
   )
@@ -279,7 +314,85 @@ if(NOT "${NEW_GLOB}" STREQUAL "${OLD_GLOB}")
   file(TOUCH_NOCREATE "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/CMakeFiles/cmake.verify_globs")
 endif()
 
-# SHADERS_TO_COMPILE at CMakeLists.txt:122 (file)
+# SHADERS_TO_COMPILE at CMakeLists.txt:127 (file)
+file(GLOB_RECURSE NEW_GLOB LIST_DIRECTORIES false "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/shaders/*.rchit")
+set(OLD_GLOB
+  "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/shaders/src/RT/SurfaceCacheHWRT.rchit"
+  )
+if(NOT "${NEW_GLOB}" STREQUAL "${OLD_GLOB}")
+  message("-- GLOB mismatch!")
+  set(NEW_ONLY ${NEW_GLOB})
+  set(OLD_ONLY ${OLD_GLOB})
+  list(REMOVE_ITEM NEW_ONLY ${OLD_GLOB})
+  list(REMOVE_ITEM OLD_ONLY ${NEW_GLOB})
+  if(NEW_ONLY)
+    message("The following files were added:")
+    foreach(VAR_FILE IN LISTS NEW_ONLY)
+      message("  +${VAR_FILE}")
+    endforeach()
+  endif()
+  if(OLD_ONLY)
+    message("The following files were removed:")
+    foreach(VAR_FILE IN LISTS OLD_ONLY)
+      message("  -${VAR_FILE}")
+    endforeach()
+  endif()
+  file(TOUCH_NOCREATE "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/CMakeFiles/cmake.verify_globs")
+endif()
+
+# SHADERS_TO_COMPILE at CMakeLists.txt:127 (file)
+file(GLOB_RECURSE NEW_GLOB LIST_DIRECTORIES false "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/shaders/*.rgen")
+set(OLD_GLOB
+  "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/shaders/src/RT/SurfaceCacheHWRT.rgen"
+  )
+if(NOT "${NEW_GLOB}" STREQUAL "${OLD_GLOB}")
+  message("-- GLOB mismatch!")
+  set(NEW_ONLY ${NEW_GLOB})
+  set(OLD_ONLY ${OLD_GLOB})
+  list(REMOVE_ITEM NEW_ONLY ${OLD_GLOB})
+  list(REMOVE_ITEM OLD_ONLY ${NEW_GLOB})
+  if(NEW_ONLY)
+    message("The following files were added:")
+    foreach(VAR_FILE IN LISTS NEW_ONLY)
+      message("  +${VAR_FILE}")
+    endforeach()
+  endif()
+  if(OLD_ONLY)
+    message("The following files were removed:")
+    foreach(VAR_FILE IN LISTS OLD_ONLY)
+      message("  -${VAR_FILE}")
+    endforeach()
+  endif()
+  file(TOUCH_NOCREATE "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/CMakeFiles/cmake.verify_globs")
+endif()
+
+# SHADERS_TO_COMPILE at CMakeLists.txt:127 (file)
+file(GLOB_RECURSE NEW_GLOB LIST_DIRECTORIES false "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/shaders/*.rmiss")
+set(OLD_GLOB
+  "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/shaders/src/RT/SurfaceCacheHWRT.rmiss"
+  )
+if(NOT "${NEW_GLOB}" STREQUAL "${OLD_GLOB}")
+  message("-- GLOB mismatch!")
+  set(NEW_ONLY ${NEW_GLOB})
+  set(OLD_ONLY ${OLD_GLOB})
+  list(REMOVE_ITEM NEW_ONLY ${OLD_GLOB})
+  list(REMOVE_ITEM OLD_ONLY ${NEW_GLOB})
+  if(NEW_ONLY)
+    message("The following files were added:")
+    foreach(VAR_FILE IN LISTS NEW_ONLY)
+      message("  +${VAR_FILE}")
+    endforeach()
+  endif()
+  if(OLD_ONLY)
+    message("The following files were removed:")
+    foreach(VAR_FILE IN LISTS OLD_ONLY)
+      message("  -${VAR_FILE}")
+    endforeach()
+  endif()
+  file(TOUCH_NOCREATE "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/CMakeFiles/cmake.verify_globs")
+endif()
+
+# SHADERS_TO_COMPILE at CMakeLists.txt:127 (file)
 file(GLOB_RECURSE NEW_GLOB LIST_DIRECTORIES false "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/shaders/*.vert")
 set(OLD_GLOB
   "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/shaders/src/Debug/DebugText.vert"

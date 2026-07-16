@@ -7,34 +7,13 @@
 
 #include "core/Logger.h"
 #include "renderer/RayTracingFunctions.h"
+#include "renderer/VulkanUtils.h"
 
 namespace renderer {
 
     namespace {
 
-        VkCommandBuffer BeginOneShotCommandBuffer(VkDevice device, VkCommandPool commandPool) {
-            VkCommandBufferAllocateInfo allocInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
-            allocInfo.commandPool = commandPool;
-            allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-            allocInfo.commandBufferCount = 1;
-            VkCommandBuffer cmd;
-            VK_CHECK(vkAllocateCommandBuffers(device, &allocInfo, &cmd));
 
-            VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-            beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-            VK_CHECK(vkBeginCommandBuffer(cmd, &beginInfo));
-            return cmd;
-        }
-
-        void EndAndSubmitOneShotCommandBuffer(VkDevice device, VkCommandPool commandPool, VkQueue queue, VkCommandBuffer cmd) {
-            VK_CHECK(vkEndCommandBuffer(cmd));
-            VkSubmitInfo submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
-            submitInfo.commandBufferCount = 1;
-            submitInfo.pCommandBuffers = &cmd;
-            VK_CHECK(vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE));
-            VK_CHECK(vkQueueWaitIdle(queue));
-            vkFreeCommandBuffers(device, commandPool, 1, &cmd);
-        }
 
         // VkPhysicalDeviceAccelerationStructurePropertiesKHR::minAccelerationStructureScratchOffsetAlignment
         // (queried fresh each call -- this only ever runs a handful of times at Init(), so caching
@@ -117,26 +96,26 @@ namespace renderer {
 
             const VkAccelerationStructureBuildRangeInfoKHR* pRangeInfo = &rangeInfo;
 
-            VkCommandBuffer cmd = BeginOneShotCommandBuffer(device, commandPool);
-            g_RTFunctions.vkCmdBuildAccelerationStructuresKHR(cmd, 1, &buildInfo, &pRangeInfo);
+            VulkanUtils::ExecuteOneShotCommands(device, commandPool, queue, [&](VkCommandBuffer cmd) {
+                g_RTFunctions.vkCmdBuildAccelerationStructuresKHR(cmd, 1, &buildInfo, &pRangeInfo);
 
-            // Makes the freshly-built acceleration structure's data visible to a later
-            // acceleration-structure read (a TLAS build referencing this BLAS, or a
-            // traceRayEXT/rayQueryEXT traversal reading this TLAS) -- explicit VkMemoryBarrier2 per
-            // CLAUDE.md's synchronization rule, no shortcut via the implicit submission-boundary
-            // ordering alone.
-            VkMemoryBarrier2 barrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
-            barrier.srcStageMask = VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
-            barrier.srcAccessMask = VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
-            barrier.dstStageMask = VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR |
-                VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-            barrier.dstAccessMask = VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR;
-            VkDependencyInfo depInfo{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-            depInfo.memoryBarrierCount = 1;
-            depInfo.pMemoryBarriers = &barrier;
-            vkCmdPipelineBarrier2(cmd, &depInfo);
+                // Makes the freshly-built acceleration structure's data visible to a later
+                // acceleration-structure read (a TLAS build referencing this BLAS, or a
+                // traceRayEXT/rayQueryEXT traversal reading this TLAS) -- explicit VkMemoryBarrier2 per
+                // CLAUDE.md's synchronization rule, no shortcut via the implicit submission-boundary
+                // ordering alone.
+                VkMemoryBarrier2 barrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+                barrier.srcStageMask = VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
+                barrier.srcAccessMask = VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
+                barrier.dstStageMask = VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR |
+                    VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+                barrier.dstAccessMask = VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR;
+                VkDependencyInfo depInfo{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+                depInfo.memoryBarrierCount = 1;
+                depInfo.pMemoryBarriers = &barrier;
+                vkCmdPipelineBarrier2(cmd, &depInfo);
+            });
 
-            EndAndSubmitOneShotCommandBuffer(device, commandPool, queue, cmd);
             scratch.buffer.Destroy();
 
             VkAccelerationStructureDeviceAddressInfoKHR addressInfo{ VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR };

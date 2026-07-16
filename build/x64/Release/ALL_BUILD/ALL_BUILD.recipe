@@ -11,6 +11,9 @@
       <FullPath>D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\Release\ClusterDAGTests.exe</FullPath>
     </ProjectOutput>
     <ProjectOutput>
+      <FullPath>D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\Release\ClusterMaskSplitTests.exe</FullPath>
+    </ProjectOutput>
+    <ProjectOutput>
       <FullPath>D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\Release\ClusterPartitionerTests.exe</FullPath>
     </ProjectOutput>
     <ProjectOutput>
@@ -21,6 +24,9 @@
     </ProjectOutput>
     <ProjectOutput>
       <FullPath>D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\Release\DemoSceneVK.exe</FullPath>
+    </ProjectOutput>
+    <ProjectOutput>
+      <FullPath>D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\Release\MeshSDFTests.exe</FullPath>
     </ProjectOutput>
     <ProjectOutput>
       <FullPath>D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\x64\Release\ALL_BUILD</FullPath>

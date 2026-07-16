@@ -86,7 +86,7 @@
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <ClCompile>
-      <AdditionalIncludeDirectories>D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src;C:\VulkanSDK\1.4.350.0\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <AssemblerListingLocation>$(IntDir)</AssemblerListingLocation>
       <BasicRuntimeChecks>EnableFastChecks</BasicRuntimeChecks>
       <BufferSecurityCheck></BufferSecurityCheck>
@@ -111,10 +111,10 @@
     </ClCompile>
     <ResourceCompile>
       <PreprocessorDefinitions>%(PreprocessorDefinitions);WIN32;_DEBUG;_WINDOWS;CMAKE_INTDIR=\"Debug\"</PreprocessorDefinitions>
-      <AdditionalIncludeDirectories>D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src;C:\VulkanSDK\1.4.350.0\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ResourceCompile>
     <Midl>
-      <AdditionalIncludeDirectories>D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src;C:\VulkanSDK\1.4.350.0\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <OutputDirectory>$(ProjectDir)/$(IntDir)</OutputDirectory>
       <HeaderFileName>%(Filename).h</HeaderFileName>
       <TypeLibraryName>%(Filename).tlb</TypeLibraryName>
@@ -141,7 +141,7 @@
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <ClCompile>
-      <AdditionalIncludeDirectories>D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src;C:\VulkanSDK\1.4.350.0\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <AssemblerListingLocation>$(IntDir)</AssemblerListingLocation>
       <BasicRuntimeChecks>Default</BasicRuntimeChecks>
       <BufferSecurityCheck></BufferSecurityCheck>
@@ -167,10 +167,10 @@
     </ClCompile>
     <ResourceCompile>
       <PreprocessorDefinitions>%(PreprocessorDefinitions);WIN32;_WINDOWS;NDEBUG;CMAKE_INTDIR=\"Release\"</PreprocessorDefinitions>
-      <AdditionalIncludeDirectories>D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src;C:\VulkanSDK\1.4.350.0\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ResourceCompile>
     <Midl>
-      <AdditionalIncludeDirectories>D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src;C:\VulkanSDK\1.4.350.0\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <OutputDirectory>$(ProjectDir)/$(IntDir)</OutputDirectory>
       <HeaderFileName>%(Filename).h</HeaderFileName>
       <TypeLibraryName>%(Filename).tlb</TypeLibraryName>
@@ -197,7 +197,7 @@
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='MinSizeRel|x64'">
     <ClCompile>
-      <AdditionalIncludeDirectories>D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src;C:\VulkanSDK\1.4.350.0\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <AssemblerListingLocation>$(IntDir)</AssemblerListingLocation>
       <BasicRuntimeChecks>Default</BasicRuntimeChecks>
       <BufferSecurityCheck></BufferSecurityCheck>
@@ -223,10 +223,10 @@
     </ClCompile>
     <ResourceCompile>
       <PreprocessorDefinitions>%(PreprocessorDefinitions);WIN32;_WINDOWS;NDEBUG;CMAKE_INTDIR=\"MinSizeRel\"</PreprocessorDefinitions>
-      <AdditionalIncludeDirectories>D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src;C:\VulkanSDK\1.4.350.0\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ResourceCompile>
     <Midl>
-      <AdditionalIncludeDirectories>D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src;C:\VulkanSDK\1.4.350.0\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <OutputDirectory>$(ProjectDir)/$(IntDir)</OutputDirectory>
       <HeaderFileName>%(Filename).h</HeaderFileName>
       <TypeLibraryName>%(Filename).tlb</TypeLibraryName>
@@ -253,7 +253,7 @@
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='RelWithDebInfo|x64'">
     <ClCompile>
-      <AdditionalIncludeDirectories>D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src;C:\VulkanSDK\1.4.350.0\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <AssemblerListingLocation>$(IntDir)</AssemblerListingLocation>
       <BasicRuntimeChecks>Default</BasicRuntimeChecks>
       <BufferSecurityCheck></BufferSecurityCheck>
@@ -278,10 +278,10 @@
     </ClCompile>
     <ResourceCompile>
       <PreprocessorDefinitions>%(PreprocessorDefinitions);WIN32;_WINDOWS;NDEBUG;CMAKE_INTDIR=\"RelWithDebInfo\"</PreprocessorDefinitions>
-      <AdditionalIncludeDirectories>D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src;C:\VulkanSDK\1.4.350.0\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ResourceCompile>
     <Midl>
-      <AdditionalIncludeDirectories>D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src;C:\VulkanSDK\1.4.350.0\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <OutputDirectory>$(ProjectDir)/$(IntDir)</OutputDirectory>
       <HeaderFileName>%(Filename).h</HeaderFileName>
       <TypeLibraryName>%(Filename).tlb</TypeLibraryName>
@@ -368,6 +368,7 @@ if %errorlevel% neq 0 goto :VCEnd</Command>
     <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\geometry\ClusterGrouping.cpp" />
     <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\geometry\MeshSimplifier.cpp" />
     <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\geometry\ClusterDAG.cpp" />
+    <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\core\Logger.cpp" />
     <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\tests\ClusterDAGTests.cpp" />
   </ItemGroup>
   <ItemGroup />

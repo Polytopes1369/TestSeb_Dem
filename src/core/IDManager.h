@@ -11,7 +11,7 @@ namespace core {
     public:
         static void Init(uint16_t contextID, uint64_t seed = (uint64_t)maths::SEED_GENERAL) 
         {
-            s_Context = static_cast<uint64_t>(contextID) << 48; // Décalage pour réserver les 16 bits de poids fort
+            s_Context = static_cast<uint64_t>(contextID) << 48; // Shift to reserve the 16 most significant bits
             s_Sequence = 0;
             s_BaseSeed = seed;
         }

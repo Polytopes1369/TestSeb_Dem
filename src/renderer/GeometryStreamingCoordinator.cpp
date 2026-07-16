@@ -130,6 +130,7 @@ namespace renderer {
             m_RequestQueue.MarkRequestCompleted(completed.clusterID);
 
             if (!completed.success || completed.bytesTransferred < geometry::kPageSizeBytes) {
+                LOG_WARNING(std::format("[GeometryStreamingCoordinator] Read failed or short for clusterID {}: success={}, bytes={}", completed.clusterID, completed.success, completed.bytesTransferred));
                 continue; // Failed/short read: not bound this frame -- a future miss report retries it.
             }
             m_TotalBytesCompleted.fetch_add(completed.bytesTransferred, std::memory_order_relaxed);

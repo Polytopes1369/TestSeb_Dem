@@ -55,6 +55,12 @@
     <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\main.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\ATrousDenoisePass.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\AccelerationStructure.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\ClusterCullingPass.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -79,6 +85,9 @@
     <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\FeedbackBuffer.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\GICompositePass.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\GeometryDecompressionPass.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -94,19 +103,43 @@
     <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\GpuGeometryPagePool.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\GpuImage.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\HZBPass.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\ProceduralMaskGenerator.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\RayTracingFunctions.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\SDFRayMarchPass.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\ScreenProbeGIPass.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\ScreenTracePass.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\ShadowMapPass.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\SurfaceCacheGIInjectPass.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\SurfaceCachePass.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\SurfaceCacheRayTracingPass.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\SurfaceCacheSWRTPass.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\SurfaceCacheTraceContext.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\VmaUsage.cpp">
@@ -116,6 +149,12 @@
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\VulkanPipeline.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\VulkanUtils.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\WorldProbeGridPass.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\debug\ClusterTriangleStatsPass.cpp">
@@ -201,6 +240,12 @@
     <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\io\StreamingRequestQueue.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\ATrousDenoisePass.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\AccelerationStructure.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\ClusterCullingPass.h">
       <Filter>Header Files</Filter>
     </ClInclude>
@@ -225,6 +270,9 @@
     <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\FeedbackBuffer.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\GICompositePass.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\GeometryDecompressionPass.h">
       <Filter>Header Files</Filter>
     </ClInclude>
@@ -240,6 +288,9 @@
     <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\GpuGeometryPagePool.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\GpuImage.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\HZBPass.h">
       <Filter>Header Files</Filter>
     </ClInclude>
@@ -249,22 +300,49 @@
     <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\ProceduralMaskGenerator.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\RayTracingFunctions.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\RenderTypes.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\SDFRayMarchPass.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\ScreenProbeGIPass.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\ScreenTracePass.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\ShadowMapPass.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\SurfaceCacheGIInjectPass.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\SurfaceCachePass.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\SurfaceCacheRayTracingPass.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\SurfaceCacheSWRTPass.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\SurfaceCacheTraceContext.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\VulkanContext.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\VulkanPipeline.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\VulkanUtils.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\WorldProbeGridPass.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\debug\BitmapFont8x8.h">

@@ -1,7 +1,9 @@
 #include "geometry/ClusterGrouping.h"
+#include "core/Logger.h"
 
 #include <algorithm>
 #include <array>
+#include <format>
 #include <unordered_map>
 
 namespace geometry {
@@ -193,6 +195,7 @@ namespace geometry {
         for (const auto& members : memberLists) {
             groups.push_back(BuildGroupMesh(members, clusters, allVertices));
         }
+        LOG_INFO(std::format("[ClusterGrouping] Grouped {} clusters into {} groups.", clusters.size(), groups.size()));
         return groups;
     }
 

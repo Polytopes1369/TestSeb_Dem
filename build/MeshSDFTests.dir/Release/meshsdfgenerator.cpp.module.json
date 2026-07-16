@@ -1,0 +1,13 @@
+{
+    "version": 1,
+    "revision": 0,
+    "rules": [
+        {
+            "primary-output": "MeshSDFTests.dir\\Release\\MeshSDFGenerator.obj",
+            "outputs": [
+                "MeshSDFTests.dir\\Release\\"
+            ],
+            "requires": []
+        }
+    ]
+}

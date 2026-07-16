@@ -13,6 +13,9 @@
     <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\io\ObjExport.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\core\Logger.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\tests\ClusterSimplificationTests.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>

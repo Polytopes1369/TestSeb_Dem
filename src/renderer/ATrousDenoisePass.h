@@ -16,8 +16,8 @@
 // with a dilating step size (1, 2, 4, 8, 16 texels), each tap weighted down whenever it crosses a
 // depth discontinuity, a normal mismatch, or a large luminance jump relative to the CENTER texel
 // -- the standard SVGF-style 3-way edge-stopping weight -- so noise gets averaged away only where
-// the underlying signal is actually expected to be smooth, exactly the "n'élimine le bruit sans
-// lisser les détails de la géométrie ou des textures du matériau final" requirement.
+// the underlying signal is actually expected to be smooth, exactly the "eliminates noise without
+// smoothing the details of the geometry or final material textures" requirement.
 
 #include <cstdint>
 #include <vulkan/vulkan.h>

@@ -1,43 +1,17 @@
 #include "renderer/SurfaceCacheGIInjectPass.h"
 
 #include <algorithm>
-#include <fstream>
-#include <stdexcept>
-#include <vector>
 
 #include "core/Logger.h"
 #include "geometry/ClusterFormat.h"
 #include "renderer/SurfaceCachePass.h"
 #include "renderer/SurfaceCacheRayTracingPass.h"
 #include "renderer/SurfaceCacheTraceContext.h"
+#include "renderer/VulkanPipeline.h"
 
 namespace renderer {
 
     namespace {
-
-        // Mirrors GlobalSDFPass.cpp / SurfaceCachePass.cpp's own copy of these two helpers -- see
-        // GlobalSDFPass.cpp's own comment on this codebase's per-pass self-containment convention.
-        std::vector<char> ReadShaderFile(const std::string& filename) {
-            std::ifstream file(filename, std::ios::ate | std::ios::binary);
-            if (!file.is_open()) {
-                throw std::runtime_error("SurfaceCacheGIInjectPass: failed to open SPIR-V file: " + filename);
-            }
-            size_t fileSize = static_cast<size_t>(file.tellg());
-            std::vector<char> buffer(fileSize);
-            file.seekg(0);
-            file.read(buffer.data(), static_cast<std::streamsize>(fileSize));
-            file.close();
-            return buffer;
-        }
-
-        VkShaderModule CreateShaderModule(VkDevice device, const std::vector<char>& code) {
-            VkShaderModuleCreateInfo createInfo{ VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
-            createInfo.codeSize = code.size();
-            createInfo.pCode = reinterpret_cast<const uint32_t*>(code.data());
-            VkShaderModule module;
-            VK_CHECK(vkCreateShaderModule(device, &createInfo, nullptr, &module));
-            return module;
-        }
 
         // Byte-for-byte layout match for GIInjectPushConstants in SurfaceCacheGIInject.comp.
         struct GIInjectPushConstants {
@@ -189,7 +163,7 @@ namespace renderer {
         layoutInfo.pPushConstantRanges = &pushConstantRange;
         VK_CHECK(vkCreatePipelineLayout(m_Device, &layoutInfo, nullptr, &m_PipelineLayout));
 
-        VkShaderModule shaderModule = CreateShaderModule(m_Device, ReadShaderFile("shaders/SurfaceCacheGIInject.comp.spv"));
+        VkShaderModule shaderModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/SurfaceCacheGIInject.comp.spv");
         VkComputePipelineCreateInfo pipelineInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
         pipelineInfo.layout = m_PipelineLayout;
         pipelineInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;

@@ -9,8 +9,8 @@
 // rendered as a magenta placeholder by ClusterResolve.comp's own unhandled-viewMode fallback).
 // This pass replaces that placeholder for real: mode 13 shows the denoised GI term alone (no
 // direct light added), mode 14 visualizes the World Probe grid directly at each pixel's
-// reconstructed world position. Per CLAUDE.md's Debug/Release rule ("les modes de visualisation
-// Lumen/Nanite ne doivent pas être compilés en Release"), every resource these two debug modes
+// reconstructed world position. Per CLAUDE.md's Debug/Release rule ("Lumen/Nanite visualization
+// modes must not be compiled in Release"), every resource these two debug modes
 // need beyond the always-present direct/denoised-GI blend (the depth image + an inverse-view-
 // projection UBO, to reconstruct a world position; the World Probe grid itself) is bound ONLY in
 // a `#ifndef NDEBUG` build, exactly like renderer::ClusterResolvePass's own viewMode push constant

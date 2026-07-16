@@ -3,7 +3,7 @@
 
 namespace renderer 
 {
-    // Aligné sur 32 octets (2x16) pour le cache GPU
+    // Aligned to 32 bytes (2x16) for GPU cache alignment
     struct alignas(16) Vertex 
     {
         maths::vec3 position;

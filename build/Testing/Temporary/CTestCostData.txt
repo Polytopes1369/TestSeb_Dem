@@ -1,7 +1,7 @@
-ClusterPartitionerTests 8 0.011993
-ClusterSimplificationTests 8 0.0114734
-ClusterDAGTests 8 0.0152223
-CacheFileFormatTests 10 0.0499613
-ClusterMaskSplitTests 7 0.00659917
-MeshSDFTests 5 0.0885694
+ClusterPartitionerTests 11 0.00588263
+ClusterSimplificationTests 11 0.0046597
+ClusterDAGTests 11 0.00411468
+CacheFileFormatTests 13 0.00357194
+ClusterMaskSplitTests 10 0.00388647
+MeshSDFTests 8 0.0283284
 ---

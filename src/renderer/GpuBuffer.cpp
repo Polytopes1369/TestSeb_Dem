@@ -1,5 +1,7 @@
 #include "renderer/GpuBuffer.h"
+#include "core/Logger.h"
 
+#include <format>
 #include <stdexcept>
 #include <utility>
 
@@ -59,16 +61,22 @@ namespace renderer {
         if (vmaCreateBuffer(allocator, &bufferInfo, &allocInfo, &m_Buffer, &m_Allocation, &resultInfo) != VK_SUCCESS) {
             m_Buffer = VK_NULL_HANDLE;
             m_Allocation = VK_NULL_HANDLE;
+            LOG_ERROR(std::format("[GpuBuffer] Failed to allocate buffer of size {} bytes (usage flags: 0x{:08X})!", sizeBytes, usage));
             throw std::runtime_error("GpuBuffer::Create -- vmaCreateBuffer failed");
         }
 
         m_Allocator = allocator;
         m_SizeBytes = sizeBytes;
         m_MappedData = mapped ? resultInfo.pMappedData : nullptr;
+
+        LOG_INFO(std::format("[GpuBuffer] Allocated buffer: handle={:#x}, size={} bytes, usage=0x{:08X}, mapped={}",
+            reinterpret_cast<uintptr_t>(m_Buffer), sizeBytes, usage, mapped));
     }
 
     void GpuBuffer::Destroy() {
         if (m_Buffer != VK_NULL_HANDLE) {
+            LOG_INFO(std::format("[GpuBuffer] Destroying buffer: handle={:#x}, size={} bytes",
+                reinterpret_cast<uintptr_t>(m_Buffer), m_SizeBytes));
             vmaDestroyBuffer(m_Allocator, m_Buffer, m_Allocation);
         }
         m_Allocator = VK_NULL_HANDLE;

@@ -2,4 +2,5 @@ D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\geometry\ClusterP
 D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\geometry\ClusterGrouping.cpp;D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\ClusterSimplificationTests.dir\Debug\ClusterGrouping.obj
 D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\geometry\MeshSimplifier.cpp;D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\ClusterSimplificationTests.dir\Debug\MeshSimplifier.obj
 D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\io\ObjExport.cpp;D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\ClusterSimplificationTests.dir\Debug\ObjExport.obj
+D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\core\Logger.cpp;D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\ClusterSimplificationTests.dir\Debug\Logger.obj
 D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\tests\ClusterSimplificationTests.cpp;D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\ClusterSimplificationTests.dir\Debug\ClusterSimplificationTests.obj

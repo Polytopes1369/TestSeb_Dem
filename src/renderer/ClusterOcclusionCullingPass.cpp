@@ -1,41 +1,13 @@
 #include "renderer/ClusterOcclusionCullingPass.h"
 
-#include <fstream>
+#include <format>
 #include <stdexcept>
 
 #include "core/Logger.h"
+#include "renderer/VulkanPipeline.h"
 
 namespace renderer {
 
-    namespace {
-
-        // Mirrors HZBPass::ReadShaderFile / ClusterCullingPass's own copy -- duplicated rather
-        // than shared because this class is deliberately self-contained (no VulkanContext
-        // dependency), matching this codebase's existing per-pass convention.
-        std::vector<char> ReadShaderFile(const std::string& filename) {
-            std::ifstream file(filename, std::ios::ate | std::ios::binary);
-            if (!file.is_open()) {
-                throw std::runtime_error("ClusterOcclusionCullingPass: failed to open SPIR-V file: " + filename);
-            }
-            size_t fileSize = static_cast<size_t>(file.tellg());
-            std::vector<char> buffer(fileSize);
-            file.seekg(0);
-            file.read(buffer.data(), static_cast<std::streamsize>(fileSize));
-            file.close();
-            return buffer;
-        }
-
-        VkShaderModule CreateShaderModule(VkDevice device, const std::vector<char>& code) {
-            VkShaderModuleCreateInfo createInfo{ VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
-            createInfo.codeSize = code.size();
-            createInfo.pCode = reinterpret_cast<const uint32_t*>(code.data());
-
-            VkShaderModule module;
-            VK_CHECK(vkCreateShaderModule(device, &createInfo, nullptr, &module));
-            return module;
-        }
-
-    } // namespace
 
     void ClusterOcclusionCullingPass::Init(VkDevice device, VmaAllocator allocator, uint32_t maxClusters, uint32_t totalClusterCount,
         VkBuffer candidateMetadataBuffer, VkBuffer candidateCountBuffer,
@@ -50,6 +22,9 @@ namespace renderer {
         m_HZBMip0Width = static_cast<float>(hzbMip0Extent.width);
         m_HZBMip0Height = static_cast<float>(hzbMip0Extent.height);
         m_HZBMipCount = static_cast<float>(hzbMipLevelCount);
+
+        LOG_INFO(std::format("[ClusterOcclusionCullingPass] Initializing pass: maxClusters={}, totalClusterCount={}, HZB={}x{}",
+            maxClusters, totalClusterCount, hzbMip0Extent.width, hzbMip0Extent.height));
 
         // --- Buffers ---
         m_ViewParamsBuffer.Create(
@@ -310,8 +285,7 @@ namespace renderer {
         // --- Early/late pipelines: one shader module, two specializations of the LATE_PASS spec
         // constant (constant_id = 0 in ClusterHZBOcclusionCull.comp), built in a single
         // vkCreateComputePipelines call. ---
-        std::vector<char> occlusionShaderCode = ReadShaderFile("shaders/ClusterHZBOcclusionCull.comp.spv");
-        VkShaderModule occlusionShaderModule = CreateShaderModule(m_Device, occlusionShaderCode);
+        VkShaderModule occlusionShaderModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/ClusterHZBOcclusionCull.comp.spv");
 
         VkSpecializationMapEntry specEntry{};
         specEntry.constantID = 0;
@@ -365,8 +339,7 @@ namespace renderer {
         buildArgsPipelineLayoutInfo.pPushConstantRanges = &buildArgsPushConstantRange;
         VK_CHECK(vkCreatePipelineLayout(m_Device, &buildArgsPipelineLayoutInfo, nullptr, &m_BuildArgsPipelineLayout));
 
-        std::vector<char> buildArgsShaderCode = ReadShaderFile("shaders/BuildDispatchIndirectArgs.comp.spv");
-        VkShaderModule buildArgsShaderModule = CreateShaderModule(m_Device, buildArgsShaderCode);
+        VkShaderModule buildArgsShaderModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/BuildDispatchIndirectArgs.comp.spv");
 
         VkComputePipelineCreateInfo buildArgsPipelineInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
         buildArgsPipelineInfo.layout = m_BuildArgsPipelineLayout;
@@ -380,6 +353,7 @@ namespace renderer {
 
     void ClusterOcclusionCullingPass::Shutdown() {
         if (m_Device != VK_NULL_HANDLE) {
+            LOG_INFO("[ClusterOcclusionCullingPass] Shutting down pass...");
             if (m_EarlyPipeline != VK_NULL_HANDLE) {
                 vkDestroyPipeline(m_Device, m_EarlyPipeline, nullptr);
             }

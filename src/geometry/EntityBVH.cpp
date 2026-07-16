@@ -1,7 +1,9 @@
 #include "geometry/EntityBVH.h"
+#include "core/Logger.h"
 
 #include <algorithm>
 #include <cfloat>
+#include <format>
 
 namespace geometry {
 
@@ -99,6 +101,8 @@ namespace geometry {
             return bvh;
         }
 
+        LOG_INFO(std::format("[EntityBVH] Building CPU spatial acceleration structure over {} entities...", entities.size()));
+
         std::vector<BuildEntity> items;
         items.reserve(entities.size());
         for (uint32_t i = 0; i < entities.size(); ++i) {
@@ -120,6 +124,7 @@ namespace geometry {
 
         BuildRecursive(items, 0, static_cast<uint32_t>(items.size()), bvh.nodes, bvh.entityIndices);
 
+        LOG_INFO(std::format("[EntityBVH] BVH build complete: {} nodes, {} indices packed.", bvh.nodes.size(), bvh.entityIndices.size()));
         return bvh;
     }
 

@@ -1,6 +1,8 @@
 #include "renderer/GpuGeometryPagePool.h"
+#include "core/Logger.h"
 
 #include <cassert>
+#include <format>
 
 namespace renderer {
 
@@ -21,9 +23,13 @@ namespace renderer {
             static_cast<VkDeviceSize>(maxLogicalPages) * sizeof(uint32_t),
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
             VMA_MEMORY_USAGE_GPU_ONLY);
+
+        LOG_INFO(std::format("[GpuGeometryPagePool] Initialized page pool: maxLogicalPages={}, maxPhysicalPages={}, poolSize={} KB",
+            maxLogicalPages, maxPhysicalPages, (maxPhysicalPages * geometry::kPageSizeBytes) / 1024));
     }
 
     void GpuGeometryPagePool::Shutdown() {
+        LOG_INFO("[GpuGeometryPagePool] Shutting down page pool...");
         m_PhysicalPool.Destroy();
         m_PageTableBuffer.Destroy();
         m_PageTable = geometry::GpuPageTable(0);
@@ -57,6 +63,7 @@ namespace renderer {
 
         uint32_t pageID = geometry::GpuPageTable::LogicalAddressToPageID(logicalAddress);
         if (pageID >= m_MaxLogicalPages) {
+            LOG_ERROR(std::format("[GpuGeometryPagePool] BindPage failed: pageID {} is out of range (max: {})", pageID, m_MaxLogicalPages));
             return false;
         }
 
@@ -64,6 +71,10 @@ namespace renderer {
         if (physicalPage == geometry::kInvalidPhysicalPage) {
             // Either already resident, or the physical pool is full -- either way, no other
             // resident page's mapping was touched by this failed attempt.
+            if (!m_PageTable.IsResident(logicalAddress)) {
+                LOG_WARNING(std::format("[GpuGeometryPagePool] Failed to allocate physical page for logicalAddress {:#x} (pool is full, capacity: {})",
+                    logicalAddress, m_PageTable.GetCapacity()));
+            }
             return false;
         }
 
@@ -104,6 +115,9 @@ namespace renderer {
         depInfo.pMemoryBarriers = barriers;
         vkCmdPipelineBarrier2(cmd, &depInfo);
 
+        LOG_INFO(std::format("[GpuGeometryPagePool] Bound logicalAddress {:#x} to physical page slot {} (offset: {:#x})",
+            logicalAddress, physicalPage, dstOffset));
+
         return true;
     }
 
@@ -113,6 +127,10 @@ namespace renderer {
         }
 
         uint32_t pageID = geometry::GpuPageTable::LogicalAddressToPageID(logicalAddress);
+        uint32_t physicalPage = m_PageTable.GetPhysicalPageIndex(logicalAddress);
+
+        LOG_INFO(std::format("[GpuGeometryPagePool] Unbound logicalAddress {:#x} from physical page slot {}",
+            logicalAddress, physicalPage));
 
         // Free the CPU-side mapping first: the physical slot is now eligible for reuse by a
         // concurrently-recorded future BindPage() call, but that call will not itself become
@@ -143,6 +161,10 @@ namespace renderer {
         // page backing the logical address it is given, so an earlier eviction in this loop can
         // never invalidate a later candidate's own eligibility.
         std::vector<uint64_t> candidates = m_PageTable.SelectLeastRecentlyUsedPages(maxPagesToEvict);
+
+        if (!candidates.empty()) {
+            LOG_INFO(std::format("[GpuGeometryPagePool] Evicting {} LRU pages from physical pool...", candidates.size()));
+        }
 
         for (uint64_t logicalAddress : candidates) {
             bool unbound = UnbindPage(cmd, logicalAddress);

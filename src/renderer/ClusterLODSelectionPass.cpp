@@ -2,13 +2,13 @@
 
 #include <cstring>
 #include <format>
-#include <fstream>
 #include <stdexcept>
 
 #include "core/Logger.h"
 #include "geometry/ClusterDAG.h" // geometry::kInvalidClusterID
 #include "geometry/GpuPageTable.h" // geometry::GpuPageTable::LogicalAddressToPageID
 #include "renderer/VulkanPipeline.h"
+#include "renderer/VulkanUtils.h"
 
 namespace renderer {
 
@@ -27,22 +27,6 @@ namespace renderer {
         };
         static_assert(sizeof(DAGScreenErrorViewParamsUBO) == 144,
             "DAGScreenErrorViewParamsUBO must match DAGScreenErrorViewParams in ClusterDAGScreenError.comp exactly (std140 layout)");
-
-        // Mirrors HZBPass::ReadShaderFile / every other pass's own copy -- duplicated rather than
-        // shared because this class is deliberately self-contained, matching this codebase's
-        // existing per-pass convention.
-        std::vector<char> ReadShaderFile(const std::string& filename) {
-            std::ifstream file(filename, std::ios::ate | std::ios::binary);
-            if (!file.is_open()) {
-                throw std::runtime_error("ClusterLODSelectionPass: failed to open SPIR-V file: " + filename);
-            }
-            size_t fileSize = static_cast<size_t>(file.tellg());
-            std::vector<char> buffer(fileSize);
-            file.seekg(0);
-            file.read(buffer.data(), static_cast<std::streamsize>(fileSize));
-            file.close();
-            return buffer;
-        }
 
     } // namespace
 
@@ -158,43 +142,23 @@ namespace renderer {
             std::memcpy(stagingAllocResultInfo.pMappedData, dagNodes.data(), static_cast<size_t>(dagNodesSize));
             std::memcpy(static_cast<char*>(stagingAllocResultInfo.pMappedData) + dagNodesSize, lodNodes.data(), static_cast<size_t>(lodNodesSize));
 
-            VkCommandBufferAllocateInfo cmdAllocInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
-            cmdAllocInfo.commandPool = commandPool;
-            cmdAllocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-            cmdAllocInfo.commandBufferCount = 1;
+            VulkanUtils::ExecuteOneShotCommands(m_Device, commandPool, queue, [&](VkCommandBuffer cmd) {
+                VkBufferCopy dagNodesCopy{ 0, 0, dagNodesSize };
+                vkCmdCopyBuffer(cmd, stagingBuffer, m_DAGNodesBuffer.Handle(), 1, &dagNodesCopy);
+                VkBufferCopy lodNodesCopy{ dagNodesSize, 0, lodNodesSize };
+                vkCmdCopyBuffer(cmd, stagingBuffer, m_LODNodeMetadataBuffer.Handle(), 1, &lodNodesCopy);
 
-            VkCommandBuffer cmd;
-            VK_CHECK(vkAllocateCommandBuffers(m_Device, &cmdAllocInfo, &cmd));
+                VkMemoryBarrier2 barrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+                barrier.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+                barrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+                barrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+                barrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
 
-            VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-            beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-            vkBeginCommandBuffer(cmd, &beginInfo);
-
-            VkBufferCopy dagNodesCopy{ 0, 0, dagNodesSize };
-            vkCmdCopyBuffer(cmd, stagingBuffer, m_DAGNodesBuffer.Handle(), 1, &dagNodesCopy);
-            VkBufferCopy lodNodesCopy{ dagNodesSize, 0, lodNodesSize };
-            vkCmdCopyBuffer(cmd, stagingBuffer, m_LODNodeMetadataBuffer.Handle(), 1, &lodNodesCopy);
-
-            VkMemoryBarrier2 barrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
-            barrier.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
-            barrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-            barrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-            barrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
-
-            VkDependencyInfo depInfo{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-            depInfo.memoryBarrierCount = 1;
-            depInfo.pMemoryBarriers = &barrier;
-            vkCmdPipelineBarrier2(cmd, &depInfo);
-
-            vkEndCommandBuffer(cmd);
-
-            VkSubmitInfo submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
-            submitInfo.commandBufferCount = 1;
-            submitInfo.pCommandBuffers = &cmd;
-            VK_CHECK(vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE));
-            VK_CHECK(vkQueueWaitIdle(queue));
-
-            vkFreeCommandBuffers(m_Device, commandPool, 1, &cmd);
+                VkDependencyInfo depInfo{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+                depInfo.memoryBarrierCount = 1;
+                depInfo.pMemoryBarriers = &barrier;
+                vkCmdPipelineBarrier2(cmd, &depInfo);
+            });
             vmaDestroyBuffer(allocator, stagingBuffer, stagingAllocation);
         }
 
@@ -252,8 +216,7 @@ namespace renderer {
             pipelineLayoutInfo.pSetLayouts = &m_ScreenErrorSetLayout;
             VK_CHECK(vkCreatePipelineLayout(m_Device, &pipelineLayoutInfo, nullptr, &m_ScreenErrorPipelineLayout));
 
-            std::vector<char> shaderCode = ReadShaderFile("shaders/ClusterDAGScreenError.comp.spv");
-            VkShaderModule shaderModule = VulkanPipeline::CreateShaderModule(m_Device, shaderCode);
+            VkShaderModule shaderModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/ClusterDAGScreenError.comp.spv");
             m_ScreenErrorPipeline = VulkanPipeline::CreateComputePipeline(m_Device, m_ScreenErrorPipelineLayout, shaderModule);
             vkDestroyShaderModule(m_Device, shaderModule, nullptr);
         }
@@ -299,8 +262,7 @@ namespace renderer {
             pipelineLayoutInfo.pSetLayouts = &m_ResidencyFallbackSetLayout;
             VK_CHECK(vkCreatePipelineLayout(m_Device, &pipelineLayoutInfo, nullptr, &m_ResidencyFallbackPipelineLayout));
 
-            std::vector<char> shaderCode = ReadShaderFile("shaders/ClusterLODResidencyFallback.comp.spv");
-            VkShaderModule shaderModule = VulkanPipeline::CreateShaderModule(m_Device, shaderCode);
+            VkShaderModule shaderModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/ClusterLODResidencyFallback.comp.spv");
             m_ResidencyFallbackPipeline = VulkanPipeline::CreateComputePipeline(m_Device, m_ResidencyFallbackPipelineLayout, shaderModule);
             vkDestroyShaderModule(m_Device, shaderModule, nullptr);
         }
@@ -349,8 +311,7 @@ namespace renderer {
             pipelineLayoutInfo.pSetLayouts = &m_CompactSetLayout;
             VK_CHECK(vkCreatePipelineLayout(m_Device, &pipelineLayoutInfo, nullptr, &m_CompactPipelineLayout));
 
-            std::vector<char> shaderCode = ReadShaderFile("shaders/ClusterLODCompact.comp.spv");
-            VkShaderModule shaderModule = VulkanPipeline::CreateShaderModule(m_Device, shaderCode);
+            VkShaderModule shaderModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/ClusterLODCompact.comp.spv");
             m_CompactPipeline = VulkanPipeline::CreateComputePipeline(m_Device, m_CompactPipelineLayout, shaderModule);
             vkDestroyShaderModule(m_Device, shaderModule, nullptr);
         }
@@ -396,8 +357,7 @@ namespace renderer {
             pipelineLayoutInfo.pPushConstantRanges = &pushConstantRange;
             VK_CHECK(vkCreatePipelineLayout(m_Device, &pipelineLayoutInfo, nullptr, &m_BuildArgsPipelineLayout));
 
-            std::vector<char> shaderCode = ReadShaderFile("shaders/BuildDispatchIndirectArgs.comp.spv");
-            VkShaderModule shaderModule = VulkanPipeline::CreateShaderModule(m_Device, shaderCode);
+            VkShaderModule shaderModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/BuildDispatchIndirectArgs.comp.spv");
             m_BuildArgsPipeline = VulkanPipeline::CreateComputePipeline(m_Device, m_BuildArgsPipelineLayout, shaderModule);
             vkDestroyShaderModule(m_Device, shaderModule, nullptr);
         }
@@ -408,6 +368,7 @@ namespace renderer {
 
     void ClusterLODSelectionPass::Shutdown() {
         if (m_Device != VK_NULL_HANDLE) {
+            LOG_INFO("[ClusterLODSelectionPass] Shutting down pass...");
             if (m_ScreenErrorPipeline != VK_NULL_HANDLE) vkDestroyPipeline(m_Device, m_ScreenErrorPipeline, nullptr);
             if (m_ResidencyFallbackPipeline != VK_NULL_HANDLE) vkDestroyPipeline(m_Device, m_ResidencyFallbackPipeline, nullptr);
             if (m_CompactPipeline != VK_NULL_HANDLE) vkDestroyPipeline(m_Device, m_CompactPipeline, nullptr);

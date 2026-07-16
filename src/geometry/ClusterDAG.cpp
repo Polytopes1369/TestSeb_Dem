@@ -1,8 +1,10 @@
 #include "geometry/ClusterDAG.h"
+#include "core/Logger.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <format>
 #include <limits>
 #include <numeric>
 #include <unordered_map>
@@ -411,10 +413,12 @@ namespace geometry {
         const std::vector<uint32_t>& allIndices,
         uint32_t maskTextureIndex) {
 
+        LOG_INFO(std::format("[ClusterDAG] Building DAG for mesh ID {} (mask texture index: {})...", targetMeshID, maskTextureIndex));
         ClusterDAG dag;
 
         std::vector<MeshCluster> leafClusters = PartitionMeshIntoClusters(targetMeshID, allVertices, allIndices, maskTextureIndex);
         if (leafClusters.empty()) {
+            LOG_WARNING(std::format("[ClusterDAG] No triangles matched targetMeshID {} during DAG creation.", targetMeshID));
             return dag;
         }
 
@@ -523,12 +527,25 @@ namespace geometry {
                     nextLevel);
             }
 
+            LOG_INFO(std::format("[ClusterDAG] Level {} completed: {} nodes (total nodes: {}).", level, nextLevel.size(), dag.nodes.size()));
             currentLevel = std::move(nextLevel);
             isFirstPass = false;
             ++level;
         }
 
         dag.rootIndices = currentLevel;
+
+        std::vector<std::string> validationErrors;
+        bool isValid = ValidateClusterDAG(dag, validationErrors);
+        if (isValid) {
+            LOG_INFO(std::format("[ClusterDAG] DAG generation complete. Total levels: {}, Total nodes: {}, Root count: {}. Validation: PASSED.", level, dag.nodes.size(), dag.rootIndices.size()));
+        } else {
+            LOG_ERROR(std::format("[ClusterDAG] DAG validation FAILED with {} errors!", validationErrors.size()));
+            for (const auto& err : validationErrors) {
+                LOG_ERROR(std::format("[ClusterDAG]   Validation Error: {}", err));
+            }
+        }
+
         return dag;
     }
 

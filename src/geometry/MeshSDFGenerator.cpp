@@ -1,8 +1,10 @@
 #include "geometry/MeshSDFGenerator.h"
+#include "core/Logger.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <format>
 #include <limits>
 #include <unordered_map>
 
@@ -239,12 +241,14 @@ namespace geometry {
         uint32_t resolution,
         std::vector<float>* outRawDistances) {
 
-        MeshSDF sdf;
         if (positions.empty() || triangles.size() < 3u ||
             resolution == 0u || (resolution % kSDFBlockDim) != 0u ||
             resolution <= 2u * kSDFVolumeMarginVoxels) {
-            return sdf; // resolution stays 0: empty/invalid.
+            return MeshSDF{}; // Return empty MeshSDF.
         }
+
+        LOG_INFO(std::format("[MeshSDFGenerator] Generating SDF (res: {}) for mesh (vertices: {}, triangles: {})...", resolution, positions.size(), triangles.size() / 3u));
+        MeshSDF sdf;
 
         // --- Volume fit: cubic voxels, mesh AABB centered, kSDFVolumeMarginVoxels margin -------
         maths::vec3 boundsMin{ std::numeric_limits<float>::max(), std::numeric_limits<float>::max(), std::numeric_limits<float>::max() };
@@ -343,6 +347,7 @@ namespace geometry {
             }
         }
 
+        LOG_INFO(std::format("[MeshSDFGenerator] SDF compression complete: voxelSize={:.4f}, maxDistance={:.4f}, {} blocks generated.", sdf.voxelSize, sdf.maxEncodedDistance, sdf.blocks.size()));
         return sdf;
     }
 

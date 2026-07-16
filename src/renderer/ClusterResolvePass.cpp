@@ -1,31 +1,12 @@
 #include "renderer/ClusterResolvePass.h"
 
-#include <fstream>
-#include <stdexcept>
-#include <vector>
-
 #include "core/Logger.h"
 #include "renderer/VulkanPipeline.h"
+#include "renderer/VulkanUtils.h"
 
 namespace renderer {
 
     namespace {
-
-        // Mirrors HZBPass::ReadShaderFile / every other pass's own copy -- duplicated rather than
-        // shared because this class is deliberately self-contained (no VulkanContext dependency),
-        // matching this codebase's existing per-pass convention.
-        std::vector<char> ReadShaderFile(const std::string& filename) {
-            std::ifstream file(filename, std::ios::ate | std::ios::binary);
-            if (!file.is_open()) {
-                throw std::runtime_error("ClusterResolvePass: failed to open SPIR-V file: " + filename);
-            }
-            size_t fileSize = static_cast<size_t>(file.tellg());
-            std::vector<char> buffer(fileSize);
-            file.seekg(0);
-            file.read(buffer.data(), static_cast<std::streamsize>(fileSize));
-            file.close();
-            return buffer;
-        }
 
         // Byte-for-byte mirror of ResolveViewParamsUBO in ClusterResolve.comp (std140): mat4 (64
         // bytes) + mat4 (64 bytes, prevViewProj -- DEBUG_VIEW_MOTION_VECTORS' own reprojection) +
@@ -116,19 +97,7 @@ namespace renderer {
         // --- One-time UNDEFINED -> GENERAL transition (mirrors HZBPass::Init /
         // ClusterSoftwareRasterPass::Init's own one-shot pattern) -- stays in GENERAL for its
         // entire lifetime, touched only by this class's own compute shader. ---
-        {
-            VkCommandBufferAllocateInfo cmdAllocInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
-            cmdAllocInfo.commandPool = commandPool;
-            cmdAllocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-            cmdAllocInfo.commandBufferCount = 1;
-
-            VkCommandBuffer cmd;
-            VK_CHECK(vkAllocateCommandBuffers(m_Device, &cmdAllocInfo, &cmd));
-
-            VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-            beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-            vkBeginCommandBuffer(cmd, &beginInfo);
-
+        VulkanUtils::ExecuteOneShotCommands(m_Device, commandPool, queue, [&](VkCommandBuffer cmd) {
             VkImageMemoryBarrier2 barriers[4]{};
             for (auto& barrier : barriers) {
                 barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
@@ -151,17 +120,7 @@ namespace renderer {
             depInfo.imageMemoryBarrierCount = 4;
             depInfo.pImageMemoryBarriers = barriers;
             vkCmdPipelineBarrier2(cmd, &depInfo);
-
-            vkEndCommandBuffer(cmd);
-
-            VkSubmitInfo submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
-            submitInfo.commandBufferCount = 1;
-            submitInfo.pCommandBuffers = &cmd;
-            VK_CHECK(vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE));
-            VK_CHECK(vkQueueWaitIdle(queue));
-
-            vkFreeCommandBuffers(m_Device, commandPool, 1, &cmd);
-        }
+        });
 
         // --- Depth sampler: nearest filtering, matching HZBPass's own depth-sampling convention
         // (the shader always reads exact integer texels via texelFetch, no filtering ever actually
@@ -301,8 +260,7 @@ namespace renderer {
 #endif
         VK_CHECK(vkCreatePipelineLayout(m_Device, &pipelineLayoutInfo, nullptr, &m_PipelineLayout));
 
-        std::vector<char> shaderCode = ReadShaderFile("shaders/ClusterResolve.comp.spv");
-        VkShaderModule shaderModule = VulkanPipeline::CreateShaderModule(m_Device, shaderCode);
+        VkShaderModule shaderModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/ClusterResolve.comp.spv");
         m_Pipeline = VulkanPipeline::CreateComputePipeline(m_Device, m_PipelineLayout, shaderModule);
         vkDestroyShaderModule(m_Device, shaderModule, nullptr);
     }

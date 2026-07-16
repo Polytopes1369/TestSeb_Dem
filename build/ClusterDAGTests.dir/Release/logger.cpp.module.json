@@ -1,0 +1,13 @@
+{
+    "version": 1,
+    "revision": 0,
+    "rules": [
+        {
+            "primary-output": "ClusterDAGTests.dir\\Release\\Logger.obj",
+            "outputs": [
+                "ClusterDAGTests.dir\\Release\\"
+            ],
+            "requires": []
+        }
+    ]
+}

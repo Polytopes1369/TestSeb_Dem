@@ -149,8 +149,8 @@ void main() {
 
     if (!hit) {
         // Tiered fallback: no near-field screen hit -- sample the low-resolution World Probe grid
-        // at this pixel's own (unbiased) world position instead ("fusionne ce résultat avec
-        // l'éclairage des sondes globales").
+        // at this pixel's own (unbiased) world position instead ("merge this result with the
+        // lighting of the global probes").
         result = SampleWorldProbeGrid(worldPos);
     }
 

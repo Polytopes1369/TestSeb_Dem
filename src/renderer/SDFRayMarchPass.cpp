@@ -5,62 +5,20 @@
 
 #include <algorithm>
 #include <cstring>
-#include <fstream>
 #include <format>
 #include <stdexcept>
 
 #include "core/Logger.h"
 #include "geometry/MeshSDFGenerator.h"
 #include "io/CacheFileManager.h"
+#include "renderer/VulkanPipeline.h"
+#include "renderer/VulkanUtils.h"
 
 namespace renderer {
 
     namespace {
 
-        // Mirrors every other pass's own copy -- duplicated rather than shared, see this class's
-        // own header comment on self-containment.
-        std::vector<char> ReadShaderFile(const std::string& filename) {
-            std::ifstream file(filename, std::ios::ate | std::ios::binary);
-            if (!file.is_open()) {
-                throw std::runtime_error("SDFRayMarchPass: failed to open SPIR-V file: " + filename);
-            }
-            size_t fileSize = static_cast<size_t>(file.tellg());
-            std::vector<char> buffer(fileSize);
-            file.seekg(0);
-            file.read(buffer.data(), static_cast<std::streamsize>(fileSize));
-            file.close();
-            return buffer;
-        }
 
-        VkShaderModule CreateShaderModule(VkDevice device, const std::vector<char>& code) {
-            VkShaderModuleCreateInfo createInfo{ VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
-            createInfo.codeSize = code.size();
-            createInfo.pCode = reinterpret_cast<const uint32_t*>(code.data());
-            VkShaderModule module;
-            VK_CHECK(vkCreateShaderModule(device, &createInfo, nullptr, &module));
-            return module;
-        }
-
-        void TransitionImageLayout(VkCommandBuffer cmd, VkImage image, VkImageAspectFlags aspect,
-            VkImageLayout oldLayout, VkImageLayout newLayout,
-            VkPipelineStageFlags2 srcStage, VkAccessFlags2 srcAccess,
-            VkPipelineStageFlags2 dstStage, VkAccessFlags2 dstAccess) {
-            VkImageMemoryBarrier2 barrier{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
-            barrier.srcStageMask = srcStage;
-            barrier.srcAccessMask = srcAccess;
-            barrier.dstStageMask = dstStage;
-            barrier.dstAccessMask = dstAccess;
-            barrier.oldLayout = oldLayout;
-            barrier.newLayout = newLayout;
-            barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            barrier.image = image;
-            barrier.subresourceRange = { aspect, 0, 1, 0, 1 };
-            VkDependencyInfo depInfo{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-            depInfo.imageMemoryBarrierCount = 1;
-            depInfo.pImageMemoryBarriers = &barrier;
-            vkCmdPipelineBarrier2(cmd, &depInfo);
-        }
 
         // Byte-for-byte std430 layout match for EntitySDFParamsGPU in SDFRayMarch.comp -- flat
         // scalar fields throughout (see GlobalSDFCompositePC's own comment on why this codebase
@@ -437,80 +395,62 @@ namespace renderer {
             const VkDeviceSize leafIndexOffset = stageCopy(bvh.entityIndices.empty() ? nullptr : bvh.entityIndices.data(), bvh.entityIndices.empty() ? 0 : leafIndexBytes);
             const VkDeviceSize entityParamsOffset = stageCopy(entityParams.data(), entityParamsBytes);
 
-            VkCommandBufferAllocateInfo cmdAllocInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
-            cmdAllocInfo.commandPool = commandPool;
-            cmdAllocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-            cmdAllocInfo.commandBufferCount = 1;
-            VkCommandBuffer cmd;
-            VK_CHECK(vkAllocateCommandBuffers(m_Device, &cmdAllocInfo, &cmd));
+            VulkanUtils::ExecuteOneShotCommands(m_Device, commandPool, queue, [&](VkCommandBuffer cmd) {
+                for (size_t i = 0; i < uploads.size(); ++i) {
+                    VulkanUtils::TransitionImageLayout(cmd, m_Entities[i].image,
+                        VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                        VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
+                        VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
 
-            VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-            beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-            vkBeginCommandBuffer(cmd, &beginInfo);
+                    VkBufferImageCopy copyRegion{};
+                    copyRegion.bufferOffset = entityGridOffsets[i];
+                    copyRegion.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+                    copyRegion.imageExtent = { m_Entities[i].resolution, m_Entities[i].resolution, m_Entities[i].resolution };
+                    vkCmdCopyBufferToImage(cmd, stagingBuffer, m_Entities[i].image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copyRegion);
 
-            for (size_t i = 0; i < uploads.size(); ++i) {
-                TransitionImageLayout(cmd, m_Entities[i].image, VK_IMAGE_ASPECT_COLOR_BIT,
+                    VulkanUtils::TransitionImageLayout(cmd, m_Entities[i].image,
+                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                        VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+                }
+
+                VulkanUtils::TransitionImageLayout(cmd, m_PlaceholderImage,
                     VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                     VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
                     VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
-
-                VkBufferImageCopy copyRegion{};
-                copyRegion.bufferOffset = entityGridOffsets[i];
-                copyRegion.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-                copyRegion.imageExtent = { m_Entities[i].resolution, m_Entities[i].resolution, m_Entities[i].resolution };
-                vkCmdCopyBufferToImage(cmd, stagingBuffer, m_Entities[i].image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copyRegion);
-
-                TransitionImageLayout(cmd, m_Entities[i].image, VK_IMAGE_ASPECT_COLOR_BIT,
+                VkBufferImageCopy placeholderCopy{};
+                placeholderCopy.bufferOffset = placeholderOffset;
+                placeholderCopy.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+                placeholderCopy.imageExtent = { 1, 1, 1 };
+                vkCmdCopyBufferToImage(cmd, stagingBuffer, m_PlaceholderImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &placeholderCopy);
+                VulkanUtils::TransitionImageLayout(cmd, m_PlaceholderImage,
                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                     VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
                     VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
-            }
 
-            TransitionImageLayout(cmd, m_PlaceholderImage, VK_IMAGE_ASPECT_COLOR_BIT,
-                VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
-                VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
-            VkBufferImageCopy placeholderCopy{};
-            placeholderCopy.bufferOffset = placeholderOffset;
-            placeholderCopy.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-            placeholderCopy.imageExtent = { 1, 1, 1 };
-            vkCmdCopyBufferToImage(cmd, stagingBuffer, m_PlaceholderImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &placeholderCopy);
-            TransitionImageLayout(cmd, m_PlaceholderImage, VK_IMAGE_ASPECT_COLOR_BIT,
-                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
-                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+                VkBufferCopy bvhNodeCopy{ bvhNodeOffset, 0, bvhNodeBytes };
+                vkCmdCopyBuffer(cmd, stagingBuffer, m_BVHNodeBuffer.Handle(), 1, &bvhNodeCopy);
+                VkBufferCopy leafIndexCopy{ leafIndexOffset, 0, leafIndexBytes };
+                vkCmdCopyBuffer(cmd, stagingBuffer, m_LeafEntityIndexBuffer.Handle(), 1, &leafIndexCopy);
+                VkBufferCopy entityParamsCopy{ entityParamsOffset, 0, entityParamsBytes };
+                vkCmdCopyBuffer(cmd, stagingBuffer, m_EntityParamsBuffer.Handle(), 1, &entityParamsCopy);
 
-            VkBufferCopy bvhNodeCopy{ bvhNodeOffset, 0, bvhNodeBytes };
-            vkCmdCopyBuffer(cmd, stagingBuffer, m_BVHNodeBuffer.Handle(), 1, &bvhNodeCopy);
-            VkBufferCopy leafIndexCopy{ leafIndexOffset, 0, leafIndexBytes };
-            vkCmdCopyBuffer(cmd, stagingBuffer, m_LeafEntityIndexBuffer.Handle(), 1, &leafIndexCopy);
-            VkBufferCopy entityParamsCopy{ entityParamsOffset, 0, entityParamsBytes };
-            vkCmdCopyBuffer(cmd, stagingBuffer, m_EntityParamsBuffer.Handle(), 1, &entityParamsCopy);
+                VkMemoryBarrier2 bufferUploadBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+                bufferUploadBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+                bufferUploadBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+                bufferUploadBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+                bufferUploadBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+                VkDependencyInfo bufferUploadDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+                bufferUploadDep.memoryBarrierCount = 1;
+                bufferUploadDep.pMemoryBarriers = &bufferUploadBarrier;
+                vkCmdPipelineBarrier2(cmd, &bufferUploadDep);
 
-            VkMemoryBarrier2 bufferUploadBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
-            bufferUploadBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
-            bufferUploadBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-            bufferUploadBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-            bufferUploadBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
-            VkDependencyInfo bufferUploadDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-            bufferUploadDep.memoryBarrierCount = 1;
-            bufferUploadDep.pMemoryBarriers = &bufferUploadBarrier;
-            vkCmdPipelineBarrier2(cmd, &bufferUploadDep);
+                VulkanUtils::TransitionImageLayout(cmd, m_OutputImage,
+                    VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                    VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
+                    VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+            });
 
-            TransitionImageLayout(cmd, m_OutputImage, VK_IMAGE_ASPECT_COLOR_BIT,
-                VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
-                VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
-                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
-
-            vkEndCommandBuffer(cmd);
-
-            VkSubmitInfo submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
-            submitInfo.commandBufferCount = 1;
-            submitInfo.pCommandBuffers = &cmd;
-            VK_CHECK(vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE));
-            VK_CHECK(vkQueueWaitIdle(queue));
-
-            vkFreeCommandBuffers(m_Device, commandPool, 1, &cmd);
             vmaDestroyBuffer(allocator, stagingBuffer, stagingAllocation);
         }
 
@@ -530,8 +470,7 @@ namespace renderer {
         layoutInfo.pPushConstantRanges = &pushConstantRange;
         VK_CHECK(vkCreatePipelineLayout(m_Device, &layoutInfo, nullptr, &m_PipelineLayout));
 
-        std::vector<char> compCode = ReadShaderFile("shaders/SDFRayMarch.comp.spv");
-        VkShaderModule compModule = CreateShaderModule(m_Device, compCode);
+        VkShaderModule compModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/SDFRayMarch.comp.spv");
 
         VkPipelineShaderStageCreateInfo stage{ VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO };
         stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;

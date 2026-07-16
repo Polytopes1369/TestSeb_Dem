@@ -64,6 +64,7 @@
 #include <vector>
 #include <vulkan/vulkan.h>
 #include <vk_mem_alloc.h>
+#include "renderer/GpuImage.h"
 
 namespace renderer {
 
@@ -112,26 +113,17 @@ namespace renderer {
 
         uint32_t GetMipLevelCount() const { return static_cast<uint32_t>(m_MipExtents.size()); }
         VkExtent2D GetMipExtent(uint32_t level) const { return m_MipExtents[level]; }
-        VkImage GetImage() const { return m_Image; }
-
-        // Single-mip-level view (levelCount == 1) of `level`, matching what HZBReduce.comp binds
-        // internally -- exposed so an external debug view/readback could target one exact level.
+        VkImage GetImage() const { return m_HZBImage.Image(); }
         VkImageView GetMipView(uint32_t level) const { return m_MipViews[level]; }
-
-        // Full-pyramid view (all mips, one array layer) for a future occlusion-culling shader to
-        // sample with an explicit LOD (textureLod), e.g. to pick the mip level whose texel
-        // footprint best matches an occludee's screen-space bounding box.
-        VkImageView GetFullView() const { return m_FullView; }
+        VkImageView GetFullView() const { return m_HZBImage.View(); }
 
     private:
         VkDevice m_Device = VK_NULL_HANDLE;
         VmaAllocator m_Allocator = VK_NULL_HANDLE; // Retained only to vmaDestroyImage() in Shutdown().
 
-        VkImage m_Image = VK_NULL_HANDLE;
-        VmaAllocation m_Allocation = VK_NULL_HANDLE;
+        GpuImage m_HZBImage;
         std::vector<VkImageView> m_MipViews; // One per mip level, levelCount = 1 each.
         std::vector<VkExtent2D> m_MipExtents; // Index-aligned with m_MipViews.
-        VkImageView m_FullView = VK_NULL_HANDLE; // All mips, for a future sampled read.
         VkExtent2D m_SourceExtent{ 0, 0 };
 
         VkSampler m_DepthSampler = VK_NULL_HANDLE;

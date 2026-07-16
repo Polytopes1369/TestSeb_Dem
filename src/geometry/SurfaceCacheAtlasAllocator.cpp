@@ -1,6 +1,8 @@
 #include "geometry/SurfaceCacheAtlasAllocator.h"
+#include "core/Logger.h"
 
 #include <algorithm>
+#include <format>
 #include <limits>
 
 namespace geometry {
@@ -11,6 +13,7 @@ namespace geometry {
     }
 
     void SurfaceCacheAtlasAllocator::Reset() {
+        LOG_INFO(std::format("[SurfaceCacheAtlasAllocator] Resetting atlas allocator (size: {}x{}).", m_AtlasSize, m_AtlasSize));
         m_FreeRects.clear();
         m_FreeRects.push_back(AtlasRect{ 0, 0, m_AtlasSize, m_AtlasSize });
     }
@@ -39,6 +42,8 @@ namespace geometry {
         }
 
         if (bestIndex == std::numeric_limits<size_t>::max()) {
+            LOG_WARNING(std::format("[SurfaceCacheAtlasAllocator] Allocate failed for {}x{} rect! Free area remaining: {} texels across {} block(s).",
+                width, height, FreeAreaTexels(), m_FreeRects.size()));
             return false;
         }
 
@@ -75,6 +80,8 @@ namespace geometry {
             m_FreeRects.push_back(bottomRect);
         }
 
+        LOG_INFO(std::format("[SurfaceCacheAtlasAllocator] Allocated {}x{} rect at ({}, {})",
+            width, height, outRect.x, outRect.y));
         return true;
     }
 
@@ -82,6 +89,8 @@ namespace geometry {
         if (rect.width == 0 || rect.height == 0) {
             return;
         }
+        LOG_INFO(std::format("[SurfaceCacheAtlasAllocator] Freeing {}x{} rect at ({}, {})",
+            rect.width, rect.height, rect.x, rect.y));
         m_FreeRects.push_back(rect);
         CoalesceFreeRects();
     }

@@ -4,9 +4,9 @@
 // for why this is a plain linear march, not a Hi-Z/HZB traversal) starting from a cosine-weighted
 // hemisphere direction around that pixel's own surface normal. On a hit, samples
 // renderer::ClusterResolvePass's own direct-lit color at the hit pixel as a cheap, correct-enough
-// near-field indirect contribution ("utilise la couleur de ce pixel comme contribution lumineuse
-// proche"). On a miss, falls back to renderer::WorldProbeGridPass's own low-resolution ambient
-// grid ("fusionne ce résultat avec l'éclairage des sondes globales") -- exactly Lumen's own tiered
+// near-field indirect contribution ("use the color of this pixel as near-field light contribution").
+// On a miss, falls back to renderer::WorldProbeGridPass's own low-resolution ambient
+// grid ("merge this result with the lighting from the global probes") -- exactly Lumen's own tiered
 // Final Gather shape: cheap screen trace first, radiance-cache-style fallback second. The combined
 // (still noisy -- one ray per pixel per frame) result is what renderer::ATrousDenoisePass denoises
 // next.

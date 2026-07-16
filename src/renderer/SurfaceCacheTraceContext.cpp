@@ -1,11 +1,13 @@
 #include "renderer/SurfaceCacheTraceContext.h"
 
+#include <algorithm>
 #include <cstring>
 #include <format>
 #include <stdexcept>
 #include <unordered_map>
 
 #include "core/Logger.h"
+#include "renderer/VulkanUtils.h"
 #include "geometry/ClusterFormat.h"
 
 namespace renderer {
@@ -140,63 +142,46 @@ namespace renderer {
             VK_CHECK(vmaCreateBuffer(allocator, &stagingInfo, &stagingAllocInfo, &stagingBuffer, &stagingAllocation, &stagingAllocResultInfo));
             *static_cast<float*>(stagingAllocResultInfo.pMappedData) = kDummyFarDistance;
 
-            VkCommandBufferAllocateInfo cmdAllocInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
-            cmdAllocInfo.commandPool = commandPool;
-            cmdAllocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-            cmdAllocInfo.commandBufferCount = 1;
-            VkCommandBuffer cmd;
-            VK_CHECK(vkAllocateCommandBuffers(m_Device, &cmdAllocInfo, &cmd));
+            VulkanUtils::ExecuteOneShotCommands(m_Device, commandPool, queue, [&](VkCommandBuffer cmd) {
+                VkImageMemoryBarrier2 toDst{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
+                toDst.srcStageMask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
+                toDst.srcAccessMask = 0;
+                toDst.dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+                toDst.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+                toDst.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+                toDst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                toDst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                toDst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                toDst.image = m_DummySdfImage;
+                toDst.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+                VkDependencyInfo toDstDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+                toDstDep.imageMemoryBarrierCount = 1;
+                toDstDep.pImageMemoryBarriers = &toDst;
+                vkCmdPipelineBarrier2(cmd, &toDstDep);
 
-            VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-            beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-            vkBeginCommandBuffer(cmd, &beginInfo);
+                VkBufferImageCopy copyRegion{};
+                copyRegion.bufferOffset = 0;
+                copyRegion.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+                copyRegion.imageExtent = { 1, 1, 1 };
+                vkCmdCopyBufferToImage(cmd, stagingBuffer, m_DummySdfImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copyRegion);
 
-            VkImageMemoryBarrier2 toDst{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
-            toDst.srcStageMask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
-            toDst.srcAccessMask = 0;
-            toDst.dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
-            toDst.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-            toDst.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-            toDst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-            toDst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            toDst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            toDst.image = m_DummySdfImage;
-            toDst.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-            VkDependencyInfo toDstDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-            toDstDep.imageMemoryBarrierCount = 1;
-            toDstDep.pImageMemoryBarriers = &toDst;
-            vkCmdPipelineBarrier2(cmd, &toDstDep);
+                VkImageMemoryBarrier2 toRead{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
+                toRead.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+                toRead.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+                toRead.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
+                toRead.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+                toRead.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                toRead.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                toRead.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                toRead.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                toRead.image = m_DummySdfImage;
+                toRead.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+                VkDependencyInfo toReadDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+                toReadDep.imageMemoryBarrierCount = 1;
+                toReadDep.pImageMemoryBarriers = &toRead;
+                vkCmdPipelineBarrier2(cmd, &toReadDep);
+            });
 
-            VkBufferImageCopy copyRegion{};
-            copyRegion.bufferOffset = 0;
-            copyRegion.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-            copyRegion.imageExtent = { 1, 1, 1 };
-            vkCmdCopyBufferToImage(cmd, stagingBuffer, m_DummySdfImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copyRegion);
-
-            VkImageMemoryBarrier2 toRead{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
-            toRead.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
-            toRead.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-            toRead.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
-            toRead.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
-            toRead.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-            toRead.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-            toRead.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            toRead.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            toRead.image = m_DummySdfImage;
-            toRead.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-            VkDependencyInfo toReadDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-            toReadDep.imageMemoryBarrierCount = 1;
-            toReadDep.pImageMemoryBarriers = &toRead;
-            vkCmdPipelineBarrier2(cmd, &toReadDep);
-
-            vkEndCommandBuffer(cmd);
-            VkSubmitInfo submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
-            submitInfo.commandBufferCount = 1;
-            submitInfo.pCommandBuffers = &cmd;
-            VK_CHECK(vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE));
-            VK_CHECK(vkQueueWaitIdle(queue));
-
-            vkFreeCommandBuffers(m_Device, commandPool, 1, &cmd);
             vmaDestroyBuffer(allocator, stagingBuffer, stagingAllocation);
         }
 

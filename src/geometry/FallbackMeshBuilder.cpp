@@ -1,7 +1,9 @@
 #include "geometry/FallbackMeshBuilder.h"
+#include "core/Logger.h"
 
 #include <algorithm>
 #include <cstring>
+#include <format>
 #include <unordered_map>
 
 #include "geometry/MeshSimplifier.h"
@@ -119,6 +121,7 @@ namespace geometry {
             return result;
         }
 
+        LOG_INFO("[FallbackMeshBuilder] Building fallback mesh...");
         SimplifiableMesh merged = MergeRootsWeldingAllVertices(dag);
 
         // UE5-Nanite-"Auto"-style: keep applying the same QEM error metric used everywhere else in
@@ -157,6 +160,8 @@ namespace geometry {
         result.normals = ComputeFaceAccumulatedNormals(merged);
         result.uvs = merged.uvs;
         result.triangles = merged.triangles;
+
+        LOG_INFO(std::format("[FallbackMeshBuilder] Built fallback mesh with {} vertices, {} triangles (reduced from {} original leaf triangles).", result.positions.size(), result.triangles.size() / 3u, originalLeafTriangleCount));
         return result;
     }
 

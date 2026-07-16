@@ -1,42 +1,18 @@
 #include "renderer/WorldProbeGridPass.h"
 
 #include <cmath>
-#include <fstream>
 #include <stdexcept>
-#include <vector>
 
 #include "core/Logger.h"
 #include "renderer/SurfaceCachePass.h"
 #include "renderer/SurfaceCacheRayTracingPass.h"
 #include "renderer/SurfaceCacheTraceContext.h"
+#include "renderer/VulkanPipeline.h"
+#include "renderer/VulkanUtils.h"
 
 namespace renderer {
 
     namespace {
-
-        // Mirrors SurfaceCacheGIInjectPass.cpp / GlobalSDFPass.cpp's own copy of these two helpers --
-        // see GlobalSDFPass.cpp's own comment on this codebase's per-pass self-containment convention.
-        std::vector<char> ReadShaderFile(const std::string& filename) {
-            std::ifstream file(filename, std::ios::ate | std::ios::binary);
-            if (!file.is_open()) {
-                throw std::runtime_error("WorldProbeGridPass: failed to open SPIR-V file: " + filename);
-            }
-            size_t fileSize = static_cast<size_t>(file.tellg());
-            std::vector<char> buffer(fileSize);
-            file.seekg(0);
-            file.read(buffer.data(), static_cast<std::streamsize>(fileSize));
-            file.close();
-            return buffer;
-        }
-
-        VkShaderModule CreateShaderModule(VkDevice device, const std::vector<char>& code) {
-            VkShaderModuleCreateInfo createInfo{ VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
-            createInfo.codeSize = code.size();
-            createInfo.pCode = reinterpret_cast<const uint32_t*>(code.data());
-            VkShaderModule module;
-            VK_CHECK(vkCreateShaderModule(device, &createInfo, nullptr, &module));
-            return module;
-        }
 
         // Byte-for-byte layout match for WorldProbeInjectPushConstants in WorldProbeInject.comp.
         struct WorldProbeInjectPushConstants {
@@ -105,19 +81,7 @@ namespace renderer {
 
         // One-time UNDEFINED -> GENERAL transition (mirrors ClusterResolvePass::Init's own one-shot
         // pattern) -- stays GENERAL for this image's entire lifetime.
-        {
-            VkCommandBufferAllocateInfo cmdAllocInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
-            cmdAllocInfo.commandPool = commandPool;
-            cmdAllocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-            cmdAllocInfo.commandBufferCount = 1;
-
-            VkCommandBuffer cmd;
-            VK_CHECK(vkAllocateCommandBuffers(m_Device, &cmdAllocInfo, &cmd));
-
-            VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-            beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-            vkBeginCommandBuffer(cmd, &beginInfo);
-
+        VulkanUtils::ExecuteOneShotCommands(m_Device, commandPool, queue, [&](VkCommandBuffer cmd) {
             VkImageMemoryBarrier2 barrier{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
             barrier.srcStageMask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
             barrier.srcAccessMask = 0;
@@ -134,17 +98,7 @@ namespace renderer {
             depInfo.imageMemoryBarrierCount = 1;
             depInfo.pImageMemoryBarriers = &barrier;
             vkCmdPipelineBarrier2(cmd, &depInfo);
-
-            vkEndCommandBuffer(cmd);
-
-            VkSubmitInfo submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
-            submitInfo.commandBufferCount = 1;
-            submitInfo.pCommandBuffers = &cmd;
-            VK_CHECK(vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE));
-            VK_CHECK(vkQueueWaitIdle(queue));
-
-            vkFreeCommandBuffers(m_Device, commandPool, 1, &cmd);
-        }
+        });
 
         // =====================================================================================
         // STEP 2 -- set 0's layout: grid output + the shared TLAS/vertex/index/draw-range
@@ -238,7 +192,7 @@ namespace renderer {
         layoutInfo.pPushConstantRanges = &pushConstantRange;
         VK_CHECK(vkCreatePipelineLayout(m_Device, &layoutInfo, nullptr, &m_PipelineLayout));
 
-        VkShaderModule shaderModule = CreateShaderModule(m_Device, ReadShaderFile("shaders/WorldProbeInject.comp.spv"));
+        VkShaderModule shaderModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/WorldProbeInject.comp.spv");
         VkComputePipelineCreateInfo pipelineInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
         pipelineInfo.layout = m_PipelineLayout;
         pipelineInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;

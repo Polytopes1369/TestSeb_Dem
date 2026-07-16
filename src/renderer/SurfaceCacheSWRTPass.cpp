@@ -1,40 +1,12 @@
 #include "renderer/SurfaceCacheSWRTPass.h"
 
-#include <fstream>
-#include <stdexcept>
-#include <vector>
-
 #include "core/Logger.h"
 #include "renderer/SurfaceCacheTraceContext.h"
+#include "renderer/VulkanPipeline.h"
 
 namespace renderer {
 
     namespace {
-
-        // Mirrors GlobalSDFPass.cpp / SurfaceCachePass.cpp's own copy of these two helpers --
-        // duplicated rather than shared, matching this codebase's existing per-pass
-        // self-containment convention (see GlobalSDFPass.cpp's own comment on this).
-        std::vector<char> ReadShaderFile(const std::string& filename) {
-            std::ifstream file(filename, std::ios::ate | std::ios::binary);
-            if (!file.is_open()) {
-                throw std::runtime_error("SurfaceCacheSWRTPass: failed to open SPIR-V file: " + filename);
-            }
-            size_t fileSize = static_cast<size_t>(file.tellg());
-            std::vector<char> buffer(fileSize);
-            file.seekg(0);
-            file.read(buffer.data(), static_cast<std::streamsize>(fileSize));
-            file.close();
-            return buffer;
-        }
-
-        VkShaderModule CreateShaderModule(VkDevice device, const std::vector<char>& code) {
-            VkShaderModuleCreateInfo createInfo{ VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
-            createInfo.codeSize = code.size();
-            createInfo.pCode = reinterpret_cast<const uint32_t*>(code.data());
-            VkShaderModule module;
-            VK_CHECK(vkCreateShaderModule(device, &createInfo, nullptr, &module));
-            return module;
-        }
 
         // Byte-for-byte layout match for SWRTPushConstants in SurfaceCacheTraceSWRT.comp.
         struct SWRTPushConstants {
@@ -106,8 +78,7 @@ namespace renderer {
         // =====================================================================================
         // STEP 3 -- compute pipeline.
         // =====================================================================================
-        std::vector<char> shaderCode = ReadShaderFile("shaders/SurfaceCacheTraceSWRT.comp.spv");
-        VkShaderModule shaderModule = CreateShaderModule(m_Device, shaderCode);
+        VkShaderModule shaderModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/SurfaceCacheTraceSWRT.comp.spv");
 
         VkComputePipelineCreateInfo pipelineInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
         pipelineInfo.layout = m_PipelineLayout;

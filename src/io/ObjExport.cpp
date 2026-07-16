@@ -1,5 +1,7 @@
 #include "io/ObjExport.h"
+#include "core/Logger.h"
 
+#include <format>
 #include <fstream>
 
 namespace geometry {
@@ -44,18 +46,21 @@ namespace geometry {
     bool ExportSimplifiableMeshToOBJ(const std::filesystem::path& filePath, const SimplifiableMesh& mesh, const std::string& objectName) {
         std::ofstream out(filePath, std::ios::out | std::ios::trunc);
         if (!out.is_open()) {
+            LOG_ERROR(std::format("[ObjExport] Failed to open '{}' for OBJ export!", filePath.string()));
             return false;
         }
 
         out << "# " << objectName << " -- " << (mesh.triangles.size() / 3) << " triangles, "
             << mesh.positions.size() << " vertices\n";
         WriteMeshObject(out, mesh, objectName, 0u);
+        LOG_INFO(std::format("[ObjExport] Exported SimplifiableMesh '{}' to '{}' successfully.", objectName, filePath.string()));
         return true;
     }
 
     bool ExportClusterGroupsToOBJ(const std::filesystem::path& filePath, const std::vector<ClusterGroup>& groups) {
         std::ofstream out(filePath, std::ios::out | std::ios::trunc);
         if (!out.is_open()) {
+            LOG_ERROR(std::format("[ObjExport] Failed to open '{}' for cluster groups OBJ export!", filePath.string()));
             return false;
         }
 
@@ -69,6 +74,7 @@ namespace geometry {
             WriteMeshObject(out, groups[g].mesh, "group_" + std::to_string(g), vertexIndexBase);
             vertexIndexBase += static_cast<uint32_t>(groups[g].mesh.positions.size());
         }
+        LOG_INFO(std::format("[ObjExport] Exported {} cluster group(s) to '{}' successfully.", groups.size(), filePath.string()));
         return true;
     }
 

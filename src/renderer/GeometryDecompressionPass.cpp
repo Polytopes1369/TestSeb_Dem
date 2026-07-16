@@ -2,42 +2,16 @@
 
 #include <cassert>
 #include <cstring>
-#include <fstream>
+#include <format>
 #include <stdexcept>
-#include <vector>
 
 #include "core/Logger.h"
 #include "geometry/ClusterFormat.h" // geometry::kMaxClusterVertices, geometry::kPageSizeBytes
+#include "renderer/VulkanPipeline.h"
 
 namespace renderer {
 
     namespace {
-
-        // Mirrors VulkanContext::ReadShaderFile (VulkanContext.cpp) -- duplicated rather than
-        // shared because this class is deliberately self-contained (no VulkanContext dependency),
-        // matching GpuGeometryPagePool's own independence from the rest of the renderer.
-        std::vector<char> ReadShaderFile(const std::string& filename) {
-            std::ifstream file(filename, std::ios::ate | std::ios::binary);
-            if (!file.is_open()) {
-                throw std::runtime_error("GeometryDecompressionPass: failed to open SPIR-V file: " + filename);
-            }
-            size_t fileSize = static_cast<size_t>(file.tellg());
-            std::vector<char> buffer(fileSize);
-            file.seekg(0);
-            file.read(buffer.data(), static_cast<std::streamsize>(fileSize));
-            file.close();
-            return buffer;
-        }
-
-        VkShaderModule CreateShaderModule(VkDevice device, const std::vector<char>& code) {
-            VkShaderModuleCreateInfo createInfo{ VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
-            createInfo.codeSize = code.size();
-            createInfo.pCode = reinterpret_cast<const uint32_t*>(code.data());
-
-            VkShaderModule module;
-            VK_CHECK(vkCreateShaderModule(device, &createInfo, nullptr, &module));
-            return module;
-        }
 
         // Byte-for-byte layout match for DecompressPushConstants in
         // DecompressClusterVertices.comp: a uint plus 12 bytes of padding (16 bytes total, so the
@@ -159,8 +133,7 @@ namespace renderer {
         pipelineLayoutInfo.pPushConstantRanges = &pushConstantRange;
         VK_CHECK(vkCreatePipelineLayout(m_Device, &pipelineLayoutInfo, nullptr, &m_PipelineLayout));
 
-        std::vector<char> vertexShaderCode = ReadShaderFile("shaders/DecompressClusterVertices.comp.spv");
-        VkShaderModule vertexShaderModule = CreateShaderModule(m_Device, vertexShaderCode);
+        VkShaderModule vertexShaderModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/DecompressClusterVertices.comp.spv");
 
         VkComputePipelineCreateInfo vertexPipelineInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
         vertexPipelineInfo.layout = m_PipelineLayout;
@@ -172,8 +145,7 @@ namespace renderer {
 
         vkDestroyShaderModule(m_Device, vertexShaderModule, nullptr);
 
-        std::vector<char> indexShaderCode = ReadShaderFile("shaders/DecompressClusterIndices.comp.spv");
-        VkShaderModule indexShaderModule = CreateShaderModule(m_Device, indexShaderCode);
+        VkShaderModule indexShaderModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/DecompressClusterIndices.comp.spv");
 
         VkComputePipelineCreateInfo indexPipelineInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
         indexPipelineInfo.layout = m_PipelineLayout;
@@ -184,10 +156,13 @@ namespace renderer {
         VK_CHECK(vkCreateComputePipelines(m_Device, VK_NULL_HANDLE, 1, &indexPipelineInfo, nullptr, &m_IndexPipeline));
 
         vkDestroyShaderModule(m_Device, indexShaderModule, nullptr);
+
+        LOG_INFO(std::format("[GeometryDecompressionPass] Initialized decompression pass: maxPhysicalPages={}", maxPhysicalPages));
     }
 
     void GeometryDecompressionPass::Shutdown() {
         if (m_Device != VK_NULL_HANDLE) {
+            LOG_INFO("[GeometryDecompressionPass] Shutting down decompression pass...");
             if (m_Pipeline != VK_NULL_HANDLE) {
                 vkDestroyPipeline(m_Device, m_Pipeline, nullptr);
             }

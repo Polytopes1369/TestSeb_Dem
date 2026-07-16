@@ -1,4 +1,7 @@
 #include "renderer/FeedbackBuffer.h"
+#include "core/Logger.h"
+
+#include <format>
 
 namespace renderer {
 
@@ -33,9 +36,13 @@ namespace renderer {
             VK_BUFFER_USAGE_TRANSFER_DST_BIT,
             VMA_MEMORY_USAGE_CPU_ONLY,
             /*mapped=*/true);
+
+        LOG_INFO(std::format("[FeedbackBuffer] Initialized feedback buffer: capacity={}, size={} KB",
+            capacity, sizeBytes / 1024));
     }
 
     void FeedbackBuffer::Shutdown() {
+        LOG_INFO("[FeedbackBuffer] Shutting down feedback buffer...");
         m_DeviceBuffer.Destroy();
         m_ReadbackBuffer.Destroy();
         m_Capacity = 0;

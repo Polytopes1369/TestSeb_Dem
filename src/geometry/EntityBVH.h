@@ -10,7 +10,7 @@
 // a plain read-only storage buffer -- NOT a VK_KHR_acceleration_structure (this codebase's Vulkan
 // context does not currently enable that extension; see VulkanContext.cpp's own deviceExtensions
 // list). A compute shader traverses it with a manual stack-based walk (see SDFRayMarch.comp) --
-// exactly the "table de structures d'accélération CPU" a Lumen-style ray march needs to identify
+// exactly the "CPU acceleration structures table" a Lumen-style ray march needs to identify
 // candidate Mesh SDFs near the current marching position, without requiring hardware ray tracing
 // acceleration structures at all.
 //

@@ -65,6 +65,7 @@
 #include "geometry/ClusterFormat.h"
 #include "geometry/SurfaceCacheAtlasAllocator.h"
 #include "renderer/GpuBuffer.h"
+#include "renderer/GpuImage.h"
 #include "renderer/LightingTypes.h"
 
 namespace renderer {
@@ -176,18 +177,18 @@ namespace renderer {
             return cardIndex < m_CardStates.size() && m_CardStates[cardIndex].resident;
         }
 
-        VkImage GetAlbedoImage() const { return m_AlbedoImage; }
-        VkImageView GetAlbedoView() const { return m_AlbedoView; }
-        VkImage GetNormalImage() const { return m_NormalImage; }
-        VkImageView GetNormalView() const { return m_NormalView; }
-        VkImage GetEmissiveImage() const { return m_EmissiveImage; }
-        VkImageView GetEmissiveView() const { return m_EmissiveView; }
-        VkImage GetDirectLightingImage() const { return m_DirectLightingImage; }
-        VkImageView GetDirectLightingView() const { return m_DirectLightingView; }
-        VkImage GetRadianceImage() const { return m_RadianceImage; }
-        VkImageView GetRadianceView() const { return m_RadianceView; }
-        VkImage GetWorldPosImage() const { return m_WorldPosImage; }
-        VkImageView GetWorldPosView() const { return m_WorldPosView; }
+        VkImage GetAlbedoImage() const { return m_Albedo.Image(); }
+        VkImageView GetAlbedoView() const { return m_Albedo.View(); }
+        VkImage GetNormalImage() const { return m_Normal.Image(); }
+        VkImageView GetNormalView() const { return m_Normal.View(); }
+        VkImage GetEmissiveImage() const { return m_Emissive.Image(); }
+        VkImageView GetEmissiveView() const { return m_Emissive.View(); }
+        VkImage GetDirectLightingImage() const { return m_DirectLighting.Image(); }
+        VkImageView GetDirectLightingView() const { return m_DirectLighting.View(); }
+        VkImage GetRadianceImage() const { return m_Radiance.Image(); }
+        VkImageView GetRadianceView() const { return m_Radiance.View(); }
+        VkImage GetWorldPosImage() const { return m_WorldPos.Image(); }
+        VkImageView GetWorldPosView() const { return m_WorldPos.View(); }
         VkSampler GetAtlasSampler() const { return m_AtlasSampler; }
 
         // One entity's span inside the combined vertex/index buffers -- vkCmdDrawIndexed's own
@@ -263,27 +264,13 @@ namespace renderer {
         GpuBuffer m_VertexBuffer; // geometry::FallbackVertex[], GPU_ONLY.
         GpuBuffer m_IndexBuffer;  // uint32_t[], GPU_ONLY.
 
-        VkImage m_AlbedoImage = VK_NULL_HANDLE;
-        VmaAllocation m_AlbedoAllocation = VK_NULL_HANDLE;
-        VkImageView m_AlbedoView = VK_NULL_HANDLE;
-        VkImage m_NormalImage = VK_NULL_HANDLE;
-        VmaAllocation m_NormalAllocation = VK_NULL_HANDLE;
-        VkImageView m_NormalView = VK_NULL_HANDLE;
-        VkImage m_EmissiveImage = VK_NULL_HANDLE;
-        VmaAllocation m_EmissiveAllocation = VK_NULL_HANDLE;
-        VkImageView m_EmissiveView = VK_NULL_HANDLE;
-        VkImage m_DirectLightingImage = VK_NULL_HANDLE;
-        VmaAllocation m_DirectLightingAllocation = VK_NULL_HANDLE;
-        VkImageView m_DirectLightingView = VK_NULL_HANDLE;
-        VkImage m_RadianceImage = VK_NULL_HANDLE;
-        VmaAllocation m_RadianceAllocation = VK_NULL_HANDLE;
-        VkImageView m_RadianceView = VK_NULL_HANDLE;
-        VkImage m_WorldPosImage = VK_NULL_HANDLE;
-        VmaAllocation m_WorldPosAllocation = VK_NULL_HANDLE;
-        VkImageView m_WorldPosView = VK_NULL_HANDLE;
-        VkImage m_DepthImage = VK_NULL_HANDLE;
-        VmaAllocation m_DepthAllocation = VK_NULL_HANDLE;
-        VkImageView m_DepthView = VK_NULL_HANDLE;
+        GpuImage m_Albedo;
+        GpuImage m_Normal;
+        GpuImage m_Emissive;
+        GpuImage m_DirectLighting;
+        GpuImage m_Radiance;
+        GpuImage m_WorldPos;
+        GpuImage m_Depth;
         VkSampler m_AtlasSampler = VK_NULL_HANDLE;
 
         // Lighting: one UBO (set 0 binding 0, SurfaceCacheLightingUBO -- see the .cpp) written by

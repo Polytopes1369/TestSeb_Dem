@@ -50,9 +50,10 @@ enable_testing()
 
 add_executable(ClusterPartitionerTests
     src/geometry/ClusterPartitioner.cpp
+    src/core/Logger.cpp
     tests/ClusterPartitionerTests.cpp
 )
-target_include_directories(ClusterPartitionerTests PRIVATE src)
+target_include_directories(ClusterPartitionerTests PRIVATE src ${Vulkan_INCLUDE_DIRS})
 add_test(NAME ClusterPartitionerTests COMMAND ClusterPartitionerTests)
 
 add_executable(ClusterSimplificationTests
@@ -60,9 +61,10 @@ add_executable(ClusterSimplificationTests
     src/geometry/ClusterGrouping.cpp
     src/geometry/MeshSimplifier.cpp
     src/io/ObjExport.cpp
+    src/core/Logger.cpp
     tests/ClusterSimplificationTests.cpp
 )
-target_include_directories(ClusterSimplificationTests PRIVATE src)
+target_include_directories(ClusterSimplificationTests PRIVATE src ${Vulkan_INCLUDE_DIRS})
 add_test(NAME ClusterSimplificationTests COMMAND ClusterSimplificationTests)
 
 add_executable(ClusterDAGTests
@@ -70,9 +72,10 @@ add_executable(ClusterDAGTests
     src/geometry/ClusterGrouping.cpp
     src/geometry/MeshSimplifier.cpp
     src/geometry/ClusterDAG.cpp
+    src/core/Logger.cpp
     tests/ClusterDAGTests.cpp
 )
-target_include_directories(ClusterDAGTests PRIVATE src)
+target_include_directories(ClusterDAGTests PRIVATE src ${Vulkan_INCLUDE_DIRS})
 add_test(NAME ClusterDAGTests COMMAND ClusterDAGTests)
 
 add_executable(CacheFileFormatTests
@@ -91,9 +94,10 @@ add_test(NAME CacheFileFormatTests COMMAND CacheFileFormatTests)
 
 add_executable(MeshSDFTests
     src/geometry/MeshSDFGenerator.cpp
+    src/core/Logger.cpp
     tests/MeshSDFTests.cpp
 )
-target_include_directories(MeshSDFTests PRIVATE src)
+target_include_directories(MeshSDFTests PRIVATE src ${Vulkan_INCLUDE_DIRS})
 add_test(NAME MeshSDFTests COMMAND MeshSDFTests)
 
 add_executable(ClusterMaskSplitTests
@@ -101,9 +105,10 @@ add_executable(ClusterMaskSplitTests
     src/geometry/ClusterGrouping.cpp
     src/geometry/MeshSimplifier.cpp
     src/geometry/ClusterDAG.cpp
+    src/core/Logger.cpp
     tests/ClusterMaskSplitTests.cpp
 )
-target_include_directories(ClusterMaskSplitTests PRIVATE src)
+target_include_directories(ClusterMaskSplitTests PRIVATE src ${Vulkan_INCLUDE_DIRS})
 add_test(NAME ClusterMaskSplitTests COMMAND ClusterMaskSplitTests)
 
 # ==============================================================================

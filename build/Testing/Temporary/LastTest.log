@@ -1,44 +1,44 @@
-Start testing: Jul 16 07:46 Eastern Daylight Time
+Start testing: Jul 16 12:00 Eastern Daylight Time
 ----------------------------------------------------------
 1/6 Testing: ClusterPartitionerTests
 1/6 Test: ClusterPartitionerTests
-Command: "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Debug/ClusterPartitionerTests.exe"
+Command: "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Release/ClusterPartitionerTests.exe"
 Directory: D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build
-"ClusterPartitionerTests" start time: Jul 16 07:46 Eastern Daylight Time
+"ClusterPartitionerTests" start time: Jul 16 12:00 Eastern Daylight Time
 Output:
 ----------------------------------------------------------
 [ClusterPartitionerTests] All checks PASSED.
 <end of output>
-Test time =   0.10 sec
+Test time =   0.06 sec
 ----------------------------------------------------------
 Test Passed.
-"ClusterPartitionerTests" end time: Jul 16 07:46 Eastern Daylight Time
+"ClusterPartitionerTests" end time: Jul 16 12:00 Eastern Daylight Time
 "ClusterPartitionerTests" time elapsed: 00:00:00
 ----------------------------------------------------------
 
 2/6 Testing: ClusterSimplificationTests
 2/6 Test: ClusterSimplificationTests
-Command: "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Debug/ClusterSimplificationTests.exe"
+Command: "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Release/ClusterSimplificationTests.exe"
 Directory: D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build
-"ClusterSimplificationTests" start time: Jul 16 07:46 Eastern Daylight Time
+"ClusterSimplificationTests" start time: Jul 16 12:00 Eastern Daylight Time
 Output:
 ----------------------------------------------------------
 [ClusterSimplificationTests] 56 cluster(s), 29 group(s) (2 singleton), 3200 -> 1678 triangles (24/29 groups reached their target).
 [ClusterSimplificationTests] Debug mesh exported to: D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\cluster_group_simplification_debug.obj -- open it in Blender/MeshLab and confirm no gaps appear between group boundaries.
 [ClusterSimplificationTests] All checks PASSED.
 <end of output>
-Test time =   0.09 sec
+Test time =   0.05 sec
 ----------------------------------------------------------
 Test Passed.
-"ClusterSimplificationTests" end time: Jul 16 07:46 Eastern Daylight Time
+"ClusterSimplificationTests" end time: Jul 16 12:00 Eastern Daylight Time
 "ClusterSimplificationTests" time elapsed: 00:00:00
 ----------------------------------------------------------
 
 3/6 Testing: ClusterDAGTests
 3/6 Test: ClusterDAGTests
-Command: "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Debug/ClusterDAGTests.exe"
+Command: "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Release/ClusterDAGTests.exe"
 Directory: D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build
-"ClusterDAGTests" start time: Jul 16 07:46 Eastern Daylight Time
+"ClusterDAGTests" start time: Jul 16 12:00 Eastern Daylight Time
 Output:
 ----------------------------------------------------------
 [ClusterDAGTests] 56 leaf node(s), 64 internal node(s), 2 root(s), max level 6.
@@ -46,61 +46,60 @@ Output:
 [ClusterDAGTests] root 119: level 6, clusterError 3.18726, 57 triangle(s).
 [ClusterDAGTests] All checks PASSED.
 <end of output>
-Test time =   0.12 sec
+Test time =   0.05 sec
 ----------------------------------------------------------
 Test Passed.
-"ClusterDAGTests" end time: Jul 16 07:46 Eastern Daylight Time
+"ClusterDAGTests" end time: Jul 16 12:00 Eastern Daylight Time
 "ClusterDAGTests" time elapsed: 00:00:00
 ----------------------------------------------------------
 
 4/6 Testing: CacheFileFormatTests
 4/6 Test: CacheFileFormatTests
-Command: "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Debug/CacheFileFormatTests.exe"
+Command: "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Release/CacheFileFormatTests.exe"
 Directory: D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build
-"CacheFileFormatTests" start time: Jul 16 07:46 Eastern Daylight Time
+"CacheFileFormatTests" start time: Jul 16 12:00 Eastern Daylight Time
 Output:
 ----------------------------------------------------------
-[2026-07-16 07:46:14.163] [INFO] CacheFileManager.cpp:289 - [CacheFileManager] Wrote 'cache_format_test.cache': 8 cluster(s) across 2 entit(y/ies), 2 fallback mesh(es), 12 surface-cache card(s), 57344 bytes total (index table 4096 B, DAG table 4096 B, geometry 32768 B, fallback table 4096 B, fallback data 4096 B, card table 4096 B).
 [CacheFileFormatTests] 8 cluster(s), 57344 byte file, header+2 tables+8 geometry block(s), all page-aligned.
 [CacheFileFormatTests] All checks PASSED.
 <end of output>
-Test time =   0.50 sec
+Test time =   0.05 sec
 ----------------------------------------------------------
 Test Passed.
-"CacheFileFormatTests" end time: Jul 16 07:46 Eastern Daylight Time
+"CacheFileFormatTests" end time: Jul 16 12:00 Eastern Daylight Time
 "CacheFileFormatTests" time elapsed: 00:00:00
 ----------------------------------------------------------
 
 5/6 Testing: MeshSDFTests
 5/6 Test: MeshSDFTests
-Command: "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Debug/MeshSDFTests.exe"
+Command: "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Release/MeshSDFTests.exe"
 Directory: D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build
-"MeshSDFTests" start time: Jul 16 07:46 Eastern Daylight Time
+"MeshSDFTests" start time: Jul 16 12:00 Eastern Daylight Time
 Output:
 ----------------------------------------------------------
 [MeshSDFTests] All checks PASSED.
 <end of output>
-Test time =   0.44 sec
+Test time =   0.23 sec
 ----------------------------------------------------------
 Test Passed.
-"MeshSDFTests" end time: Jul 16 07:46 Eastern Daylight Time
+"MeshSDFTests" end time: Jul 16 12:00 Eastern Daylight Time
 "MeshSDFTests" time elapsed: 00:00:00
 ----------------------------------------------------------
 
 6/6 Testing: ClusterMaskSplitTests
 6/6 Test: ClusterMaskSplitTests
-Command: "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Debug/ClusterMaskSplitTests.exe"
+Command: "D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Release/ClusterMaskSplitTests.exe"
 Directory: D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build
-"ClusterMaskSplitTests" start time: Jul 16 07:46 Eastern Daylight Time
+"ClusterMaskSplitTests" start time: Jul 16 12:00 Eastern Daylight Time
 Output:
 ----------------------------------------------------------
 [ClusterMaskSplitTests] All checks passed.
 <end of output>
-Test time =   0.05 sec
+Test time =   0.04 sec
 ----------------------------------------------------------
 Test Passed.
-"ClusterMaskSplitTests" end time: Jul 16 07:46 Eastern Daylight Time
+"ClusterMaskSplitTests" end time: Jul 16 12:00 Eastern Daylight Time
 "ClusterMaskSplitTests" time elapsed: 00:00:00
 ----------------------------------------------------------
 
-End testing: Jul 16 07:46 Eastern Daylight Time
+End testing: Jul 16 12:00 Eastern Daylight Time

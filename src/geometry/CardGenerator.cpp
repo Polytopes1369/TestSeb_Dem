@@ -1,7 +1,9 @@
 #include "geometry/CardGenerator.h"
+#include "core/Logger.h"
 
 #include <algorithm>
 #include <cmath>
+#include <format>
 #include <numeric>
 
 namespace geometry {
@@ -84,6 +86,8 @@ namespace geometry {
             return true;
         }
 
+        LOG_INFO(std::format("[CardGenerator] Packing {} cards into a {}x{} atlas...", cards.size(), atlasSize, atlasSize));
+
         // Shelf packing over an index permutation (tallest card first, so shelf height waste is
         // minimized) -- the cards vector itself keeps its caller-defined order, because the
         // on-disk table's order is part of the format contract (entity-grouped, face-ordered).
@@ -120,6 +124,7 @@ namespace geometry {
                 shelfHeight = 0;
             }
             if (shelfY + paddedH > atlasSize) {
+                LOG_ERROR(std::format("[CardGenerator] Atlas exhausted while packing! Failed on card with size {}x{}.", card.atlasSize[0], card.atlasSize[1]));
                 return false; // Atlas exhausted.
             }
 
@@ -136,6 +141,7 @@ namespace geometry {
             shelfHeight = std::max(shelfHeight, paddedH);
         }
 
+        LOG_INFO(std::format("[CardGenerator] Packed {} cards successfully. Final height usage: {}/{} texels.", cards.size(), shelfY + shelfHeight, atlasSize));
         return true;
     }
 

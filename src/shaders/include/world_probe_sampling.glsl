@@ -5,8 +5,8 @@
 // surface_cache_sampling.glsl's own doc-comment convention. renderer::WorldProbeGridPass fills
 // the grid (WorldProbeInject.comp); this header is what any OTHER shader includes to read it back
 // -- renderer::ScreenTracePass's own ScreenTrace.comp (as its far-field fallback whenever the
-// screen-space march misses) today, and, per the original ask ("permets aux shaders de ces objets
-// dynamiques d'échantillonner cette grille"), a future particle/character shader tomorrow: neither
+// screen-space march misses) today, and, per the original ask ("allow the shaders of these dynamic
+// objects to sample this grid"), a future particle/character shader tomorrow: neither
 // needs to know anything about how the grid was built, only this one function.
 //
 // Binding convention every including shader must reserve -- the exact set/binding indices are

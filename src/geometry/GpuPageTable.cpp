@@ -1,4 +1,6 @@
 #include "geometry/GpuPageTable.h"
+#include "core/Logger.h"
+#include <format>
 
 namespace geometry {
 
@@ -9,6 +11,7 @@ namespace geometry {
         // first handed out by AllocatePage, so this is a resize (real, default-constructed
         // elements), not a reserve.
         m_LRUNodes.resize(physicalPageCapacity);
+        LOG_INFO(std::format("[GpuPageTable] Initialized page table with capacity of {} physical pages ({} KB).", physicalPageCapacity, (physicalPageCapacity * kPageSizeBytes) / 1024));
     }
 
     uint32_t GpuPageTable::AllocatePage(uint64_t logicalAddress) {

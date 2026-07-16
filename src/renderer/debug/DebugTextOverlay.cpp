@@ -4,32 +4,15 @@
 
 #include <cstring>
 #include <format>
-#include <fstream>
-#include <stdexcept>
 
 #include "core/Logger.h"
 #include "renderer/VulkanPipeline.h"
+#include "renderer/VulkanUtils.h"
 #include "renderer/debug/BitmapFont8x8.h"
 
 namespace renderer::debug {
 
     namespace {
-
-        // Mirrors HZBPass::ReadShaderFile / every other pass's own copy -- duplicated rather than
-        // shared because this class is deliberately self-contained, matching this codebase's
-        // existing per-pass convention.
-        std::vector<char> ReadShaderFile(const std::string& filename) {
-            std::ifstream file(filename, std::ios::ate | std::ios::binary);
-            if (!file.is_open()) {
-                throw std::runtime_error("DebugTextOverlay: failed to open SPIR-V file: " + filename);
-            }
-            size_t fileSize = static_cast<size_t>(file.tellg());
-            std::vector<char> buffer(fileSize);
-            file.seekg(0);
-            file.read(buffer.data(), static_cast<std::streamsize>(fileSize));
-            file.close();
-            return buffer;
-        }
 
         constexpr uint32_t kFontCharCount = 128;
         constexpr uint32_t kFontRowsPerChar = 8;
@@ -75,41 +58,22 @@ namespace renderer::debug {
             VK_CHECK(vmaCreateBuffer(allocator, &stagingInfo, &stagingAllocInfo, &stagingBuffer, &stagingAllocation, &stagingAllocResultInfo));
             std::memcpy(stagingAllocResultInfo.pMappedData, fontRows.data(), static_cast<size_t>(fontBytes));
 
-            VkCommandBufferAllocateInfo cmdAllocInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
-            cmdAllocInfo.commandPool = commandPool;
-            cmdAllocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-            cmdAllocInfo.commandBufferCount = 1;
+            VulkanUtils::ExecuteOneShotCommands(m_Device, commandPool, queue, [&](VkCommandBuffer cmd) {
+                VkBufferCopy copyRegion{ 0, 0, fontBytes };
+                vkCmdCopyBuffer(cmd, stagingBuffer, m_FontBuffer.Handle(), 1, &copyRegion);
 
-            VkCommandBuffer cmd;
-            VK_CHECK(vkAllocateCommandBuffers(m_Device, &cmdAllocInfo, &cmd));
+                VkMemoryBarrier2 barrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+                barrier.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+                barrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+                barrier.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+                barrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
 
-            VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-            beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-            vkBeginCommandBuffer(cmd, &beginInfo);
+                VkDependencyInfo depInfo{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+                depInfo.memoryBarrierCount = 1;
+                depInfo.pMemoryBarriers = &barrier;
+                vkCmdPipelineBarrier2(cmd, &depInfo);
+            });
 
-            VkBufferCopy copyRegion{ 0, 0, fontBytes };
-            vkCmdCopyBuffer(cmd, stagingBuffer, m_FontBuffer.Handle(), 1, &copyRegion);
-
-            VkMemoryBarrier2 barrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
-            barrier.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
-            barrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-            barrier.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
-            barrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
-
-            VkDependencyInfo depInfo{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-            depInfo.memoryBarrierCount = 1;
-            depInfo.pMemoryBarriers = &barrier;
-            vkCmdPipelineBarrier2(cmd, &depInfo);
-
-            vkEndCommandBuffer(cmd);
-
-            VkSubmitInfo submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
-            submitInfo.commandBufferCount = 1;
-            submitInfo.pCommandBuffers = &cmd;
-            VK_CHECK(vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE));
-            VK_CHECK(vkQueueWaitIdle(queue));
-
-            vkFreeCommandBuffers(m_Device, commandPool, 1, &cmd);
             vmaDestroyBuffer(allocator, stagingBuffer, stagingAllocation);
         }
 
@@ -161,10 +125,8 @@ namespace renderer::debug {
         // --- Graphics pipeline: built manually (not via VulkanPipeline::CreateGraphicsPipeline,
         // which is hardcoded for the 2-attachment integer VisBuffer with no blending) -- single
         // RGBA8 color attachment, standard alpha blending, no depth attachment at all. ---
-        std::vector<char> vertCode = ReadShaderFile("shaders/DebugText.vert.spv");
-        std::vector<char> fragCode = ReadShaderFile("shaders/DebugText.frag.spv");
-        VkShaderModule vertModule = VulkanPipeline::CreateShaderModule(m_Device, vertCode);
-        VkShaderModule fragModule = VulkanPipeline::CreateShaderModule(m_Device, fragCode);
+        VkShaderModule vertModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/DebugText.vert.spv");
+        VkShaderModule fragModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/DebugText.frag.spv");
 
         VkPipelineShaderStageCreateInfo stages[2]{};
         stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
@@ -250,10 +212,13 @@ namespace renderer::debug {
 
         vkDestroyShaderModule(m_Device, vertModule, nullptr);
         vkDestroyShaderModule(m_Device, fragModule, nullptr);
+
+        LOG_INFO("[DebugTextOverlay] Initialized debug text overlay.");
     }
 
     void DebugTextOverlay::Shutdown() {
         if (m_Device != VK_NULL_HANDLE) {
+            LOG_INFO("[DebugTextOverlay] Shutting down debug text overlay...");
             if (m_Pipeline != VK_NULL_HANDLE) vkDestroyPipeline(m_Device, m_Pipeline, nullptr);
             if (m_PipelineLayout != VK_NULL_HANDLE) vkDestroyPipelineLayout(m_Device, m_PipelineLayout, nullptr);
             if (m_DescriptorPool != VK_NULL_HANDLE) {

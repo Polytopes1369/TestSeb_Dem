@@ -5,12 +5,15 @@
 Camera::Camera(maths::vec3 position, maths::vec3 target)
     : m_Position(position), m_FovDegrees(45.0f)
 {
+    // Derive initial pitch and yaw from the direction vector pointing towards the target
     maths::vec3 direction = target - position;
     float distance = std::sqrt(direction.x * direction.x + direction.y * direction.y + direction.z * direction.z);
 
     if (distance > 0.0f) {
         maths::vec3 normalizedDir = direction * (1.0f / distance);
+        // Pitch represents the vertical angle (arcsine of normalized direction's Y component)
         m_PitchDegrees = std::asin(normalizedDir.y) * (180.0f / 3.14159265358979323846f);
+        // Yaw represents the horizontal angle in the XZ plane (arctangent of Z/X)
         m_YawDegrees = std::atan2(normalizedDir.z, normalizedDir.x) * (180.0f / 3.14159265358979323846f);
     }
     else {
@@ -20,9 +23,11 @@ Camera::Camera(maths::vec3 position, maths::vec3 target)
 }
 
 maths::vec3 Camera::GetForwardVector() const {
+    // Convert pitch and yaw angles from degrees to radians for trigonometric functions
     float pitchRad = m_PitchDegrees * (3.14159265358979323846f / 180.0f);
     float yawRad = m_YawDegrees * (3.14159265358979323846f / 180.0f);
 
+    // Calculate Cartesian coordinates of the unit forward vector from spherical angles
     maths::vec3 forward;
     forward.x = std::cos(pitchRad) * std::cos(yawRad);
     forward.y = std::sin(pitchRad);
@@ -46,8 +51,10 @@ void Camera::Update(float aspectRatio) {
     maths::vec3 forward = GetForwardVector();
     maths::vec3 targetDestination = m_Position + forward;
 
+    // Generate the view matrix using the LookAt vector construction
     m_PushConstants.view = maths::mat4::LookAt(m_Position, targetDestination, worldUp);
 
+    // Generate the Vulkan-compatible projection matrix (Reversed-Z depth mapping)
     float fovRadians = m_FovDegrees * (3.14159265358979323846f / 180.0f);
     m_PushConstants.proj = maths::mat4::PerspectiveVulkan(fovRadians, aspectRatio, m_Near, m_Far);
 }
@@ -62,15 +69,18 @@ void Camera::CameraZoom(float fovChangeDegrees) {
 }
 
 void Camera::CameraOrbit(maths::vec3 center, float distance, float azimuthDegrees, float elevationDegrees) {
+    // Restrict elevation to prevent gimbal lock at polar limits
     elevationDegrees = std::clamp(elevationDegrees, -89.0f, 89.0f);
 
     float azimuthRad = azimuthDegrees * (3.14159265358979323846f / 180.0f);
     float elevationRad = elevationDegrees * (3.14159265358979323846f / 180.0f);
 
+    // Position camera on a sphere of radius 'distance' around target center
     m_Position.x = center.x + distance * std::cos(elevationRad) * std::cos(azimuthRad);
     m_Position.y = center.y + distance * std::sin(elevationRad);
     m_Position.z = center.z + distance * std::cos(elevationRad) * std::sin(azimuthRad);
 
+    // Look back at the orbit center
     m_PitchDegrees = -elevationDegrees;
     m_YawDegrees = azimuthDegrees + 180.0f;
 

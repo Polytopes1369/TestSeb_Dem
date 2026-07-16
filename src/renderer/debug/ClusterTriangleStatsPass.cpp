@@ -2,30 +2,13 @@
 
 #include "renderer/debug/ClusterTriangleStatsPass.h"
 
-#include <fstream>
-#include <stdexcept>
+#include <format>
 
 #include "core/Logger.h"
 #include "renderer/VulkanPipeline.h"
 
 namespace renderer::debug {
 
-    namespace {
-
-        std::vector<char> ReadShaderFile(const std::string& filename) {
-            std::ifstream file(filename, std::ios::ate | std::ios::binary);
-            if (!file.is_open()) {
-                throw std::runtime_error("ClusterTriangleStatsPass: failed to open SPIR-V file: " + filename);
-            }
-            size_t fileSize = static_cast<size_t>(file.tellg());
-            std::vector<char> buffer(fileSize);
-            file.seekg(0);
-            file.read(buffer.data(), static_cast<std::streamsize>(fileSize));
-            file.close();
-            return buffer;
-        }
-
-    } // namespace
 
     void ClusterTriangleStatsPass::Init(VkDevice device, VmaAllocator allocator, uint32_t maxClusters,
         VkBuffer clusterMetadataBuffer, VkBuffer earlyIndirectCommandBuffer, VkBuffer earlyDrawCountBuffer,
@@ -116,14 +99,16 @@ namespace renderer::debug {
         pipelineLayoutInfo.pPushConstantRanges = &pushConstantRange;
         VK_CHECK(vkCreatePipelineLayout(m_Device, &pipelineLayoutInfo, nullptr, &m_PipelineLayout));
 
-        std::vector<char> shaderCode = ReadShaderFile("shaders/ComputeTriangleStats.comp.spv");
-        VkShaderModule shaderModule = VulkanPipeline::CreateShaderModule(m_Device, shaderCode);
+        VkShaderModule shaderModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/ComputeTriangleStats.comp.spv");
         m_Pipeline = VulkanPipeline::CreateComputePipeline(m_Device, m_PipelineLayout, shaderModule);
         vkDestroyShaderModule(m_Device, shaderModule, nullptr);
+
+        LOG_INFO(std::format("[ClusterTriangleStatsPass] Initialized triangle stats pass: maxClusters={}", maxClusters));
     }
 
     void ClusterTriangleStatsPass::Shutdown() {
         if (m_Device != VK_NULL_HANDLE) {
+            LOG_INFO("[ClusterTriangleStatsPass] Shutting down triangle stats pass...");
             if (m_Pipeline != VK_NULL_HANDLE) vkDestroyPipeline(m_Device, m_Pipeline, nullptr);
             if (m_PipelineLayout != VK_NULL_HANDLE) vkDestroyPipelineLayout(m_Device, m_PipelineLayout, nullptr);
             if (m_DescriptorPool != VK_NULL_HANDLE) vkDestroyDescriptorPool(m_Device, m_DescriptorPool, nullptr);

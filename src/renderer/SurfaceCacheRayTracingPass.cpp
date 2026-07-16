@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <cstring>
 #include <format>
-#include <fstream>
 #include <stdexcept>
 
 #include "core/Logger.h"
@@ -11,34 +10,11 @@
 #include "renderer/RayTracingFunctions.h"
 #include "renderer/SurfaceCachePass.h"
 #include "renderer/SurfaceCacheTraceContext.h"
+#include "renderer/VulkanPipeline.h"
 
 namespace renderer {
 
     namespace {
-
-        // Mirrors GlobalSDFPass.cpp / SurfaceCachePass.cpp's own copy of these two helpers -- see
-        // GlobalSDFPass.cpp's own comment on this codebase's per-pass self-containment convention.
-        std::vector<char> ReadShaderFile(const std::string& filename) {
-            std::ifstream file(filename, std::ios::ate | std::ios::binary);
-            if (!file.is_open()) {
-                throw std::runtime_error("SurfaceCacheRayTracingPass: failed to open SPIR-V file: " + filename);
-            }
-            size_t fileSize = static_cast<size_t>(file.tellg());
-            std::vector<char> buffer(fileSize);
-            file.seekg(0);
-            file.read(buffer.data(), static_cast<std::streamsize>(fileSize));
-            file.close();
-            return buffer;
-        }
-
-        VkShaderModule CreateShaderModule(VkDevice device, const std::vector<char>& code) {
-            VkShaderModuleCreateInfo createInfo{ VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
-            createInfo.codeSize = code.size();
-            createInfo.pCode = reinterpret_cast<const uint32_t*>(code.data());
-            VkShaderModule module;
-            VK_CHECK(vkCreateShaderModule(device, &createInfo, nullptr, &module));
-            return module;
-        }
 
         VkDeviceSize AlignUp(VkDeviceSize value, VkDeviceSize alignment) {
             return (value + alignment - 1) & ~(alignment - 1);
@@ -278,9 +254,9 @@ namespace renderer {
         pipelineLayoutInfo.pPushConstantRanges = &pushConstantRange;
         VK_CHECK(vkCreatePipelineLayout(m_Device, &pipelineLayoutInfo, nullptr, &m_PipelineLayout));
 
-        VkShaderModule rgenModule = CreateShaderModule(m_Device, ReadShaderFile("shaders/SurfaceCacheHWRT.rgen.spv"));
-        VkShaderModule missModule = CreateShaderModule(m_Device, ReadShaderFile("shaders/SurfaceCacheHWRT.rmiss.spv"));
-        VkShaderModule chitModule = CreateShaderModule(m_Device, ReadShaderFile("shaders/SurfaceCacheHWRT.rchit.spv"));
+        VkShaderModule rgenModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/SurfaceCacheHWRT.rgen.spv");
+        VkShaderModule missModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/SurfaceCacheHWRT.rmiss.spv");
+        VkShaderModule chitModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/SurfaceCacheHWRT.rchit.spv");
 
         VkPipelineShaderStageCreateInfo stages[3]{};
         stages[0] = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO };

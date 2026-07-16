@@ -2,8 +2,10 @@
 
 #include "geometry/ClusterFormat.h"
 #include "geometry/ProceduralMaskSampler.h"
+#include "core/Logger.h"
 
 #include <algorithm>
+#include <format>
 #include <limits>
 #include <numeric>
 #include <unordered_map>
@@ -399,6 +401,8 @@ namespace geometry {
         }
 
         ClassifyAndSplitForOpacity(result, maskTextureIndex, allVertices);
+
+        LOG_INFO(std::format("[ClusterPartitioner] Partitioned mesh {} into {} clusters (mask texture index: {}).", targetMeshID, result.size(), maskTextureIndex));
         return result;
     }
 

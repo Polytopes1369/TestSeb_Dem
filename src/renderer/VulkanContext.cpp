@@ -5,6 +5,7 @@
 #include "core/Logger.h"
 #include "renderer/RenderTypes.h" // renderer::Vertex, used to interpret the DEBUG readback bytes
 #include "renderer/RayTracingFunctions.h"
+#include "VulkanUtils.h"
 #include <algorithm>
 #include <cassert>
 #include <cmath>
@@ -579,7 +580,7 @@ void VulkanContext::SetupDebugMessenger() {
 
   VkDebugUtilsMessengerCreateInfoEXT createInfo{
       VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT};
-  // Ajouter le flag de message fatal pour casser l'exécution immédiatement
+  // Add the fatal message flag to break execution immediately
   createInfo.messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT |
                                VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT;
   createInfo.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT |
@@ -1168,63 +1169,33 @@ void VulkanContext::DispatchGeometryCompute(
     vmaUnmapMemory(m_Allocator, m_ParamsAllocation);
   }
 
-  VkCommandBufferAllocateInfo allocInfo{
-      VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-  allocInfo.commandPool = m_CommandPool;
-  allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-  allocInfo.commandBufferCount = 1;
+  renderer::VulkanUtils::ExecuteOneShotCommands(m_Device, m_CommandPool, m_GraphicsQueue, [&](VkCommandBuffer cmd) {
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1,
+                            &m_GeometryDescriptorSet, 0, nullptr);
 
-  VkCommandBuffer cmd;
-  if (vkAllocateCommandBuffers(m_Device, &allocInfo, &cmd) != VK_SUCCESS) {
-    throw std::runtime_error(
-        "Failed allocating single submit compute command buffer!");
-  }
+    if (pushConstantData != nullptr) {
+      vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                         static_cast<uint32_t>(pushConstantSize),
+                         pushConstantData);
+    }
 
-  VkCommandBufferBeginInfo beginInfo{
-      VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-  beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-  vkBeginCommandBuffer(cmd, &beginInfo);
+    vkCmdDispatch(cmd, groupCountX, groupCountY, groupCountZ);
 
-  vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
-  vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1,
-                          &m_GeometryDescriptorSet, 0, nullptr);
+    // Memory layout safe transition barrier execution: compute writes to the
+    // shared Vertex/Index SSBOs must be visible to the vertex shader stage that
+    // reads them at draw time.
+    VkMemoryBarrier2 memBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    memBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    memBarrier.srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT;
+    memBarrier.dstStageMask = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT;
+    memBarrier.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
 
-  if (pushConstantData != nullptr) {
-    vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
-                       static_cast<uint32_t>(pushConstantSize),
-                       pushConstantData);
-  }
-
-  vkCmdDispatch(cmd, groupCountX, groupCountY, groupCountZ);
-
-  // Memory layout safe transition barrier execution: compute writes to the
-  // shared Vertex/Index SSBOs must be visible to the vertex shader stage that
-  // reads them at draw time.
-  VkMemoryBarrier2 memBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
-  memBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-  memBarrier.srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT;
-  memBarrier.dstStageMask = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT;
-  memBarrier.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
-
-  VkDependencyInfo depInfo{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
-  depInfo.memoryBarrierCount = 1;
-  depInfo.pMemoryBarriers = &memBarrier;
-  vkCmdPipelineBarrier2(cmd, &depInfo);
-
-  vkEndCommandBuffer(cmd);
-
-  VkSubmitInfo submitInfo{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-  submitInfo.commandBufferCount = 1;
-  submitInfo.pCommandBuffers = &cmd;
-  vkQueueSubmit(m_GraphicsQueue, 1, &submitInfo, VK_NULL_HANDLE);
-
-  // Blocking wait between dispatches: this is a one-time startup pass (not a
-  // per-frame path), so trading dispatch-level parallelism for simplicity is an
-  // explicit, deliberate choice here — it also guarantees the next dispatch's
-  // Params UBO overwrite (above) never races a still-in-flight read of the
-  // previous dispatch's parameters.
-  vkQueueWaitIdle(m_GraphicsQueue);
-  vkFreeCommandBuffers(m_Device, m_CommandPool, 1, &cmd);
+    VkDependencyInfo depInfo{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    depInfo.memoryBarrierCount = 1;
+    depInfo.pMemoryBarriers = &memBarrier;
+    vkCmdPipelineBarrier2(cmd, &depInfo);
+  });
 }
 
 maths::vec2 VulkanContext::GridSlot(int slotIndex) const {
@@ -1287,50 +1258,28 @@ void VulkanContext::UploadEntityData() {
 
   VkCommandBufferAllocateInfo cmdAllocInfo{
       VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-  cmdAllocInfo.commandPool = m_CommandPool;
-  cmdAllocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-  cmdAllocInfo.commandBufferCount = 1;
+  renderer::VulkanUtils::ExecuteOneShotCommands(m_Device, m_CommandPool, m_GraphicsQueue, [&](VkCommandBuffer cmd) {
+    VkBufferCopy copyRegion{};
+    copyRegion.srcOffset = 0;
+    copyRegion.dstOffset = 0;
+    copyRegion.size = uploadSize;
+    vkCmdCopyBuffer(cmd, stagingBuffer, m_EntityBuffer, 1, &copyRegion);
 
-  VkCommandBuffer cmd;
-  if (vkAllocateCommandBuffers(m_Device, &cmdAllocInfo, &cmd) != VK_SUCCESS) {
-    throw std::runtime_error("Failed allocating single submit command buffer "
-                             "for entity data upload!");
-  }
+    // Explicit layout/ownership-free memory barrier: the copy's writes must be
+    // visible to the vertex shader's storage-buffer reads (draw.vert, binding =
+    // 4) before any draw call.
+    VkMemoryBarrier2 memBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    memBarrier.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+    memBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    memBarrier.dstStageMask = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT;
+    memBarrier.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
 
-  VkCommandBufferBeginInfo beginInfo{
-      VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-  beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-  vkBeginCommandBuffer(cmd, &beginInfo);
+    VkDependencyInfo depInfo{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    depInfo.memoryBarrierCount = 1;
+    depInfo.pMemoryBarriers = &memBarrier;
+    vkCmdPipelineBarrier2(cmd, &depInfo);
+  });
 
-  VkBufferCopy copyRegion{};
-  copyRegion.srcOffset = 0;
-  copyRegion.dstOffset = 0;
-  copyRegion.size = uploadSize;
-  vkCmdCopyBuffer(cmd, stagingBuffer, m_EntityBuffer, 1, &copyRegion);
-
-  // Explicit layout/ownership-free memory barrier: the copy's writes must be
-  // visible to the vertex shader's storage-buffer reads (draw.vert, binding =
-  // 4) before any draw call.
-  VkMemoryBarrier2 memBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
-  memBarrier.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
-  memBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-  memBarrier.dstStageMask = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT;
-  memBarrier.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
-
-  VkDependencyInfo depInfo{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
-  depInfo.memoryBarrierCount = 1;
-  depInfo.pMemoryBarriers = &memBarrier;
-  vkCmdPipelineBarrier2(cmd, &depInfo);
-
-  vkEndCommandBuffer(cmd);
-
-  VkSubmitInfo submitInfo{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-  submitInfo.commandBufferCount = 1;
-  submitInfo.pCommandBuffers = &cmd;
-  vkQueueSubmit(m_GraphicsQueue, 1, &submitInfo, VK_NULL_HANDLE);
-  vkQueueWaitIdle(m_GraphicsQueue);
-
-  vkFreeCommandBuffers(m_Device, m_CommandPool, 1, &cmd);
   vmaDestroyBuffer(m_Allocator, stagingBuffer, stagingAllocation);
 }
 
@@ -2148,43 +2097,17 @@ void VulkanContext::DebugReadbackGeometrySample(uint32_t vertsPerFace,
     return;
   }
 
-  VkCommandBufferAllocateInfo cmdAllocInfo{
-      VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-  cmdAllocInfo.commandPool = m_CommandPool;
-  cmdAllocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-  cmdAllocInfo.commandBufferCount = 1;
+  renderer::VulkanUtils::ExecuteOneShotCommands(m_Device, m_CommandPool, m_GraphicsQueue, [&](VkCommandBuffer cmd) {
+    // GenerateGeometry() already vkQueueWaitIdle'd after the compute dispatch
+    // before calling this function, so the compute writes are complete and
+    // visible: a plain copy is safe here.
+    VkBufferCopy vertexCopyRegion{0, 0, vertexSampleBytes};
+    vkCmdCopyBuffer(cmd, m_VertexBuffer, stagingVertexBuffer, 1,
+                    &vertexCopyRegion);
 
-  VkCommandBuffer cmd;
-  if (vkAllocateCommandBuffers(m_Device, &cmdAllocInfo, &cmd) != VK_SUCCESS) {
-    LOG_ERROR("[DebugReadback] Failed allocating readback command buffer!");
-    vmaDestroyBuffer(m_Allocator, stagingVertexBuffer, stagingVertexAlloc);
-    vmaDestroyBuffer(m_Allocator, stagingIndexBuffer, stagingIndexAlloc);
-    return;
-  }
-
-  VkCommandBufferBeginInfo beginInfo{
-      VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-  beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-  vkBeginCommandBuffer(cmd, &beginInfo);
-
-  // GenerateGeometry() already vkQueueWaitIdle'd after the compute dispatch
-  // before calling this function, so the compute writes are complete and
-  // visible: a plain copy is safe here.
-  VkBufferCopy vertexCopyRegion{0, 0, vertexSampleBytes};
-  vkCmdCopyBuffer(cmd, m_VertexBuffer, stagingVertexBuffer, 1,
-                  &vertexCopyRegion);
-
-  VkBufferCopy indexCopyRegion{0, 0, indexSampleBytes};
-  vkCmdCopyBuffer(cmd, m_IndexBuffer, stagingIndexBuffer, 1, &indexCopyRegion);
-
-  vkEndCommandBuffer(cmd);
-
-  VkSubmitInfo submitInfo{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-  submitInfo.commandBufferCount = 1;
-  submitInfo.pCommandBuffers = &cmd;
-  vkQueueSubmit(m_GraphicsQueue, 1, &submitInfo, VK_NULL_HANDLE);
-  vkQueueWaitIdle(m_GraphicsQueue);
-  vkFreeCommandBuffers(m_Device, m_CommandPool, 1, &cmd);
+    VkBufferCopy indexCopyRegion{0, 0, indexSampleBytes};
+    vkCmdCopyBuffer(cmd, m_IndexBuffer, stagingIndexBuffer, 1, &indexCopyRegion);
+  });
 
   // Log a handful of representative vertices: the first vertex of face 0, the
   // last vertex of face 0, and the first vertex of face 1 (proves writes
@@ -2259,6 +2182,7 @@ std::vector<char> VulkanContext::ReadShaderFile(const std::string &filename) {
 
 void VulkanContext::Shutdown() {
   if (m_Device != VK_NULL_HANDLE) {
+    LOG_INFO("[VulkanContext] Shutting down Vulkan context...");
     vkDeviceWaitIdle(m_Device);
   }
 
