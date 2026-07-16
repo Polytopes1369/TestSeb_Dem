@@ -1,0 +1,233 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+
+// Phase 1b's actual shading dispatch: MATERIAL_TABLE_SIZE (32) indirect dispatches, one per
+// material bin (renderer::ClusterResolvePass::RecordResolveBinned), each processing exactly the
+// pixels renderer::ClusterShadingBinPass's Classify->Prefix-sum->Scatter pipeline routed into that
+// bin. `binIndex` (push constant) IS this dispatch's materialSlot -- every thread in this dispatch
+// shades the SAME material, the genuine warp coherence the whole shading-bin pipeline exists to
+// provide. Contains only ClusterResolve.comp's Step 2 (barycentric reconstruction) + Step 3
+// (material evaluation) -- no Step 1 (visibility is already fully resolved, see
+// renderer::ClusterShadingBinPass's own class comment) and no debug view branches (this path only
+// ever runs for the normal, non-debug-visualization view -- see ClusterResolvePass::RecordResolve's
+// own comment for why every debug view instead falls back to the original full-screen shader).
+
+#include "include/cluster_culling_common.glsl"
+#include "include/struct_custo.glsl"
+
+#define COMPRESSED_POOL_SET 0
+#define COMPRESSED_POOL_BINDING 1
+#include "include/cluster_vertex_decode.glsl"
+
+#include "include/half_space_raster.glsl"
+#include "include/octahedral.glsl"
+#include "include/wpo_deformation.glsl"
+#include "include/material_params.glsl"
+#include "include/shading_bin_common.glsl"
+
+#define MASK_ARRAY_SET 0
+#define MASK_ARRAY_BINDING 7
+#include "include/mask_sampling.glsl"
+
+// Phase 3 (UE5.8 parity roadmap): sun shadow lookup -- see ClusterResolve.comp's own identical
+// include block comment for the full rationale (this shader was, like that one, fully unshadowed
+// for direct lighting before Phase 3).
+#define SHADOW_ATLAS_SET 0
+#define SHADOW_ATLAS_BINDING 14
+#define SHADOW_PAGE_TABLE_SET 0
+#define SHADOW_PAGE_TABLE_BINDING 15
+#define SHADOW_FEEDBACK_SET 0
+#define SHADOW_FEEDBACK_BINDING 16
+#define SHADOW_SUN_LEVELS_SET 0
+#define SHADOW_SUN_LEVELS_BINDING 17
+#include "include/shadow_page_table.glsl"
+#include "include/shadow_feedback.glsl"
+#include "include/shadow_atlas_sampling.glsl"
+#include "include/shadow_sun_sampling.glsl"
+
+layout(std430, set = 0, binding = 0) readonly buffer ClusterCullMetadataSSBO {
+    ClusterCullMetadata clusters[];
+} g_Clusters;
+
+// binding 1 == g_CompressedClusterPool, declared by cluster_vertex_decode.glsl.
+
+layout(std430, set = 0, binding = 2) readonly buffer SortedPixelListSSBO {
+    SortedPixelEntry entries[];
+} g_SortedPixelList;
+
+layout(std430, set = 0, binding = 3) readonly buffer BinOffsetsSSBO {
+    uint offsets[];
+} g_BinOffsets;
+
+layout(std430, set = 0, binding = 4) readonly buffer BinHistogramSSBO {
+    uint counts[]; // This bin's own count bounds how many of this dispatch's threads are valid.
+} g_BinHistogram;
+
+layout(rgba8, set = 0, binding = 5) uniform writeonly image2D g_OutputColor;
+
+// Same ResolveViewParamsUBO renderer::ClusterResolvePass::RecordResolveBinned uploads before
+// issuing this shader's 32 indirect dispatches (identical struct/binding contract to
+// ClusterResolve.comp's own binding 7) -- only .viewProj and .viewportSize are read here;
+// .prevViewProj exists only for DEBUG_VIEW_MOTION_VECTORS, which this shader never serves.
+layout(std140, set = 0, binding = 6) uniform ResolveViewParamsUBO {
+    mat4 viewProj;
+    mat4 prevViewProj;
+    vec2 viewportSize;
+    float _pad0;
+    float _pad1;
+    // Phase 3: sun direction -- see ClusterResolve.comp's own identical field comment.
+    vec3 sunDirection;
+    float _pad2;
+} g_ViewParams;
+
+// binding 7 == g_MaskTextures[], declared by mask_sampling.glsl.
+
+layout(std140, set = 0, binding = 8) uniform WPOGlobalsUBO {
+    float globalTime;
+    float _pad0;
+    float _pad1;
+    float _pad2;
+} g_WPOGlobals;
+
+layout(std430, set = 0, binding = 9) readonly buffer MaterialParamsSSBO {
+    MaterialParams params[];
+} g_MaterialParams;
+
+layout(rg16f, set = 0, binding = 10) uniform writeonly image2D g_OutputNormal;
+layout(r32f, set = 0, binding = 11) uniform writeonly image2D g_OutputDepth;
+layout(rgba8, set = 0, binding = 12) uniform writeonly image2D g_OutputAlbedo;
+layout(rg8, set = 0, binding = 13) uniform writeonly image2D g_OutputRoughnessMetallic;
+
+// Per-entity self-rotation (dynamic primitive spin) -- appended past the shadow bindings above
+// (14-17) rather than renumbering them; see ClusterResolve.comp's identical bindings 19/20 for
+// the full-screen/debug path this binned/Release path mirrors.
+layout(std430, set = 0, binding = 18) readonly buffer EntityTransformBuffer {
+    EntityTransform entityTransforms[];
+};
+
+layout(std430, set = 0, binding = 19) readonly buffer EntityDataBuffer {
+    EntityData entityData[];
+};
+
+layout(push_constant) uniform BinIndexPC {
+    uint binIndex;
+} pc;
+
+layout(local_size_x = 64) in;
+
+void main() {
+    uint threadIndex = gl_GlobalInvocationID.x;
+    // groupCountX (built by ClusterShadingBinPrefixSum.comp) rounds UP to the workgroup size, so
+    // the last workgroup can have threads past this bin's real pixel count -- bail on those.
+    uint binCount = g_BinHistogram.counts[pc.binIndex];
+    if (threadIndex >= binCount) {
+        return;
+    }
+
+    uint entryIndex = g_BinOffsets.offsets[pc.binIndex] + threadIndex;
+    SortedPixelEntry entry = g_SortedPixelList.entries[entryIndex];
+
+    uint viewportWidth = uint(g_ViewParams.viewportSize.x);
+    ivec2 pixel = ivec2(int(entry.pixelLinearIndex % viewportWidth), int(entry.pixelLinearIndex / viewportWidth));
+
+    uint clusterSlotIndex;
+    uint triangleOrdinal;
+    UnpackVisibilityIDForBin(entry.packedVisID, clusterSlotIndex, triangleOrdinal);
+
+    // --- Step 2: re-fetch the winning triangle's 3 vertices and reconstruct barycentrics (same
+    // algorithm as ClusterResolve.comp's own Step 2 -- see that shader's comment for the full
+    // rationale) ---
+    ClusterCullMetadata cluster = g_Clusters.clusters[clusterSlotIndex];
+    uint physicalPageIndex = cluster.vertexOffset / CLUSTER_MAX_VERTICES;
+    uint pageByteBase = physicalPageIndex * CLUSTER_PAGE_SIZE_BYTES;
+
+    uint i0 = ClusterLoadByte(pageByteBase + CLUSTER_INDICES_BASE_BYTES + triangleOrdinal * 3u + 0u);
+    uint i1 = ClusterLoadByte(pageByteBase + CLUSTER_INDICES_BASE_BYTES + triangleOrdinal * 3u + 1u);
+    uint i2 = ClusterLoadByte(pageByteBase + CLUSTER_INDICES_BASE_BYTES + triangleOrdinal * 3u + 2u);
+
+    vec3 p0 = DecodeClusterPosition(pageByteBase, i0, cluster.boundsMin, cluster.boundsMax);
+    vec3 p1 = DecodeClusterPosition(pageByteBase, i1, cluster.boundsMin, cluster.boundsMax);
+    vec3 p2 = DecodeClusterPosition(pageByteBase, i2, cluster.boundsMin, cluster.boundsMax);
+
+    // Apply entity self-rotation -- see ClusterResolve.comp's own identical comment (this
+    // binned/Release path re-derives the exact same barycentrics from the exact same deformed
+    // triangle, so it must reapply the exact same per-entity rotation before re-projecting).
+    EntityData ed = entityData[cluster.entityID];
+    EntityTransform xform = entityTransforms[ed.meshID];
+    mat3 rotation = mat3(xform.rotation);
+
+    p0 = xform.center + rotation * (p0 - xform.center);
+    p1 = xform.center + rotation * (p1 - xform.center);
+    p2 = xform.center + rotation * (p2 - xform.center);
+
+    // Reapply the exact same WPO sway both rasterizers already applied -- see
+    // ClusterResolve.comp's own comment for why this must happen before re-deriving barycentrics.
+    p0 = ApplyWPODeformation(p0, cluster.clusterID, cluster.maxWPOAmplitude, g_WPOGlobals.globalTime);
+    p1 = ApplyWPODeformation(p1, cluster.clusterID, cluster.maxWPOAmplitude, g_WPOGlobals.globalTime);
+    p2 = ApplyWPODeformation(p2, cluster.clusterID, cluster.maxWPOAmplitude, g_WPOGlobals.globalTime);
+
+    vec3 n0 = rotation * DecodeClusterNormal(pageByteBase, i0);
+    vec3 n1 = rotation * DecodeClusterNormal(pageByteBase, i1);
+    vec3 n2 = rotation * DecodeClusterNormal(pageByteBase, i2);
+    vec2 uv0 = DecodeClusterUV(pageByteBase, i0);
+    vec2 uv1 = DecodeClusterUV(pageByteBase, i1);
+    vec2 uv2 = DecodeClusterUV(pageByteBase, i2);
+
+    vec4 clip0 = g_ViewParams.viewProj * vec4(p0, 1.0);
+    vec4 clip1 = g_ViewParams.viewProj * vec4(p1, 1.0);
+    vec4 clip2 = g_ViewParams.viewProj * vec4(p2, 1.0);
+
+    vec2 screen0 = (clip0.xy / clip0.w * 0.5 + 0.5) * g_ViewParams.viewportSize;
+    vec2 screen1 = (clip1.xy / clip1.w * 0.5 + 0.5) * g_ViewParams.viewportSize;
+    vec2 screen2 = (clip2.xy / clip2.w * 0.5 + 0.5) * g_ViewParams.viewportSize;
+
+    vec2 pixelCenter = vec2(pixel) + 0.5;
+
+    float area2 = EdgeFunction(screen0, screen1, screen2);
+    float invArea2 = (abs(area2) > 1.0e-8) ? (1.0 / area2) : 0.0;
+
+    float w0 = EdgeFunction(screen1, screen2, pixelCenter) * invArea2;
+    float w1 = EdgeFunction(screen2, screen0, pixelCenter) * invArea2;
+    float w2 = EdgeFunction(screen0, screen1, pixelCenter) * invArea2;
+
+    float invW0 = 1.0 / clip0.w;
+    float invW1 = 1.0 / clip1.w;
+    float invW2 = 1.0 / clip2.w;
+    float interpInvW = w0 * invW0 + w1 * invW1 + w2 * invW2;
+    float perspNorm = (abs(interpInvW) > 1.0e-8) ? (1.0 / interpInvW) : 0.0;
+    float pw0 = w0 * invW0 * perspNorm;
+    float pw1 = w1 * invW1 * perspNorm;
+    float pw2 = w2 * invW2 * perspNorm;
+
+    vec3 normal = normalize(pw0 * n0 + pw1 * n1 + pw2 * n2);
+    vec2 uv = pw0 * uv0 + pw1 * uv1 + pw2 * uv2;
+    vec3 worldPos = pw0 * p0 + pw1 * p1 + pw2 * p2;
+
+    // --- Step 3: material evaluation -- pc.binIndex IS this dispatch's materialSlot already (every
+    // thread in this dispatch shades the same material), no per-pixel lookup/clamp needed. ---
+    vec3 lightDir = normalize(-g_ViewParams.sunDirection);
+    float diff = max(dot(normal, lightDir), 0.0);
+    // Phase 3: shadow visibility -- see ClusterResolve.comp's own identical comment.
+    float sunVisibility = (diff > 0.0) ? SampleSunShadowVSM(worldPos) : 1.0;
+
+    MaterialParams mat = g_MaterialParams.params[pc.binIndex];
+    vec3 albedo = mat.baseColor;
+    // Metallic workflow energy conservation (Phase 2) -- see ClusterResolve.comp's identical fix
+    // for the full rationale (a pure metal has zero diffuse response; without this, metals would
+    // double-count energy against ReflectionGather.comp's specular RMW).
+    vec3 diffuseAlbedo = albedo * (1.0 - mat.metallic);
+    vec3 finalColor = diffuseAlbedo * 0.15 + diffuseAlbedo * diff * sunVisibility + mat.emissive;
+
+    // Opacity-mask soft edge feathering -- see ClusterResolve.comp's own comment.
+    if (cluster.maskTextureIndex != 0xFFFFFFFFu) {
+        float maskAlpha = SampleMaskAlpha(cluster.maskTextureIndex, uv);
+        float edgeBlend = smoothstep(0.5, 0.75, maskAlpha);
+        finalColor = mix(vec3(0.05, 0.05, 0.1), finalColor, edgeBlend);
+    }
+
+    imageStore(g_OutputNormal, pixel, vec4(OctEncode(normal), 0.0, 0.0));
+    imageStore(g_OutputDepth, pixel, vec4(entry.winningDepth, 0.0, 0.0, 0.0));
+    imageStore(g_OutputAlbedo, pixel, vec4(albedo, 1.0));
+    imageStore(g_OutputRoughnessMetallic, pixel, vec4(mat.roughness, mat.metallic, 0.0, 0.0));
+    imageStore(g_OutputColor, pixel, vec4(finalColor, 1.0));
+}

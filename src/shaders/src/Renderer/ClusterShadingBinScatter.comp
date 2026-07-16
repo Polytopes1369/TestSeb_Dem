@@ -1,0 +1,49 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+
+// Phase 1b, stage C of 3 (Classify -> Prefix-sum -> Scatter, see renderer::ClusterShadingBinPass's
+// own class comment for the full pipeline). One invocation per output pixel, identical dispatch
+// grid to stage A (Classify). Re-reads stage A's per-pixel scratch entry (avoiding re-deriving
+// visibility arbitration a second time); background pixels (SHADING_BIN_BACKGROUND_SENTINEL) are
+// skipped entirely -- stage A already fully resolved them. Foreground pixels claim their own slot
+// within their bin's contiguous range of the single shared g_SortedPixelList buffer via an atomic
+// increment of that bin's cursor (which stage B initialized to the bin's own prefix-sum offset),
+// so every pixel lands at a unique index with no collisions.
+
+#include "include/shading_bin_common.glsl"
+
+layout(std430, set = 0, binding = 0) readonly buffer PixelScratchSSBO {
+    PixelScratchEntry entries[]; // Written by ClusterShadingBinClassify.comp.
+} g_PixelScratch;
+
+layout(std430, set = 0, binding = 1) buffer BinCursorSSBO {
+    uint cursors[]; // Initialized by ClusterShadingBinPrefixSum.comp to each bin's own offset.
+} g_BinCursor;
+
+layout(std430, set = 0, binding = 2) writeonly buffer SortedPixelListSSBO {
+    SortedPixelEntry entries[]; // viewportWidth*viewportHeight entries total (not per-bin).
+} g_SortedPixelList;
+
+layout(push_constant) uniform ViewportSizePC {
+    uvec2 viewportSize;
+} pc;
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (pixel.x >= int(pc.viewportSize.x) || pixel.y >= int(pc.viewportSize.y)) {
+        return;
+    }
+    uint pixelLinearIndex = uint(pixel.y) * pc.viewportSize.x + uint(pixel.x);
+
+    PixelScratchEntry scratch = g_PixelScratch.entries[pixelLinearIndex];
+    if (scratch.materialSlot == SHADING_BIN_BACKGROUND_SENTINEL) {
+        return; // Already fully resolved by stage A -- nothing to scatter.
+    }
+
+    uint slot = atomicAdd(g_BinCursor.cursors[scratch.materialSlot], 1u);
+    g_SortedPixelList.entries[slot].pixelLinearIndex = pixelLinearIndex;
+    g_SortedPixelList.entries[slot].packedVisID = scratch.packedVisID;
+    g_SortedPixelList.entries[slot].winningDepth = scratch.winningDepth;
+}

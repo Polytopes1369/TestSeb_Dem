@@ -3,8 +3,9 @@
 // BVH proxy geometry built for ray tracing, geometry::BuildFallbackMesh / FallbackMeshBuilder.h)
 // through its pre-packed orthographic "Cards" (geometry::SurfaceCacheCardEntry, ClusterFormat.h)
 // into a shared global texture atlas, injecting albedo/normal/emissive/direct-lighting/radiance/
-// world-position per texel (direct-lighting shaded against renderer::ShadowMapPass's sun shadow
-// map plus any active point lights, see SetShadowMap/UpdateLighting and SurfaceCacheCapture.frag).
+// world-position per texel (direct-lighting shaded against renderer::VirtualShadowMapPass's sun
+// clipmap and point light cube faces, see SetVirtualShadowMap/UpdateLighting and
+// SurfaceCacheCapture.frag).
 // renderer::SurfaceCacheSWRTPass / SurfaceCacheRayTracingPass / SurfaceCacheGIInjectPass are the
 // GI consumers: they sample this atlas by reprojecting a hit position through a card's stored UV
 // rect (uvMin/uvMax) instead of re-evaluating heavy cluster geometry at every light bounce, and
@@ -70,6 +71,8 @@
 #include "renderer/LightingTypes.h"
 
 namespace renderer {
+
+    class VirtualShadowMapPass;
 
     class SurfaceCachePass {
     public:
@@ -143,21 +146,24 @@ namespace renderer {
         void UpdateVisibility(const maths::vec3& cameraPosition, const maths::vec3& cameraForward,
             const maths::vec3& cameraUp, float fovYRadians, float aspectRatio, float nearZ, float farZ);
 
-        // Binds the sun's shadow map (renderer::ShadowMapPass::GetShadowMapView/GetShadowMapSampler)
-        // into this pass's lighting descriptor set (set 0, binding 1 -- see SurfaceCacheCapture.frag).
-        // Must be called exactly once after Init(), before the first RecordCapture() call, and
-        // before any UpdateLighting() call -- the shadow map image itself is never recreated after
-        // ShadowMapPass::Init(), so this binding does not need to be refreshed again afterward
-        // (only the UBO contents change per frame, via UpdateLighting()).
-        void SetShadowMap(VkImageView shadowMapView, VkSampler shadowMapSampler);
+        // Binds renderer::VirtualShadowMapPass's own resources (physical page atlas + sampler,
+        // page table, feedback buffer, sun clipmap levels UBO, point light cube faces UBO) into
+        // this pass's lighting descriptor set (set 0, bindings 1-5 -- see SurfaceCacheCapture.frag
+        // / shadow_atlas_sampling.glsl / shadow_page_table.glsl / shadow_feedback.glsl /
+        // shadow_sun_sampling.glsl / shadow_point_sampling.glsl). Must be called exactly once after
+        // Init(), before the first RecordCapture() call, and before any UpdateLighting() call --
+        // none of these buffer/image handles are ever recreated after VirtualShadowMapPass::Init(),
+        // so this binding does not need to be refreshed again afterward (only their CONTENTS change
+        // per frame, via VirtualShadowMapPass::RecordBeginFrame()).
+        void SetVirtualShadowMap(const VirtualShadowMapPass& vsm);
 
-        // Writes `lights` and `lightViewProj` (renderer::ShadowMapPass::GetLightViewProj() from
-        // the SAME frame's ShadowMapPass::RecordCapture() call) into the persistently-mapped
-        // lighting UBO (set 0, binding 0) that every SurfaceCacheCapture.frag invocation reads.
-        // Call once per frame before RecordCapture() -- a plain memcpy into host-visible/coherent
-        // memory, no descriptor-set update needed (only SetShadowMap() touches the descriptor set
-        // itself).
-        void UpdateLighting(const SceneLights& lights, const maths::mat4& lightViewProj);
+        // Writes `lights` into the persistently-mapped lighting UBO (set 0, binding 0) that every
+        // SurfaceCacheCapture.frag invocation reads. Call once per frame before RecordCapture() --
+        // a plain memcpy into host-visible/coherent memory, no descriptor-set update needed (only
+        // SetVirtualShadowMap() touches the descriptor set itself). Unlike pre-Phase-3, this no
+        // longer takes a `lightViewProj` parameter -- shadow lookups read
+        // renderer::VirtualShadowMapPass's own dedicated UBOs (bindings 4/5) directly instead.
+        void UpdateLighting(const SceneLights& lights);
 
         // Records up to kCardsPerFrameBudget cards' worth of capture draws into `cmd`, draining
         // from the front of the dirty-card queue UpdateVisibility() fills (a card is dirty exactly

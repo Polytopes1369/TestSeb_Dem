@@ -7,6 +7,7 @@
 #include "core/EngineConfig.h" // config::VERTEX_SPACING default arg for GeneratePlane()
 #include "core/EntityData.h"
 #include "core/IDManager.h"
+#include "renderer/MaterialParameterTable.h"
 #include <array>
 #include <string_view>
 #include <vector>
@@ -81,6 +82,7 @@ public:
     uint32_t GetEntityCount() const { return kEntityCount; }
     VkBuffer GetEntityTransformBuffer() const { return m_EntityTransformBuffer; }
     VkBuffer GetEntityBuffer() const { return m_EntityBuffer; }
+    const renderer::MaterialTable& GetMaterialTable() const { return m_MaterialTable; }
 
 private:
     VkInstance m_Instance = VK_NULL_HANDLE;
@@ -180,11 +182,22 @@ private:
 
     // One EntityTransform slot per primitive meshID (box=0 .. floor=12); see struct_custo.glsl.
     static constexpr uint32_t kEntityCount = 13;
+    // The floor plane is always generated last (see GenerateGeometry()'s own GeneratePlane() call)
+    // -- excluded from GenerateRandomMaterialTable()'s transparent/translucent categories in
+    // BuildEntityData() below (a see-through 300x300m ground plane would read as broken, not
+    // stylized, and would be the single worst-case primitive for TransparentForwardPass's
+    // unsorted-between-entities blending, being by far the largest on screen).
+    static constexpr uint32_t kFloorEntityIndex = kEntityCount - 1;
 
     // CPU-authoritative entity records: built once by BuildEntityData() (meshID assigned via
     // core::IDManager) before GenerateGeometry() runs, then copied to m_EntityBuffer by
     // UploadEntityData(). One entry per primitive (box=0 .. chamferBox=11), see struct_custo.glsl.
     std::array<core::EntityData, kEntityCount> m_EntityData{};
+
+    // Randomly-generated PBR materials (renderer::GenerateRandomMaterialTable), one slot per
+    // entity -- built once by BuildEntityData(), uploaded to the GPU by ClusterResolvePass::Init()
+    // via ClusterRenderPipelineCreateInfo::materialTable.
+    renderer::MaterialTable m_MaterialTable{};
 
 #ifndef NDEBUG
     const bool m_EnableValidationLayers = true;

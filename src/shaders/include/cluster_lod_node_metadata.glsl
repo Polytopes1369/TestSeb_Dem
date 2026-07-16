@@ -33,6 +33,7 @@ struct LODNodeMetadata {
     uint maskTextureIndex;
     float maxWPOAmplitude;
     uint entityID;        // geometry::ClusterIndexEntry::entityID -- the owning entity's meshID.
+    uint materialID;       // geometry::ClusterIndexEntry::materialID -- indexes g_MaterialParams.
 };
 
 #endif // CLUSTER_LOD_NODE_METADATA_GLSL

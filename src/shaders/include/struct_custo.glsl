@@ -15,6 +15,7 @@ const uint ENTITY_FLAG_CAST_SHADOWS   = 1u << 0; // 0x01
 const uint ENTITY_FLAG_IS_INTERACTIVE = 1u << 1; // 0x02
 const uint ENTITY_FLAG_IS_DYNAMIC     = 1u << 2; // 0x04
 const uint ENTITY_FLAG_USE_CUSTOM_FOG = 1u << 3; // 0x08
+const uint ENTITY_FLAG_IS_TRANSPARENT = 1u << 4; // 0x10 -- see core::EntityFlags::IsTransparent (EntityData.h).
 
 // Helper to test flags easily in GLSL
 bool GetFlag(uint flags, uint f) {

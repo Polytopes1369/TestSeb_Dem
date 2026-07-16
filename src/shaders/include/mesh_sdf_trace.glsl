@@ -24,7 +24,11 @@
 // by the caller is used directly against every entity's own local-space SDF volume, with no
 // per-entity inverse-transform step anywhere below.
 
-const uint kMaxTracedEntities = 64u;
+// Must match config::lumen::MAX_TRACED_ENTITIES (EngineConfig.h) exactly -- GLSL cannot include
+// that C++ header directly, so this literal has to be kept manually in sync (see
+// SurfaceCacheTraceContext.cpp's own truncation-warning comment for the same requirement stated
+// from the C++ side).
+const uint kMaxTracedEntities = 32u;
 const float kFarDistance = 1.0e4;
 const float kSphereTraceEpsilon = 1.0e-3;
 const uint kSphereTraceMaxSteps = 96u;

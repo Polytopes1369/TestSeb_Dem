@@ -34,6 +34,11 @@ struct DebugState {
     // live consumer yet (see that setter's own comment), so it defaults to true here only to keep
     // it exercisable in Debug -- Release hardcodes it off regardless of this default.
     bool worldProbesEnabled = true;
+    // renderer::ClusterRenderPipeline::SetDebugReflectionsEnabled -- gates the Phase 2 (UE5.8
+    // parity roadmap) specular reflections trace/temporal/gather trio ([12b2] in RecordFrame) so
+    // its cost/contribution can be A/B'd, same as ssrtEnabled above (this pass has a real live
+    // consumer from its first frame, unlike worldProbesEnabled).
+    bool reflectionsEnabled = true;
     // Set by the 'K' key, consumed (and reset) once per frame by the main loop, which calls
     // renderer::ClusterRenderPipeline::RequestDebugDAGCutGapsDump() -- see that method's own
     // comment for the investigation this is part of.
@@ -122,6 +127,17 @@ static void KeyCallback(GLFWwindow* window, int key, int scancode, int action, i
         g_DebugState.worldProbesEnabled = !g_DebugState.worldProbesEnabled;
         LOG_INFO(std::format("[Debug] World Probe Grid (not yet sampled by shading): {}", g_DebugState.worldProbesEnabled ? "ON" : "OFF"));
         break;
+    case GLFW_KEY_R:
+        g_DebugState.reflectionsEnabled = !g_DebugState.reflectionsEnabled;
+        LOG_INFO(std::format("[Debug] Specular Reflections: {}", g_DebugState.reflectionsEnabled ? "ON" : "OFF"));
+        break;
+    case GLFW_KEY_M:
+        // Phase 3 (UE5.8 parity roadmap): every NUMPAD key is already claimed by an existing view
+        // mode/toggle (see the cases above), so this one new view mode gets a plain letter key
+        // instead -- 'M' for shadow "Map" cascades.
+        g_DebugState.viewMode = DEBUG_VIEW_SHADOW_CASCADES;
+        LOG_INFO("[Debug] View Mode: SHADOW CASCADES");
+        break;
     case GLFW_KEY_K:
         // See renderer::ClusterRenderPipeline::RequestDebugDAGCutGapsDump()'s own comment: this
         // one-shot dump walks every leaf's ancestor chain looking for DAG-cut regions with zero
@@ -201,6 +217,7 @@ int main() {
     pipelineInfo.cacheFilePath = "scene.cache";
     pipelineInfo.entityTransformBuffer = vkContext.GetEntityTransformBuffer();
     pipelineInfo.entityDataBuffer = vkContext.GetEntityBuffer();
+    pipelineInfo.materialTable = vkContext.GetMaterialTable();
 
     // Init is wrapped so an uncaught std::runtime_error (GpuBuffer allocation failure, missing
     // SPIR-V file, ...) surfaces as a logged message instead of a silent std::terminate -- the
@@ -268,6 +285,7 @@ int main() {
         clusterPipeline.SetDebugRadiosityEnabled(g_DebugState.radiosityEnabled);
         clusterPipeline.SetDebugSSRTEnabled(g_DebugState.ssrtEnabled);
         clusterPipeline.SetDebugWorldProbesEnabled(g_DebugState.worldProbesEnabled);
+        clusterPipeline.SetDebugReflectionsEnabled(g_DebugState.reflectionsEnabled);
         if (g_DebugState.dumpDAGCutGapsRequested) {
             clusterPipeline.RequestDebugDAGCutGapsDump();
             g_DebugState.dumpDAGCutGapsRequested = false;

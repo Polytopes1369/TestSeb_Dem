@@ -152,7 +152,7 @@ bool ClusterRenderPipeline::Init(
                       createInfo.commandPool, createInfo.queue,
                       m_PagePool.GetPageTableBuffer(),
                       createInfo.entityTransformBuffer, leafCount,
-                      indexEntries, dagEntries);
+                      indexEntries, dagEntries, createInfo.entityDataBuffer);
 
   // Wires the async streaming stack for real -- see GeometryStreamingCoordinator's own class
   // comment. Needs only the cache file path (re-opened for unbuffered/overlapped reads,
@@ -265,19 +265,37 @@ bool ClusterRenderPipeline::Init(
       m_MaskGenerator.GetMaskImageInfos(),
       m_WPOGlobalsBuffer.Handle(),
       createInfo.entityTransformBuffer,
-      createInfo.entityDataBuffer);
+      createInfo.entityDataBuffer,
+      createInfo.materialTable.params);
+
+  // Phase 1b: the shading-bin sort pass needs m_Resolve's own 5 output image views (its Classify
+  // stage writes background pixels directly into them, see ClusterShadingBinPass's own class
+  // comment) -- must run after m_Resolve.Init() above for exactly that reason. m_Resolve's own
+  // InitBinnedResolve() then runs AFTER m_ShadingBin.Init(), for the opposite reason (its
+  // descriptor set needs m_ShadingBin's sorted-pixel-list/bin-offsets/bin-histogram buffers) --
+  // see that method's own comment for why these two calls cannot be collapsed into one ordering.
+  m_ShadingBin.Init(createInfo.device, createInfo.allocator, createInfo.commandPool,
+                    createInfo.queue, createInfo.renderExtent,
+                    m_OcclusionCulling.GetClusterMetadataBuffer(),
+                    createInfo.visBufferClusterIDView, createInfo.visBufferTriangleIDView,
+                    createInfo.depthImageView, m_SoftwareRaster.GetVisBufferAtomicView(),
+                    m_Resolve.GetOutputColorView(), m_Resolve.GetOutputNormalView(),
+                    m_Resolve.GetOutputDepthView(), m_Resolve.GetOutputAlbedoView(),
+                    m_Resolve.GetOutputRoughnessMetallicView());
+  m_Resolve.InitBinnedResolve(createInfo.device, createInfo.commandPool, createInfo.queue, m_ShadingBin);
 
   // =========================================================================================
-  // STEP 7 -- Lumen-style GI infrastructure: sun shadow map, Surface Cache, Global SDF clipmap
-  // (see ClusterRenderPipeline.h's own class-comment addendum on why these are unconditional,
-  // not Debug-only, unlike the stats/overlay block and m_SDFRayMarch below). Each pass re-reads
-  // the same consolidated .cache file independently (this codebase's established "self-contained
-  // pass" convention -- see e.g. renderer::ShadowMapPass's own class comment).
+  // STEP 7 -- Lumen-style GI infrastructure: sun+point-light Virtual Shadow Maps (Phase 3), Surface
+  // Cache, Global SDF clipmap (see ClusterRenderPipeline.h's own class-comment addendum on why
+  // these are unconditional, not Debug-only, unlike the stats/overlay block and m_SDFRayMarch
+  // below). Each pass re-reads the same consolidated .cache file independently (this codebase's
+  // established "self-contained pass" convention -- see e.g. renderer::VirtualShadowMapPass's own
+  // class comment).
   // =========================================================================================
-  if (!m_ShadowMap.Init(createInfo.device, createInfo.allocator,
-                        createInfo.commandPool, createInfo.queue,
-                        createInfo.cacheFilePath)) {
-    LOG_ERROR("[ClusterRenderPipeline] Failed to initialize ShadowMapPass.");
+  if (!m_VirtualShadowMap.Init(createInfo.device, createInfo.allocator,
+                               createInfo.commandPool, createInfo.queue,
+                               createInfo.cacheFilePath)) {
+    LOG_ERROR("[ClusterRenderPipeline] Failed to initialize VirtualShadowMapPass.");
     return false;
   }
   if (!m_SurfaceCache.Init(createInfo.device, createInfo.allocator,
@@ -286,9 +304,52 @@ bool ClusterRenderPipeline::Init(
     LOG_ERROR("[ClusterRenderPipeline] Failed to initialize SurfaceCachePass.");
     return false;
   }
-  // One-time wiring (see SurfaceCachePass::SetShadowMap's own comment): the shadow map's view/
-  // sampler never change again after ShadowMapPass::Init(), so this binding is never refreshed.
-  m_SurfaceCache.SetShadowMap(m_ShadowMap.GetShadowMapView(), m_ShadowMap.GetShadowMapSampler());
+  // One-time wiring (see SurfaceCachePass::SetVirtualShadowMap's own comment): none of
+  // VirtualShadowMapPass's exposed buffer/image handles are ever recreated after Init(), so this
+  // binding is never refreshed again. m_Resolve's own equivalent binding is deferred until after
+  // m_Resolve.InitBinnedResolve() above has already run (SetVirtualShadowMap() needs BOTH of
+  // m_Resolve's descriptor sets to already exist) -- see the call further below.
+  m_SurfaceCache.SetVirtualShadowMap(m_VirtualShadowMap);
+  m_Resolve.SetVirtualShadowMap(m_VirtualShadowMap);
+
+  // Forward-rendered translucent/transparent materials (see TransparentForwardPass's own class
+  // comment) -- reuses the SAME indexEntries/dagEntries this function loaded above for
+  // m_LODSelection.Init(), and the SAME page pool/compressed pool/entity/WPO buffer handles every
+  // opaque pass already borrows.
+  m_TransparentForward.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
+                            m_PagePool.GetPageTableBuffer(), m_PagePool.GetPhysicalPoolBuffer(),
+                            createInfo.entityTransformBuffer, createInfo.entityDataBuffer, m_WPOGlobalsBuffer.Handle(),
+                            createInfo.materialTable.params, indexEntries, dagEntries,
+                            ClusterResolvePass::kOutputColorFormat, createInfo.depthFormat);
+  m_TransparentForward.SetVirtualShadowMap(m_VirtualShadowMap);
+
+  // Sun orientation: Toronto (lat 43.6532N, lon 79.3832W), July 16, 16:30 local (EDT, UTC-4) --
+  // a standard NOAA solar-position computation (equation of time + hour angle + declination for
+  // day-of-year 197) gives solar elevation ~45.5 degrees and azimuth ~255.3 degrees (measured
+  // clockwise from North -- i.e. WSW, past due-south/solar-noon since 16:30 EDT is mid-afternoon).
+  // Axis convention chosen for this scene (no real-world map exists, Y is up): +X = East, -Z =
+  // North, so azimuth Az and elevation El convert to the unit vector FROM the scene TOWARD the sun
+  // as (cos(El)*sin(Az), sin(El), -cos(El)*cos(Az)); DirectionalLight::direction is the reverse of
+  // that (points FROM the light TOWARD the scene, see LightingTypes.h's own convention comment).
+  // The lower afternoon elevation (vs. a near-overhead default) is what actually produces long,
+  // clearly readable cast shadows instead of short near-vertical ones.
+  m_SceneLights.sun.direction = maths::vec3(0.678f, -0.713f, -0.178f).Normalize();
+  // Mild warm tint for late-afternoon sunlight (intensity left at its existing default -- a 45
+  // degree summer sun is still strong, not golden-hour-grazing).
+  m_SceneLights.sun.color = maths::vec3(1.0f, 0.88f, 0.72f);
+
+  // Phase 3 (UE5.8 parity roadmap) verification: SceneLights::pointLights defaults to an empty
+  // array (see LightingTypes.h) -- with zero point lights ever authored, Phase 3's point-light
+  // Virtual Shadow Maps would be entirely unexercised and unverifiable (the same difficulty this
+  // roadmap's own Phase 2 ran into for its reflections). One point light is authored here,
+  // positioned above and offset from the "box" entity (materialID 0, world position (-3,0,-3),
+  // see VulkanContext::GridSlot()/BuildEntityData()) so its shadow has a genuine chance of falling
+  // visibly toward a neighboring grid cell.
+  m_SceneLights.pointLights[0].position = maths::vec3{ -3.0f, 2.5f, -1.5f };
+  m_SceneLights.pointLights[0].color = maths::vec3{ 1.0f, 0.85f, 0.6f };
+  m_SceneLights.pointLights[0].intensity = 4.0f;
+  m_SceneLights.pointLights[0].radius = 8.0f;
+  m_SceneLights.pointLightCount = 1;
 
   if (!m_GlobalSDF.Init(createInfo.device, createInfo.allocator,
                         createInfo.commandPool, createInfo.queue,
@@ -326,6 +387,15 @@ bool ClusterRenderPipeline::Init(
                             createInfo.queue, createInfo.renderExtent, m_TraceContext, m_SurfaceCache,
                             m_SurfaceCacheRT, m_Resolve)) {
     LOG_ERROR("[ClusterRenderPipeline] Failed to initialize ScreenProbeGIPass.");
+    return false;
+  }
+  // Phase 2 (UE5.8 parity roadmap): specular reflections -- same dependencies as m_ScreenProbeGI
+  // above (needs m_Resolve's GBuffer, including its Phase 1a roughness/metallic channel, plus
+  // m_TraceContext/m_SurfaceCacheRT for its own trace pass).
+  if (!m_Reflection.Init(createInfo.device, createInfo.allocator, createInfo.commandPool,
+                         createInfo.queue, createInfo.renderExtent, m_TraceContext, m_SurfaceCache,
+                         m_SurfaceCacheRT, m_Resolve)) {
+    LOG_ERROR("[ClusterRenderPipeline] Failed to initialize ReflectionPass.");
     return false;
   }
   // World Probe grid (Lumen "Translucency Volume") -- reuses the same shared trace-scene sets and
@@ -404,6 +474,7 @@ void ClusterRenderPipeline::Shutdown() {
   m_LastStatsSampleBytes = 0;
   m_SDFRayMarch.Shutdown();
 #endif
+  m_Reflection.Shutdown();
   m_ScreenProbeGI.Shutdown();
   m_Denoiser.Shutdown();
   m_WorldProbes.Shutdown();
@@ -412,7 +483,7 @@ void ClusterRenderPipeline::Shutdown() {
   m_TraceContext.Shutdown();
   m_GlobalSDF.Shutdown();
   m_SurfaceCache.Shutdown();
-  m_ShadowMap.Shutdown();
+  m_VirtualShadowMap.Shutdown();
   m_PrevViewProj = maths::mat4{};
   m_HasPrevViewProj = false;
   m_FrameIndex = 0;
@@ -420,6 +491,8 @@ void ClusterRenderPipeline::Shutdown() {
   m_DebugTraceMode = 0;
 #endif
 
+  m_TransparentForward.Shutdown();
+  m_ShadingBin.Shutdown();
   m_Resolve.Shutdown();
   m_SoftwareRaster.Shutdown();
   m_HardwareRaster.Shutdown();
@@ -526,26 +599,29 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
   m_LODSelection.RecordClear(cmd);
 
   // =========================================================================================
-  // [1z] Lumen-style GI infrastructure: sun shadow map -> Surface Cache capture -> Global SDF
-  // clipmap streaming -> (Debug-only) SDF ray march debug visualization. Independent of the
-  // Nanite VisBuffer/HZB machinery above and below (no shared images, no fence contention -- see
-  // ClusterRenderPipeline.h's own class-comment addendum), so it can run anywhere in the frame;
-  // placed early, right after the worklist clears, so it overlaps with the GPU's own internal
-  // scheduling of the culling/streaming work that follows rather than sitting at the tail end.
+  // [1z] Lumen-style GI infrastructure: Virtual Shadow Map page requests/renders (Phase 3) ->
+  // Surface Cache capture -> Global SDF clipmap streaming -> (Debug-only) SDF ray march debug
+  // visualization. Independent of the Nanite VisBuffer/HZB machinery above and below (no shared
+  // images, no fence contention -- see ClusterRenderPipeline.h's own class-comment addendum), so
+  // it can run anywhere in the frame; placed early, right after the worklist clears, so it
+  // overlaps with the GPU's own internal scheduling of the culling/streaming work that follows
+  // rather than sitting at the tail end.
   // =========================================================================================
   {
     // Sun direction is fixed for now (m_SceneLights' own default, see LightingTypes.h) -- a
     // future day/night system would rotate it per frame instead.
     const maths::vec3 sunDirection = m_SceneLights.sun.direction;
 
-    // 1. Shadow map first: SurfaceCachePass's shadow lookup (below) needs THIS frame's light
-    // view-projection, and ShadowMapPass::RecordCapture's own trailing barrier already makes its
-    // depth writes visible to a fragment-shader sampled read (see that method's own comment).
-    m_ShadowMap.RecordCapture(cmd, sunDirection);
+    // 1. Virtual Shadow Maps first: SurfaceCachePass's/m_Resolve's shadow lookups (below and at
+    // [12]) need THIS frame's VSM view-projection matrices + any pages rendered this frame already
+    // visible -- RecordBeginFrame()'s own trailing barrier (when it renders any page) covers that.
+    // See VirtualShadowMapPass's own class comment for the full one-frame-lag feedback contract.
+    m_VirtualShadowMap.RecordBeginFrame(cmd, sunDirection, m_SceneLights, cameraFrameInfo.position);
 
-    // 2. Surface Cache: feed this frame's light data (the light view-proj THIS frame's shadow map
-    // was just rendered with, not a stale one) before the visibility-driven capture draws.
-    m_SurfaceCache.UpdateLighting(m_SceneLights, m_ShadowMap.GetLightViewProj());
+    // 2. Surface Cache: feed this frame's light data before the visibility-driven capture draws --
+    // shadow lookups now read renderer::VirtualShadowMapPass's own UBOs directly (bound once via
+    // SetVirtualShadowMap()), no per-frame light-view-proj parameter needed here anymore.
+    m_SurfaceCache.UpdateLighting(m_SceneLights);
     m_SurfaceCache.UpdateVisibility(cameraFrameInfo.position, cameraFrameInfo.forward,
                                     maths::vec3{0.0f, 1.0f, 0.0f}, cameraFrameInfo.fovYRadians,
                                     cameraFrameInfo.aspectRatio, cameraFrameInfo.nearZ,
@@ -576,8 +652,8 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
       for (uint32_t bounce = 0; bounce < kRadiosityBounceCount; ++bounce) {
         m_GIInject.RecordInject(cmd, m_TraceContext, m_SurfaceCache, traceMode);
 
-        // Unlike SurfaceCachePass::RecordCapture/ShadowMapPass::RecordCapture/GlobalSDFPass::
-        // RecordUpdate, SurfaceCacheGIInjectPass::RecordInject does NOT end with its own trailing
+        // Unlike SurfaceCachePass::RecordCapture/VirtualShadowMapPass::RecordBeginFrame/
+        // GlobalSDFPass::RecordUpdate, SurfaceCacheGIInjectPass::RecordInject does NOT end with its own trailing
         // barrier -- its read-modify-write of the radiance atlas (imageLoad/imageStore, STORAGE
         // access) must be made visible here, explicitly, before the NEXT bounce's own RecordInject
         // call samples that same atlas (surface_cache_sampling.glsl's g_SurfaceCacheRadiance) --
@@ -987,17 +1063,39 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
   }
 
   // =========================================================================================
-  // [12] Resolve: per-pixel hardware-vs-software arbitration + barycentric
-  // reconstruction + material evaluation into the resolve pass's own RGBA8
-  // output image. The software rasterizer's atomic writes are already visible
-  // (RecordRaster's trailing COMPUTE -> COMPUTE barrier).
+  // [11b] Phase 1b: shading-bin classify + sort (renderer::ClusterShadingBinPass), only for the
+  // normal (non-debug-visualization) view path -- every debug view (DEBUG_VIEW_NANITE_TRIANGLES,
+  // DEBUG_VIEW_LUMEN, etc.) instead falls back to [12] Resolve's original full-screen dispatch
+  // unchanged, since duplicating 15 debug-view branches into the leaner binned shader
+  // (ClusterResolveBinned.comp) would only maintain two copies of the same visualization code for
+  // no benefit -- see renderer::ClusterResolvePass::RecordResolveBinned's own comment. Release has
+  // no debug view switch at all (camera.debugViewMode does not exist as a field, see
+  // core/Camera.h), so Release always takes the binned path -- zero runtime branch, matching
+  // CLAUDE.md's build-separation rule.
+  // [12] Resolve: per-pixel hardware-vs-software arbitration + barycentric reconstruction +
+  // material evaluation into the resolve pass's own RGBA8 output image (either path). The
+  // software rasterizer's atomic writes are already visible (RecordRaster's trailing COMPUTE ->
+  // COMPUTE barrier).
   // =========================================================================================
-  maths::mat4 prevViewProjForResolve = m_HasPrevViewProj ? m_PrevViewProj : viewProj;
-  m_Resolve.RecordResolve(cmd, viewProj, prevViewProjForResolve
 #ifndef NDEBUG
-    , camera.debugViewMode
+  if (camera.debugViewMode == DEBUG_VIEW_NORMAL) {
+    m_ShadingBin.RecordClassifyAndSort(cmd, m_RenderExtent);
+    m_Resolve.RecordResolveBinned(cmd, viewProj, m_SceneLights.sun.direction, m_ShadingBin);
+  } else {
+    maths::mat4 prevViewProjForResolve = m_HasPrevViewProj ? m_PrevViewProj : viewProj;
+    m_Resolve.RecordResolve(cmd, viewProj, prevViewProjForResolve, m_SceneLights.sun.direction, camera.debugViewMode);
+  }
+#else
+  m_ShadingBin.RecordClassifyAndSort(cmd, m_RenderExtent);
+  m_Resolve.RecordResolveBinned(cmd, viewProj, m_SceneLights.sun.direction, m_ShadingBin);
 #endif
-  );
+
+  // Captures THIS frame's shadow-page miss reports (written by SurfaceCacheCapture.frag at [1z]
+  // above and by whichever ClusterResolve.comp/ClusterResolveBinned.comp path just ran) for
+  // VirtualShadowMapPass::RecordBeginFrame() to consume next frame -- see that class' own
+  // one-frame-lag contract. Placed here, right after every pass that can call
+  // RequestShadowPageResidency() this frame has run.
+  m_VirtualShadowMap.RecordEndFrame(cmd);
 
   // [12b] Screen Space Probe GI: trace -> temporal reprojection/accumulation -> bilateral
   // gather, read-modify-writing m_Resolve's own output color image directly (see
@@ -1026,6 +1124,37 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
         , camera.debugViewMode
 #endif
       );
+    }
+  }
+
+  // =========================================================================================
+  // [12b2] Phase 2 (UE5.8 parity roadmap): specular reflections -- trace -> temporal
+  // reprojection/accumulation -> Fresnel-weighted gather, read-modify-writing m_Resolve's own
+  // output color image directly, the exact same convention as [12b] above (see
+  // renderer::ReflectionPass's own class comment for the full per-frame call contract). Grouped
+  // right after [12b] since both read the same GBuffer and compose into the same color image;
+  // runs BEFORE [12d]'s À-Trous denoiser deliberately -- reflections have no dedicated spatial
+  // filter of their own, they inherit whatever spatial smoothing the existing denoiser already
+  // applies to the rest of the composited image (see this phase's approved plan's own "Hors
+  // scope" note).
+  //
+  // `reflectionsEnabled` (debug-only toggle, main.cpp's 'R' key) gates the trio entirely, same
+  // A/B-ability as `ssrtEnabled` above. Release always runs the trio (see
+  // SetDebugReflectionsEnabled()'s own comment for why this differs from worldProbesEnabled).
+  // =========================================================================================
+  {
+    maths::mat4 prevViewProjForReflection = m_HasPrevViewProj ? m_PrevViewProj : maths::mat4{};
+    m_Reflection.RecordUpdateViewParams(cmd, viewProj, prevViewProjForReflection, cameraPositionWorld);
+
+#ifndef NDEBUG
+    bool reflectionsEnabled = m_DebugReflectionsEnabled;
+#else
+    bool reflectionsEnabled = true;
+#endif
+    if (reflectionsEnabled) {
+      m_Reflection.RecordTrace(cmd, m_TraceContext, m_TraceContext.GetEntityCount(), traceMode, m_FrameIndex);
+      m_Reflection.RecordTemporal(cmd);
+      m_Reflection.RecordGather(cmd);
     }
   }
 
@@ -1124,6 +1253,22 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
     depInfo.memoryBarrierCount = 1;
     depInfo.pMemoryBarriers = &barrier;
     vkCmdPipelineBarrier2(cmd, &depInfo);
+  }
+
+  // =========================================================================================
+  // [13c] Forward-rendered translucent/transparent materials -- drawn onto whichever image [14]'s
+  // blit will actually read (m_Denoiser's output when [12d] applied it, m_Resolve's own color
+  // image otherwise -- same `applyDenoise` condition the debug overlay below and the blit itself
+  // both use), so transparency composites on top of the fully-lit (GI/reflections included) opaque
+  // scene. No-op internally if TransparentForwardPass::Init() found zero transparent leaf clusters
+  // this run. Must run before the debug overlay below so the HUD stays on top of everything.
+  // =========================================================================================
+  {
+    VkImage transparentTargetImage = applyDenoise ? m_Denoiser.GetOutputImage() : m_Resolve.GetOutputColorImage();
+    VkImageView transparentTargetView = applyDenoise ? m_Denoiser.GetOutputView() : m_Resolve.GetOutputColorView();
+    m_TransparentForward.RecordDraw(cmd, transparentTargetImage, transparentTargetView, m_DepthImageView,
+        m_RenderExtent, camera.view, camera.proj, m_Decompression.GetDecompressedIndexPoolBuffer(),
+        m_SceneLights.sun.direction);
   }
 
 #ifndef NDEBUG

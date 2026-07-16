@@ -101,7 +101,12 @@ namespace renderer {
         // LOD cut so ClusterLODCompact.comp can copy it verbatim into ClusterCullMetadata::entityID
         // (see that struct's own comment) for the resolve pass's NANITE_INSTANCES debug view.
         uint32_t entityID = 0;
-        float _padTrailing[1] = { 0.0f };
+        // geometry::ClusterIndexEntry::materialID, carried through the LOD cut the same way as
+        // entityID above so ClusterLODCompact.comp can copy it verbatim into
+        // ClusterCullMetadata::materialID for ClusterResolve.comp's real PBR material lookup.
+        // Occupies what used to be this struct's trailing padding float -- same 96-byte std430
+        // stride, no size change.
+        uint32_t materialID = 0;
     };
     static_assert(sizeof(LODNodeMetadata) == 96,
         "LODNodeMetadata must match LODNodeMetadata in cluster_lod_node_metadata.glsl exactly (std430 layout)");
@@ -122,11 +127,16 @@ namespace renderer {
         // per-entity rotation buffer VulkanContext::UpdateEntityRotations() re-uploads every frame
         // (VulkanContext::GetEntityTransformBuffer()) -- bound into the ScreenError and Compact
         // passes so their cluster-bounds tests stay in sync with each entity's current rotation
-        // instead of its rest pose (see cluster_entity_transform.glsl).
+        // instead of its rest pose (see cluster_entity_transform.glsl). `entityDataBuffer`
+        // (renderer::VulkanContext's own, same handle ClusterResolvePass::Init receives) is bound
+        // read-only into ClusterLODCompact.comp's descriptor set (binding 6) so it can exclude
+        // core::EntityFlags::IsTransparent entities from this candidate list -- see that shader's
+        // own comment.
         void Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
             VkBuffer pageTableBuffer, VkBuffer entityTransformBuffer, uint32_t leafCount,
             const std::vector<geometry::ClusterIndexEntry>& indexEntries,
-            const std::vector<geometry::DAGNodeEntry>& dagEntries);
+            const std::vector<geometry::DAGNodeEntry>& dagEntries,
+            VkBuffer entityDataBuffer);
 
         void Shutdown();
 

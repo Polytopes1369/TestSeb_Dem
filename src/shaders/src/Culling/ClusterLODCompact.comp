@@ -10,6 +10,7 @@
 
 #include "include/cluster_culling_common.glsl"
 #include "include/cluster_lod_node_metadata.glsl"
+#include "include/struct_custo.glsl"
 
 #define PAGE_TABLE_SET 0
 #define PAGE_TABLE_BINDING 2
@@ -47,6 +48,16 @@ layout(std430, set = 0, binding = 5) writeonly buffer CandidateMetadataSSBO {
     ClusterCullMetadata clusters[];
 } g_CandidateMetadata;
 
+// Transparent-entity exclusion: a Visibility Buffer stores exactly one winning surface per pixel,
+// so translucent/transparent materials (core::EntityFlags::IsTransparent) can never be shaded
+// correctly by the opaque VisBuffer resolve pipeline this candidate list feeds -- see
+// renderer::MaterialParameters::alpha's own comment. Their clusters are rendered instead by a
+// separate renderer::TransparentForwardPass with its own, independent candidate gathering (not a
+// second output of this shader -- see that class' own comment for why).
+layout(std430, set = 0, binding = 6) readonly buffer EntityDataBuffer {
+    EntityData entityData[];
+};
+
 layout(local_size_x = 64) in;
 
 void main() {
@@ -64,6 +75,10 @@ void main() {
     bool shouldDraw = (g_DAGDecisions.decisions[index] == DAG_DECISION_DRAW) || (g_ForceDraw.forceDraw[index] != 0u);
     if (!shouldDraw) {
         return;
+    }
+
+    if (GetFlag(entityData[node.entityID].flags, ENTITY_FLAG_IS_TRANSPARENT)) {
+        return; // Shaded by TransparentForwardPass instead -- see EntityDataBuffer's own comment.
     }
 
     uint physicalPageIndex = g_GeometryPageTable.physicalPageIndex[node.logicalPageID];
@@ -90,6 +105,7 @@ void main() {
     meta.maxWPOAmplitude = node.maxWPOAmplitude;
     meta.maskTextureIndex = node.maskTextureIndex;
     meta.entityID = node.entityID;
+    meta.materialID = node.materialID;
 
     uint slot = atomicAdd(g_CandidateCount.count, 1u);
     if (slot < g_CandidateMetadata.clusters.length()) {
