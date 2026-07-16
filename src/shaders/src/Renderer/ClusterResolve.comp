@@ -48,6 +48,7 @@
 #include "include/half_space_raster.glsl"
 #include "include/procedural_material.glsl"
 #include "include/octahedral.glsl"
+#include "include/wpo_deformation.glsl"
 
 #define MASK_ARRAY_SET 0
 #define MASK_ARRAY_BINDING 8
@@ -80,6 +81,17 @@ layout(std140, set = 0, binding = 7) uniform ResolveViewParamsUBO {
 layout(rg16f, set = 0, binding = 9) uniform writeonly image2D g_OutputNormal;
 layout(r32f, set = 0, binding = 10) uniform writeonly image2D g_OutputDepth;
 layout(rgba8, set = 0, binding = 11) uniform writeonly image2D g_OutputAlbedo;
+
+// Same WPOGlobalsUBO renderer::ClusterRenderPipeline uploads once per frame and both rasterizers
+// already bind (ClusterRaster.vert / ClusterSoftwareRaster.comp) -- this shader needs it too, to
+// reapply the exact same sway deformation before re-deriving barycentric weights below (see this
+// binding's own Init()-time comment in ClusterResolvePass::Init).
+layout(std140, set = 0, binding = 12) uniform WPOGlobalsUBO {
+    float globalTime;
+    float _pad0;
+    float _pad1;
+    float _pad2;
+} g_WPOGlobals;
 
 #ifdef _DEBUG
 layout(push_constant) uniform DebugPC {
@@ -141,21 +153,33 @@ void main() {
     // --- Step 1: hardware vs software, whichever is nearer ---
     uint hwClusterSlot = imageLoad(g_HWClusterIDImage, pixel).r;
     uint hwTriangleOrdinal = imageLoad(g_HWTriangleIDImage, pixel).r;
-    float hwDepth = texelFetch(g_HWDepthTexture, pixel, 0).r; // NDC [0,1], non-reversed -- smaller is nearer.
+    float hwDepth = texelFetch(g_HWDepthTexture, pixel, 0).r; // NDC [0,1], reversed-Z -- LARGER is nearer.
     bool hwHasData = hwClusterSlot != 0xFFFFFFFFu; // Matches main.cpp's VisBuffer clear value (kInvalidClusterID).
 
     uint64_t swPacked = imageLoad(g_SWVisBufferAtomic, pixel).x;
     bool swHasData = swPacked != 0uL; // Matches ClearVisBufferAtomic.comp's clear value.
     uint swDepthBits = uint(swPacked >> 32);
     uint swVisibilityID = uint(swPacked & 0xFFFFFFFFuL);
-    // Inverse of ClusterSoftwareRaster.comp's own encoding (depthBits = (1 - ndcDepth) * UINT32_MAX).
-    float swDepth = 1.0 - (float(swDepthBits) / 4294967295.0);
+    // Direct decode, reversed-Z (see cluster_software_raster_core.glsl's own encoding comment --
+    // no more "1.0 -" inversion, larger swDepthBits already means nearer).
+    float swDepth = float(swDepthBits) / 4294967295.0;
+
+    // Epsilon-tolerant, single source of truth for "which path wins," reused by every consumer
+    // below (arbitration, GBuffer depth capture, and the OVERDRAWS/DEPTH debug views) so they can
+    // never disagree with each other. The epsilon absorbs the residual hw-vs-sw depth disagreement
+    // documented in ClusterSoftwareRasterPass's own class comment (independent rasterizers, no
+    // shared depth buffer, plus per-cluster position requantization at cluster boundaries) instead
+    // of a zero-tolerance `>=` compare picking a winner based on sub-ULP floating-point noise that
+    // shifts every frame as the camera moves -- a real, if partial, mitigation for the z-fighting
+    // this codebase's own bug reports describe at hw/sw cluster-routing boundaries.
+    const float kDepthArbitrationEpsilon = 1.0e-6;
+    bool hwWins = hwHasData && (!swHasData || hwDepth >= swDepth - kDepthArbitrationEpsilon);
 
     uint clusterSlotIndex;
     uint triangleOrdinal;
     bool hasAnyData = hwHasData || swHasData;
 
-    if (hwHasData && (!swHasData || hwDepth <= swDepth)) {
+    if (hwWins) {
         clusterSlotIndex = hwClusterSlot;
         triangleOrdinal = hwTriangleOrdinal;
     } else {
@@ -165,11 +189,11 @@ void main() {
     }
 
     vec3 finalColor = vec3(0.05, 0.05, 0.1);
-    // GBuffer defaults for a background (no-geometry) pixel: depth = 1.0 (the far plane, matching
-    // this shader's own hwDepth/swDepth "smaller is nearer" convention) is renderer::
+    // GBuffer defaults for a background (no-geometry) pixel: depth = 0.0 (the far plane, reversed-Z
+    // -- see maths::mat4::PerspectiveVulkan's own comment, "LARGER is nearer" now) is renderer::
     // ScreenProbeGIPass's validity sentinel for "do not place/gather a probe against this pixel" --
     // mirrors renderer::SurfaceCachePass's own worldPosClear alpha=0 "never captured" convention.
-    float gbufferDepth = 1.0;
+    float gbufferDepth = 0.0;
     vec3 gbufferNormal = vec3(0.0, 1.0, 0.0);
     vec3 gbufferAlbedo = vec3(0.0);
 
@@ -186,6 +210,25 @@ void main() {
         vec3 p0 = DecodeClusterPosition(pageByteBase, i0, cluster.boundsMin, cluster.boundsMax);
         vec3 p1 = DecodeClusterPosition(pageByteBase, i1, cluster.boundsMin, cluster.boundsMax);
         vec3 p2 = DecodeClusterPosition(pageByteBase, i2, cluster.boundsMin, cluster.boundsMax);
+
+#ifdef _DEBUG
+        // Pre-deformation copies, kept ONLY in Debug builds -- DEBUG_VIEW_NANITE_WPO (below) needs
+        // both the deformed and undeformed position at this pixel to visualize actual per-pixel WPO
+        // displacement magnitude; Release has no such view mode and pays zero cost for these.
+        vec3 p0Undeformed = p0;
+        vec3 p1Undeformed = p1;
+        vec3 p2Undeformed = p2;
+#endif
+
+        // Reapply the exact same WPO sway both rasterizers already applied to the vertices they
+        // actually drew (ClusterRaster.vert / cluster_software_raster_core.glsl) -- without this,
+        // any swaying cluster's re-projected screen-space triangle here disagrees with the one that
+        // determined pixel coverage, corrupting the reconstructed barycentric weights (and, at a
+        // swaying cluster's own silhouette/boundary, contributing to depth/position mismatches).
+        p0 = ApplyWPODeformation(p0, cluster.clusterID, cluster.maxWPOAmplitude, g_WPOGlobals.globalTime);
+        p1 = ApplyWPODeformation(p1, cluster.clusterID, cluster.maxWPOAmplitude, g_WPOGlobals.globalTime);
+        p2 = ApplyWPODeformation(p2, cluster.clusterID, cluster.maxWPOAmplitude, g_WPOGlobals.globalTime);
+
         vec3 n0 = DecodeClusterNormal(pageByteBase, i0);
         vec3 n1 = DecodeClusterNormal(pageByteBase, i1);
         vec3 n2 = DecodeClusterNormal(pageByteBase, i2);
@@ -240,7 +283,7 @@ void main() {
         // GBuffer capture (renderer::ClusterResolvePass's new outputs -- see this file's own
         // binding comment): the same winning (hw-vs-sw arbitrated) depth already used to pick
         // clusterSlotIndex/triangleOrdinal above, plus the reconstructed normal/albedo.
-        gbufferDepth = (hwHasData && (!swHasData || hwDepth <= swDepth)) ? hwDepth : swDepth;
+        gbufferDepth = hwWins ? hwDepth : swDepth;
         gbufferNormal = normal;
         gbufferAlbedo = albedo;
 
@@ -263,11 +306,55 @@ void main() {
             finalColor = HsvToRgb(vec3(float(hashedTri) / 4294967295.0, 0.8, 0.8));
         } else if (pc.viewMode == 2) { // DEBUG_VIEW_NANITE_CLUSTERS
             finalColor = HsvToRgb(vec3(hue, 0.8, 0.8));
+        } else if (pc.viewMode == 3) { // DEBUG_VIEW_NANITE_INSTANCES
+            // Hash-color by the owning entity's meshID (ClusterCullMetadata::entityID) -- same
+            // technique as DEBUG_VIEW_NANITE_CLUSTERS above, but grouping every cluster belonging
+            // to the same entity under one color instead of coloring per-cluster.
+            uint hashedEntity = HashID(cluster.entityID);
+            finalColor = HsvToRgb(vec3(float(hashedEntity) / 4294967295.0, 0.8, 0.8));
+        } else if (pc.viewMode == 4) { // DEBUG_VIEW_NANITE_PRIMITIVES
+            // Triangle-density heat gradient: cluster.indexCount / 3 is this cluster's triangle
+            // count, capped at CLUSTER_MAX_INDICES/3 (128, see ClusterFormat.h's kMaxClusterTriangles)
+            // -- a standard cold (sparse) -> hot (dense) 3-stop ramp.
+            float density = clamp(float(cluster.indexCount) / 384.0, 0.0, 1.0);
+            vec3 cold = vec3(0.0, 0.0, 1.0);
+            vec3 mid = vec3(0.0, 1.0, 0.0);
+            vec3 hot = vec3(1.0, 0.0, 0.0);
+            finalColor = (density < 0.5) ? mix(cold, mid, density * 2.0) : mix(mid, hot, (density - 0.5) * 2.0);
+        } else if (pc.viewMode == 5) { // DEBUG_VIEW_NANITE_SHADING_BINS
+            // Hash-color by cluster.maskTextureIndex -- the closest existing real analog to a
+            // material/shading bin in this codebase, which has no texture/material-binding system
+            // yet (see this file's own class comment); every opaque (0xFFFFFFFF) cluster shares one
+            // bin, every distinct mask texture index gets its own.
+            uint hashedBin = HashID(cluster.maskTextureIndex);
+            finalColor = HsvToRgb(vec3(float(hashedBin) / 4294967295.0, 0.8, 0.8));
+        } else if (pc.viewMode == 6) { // DEBUG_VIEW_NANITE_RASTER_BINS
+            // Hash-color by a bucketed clusterSlotIndex -- visualizes rasterization submission
+            // batching (nearby slot indices, likely dispatched/drawn close together, share a color).
+            const uint kRasterBinSize = 64u;
+            uint hashedBin = HashID(clusterSlotIndex / kRasterBinSize);
+            finalColor = HsvToRgb(vec3(float(hashedBin) / 4294967295.0, 0.8, 0.8));
+        } else if (pc.viewMode == 7) { // DEBUG_VIEW_NANITE_WPO
+            // Actual per-pixel WPO displacement magnitude: the same perspective-correct barycentric
+            // weights (pw0/pw1/pw2, computed above) applied to both the deformed (p0/p1/p2) and
+            // undeformed (p0Undeformed/p1Undeformed/p2Undeformed) vertex positions, so this reads
+            // the REAL resolved displacement at this exact pixel, not merely the cluster's
+            // worst-case bound (cluster.maxWPOAmplitude) used only to normalize the color ramp.
+            vec3 deformedPos = pw0 * p0 + pw1 * p1 + pw2 * p2;
+            vec3 undeformedPos = pw0 * p0Undeformed + pw1 * p1Undeformed + pw2 * p2Undeformed;
+            float displacement = length(deformedPos - undeformedPos);
+            float normalizedDisplacement = (cluster.maxWPOAmplitude > 1.0e-6)
+                ? clamp(displacement / cluster.maxWPOAmplitude, 0.0, 1.0) : 0.0;
+            finalColor = mix(vec3(0.0, 0.0, 0.2), vec3(1.0, 0.35, 0.0), normalizedDisplacement);
         } else if (pc.viewMode == 8) { // DEBUG_VIEW_OVERDRAWS
-            if (hwHasData && (!swHasData || hwDepth <= swDepth)) finalColor = vec3(0.0, 1.0, 0.0);
+            if (hwWins) finalColor = vec3(0.0, 1.0, 0.0);
             else finalColor = vec3(0.0, 0.0, 1.0);
         } else if (pc.viewMode == 10) { // DEBUG_VIEW_DEPTH
-            float d = hwHasData && (!swHasData || hwDepth <= swDepth) ? hwDepth : swDepth;
+            // 1.0 - d: reversed-Z means d=1 is near/d=0 is far now, but this visualization's own
+            // "near reads dark, far reads bright" intent (unchanged since before this codebase's
+            // reversed-Z conversion) still wants the ORIGINAL [0,1]-non-reversed sense fed to the
+            // display curve below.
+            float d = 1.0 - (hwWins ? hwDepth : swDepth);
             finalColor = vec3(pow(d, 0.2));
         } else if (pc.viewMode == 11) { // DEBUG_VIEW_NORMALS
             finalColor = normal * 0.5 + 0.5;
@@ -307,6 +394,10 @@ void main() {
         } else if (pc.viewMode == 12 || pc.viewMode == 14) {
             // No geometry here: zero motion / no probe contribution -- leave finalColor at the
             // plain background color instead of the "unhandled view mode" magenta placeholder.
+        } else if (pc.viewMode == 3 || pc.viewMode == 4 || pc.viewMode == 5 || pc.viewMode == 6 || pc.viewMode == 7) {
+            // NANITE_INSTANCES/PRIMITIVES/SHADING_BINS/RASTER_BINS/WPO: all per-cluster
+            // visualizations with nothing meaningful to show on a no-geometry pixel -- leave
+            // finalColor at the plain background color, matching NANITE_TRIANGLES/CLUSTERS above.
         } else if (pc.viewMode != 0 && pc.viewMode != 1 && pc.viewMode != 2 && pc.viewMode != 8 && pc.viewMode != 11) {
             // For Lumen / SDF placeholders, render the placeholder color even on background
             finalColor = vec3(1.0, 0.0, 1.0);
@@ -330,6 +421,16 @@ void main() {
         chars[0]=78; chars[1]=65; chars[2]=78; chars[3]=73; chars[4]=84; chars[5]=69; chars[6]=32; chars[7]=84; chars[8]=82; chars[9]=73; chars[10]=65; chars[11]=78; chars[12]=71; chars[13]=76; chars[14]=69; chars[15]=83; len=16;
     } else if (pc.viewMode == 2) {
         chars[0]=78; chars[1]=65; chars[2]=78; chars[3]=73; chars[4]=84; chars[5]=69; chars[6]=32; chars[7]=67; chars[8]=76; chars[9]=85; chars[10]=83; chars[11]=84; chars[12]=69; chars[13]=82; chars[14]=83; len=15;
+    } else if (pc.viewMode == 3) { // "NANITE INSTANCES"
+        chars[0]=78; chars[1]=65; chars[2]=78; chars[3]=73; chars[4]=84; chars[5]=69; chars[6]=32; chars[7]=73; chars[8]=78; chars[9]=83; chars[10]=84; chars[11]=65; chars[12]=78; chars[13]=67; chars[14]=69; chars[15]=83; len=16;
+    } else if (pc.viewMode == 4) { // "NANITE PRIMITIVES"
+        chars[0]=78; chars[1]=65; chars[2]=78; chars[3]=73; chars[4]=84; chars[5]=69; chars[6]=32; chars[7]=80; chars[8]=82; chars[9]=73; chars[10]=77; chars[11]=73; chars[12]=84; chars[13]=73; chars[14]=86; chars[15]=69; chars[16]=83; len=17;
+    } else if (pc.viewMode == 5) { // "NANITE SHADING BINS"
+        chars[0]=78; chars[1]=65; chars[2]=78; chars[3]=73; chars[4]=84; chars[5]=69; chars[6]=32; chars[7]=83; chars[8]=72; chars[9]=65; chars[10]=68; chars[11]=73; chars[12]=78; chars[13]=71; chars[14]=32; chars[15]=66; chars[16]=73; chars[17]=78; chars[18]=83; len=19;
+    } else if (pc.viewMode == 6) { // "NANITE RASTER BINS"
+        chars[0]=78; chars[1]=65; chars[2]=78; chars[3]=73; chars[4]=84; chars[5]=69; chars[6]=32; chars[7]=82; chars[8]=65; chars[9]=83; chars[10]=84; chars[11]=69; chars[12]=82; chars[13]=32; chars[14]=66; chars[15]=73; chars[16]=78; chars[17]=83; len=18;
+    } else if (pc.viewMode == 7) { // "NANITE WPO"
+        chars[0]=78; chars[1]=65; chars[2]=78; chars[3]=73; chars[4]=84; chars[5]=69; chars[6]=32; chars[7]=87; chars[8]=80; chars[9]=79; len=10;
     } else if (pc.viewMode == 8) {
         chars[0]=79; chars[1]=86; chars[2]=69; chars[3]=82; chars[4]=68; chars[5]=82; chars[6]=65; chars[7]=87; chars[8]=83; len=9;
     } else if (pc.viewMode == 10) {

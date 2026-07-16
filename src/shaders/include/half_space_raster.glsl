@@ -23,4 +23,26 @@ float EdgeFunction(vec2 a, vec2 b, vec2 p) {
     return (b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x);
 }
 
+// Standard top-left fill-rule tie-break (the rule real GPU rasterizer hardware applies
+// automatically, and that renderer::ClusterSoftwareRasterPass's manual half-space test must
+// replicate by hand): a pixel exactly on a shared edge between two adjacent triangles must be
+// claimed by exactly ONE of them, never both and never neither, or the two triangles' coverage
+// tests can disagree right at their shared boundary. A purely inclusive (>=0) test on both sides of
+// a shared edge fails this -- both triangles independently see w==0 as "inside" -- which is exactly
+// the mechanism behind the shimmering/z-fighting seams this function fixes (see
+// cluster_software_raster_core.glsl's own call site).
+//
+// "Top" edge: exactly horizontal, pointing in +X (screen space is Y-down in Vulkan, so this is the
+// edge running along the top of the triangle in the conventional sense). "Left" edge: pointing in
+// -Y (i.e. upward on screen). `edgeStart`/`edgeEnd` must be passed in the SAME winding order the
+// edge function itself was evaluated with (e.g. EdgeFunction(a, b, p) pairs with
+// IsTopLeftEdge(a, b), not (b, a)) -- reversing the pair negates the edge vector, which negates
+// this function's own result, which is exactly what makes the rule antisymmetric: the two triangles
+// sharing a physical edge always evaluate it in opposite vertex order, so of the two, exactly one
+// ever satisfies this tie-break.
+bool IsTopLeftEdge(vec2 edgeStart, vec2 edgeEnd) {
+    vec2 e = edgeEnd - edgeStart;
+    return (e.y == 0.0 && e.x > 0.0) || (e.y < 0.0);
+}
+
 #endif // HALF_SPACE_RASTER_GLSL

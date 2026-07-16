@@ -29,36 +29,45 @@ struct HZBOcclusionViewParams {
     float projScaleY;
 };
 
-float SampleHZBMaxDepth(vec2 uv, float mipLevel) {
-    return textureLod(g_HZBTexture, clamp(uv, 0.0, 1.0), mipLevel).g;
+// Reversed-Z (see maths::mat4::PerspectiveVulkan's own comment): LARGER ndc.z is now nearer, so
+// the conservative "farthest already-drawn depth across this texel's footprint" bound is the
+// SMALLEST ndc.z reduced into it -- the R (min) channel, not G (max) as it was under the old,
+// non-reversed [0,1] convention. HZBBuildInit.comp/HZBReduce.comp's own min/max reduction is a
+// pure numeric operation on whatever values they're given, unaffected by this convention flip --
+// only which CHANNEL means "farthest" changes.
+float SampleHZBFarthestDepth(vec2 uv, float mipLevel) {
+    return textureLod(g_HZBTexture, clamp(uv, 0.0, 1.0), mipLevel).r;
 }
 
 // Conservative HZB occlusion test. Projects the cluster's world-space AABB's 8 corners into NDC,
-// derives its screen-space bounding rectangle and nearest (minimum) NDC depth, picks the coarsest
-// HZB mip whose texel footprint still fully covers that rectangle, and compares the cluster's
-// nearest depth against the farthest already-drawn depth recorded there.
+// derives its screen-space bounding rectangle and nearest (maximum, reversed-Z) NDC depth, picks
+// the coarsest HZB mip whose texel footprint still fully covers that rectangle, and compares the
+// cluster's nearest depth against the farthest already-drawn depth recorded there.
 //
-// Why the *max* channel is the correct conservative bound: a mip texel's G channel is the max
-// (farthest) depth among every full-resolution sample that was reduced into it, so by
-// construction every already-rasterized pixel within that texel's footprint is at a depth <= that
-// stored max -- i.e. at least as near as it. If the cluster's own *nearest* possible point
-// (nearestDepth, the minimum over its 8 projected corners) is still farther away than that stored
-// max, then every already-drawn pixel across the whole footprint is nearer than every point the
-// cluster could possibly occupy there, so the cluster cannot be visible anywhere in that
-// footprint and is safe to cull. This is the exact inverse of the min-channel test that would be
+// Why the R (min) channel is the correct conservative bound (reversed-Z): a mip texel's R channel
+// is the min (farthest, in this reversed-Z convention -- smaller ndc.z is farther) depth among
+// every full-resolution sample reduced into it, so by construction every already-rasterized pixel
+// within that texel's footprint is at a depth >= that stored min -- i.e. at least as near as it.
+// If the cluster's own *nearest* possible point (nearestDepth, the MAXIMUM over its 8 projected
+// corners, since larger ndc.z is nearer now) is still farther away (a SMALLER ndc.z) than that
+// stored min, then every already-drawn pixel across the whole footprint is nearer than every point
+// the cluster could possibly occupy there, so the cluster cannot be visible anywhere in that
+// footprint and is safe to cull. This is the exact inverse of the max-channel test that would be
 // used to answer "is anything definitely NOT occluded" -- occlusion culling only ever needs this
-// max-channel, nearest-corner comparison.
+// min-channel, nearest-corner comparison (under this reversed-Z convention).
 //
 // Mip selection rounds UP (ceil) so a single mip texel's reduced footprint is guaranteed to be at
 // least as large as the cluster's screen rectangle; the 4 corner taps below then guard against the
 // rectangle straddling a texel boundary at that mip (a single center sample could otherwise miss
-// part of the footprint), each contributing its own max-depth value combined with max() -- still a
-// valid upper bound on "farthest already-drawn depth across the whole footprint" as required by
-// the derivation above.
+// part of the footprint), each contributing its own farthest-depth value combined with min() --
+// still a valid lower bound on "farthest already-drawn depth across the whole footprint" as
+// required by the derivation above.
 bool IsClusterOccluded(vec3 boundsMin, vec3 boundsMax, mat4 viewProj, vec2 hzbMip0Size, float hzbMipCount) {
     vec2 ndcMin = vec2(1.0, 1.0);
     vec2 ndcMax = vec2(-1.0, -1.0);
-    float nearestDepth = 1.0;
+    // 0.0 is this pipeline's own far-plane sentinel now (reversed-Z) -- starting here lets max()
+    // only ever increase nearestDepth toward whichever corner is genuinely nearest.
+    float nearestDepth = 0.0;
 
     for (int i = 0; i < 8; ++i) {
         vec3 corner = vec3(
@@ -79,7 +88,7 @@ bool IsClusterOccluded(vec3 boundsMin, vec3 boundsMax, mat4 viewProj, vec2 hzbMi
         vec3 ndc = clip.xyz / clip.w;
         ndcMin = min(ndcMin, ndc.xy);
         ndcMax = max(ndcMax, ndc.xy);
-        nearestDepth = min(nearestDepth, ndc.z);
+        nearestDepth = max(nearestDepth, ndc.z);
     }
 
     // Vulkan clip space is already y-down, matching texel-space directly (unlike OpenGL's
@@ -90,11 +99,11 @@ bool IsClusterOccluded(vec3 boundsMin, vec3 boundsMax, mat4 viewProj, vec2 hzbMi
     vec2 footprintTexels = (uvMax - uvMin) * hzbMip0Size;
     float mipLevel = clamp(ceil(log2(max(footprintTexels.x, footprintTexels.y))), 0.0, hzbMipCount - 1.0);
 
-    float storedMaxDepth = max(
-        max(SampleHZBMaxDepth(uvMin, mipLevel), SampleHZBMaxDepth(vec2(uvMax.x, uvMin.y), mipLevel)),
-        max(SampleHZBMaxDepth(vec2(uvMin.x, uvMax.y), mipLevel), SampleHZBMaxDepth(uvMax, mipLevel)));
+    float storedFarthestDepth = min(
+        min(SampleHZBFarthestDepth(uvMin, mipLevel), SampleHZBFarthestDepth(vec2(uvMax.x, uvMin.y), mipLevel)),
+        min(SampleHZBFarthestDepth(vec2(uvMin.x, uvMax.y), mipLevel), SampleHZBFarthestDepth(uvMax, mipLevel)));
 
-    return nearestDepth > storedMaxDepth;
+    return nearestDepth < storedFarthestDepth;
 }
 
 // Approximate screen-space radius, in pixels, of a bounding sphere -- used by

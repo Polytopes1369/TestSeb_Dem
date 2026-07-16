@@ -1,16 +1,17 @@
 #pragma once
 // Hardware rasterization pipeline for "large" clusters -- the Nanite-style dual rasterization
-// path's fixed-function half: triangles covering more than a few pixels are efficiently rasterized
-// by the ordinary hardware triangle pipeline, where per-pixel/per-quad fixed-function costs are
-// well amortized. (A future compute-based software rasterizer would handle the *other* half --
-// sub-pixel triangles, where hardware quad overdraw becomes wasteful -- and a size-classification
-// step routing clusters to one path or the other; both are out of scope here. This class only
-// builds the hardware path, and currently consumes whatever a culling pass's indirect buffers
-// contain, unfiltered by triangle screen size.)
+// path's fixed-function half: triangles covering more than kSoftwareRasterThresholdPixels screen
+// pixels (renderer::ClusterRenderPipeline's own constant) are efficiently rasterized by the
+// ordinary hardware triangle pipeline, where per-pixel/per-quad fixed-function costs are well
+// amortized. renderer::ClusterSoftwareRasterPass is this path's live sibling, handling the *other*
+// half -- sub-pixel triangles, where hardware quad overdraw becomes wasteful -- via a 64-bit atomic
+// software rasterizer; the size-classification step routing each cluster to one path or the other
+// runs entirely on the GPU inside ClusterHZBOcclusionCull.comp's ShouldUseSoftwareRaster(), driven
+// by renderer::ClusterOcclusionCullingPass. This class only builds the hardware path, consuming
+// whichever subset of clusters that classification already routed here.
 //
-// Consumes, unmodified, whichever VkDrawIndexedIndirectCommand + draw-count buffer pair a culling
-// pass already produced (renderer::ClusterCullingPass::GetIndirectCommandBuffer()/
-// GetDrawCountBuffer(), or renderer::ClusterOcclusionCullingPass's early/late equivalents) via
+// Consumes, unmodified, whichever VkDrawIndexedIndirectCommand + draw-count buffer pair
+// renderer::ClusterOcclusionCullingPass's early/late passes already produced via
 // vkCmdDrawIndexedIndirectCount -- every render argument (which clusters, how many indices, at
 // what buffer offsets) is generated entirely on the GPU by that upstream culling pass; this class
 // never reads a draw count or cluster list back to the CPU, and RecordDraw() is a thin wrapper
@@ -37,14 +38,15 @@
 // of time by DecompressClusterIndices.comp) -- RecordDraw() binds it every call, since which
 // buffer is current can change as pages stream in/out.
 //
-// Exactly like every other piece of this Nanite-style pipeline (HZBPass, ClusterCullingPass,
-// ClusterOcclusionCullingPass, GeometryDecompressionPass), this class is a self-contained building
-// block -- Init()/Shutdown()/RecordDraw() only -- not wired into VulkanContext/main.cpp by this
-// change. RecordDraw() must be called inside an already-open vkCmdBeginRendering scope targeting
-// VisBuffer color attachments matching the formats passed to Init() (see
-// VulkanContext::kVisBufferFormat) plus a depth attachment matching Init()'s depthFormat -- this
-// class does not own or open that rendering scope itself, since it may need to share it with the
-// flat/legacy VisBuffer draw (draw.vert/draw.frag) or a future software-rasterization path.
+// Exactly like every other piece of this Nanite-style pipeline (HZBPass, ClusterOcclusionCullingPass,
+// ClusterSoftwareRasterPass, GeometryDecompressionPass), this class is a self-contained building
+// block -- Init()/Shutdown()/RecordDraw() only; renderer::ClusterRenderPipeline is what actually
+// wires it into the frame loop main.cpp drives. RecordDraw() must be called inside an already-open
+// vkCmdBeginRendering scope targeting VisBuffer color attachments matching the formats passed to
+// Init() (see VulkanContext::kVisBufferFormat) plus a depth attachment matching Init()'s
+// depthFormat -- this class does not own or open that rendering scope itself, since
+// ClusterRenderPipeline::BeginVisBufferRendering shares it across both the early and late hardware
+// raster passes (see that method's own comment on the CLEAR-vs-LOAD distinction between the two).
 
 #include <array>
 #include <cstdint>
@@ -75,7 +77,7 @@ namespace renderer {
         // frag module simply never references binding 3 (the mask array), so no second descriptor
         // set is needed. `clusterMetadataBuffer` is whichever culling pass's
         // GetClusterMetadataBuffer() the caller intends to feed RecordDraw()'s indirect buffers
-        // from (renderer::ClusterCullingPass or renderer::ClusterOcclusionCullingPass) --
+        // from -- renderer::ClusterOcclusionCullingPass in this pipeline today --
         // `firstInstance` in that pass's emitted VkDrawIndexedIndirectCommands indexes exactly this
         // buffer, so the two must come from the same culling pass instance/frame.
         // `compressedPhysicalPoolBuffer` is renderer::GpuGeometryPagePool::GetPhysicalPoolBuffer().

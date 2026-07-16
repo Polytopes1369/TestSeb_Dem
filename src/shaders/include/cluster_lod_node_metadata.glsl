@@ -32,6 +32,7 @@ struct LODNodeMetadata {
     uint logicalPageID;   // virtualAddress / GEOMETRY_PAGE_SIZE_BYTES -- see geometry_page_table.glsl.
     uint maskTextureIndex;
     float maxWPOAmplitude;
+    uint entityID;        // geometry::ClusterIndexEntry::entityID -- the owning entity's meshID.
 };
 
 #endif // CLUSTER_LOD_NODE_METADATA_GLSL

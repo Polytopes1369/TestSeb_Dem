@@ -65,7 +65,7 @@ namespace renderer {
         "DAGNodePayload must match DAGNodePayload in ClusterDAGScreenError.comp exactly (std430 layout)");
 
     // GLSL-friendly, std430-compatible mirror of LODNodeMetadata in cluster_lod_node_metadata.glsl.
-    // See that file's comment for the field-ordering rationale; the trailing 8-byte pad below
+    // See that file's comment for the field-ordering rationale; the trailing 4-byte pad below
     // rounds this struct up to its actual 96-byte std430 array stride (GLSL infers this
     // automatically for its own copy, but the C++ mirror must declare it explicitly).
     struct LODNodeMetadata {
@@ -80,7 +80,11 @@ namespace renderer {
         uint32_t logicalPageID = 0;
         uint32_t maskTextureIndex = 0xFFFFFFFFu;
         float maxWPOAmplitude = 0.0f;
-        float _padTrailing[2] = { 0.0f, 0.0f };
+        // geometry::ClusterIndexEntry::entityID -- the owning entity's meshID, carried through the
+        // LOD cut so ClusterLODCompact.comp can copy it verbatim into ClusterCullMetadata::entityID
+        // (see that struct's own comment) for the resolve pass's NANITE_INSTANCES debug view.
+        uint32_t entityID = 0;
+        float _padTrailing[1] = { 0.0f };
     };
     static_assert(sizeof(LODNodeMetadata) == 96,
         "LODNodeMetadata must match LODNodeMetadata in cluster_lod_node_metadata.glsl exactly (std430 layout)");

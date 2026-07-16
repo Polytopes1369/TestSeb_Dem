@@ -1,8 +1,10 @@
 #pragma once
-// Hierarchical Z-Buffer (HZB) pyramid: the depth-based visibility oracle a future GPU-driven
-// occlusion-culling compute pass (sitting alongside src/shaders/src/Culling/ClusterResidencyCheck.comp
-// in the culling pipeline) will sample to reject clusters/instances whose screen-space bounds are
-// fully behind already-rasterized geometry, without reading back anything to the CPU.
+// Hierarchical Z-Buffer (HZB) pyramid: the depth-based visibility oracle renderer::
+// ClusterOcclusionCullingPass's GPU-driven occlusion cull (src/shaders/src/Culling/
+// ClusterHZBOcclusionCull.comp, via include/hzb_occlusion.glsl's IsClusterOccluded) samples every
+// frame, for both its early (previous frame's HZB) and late (this frame's own early-pass depth)
+// passes, to reject clusters/instances whose screen-space bounds are fully behind already-
+// rasterized geometry, without reading back anything to the CPU.
 //
 // --- What this builds ---
 // A single VkImage with a full mip chain, format VK_FORMAT_R32G32_SFLOAT (min depth in the R

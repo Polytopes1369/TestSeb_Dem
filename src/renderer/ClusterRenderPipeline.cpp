@@ -280,7 +280,8 @@ bool ClusterRenderPipeline::Init(
       m_PagePool.GetPhysicalPoolBuffer(), createInfo.visBufferClusterIDView,
       createInfo.visBufferTriangleIDView, createInfo.depthImageView,
       m_SoftwareRaster.GetVisBufferAtomicView(),
-      m_MaskGenerator.GetMaskImageInfos());
+      m_MaskGenerator.GetMaskImageInfos(),
+      m_WPOGlobalsBuffer.Handle());
 
   // =========================================================================================
   // STEP 7 -- Lumen-style GI infrastructure: sun shadow map, Surface Cache, Global SDF clipmap
@@ -483,7 +484,10 @@ void ClusterRenderPipeline::BeginVisBufferRendering(
   // after each raster pass -- by the HZB rebuilds and by the resolve pass's
   // per-pixel depth arbitration.
   depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-  depthAttachment.clearValue.depthStencil = {1.0f, 0};
+  // Reversed-Z: 0.0 is now the "nothing drawn here yet" far sentinel (see
+  // maths::mat4::PerspectiveVulkan's own comment) -- VK_COMPARE_OP_GREATER
+  // (VulkanPipeline::CreateGraphicsPipeline) then lets any real, nearer (larger) depth win.
+  depthAttachment.clearValue.depthStencil = {0.0f, 0};
 
   VkRenderingInfo renderingInfo{VK_STRUCTURE_TYPE_RENDERING_INFO};
   renderingInfo.renderArea = {{0, 0}, m_RenderExtent};
@@ -567,24 +571,42 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
     // 4. Secondary-bounce injection into m_SurfaceCache's own radiance atlas (budgeted, a handful
     // of cards per call -- see SurfaceCacheGIInjectPass::kCardsPerFrameBudget) via m_TraceContext's
     // shared trace-scene sets against m_SurfaceCacheRT's static TLAS or the per-entity mesh SDFs,
-    // depending on `traceMode`.
-    m_GIInject.RecordInject(cmd, m_TraceContext, m_SurfaceCache, traceMode);
+    // depending on `traceMode`. Called kRadiosityBounceCount times in a row, each isolated from the
+    // next by the exact same barrier RecordInject itself doesn't carry (see the comment below) --
+    // this turns the pass's single budgeted round into a genuine INTRA-FRAME multi-bounce chain:
+    // m_GIInject's own round-robin cursor advances across every call in the loop, so bounce N+1's
+    // newly-processed cards sample the atlas including bounce N's own fresh writes wherever their
+    // footprints overlap, on top of (not instead of) the pass's existing cross-frame convergence.
+    // `radiosityEnabled` (debug-only toggle, main.cpp's 'G' key) lets this whole loop be switched
+    // off to isolate its cost/visual contribution from the rest of the GI stack; Release always
+    // runs it.
+#ifndef NDEBUG
+    bool radiosityEnabled = m_DebugRadiosityEnabled;
+#else
+    bool radiosityEnabled = true;
+#endif
+    if (radiosityEnabled) {
+      for (uint32_t bounce = 0; bounce < kRadiosityBounceCount; ++bounce) {
+        m_GIInject.RecordInject(cmd, m_TraceContext, m_SurfaceCache, traceMode);
 
-    // Unlike SurfaceCachePass::RecordCapture/ShadowMapPass::RecordCapture/GlobalSDFPass::
-    // RecordUpdate, SurfaceCacheGIInjectPass::RecordInject does NOT end with its own trailing
-    // barrier -- its read-modify-write of the radiance atlas (imageLoad/imageStore, STORAGE
-    // access) must be made visible here, explicitly, before m_ScreenProbeGI's own trace pass
-    // samples that same atlas (surface_cache_sampling.glsl's g_SurfaceCacheRadiance) later this
-    // frame.
-    VkMemoryBarrier2 giInjectBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
-    giInjectBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-    giInjectBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-    giInjectBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
-    giInjectBarrier.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
-    VkDependencyInfo giInjectDepInfo{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
-    giInjectDepInfo.memoryBarrierCount = 1;
-    giInjectDepInfo.pMemoryBarriers = &giInjectBarrier;
-    vkCmdPipelineBarrier2(cmd, &giInjectDepInfo);
+        // Unlike SurfaceCachePass::RecordCapture/ShadowMapPass::RecordCapture/GlobalSDFPass::
+        // RecordUpdate, SurfaceCacheGIInjectPass::RecordInject does NOT end with its own trailing
+        // barrier -- its read-modify-write of the radiance atlas (imageLoad/imageStore, STORAGE
+        // access) must be made visible here, explicitly, before the NEXT bounce's own RecordInject
+        // call samples that same atlas (surface_cache_sampling.glsl's g_SurfaceCacheRadiance) --
+        // and, after the loop's final iteration, before m_ScreenProbeGI's own trace pass does the
+        // same later this frame.
+        VkMemoryBarrier2 giInjectBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+        giInjectBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        giInjectBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+        giInjectBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
+        giInjectBarrier.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+        VkDependencyInfo giInjectDepInfo{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        giInjectDepInfo.memoryBarrierCount = 1;
+        giInjectDepInfo.pMemoryBarriers = &giInjectBarrier;
+        vkCmdPipelineBarrier2(cmd, &giInjectDepInfo);
+      }
+    }
 
 #ifndef NDEBUG
     // GlobalSDFPass::RecordUpdate's own trailing barrier only extends visibility to
@@ -604,11 +626,17 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
     vkCmdPipelineBarrier2(cmd, &globalSDFToSampledDep);
 
     // 4. Two-tier SDF ray march DEBUG VISUALIZATION -- only its OUTPUT IMAGE is ever displayed
-    // (via the DEBUG_VIEW_LUMEN blit-swap below), but it is always recorded so the debug view
-    // shows this frame's state the instant it's selected, with no one-frame lag.
+    // (via the DEBUG_VIEW_LUMEN/DEBUG_VIEW_GLOBAL_SDF blit-swap below), but it is always recorded
+    // so either debug view shows this frame's state the instant it's selected, with no one-frame
+    // lag. `coarseOnly` picks which of the two views this frame's single recording serves: DEBUG_
+    // VIEW_GLOBAL_SDF wants ONLY the coarse clipmap trace (see SDFRayMarch.comp's own comment on
+    // why that's a distinct, useful signal from DEBUG_VIEW_LUMEN's full two-tier result); any other
+    // view mode (including DEBUG_VIEW_LUMEN itself) gets the normal full march, since only one of
+    // the two blit-swaps can be selected at a time anyway.
     m_SDFRayMarch.RecordRayMarch(cmd, m_GlobalSDF, cameraFrameInfo.position, cameraFrameInfo.forward,
                                  maths::vec3{0.0f, 1.0f, 0.0f}, cameraFrameInfo.fovYRadians,
-                                 cameraFrameInfo.aspectRatio, cameraFrameInfo.nearZ, cameraFrameInfo.farZ);
+                                 cameraFrameInfo.aspectRatio, cameraFrameInfo.nearZ, cameraFrameInfo.farZ,
+                                 camera.debugViewMode == DEBUG_VIEW_GLOBAL_SDF);
 #endif
   }
 
@@ -685,7 +713,11 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
   // =========================================================================================
   m_OcclusionCulling.RecordEarlyPass(cmd, viewParams, viewProj, projScaleY,
                                      m_LODSelection.GetEarlyDispatchArgsBuffer(),
-                                     kSoftwareRasterThresholdPixels);
+                                     kSoftwareRasterThresholdPixels
+#ifndef NDEBUG
+                                     , camera.disableOcclusionCulling
+#endif
+                                     );
 
   // =========================================================================================
   // [3] Attachment layout acquisition. All three images are re-acquired with
@@ -819,7 +851,11 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
   // cover.
   // =========================================================================================
   m_OcclusionCulling.RecordBuildLateDispatchArgs(cmd);
-  m_OcclusionCulling.RecordLatePass(cmd);
+  m_OcclusionCulling.RecordLatePass(cmd
+#ifndef NDEBUG
+    , camera.disableOcclusionCulling
+#endif
+  );
   {
     VkMemoryBarrier2 barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
     barrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
@@ -974,13 +1010,25 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
   {
     maths::mat4 prevViewProjForProbes = m_HasPrevViewProj ? m_PrevViewProj : maths::mat4{};
     m_ScreenProbeGI.RecordUpdateViewParams(cmd, viewProj, prevViewProjForProbes);
-    m_ScreenProbeGI.RecordTrace(cmd, m_TraceContext, m_TraceContext.GetEntityCount(), traceMode, m_FrameIndex);
-    m_ScreenProbeGI.RecordTemporal(cmd);
-    m_ScreenProbeGI.RecordGather(cmd
+
+    // `ssrtEnabled` (debug-only toggle, main.cpp's 'F' key) gates the trace/temporal/gather trio
+    // entirely -- skipped means zero screen-space probe indirect contribution this frame at all,
+    // isolating this stage's own cost/visual contribution from the rest of the GI stack. Release
+    // always runs the trio.
 #ifndef NDEBUG
-      , camera.debugViewMode
+    bool ssrtEnabled = m_DebugSSRTEnabled;
+#else
+    bool ssrtEnabled = true;
 #endif
-    );
+    if (ssrtEnabled) {
+      m_ScreenProbeGI.RecordTrace(cmd, m_TraceContext, m_TraceContext.GetEntityCount(), traceMode, m_FrameIndex);
+      m_ScreenProbeGI.RecordTemporal(cmd);
+      m_ScreenProbeGI.RecordGather(cmd
+#ifndef NDEBUG
+        , camera.debugViewMode
+#endif
+      );
+    }
   }
 
   // =========================================================================================
@@ -1102,10 +1150,14 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
     float bytesPerSecond = (deltaTime > 0.0f)
         ? static_cast<float>(totalBytesCompleted - m_LastStatsSampleBytes) / deltaTime
         : 0.0f;
+    // Same wall-clock delta this block already samples once per frame for bytesPerSecond above --
+    // reused directly rather than re-derived, since it already IS this frame's frame-to-frame time.
+    float fps = (deltaTime > 0.0f) ? (1.0f / deltaTime) : 0.0f;
     m_LastStatsSampleTime = globalTimeSeconds;
     m_LastStatsSampleBytes = totalBytesCompleted;
 
-    m_DebugOverlay.BuildFrameText(gpuMemUsedMB, pendingPageLoads, bytesPerSecond, hwTriangleCount, swTriangleCount);
+    m_DebugOverlay.BuildFrameText(gpuMemUsedMB, pendingPageLoads, bytesPerSecond, hwTriangleCount, swTriangleCount,
+        fps, static_cast<float>(m_RenderExtent.width), m_DebugRadiosityEnabled, m_DebugSSRTEnabled, traceMode);
     // Drawn onto whichever image [14]'s blit will actually read below (m_Denoiser's output when
     // [12d] applied it, m_Resolve's own color image otherwise -- same `applyDenoise` condition) --
     // the overlay text must land on the real final image, not on a buffer already bypassed.
@@ -1123,19 +1175,21 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
   // re-stated here explicitly for the same reason every other cross-pass barrier in this function
   // is: the dependency must not silently vanish if an intermediate pass's barriers change.
   // =========================================================================================
-  // DEBUG_VIEW_LUMEN swaps the blit SOURCE to m_SDFRayMarch's own debug-visualization image
-  // instead of m_Resolve's normal lit output -- see ClusterRenderPipeline.h's own comment on why
-  // this (not sampling it from within ClusterResolve.comp) is the chosen mechanism. Both images
-  // share the exact same format (VK_FORMAT_R8G8B8A8_UNORM) and permanent layout (GENERAL), and
-  // both are last written by a compute shader's imageStore, so the SAME barrier below (targeting
-  // COMPUTE_SHADER_BIT/SHADER_STORAGE_WRITE_BIT -> BLIT_BIT/TRANSFER_READ_BIT) covers either
-  // choice with no changes needed -- only which VkImage is actually blitted differs.
+  // DEBUG_VIEW_LUMEN and DEBUG_VIEW_GLOBAL_SDF both swap the blit SOURCE to m_SDFRayMarch's own
+  // debug-visualization image instead of m_Resolve's normal lit output -- see ClusterRenderPipeline
+  // .h's own comment on why this (not sampling it from within ClusterResolve.comp) is the chosen
+  // mechanism. Both share the exact same output image (this frame's single RecordRayMarch() call
+  // above already picked which of the two variants -- full two-tier vs. coarse-only -- filled it,
+  // via `coarseOnly`); the image's format (VK_FORMAT_R8G8B8A8_UNORM) and permanent layout (GENERAL)
+  // match m_Resolve's own output either way, so the SAME barrier below (targeting COMPUTE_SHADER_
+  // BIT/SHADER_STORAGE_WRITE_BIT -> BLIT_BIT/TRANSFER_READ_BIT) covers either choice with no changes
+  // needed -- only which VkImage is actually blitted differs.
   // Denoised (see [12d] above) unless a debug view substitutes a different image entirely
-  // (DEBUG_VIEW_LUMEN) or would have its own overlay blurred by the filter (DEBUG_VIEW_SPATIAL_
-  // PROBES) -- applyDenoise (computed at [12d]) tracks exactly the same condition.
+  // (DEBUG_VIEW_LUMEN/DEBUG_VIEW_GLOBAL_SDF) or would have its own overlay blurred by the filter
+  // (DEBUG_VIEW_SPATIAL_PROBES) -- applyDenoise (computed at [12d]) tracks exactly the same condition.
   VkImage blitSourceImage = applyDenoise ? m_Denoiser.GetOutputImage() : m_Resolve.GetOutputColorImage();
 #ifndef NDEBUG
-  if (camera.debugViewMode == DEBUG_VIEW_LUMEN) {
+  if (camera.debugViewMode == DEBUG_VIEW_LUMEN || camera.debugViewMode == DEBUG_VIEW_GLOBAL_SDF) {
     blitSourceImage = m_SDFRayMarch.GetOutputImage();
   }
 #endif

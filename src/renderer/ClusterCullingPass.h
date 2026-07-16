@@ -65,12 +65,15 @@ namespace renderer {
         // GPU-side mirror, copied verbatim (no quantization involved for either field).
         float maxWPOAmplitude = 0.0f;
         uint32_t maskTextureIndex = 0xFFFFFFFFu;
-        // Explicit trailing padding: adding the 8 bytes above makes the raw struct size 88, which
+        // geometry::ClusterIndexEntry::entityID -- the owning entity's meshID, copied verbatim.
+        // Used by ClusterResolve.comp's DEBUG_VIEW_NANITE_INSTANCES hash-color visualization.
+        uint32_t entityID = 0;
+        // Explicit trailing padding: adding the 4 bytes above makes the raw struct size 92, which
         // is NOT a multiple of 16 -- GLSL's std430 rules round an array's element stride up to the
         // struct's base alignment (16, from the vec3 members) regardless, silently making the real
         // GPU stride 96 whether or not this pad field exists. Declaring it explicitly keeps the
         // CPU-side struct's sizeof() honest about the stride the GPU actually uses.
-        float _padTrailing[2] = { 0.0f, 0.0f };
+        float _padTrailing[1] = { 0.0f };
     };
     static_assert(sizeof(ClusterCullMetadata) == 96,
         "ClusterCullMetadata must match ClusterCullMetadata in cluster_culling_common.glsl exactly (std430 layout)");

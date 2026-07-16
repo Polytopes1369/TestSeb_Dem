@@ -96,8 +96,24 @@ void RasterizeClusterTriangle(ClusterCullMetadata cluster, uint clusterSlotIndex
             float w1 = EdgeFunction(screen2, screen0, pixelCenter);
             float w2 = EdgeFunction(screen0, screen1, pixelCenter);
 
-            bool inside = (area2 > 0.0) ? (w0 >= 0.0 && w1 >= 0.0 && w2 >= 0.0)
-                                         : (w0 <= 0.0 && w1 <= 0.0 && w2 <= 0.0);
+            // Top-left tie-break (half_space_raster.glsl's IsTopLeftEdge -- see its own comment for
+            // why this is required, not optional, to avoid double-covering a shared triangle edge):
+            // a strictly-inside pixel (w != 0) always passes on the correct side regardless of
+            // area2's sign; only a pixel EXACTLY on an edge (w == 0) additionally needs the
+            // tie-break, evaluated with the edge in the same vertex order EdgeFunction itself used
+            // for that edge (reversed for the area2 < 0 / clockwise-in-screen-space case, since the
+            // "inside" half-plane itself is mirrored there).
+            bool c0, c1, c2;
+            if (area2 > 0.0) {
+                c0 = (w0 > 0.0) || (w0 == 0.0 && IsTopLeftEdge(screen1, screen2));
+                c1 = (w1 > 0.0) || (w1 == 0.0 && IsTopLeftEdge(screen2, screen0));
+                c2 = (w2 > 0.0) || (w2 == 0.0 && IsTopLeftEdge(screen0, screen1));
+            } else {
+                c0 = (w0 < 0.0) || (w0 == 0.0 && IsTopLeftEdge(screen2, screen1));
+                c1 = (w1 < 0.0) || (w1 == 0.0 && IsTopLeftEdge(screen0, screen2));
+                c2 = (w2 < 0.0) || (w2 == 0.0 && IsTopLeftEdge(screen1, screen0));
+            }
+            bool inside = c0 && c1 && c2;
             if (!inside) {
                 continue;
             }
@@ -119,7 +135,15 @@ void RasterizeClusterTriangle(ClusterCullMetadata cluster, uint clusterSlotIndex
 
             float ndcDepth = bary.x * ndc0.z + bary.y * ndc1.z + bary.z * ndc2.z;
 
-            uint depthBits = uint(clamp(1.0 - ndcDepth, 0.0, 1.0) * 4294967295.0);
+            // Reversed-Z (see maths::mat4::PerspectiveVulkan's own comment): larger ndcDepth is now
+            // nearer, so it packs DIRECTLY (no more "1.0 - ndcDepth" inversion) into the atomic
+            // word's high bits -- imageAtomicMax below still means "keep whichever write is
+            // nearer," just without the extra subtraction the old [0,1]-non-reversed convention
+            // needed. min(...) guards against the float literal 4294967295.0 (2^32-1) not being
+            // exactly representable in float32 -- it rounds up to 2^32, and clamp(...,0,1)==1.0
+            // would otherwise convert to a uint value one past UINT32_MAX (undefined behavior per
+            // the GLSL spec) for any ndcDepth close enough to 1.0 (i.e. very close to the camera).
+            uint depthBits = min(uint(clamp(ndcDepth, 0.0, 1.0) * 4294967295.0), 0xFFFFFFFEu);
             uint visibilityID = PackVisibilityID(clusterSlotIndex, triangleOrdinal);
             uint64_t packed = (uint64_t(depthBits) << 32) | uint64_t(visibilityID);
 

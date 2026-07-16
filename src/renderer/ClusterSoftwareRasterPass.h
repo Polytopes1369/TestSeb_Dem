@@ -31,8 +31,8 @@
 //      actually won and shade accordingly.
 //
 // Exactly like every other piece of this Nanite-style pipeline, this class is a self-contained
-// building block -- Init()/Shutdown()/per-frame Record*() only -- not wired into
-// VulkanContext/main.cpp by this change.
+// building block -- Init()/Shutdown()/per-frame Record*() only; renderer::ClusterRenderPipeline is
+// what actually wires it into the frame loop main.cpp drives.
 
 #include <cstdint>
 #include <vector>

@@ -14,13 +14,15 @@
 // (one reduction rule from top to bottom) instead of special-casing level 0 as a full-resolution
 // copy pass.
 //
-// Standard (non-reversed) depth convention is assumed throughout this codebase: 0.0 = near plane,
-// 1.0 = far plane (see VulkanPipeline::CreateGraphicsPipeline's VK_COMPARE_OP_LESS and the
-// depthAttachment.clearValue.depthStencil = {1.0f, 0} clear in main.cpp). Both the nearest (min)
-// and farthest (max) depth of every reduced footprint are kept -- not just the conservative max a
-// classic single-channel Hi-Z uses -- so a future occlusion-culling pass can pick whichever bound
-// its test needs (a far-bound test against the max channel, a near-bound/depth-bounds test against
-// the min channel) without having to rebuild the pyramid.
+// Reversed-Z depth convention throughout this codebase's main camera pipeline: 1.0 = near plane,
+// 0.0 = far plane (see maths::mat4::PerspectiveVulkan's own comment, VulkanPipeline::
+// CreateGraphicsPipeline's VK_COMPARE_OP_GREATER, and the depthAttachment.clearValue.depthStencil
+// = {0.0f, 0} clear in renderer::ClusterRenderPipeline::BeginVisBufferRendering). Both the min and
+// max depth of every reduced footprint are kept -- not just the conservative bound a classic
+// single-channel Hi-Z uses -- so a future occlusion-culling pass can pick whichever bound its test
+// needs (min = the farthest reduced sample now, max = the nearest -- see hzb_occlusion.glsl's own
+// IsClusterOccluded for which one an occlusion test actually needs under this convention) without
+// having to rebuild the pyramid.
 
 layout(set = 0, binding = 0) uniform sampler2D u_SourceDepth;
 layout(set = 0, binding = 1, rg32f) writeonly uniform image2D u_HZBMip0;

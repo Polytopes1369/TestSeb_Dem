@@ -90,7 +90,11 @@ namespace renderer {
             int32_t clipmapResolution;
             int32_t rootNodeIndex;
             int32_t entitySamplerCount;
-            int32_t _pad0;
+            // Repurposes what was pure trailing padding (still keeps the struct at its original,
+            // static_assert-checked 144 bytes): 0 = normal two-tier march (DEBUG_VIEW_LUMEN), 1 =
+            // DEBUG_VIEW_GLOBAL_SDF's coarse-only variant -- see SDFRayMarch.comp's own comment on
+            // what skipping Stage 2+3 (BVH traversal + per-entity refine) actually shows instead.
+            int32_t coarseOnly;
         };
         static_assert(sizeof(SDFRayMarchPC) == 144,
             "SDFRayMarchPC must match SDFRayMarch.comp's push_constant block exactly");
@@ -608,7 +612,7 @@ namespace renderer {
 
     void SDFRayMarchPass::RecordRayMarch(VkCommandBuffer cmd, const GlobalSDFPass& globalSDF,
         const maths::vec3& cameraPosition, const maths::vec3& cameraForward, const maths::vec3& cameraUp,
-        float fovYRadians, float aspectRatio, float nearZ, float farZ) {
+        float fovYRadians, float aspectRatio, float nearZ, float farZ, bool coarseOnly) {
 
         // Same orthonormal-basis derivation as renderer::SurfaceCachePass::UpdateVisibility (right =
         // forward x upHint, up = right x forward) -- see that method's own comment.
@@ -637,6 +641,7 @@ namespace renderer {
         pc.clipmapResolution = static_cast<int32_t>(GlobalSDFPass::kClipmapResolution);
         pc.rootNodeIndex = m_RootNodeIndex;
         pc.entitySamplerCount = static_cast<int32_t>(std::min<size_t>(m_Entities.size(), kMaxEntitySDFs));
+        pc.coarseOnly = coarseOnly ? 1 : 0;
 
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_Pipeline);
         VkDescriptorSet sets[2] = { m_EntitySet, m_ClipmapSet };

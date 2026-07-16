@@ -104,15 +104,15 @@ void main() {
     uint rayIndex = gl_LocalInvocationID.x;
 
     // Every invocation in this workgroup computes the exact same probeCoord/centerPixel, so this
-    // GBuffer read (and the `depth < 1.0` branch below) is workgroup-uniform -- safe for every
+    // GBuffer read (and the `depth <= 0.0` branch below) is workgroup-uniform -- safe for every
     // thread to return together without any of them reaching the barrier() further down.
     ivec2 viewportSize = ivec2(g_ViewParams.viewportSize);
     ivec2 centerPixel = clamp(probeCoord * int(kProbeTileSize) + int(kProbeTileSize / 2u), ivec2(0), viewportSize - ivec2(1));
     float depth = imageLoad(g_GBufferDepth, centerPixel).r;
 
-    if (depth >= 1.0) {
+    if (depth <= 0.0) {
         // No geometry at this probe's representative pixel (matches ClusterResolve.comp's own
-        // "depth == 1.0 == background" sentinel) -- nothing to trace from; mark the probe invalid
+        // reversed-Z "depth == 0.0 == background" sentinel) -- nothing to trace from; mark the probe invalid
         // (worldPos.a = 0, see renderer::ScreenProbeGIPass::kWorldPosFormat's own comment) so
         // ScreenProbeGather.comp's bilateral weighting and ScreenProbeTemporal.comp's disocclusion
         // test both skip it.

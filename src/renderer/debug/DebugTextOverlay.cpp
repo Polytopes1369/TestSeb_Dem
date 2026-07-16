@@ -277,7 +277,6 @@ namespace renderer::debug {
     }
 
     void DebugTextOverlay::AppendLine(const std::string& text, float x, float y) {
-        constexpr float kGlyphAdvanceX = 9.0f; // 8px glyph + 1px gap.
         float cursorX = x;
         for (char c : text) {
             if (m_PendingGlyphs.size() >= kMaxGlyphs) {
@@ -292,7 +291,8 @@ namespace renderer::debug {
     }
 
     void DebugTextOverlay::BuildFrameText(float gpuMemUsedMB, uint32_t pendingPageLoads, float bytesPerSecond,
-        uint32_t hwTriangleCount, uint32_t swTriangleCount) {
+        uint32_t hwTriangleCount, uint32_t swTriangleCount, float fps, float viewportWidthPixels,
+        bool radiosityEnabled, bool ssrtEnabled, uint32_t traceMode) {
         m_PendingGlyphs.clear();
 
         constexpr float kMarginX = 8.0f;
@@ -305,6 +305,15 @@ namespace renderer::debug {
         AppendLine(std::format("READ: {:.1f} KB/S", bytesPerSecond / 1024.0f), kMarginX, y); y += kLineHeight;
         AppendLine(std::format("HW TRIS: {}", hwTriangleCount), kMarginX, y); y += kLineHeight;
         AppendLine(std::format("SW TRIS: {}", swTriangleCount), kMarginX, y); y += kLineHeight;
+        AppendLine(std::format("GI: RADIOSITY={} SSRT={} TRACE={}",
+            radiosityEnabled ? "ON" : "OFF", ssrtEnabled ? "ON" : "OFF", traceMode == 0u ? "SWRT" : "HWRT"),
+            kMarginX, y); y += kLineHeight;
+
+        // Top-right FPS counter -- right-aligned against the render extent's own width using
+        // kGlyphAdvanceX's fixed per-glyph pixel advance to measure the line before it's drawn.
+        std::string fpsText = std::format("FPS: {:.1f}", fps);
+        float fpsTextWidth = static_cast<float>(fpsText.size()) * kGlyphAdvanceX;
+        AppendLine(fpsText, viewportWidthPixels - fpsTextWidth - kMarginX, kMarginY);
     }
 
     void DebugTextOverlay::RecordDraw(VkCommandBuffer cmd, VkImage outputColorImage, VkImageView outputColorView, VkExtent2D extent) {

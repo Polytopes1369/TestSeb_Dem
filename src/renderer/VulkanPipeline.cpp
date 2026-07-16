@@ -104,7 +104,12 @@ VkPipeline VulkanPipeline::CreateGraphicsPipeline(VkDevice device, VkPipelineLay
     depthStencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
     depthStencil.depthTestEnable = (depthFormat != VK_FORMAT_UNDEFINED) ? VK_TRUE : VK_FALSE;
     depthStencil.depthWriteEnable = (depthFormat != VK_FORMAT_UNDEFINED) ? VK_TRUE : VK_FALSE;
-    depthStencil.depthCompareOp = VK_COMPARE_OP_LESS;
+    // Reversed-Z (see maths::mat4::PerspectiveVulkan's own comment): larger NDC depth is now
+    // nearer, so the surviving fragment at a pixel is the one with the GREATER depth value. The
+    // only live consumer of this shared helper is renderer::ClusterHardwareRasterPass (the main
+    // camera's VisBuffer raster); VulkanContext's own separate, dead legacy m_GraphicsPipeline also
+    // uses this helper but is never recorded by main.cpp's frame loop.
+    depthStencil.depthCompareOp = VK_COMPARE_OP_GREATER;
     depthStencil.depthBoundsTestEnable = VK_FALSE;
     depthStencil.stencilTestEnable = VK_FALSE;
 

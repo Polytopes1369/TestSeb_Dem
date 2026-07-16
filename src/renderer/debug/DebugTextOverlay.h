@@ -38,8 +38,14 @@ namespace renderer::debug {
         DebugTextOverlay& operator=(const DebugTextOverlay&) = delete;
 
         // Upper bound on glyphs drawn in a single frame -- generously covers this overlay's fixed
-        // ~5-line stat stack (see BuildFrameText()) with headroom to spare.
+        // ~7-line stat stack (see BuildFrameText()) with headroom to spare.
         static constexpr uint32_t kMaxGlyphs = 2048;
+
+        // Fixed advance (8px glyph + 1px gap) between consecutive glyphs -- also used by
+        // BuildFrameText() to estimate a line's pixel width for right-aligned placement (the FPS
+        // counter), so it must stay a single shared constant rather than a value duplicated in
+        // AppendLine()'s own body.
+        static constexpr float kGlyphAdvanceX = 9.0f;
 
         // Builds the font bitmap SSBO (BitmapFont8x8.h, uploaded once via a blocking one-time
         // submit) and the glyph-instance SSBO/descriptor set/pipeline. `outputColorFormat` must
@@ -50,10 +56,15 @@ namespace renderer::debug {
 
         void Shutdown();
 
-        // Formats a fixed top-left stack of short stat lines into this frame's glyph instance
-        // list (CPU-side only -- no GPU work happens here). `bytesPerSecond` is displayed in KB/s.
+        // Formats a fixed top-left stack of short stat lines, a GI-component-state line, and a
+        // top-right FPS counter into this frame's glyph instance list (CPU-side only -- no GPU
+        // work happens here). `bytesPerSecond` is displayed in KB/s. `fps` and `viewportWidthPixels`
+        // (the render extent's width, needed to right-align the FPS text) drive the top-right
+        // counter; `radiosityEnabled`/`ssrtEnabled`/`traceMode` (0 = SWRT, 1 = HWRT) mirror
+        // ClusterRenderPipeline's own current debug-toggle state exactly.
         void BuildFrameText(float gpuMemUsedMB, uint32_t pendingPageLoads, float bytesPerSecond,
-            uint32_t hwTriangleCount, uint32_t swTriangleCount);
+            uint32_t hwTriangleCount, uint32_t swTriangleCount, float fps, float viewportWidthPixels,
+            bool radiosityEnabled, bool ssrtEnabled, uint32_t traceMode);
 
         void RecordDraw(VkCommandBuffer cmd, VkImage outputColorImage, VkImageView outputColorView, VkExtent2D extent);
 

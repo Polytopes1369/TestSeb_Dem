@@ -80,8 +80,8 @@ void main() {
     }
 
     float depth = imageLoad(g_GBufferDepth, pixel).r;
-    if (depth >= 1.0) {
-        return; // Sky/background -- nothing to add.
+    if (depth <= 0.0) {
+        return; // Sky/background (reversed-Z: 0.0 == far/background sentinel) -- nothing to add.
     }
 
     vec3 normal = OctDecode(imageLoad(g_GBufferNormal, pixel).rg);

@@ -130,6 +130,24 @@ namespace maths {
             return result;
         }
 
+        // Reversed-Z perspective projection: viewZ = -zNear -> ndc.z = 1 (near plane), viewZ = -zFar
+        // -> ndc.z = 0 (far plane) -- the OPPOSITE of the "textbook" [0,1] mapping (which this
+        // function used before this comment was written; see git history for the old formula). A
+        // floating-point depth buffer's relative precision is densest near 0 and sparsest near 1,
+        // so a non-reversed mapping wastes that density on the region right in front of the camera
+        // and starves precision at the far end -- exactly backwards from where depth PRECISION
+        // actually needs to win ties (distant, near-coplanar geometry), and exactly the amplifying
+        // factor behind this codebase's own z-fighting bug reports at this scene's far/near ratio.
+        // Reversing the mapping (paired site-wide with VK_COMPARE_OP_GREATER, a depth clear of 0.0,
+        // and every "nearer" depth comparison in the culling/resolve/software-raster pipeline
+        // flipped to match -- see ClusterHardwareRasterPass/HZBPass/ClusterResolve.comp/
+        // cluster_software_raster_core.glsl's own comments) puts that same dense-near-0 precision
+        // region at the FAR plane instead, which is the well-established standard fix real-time
+        // engines (this codebase's own Unreal Engine 5 Nanite/Lumen inspiration included) use.
+        // Derivation: solving clip.z = m[10]*viewZ + m[14], clip.w = -viewZ, ndc.z = clip.z/clip.w
+        // for ndc.z(-zNear)=1 and ndc.z(-zFar)=0 gives m[10] = zNear/(zFar-zNear),
+        // m[14] = zNear*zFar/(zFar-zNear) (the exact negation-and-swap of the old formula's
+        // zFar/(zNear-zFar) / -(zFar*zNear)/(zFar-zNear) pair).
         static inline mat4 PerspectiveVulkan(float fovRadians, float aspect, float zNear, float zFar) {
             float g = 1.0f / std::tan(fovRadians * 0.5f);
             mat4 result;
@@ -137,9 +155,9 @@ namespace maths {
 
             result.m[0] = g / aspect;
             result.m[5] = -g;
-            result.m[10] = zFar / (zNear - zFar);
+            result.m[10] = zNear / (zFar - zNear);
             result.m[11] = -1.0f;
-            result.m[14] = -(zFar * zNear) / (zFar - zNear);
+            result.m[14] = (zNear * zFar) / (zFar - zNear);
             return result;
         }
 

@@ -19,8 +19,16 @@ struct DebugState {
     // renderer::ClusterRenderPipeline::SetDebugTraceMode -- 0 = SWRT (mesh SDF sphere tracing),
     // 1 = HWRT (inline rayQueryEXT). Shared by SurfaceCacheGIInjectPass and ScreenProbeGIPass so
     // both ray tracing back-ends stay exercised. Defaults to HWRT, matching Release's own fixed
-    // choice (see ClusterRenderPipeline::RecordFrame's own comment).
+    // choice (see ClusterRenderPipeline::RecordFrame's own comment). Set by two explicit keys
+    // ('T'/'Y' below) rather than a single flip-toggle, matching how UE5.8 Lumen itself exposes
+    // this as one explicit project-wide back-end choice, never simultaneous dual-tracing.
     uint32_t traceMode = 1;
+    // renderer::ClusterRenderPipeline::SetDebugRadiosityEnabled -- gates the intra-frame
+    // multi-bounce radiosity loop ([1z] in RecordFrame) so its cost/contribution can be A/B'd.
+    bool radiosityEnabled = true;
+    // renderer::ClusterRenderPipeline::SetDebugSSRTEnabled -- gates the Screen Space Probe GI
+    // trace/temporal/gather trio ([12b] in RecordFrame) so its cost/contribution can be A/B'd.
+    bool ssrtEnabled = true;
 };
 static DebugState g_DebugState;
 
@@ -79,8 +87,23 @@ static void KeyCallback(GLFWwindow* window, int key, int scancode, int action, i
         LOG_INFO(std::format("[Debug] Occlusion Culling: {}", g_DebugState.disableOcclusionCulling ? "DISABLED" : "ENABLED"));
         break;
     case GLFW_KEY_T:
-        g_DebugState.traceMode = 1u - g_DebugState.traceMode;
-        LOG_INFO(std::format("[Debug] GI Trace Mode: {}", g_DebugState.traceMode == 0u ? "SWRT" : "HWRT"));
+        // Explicit "force SWRT" -- see DebugState::traceMode's own comment for why this replaces
+        // the old single flip-toggle key.
+        g_DebugState.traceMode = 0u;
+        LOG_INFO("[Debug] GI Trace Mode: SWRT");
+        break;
+    case GLFW_KEY_Y:
+        // Explicit "force HWRT".
+        g_DebugState.traceMode = 1u;
+        LOG_INFO("[Debug] GI Trace Mode: HWRT");
+        break;
+    case GLFW_KEY_G:
+        g_DebugState.radiosityEnabled = !g_DebugState.radiosityEnabled;
+        LOG_INFO(std::format("[Debug] Radiosity (multi-bounce GI injection): {}", g_DebugState.radiosityEnabled ? "ON" : "OFF"));
+        break;
+    case GLFW_KEY_F:
+        g_DebugState.ssrtEnabled = !g_DebugState.ssrtEnabled;
+        LOG_INFO(std::format("[Debug] Screen Space Probe GI (SSRT): {}", g_DebugState.ssrtEnabled ? "ON" : "OFF"));
         break;
     default:
         break;
@@ -218,6 +241,8 @@ int main() {
         camera.SetDebugViewMode(g_DebugState.viewMode);
         camera.SetDebugOcclusionCullingDisabled(g_DebugState.disableOcclusionCulling);
         clusterPipeline.SetDebugTraceMode(g_DebugState.traceMode);
+        clusterPipeline.SetDebugRadiosityEnabled(g_DebugState.radiosityEnabled);
+        clusterPipeline.SetDebugSSRTEnabled(g_DebugState.ssrtEnabled);
 #endif
 
         // --- DEBUG: dump the camera position and the resulting view/proj matrices on the

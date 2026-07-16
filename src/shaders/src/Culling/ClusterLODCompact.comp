@@ -81,6 +81,7 @@ void main() {
     meta.clusterID = node.clusterID;
     meta.maxWPOAmplitude = node.maxWPOAmplitude;
     meta.maskTextureIndex = node.maskTextureIndex;
+    meta.entityID = node.entityID;
 
     uint slot = atomicAdd(g_CandidateCount.count, 1u);
     if (slot < g_CandidateMetadata.clusters.length()) {

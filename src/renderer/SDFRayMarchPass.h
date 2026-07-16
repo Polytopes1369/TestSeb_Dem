@@ -109,10 +109,14 @@ namespace renderer {
         // the shader's toroidal-wrap addressing in agreement with whatever GlobalSDFPass most
         // recently wrote. Must be called into an already-open, caller-owned command buffer (never
         // submits on its own); ends with a VkMemoryBarrier2 making the output image's writes visible
-        // to a later sampled/compute read.
+        // to a later sampled/compute read. `coarseOnly` (false = normal two-tier march, matching
+        // DEBUG_VIEW_LUMEN's full result; true = DEBUG_VIEW_GLOBAL_SDF's own coarse-clipmap-only
+        // variant, skipping the fine per-entity BVH refinement tier entirely) makes this pass's
+        // output visually distinct between the two debug views that both blit-swap to it -- see
+        // renderer::ClusterRenderPipeline::RecordFrame's own [14] blit-source-swap comment.
         void RecordRayMarch(VkCommandBuffer cmd, const GlobalSDFPass& globalSDF,
             const maths::vec3& cameraPosition, const maths::vec3& cameraForward, const maths::vec3& cameraUp,
-            float fovYRadians, float aspectRatio, float nearZ, float farZ);
+            float fovYRadians, float aspectRatio, float nearZ, float farZ, bool coarseOnly);
 
         uint32_t GetOutputWidth() const { return m_OutputWidth; }
         uint32_t GetOutputHeight() const { return m_OutputHeight; }

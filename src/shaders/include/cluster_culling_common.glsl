@@ -30,6 +30,7 @@ struct ClusterCullMetadata {
     uint clusterID;
     float maxWPOAmplitude;  // Worst-case world-space vertex displacement the WPO sway function can apply (see wpo_deformation.glsl).
     uint maskTextureIndex;  // Index into the bindless cutout mask array (mask_sampling.glsl), or 0xFFFFFFFF for "fully opaque".
+    uint entityID;          // geometry::ClusterIndexEntry::entityID -- the owning entity's meshID.
     // No manual padding needed here (unlike the C++ mirror): the GLSL compiler infers the std430
     // array stride (96 bytes, rounded up from this struct's 16-byte base alignment) on its own.
 };

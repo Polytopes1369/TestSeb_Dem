@@ -78,7 +78,7 @@ layout(push_constant) uniform SDFRayMarchPC {
     int clipmapResolution;
     int rootNodeIndex;        // -1 if the scene has zero entities (BVH is empty).
     int entitySamplerCount;   // How many of uEntitySDFs' 64 slots are real entities (rest are the far-value placeholder).
-    int _pad0;
+    int coarseOnly;           // 0 = normal two-tier march (DEBUG_VIEW_LUMEN); 1 = coarse-clipmap-only (DEBUG_VIEW_GLOBAL_SDF), skips Stage 2+3 entirely.
 } pc;
 
 vec3 GetCameraPosition() { return vec3(pc.cameraPosition[0], pc.cameraPosition[1], pc.cameraPosition[2]); }
@@ -114,6 +114,20 @@ float SampleClipmap(int level, vec3 p) {
     ivec3 wrapped = ((worldVoxel % res) + res) % res;
     vec3 uvw = (vec3(wrapped) + 0.5) / float(res);
     return texture(uGlobalClipmaps[level], uvw).r;
+}
+
+// SDF-gradient world-space normal at `p` from the COARSE Global SDF clipmap itself (as opposed to
+// ComputeEntityNormal's per-entity Mesh SDF gradient below) -- central differences, one `level`
+// voxel-size step per axis. Used only by DEBUG_VIEW_GLOBAL_SDF's coarse-only shading path (see
+// main()), where there is no refined per-entity hit to take a precise normal from.
+vec3 ComputeClipmapNormal(int level, vec3 p) {
+    float step = pc.levelVoxelSize[level];
+    float dx = SampleClipmap(level, p + vec3(step, 0.0, 0.0)) - SampleClipmap(level, p - vec3(step, 0.0, 0.0));
+    float dy = SampleClipmap(level, p + vec3(0.0, step, 0.0)) - SampleClipmap(level, p - vec3(0.0, step, 0.0));
+    float dz = SampleClipmap(level, p + vec3(0.0, 0.0, step)) - SampleClipmap(level, p - vec3(0.0, 0.0, step));
+    vec3 n = vec3(dx, dy, dz);
+    float len = length(n);
+    return len > 1.0e-8 ? n / len : vec3(0.0, 1.0, 0.0);
 }
 
 // Robust slab-method ray-AABB test (Kay/Kajiya): correct regardless of the sign of `dir`'s
@@ -290,8 +304,11 @@ void main() {
     float hitT = 0.0;
     uint hitEntity = 0u;
 
-    // --- Stage 2 + 3: BVH traversal + precise per-entity local refine. ---
-    if (foundCandidate) {
+    // --- Stage 2 + 3: BVH traversal + precise per-entity local refine. Entirely skipped in
+    // DEBUG_VIEW_GLOBAL_SDF's coarse-only mode (pc.coarseOnly != 0) -- that view exists specifically
+    // to show the coarse Global SDF clipmap trace ALONE, visually distinct from DEBUG_VIEW_LUMEN's
+    // full two-tier result (see Stage 4 below, which shades the coarse hit directly instead). ---
+    if (foundCandidate && pc.coarseOnly == 0) {
         float margin = pc.levelVoxelSize[hitLevel] * 4.0; // The coarse step above is only accurate to about one voxel.
         float tMin = max(pc.nearZ, t - margin);
         float tMax = min(pc.farZ, t + margin);
@@ -310,6 +327,26 @@ void main() {
 
         // Simple single-directional Lambertian debug shade -- this is a visualization image (see
         // renderer::SDFRayMarchPass's own class comment), not the Surface Cache's own lit result.
+        vec3 lightDir = normalize(vec3(0.5, 1.0, 0.5));
+        float ndotl = max(dot(normal, lightDir), 0.0);
+        color = baseColor * (0.2 + 0.8 * ndotl);
+    } else if (foundCandidate && pc.coarseOnly != 0) {
+        // Coarse-only hit: shade the Global SDF clipmap surface directly at the coarse march's own
+        // stopping point, colored by WHICH clipmap level (hitLevel) covers it here -- a genuinely
+        // useful debug signal DEBUG_VIEW_LUMEN's entity-hash-colored result cannot show, since it
+        // reveals the streamed clipmap cascade boundaries themselves (level 0 = finest/nearest
+        // camera, level 3 = coarsest/farthest).
+        vec3 hitPos = rayOrigin + rayDir * t;
+        vec3 normal = ComputeClipmapNormal(hitLevel, hitPos);
+
+        const vec3 kLevelColors[4] = vec3[4](
+            vec3(0.90, 0.25, 0.25), // Level 0 -- finest.
+            vec3(0.95, 0.70, 0.20),
+            vec3(0.30, 0.75, 0.35),
+            vec3(0.30, 0.55, 0.95)  // Level 3 -- coarsest.
+        );
+        vec3 baseColor = kLevelColors[hitLevel];
+
         vec3 lightDir = normalize(vec3(0.5, 1.0, 0.5));
         float ndotl = max(dot(normal, lightDir), 0.0);
         color = baseColor * (0.2 + 0.8 * ndotl);

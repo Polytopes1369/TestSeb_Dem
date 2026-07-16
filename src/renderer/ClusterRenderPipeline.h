@@ -15,22 +15,25 @@
 //     -> blit to the acquired swapchain image, ready for present.
 //
 // --- Streaming scope in this integration ---
-// The current scene's entire cluster set fits comfortably in the physical page pool, so Init()
-// streams every cluster page in once, at startup, through the real streaming path (cache file ->
-// staging -> BindPage -> DecompressPage) and everything stays resident -- there is no per-frame
-// disk traffic, which is also the strongest possible anti-stutter guarantee for a demoscene-sized
-// scene. The per-frame async residency loop (FeedbackBuffer misses -> StreamingRequestQueue ->
-// AsyncFileStreamer -> BindPageEvictingIfFull) stays future work: it additionally requires
-// residency-aware culling (a cluster whose page is evicted must never reach a raster worklist),
-// which no culling shader implements yet.
+// Init() streams every cluster page in once at startup through the real streaming path (cache file
+// -> staging -> BindPage -> DecompressPage), so everything the LOD cut could ever select is already
+// resident before the first frame -- the strongest possible anti-stutter guarantee for a demoscene-
+// sized scene. On top of that baseline, m_Streaming (GeometryStreamingCoordinator) drives the async
+// residency loop for real, every frame (FeedbackBuffer misses from m_LODSelection's own residency
+// check -> StreamingRequestQueue -> AsyncFileStreamer -> BindPageEvictingIfFull), so this class is
+// exercised exactly as a scene that DOESN'T fit entirely resident would be -- see that class's own
+// class comment for the exact per-frame sequencing contract with m_LODSelection's feedback buffer.
 //
 // --- LOD scope ---
-// The candidate cluster set uploaded to the culling pass is the DAG's LEAF level (full detail,
-// geometry::DAGNodeEntry::level == 0) -- exactly the geometry the flat pre-cluster path drew. The
-// GPU LOD cut (ClusterDAGScreenError.comp) exists but has no driver yet; when it lands, it slots
-// in as a pass that rewrites this candidate set per frame, upstream of the occlusion cull, with no
-// change to anything downstream. Entity self-rotation (EntityTransform) is likewise not applied by
-// the clustered path yet -- clusters render the static geometry as captured into the cache.
+// The candidate cluster set fed to the occlusion cull is NOT a fixed DAG level anymore -- m_LODSelection
+// (ClusterLODSelectionPass) rewrites it every frame from a real GPU-driven DAG cut (ClusterDAGScreenError
+// .comp's per-node projected-error test -> ClusterLODResidencyFallback.comp's non-resident-node
+// ancestor walk, so a cut node whose page hasn't streamed in yet never reaches the raster worklist ->
+// ClusterLODCompact.comp's final candidate emission), upstream of m_OcclusionCulling with no change to
+// anything downstream -- see ClusterLODSelectionPass's own class comment for the full 3-dispatch
+// sequence. Entity self-rotation (EntityTransform) is still not applied by the clustered path --
+// clusters render the static geometry as captured into the cache; the camera orbit is the scene's
+// only motion for now (see main.cpp's own note on why UpdateEntityRotations() is no longer called).
 //
 // --- Per-frame GPU work (all recorded by RecordFrame() into ONE command buffer, submitted once:
 // no mid-frame vkQueueSubmit/vkQueueWaitIdle anywhere, the other half of the anti-stutter
@@ -132,6 +135,18 @@ namespace renderer {
         // target roughly 1 pixel.
         static constexpr float kLODPixelErrorThreshold = 1.0f;
 
+        // Number of consecutive SurfaceCacheGIInjectPass::RecordInject calls made THIS frame (see
+        // RecordFrame()'s own [1z] block). Each call advances m_GIInject's own round-robin cursor by
+        // its fixed per-call card budget (SurfaceCacheGIInjectPass::kCardsPerFrameBudget) and is
+        // barrier-isolated from the next, so bounce N+1's freshly-processed cards sample the Surface
+        // Cache atlas INCLUDING bounce N's own same-frame writes wherever their sampled footprints
+        // overlap -- a genuine intra-frame multi-bounce chain, layered on top of (not a replacement
+        // for) the pass's existing cross-frame convergence. 3 is enough for indirect light to
+        // visibly wrap a corner within a single frame without tripling GI cost for a barely-visible
+        // 4th+ bounce (each bounce's marginal energy contribution falls off quickly against typical
+        // scene albedo).
+        static constexpr uint32_t kRadiosityBounceCount = 3;
+
         // Reads the .cache file's header/tables, streams every cluster's 4 KB geometry page into
         // the physical pool (one staging buffer, one setup command buffer, one blocking submit --
         // startup-only, never repeated per frame), decompresses vertices and expands indices for
@@ -164,9 +179,21 @@ namespace renderer {
 #ifndef NDEBUG
         // SWRT/HWRT back-end toggle shared by m_GIInject and m_ScreenProbeGI (0 = SWRT mesh-SDF
         // sphere tracing, 1 = HWRT inline rayQueryEXT against m_SurfaceCacheRT's TLAS) -- debug-only
-        // (main.cpp numpad/T key) so both back-ends stay exercised; Release always uses HWRT (see
-        // RecordFrame()'s own use of this member).
+        // (main.cpp's 'T'/'Y' explicit-set keys) so both back-ends stay exercised; Release always
+        // uses HWRT (see RecordFrame()'s own use of this member).
         void SetDebugTraceMode(uint32_t traceMode) { m_DebugTraceMode = traceMode; }
+
+        // Independently gates RecordFrame()'s [1z] intra-frame radiosity bounce loop
+        // (kRadiosityBounceCount calls to SurfaceCacheGIInjectPass::RecordInject) so its cost and
+        // visual contribution can be A/B'd via the FPS counter and the resolved image -- see
+        // main.cpp's 'G' key. Defaults to true (Release has no toggle and always runs the loop).
+        void SetDebugRadiosityEnabled(bool enabled) { m_DebugRadiosityEnabled = enabled; }
+
+        // Independently gates RecordFrame()'s [12b] m_ScreenProbeGI RecordTrace/RecordTemporal/
+        // RecordGather trio entirely -- skipped means zero screen-space probe indirect contribution
+        // this frame, so its cost/contribution is directly A/B-able the same way -- see main.cpp's
+        // 'F' key. Defaults to true (Release has no toggle and always runs the trio).
+        void SetDebugSSRTEnabled(bool enabled) { m_DebugSSRTEnabled = enabled; }
 #endif
 
     private:
@@ -282,6 +309,8 @@ namespace renderer {
 
 #ifndef NDEBUG
         uint32_t m_DebugTraceMode = 0;
+        bool m_DebugRadiosityEnabled = true;
+        bool m_DebugSSRTEnabled = true;
 #endif
 
 #ifndef NDEBUG

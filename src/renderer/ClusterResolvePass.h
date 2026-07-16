@@ -78,10 +78,16 @@ namespace renderer {
         // write time, not re-validated per use.
         // `maskImageInfos` is renderer::ProceduralMaskGenerator::GetMaskImageInfos(), bound as
         // binding 8 for ClusterResolve.comp's soft opacity-mask edge blending (mask_sampling.glsl).
+        // `wpoGlobalsBuffer` is renderer::ClusterRenderPipeline's own WPOGlobalsUBO (bound read-only
+        // here as binding 12) -- this shader must reapply the exact same World Position Offset sway
+        // deformation (wpo_deformation.glsl's ApplyWPODeformation) that both rasterizers already
+        // applied to the vertices they actually drew, so its own re-projection for barycentric
+        // reconstruction operates on the same deformed triangle, not the rest-pose one.
         void Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue, VkExtent2D renderExtent,
             VkBuffer clusterMetadataBuffer, VkBuffer compressedPhysicalPoolBuffer,
             VkImageView hwClusterIDView, VkImageView hwTriangleIDView, VkImageView hwDepthView,
-            VkImageView swVisBufferAtomicView, const std::vector<VkDescriptorImageInfo>& maskImageInfos);
+            VkImageView swVisBufferAtomicView, const std::vector<VkDescriptorImageInfo>& maskImageInfos,
+            VkBuffer wpoGlobalsBuffer);
 
         void Shutdown();
 
