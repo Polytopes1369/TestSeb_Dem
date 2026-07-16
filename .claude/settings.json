@@ -2,7 +2,7 @@
   "permissions": {
     "defaultMode": "acceptEdits",
     "allow": [
-      "Read(//d/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026-ssrt-atrous-worldprobes-worktree/**)",
+      "Read(**)",
       "Write(**)",
       "Skill(run)",
       "Skill(run:*)"
