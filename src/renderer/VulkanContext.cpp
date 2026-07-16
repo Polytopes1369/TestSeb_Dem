@@ -53,12 +53,12 @@ constexpr VkDeviceSize kIndexBufferBytes = 256 * 1024;
 // GPU, avoiding a separate per-instance transform stage.
 
 struct ConeParams {
-  float bottomRadius;
-  float topRadius;
+  float radius1;
+  float radius2;
   float height;
-  uint32_t nbHeightSegs;
-  uint32_t nbCapSegs;
-  uint32_t nbSides;
+  uint32_t heightSegments;
+  uint32_t capSegments;
+  uint32_t sides;
   uint32_t meshID;
   float materialID;
   uint32_t vertexOffset;
@@ -70,8 +70,10 @@ struct ConeParams {
 
 struct IcosphereParams {
   float radius;
-  uint32_t subdiv;
-  uint32_t baseType; // 0 = Tetra, 1 = Octa, 2 = Icosa
+  uint32_t segments;
+  uint32_t tetra;
+  uint32_t octa;
+  uint32_t icosa;
   uint32_t meshID;
   float materialID;
   uint32_t vertexOffset;
@@ -84,8 +86,8 @@ struct IcosphereParams {
 struct PlaneParams {
   float width;
   float length_;
-  uint32_t widthSegs;
-  uint32_t lengthSegs;
+  uint32_t widthSegments;
+  uint32_t lengthSegments;
   uint32_t meshID;
   float materialID;
   uint32_t vertexOffset;
@@ -112,8 +114,8 @@ struct TorusParams {
   float radius2;
   float rotation;
   float twist;
-  uint32_t nbRadSeg;
-  uint32_t nbSides;
+  uint32_t segments;
+  uint32_t sides;
   uint32_t meshID;
   float materialID;
   uint32_t vertexOffset;
@@ -127,9 +129,9 @@ struct TubeParams {
   float radius1;
   float radius2;
   float height;
-  uint32_t nbHeightSegs;
-  uint32_t nbCapSegs;
-  uint32_t nbSides;
+  uint32_t heightSegments;
+  uint32_t capSegments;
+  uint32_t sides;
   uint32_t meshID;
   float materialID;
   uint32_t vertexOffset;
@@ -142,9 +144,8 @@ struct TubeParams {
 struct CapsuleParams {
   float radius;
   float height; // cylindrical body length (= total height - 2*radius)
-  uint32_t nbSides;
-  uint32_t nbHeightSegs;
-  uint32_t nbCapSegs;
+  uint32_t sides;
+  uint32_t heightSegs;
   uint32_t meshID;
   float materialID;
   uint32_t vertexOffset;
@@ -157,9 +158,9 @@ struct CapsuleParams {
 struct CylinderParams {
   float radius;
   float height;
-  uint32_t nbSides;
-  uint32_t nbHeightSegs;
-  uint32_t nbCapSegs;
+  uint32_t heightSegments;
+  uint32_t capSegments;
+  uint32_t sides;
   uint32_t meshID;
   float materialID;
   uint32_t vertexOffset;
@@ -173,9 +174,9 @@ struct PyramidParams {
   float width;
   float depth;
   float height;
-  uint32_t widthSegs;
-  uint32_t depthSegs;
-  uint32_t heightSegs;
+  uint32_t widthSegments;
+  uint32_t depthSegments;
+  uint32_t heightSegments;
   uint32_t meshID;
   float materialID;
   uint32_t vertexOffset;
@@ -232,11 +233,12 @@ struct EntityTransform {
 // because each of its 6 face dispatches also needs distinct specialization
 // constants baked per-pipeline.
 struct BoxPushConstants {
-  float faceWidth;
-  float faceHeight;
-  float lengthOffset; // constant coordinate along wAxis (±half box size)
-  uint32_t uSegsCount;
-  uint32_t vSegsCount;
+  float width;
+  float length;
+  float height;
+  uint32_t widthSegments;
+  uint32_t lengthSegments;
+  uint32_t heightSegments;
   uint32_t meshID;
   float materialID;
   uint32_t vertexOffset;
@@ -247,7 +249,7 @@ struct BoxPushConstants {
 };
 
 // Specialization constants for geom_box.comp's 6 face dispatches (constant_id
-// 0..5: uAxis, vAxis, wAxis, faceMode, udir, vdir — axis indices 0=x,1=y,2=z,
+// 0..6: uAxis, vAxis, wAxis, faceMode, udir, vdir, wSign — axis indices 0=x,1=y,2=z,
 // matching the shader's setComp() convention). Each face's
 // (uAxis,vAxis,wAxis,udir,vdir) is chosen so that the shader's (a,b,d) triangle
 // — built from vectors vAxis*(segH*vdir) and uAxis*(segW*udir) — satisfies
@@ -266,20 +268,17 @@ struct BoxFaceSpecConstants {
                     // formula branch)
   float udir;
   float vdir;
+  float wSign;
 };
 
 constexpr BoxFaceSpecConstants kBoxFaceSpecs[6] = {
-    {0, 1, 2, 0, -1.0f, 1.0f}, // +Z  (u=x,v=y,w=z, P=+1, wSign=+1)
-    {0, 1, 2, 0, 1.0f, 1.0f},  // -Z  (wSign=-1)
-    {0, 2, 1, 1, 1.0f, 1.0f},  // +Y  (u=x,v=z,w=y, P=-1, wSign=+1)
-    {0, 2, 1, 1, -1.0f, 1.0f}, // -Y  (wSign=-1)
-    {1, 2, 0, 2, -1.0f, 1.0f}, // +X  (u=y,v=z,w=x, P=+1, wSign=+1)
-    {1, 2, 0, 2, 1.0f, 1.0f},  // -X  (wSign=-1)
+    {0, 1, 2, 0, -1.0f, 1.0f, 1.0f},  // +Z  (u=x,v=y,w=z, P=+1, wSign=+1)
+    {0, 1, 2, 0, 1.0f,  1.0f, -1.0f}, // -Z  (wSign=-1)
+    {0, 2, 1, 1, 1.0f,  1.0f, 1.0f},  // +Y  (u=x,v=z,w=y, P=-1, wSign=+1)
+    {0, 2, 1, 1, -1.0f, 1.0f, -1.0f}, // -Y  (wSign=-1)
+    {1, 2, 0, 2, -1.0f, 1.0f, 1.0f},  // +X  (u=y,v=z,w=x, P=+1, wSign=+1)
+    {1, 2, 0, 2, 1.0f,  1.0f, -1.0f}, // -X  (wSign=-1)
 };
-
-// lengthOffset sign per face, matching kBoxFaceSpecs order: +Z,-Z,+Y,-Y,+X,-X.
-constexpr float kBoxFaceLengthOffsetSign[6] = {1.0f,  -1.0f, 1.0f,
-                                               -1.0f, 1.0f,  -1.0f};
 } // namespace
 
 #ifndef NDEBUG
@@ -1014,18 +1013,19 @@ void VulkanContext::CreatePipelinesAndDescriptors() {
     VkShaderModule boxModule =
         VulkanPipeline::CreateShaderModule(m_Device, boxCode);
 
-    VkSpecializationMapEntry mapEntries[6] = {
+    VkSpecializationMapEntry mapEntries[7] = {
         {0, offsetof(BoxFaceSpecConstants, uAxis), sizeof(int32_t)},
         {1, offsetof(BoxFaceSpecConstants, vAxis), sizeof(int32_t)},
         {2, offsetof(BoxFaceSpecConstants, wAxis), sizeof(int32_t)},
         {3, offsetof(BoxFaceSpecConstants, faceMode), sizeof(int32_t)},
         {4, offsetof(BoxFaceSpecConstants, udir), sizeof(float)},
         {5, offsetof(BoxFaceSpecConstants, vdir), sizeof(float)},
+        {6, offsetof(BoxFaceSpecConstants, wSign), sizeof(float)},
     };
 
     for (uint32_t face = 0; face < 6u; ++face) {
       VkSpecializationInfo specInfo{};
-      specInfo.mapEntryCount = 6;
+      specInfo.mapEntryCount = 7;
       specInfo.pMapEntries = mapEntries;
       specInfo.dataSize = sizeof(BoxFaceSpecConstants);
       specInfo.pData = &kBoxFaceSpecs[face];
@@ -1270,6 +1270,438 @@ void VulkanContext::UploadEntityData() {
   vmaDestroyBuffer(m_Allocator, stagingBuffer, stagingAllocation);
 }
 
+void VulkanContext::GenerateBox(
+    float Width, float Length, float Height,
+    uint32_t WidthSegments, uint32_t LengthSegments, uint32_t HeightSegments,
+    uint32_t meshID, maths::vec2 slot,
+    uint32_t& runningVertexOffset, uint32_t& runningIndexOffset) {
+  // Validate dimensions and segments are positive and non-zero
+  assert(Width > 0.0f);
+  assert(Length > 0.0f);
+  assert(Height > 0.0f);
+  assert(WidthSegments > 0u);
+  assert(LengthSegments > 0u);
+  assert(HeightSegments > 0u);
+
+  for (uint32_t face = 0; face < 6u; ++face) {
+    BoxPushConstants params{};
+    params.width = Width;
+    params.length = Length;
+    params.height = Height;
+    params.widthSegments = WidthSegments;
+    params.lengthSegments = LengthSegments;
+    params.heightSegments = HeightSegments;
+    params.meshID = meshID;
+    params.materialID = 0.0f;
+    params.vertexOffset = runningVertexOffset;
+    params.indexOffset = runningIndexOffset;
+    params.worldOffsetX = slot.x;
+    params.worldOffsetY = 0.0f;
+    params.worldOffsetZ = slot.y;
+
+    uint32_t uSegs = 0, vSegs = 0;
+    if (face == 0u || face == 1u) {
+      uSegs = WidthSegments;
+      vSegs = HeightSegments;
+    } else if (face == 2u || face == 3u) {
+      uSegs = WidthSegments;
+      vSegs = LengthSegments;
+    } else {
+      uSegs = HeightSegments;
+      vSegs = LengthSegments;
+    }
+
+    uint32_t uSegsCount = uSegs + 1u;
+    uint32_t vSegsCount = vSegs + 1u;
+
+    constexpr uint32_t kLocalSizeXY = 8u; // geom_box.comp local_size = (8, 8, 1)
+    uint32_t groupCountX = (uSegsCount + kLocalSizeXY - 1u) / kLocalSizeXY;
+    uint32_t groupCountY = (vSegsCount + kLocalSizeXY - 1u) / kLocalSizeXY;
+
+    DispatchGeometryCompute(m_BoxFacePipelines[face],
+                            m_BoxComputePipelineLayout, nullptr, 0, &params,
+                            sizeof(params), groupCountX, groupCountY, 1);
+
+    runningVertexOffset += uSegsCount * vSegsCount;
+    runningIndexOffset += uSegs * vSegs * 6u;
+  }
+}
+
+void VulkanContext::GenerateCone(
+    float Radius1, float Radius2, float Height,
+    uint32_t HeightSegments, uint32_t CapSegments, uint32_t Sides,
+    uint32_t meshID, maths::vec2 slot,
+    uint32_t& runningVertexOffset, uint32_t& runningIndexOffset) {
+  // Validate dimensions and segments are positive and non-zero
+  assert(Radius1 > 0.0f);
+  assert(Radius2 > 0.0f);
+  assert(Height > 0.0f);
+  assert(HeightSegments > 0u);
+  assert(CapSegments > 0u);
+  assert(Sides > 0u);
+  assert(Sides >= 3u);
+
+  ConeParams params{};
+  params.radius1 = Radius1;
+  params.radius2 = Radius2;
+  params.height = Height;
+  params.heightSegments = HeightSegments;
+  params.capSegments = CapSegments;
+  params.sides = Sides;
+  params.meshID = meshID;
+  params.materialID = 0.0f;
+  params.vertexOffset = runningVertexOffset;
+  params.indexOffset = runningIndexOffset;
+  params.worldOffsetX = slot.x;
+  params.worldOffsetY = -params.height * 0.5f; // recenter: geometry spans y=[0,height]
+  params.worldOffsetZ = slot.y;
+
+  uint32_t sideVertCount = (params.sides + 1u) * (params.heightSegments + 1u);
+  uint32_t capVertCount = 1u + params.capSegments * (params.sides + 1u);
+  uint32_t totalVerts = sideVertCount + 2u * capVertCount;
+
+  constexpr uint32_t kLocalSizeX = 64u;
+  uint32_t groupCount = (totalVerts + kLocalSizeX - 1u) / kLocalSizeX;
+
+  DispatchGeometryCompute(m_ConePipeline, m_ComputePipelineLayout, &params,
+                          sizeof(params), nullptr, 0, groupCount, 1, 1);
+
+  runningVertexOffset += totalVerts;
+  runningIndexOffset += params.sides * params.heightSegments * 6u +
+                        2u * params.capSegments * params.sides * 6u;
+}
+
+void VulkanContext::GenerateSphere(
+    float Radius, uint32_t Segments,
+    uint32_t meshID, maths::vec2 slot,
+    uint32_t& runningVertexOffset, uint32_t& runningIndexOffset) {
+  // Validate dimensions and segments are positive and non-zero
+  assert(Radius > 0.0f);
+  assert(Segments > 0u);
+  assert(Segments >= 3u);
+
+  SphereParams params{};
+  params.radius = Radius;
+  params.segments = Segments;
+  params.meshID = meshID;
+  params.materialID = 0.0f;
+  params.vertexOffset = runningVertexOffset;
+  params.indexOffset = runningIndexOffset;
+  params.worldOffsetX = slot.x;
+  params.worldOffsetY = 0.0f;
+  params.worldOffsetZ = slot.y;
+
+  uint32_t ringCount = params.segments - 2u; // interior latitude rings (excludes poles)
+  uint32_t ringStride = params.segments + 1u;
+  uint32_t vertCount = ringCount * ringStride + 2u;
+  constexpr uint32_t kLocalSizeX = 64u; // geom_sphere.comp local_size_x = 64
+  uint32_t groupCount = (vertCount + kLocalSizeX - 1u) / kLocalSizeX;
+
+  DispatchGeometryCompute(m_SpherePipeline, m_ComputePipelineLayout, &params,
+                          sizeof(params), nullptr, 0, groupCount, 1, 1);
+
+  runningVertexOffset += vertCount;
+  runningIndexOffset += 6u * params.segments * ringCount;
+}
+
+void VulkanContext::GenerateIcosphere(
+    float Radius, uint32_t Segments, bool Tetra, bool Octa, bool Icosa,
+    uint32_t meshID, maths::vec2 slot,
+    uint32_t& runningVertexOffset, uint32_t& runningIndexOffset,
+    uint32_t& outBaseFaceCount, uint32_t& outVertsPerFace) {
+  // Validate dimensions and segments are positive and non-zero
+  assert(Radius > 0.0f);
+  assert(Segments > 0u);
+  assert((Tetra ? 1 : 0) + (Octa ? 1 : 0) + (Icosa ? 1 : 0) == 1);
+
+  IcosphereParams params{};
+  params.radius = Radius;
+  params.segments = Segments;
+  params.tetra = Tetra ? 1u : 0u;
+  params.octa = Octa ? 1u : 0u;
+  params.icosa = Icosa ? 1u : 0u;
+  params.meshID = meshID;
+  params.materialID = 0.0f;
+  params.vertexOffset = runningVertexOffset;
+  params.indexOffset = runningIndexOffset;
+  params.worldOffsetX = slot.x;
+  params.worldOffsetY = 0.0f;
+  params.worldOffsetZ = slot.y;
+
+  outBaseFaceCount = Tetra ? 4u : (Octa ? 8u : 20u);
+
+  // Dispatch sizing must match geom_icosphere.comp's local_size = (8, 8, 1):
+  // X and Y cover the triangular grid coordinates (i, j) in [0, segments], Z
+  // covers the base faces.
+  constexpr uint32_t kLocalSizeXY = 8u;
+  uint32_t gridExtent = params.segments + 1u; // valid i,j range is [0, segments] inclusive
+  uint32_t groupCountXY = (gridExtent + kLocalSizeXY - 1u) / kLocalSizeXY;
+
+  DispatchGeometryCompute(m_IcospherePipeline, m_ComputePipelineLayout,
+                          &params, sizeof(params), nullptr, 0, groupCountXY,
+                          groupCountXY, outBaseFaceCount);
+
+  outVertsPerFace = (params.segments + 1u) * (params.segments + 2u) / 2u;
+  uint32_t totalVerts = outVertsPerFace * outBaseFaceCount;
+  uint32_t icosphereIndexCount = outBaseFaceCount * params.segments * params.segments * 3u;
+
+  runningVertexOffset += totalVerts;
+  runningIndexOffset += icosphereIndexCount;
+}
+
+void VulkanContext::GenerateCylinder(
+    float Radius, float Height, uint32_t HeightSegments, uint32_t CapSegments, uint32_t Sides,
+    uint32_t meshID, maths::vec2 slot,
+    uint32_t& runningVertexOffset, uint32_t& runningIndexOffset) {
+  // Validate dimensions and segments are positive and non-zero
+  assert(Radius > 0.0f);
+  assert(Height > 0.0f);
+  assert(HeightSegments > 0u);
+  assert(CapSegments > 0u);
+  assert(Sides > 0u);
+  assert(Sides >= 3u);
+
+  CylinderParams params{};
+  params.radius = Radius;
+  params.height = Height;
+  params.heightSegments = HeightSegments;
+  params.capSegments = CapSegments;
+  params.sides = Sides;
+  params.meshID = meshID;
+  params.materialID = 0.0f;
+  params.vertexOffset = runningVertexOffset;
+  params.indexOffset = runningIndexOffset;
+  params.worldOffsetX = slot.x;
+  params.worldOffsetY = -params.height * 0.5f; // recenter: geometry spans y=[0,height]
+  params.worldOffsetZ = slot.y;
+
+  uint32_t sideColumns = params.sides + 1u;
+  uint32_t sideVertCount = sideColumns * (params.heightSegments + 1u);
+  uint32_t capVertCount = 1u + params.capSegments * sideColumns; // center + rings
+  uint32_t totalVerts = sideVertCount + 2u * capVertCount;
+  constexpr uint32_t kLocalSizeX = 64u; // geom_cylinder.comp local_size_x = 64
+  uint32_t groupCount = (totalVerts + kLocalSizeX - 1u) / kLocalSizeX;
+
+  DispatchGeometryCompute(m_CylinderPipeline, m_ComputePipelineLayout,
+                          &params, sizeof(params), nullptr, 0, groupCount, 1, 1);
+
+  runningVertexOffset += totalVerts;
+  runningIndexOffset += 6u * params.sides * (params.heightSegments + 2u * params.capSegments);
+}
+
+void VulkanContext::GenerateTube(
+    float Radius1, float Radius2, float Height, uint32_t HeightSegments, uint32_t CapSegments, uint32_t Sides,
+    uint32_t meshID, maths::vec2 slot,
+    uint32_t& runningVertexOffset, uint32_t& runningIndexOffset) {
+  // Validate dimensions and segments are positive and non-zero
+  assert(Radius1 > 0.0f);
+  assert(Radius2 > 0.0f);
+  assert(Radius1 > Radius2);
+  assert(Height > 0.0f);
+  assert(HeightSegments > 0u);
+  assert(CapSegments > 0u);
+  assert(Sides > 0u);
+  assert(Sides >= 3u);
+
+  TubeParams params{};
+  params.radius1 = Radius1;
+  params.radius2 = Radius2;
+  params.height = Height;
+  params.heightSegments = HeightSegments;
+  params.capSegments = CapSegments;
+  params.sides = Sides;
+  params.meshID = meshID;
+  params.materialID = 0.0f;
+  params.vertexOffset = runningVertexOffset;
+  params.indexOffset = runningIndexOffset;
+  params.worldOffsetX = slot.x;
+  params.worldOffsetY = -params.height * 0.5f; // recenter: geometry spans y=[0,height]
+  params.worldOffsetZ = slot.y;
+
+  uint32_t sideColumns = params.sides + 1u;
+  uint32_t outerSideVertCount = sideColumns * (params.heightSegments + 1u);
+  uint32_t innerSideVertCount = sideColumns * (params.heightSegments + 1u);
+  uint32_t bottomCapVertCount = sideColumns * (params.capSegments + 1u);
+  uint32_t topCapVertCount = sideColumns * (params.capSegments + 1u);
+  uint32_t totalVerts = outerSideVertCount + innerSideVertCount +
+                        bottomCapVertCount + topCapVertCount;
+
+  constexpr uint32_t kLocalSizeX = 64u;
+  uint32_t groupCount = (totalVerts + kLocalSizeX - 1u) / kLocalSizeX;
+
+  DispatchGeometryCompute(m_TubePipeline, m_ComputePipelineLayout, &params,
+                          sizeof(params), nullptr, 0, groupCount, 1, 1);
+
+  runningVertexOffset += totalVerts;
+  runningIndexOffset += 12u * params.sides * params.heightSegments +
+                        12u * params.sides * params.capSegments;
+}
+
+void VulkanContext::GenerateTorus(
+    float Radius1, float Radius2, float Rotation, float Twist, uint32_t Segments, uint32_t Sides,
+    uint32_t meshID, maths::vec2 slot,
+    uint32_t& runningVertexOffset, uint32_t& runningIndexOffset) {
+  // Validate dimensions and segments are positive and non-zero
+  assert(Radius1 > 0.0f);
+  assert(Radius2 > 0.0f);
+  assert(Segments > 0u);
+  assert(Sides > 0u);
+
+  TorusParams params{};
+  params.radius1 = Radius1;
+  params.radius2 = Radius2;
+  params.rotation = Rotation;
+  params.twist = Twist;
+  params.segments = Segments;
+  params.sides = Sides;
+  params.meshID = meshID;
+  params.materialID = 0.0f;
+  params.vertexOffset = runningVertexOffset;
+  params.indexOffset = runningIndexOffset;
+  params.worldOffsetX = slot.x;
+  params.worldOffsetY = 0.0f;
+  params.worldOffsetZ = slot.y;
+
+  uint32_t stride = params.sides + 1u;
+  uint32_t vertCount = (params.segments + 1u) * stride;
+  constexpr uint32_t kLocalSizeX = 64u;
+  uint32_t groupCount = (vertCount + kLocalSizeX - 1u) / kLocalSizeX;
+
+  DispatchGeometryCompute(m_TorusPipeline, m_ComputePipelineLayout, &params,
+                          sizeof(params), nullptr, 0, groupCount, 1, 1);
+
+  runningVertexOffset += vertCount;
+  runningIndexOffset += 6u * params.segments * params.sides;
+}
+
+void VulkanContext::GeneratePyramid(
+    float Width, float Depth, float Height, uint32_t WidthSegments, uint32_t DepthSegments, uint32_t HeightSegments,
+    uint32_t meshID, maths::vec2 slot,
+    uint32_t& runningVertexOffset, uint32_t& runningIndexOffset) {
+  // Validate dimensions and segments are positive and non-zero
+  assert(Width > 0.0f);
+  assert(Depth > 0.0f);
+  assert(Height > 0.0f);
+  assert(WidthSegments > 0u);
+  assert(DepthSegments > 0u);
+  assert(HeightSegments > 0u);
+
+  PyramidParams params{};
+  params.width = Width;
+  params.depth = Depth;
+  params.height = Height;
+  params.widthSegments = WidthSegments;
+  params.depthSegments = DepthSegments;
+  params.heightSegments = HeightSegments;
+  params.meshID = meshID;
+  params.materialID = 0.0f;
+  params.vertexOffset = runningVertexOffset;
+  params.indexOffset = runningIndexOffset;
+  params.worldOffsetX = slot.x;
+  params.worldOffsetY = -params.height * 0.5f; // recenter
+  params.worldOffsetZ = slot.y;
+
+  uint32_t baseColumns = params.widthSegments + 1u;
+  uint32_t baseRows = params.depthSegments + 1u;
+  uint32_t baseVertCount = baseColumns * baseRows;
+
+  uint32_t sideZCols = params.widthSegments + 1u;
+  uint32_t sideZRows = params.heightSegments + 1u;
+  uint32_t sideZVerts = sideZCols * sideZRows;
+
+  uint32_t sideXCols = params.depthSegments + 1u;
+  uint32_t sideXRows = params.heightSegments + 1u;
+  uint32_t sideXVerts = sideXCols * sideXRows;
+
+  uint32_t totalVerts = baseVertCount + 2u * sideZVerts + 2u * sideXVerts;
+  constexpr uint32_t kLocalSizeX = 64u;
+  uint32_t groupCount = (totalVerts + kLocalSizeX - 1u) / kLocalSizeX;
+
+  DispatchGeometryCompute(m_PyramidPipeline, m_ComputePipelineLayout, &params,
+                          sizeof(params), nullptr, 0, groupCount, 1, 1);
+
+  runningVertexOffset += totalVerts;
+
+  uint32_t baseQuads = params.widthSegments * params.depthSegments;
+  uint32_t sideZQuads = params.widthSegments * params.heightSegments;
+  uint32_t sideXQuads = params.depthSegments * params.heightSegments;
+  runningIndexOffset += 6u * (baseQuads + 2u * sideZQuads + 2u * sideXQuads);
+}
+
+void VulkanContext::GeneratePlane(
+    float Length, float Width, uint32_t LengthSegments, uint32_t WidthSegments,
+    uint32_t meshID, maths::vec2 slot,
+    uint32_t& runningVertexOffset, uint32_t& runningIndexOffset) {
+  // Validate dimensions and segments are positive and non-zero
+  assert(Length > 0.0f);
+  assert(Width > 0.0f);
+  assert(LengthSegments > 0u);
+  assert(WidthSegments > 0u);
+
+  PlaneParams params{};
+  params.width = Width;
+  params.length_ = Length;
+  params.widthSegments = WidthSegments;
+  params.lengthSegments = LengthSegments;
+  params.meshID = meshID;
+  params.materialID = 0.0f;
+  params.vertexOffset = runningVertexOffset;
+  params.indexOffset = runningIndexOffset;
+  params.worldOffsetX = slot.x;
+  params.worldOffsetY = 0.0f;
+  params.worldOffsetZ = slot.y;
+
+  uint32_t totalVerts = params.widthSegments * params.lengthSegments;
+  constexpr uint32_t kLocalSizeXY = 8u; // geom_plane.comp local_size = (8, 8, 1)
+  uint32_t groupCountX = (params.widthSegments + kLocalSizeXY - 1u) / kLocalSizeXY;
+  uint32_t groupCountY = (params.lengthSegments + kLocalSizeXY - 1u) / kLocalSizeXY;
+
+  DispatchGeometryCompute(m_PlanePipeline, m_ComputePipelineLayout, &params,
+                          sizeof(params), nullptr, 0, groupCountX, groupCountY, 1);
+
+  runningVertexOffset += totalVerts;
+  runningIndexOffset += 6u * (params.widthSegments - 1u) * (params.lengthSegments - 1u);
+}
+
+void VulkanContext::GenerateCapsule(
+    float Radius, float Height, uint32_t Sides, uint32_t HeightSegs,
+    uint32_t meshID, maths::vec2 slot,
+    uint32_t& runningVertexOffset, uint32_t& runningIndexOffset) {
+  // Validate dimensions and segments are positive and non-zero
+  assert(Radius > 0.0f);
+  assert(Height > 0.0f);
+  assert(Sides > 0u);
+  assert(Sides >= 3u);
+  assert(HeightSegs > 0u);
+
+  CapsuleParams params{};
+  params.radius = Radius;
+  params.height = Height;
+  params.sides = Sides;
+  params.heightSegs = HeightSegs;
+  params.meshID = meshID;
+  params.materialID = 0.0f;
+  params.vertexOffset = runningVertexOffset;
+  params.indexOffset = runningIndexOffset;
+  params.worldOffsetX = slot.x;
+  params.worldOffsetY = -params.height * 0.5f; // recenter: vertical midpoint is height/2
+  params.worldOffsetZ = slot.y;
+
+  uint32_t sideColumns = params.sides + 1u;
+  uint32_t hemiVerts = (params.heightSegs + 1u) * sideColumns; // nbCapSegs derived as heightSegs in shader
+  uint32_t bodyVerts = (params.heightSegs + 1u) * sideColumns;
+  uint32_t totalVerts = hemiVerts * 2u + bodyVerts;
+
+  constexpr uint32_t kLocalSizeX = 64u; // geom_capsule.comp local_size_x = 64
+  uint32_t groupCount = (totalVerts + kLocalSizeX - 1u) / kLocalSizeX;
+
+  DispatchGeometryCompute(m_CapsulePipeline, m_ComputePipelineLayout, &params,
+                          sizeof(params), nullptr, 0, groupCount, 1, 1);
+
+  runningVertexOffset += totalVerts;
+  runningIndexOffset += 6u * params.sides * (3u * params.heightSegs);
+}
+
 void VulkanContext::GenerateGeometry() {
   // --- Grid layout: 12 primitives arranged on a 3-wide grid (see GridSlot()).
   // Generation order below is Icosphere-first (so it lands at
@@ -1305,44 +1737,12 @@ void VulkanContext::GenerateGeometry() {
     bool Octa = false;
     bool Icosa = true;
 
-    assert(Radius > 0.0f);
-    assert(Segments > 0u);
-    assert((Tetra ? 1 : 0) + (Octa ? 1 : 0) + (Icosa ? 1 : 0) == 1);
+    GenerateIcosphere(Radius, Segments, Tetra, Octa, Icosa,
+                      m_EntityData[2].meshID, slot,
+                      runningVertexOffset, runningIndexOffset,
+                      icosphereBaseFaceCount, icosphereVertsPerFace);
 
-    IcosphereParams params{};
-    params.radius = Radius;
-    params.subdiv = Segments;
-    params.baseType = Tetra ? 0u : (Octa ? 1u : 2u);
-    params.meshID = m_EntityData[2].meshID;
-    params.materialID = 0.0f;
-    params.vertexOffset = runningVertexOffset;
-    params.indexOffset = runningIndexOffset;
-    params.worldOffsetX = slot.x;
-    params.worldOffsetY = 0.0f;
-    params.worldOffsetZ = slot.y;
-
-    icosphereBaseFaceCount =
-        params.baseType == 0u ? 4u : (params.baseType == 1u ? 8u : 20u);
-
-    // Dispatch sizing must match geom_icosphere.comp's local_size = (8, 8, 1):
-    // X and Y cover the triangular grid coordinates (i, j) in [0, subdiv], Z
-    // covers the base faces.
-    constexpr uint32_t kLocalSizeXY = 8u;
-    uint32_t gridExtent =
-        params.subdiv + 1u; // valid i,j range is [0, subdiv] inclusive
-    uint32_t groupCountXY = (gridExtent + kLocalSizeXY - 1u) / kLocalSizeXY;
-
-    DispatchGeometryCompute(m_IcospherePipeline, m_ComputePipelineLayout,
-                            &params, sizeof(params), nullptr, 0, groupCountXY,
-                            groupCountXY, icosphereBaseFaceCount);
-
-    icosphereVertsPerFace = (params.subdiv + 1u) * (params.subdiv + 2u) / 2u;
-    uint32_t totalVerts = icosphereVertsPerFace * icosphereBaseFaceCount;
-    icosphereIndexCount =
-        icosphereBaseFaceCount * params.subdiv * params.subdiv * 3u;
-
-    runningVertexOffset += totalVerts;
-    runningIndexOffset += icosphereIndexCount;
+    icosphereIndexCount = icosphereBaseFaceCount * Segments * Segments * 3u;
   }
   // DEBUG: sample-readback the icosphere geometry, exactly as before this
   // feature, to catch regressions in the (still buffer-offset-0) icosphere
@@ -1355,70 +1755,7 @@ void VulkanContext::GenerateGeometry() {
   // -------------------------------------------------------------------------
   {
     maths::vec2 slot = gridSlot(0);
-
-    // Target parameters to accept and strictly validate:
-    // Box: Width, Length, Height, WidthSegments, LengthSegments, HeightSegments
-    float Width = 1.4f;
-    float Length = 1.4f;
-    float Height = 1.4f;
-    uint32_t WidthSegments = 2u;
-    uint32_t LengthSegments = 2u;
-    uint32_t HeightSegments = 2u;
-
-    assert(Width > 0.0f);
-    assert(Length > 0.0f);
-    assert(Height > 0.0f);
-    assert(WidthSegments > 0u);
-    assert(LengthSegments > 0u);
-    assert(HeightSegments > 0u);
-
-    for (uint32_t face = 0; face < 6u; ++face) {
-      BoxPushConstants params{};
-      uint32_t uSegs = 0, vSegs = 0;
-      if (face == 0u || face == 1u) {
-        params.faceWidth = Width;
-        params.faceHeight = Height;
-        params.lengthOffset = kBoxFaceLengthOffsetSign[face] * Length * 0.5f;
-        uSegs = WidthSegments;
-        vSegs = HeightSegments;
-      } else if (face == 2u || face == 3u) {
-        params.faceWidth = Width;
-        params.faceHeight = Length;
-        params.lengthOffset = kBoxFaceLengthOffsetSign[face] * Height * 0.5f;
-        uSegs = WidthSegments;
-        vSegs = LengthSegments;
-      } else {
-        params.faceWidth = Height;
-        params.faceHeight = Length;
-        params.lengthOffset = kBoxFaceLengthOffsetSign[face] * Width * 0.5f;
-        uSegs = HeightSegments;
-        vSegs = LengthSegments;
-      }
-
-      params.uSegsCount = uSegs + 1u;
-      params.vSegsCount = vSegs + 1u;
-      params.meshID = m_EntityData[0].meshID;
-      params.materialID = 0.0f;
-      params.vertexOffset = runningVertexOffset;
-      params.indexOffset = runningIndexOffset;
-      params.worldOffsetX = slot.x;
-      params.worldOffsetY = 0.0f;
-      params.worldOffsetZ = slot.y;
-
-      constexpr uint32_t kLocalSizeXY =
-          8u; // geom_box.comp local_size = (8, 8, 1)
-      uint32_t groupCountX =
-          (params.uSegsCount + kLocalSizeXY - 1u) / kLocalSizeXY;
-      uint32_t groupCountY =
-          (params.vSegsCount + kLocalSizeXY - 1u) / kLocalSizeXY;
-
-      DispatchGeometryCompute(m_BoxFacePipelines[face],
-                              m_BoxComputePipelineLayout, nullptr, 0, &params,
-                              sizeof(params), groupCountX, groupCountY, 1);
-
-      runningVertexOffset += params.uSegsCount * params.vSegsCount;
-      runningIndexOffset += uSegs * vSegs * 6u;
-    }
+    GenerateBox(1.4f, 1.4f, 1.4f, 2u, 2u, 2u, m_EntityData[0].meshID, slot, runningVertexOffset, runningIndexOffset);
   }
 
   // -------------------------------------------------------------------------
@@ -1426,56 +1763,11 @@ void VulkanContext::GenerateGeometry() {
   // -------------------------------------------------------------------------
   {
     maths::vec2 slot = gridSlot(1);
-
-    // Target parameters to accept and strictly validate:
-    // Cone: Radius 1, Radius 2, Height, HeightSegments, CapSegments, Sides
-    float Radius1 = 0.7f;
-    float Radius2 = 0.35f;
-    float Height = 1.4f;
-    uint32_t HeightSegments = 4u;
-    uint32_t CapSegments = 4u;
-    uint32_t Sides = 32u;
-
-    assert(Radius1 > 0.0f);
-    assert(Radius2 > 0.0f);
-    assert(Height > 0.0f);
-    assert(HeightSegments > 0u);
-    assert(CapSegments > 0u);
-    assert(Sides >= 3u);
-
-    ConeParams params{};
-    params.bottomRadius = Radius1;
-    params.topRadius = Radius2;
-    params.height = Height;
-    params.nbHeightSegs = HeightSegments;
-    params.nbCapSegs = CapSegments;
-    params.nbSides = Sides;
-    params.meshID = m_EntityData[1].meshID;
-    params.materialID = 0.0f;
-    params.vertexOffset = runningVertexOffset;
-    params.indexOffset = runningIndexOffset;
-    params.worldOffsetX = slot.x;
-    params.worldOffsetY =
-        -params.height * 0.5f; // recenter: geometry spans y=[0,height]
-    params.worldOffsetZ = slot.y;
-
-    uint32_t sideVertCount = (params.nbSides + 1u) * (params.nbHeightSegs + 1u);
-    uint32_t capVertCount = 1u + params.nbCapSegs * (params.nbSides + 1u);
-    uint32_t totalVerts = sideVertCount + 2u * capVertCount;
-
-    constexpr uint32_t kLocalSizeX = 64u;
-    uint32_t groupCount = (totalVerts + kLocalSizeX - 1u) / kLocalSizeX;
-
-    DispatchGeometryCompute(m_ConePipeline, m_ComputePipelineLayout, &params,
-                            sizeof(params), nullptr, 0, groupCount, 1, 1);
-
-    runningVertexOffset += totalVerts;
-    runningIndexOffset += params.nbSides * params.nbHeightSegs * 6u +
-                          2u * params.nbCapSegs * params.nbSides * 6u;
+    GenerateCone(0.7f, 0.35f, 1.4f, 4u, 4u, 32u, m_EntityData[1].meshID, slot, runningVertexOffset, runningIndexOffset);
   }
 
   // -------------------------------------------------------------------------
-  // PLANE (slot 3)
+  // PLANE (slot 3 visually)
   // -------------------------------------------------------------------------
   {
     maths::vec2 slot = gridSlot(3);
@@ -1487,38 +1779,9 @@ void VulkanContext::GenerateGeometry() {
     uint32_t LengthSegments = 2u;
     uint32_t WidthSegments = 2u;
 
-    assert(Length > 0.0f);
-    assert(Width > 0.0f);
-    assert(LengthSegments > 0u);
-    assert(WidthSegments > 0u);
-
-    PlaneParams params{};
-    params.width = Width;
-    params.length_ = Length;
-    params.widthSegs = WidthSegments + 1u;
-    params.lengthSegs = LengthSegments + 1u;
-    params.meshID = m_EntityData[3].meshID;
-    params.materialID = 0.0f;
-    params.vertexOffset = runningVertexOffset;
-    params.indexOffset = runningIndexOffset;
-    params.worldOffsetX = slot.x;
-    params.worldOffsetY = 0.0f;
-    params.worldOffsetZ = slot.y;
-
-    constexpr uint32_t kLocalSizeXY =
-        8u; // geom_plane.comp local_size = (8, 8, 1)
-    uint32_t groupCountX =
-        (params.widthSegs + kLocalSizeXY - 1u) / kLocalSizeXY;
-    uint32_t groupCountY =
-        (params.lengthSegs + kLocalSizeXY - 1u) / kLocalSizeXY;
-
-    DispatchGeometryCompute(m_PlanePipeline, m_ComputePipelineLayout, &params,
-                            sizeof(params), nullptr, 0, groupCountX,
-                            groupCountY, 1);
-
-    runningVertexOffset += params.widthSegs * params.lengthSegs;
-    runningIndexOffset +=
-        6u * (params.widthSegs - 1u) * (params.lengthSegs - 1u);
+    GeneratePlane(Length, Width, LengthSegments, WidthSegments,
+                  m_EntityData[3].meshID, slot,
+                  runningVertexOffset, runningIndexOffset);
   }
 
   // -------------------------------------------------------------------------
@@ -1526,38 +1789,7 @@ void VulkanContext::GenerateGeometry() {
   // -------------------------------------------------------------------------
   {
     maths::vec2 slot = gridSlot(4);
-
-    // Target parameters to accept and strictly validate:
-    // Sphere: Radius, Segments
-    float Radius = 0.8f;
-    uint32_t Segments = 24u;
-
-    assert(Radius > 0.0f);
-    assert(Segments >= 3u);
-
-    SphereParams params{};
-    params.radius = Radius;
-    params.segments = Segments;
-    params.meshID = m_EntityData[4].meshID;
-    params.materialID = 0.0f;
-    params.vertexOffset = runningVertexOffset;
-    params.indexOffset = runningIndexOffset;
-    params.worldOffsetX = slot.x;
-    params.worldOffsetY = 0.0f;
-    params.worldOffsetZ = slot.y;
-
-    uint32_t ringCount =
-        params.segments - 2u; // interior latitude rings (excludes poles)
-    uint32_t ringStride = params.segments + 1u;
-    uint32_t vertCount = ringCount * ringStride + 2u;
-    constexpr uint32_t kLocalSizeX = 64u; // geom_sphere.comp local_size_x = 64
-    uint32_t groupCount = (vertCount + kLocalSizeX - 1u) / kLocalSizeX;
-
-    DispatchGeometryCompute(m_SpherePipeline, m_ComputePipelineLayout, &params,
-                            sizeof(params), nullptr, 0, groupCount, 1, 1);
-
-    runningVertexOffset += vertCount;
-    runningIndexOffset += 6u * params.segments * ringCount;
+    GenerateSphere(0.8f, 24u, m_EntityData[4].meshID, slot, runningVertexOffset, runningIndexOffset);
   }
 
   // -------------------------------------------------------------------------
@@ -1575,36 +1807,9 @@ void VulkanContext::GenerateGeometry() {
     uint32_t Segments = 32u;
     uint32_t Sides = 16u;
 
-    assert(Radius1 > 0.0f);
-    assert(Radius2 > 0.0f);
-    assert(Radius1 > Radius2);
-    assert(Segments > 0u);
-    assert(Sides >= 3u);
-
-    TorusParams params{};
-    params.radius1 = Radius1;
-    params.radius2 = Radius2;
-    params.rotation = Rotation;
-    params.twist = Twist;
-    params.nbRadSeg = Segments;
-    params.nbSides = Sides;
-    params.meshID = m_EntityData[5].meshID;
-    params.materialID = 0.0f;
-    params.vertexOffset = runningVertexOffset;
-    params.indexOffset = runningIndexOffset;
-    params.worldOffsetX = slot.x;
-    params.worldOffsetY = 0.0f;
-    params.worldOffsetZ = slot.y;
-
-    uint32_t vertCount = (params.nbRadSeg + 1u) * (params.nbSides + 1u);
-    constexpr uint32_t kLocalSizeX = 64u; // geom_torus.comp local_size_x = 64
-    uint32_t groupCount = (vertCount + kLocalSizeX - 1u) / kLocalSizeX;
-
-    DispatchGeometryCompute(m_TorusPipeline, m_ComputePipelineLayout, &params,
-                            sizeof(params), nullptr, 0, groupCount, 1, 1);
-
-    runningVertexOffset += vertCount;
-    runningIndexOffset += 6u * params.nbRadSeg * params.nbSides;
+    GenerateTorus(Radius1, Radius2, Rotation, Twist, Segments, Sides,
+                  m_EntityData[5].meshID, slot,
+                  runningVertexOffset, runningIndexOffset);
   }
 
   // -------------------------------------------------------------------------
@@ -1623,47 +1828,9 @@ void VulkanContext::GenerateGeometry() {
     uint32_t CapSegments = 4u;
     uint32_t Sides = 24u;
 
-    assert(Radius1 > 0.0f);
-    assert(Radius2 > 0.0f);
-    assert(Radius1 > Radius2);
-    assert(Height > 0.0f);
-    assert(HeightSegments > 0u);
-    assert(CapSegments > 0u);
-    assert(Sides >= 3u);
-
-    TubeParams params{};
-    params.radius1 = Radius1;
-    params.radius2 = Radius2;
-    params.height = Height;
-    params.nbHeightSegs = HeightSegments;
-    params.nbCapSegs = CapSegments;
-    params.nbSides = Sides;
-    params.meshID = m_EntityData[6].meshID;
-    params.materialID = 0.0f;
-    params.vertexOffset = runningVertexOffset;
-    params.indexOffset = runningIndexOffset;
-    params.worldOffsetX = slot.x;
-    params.worldOffsetY =
-        -params.height * 0.5f; // recenter: geometry spans y=[0,height]
-    params.worldOffsetZ = slot.y;
-
-    uint32_t sideColumns = params.nbSides + 1u;
-    uint32_t outerSideVertCount = sideColumns * (params.nbHeightSegs + 1u);
-    uint32_t innerSideVertCount = sideColumns * (params.nbHeightSegs + 1u);
-    uint32_t bottomCapVertCount = sideColumns * (params.nbCapSegs + 1u);
-    uint32_t topCapVertCount = sideColumns * (params.nbCapSegs + 1u);
-    uint32_t totalVerts = outerSideVertCount + innerSideVertCount +
-                          bottomCapVertCount + topCapVertCount;
-
-    constexpr uint32_t kLocalSizeX = 64u;
-    uint32_t groupCount = (totalVerts + kLocalSizeX - 1u) / kLocalSizeX;
-
-    DispatchGeometryCompute(m_TubePipeline, m_ComputePipelineLayout, &params,
-                            sizeof(params), nullptr, 0, groupCount, 1, 1);
-
-    runningVertexOffset += totalVerts;
-    runningIndexOffset += 12u * params.nbSides * params.nbHeightSegs +
-                          12u * params.nbSides * params.nbCapSegs;
+    GenerateTube(Radius1, Radius2, Height, HeightSegments, CapSegments, Sides,
+                 m_EntityData[6].meshID, slot,
+                 runningVertexOffset, runningIndexOffset);
   }
 
   // -------------------------------------------------------------------------
@@ -1671,38 +1838,17 @@ void VulkanContext::GenerateGeometry() {
   // -------------------------------------------------------------------------
   {
     maths::vec2 slot = gridSlot(7);
-    CapsuleParams params{};
-    params.radius = 0.5f;
-    params.height = 0.8f; // cylindrical body length; full shape spans
-                          // y=[-radius, height+radius]
-    params.nbSides = 24u;
-    params.nbHeightSegs = 4u;
-    params.nbCapSegs = 8u;
-    params.meshID = m_EntityData[7].meshID;
-    params.materialID = 0.0f;
-    params.vertexOffset = runningVertexOffset;
-    params.indexOffset = runningIndexOffset;
-    params.worldOffsetX = slot.x;
-    params.worldOffsetY =
-        -params.height *
-        0.5f; // recenter: shape's vertical midpoint is height/2
-    params.worldOffsetZ = slot.y;
 
-    uint32_t sideColumns = params.nbSides + 1u;
-    uint32_t hemiVerts = (params.nbCapSegs + 1u) * sideColumns;
-    uint32_t bodyVerts = (params.nbHeightSegs + 1u) * sideColumns;
-    uint32_t totalVerts = hemiVerts * 2u + bodyVerts;
-    constexpr uint32_t kLocalSizeX = 64u; // geom_capsule.comp local_size_x = 64
-    uint32_t groupCount = (totalVerts + kLocalSizeX - 1u) / kLocalSizeX;
+    // Target parameters to accept and strictly validate:
+    // Capsule: Radius, Height, Sides, HeightSegs
+    float Radius = 0.5f;
+    float Height = 0.8f; // cylindrical body length
+    uint32_t Sides = 24u;
+    uint32_t HeightSegs = 4u;
 
-    DispatchGeometryCompute(m_CapsulePipeline, m_ComputePipelineLayout, &params,
-                            sizeof(params), nullptr, 0, groupCount, 1, 1);
-
-    runningVertexOffset += totalVerts;
-    // 2 hemispheres (nbCapSegs*nbSides quads each) + body (nbHeightSegs*nbSides
-    // quads), 6 indices/quad.
-    runningIndexOffset +=
-        6u * params.nbSides * (2u * params.nbCapSegs + params.nbHeightSegs);
+    GenerateCapsule(Radius, Height, Sides, HeightSegs,
+                    m_EntityData[7].meshID, slot,
+                    runningVertexOffset, runningIndexOffset);
   }
 
   // -------------------------------------------------------------------------
@@ -1719,45 +1865,9 @@ void VulkanContext::GenerateGeometry() {
     uint32_t CapSegments = 4u;
     uint32_t Sides = 24u;
 
-    assert(Radius > 0.0f);
-    assert(Height > 0.0f);
-    assert(HeightSegments > 0u);
-    assert(CapSegments > 0u);
-    assert(Sides >= 3u);
-
-    CylinderParams params{};
-    params.radius = Radius;
-    params.height = Height;
-    params.nbSides = Sides;
-    params.nbHeightSegs = HeightSegments;
-    params.nbCapSegs = CapSegments;
-    params.meshID = m_EntityData[8].meshID;
-    params.materialID = 0.0f;
-    params.vertexOffset = runningVertexOffset;
-    params.indexOffset = runningIndexOffset;
-    params.worldOffsetX = slot.x;
-    params.worldOffsetY =
-        -params.height * 0.5f; // recenter: geometry spans y=[0,height]
-    params.worldOffsetZ = slot.y;
-
-    uint32_t sideColumns = params.nbSides + 1u;
-    uint32_t sideVertCount = sideColumns * (params.nbHeightSegs + 1u);
-    uint32_t capVertCount =
-        1u + params.nbCapSegs * sideColumns; // center + rings
-    uint32_t totalVerts = sideVertCount + 2u * capVertCount;
-    constexpr uint32_t kLocalSizeX =
-        64u; // geom_cylinder.comp local_size_x = 64
-    uint32_t groupCount = (totalVerts + kLocalSizeX - 1u) / kLocalSizeX;
-
-    DispatchGeometryCompute(m_CylinderPipeline, m_ComputePipelineLayout,
-                            &params, sizeof(params), nullptr, 0, groupCount, 1,
-                            1);
-
-    runningVertexOffset += totalVerts;
-    // Side quads (nbHeightSegs*nbSides) + 2 caps (nbCapSegs*nbSides each), 6
-    // indices/quad.
-    runningIndexOffset +=
-        6u * params.nbSides * (params.nbHeightSegs + 2u * params.nbCapSegs);
+    GenerateCylinder(Radius, Height, HeightSegments, CapSegments, Sides,
+                     m_EntityData[8].meshID, slot,
+                     runningVertexOffset, runningIndexOffset);
   }
 
   // -------------------------------------------------------------------------
@@ -1776,53 +1886,9 @@ void VulkanContext::GenerateGeometry() {
     uint32_t DepthSegments = 4u;
     uint32_t HeightSegments = 4u;
 
-    assert(Width > 0.0f);
-    assert(Depth > 0.0f);
-    assert(Height > 0.0f);
-    assert(WidthSegments > 0u);
-    assert(DepthSegments > 0u);
-    assert(HeightSegments > 0u);
-
-    PyramidParams params{};
-    params.width = Width;
-    params.depth = Depth;
-    params.height = Height;
-    params.widthSegs = WidthSegments;
-    params.depthSegs = DepthSegments;
-    params.heightSegs = HeightSegments;
-    params.meshID = m_EntityData[9].meshID;
-    params.materialID = 0.0f;
-    params.vertexOffset = runningVertexOffset;
-    params.indexOffset = runningIndexOffset;
-    params.worldOffsetX = slot.x;
-    params.worldOffsetY =
-        -params.height * 0.5f; // recenter: geometry spans y=[0,height]
-    params.worldOffsetZ = slot.y;
-
-    uint32_t baseColumns = params.widthSegs + 1u;
-    uint32_t baseRows = params.depthSegs + 1u;
-    uint32_t baseVertCount = baseColumns * baseRows;
-
-    uint32_t sideZCols = params.widthSegs + 1u;
-    uint32_t sideZRows = params.heightSegs + 1u;
-    uint32_t sideZVerts = sideZCols * sideZRows;
-
-    uint32_t sideXCols = params.depthSegs + 1u;
-    uint32_t sideXRows = params.heightSegs + 1u;
-    uint32_t sideXVerts = sideXCols * sideXRows;
-
-    uint32_t totalVerts = baseVertCount + 2u * sideZVerts + 2u * sideXVerts;
-    constexpr uint32_t kLocalSizeX =
-        64u; // geom_pyramide.comp local_size_x = 64
-    uint32_t groupCount = (totalVerts + kLocalSizeX - 1u) / kLocalSizeX;
-
-    DispatchGeometryCompute(m_PyramidPipeline, m_ComputePipelineLayout, &params,
-                            sizeof(params), nullptr, 0, groupCount, 1, 1);
-
-    runningVertexOffset += totalVerts;
-    runningIndexOffset += 6u * params.widthSegs * params.depthSegs +
-                          12u * params.widthSegs * params.heightSegs +
-                          12u * params.depthSegs * params.heightSegs;
+    GeneratePyramid(Width, Depth, Height, WidthSegments, DepthSegments, HeightSegments,
+                    m_EntityData[9].meshID, slot,
+                    runningVertexOffset, runningIndexOffset);
   }
 
   // -------------------------------------------------------------------------

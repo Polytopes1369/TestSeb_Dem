@@ -200,6 +200,59 @@ private:
     void CreatePipelinesAndDescriptors();
     void GenerateGeometry();
 
+    void GenerateBox(
+        float Width, float Length, float Height,
+        uint32_t WidthSegments, uint32_t LengthSegments, uint32_t HeightSegments,
+        uint32_t meshID, maths::vec2 slot,
+        uint32_t& runningVertexOffset, uint32_t& runningIndexOffset);
+
+    void GenerateCone(
+        float Radius1, float Radius2, float Height,
+        uint32_t HeightSegments, uint32_t CapSegments, uint32_t Sides,
+        uint32_t meshID, maths::vec2 slot,
+        uint32_t& runningVertexOffset, uint32_t& runningIndexOffset);
+
+    void GenerateSphere(
+        float Radius, uint32_t Segments,
+        uint32_t meshID, maths::vec2 slot,
+        uint32_t& runningVertexOffset, uint32_t& runningIndexOffset);
+
+    void GenerateIcosphere(
+        float Radius, uint32_t Segments, bool Tetra, bool Octa, bool Icosa,
+        uint32_t meshID, maths::vec2 slot,
+        uint32_t& runningVertexOffset, uint32_t& runningIndexOffset,
+        uint32_t& outBaseFaceCount, uint32_t& outVertsPerFace);
+
+    void GenerateCylinder(
+        float Radius, float Height, uint32_t HeightSegments, uint32_t CapSegments, uint32_t Sides,
+        uint32_t meshID, maths::vec2 slot,
+        uint32_t& runningVertexOffset, uint32_t& runningIndexOffset);
+
+    void GenerateTube(
+        float Radius1, float Radius2, float Height, uint32_t HeightSegments, uint32_t CapSegments, uint32_t Sides,
+        uint32_t meshID, maths::vec2 slot,
+        uint32_t& runningVertexOffset, uint32_t& runningIndexOffset);
+
+    void GenerateTorus(
+        float Radius1, float Radius2, float Rotation, float Twist, uint32_t Segments, uint32_t Sides,
+        uint32_t meshID, maths::vec2 slot,
+        uint32_t& runningVertexOffset, uint32_t& runningIndexOffset);
+
+    void GeneratePyramid(
+        float Width, float Depth, float Height, uint32_t WidthSegments, uint32_t DepthSegments, uint32_t HeightSegments,
+        uint32_t meshID, maths::vec2 slot,
+        uint32_t& runningVertexOffset, uint32_t& runningIndexOffset);
+
+    void GeneratePlane(
+        float Length, float Width, uint32_t LengthSegments, uint32_t WidthSegments,
+        uint32_t meshID, maths::vec2 slot,
+        uint32_t& runningVertexOffset, uint32_t& runningIndexOffset);
+
+    void GenerateCapsule(
+        float Radius, float Height, uint32_t Sides, uint32_t HeightSegs,
+        uint32_t meshID, maths::vec2 slot,
+        uint32_t& runningVertexOffset, uint32_t& runningIndexOffset);
+
     // Authors m_EntityData on the CPU: assigns each of the kEntityCount entities a meshID via
     // core::IDManager::GetNextID() (instead of a hardcoded literal). Must run before
     // GenerateGeometry(), which reads m_EntityData[i].meshID into each primitive's push

@@ -11,12 +11,12 @@ layout(std430, binding = 1) writeonly buffer IndexBuffer  { uint indices[]; };
 
 layout(std140, binding = 2) uniform Params
 {
-    float bottomRadius;
-    float topRadius;
+    float radius1;
+    float radius2;
     float height;
-    uint  nbHeightSegs;
-    uint  nbCapSegs;
-    uint  nbSides;
+    uint  heightSegments;
+    uint  capSegments;
+    uint  sides;
     uint  meshID;
     float materialID;
     uint  vertexOffset;
@@ -28,15 +28,22 @@ layout(std140, binding = 2) uniform Params
 
 void main()
 {
+    // Strict validation assertions: interdict negative or null values
+    if (radius1 <= 0.0 || radius2 <= 0.0 || height <= 0.0 ||
+        heightSegments == 0 || capSegments == 0 || sides == 0)
+    {
+        return;
+    }
+
     uint id = gl_GlobalInvocationID.x;
 
     // --- Vertex counts ---
-    uint sideColumns  = nbSides + 1u;           // duplicated seam column for clean UVs
-    uint sideRows     = nbHeightSegs + 1u;
+    uint sideColumns  = sides + 1u;           // duplicated seam column for clean UVs
+    uint sideRows     = heightSegments + 1u;
     uint sideVertCount = sideColumns * sideRows;
 
-    // Cap: center + nbCapSegs rings (each ring has nbSides+1 vertices)
-    uint capRingVerts = nbCapSegs * sideColumns;
+    // Cap: center + capSegments rings (each ring has sides+1 vertices)
+    uint capRingVerts = capSegments * sideColumns;
     uint capVertCount = 1u + capRingVerts;      // center vertex + ring vertices
     uint totalVerts   = sideVertCount + 2u * capVertCount;
 
@@ -54,16 +61,16 @@ void main()
         uint col = id % sideColumns;
         uint row = id / sideColumns;
 
-        float u   = float(col == nbSides ? 0u : col) / float(nbSides);
+        float u   = float(col == sides ? 0u : col) / float(sides);
         float ang = u * TAU;
-        float h_t = float(row) / float(nbHeightSegs);
-        float r   = mix(bottomRadius, topRadius, h_t);
+        float h_t = float(row) / float(heightSegments);
+        float r   = mix(radius1, radius2, h_t);
         float y   = h_t * height;
 
         v.position = vec3(cos(ang) * r, y, sin(ang) * r);
-        float slope = (bottomRadius - topRadius) / height;
+        float slope = (radius1 - radius2) / height;
         v.normal   = normalize(vec3(cos(ang), slope, sin(ang)));
-        v.uv       = vec2(float(col) / float(nbSides), h_t);
+        v.uv       = vec2(float(col) / float(sides), h_t);
     }
     // =========================================================================
     // BOTTOM CAP vertices  [sideVertCount .. sideVertCount + capVertCount - 1]
@@ -81,13 +88,13 @@ void main()
         {
             uint ringIdx = (local - 1u) / sideColumns; // 0 = innermost ring
             uint col     = (local - 1u) % sideColumns;
-            float t      = float(col == nbSides ? 0u : col) / float(nbSides);
+            float t      = float(col == sides ? 0u : col) / float(sides);
             float ang    = t * TAU;
-            float r      = bottomRadius * float(ringIdx + 1u) / float(nbCapSegs);
+            float r      = radius1 * float(ringIdx + 1u) / float(capSegments);
             v.position = vec3(cos(ang) * r, 0.0, sin(ang) * r);
             v.normal   = vec3(0.0, -1.0, 0.0);
-            v.uv       = vec2(cos(ang) * 0.5 * float(ringIdx + 1u) / float(nbCapSegs) + 0.5,
-                              sin(ang) * 0.5 * float(ringIdx + 1u) / float(nbCapSegs) + 0.5);
+            v.uv       = vec2(cos(ang) * 0.5 * float(ringIdx + 1u) / float(capSegments) + 0.5,
+                              sin(ang) * 0.5 * float(ringIdx + 1u) / float(capSegments) + 0.5);
         }
     }
     // =========================================================================
@@ -106,13 +113,13 @@ void main()
         {
             uint ringIdx = (local - 1u) / sideColumns;
             uint col     = (local - 1u) % sideColumns;
-            float t      = float(col == nbSides ? 0u : col) / float(nbSides);
+            float t      = float(col == sides ? 0u : col) / float(sides);
             float ang    = t * TAU;
-            float r      = topRadius * float(ringIdx + 1u) / float(nbCapSegs);
+            float r      = radius2 * float(ringIdx + 1u) / float(capSegments);
             v.position = vec3(cos(ang) * r, height, sin(ang) * r);
             v.normal   = vec3(0.0, 1.0, 0.0);
-            v.uv       = vec2(cos(ang) * 0.5 * float(ringIdx + 1u) / float(nbCapSegs) + 0.5,
-                              sin(ang) * 0.5 * float(ringIdx + 1u) / float(nbCapSegs) + 0.5);
+            v.uv       = vec2(cos(ang) * 0.5 * float(ringIdx + 1u) / float(capSegments) + 0.5,
+                              sin(ang) * 0.5 * float(ringIdx + 1u) / float(capSegments) + 0.5);
         }
     }
 
@@ -125,10 +132,10 @@ void main()
     // =========================================================================
 
     // --- Side quads ---
-    if (id < nbSides * nbHeightSegs)
+    if (id < sides * heightSegments)
     {
-        uint seg = id / nbSides; // height row
-        uint col = id % nbSides; // side column
+        uint seg = id / sides; // height row
+        uint col = id % sides; // side column
 
         uint b0 = seg       * sideColumns + col;
         uint b1 = seg       * sideColumns + col + 1u;
@@ -145,12 +152,12 @@ void main()
     }
 
     // --- Bottom cap indices ---
-    uint sideIndexCount = nbSides * nbHeightSegs * 6u;
+    uint sideIndexCount = sides * heightSegments * 6u;
 
-    if (id < nbCapSegs * nbSides)
+    if (id < capSegments * sides)
     {
-        uint ring = id / nbSides;
-        uint col  = id % nbSides;
+        uint ring = id / sides;
+        uint col  = id % sides;
 
         uint botBase  = sideVertCount;
         uint tIdx     = indexOffset + sideIndexCount + id * 6u;
@@ -189,13 +196,13 @@ void main()
     }
 
     // --- Top cap indices ---
-    uint botCapIndexCount = nbCapSegs * nbSides * 6u;
+    uint botCapIndexCount = capSegments * sides * 6u;
     uint topBase = sideVertCount + capVertCount;
 
-    if (id < nbCapSegs * nbSides)
+    if (id < capSegments * sides)
     {
-        uint ring = id / nbSides;
-        uint col  = id % nbSides;
+        uint ring = id / sides;
+        uint col  = id % sides;
 
         uint tIdx = indexOffset + sideIndexCount + botCapIndexCount + id * 6u;
 

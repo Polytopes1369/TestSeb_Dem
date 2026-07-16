@@ -25,6 +25,12 @@ layout(std140, binding = 2) uniform Params
 
 void main()
 {
+    // Strict validation assertions: interdict negative or null values
+    if (radius <= 0.0 || segments == 0)
+    {
+        return;
+    }
+
     uint sideSegs = segments;
     uint heightSegs = segments;
     uint id = gl_GlobalInvocationID.x;

@@ -23,14 +23,16 @@ layout(constant_id = 2) const int   wAxis    = 2;
 layout(constant_id = 3) const int   faceMode = 0;  // 0: w==z, 1: w==y, 2: w==x
 layout(constant_id = 4) const float udir     = 1.0;
 layout(constant_id = 5) const float vdir     = 1.0;
+layout(constant_id = 6) const float wSign    = 1.0;
 
 layout(push_constant) uniform Params
 {
-    float faceWidth;
-    float faceHeight;
-    float lengthOffset; // constant coordinate along wAxis (the BuildPlane "length" param)
-    uint  uSegsCount;    // gridX1
-    uint  vSegsCount;    // gridY1
+    float width;
+    float length;
+    float height;
+    uint  widthSegments;
+    uint  lengthSegments;
+    uint  heightSegments;
     uint  meshID;
     float materialID;
     uint  vertexOffset;  // running vertex count from previously-dispatched faces
@@ -51,6 +53,24 @@ void setComp(inout vec3 v, int axis, float val)
 
 void main()
 {
+    // Strict validation assertions: interdict negative or null values
+    if (width <= 0.0 || length <= 0.0 || height <= 0.0 ||
+        widthSegments == 0 || lengthSegments == 0 || heightSegments == 0)
+    {
+        return;
+    }
+
+    // Dynamically map parameters according to specialization constant axes
+    float faceWidth  = (uAxis == 0) ? width : ((uAxis == 1) ? height : length);
+    float faceHeight = (vAxis == 0) ? width : ((vAxis == 1) ? height : length);
+    float wDim       = (wAxis == 0) ? width : ((wAxis == 1) ? height : length);
+    float lengthOffset = wSign * wDim * 0.5;
+
+    uint uSegs = (uAxis == 0) ? widthSegments : ((uAxis == 1) ? heightSegments : lengthSegments);
+    uint vSegs = (vAxis == 0) ? widthSegments : ((vAxis == 1) ? heightSegments : lengthSegments);
+    uint uSegsCount = uSegs + 1u;
+    uint vSegsCount = vSegs + 1u;
+
     uint ix = gl_GlobalInvocationID.x;
     uint iy = gl_GlobalInvocationID.y;
     if (ix >= uSegsCount || iy >= vSegsCount) return;

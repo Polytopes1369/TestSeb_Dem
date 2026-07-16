@@ -15,9 +15,9 @@ layout(std140, binding = 2) uniform Params
     float width;
     float depth;
     float height;
-    uint  widthSegs;
-    uint  depthSegs;
-    uint  heightSegs;
+    uint  widthSegments;
+    uint  depthSegments;
+    uint  heightSegments;
     uint  meshID;
     float materialID;
     uint  vertexOffset;
@@ -29,18 +29,25 @@ layout(std140, binding = 2) uniform Params
 
 void main()
 {
+    // Strict validation assertions: interdict negative or null values
+    if (width <= 0.0 || depth <= 0.0 || height <= 0.0 ||
+        widthSegments == 0 || depthSegments == 0 || heightSegments == 0)
+    {
+        return;
+    }
+
     uint id = gl_GlobalInvocationID.x;
 
-    uint baseColumns = widthSegs + 1u;
-    uint baseRows    = depthSegs + 1u;
+    uint baseColumns = widthSegments + 1u;
+    uint baseRows    = depthSegments + 1u;
     uint baseVertCount = baseColumns * baseRows;
 
-    uint sideZCols = widthSegs + 1u;
-    uint sideZRows = heightSegs + 1u;
+    uint sideZCols = widthSegments + 1u;
+    uint sideZRows = heightSegments + 1u;
     uint sideZVerts = sideZCols * sideZRows; // vertices for one Z-aligned side
 
-    uint sideXCols = depthSegs + 1u;
-    uint sideXRows = heightSegs + 1u;
+    uint sideXCols = depthSegments + 1u;
+    uint sideXRows = heightSegments + 1u;
     uint sideXVerts = sideXCols * sideXRows; // vertices for one X-aligned side
 
     uint totalVerts = baseVertCount + 2u * sideZVerts + 2u * sideXVerts;
@@ -58,8 +65,8 @@ void main()
         // Base Face
         uint col = id % baseColumns;
         uint row = id / baseColumns;
-        float tx = float(col) / float(widthSegs);
-        float tz = float(row) / float(depthSegs);
+        float tx = float(col) / float(widthSegments);
+        float tz = float(row) / float(depthSegments);
         v.position = vec3(mix(-width * 0.5, width * 0.5, tx), 0.0, mix(-depth * 0.5, depth * 0.5, tz));
         v.normal   = vec3(0.0, -1.0, 0.0);
         v.uv       = vec2(tx, tz);
@@ -70,8 +77,8 @@ void main()
         uint local = id - baseVertCount;
         uint col = local % sideZCols;
         uint row = local / sideZCols;
-        float tx = float(col) / float(widthSegs);
-        float ty = float(row) / float(heightSegs);
+        float tx = float(col) / float(widthSegments);
+        float ty = float(row) / float(heightSegments);
         
         v.position = vec3(
             mix(-width * 0.5, width * 0.5, tx) * (1.0 - ty),
@@ -87,8 +94,8 @@ void main()
         uint local = id - (baseVertCount + sideZVerts);
         uint col = local % sideZCols;
         uint row = local / sideZCols;
-        float tx = float(col) / float(widthSegs);
-        float ty = float(row) / float(heightSegs);
+        float tx = float(col) / float(widthSegments);
+        float ty = float(row) / float(heightSegments);
         
         v.position = vec3(
             mix(width * 0.5, -width * 0.5, tx) * (1.0 - ty),
@@ -104,8 +111,8 @@ void main()
         uint local = id - (baseVertCount + 2u * sideZVerts);
         uint col = local % sideXCols;
         uint row = local / sideXCols;
-        float tx = float(col) / float(depthSegs);
-        float ty = float(row) / float(heightSegs);
+        float tx = float(col) / float(depthSegments);
+        float ty = float(row) / float(heightSegments);
         
         v.position = vec3(
             width * 0.5 * (1.0 - ty),
@@ -121,8 +128,8 @@ void main()
         uint local = id - (baseVertCount + 2u * sideZVerts + sideXVerts);
         uint col = local % sideXCols;
         uint row = local / sideXCols;
-        float tx = float(col) / float(depthSegs);
-        float ty = float(row) / float(heightSegs);
+        float tx = float(col) / float(depthSegments);
+        float ty = float(row) / float(heightSegments);
         
         v.position = vec3(
             -width * 0.5 * (1.0 - ty),
@@ -140,15 +147,15 @@ void main()
     // -------------------------------------------------------------------------
     // INDEX GENERATION (One thread per quad)
     // -------------------------------------------------------------------------
-    uint baseQuads = widthSegs * depthSegs;
-    uint sideZQuads = widthSegs * heightSegs;
-    uint sideXQuads = depthSegs * heightSegs;
+    uint baseQuads = widthSegments * depthSegments;
+    uint sideZQuads = widthSegments * heightSegments;
+    uint sideXQuads = depthSegments * heightSegments;
 
     if (id < baseQuads)
     {
         // Base Face Indices (pointing downwards, so Y-normal is negative)
-        uint col = id % widthSegs;
-        uint row = id / widthSegs;
+        uint col = id % widthSegments;
+        uint row = id / widthSegments;
         uint b0 = row * baseColumns + col;
         uint b1 = b0 + 1u;
         uint t0 = (row + 1u) * baseColumns + col;
@@ -165,12 +172,8 @@ void main()
     uint sideZ1_IndexOffset = baseQuads * 6u;
     if (id < sideZQuads)
     {
-        // +Z Side Face Indices (wound so (v1-v0) x (v2-v0) matches the stored +Z-face normal,
-        // normalize(vec3(0, depth*0.5, height)) above -- b0/t0/t1/b1's actual winding order below
-        // was previously producing the negated (inward-facing) cross product; see the fix in this
-        // same commit for -Z/+X/-X below, which had the identical inversion.)
-        uint col = id % widthSegs;
-        uint row = id / widthSegs;
+        uint col = id % widthSegments;
+        uint row = id / widthSegments;
         uint baseOffset = baseVertCount;
         uint b0 = baseOffset + row * sideZCols + col;
         uint b1 = b0 + 1u;
@@ -188,10 +191,8 @@ void main()
     uint sideZ2_IndexOffset = sideZ1_IndexOffset + sideZQuads * 6u;
     if (id < sideZQuads)
     {
-        // -Z Side Face Indices (wound to match normalize(vec3(0, depth*0.5, -height)) -- same fix
-        // as +Z above.)
-        uint col = id % widthSegs;
-        uint row = id / widthSegs;
+        uint col = id % widthSegments;
+        uint row = id / widthSegments;
         uint baseOffset = baseVertCount + sideZVerts;
         uint b0 = baseOffset + row * sideZCols + col;
         uint b1 = b0 + 1u;
@@ -209,10 +210,8 @@ void main()
     uint sideX1_IndexOffset = sideZ2_IndexOffset + sideZQuads * 6u;
     if (id < sideXQuads)
     {
-        // +X Side Face Indices (wound to match normalize(vec3(height, width*0.5, 0)) -- same fix
-        // as +Z above.)
-        uint col = id % depthSegs;
-        uint row = id / depthSegs;
+        uint col = id % depthSegments;
+        uint row = id / depthSegments;
         uint baseOffset = baseVertCount + 2u * sideZVerts;
         uint b0 = baseOffset + row * sideXCols + col;
         uint b1 = b0 + 1u;
@@ -230,10 +229,8 @@ void main()
     uint sideX2_IndexOffset = sideX1_IndexOffset + sideXQuads * 6u;
     if (id < sideXQuads)
     {
-        // -X Side Face Indices (wound to match normalize(vec3(-height, width*0.5, 0)) -- same fix
-        // as +Z above.)
-        uint col = id % depthSegs;
-        uint row = id / depthSegs;
+        uint col = id % depthSegments;
+        uint row = id / depthSegments;
         uint baseOffset = baseVertCount + 2u * sideZVerts + sideXVerts;
         uint b0 = baseOffset + row * sideXCols + col;
         uint b1 = b0 + 1u;

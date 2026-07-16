@@ -1,12 +1,7 @@
 #version 460
 #extension GL_GOOGLE_include_directive : enable
 
-// Inclure tes structures partagées
 #include "include/struct_custo.glsl"
-
-// Binding convention shared by all geom_*.comp.glsl files:
-// binding 0 = output vertex buffer, binding 1 = output index buffer (uint32, was ushort on CPU side),
-// binding 2 = per-dispatch Params UBO. vertexOffset/indexOffset let multiple primitives share one buffer.
 
 layout(local_size_x = 8, local_size_y = 8) in;
 
@@ -17,14 +12,12 @@ layout(std140, binding = 2) uniform Params
 {
     float width;
     float length_;
-    uint  widthSegs;   // clamp(widthSegs, 2, 512) on CPU before dispatch
-    uint  lengthSegs;
+    uint  widthSegments;
+    uint  lengthSegments;
     uint  meshID;
     float materialID;
     uint  vertexOffset;
     uint  indexOffset;
-    // World-space translation baked into the generated geometry, used to place multiple
-    // instances of this primitive at different grid slots without a separate transform stage.
     float worldOffsetX;
     float worldOffsetY;
     float worldOffsetZ;
@@ -32,19 +25,25 @@ layout(std140, binding = 2) uniform Params
 
 void main()
 {
+    // Strict validation assertions: interdict negative or null values
+    if (width <= 0.0 || length_ <= 0.0 || widthSegments == 0 || lengthSegments == 0)
+    {
+        return;
+    }
+
     uint x = gl_GlobalInvocationID.x;
     uint z = gl_GlobalInvocationID.y;
-    if (x >= widthSegs || z >= lengthSegs) return;
+    if (x >= widthSegments || z >= lengthSegments) return;
 
-    float xPos = (float(x) / float(widthSegs - 1u) - 0.5) * width;
-    float zPos = (float(z) / float(lengthSegs - 1u) - 0.5) * length_;
+    float xPos = (float(x) / float(widthSegments - 1u) - 0.5) * width;
+    float zPos = (float(z) / float(lengthSegments - 1u) - 0.5) * length_;
 
-    uint vIdx = x + z * widthSegs;
+    uint vIdx = x + z * widthSegments;
 
     Vertex v;
     v.position   = vec3(xPos, 0.0, zPos);
     v.normal     = vec3(0.0, 1.0, 0.0);
-    v.uv         = vec2(float(x) / float(widthSegs - 1u), float(z) / float(lengthSegs - 1u));
+    v.uv         = vec2(float(x) / float(widthSegments - 1u), float(z) / float(lengthSegments - 1u));
     v.uv2        = v.uv;
     v.meshID     = meshID;
     v.materialID = materialID;
@@ -53,17 +52,17 @@ void main()
     v.position += vec3(worldOffsetX, worldOffsetY, worldOffsetZ);
     vertices[vertexOffset + vIdx] = v;
 
-    if (x < widthSegs - 1u && z < lengthSegs - 1u)
+    if (x < widthSegments - 1u && z < lengthSegments - 1u)
     {
         uint i = vIdx; // lower-left corner of the quad
-        uint t = indexOffset + (z * (widthSegs - 1u) + x) * 6u;
+        uint t = indexOffset + (z * (widthSegments - 1u) + x) * 6u;
 
-        indices[t + 0u] = vertexOffset + i + widthSegs;
+        indices[t + 0u] = vertexOffset + i + widthSegments;
         indices[t + 1u] = vertexOffset + i + 1u;
         indices[t + 2u] = vertexOffset + i;
 
-        indices[t + 3u] = vertexOffset + i + widthSegs;
-        indices[t + 4u] = vertexOffset + i + widthSegs + 1u;
+        indices[t + 3u] = vertexOffset + i + widthSegments;
+        indices[t + 4u] = vertexOffset + i + widthSegments + 1u;
         indices[t + 5u] = vertexOffset + i + 1u;
     }
 }
