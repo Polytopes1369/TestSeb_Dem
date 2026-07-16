@@ -1,0 +1,26 @@
+#version 460
+#extension GL_EXT_shader_image_int64 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+// Resets renderer::ClusterSoftwareRasterPass's 64-bit atomic (depth, visibility) image to 0 (the
+// "nothing rasterized here" sentinel ClusterResolve.comp checks for) once per frame, before
+// ClusterSoftwareRaster.comp's imageAtomicMax writes. A plain vkCmdClearColorImage cannot be used
+// here: VkClearColorValue's uint32[4] fields are defined for up to 32-bit image channels, and
+// VK_FORMAT_R64_UINT's single channel is 64 bits -- clearing it via a dedicated compute dispatch
+// instead sidesteps that ambiguity entirely with well-defined imageStore semantics.
+
+layout(r64ui, set = 0, binding = 0) uniform writeonly u64image2D g_VisBufferAtomic;
+
+layout(push_constant) uniform ClearPushConstants {
+    uvec2 imageSize;
+} pc;
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (pixel.x >= int(pc.imageSize.x) || pixel.y >= int(pc.imageSize.y)) {
+        return;
+    }
+    imageStore(g_VisBufferAtomic, pixel, u64vec4(0uL, 0uL, 0uL, 0uL));
+}

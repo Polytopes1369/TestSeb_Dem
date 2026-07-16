@@ -19,16 +19,25 @@
 #define CLUSTER_PAGE_SIZE_BYTES 4096u
 
 // Byte layout of geometry::ClusterData, in field declaration order (positions, then normals,
-// then UVs, then the local triangle-list indices this header does not need to decode):
+// then UVs, then the local triangle-list indices):
 //   ClusterVertexPosition positions[64]; //  6 bytes/vertex -> 384 bytes, offset   0
 //   ClusterVertexNormal   normals[64];   //  3 bytes/vertex -> 192 bytes, offset 384
 //   ClusterVertexUV       uvs[64];       //  4 bytes/vertex -> 256 bytes, offset 576
-//   uint8_t               indices[384];  //  1 byte/index   -> 384 bytes, offset 832 (not decoded here)
+//   uint8_t               indices[384];  //  1 byte/index   -> 384 bytes, offset 832
+// Matches geometry::kMaxClusterTriangles / kMaxClusterIndices (ClusterFormat.h). Decoded by
+// DecompressClusterIndices.comp (see renderer::GeometryDecompressionPass), the sibling of this
+// header's vertex-attribute decode functions -- unlike positions/normals/UVs, local indices
+// cannot be decoded on the fly in a vertex shader (hardware indexed rendering fetches them
+// through a fixed-function stage that runs before any shader), so they must be expanded ahead of
+// time into a real GPU-native index buffer instead.
 #define CLUSTER_POSITION_BLOCK_BYTES (CLUSTER_MAX_VERTICES * 6u)
 #define CLUSTER_NORMAL_BLOCK_BYTES   (CLUSTER_MAX_VERTICES * 3u)
 #define CLUSTER_POSITION_BASE_BYTES  0u
 #define CLUSTER_NORMAL_BASE_BYTES    (CLUSTER_POSITION_BASE_BYTES + CLUSTER_POSITION_BLOCK_BYTES)
 #define CLUSTER_UV_BASE_BYTES        (CLUSTER_NORMAL_BASE_BYTES + CLUSTER_NORMAL_BLOCK_BYTES)
+#define CLUSTER_MAX_TRIANGLES 128u
+#define CLUSTER_MAX_INDICES (CLUSTER_MAX_TRIANGLES * 3u)
+#define CLUSTER_INDICES_BASE_BYTES (CLUSTER_UV_BASE_BYTES + CLUSTER_MAX_VERTICES * 4u)
 
 layout(std430, set = COMPRESSED_POOL_SET, binding = COMPRESSED_POOL_BINDING) readonly buffer CompressedClusterPoolSSBO {
     uint words[];

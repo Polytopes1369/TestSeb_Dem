@@ -1,0 +1,43 @@
+#version 460
+
+// Tiny GPU-driven utility: converts an atomically-produced element count (e.g.
+// renderer::ClusterOcclusionCullingPass's pending-list count, written by
+// ClusterHZBOcclusionCull.comp's early specialization, or
+// renderer::ClusterSoftwareRasterPass's software-cluster-list count) into a
+// VkDispatchIndirectCommand sized for a `local_size_x = pc.workgroupSize` consumer dispatch,
+// without a CPU round-trip -- keeping every GPU-driven pipeline stage in this codebase free of a
+// CPU sync point between an atomic compaction and the indirect dispatch that consumes it. Always
+// dispatched as exactly 1 workgroup of 1 thread.
+//
+// perElementMultiplier lets one source count seed a dispatch over a larger, regularly-strided
+// index space than the count itself: renderer::ClusterOcclusionCullingPass's late pass consumes
+// one pending-list entry per thread (multiplier = 1), while
+// renderer::ClusterSoftwareRasterPass's rasterization dispatch needs one thread per
+// (softwareCluster, triangleSlot) pair -- i.e. CLUSTER_MAX_TRIANGLES threads per listed cluster
+// (multiplier = CLUSTER_MAX_TRIANGLES, see cluster_vertex_decode.glsl) -- without either caller
+// needing its own copy of this shader.
+
+layout(std430, set = 0, binding = 0) readonly buffer SourceCountSSBO {
+    uint count;
+} g_SourceCount;
+
+// Byte-for-byte mirror of VkDispatchIndirectCommand (3x uint32).
+layout(std430, set = 0, binding = 1) writeonly buffer DispatchArgsSSBO {
+    uint groupCountX;
+    uint groupCountY;
+    uint groupCountZ;
+} g_DispatchArgs;
+
+layout(push_constant) uniform BuildDispatchArgsPushConstants {
+    uint workgroupSize;        // Divisor converting an element count into a group count (e.g. 64).
+    uint perElementMultiplier; // Elements dispatched per source-count entry (1 for a flat list).
+} pc;
+
+layout(local_size_x = 1) in;
+
+void main() {
+    uint elementCount = g_SourceCount.count * pc.perElementMultiplier;
+    g_DispatchArgs.groupCountX = (elementCount + pc.workgroupSize - 1u) / pc.workgroupSize;
+    g_DispatchArgs.groupCountY = 1u;
+    g_DispatchArgs.groupCountZ = 1u;
+}

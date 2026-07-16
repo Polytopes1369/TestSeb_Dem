@@ -1,0 +1,109 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+
+// GPU-driven per-cluster visibility pass, sitting downstream of the LOD cut / residency check
+// stages (ClusterDAGScreenError.comp / ClusterResidencyCheck.comp) in the culling pipeline: for
+// every candidate cluster of the current frame, applies two coarse, cheap-to-evaluate rejection
+// tests before any triangle of it is ever rasterized --
+//
+//   1. Camera frustum test: the cluster's local/world-space axis-aligned bounding box
+//      (ClusterCullMetadata::boundsMin/boundsMax) is tested against the camera's 6 frustum planes
+//      (CullingViewParams::frustumPlanes). A box entirely outside any single plane is rejected.
+//
+//   2. Backface (normal-cone) test: the cluster's normal cone (coneAxis/coneCutoff, meshopt_Bounds
+//      -style, see ClusterFormat.h) is tested against the camera's bounding-sphere-relative
+//      viewing direction. A cluster whose every possible triangle normal faces away from the
+//      camera can never contribute a front-facing triangle and is rejected before rasterization.
+//
+// Every cluster that survives both tests writes exactly one VkDrawIndexedIndirectCommand-
+// compatible entry into a compacted output buffer, claiming its slot via a single global atomic
+// counter (mirroring feedback_buffer.glsl's RequestClusterResidency() compaction pattern) --
+// ready for a subsequent vkCmdDrawIndexedIndirectCount (or a CPU-read draw count feeding a plain
+// vkCmdDrawIndexedIndirect), see renderer::ClusterCullingPass.
+//
+// One invocation evaluates exactly one candidate cluster.
+
+#include "include/cluster_culling_common.glsl"
+#include "include/cluster_culling_tests.glsl"
+
+layout(std430, set = 0, binding = 0) readonly buffer ClusterCullMetadataSSBO {
+    ClusterCullMetadata clusters[];
+} g_Clusters;
+
+layout(std140, set = 0, binding = 1) uniform CullingViewParamsUBO {
+    CullingViewParams data;
+} g_ViewParams;
+
+// Byte-for-byte mirror of VkDrawIndexedIndirectCommand (5x uint32 -- vertexOffset is a signed
+// int32 in the Vulkan struct, but bit-for-bit identical to a uint32 write since no arithmetic is
+// ever performed on it GPU-side; already 4-byte aligned throughout under std430, no padding
+// needed). Matches renderer::ClusterCullingPass's use of the real VkDrawIndexedIndirectCommand
+// struct on the C++ side exactly.
+struct DrawIndexedIndirectCommand {
+    uint indexCount;
+    uint instanceCount;
+    uint firstIndex;
+    uint vertexOffset;
+    uint firstInstance;
+};
+
+layout(std430, set = 0, binding = 2) writeonly buffer IndirectCommandsSSBO {
+    DrawIndexedIndirectCommand commands[];
+} g_IndirectCommands;
+
+// Single global atomic compaction counter: g_DrawCount.count is both the number of clusters that
+// survived culling so far and the next free slot in g_IndirectCommands.commands[]. Must be reset
+// to 0 by the CPU (renderer::ClusterCullingPass::RecordClear) before this dispatch runs, exactly
+// like renderer::FeedbackBuffer::RecordClear resets requestCount before a residency-check
+// dispatch.
+layout(std430, set = 0, binding = 3) buffer DrawCountSSBO {
+    uint count;
+} g_DrawCount;
+
+layout(push_constant) uniform ClusterCullPushConstants {
+    uint clusterCount; // Number of valid entries in g_Clusters.clusters[] this dispatch (<= its capacity).
+} pc;
+
+layout(local_size_x = 64) in;
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    if (index >= pc.clusterCount) {
+        return;
+    }
+
+    ClusterCullMetadata cluster = g_Clusters.clusters[index];
+
+    // --- Test 1: camera frustum vs. cluster AABB ---
+    if (!IsBoxInsideFrustum(cluster.boundsMin, cluster.boundsMax, g_ViewParams.data.frustumPlanes)) {
+        return;
+    }
+
+    // --- Test 2: global backface (normal-cone) culling ---
+    if (IsClusterBackFacing(cluster.sphereCenter, cluster.sphereRadius, cluster.coneAxis, cluster.coneCutoff, g_ViewParams.data.cameraPositionWorld)) {
+        return;
+    }
+
+    // Survived both tests: compact this cluster's draw into the indirect command buffer via a
+    // single global atomic, exactly like RequestClusterResidency()'s compaction in
+    // feedback_buffer.glsl. A frame that produces more surviving clusters than the buffer's
+    // capacity (g_IndirectCommands.commands.length()) simply stops writing past that bound --
+    // renderer::ClusterCullingPass sizes the buffer to maxClusters, so this can only happen if
+    // every single candidate cluster survives culling in the same frame, never as an overflow of
+    // real, valid draws.
+    uint slot = atomicAdd(g_DrawCount.count, 1u);
+    if (slot < g_IndirectCommands.commands.length()) {
+        DrawIndexedIndirectCommand cmd;
+        cmd.indexCount = cluster.indexCount;
+        cmd.instanceCount = 1u;
+        cmd.firstIndex = cluster.firstIndex;
+        cmd.vertexOffset = cluster.vertexOffset;
+        // firstInstance carries this cluster's own index into g_Clusters.clusters[] (NOT
+        // cluster.clusterID, an unrelated opaque cache identifier) -- with instanceCount == 1,
+        // gl_InstanceIndex == firstInstance exactly, so ClusterRaster.vert can use it to re-index
+        // the very same ClusterCullMetadataSSBO this shader is reading right now. See
+        // renderer::ClusterHardwareRasterPass.
+        cmd.firstInstance = index;
+        g_IndirectCommands.commands[slot] = cmd;
+    }
+}

@@ -67,9 +67,21 @@ namespace renderer {
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
             VMA_MEMORY_USAGE_GPU_ONLY);
 
-        // Descriptor set layout: binding 0 is the compressed physical pool (read-only input),
-        // binding 1 is this pass's own decompressed final vertex pool (write-only output).
-        VkDescriptorSetLayoutBinding bindings[2]{};
+        // INDEX_BUFFER_BIT in addition to STORAGE_BUFFER_BIT: this pool is written as an ordinary
+        // SSBO by DecompressClusterIndices.comp, but read directly by the fixed-function index
+        // fetch stage once bound via vkCmdBindIndexBuffer (see renderer::ClusterHardwareRasterPass).
+        m_DecompressedIndexPool.Create(
+            allocator,
+            static_cast<VkDeviceSize>(maxPhysicalPages) * geometry::kMaxClusterIndices * sizeof(uint32_t),
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+            VMA_MEMORY_USAGE_GPU_ONLY);
+
+        // Descriptor set layout: binding 0 is the compressed physical pool (read-only input,
+        // shared by both dispatches), binding 1 is the decompressed final vertex pool (write-only,
+        // DecompressClusterVertices.comp only), binding 2 is the decompressed final index pool
+        // (write-only, DecompressClusterIndices.comp only). Both pipelines share this one set --
+        // each simply never references the other's output binding.
+        VkDescriptorSetLayoutBinding bindings[3]{};
         bindings[0].binding = 0;
         bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         bindings[0].descriptorCount = 1;
@@ -80,12 +92,17 @@ namespace renderer {
         bindings[1].descriptorCount = 1;
         bindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
+        bindings[2].binding = 2;
+        bindings[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        bindings[2].descriptorCount = 1;
+        bindings[2].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
         VkDescriptorSetLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-        layoutInfo.bindingCount = 2;
+        layoutInfo.bindingCount = 3;
         layoutInfo.pBindings = bindings;
         VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &layoutInfo, nullptr, &m_DescriptorSetLayout));
 
-        VkDescriptorPoolSize poolSize{ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 };
+        VkDescriptorPoolSize poolSize{ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3 };
         VkDescriptorPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
         poolInfo.maxSets = 1;
         poolInfo.poolSizeCount = 1;
@@ -99,9 +116,10 @@ namespace renderer {
         VK_CHECK(vkAllocateDescriptorSets(m_Device, &allocInfo, &m_DescriptorSet));
 
         VkDescriptorBufferInfo compressedInfo{ compressedPhysicalPoolBuffer, 0, VK_WHOLE_SIZE };
-        VkDescriptorBufferInfo decompressedInfo{ m_DecompressedVertexPool.Handle(), 0, VK_WHOLE_SIZE };
+        VkDescriptorBufferInfo decompressedVertexInfo{ m_DecompressedVertexPool.Handle(), 0, VK_WHOLE_SIZE };
+        VkDescriptorBufferInfo decompressedIndexInfo{ m_DecompressedIndexPool.Handle(), 0, VK_WHOLE_SIZE };
 
-        VkWriteDescriptorSet writes[2]{};
+        VkWriteDescriptorSet writes[3]{};
         writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[0].dstSet = m_DescriptorSet;
         writes[0].dstBinding = 0;
@@ -114,10 +132,21 @@ namespace renderer {
         writes[1].dstBinding = 1;
         writes[1].descriptorCount = 1;
         writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        writes[1].pBufferInfo = &decompressedInfo;
+        writes[1].pBufferInfo = &decompressedVertexInfo;
 
-        vkUpdateDescriptorSets(m_Device, 2, writes, 0, nullptr);
+        writes[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[2].dstSet = m_DescriptorSet;
+        writes[2].dstBinding = 2;
+        writes[2].descriptorCount = 1;
+        writes[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[2].pBufferInfo = &decompressedIndexInfo;
 
+        vkUpdateDescriptorSets(m_Device, 3, writes, 0, nullptr);
+
+        // Shared pipeline layout: both DecompressClusterVertices.comp and
+        // DecompressClusterIndices.comp declare a push-constant block that fits within this same
+        // 48-byte range (the index shader's block is a strict prefix of it, only reading
+        // physicalPageIndex) -- see DecompressPushConstants below.
         VkPushConstantRange pushConstantRange{};
         pushConstantRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
         pushConstantRange.offset = 0;
@@ -130,24 +159,40 @@ namespace renderer {
         pipelineLayoutInfo.pPushConstantRanges = &pushConstantRange;
         VK_CHECK(vkCreatePipelineLayout(m_Device, &pipelineLayoutInfo, nullptr, &m_PipelineLayout));
 
-        std::vector<char> shaderCode = ReadShaderFile("shaders/DecompressClusterVertices.comp.spv");
-        VkShaderModule shaderModule = CreateShaderModule(m_Device, shaderCode);
+        std::vector<char> vertexShaderCode = ReadShaderFile("shaders/DecompressClusterVertices.comp.spv");
+        VkShaderModule vertexShaderModule = CreateShaderModule(m_Device, vertexShaderCode);
 
-        VkComputePipelineCreateInfo pipelineInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
-        pipelineInfo.layout = m_PipelineLayout;
-        pipelineInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-        pipelineInfo.stage.module = shaderModule;
-        pipelineInfo.stage.pName = "main";
-        VK_CHECK(vkCreateComputePipelines(m_Device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_Pipeline));
+        VkComputePipelineCreateInfo vertexPipelineInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
+        vertexPipelineInfo.layout = m_PipelineLayout;
+        vertexPipelineInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        vertexPipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        vertexPipelineInfo.stage.module = vertexShaderModule;
+        vertexPipelineInfo.stage.pName = "main";
+        VK_CHECK(vkCreateComputePipelines(m_Device, VK_NULL_HANDLE, 1, &vertexPipelineInfo, nullptr, &m_Pipeline));
 
-        vkDestroyShaderModule(m_Device, shaderModule, nullptr);
+        vkDestroyShaderModule(m_Device, vertexShaderModule, nullptr);
+
+        std::vector<char> indexShaderCode = ReadShaderFile("shaders/DecompressClusterIndices.comp.spv");
+        VkShaderModule indexShaderModule = CreateShaderModule(m_Device, indexShaderCode);
+
+        VkComputePipelineCreateInfo indexPipelineInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
+        indexPipelineInfo.layout = m_PipelineLayout;
+        indexPipelineInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        indexPipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        indexPipelineInfo.stage.module = indexShaderModule;
+        indexPipelineInfo.stage.pName = "main";
+        VK_CHECK(vkCreateComputePipelines(m_Device, VK_NULL_HANDLE, 1, &indexPipelineInfo, nullptr, &m_IndexPipeline));
+
+        vkDestroyShaderModule(m_Device, indexShaderModule, nullptr);
     }
 
     void GeometryDecompressionPass::Shutdown() {
         if (m_Device != VK_NULL_HANDLE) {
             if (m_Pipeline != VK_NULL_HANDLE) {
                 vkDestroyPipeline(m_Device, m_Pipeline, nullptr);
+            }
+            if (m_IndexPipeline != VK_NULL_HANDLE) {
+                vkDestroyPipeline(m_Device, m_IndexPipeline, nullptr);
             }
             if (m_PipelineLayout != VK_NULL_HANDLE) {
                 vkDestroyPipelineLayout(m_Device, m_PipelineLayout, nullptr);
@@ -163,6 +208,7 @@ namespace renderer {
         }
 
         m_Pipeline = VK_NULL_HANDLE;
+        m_IndexPipeline = VK_NULL_HANDLE;
         m_PipelineLayout = VK_NULL_HANDLE;
         m_DescriptorPool = VK_NULL_HANDLE;
         m_DescriptorSet = VK_NULL_HANDLE;
@@ -171,10 +217,11 @@ namespace renderer {
         m_MaxPhysicalPages = 0;
 
         m_DecompressedVertexPool.Destroy();
+        m_DecompressedIndexPool.Destroy();
     }
 
     void GeometryDecompressionPass::DecompressPage(VkCommandBuffer cmd, uint32_t physicalPageIndex, const maths::vec3& boundsMin, const maths::vec3& boundsMax) {
-        assert(physicalPageIndex < m_MaxPhysicalPages && "physicalPageIndex out of range for the final vertex pool");
+        assert(physicalPageIndex < m_MaxPhysicalPages && "physicalPageIndex out of range for the final vertex/index pools");
 
         DecompressPushConstants pushConstants{};
         pushConstants.physicalPageIndex = physicalPageIndex;
@@ -187,23 +234,30 @@ namespace renderer {
         pushConstants.boundsMax[2] = boundsMax.z;
         pushConstants.boundsMax[3] = 0.0f;
 
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_Pipeline);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_PipelineLayout, 0, 1, &m_DescriptorSet, 0, nullptr);
         vkCmdPushConstants(cmd, m_PipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pushConstants), &pushConstants);
 
-        // Exactly one workgroup: DecompressClusterVertices.comp's local_size_x is
-        // geometry::kMaxClusterVertices, so this dispatches exactly one thread per vertex of the
-        // one cluster resident at `physicalPageIndex`.
+        // Exactly one workgroup each: DecompressClusterVertices.comp's local_size_x is
+        // geometry::kMaxClusterVertices (one thread per vertex), DecompressClusterIndices.comp's is
+        // geometry::kMaxClusterIndices (one thread per local triangle-list index) -- both dispatch
+        // over the one cluster resident at `physicalPageIndex`.
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_Pipeline);
         vkCmdDispatch(cmd, 1, 1, 1);
 
-        // The compute write into the final vertex pool must be visible to whatever stage later
-        // reads it -- mirrors the dst stage/access mask GpuGeometryPagePool's own barriers use
-        // (see BindPage/UnbindPage), since no mesh shader pipeline exists yet in this codebase.
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_IndexPipeline);
+        vkCmdDispatch(cmd, 1, 1, 1);
+
+        // Both compute writes must be visible to whatever later reads them: the vertex pool to a
+        // later vertex-shader SSBO read (renderer::ClusterHardwareRasterPass decodes compressed
+        // positions on the fly, but a fully-decompressed vertex pool read is still a documented,
+        // supported consumer -- see the class comment), and the index pool to the fixed-function
+        // index-fetch stage once bound via vkCmdBindIndexBuffer
+        // (VK_PIPELINE_STAGE_2_INDEX_INPUT_BIT / VK_ACCESS_2_INDEX_READ_BIT).
         VkMemoryBarrier2 barrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
         barrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
         barrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-        barrier.dstStageMask = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-        barrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+        barrier.dstStageMask = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_INDEX_INPUT_BIT;
+        barrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_INDEX_READ_BIT;
 
         VkDependencyInfo depInfo{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
         depInfo.memoryBarrierCount = 1;

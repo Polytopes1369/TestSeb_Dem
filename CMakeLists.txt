@@ -21,8 +21,11 @@ set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
 add_subdirectory(vendor/glfw)
 
 # --- Collecte automatique des sources ---
-file(GLOB_RECURSE ALL_SOURCES "src/*.cpp")
-file(GLOB_RECURSE ALL_HEADERS "src/*.h" "src/*.hpp")
+# CONFIGURE_DEPENDS: re-runs the glob at build time so newly added .cpp/.h files are picked up
+# automatically -- without it, a plain GLOB is evaluated only at configure time, and any file
+# created afterwards silently never reaches the linker (LNK2019 on its symbols).
+file(GLOB_RECURSE ALL_SOURCES CONFIGURE_DEPENDS "src/*.cpp")
+file(GLOB_RECURSE ALL_HEADERS CONFIGURE_DEPENDS "src/*.h" "src/*.hpp")
 
 # --- Création de l'exécutable ---
 add_executable(${PROJECT_NAME} ${ALL_SOURCES} ${ALL_HEADERS})
@@ -95,11 +98,12 @@ endif()
 if(Vulkan_GLSLC_EXECUTABLE)
     message(STATUS "Shader compiler found: ${Vulkan_GLSLC_EXECUTABLE}")
     
-    # Automatically find all shader files
-    file(GLOB_RECURSE SHADERS_TO_COMPILE 
-        "src/shaders/*.comp" 
-        "src/shaders/*.mesh" 
-        "src/shaders/*.frag" 
+    # Automatically find all shader files. CONFIGURE_DEPENDS for the same reason as ALL_SOURCES
+    # above: without it, shaders added after the last configure are never compiled/deployed.
+    file(GLOB_RECURSE SHADERS_TO_COMPILE CONFIGURE_DEPENDS
+        "src/shaders/*.comp"
+        "src/shaders/*.mesh"
+        "src/shaders/*.frag"
         "src/shaders/*.vert"
     )
 

@@ -19,14 +19,14 @@ layout(std140, binding = 2) uniform Params
 {
     float radius1;
     float radius2;
+    float rotation;
+    float twist;
     uint  nbRadSeg;
     uint  nbSides;
     uint  meshID;
     float materialID;
     uint  vertexOffset;
     uint  indexOffset;
-    // World-space translation baked into the generated geometry, used to place multiple
-    // instances of this primitive at different grid slots without a separate transform stage.
     float worldOffsetX;
     float worldOffsetY;
     float worldOffsetZ;
@@ -43,7 +43,7 @@ void main()
     uint sideI = id % stride;
 
     float t1 = float(seg) / float(nbRadSeg) * TAU;
-    float t2 = float(sideI) / float(nbSides) * TAU;
+    float t2 = float(sideI) / float(nbSides) * TAU + rotation + twist * t1;
     float c1 = cos(t1), s1 = sin(t1);
     float c2 = cos(t2), s2 = sin(t2);
 

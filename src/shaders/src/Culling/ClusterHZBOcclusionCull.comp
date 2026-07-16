@@ -1,0 +1,276 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+
+// Nanite-style two-phase GPU occlusion culling. A single shader source, built into two pipeline
+// specializations (LATE_PASS = false / true, via the spec constant below) that together manage
+// two atomically-produced work lists across a frame:
+//
+//   - The PENDING list: candidate clusters whose true visibility could not yet be confirmed by
+//     the early pass (see below), written atomically by the early specialization and consumed by
+//     the late specialization.
+//   - The EARLY / LATE indirect draw lists: the two VkDrawIndexedIndirectCommand buffers this
+//     frame's two draw calls consume, each compacted via its own atomic draw counter (mirroring
+//     ClusterFrustumCull.comp / feedback_buffer.glsl's atomicAdd-compaction pattern).
+//
+// --- EARLY specialization (LATE_PASS = false), dispatched over every candidate cluster ---
+// Applies the frustum + backface tests (cluster_culling_tests.glsl, shared with
+// ClusterFrustumCull.comp) first: a cluster failing either can never contribute a visible
+// triangle THIS frame in either pass (the camera does not change between early and late within
+// one frame), so it is dropped outright, never touching either work list.
+//
+// A cluster passing both is then tested against the HZB as it stood at the *start* of this frame
+// -- i.e. built from the *previous* frame's final depth buffer, since this frame has not
+// rasterized anything yet. Two pieces of information decide its fate:
+//   - g_VisibleLastFrame[i]: was this exact cluster index confirmed visible at the end of last
+//     frame (persisted across frames, see renderer::ClusterOcclusionCullingPass)?
+//   - The result of testing it against that (stale) HZB right now.
+// If it was visible last frame AND still passes the stale-HZB test, it is drawn immediately (the
+// "early" list) -- this is the common case (most of the scene doesn't change from frame to
+// frame) and lets the bulk of the frame's geometry start contributing to depth as soon as
+// possible. Anything else -- a cluster that was NOT visible last frame (new, or only just
+// stopped being occluded -- its true visibility against fresh geometry is unknown), or one the
+// stale HZB now claims is occluded (which may well be wrong, since that HZB predates everything
+// drawn this frame) -- is deferred to the PENDING list instead of being decided here.
+//
+// --- LATE specialization (LATE_PASS = true), dispatched (indirectly, see
+// BuildDispatchIndirectArgs.comp) over exactly the pending list's entries ---
+// By construction every pending entry already passed the frustum + backface tests in the early
+// pass, so this specialization re-tests only occlusion, against the HZB rebuilt (by the caller,
+// between the two dispatches -- see renderer::ClusterOcclusionCullingPass's per-frame contract)
+// from the depth this frame's own early draws just produced. Anything visible against that fresh
+// HZB is drawn now (the "late" list), catching both genuinely newly-revealed geometry
+// (disocclusion) and clusters the early pass could only guess about. Either way, this
+// specialization is the one that gets to write g_VisibleLastFrame[i]'s final value for every
+// pending cluster, since it is the last word on that cluster's visibility this frame.
+//
+// --- Hardware / software rasterization classification ---
+// Immediately before a cluster is actually emitted for drawing (in either the early or late
+// list), ShouldUseSoftwareRaster() estimates its average triangle screen size (from the cluster's
+// bounding-sphere projected radius divided by sqrt(triangle count) -- a cheap, cluster-level
+// approximation, not a per-triangle measurement) and routes it to one of two disjoint worklists:
+//   - Triangles estimated >= pc.softwareRasterThresholdPixels: an ordinary
+//     VkDrawIndexedIndirectCommand in the early/late indirect list, exactly as before (consumed by
+//     renderer::ClusterHardwareRasterPass via vkCmdDrawIndexedIndirectCount).
+//   - Triangles estimated smaller: the cluster's own slot index is appended to
+//     g_SoftwareClusterList instead (consumed by ClusterSoftwareRaster.comp /
+//     renderer::ClusterSoftwareRasterPass) -- no indirect draw command is ever produced for it.
+// A cluster can only end up on one list or the other, never both, so the two rasterization paths'
+// outputs never race on the same cluster.
+
+#include "include/cluster_culling_common.glsl"
+#include "include/cluster_culling_tests.glsl"
+
+#define HZB_TEXTURE_SET 0
+#define HZB_TEXTURE_BINDING 3
+#include "include/hzb_occlusion.glsl"
+
+layout(constant_id = 0) const bool LATE_PASS = false;
+
+layout(std430, set = 0, binding = 0) readonly buffer ClusterCullMetadataSSBO {
+    ClusterCullMetadata clusters[];
+} g_Clusters;
+
+layout(std140, set = 0, binding = 1) uniform CullingViewParamsUBO {
+    CullingViewParams data;
+} g_ViewParams;
+
+layout(std140, set = 0, binding = 2) uniform HZBOcclusionViewParamsUBO {
+    HZBOcclusionViewParams data;
+} g_HZBParams;
+
+// binding 3 == g_HZBTexture, declared by hzb_occlusion.glsl.
+
+// Persisted across frames (NOT cleared by renderer::ClusterOcclusionCullingPass::RecordClearFrame):
+// element i is 1 if cluster i was confirmed visible at the end of the previous frame's late pass
+// (or this frame's early pass, for clusters decided there), 0 otherwise. Read by the early pass,
+// written by both.
+layout(std430, set = 0, binding = 4) buffer VisibleLastFrameSSBO {
+    uint visible[];
+} g_VisibleLastFrame;
+
+// The pending/wait list: cluster indices the early pass could not immediately confirm, consumed
+// by the late pass. count is reset to 0 once per frame by
+// renderer::ClusterOcclusionCullingPass::RecordClearFrame, before the early dispatch runs.
+layout(std430, set = 0, binding = 5) buffer PendingListSSBO {
+    uint count;
+    uint clusterIndex[];
+} g_PendingList;
+
+// Byte-for-byte mirror of VkDrawIndexedIndirectCommand (see ClusterFrustumCull.comp for the same
+// convention and its rationale).
+struct DrawIndexedIndirectCommand {
+    uint indexCount;
+    uint instanceCount;
+    uint firstIndex;
+    uint vertexOffset;
+    uint firstInstance;
+};
+
+layout(std430, set = 0, binding = 6) writeonly buffer EarlyIndirectCommandsSSBO {
+    DrawIndexedIndirectCommand commands[];
+} g_EarlyIndirectCommands;
+
+layout(std430, set = 0, binding = 7) buffer EarlyDrawCountSSBO {
+    uint count;
+} g_EarlyDrawCount;
+
+layout(std430, set = 0, binding = 8) writeonly buffer LateIndirectCommandsSSBO {
+    DrawIndexedIndirectCommand commands[];
+} g_LateIndirectCommands;
+
+layout(std430, set = 0, binding = 9) buffer LateDrawCountSSBO {
+    uint count;
+} g_LateDrawCount;
+
+// Clusters routed to the software rasterizer instead of an indirect hardware draw -- see the
+// class comment's "Hardware / software rasterization classification" section. count is reset to
+// 0 once per frame by renderer::ClusterOcclusionCullingPass::RecordClearFrame, exactly like
+// g_PendingList/g_EarlyDrawCount/g_LateDrawCount.
+layout(std430, set = 0, binding = 10) buffer SoftwareClusterListSSBO {
+    uint count;
+    uint clusterIndex[];
+} g_SoftwareClusterList;
+
+layout(push_constant) uniform ClusterOcclusionPushConstants {
+    uint clusterCount; // Total candidate count in g_Clusters -- only consulted by the EARLY specialization.
+    // Average estimated triangle screen size (pixels) below which a cluster is routed to the
+    // software rasterizer instead of a hardware indirect draw -- see ShouldUseSoftwareRaster().
+    // Nanite-style engines typically use a value in the 4-8 pixel range.
+    float softwareRasterThresholdPixels;
+} pc;
+
+// Cheap, cluster-level hardware/software rasterization classification: see the class comment.
+// Uses the cluster's own bounding sphere (already available in ClusterCullMetadata, no extra
+// per-triangle work) rather than measuring every individual triangle's screen footprint, which
+// would defeat the purpose of a fast, coarse routing decision made once per cluster.
+bool ShouldUseSoftwareRaster(ClusterCullMetadata cluster) {
+    float screenRadius = ProjectedScreenRadius(cluster.sphereCenter, cluster.sphereRadius,
+        g_ViewParams.data.cameraPositionWorld, g_HZBParams.data.projScaleY,
+        // HZBPass builds its mip 0 at HALF the source depth buffer's resolution (see HZBPass.h's
+        // class comment), so doubling hzbMip0Size.y recovers the actual render target height in
+        // pixels without needing a separate viewport-size field.
+        g_HZBParams.data.hzbMip0Size.y * 2.0);
+
+    float triangleCount = max(float(cluster.indexCount / 3u), 1.0);
+    float avgTriangleScreenSize = (2.0 * screenRadius) / sqrt(triangleCount);
+    return avgTriangleScreenSize < pc.softwareRasterThresholdPixels;
+}
+
+// Appends `clusterSlotIndex` to the software rasterizer's worklist via the same atomic-compaction
+// pattern as g_PendingList / the indirect draw lists.
+void EmitSoftwareCluster(uint clusterSlotIndex) {
+    uint slot = atomicAdd(g_SoftwareClusterList.count, 1u);
+    if (slot < g_SoftwareClusterList.clusterIndex.length()) {
+        g_SoftwareClusterList.clusterIndex[slot] = clusterSlotIndex;
+    }
+}
+
+layout(local_size_x = 64) in;
+
+// Compacts one surviving cluster's draw into the early or late indirect command buffer via that
+// buffer's own atomic counter -- exactly ClusterFrustumCull.comp's compaction pattern, duplicated
+// per output list since GLSL cannot pass buffer-block references as function parameters.
+// `clusterSlotIndex` is this cluster's own index into g_Clusters.clusters[] (NOT
+// cluster.clusterID, an unrelated opaque cache identifier) -- written into firstInstance so that,
+// with instanceCount == 1, gl_InstanceIndex == firstInstance exactly, letting
+// ClusterRaster.vert re-index the very same ClusterCullMetadataSSBO this shader reads. See
+// renderer::ClusterHardwareRasterPass.
+void EmitEarlyDraw(ClusterCullMetadata cluster, uint clusterSlotIndex) {
+    DrawIndexedIndirectCommand cmd;
+    cmd.indexCount = cluster.indexCount;
+    cmd.instanceCount = 1u;
+    cmd.firstIndex = cluster.firstIndex;
+    cmd.vertexOffset = cluster.vertexOffset;
+    cmd.firstInstance = clusterSlotIndex;
+
+    uint slot = atomicAdd(g_EarlyDrawCount.count, 1u);
+    if (slot < g_EarlyIndirectCommands.commands.length()) {
+        g_EarlyIndirectCommands.commands[slot] = cmd;
+    }
+}
+
+void EmitLateDraw(ClusterCullMetadata cluster, uint clusterSlotIndex) {
+    DrawIndexedIndirectCommand cmd;
+    cmd.indexCount = cluster.indexCount;
+    cmd.instanceCount = 1u;
+    cmd.firstIndex = cluster.firstIndex;
+    cmd.vertexOffset = cluster.vertexOffset;
+    cmd.firstInstance = clusterSlotIndex;
+
+    uint slot = atomicAdd(g_LateDrawCount.count, 1u);
+    if (slot < g_LateIndirectCommands.commands.length()) {
+        g_LateIndirectCommands.commands[slot] = cmd;
+    }
+}
+
+void main() {
+    if (LATE_PASS) {
+        // --- LATE: one invocation per pending-list entry (the indirect dispatch's group count is
+        // rounded up to a whole workgroup, so invocations at or past g_PendingList.count must be
+        // discarded here rather than relied upon to be absent). ---
+        uint pendingSlot = gl_GlobalInvocationID.x;
+        if (pendingSlot >= g_PendingList.count) {
+            return;
+        }
+
+        uint clusterIndex = g_PendingList.clusterIndex[pendingSlot];
+        ClusterCullMetadata cluster = g_Clusters.clusters[clusterIndex];
+
+        bool occluded = IsClusterOccluded(cluster.boundsMin, cluster.boundsMax,
+            g_HZBParams.data.viewProj, g_HZBParams.data.hzbMip0Size, g_HZBParams.data.hzbMipCount);
+
+        if (!occluded) {
+            if (ShouldUseSoftwareRaster(cluster)) {
+                EmitSoftwareCluster(clusterIndex);
+            } else {
+                EmitLateDraw(cluster, clusterIndex);
+            }
+        }
+
+        // Final word on this cluster's visibility for this frame -- next frame's early pass reads
+        // this value.
+        g_VisibleLastFrame.visible[clusterIndex] = occluded ? 0u : 1u;
+    } else {
+        // --- EARLY: one invocation per candidate cluster ---
+        uint clusterIndex = gl_GlobalInvocationID.x;
+        if (clusterIndex >= pc.clusterCount) {
+            return;
+        }
+
+        ClusterCullMetadata cluster = g_Clusters.clusters[clusterIndex];
+
+        // Frustum + backface: a rejection here holds for the whole frame (both passes), so the
+        // cluster is dropped entirely -- it never reaches either work list.
+        bool inFrustum = IsBoxInsideFrustum(cluster.boundsMin, cluster.boundsMax, g_ViewParams.data.frustumPlanes);
+        bool backFacing = IsClusterBackFacing(cluster.sphereCenter, cluster.sphereRadius, cluster.coneAxis, cluster.coneCutoff, g_ViewParams.data.cameraPositionWorld);
+        if (!inFrustum || backFacing) {
+            g_VisibleLastFrame.visible[clusterIndex] = 0u;
+            return;
+        }
+
+        bool wasVisibleLastFrame = g_VisibleLastFrame.visible[clusterIndex] != 0u;
+        bool occludedByStaleHZB = IsClusterOccluded(cluster.boundsMin, cluster.boundsMax,
+            g_HZBParams.data.viewProj, g_HZBParams.data.hzbMip0Size, g_HZBParams.data.hzbMipCount);
+
+        if (wasVisibleLastFrame && !occludedByStaleHZB) {
+            // Confirmed still visible against last frame's geometry: draw immediately, no need to
+            // spend a late-pass re-test on it.
+            if (ShouldUseSoftwareRaster(cluster)) {
+                EmitSoftwareCluster(clusterIndex);
+            } else {
+                EmitEarlyDraw(cluster, clusterIndex);
+            }
+            g_VisibleLastFrame.visible[clusterIndex] = 1u;
+        } else {
+            // Uncertain: either this cluster was not part of last frame's visible set (its
+            // visibility against anything is unknown), or the stale HZB claims occlusion by
+            // geometry that itself might be about to get overdrawn this frame. Defer to the late
+            // pass rather than guessing -- g_VisibleLastFrame is deliberately left untouched here;
+            // the late pass writes its final value once the fresh HZB is available.
+            uint slot = atomicAdd(g_PendingList.count, 1u);
+            if (slot < g_PendingList.clusterIndex.length()) {
+                g_PendingList.clusterIndex[slot] = clusterIndex;
+            }
+        }
+    }
+}

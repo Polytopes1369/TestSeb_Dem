@@ -137,6 +137,14 @@ namespace renderer {
         uint32_t GetResidentPageCount() const { return m_PageTable.GetResidentPageCount(); }
         uint32_t GetPhysicalCapacity() const { return m_PageTable.GetCapacity(); }
 
+        // Physical page slot index currently bound to `logicalAddress` (geometry::kInvalidPhysicalPage
+        // if not resident). Needed by renderer::ClusterRenderPipeline to derive each cluster's
+        // firstIndex/vertexOffset (physicalPageIndex * kMaxClusterIndices/kMaxClusterVertices, the
+        // layout contract renderer::GeometryDecompressionPass's pools are built on) right after
+        // recording that cluster's BindPage() -- the mapping is CPU-side bookkeeping, valid the
+        // moment BindPage() records, not only after the GPU executes it.
+        uint32_t GetPhysicalPageIndex(uint64_t logicalAddress) const { return m_PageTable.GetPhysicalPageIndex(logicalAddress); }
+
         VkBuffer GetPhysicalPoolBuffer() const { return m_PhysicalPool.Handle(); }
         VkBuffer GetPageTableBuffer() const { return m_PageTableBuffer.Handle(); }
 

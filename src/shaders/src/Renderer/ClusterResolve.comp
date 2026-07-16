@@ -1,0 +1,176 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+#extension GL_EXT_shader_image_int64 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+// Deferred material-resolve pass: the decoupled second half of the Visibility Buffer pipeline
+// (see renderer::ClusterHardwareRasterPass / renderer::ClusterSoftwareRasterPass for the two
+// rasterization paths that fill the VisBuffer this shader reads). One invocation per output pixel
+// -- no per-triangle or per-vertex work happens here, only per-pixel reconstruction and shading,
+// which is exactly what "decoupling shading from geometric rendering" means in a Visibility Buffer
+// architecture: a triangle is rasterized (and its coverage/depth decided) exactly once regardless
+// of how expensive its eventual material is, and a material is evaluated exactly once per pixel
+// regardless of how much overdraw the geometry pass would otherwise have caused.
+//
+// --- Step 1: pick the winning rasterization path for this pixel ---
+// The hardware path (renderer::ClusterHardwareRasterPass) writes two plain R32_UINT attachments
+// (ClusterID slot + local TriangleID) plus an ordinary hardware depth buffer; the software path
+// (renderer::ClusterSoftwareRasterPass) writes one packed 64-bit atomic (depth, visibilityID)
+// word. Since these are two independent rasterizers with no shared depth buffer between them
+// (there is no cross-path atomic seeding -- seeding a plain hardware depth buffer into an atomic
+// buffer intended for lock-free contention is unnecessary complexity a plain per-pixel comparison
+// avoids entirely), this shader is what actually reconciles them: whichever has the nearer decoded
+// depth at a given pixel wins, exactly matching how real dual-rasterization engines (Nanite) defer
+// this exact decision to their own resolve/material pass.
+//
+// --- Step 2: reconstruct barycentric coordinates from the pixel + the triangle's plane ---
+// Having identified (clusterSlotIndex, triangleOrdinal), the winning triangle's 3 vertices are
+// re-fetched and re-projected with the *same* view-projection matrix the rasterizer that wrote
+// this pixel used -- this reproduces the exact same screen-space triangle, so the half-space edge
+// functions (half_space_raster.glsl, shared with ClusterSoftwareRaster.comp) evaluated at this
+// pixel's center reconstruct the same barycentric weights the rasterizer implicitly used, without
+// this pass ever needing to store barycentrics itself.
+//
+// --- Step 3: evaluate the material ---
+// This codebase has no texture/material-binding system yet (no sampler2D material atlas, no
+// per-cluster material ID) -- decoded UVs are computed and available for that future integration,
+// but the actual shading here reuses draw.frag's own procedural approach (hash the identifying ID
+// to a stable hue, Lambertian-shade with the reconstructed normal) via procedural_material.glsl,
+// so this pass produces a genuinely complete, visually verifiable image today rather than a
+// stubbed placeholder.
+
+#include "include/cluster_culling_common.glsl"
+
+#define COMPRESSED_POOL_SET 0
+#define COMPRESSED_POOL_BINDING 1
+#include "include/cluster_vertex_decode.glsl"
+
+#include "include/half_space_raster.glsl"
+#include "include/procedural_material.glsl"
+
+layout(std430, set = 0, binding = 0) readonly buffer ClusterCullMetadataSSBO {
+    ClusterCullMetadata clusters[];
+} g_Clusters;
+
+// binding 1 == g_CompressedClusterPool, declared by cluster_vertex_decode.glsl.
+
+layout(r32ui, set = 0, binding = 2) uniform readonly uimage2D g_HWClusterIDImage;
+layout(r32ui, set = 0, binding = 3) uniform readonly uimage2D g_HWTriangleIDImage;
+layout(set = 0, binding = 4) uniform sampler2D g_HWDepthTexture;
+layout(r64ui, set = 0, binding = 5) uniform readonly u64image2D g_SWVisBufferAtomic;
+layout(rgba8, set = 0, binding = 6) uniform writeonly image2D g_OutputColor;
+
+layout(std140, set = 0, binding = 7) uniform ResolveViewParamsUBO {
+    mat4 viewProj;
+    vec2 viewportSize;
+    float _pad0;
+    float _pad1;
+} g_ViewParams;
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (pixel.x >= int(g_ViewParams.viewportSize.x) || pixel.y >= int(g_ViewParams.viewportSize.y)) {
+        return;
+    }
+
+    // --- Step 1: hardware vs software, whichever is nearer ---
+    uint hwClusterSlot = imageLoad(g_HWClusterIDImage, pixel).r;
+    uint hwTriangleOrdinal = imageLoad(g_HWTriangleIDImage, pixel).r;
+    float hwDepth = texelFetch(g_HWDepthTexture, pixel, 0).r; // NDC [0,1], non-reversed -- smaller is nearer.
+    bool hwHasData = hwClusterSlot != 0xFFFFFFFFu; // Matches main.cpp's VisBuffer clear value (kInvalidClusterID).
+
+    uint64_t swPacked = imageLoad(g_SWVisBufferAtomic, pixel).x;
+    bool swHasData = swPacked != 0uL; // Matches ClearVisBufferAtomic.comp's clear value.
+    uint swDepthBits = uint(swPacked >> 32);
+    uint swVisibilityID = uint(swPacked & 0xFFFFFFFFuL);
+    // Inverse of ClusterSoftwareRaster.comp's own encoding (depthBits = (1 - ndcDepth) * UINT32_MAX).
+    float swDepth = 1.0 - (float(swDepthBits) / 4294967295.0);
+
+    uint clusterSlotIndex;
+    uint triangleOrdinal;
+    bool hasAnyData = hwHasData || swHasData;
+
+    if (hwHasData && (!swHasData || hwDepth <= swDepth)) {
+        clusterSlotIndex = hwClusterSlot;
+        triangleOrdinal = hwTriangleOrdinal;
+    } else {
+        // swHasData is guaranteed true here (hasAnyData covers the all-false case below).
+        clusterSlotIndex = swVisibilityID >> 7;
+        triangleOrdinal = swVisibilityID & 0x7Fu;
+    }
+
+    if (!hasAnyData) {
+        // Background: matches main.cpp's dark-blue swapchain clear color from before the
+        // Visibility Buffer conversion, so a pixel with nothing rasterized reads the same either
+        // way.
+        imageStore(g_OutputColor, pixel, vec4(0.05, 0.05, 0.1, 1.0));
+        return;
+    }
+
+    // --- Step 2: re-fetch the winning triangle's 3 vertices and reconstruct barycentrics ---
+    ClusterCullMetadata cluster = g_Clusters.clusters[clusterSlotIndex];
+    uint physicalPageIndex = cluster.vertexOffset / CLUSTER_MAX_VERTICES;
+    uint pageByteBase = physicalPageIndex * CLUSTER_PAGE_SIZE_BYTES;
+
+    uint i0 = ClusterLoadByte(pageByteBase + CLUSTER_INDICES_BASE_BYTES + triangleOrdinal * 3u + 0u);
+    uint i1 = ClusterLoadByte(pageByteBase + CLUSTER_INDICES_BASE_BYTES + triangleOrdinal * 3u + 1u);
+    uint i2 = ClusterLoadByte(pageByteBase + CLUSTER_INDICES_BASE_BYTES + triangleOrdinal * 3u + 2u);
+
+    vec3 p0 = DecodeClusterPosition(pageByteBase, i0, cluster.boundsMin, cluster.boundsMax);
+    vec3 p1 = DecodeClusterPosition(pageByteBase, i1, cluster.boundsMin, cluster.boundsMax);
+    vec3 p2 = DecodeClusterPosition(pageByteBase, i2, cluster.boundsMin, cluster.boundsMax);
+    vec3 n0 = DecodeClusterNormal(pageByteBase, i0);
+    vec3 n1 = DecodeClusterNormal(pageByteBase, i1);
+    vec3 n2 = DecodeClusterNormal(pageByteBase, i2);
+    vec2 uv0 = DecodeClusterUV(pageByteBase, i0);
+    vec2 uv1 = DecodeClusterUV(pageByteBase, i1);
+    vec2 uv2 = DecodeClusterUV(pageByteBase, i2);
+
+    vec4 clip0 = g_ViewParams.viewProj * vec4(p0, 1.0);
+    vec4 clip1 = g_ViewParams.viewProj * vec4(p1, 1.0);
+    vec4 clip2 = g_ViewParams.viewProj * vec4(p2, 1.0);
+
+    vec2 screen0 = (clip0.xy / clip0.w * 0.5 + 0.5) * g_ViewParams.viewportSize;
+    vec2 screen1 = (clip1.xy / clip1.w * 0.5 + 0.5) * g_ViewParams.viewportSize;
+    vec2 screen2 = (clip2.xy / clip2.w * 0.5 + 0.5) * g_ViewParams.viewportSize;
+
+    vec2 pixelCenter = vec2(pixel) + 0.5;
+
+    float area2 = EdgeFunction(screen0, screen1, screen2);
+    float invArea2 = (abs(area2) > 1.0e-8) ? (1.0 / area2) : 0.0;
+
+    // Screen-space-linear barycentric weights (not yet perspective-correct).
+    float w0 = EdgeFunction(screen1, screen2, pixelCenter) * invArea2;
+    float w1 = EdgeFunction(screen2, screen0, pixelCenter) * invArea2;
+    float w2 = EdgeFunction(screen0, screen1, pixelCenter) * invArea2;
+
+    // Perspective correction: screen-space-linear weights interpolate attributes incorrectly under
+    // perspective projection (unlike NDC depth itself, which the rasterizer already relies on
+    // being screen-linear) -- dividing each weight by its vertex's clip.w and renormalizing
+    // recovers the perspective-correct weights standard rasterizers apply to varyings.
+    float invW0 = 1.0 / clip0.w;
+    float invW1 = 1.0 / clip1.w;
+    float invW2 = 1.0 / clip2.w;
+    float interpInvW = w0 * invW0 + w1 * invW1 + w2 * invW2;
+    float perspNorm = (abs(interpInvW) > 1.0e-8) ? (1.0 / interpInvW) : 0.0;
+    float pw0 = w0 * invW0 * perspNorm;
+    float pw1 = w1 * invW1 * perspNorm;
+    float pw2 = w2 * invW2 * perspNorm;
+
+    vec3 normal = normalize(pw0 * n0 + pw1 * n1 + pw2 * n2);
+    vec2 uv = pw0 * uv0 + pw1 * uv1 + pw2 * uv2; // Decoded and available for a future texture-sampling step.
+
+    // --- Step 3: procedural material evaluation (see the class comment for why no texture
+    // sampling happens here yet) ---
+    vec3 lightDir = normalize(vec3(0.5, 1.0, 0.5));
+    float diff = max(dot(normal, lightDir), 0.0);
+
+    uint hashed = HashID(clusterSlotIndex);
+    float hue = float(hashed) / 4294967295.0;
+    vec3 albedo = HsvToRgb(vec3(hue, 0.65, 0.85));
+    vec3 finalColor = albedo * 0.15 + albedo * diff;
+
+    imageStore(g_OutputColor, pixel, vec4(finalColor, 1.0));
+}

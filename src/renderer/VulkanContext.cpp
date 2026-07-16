@@ -13,6 +13,13 @@
 #include <cmath>
 #include <algorithm>
 #include <format>
+#include <cassert>
+
+// For IsDebuggerPresent() in DebugCallback -- lean include, and NOMINMAX so windows.h's min/max
+// macros never shadow the std:: ones used throughout this file.
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
 
 // Validation Layers array definition
 const std::vector<const char*> validationLayers = {
@@ -20,6 +27,13 @@ const std::vector<const char*> validationLayers = {
 };
 
 namespace {
+    // Procedural geometry SSBO capacities. Sized with real headroom above the current 12-primitive
+    // total (~6k vertices / ~31k indices at the time of writing) since GenerateGeometry() asserts
+    // against these below -- growing a primitive's segment counts past this ceiling now fails loudly
+    // at startup instead of silently overflowing into adjacent GPU memory.
+    constexpr VkDeviceSize kVertexBufferBytes = 1024 * 1024;
+    constexpr VkDeviceSize kIndexBufferBytes = 256 * 1024;
+
     // --- Per-shader Params blocks, mirrored 1:1 from their geom_*.comp UBO/push-constant
     // declarations (all fields are 4-byte scalars, so std140 layout == plain C++ struct
     // layout here: no vec3 members means no extra padding to account for). worldOffsetX/Y/Z
@@ -27,9 +41,11 @@ namespace {
     // grid slot directly on the GPU, avoiding a separate per-instance transform stage.
 
     struct ConeParams {
-        float height;
         float bottomRadius;
         float topRadius;
+        float height;
+        uint32_t nbHeightSegs;
+        uint32_t nbCapSegs;
         uint32_t nbSides;
         uint32_t meshID;
         float materialID;
@@ -43,6 +59,7 @@ namespace {
     struct IcosphereParams {
         float radius;
         uint32_t subdiv;
+        uint32_t baseType; // 0 = Tetra, 1 = Octa, 2 = Icosa
         uint32_t meshID;
         float materialID;
         uint32_t vertexOffset;
@@ -68,8 +85,7 @@ namespace {
 
     struct SphereParams {
         float radius;
-        uint32_t sideSegs;
-        uint32_t heightSegs;
+        uint32_t segments;
         uint32_t meshID;
         float materialID;
         uint32_t vertexOffset;
@@ -82,6 +98,8 @@ namespace {
     struct TorusParams {
         float radius1;
         float radius2;
+        float rotation;
+        float twist;
         uint32_t nbRadSeg;
         uint32_t nbSides;
         uint32_t meshID;
@@ -94,12 +112,12 @@ namespace {
     };
 
     struct TubeParams {
+        float radius1;
+        float radius2;
         float height;
+        uint32_t nbHeightSegs;
+        uint32_t nbCapSegs;
         uint32_t nbSides;
-        float bottomRadius1;
-        float bottomRadius2;
-        float topRadius1;
-        float topRadius2;
         uint32_t meshID;
         float materialID;
         uint32_t vertexOffset;
@@ -140,9 +158,12 @@ namespace {
     };
 
     struct PyramidParams {
+        float width;
+        float depth;
         float height;
-        float radius;
-        uint32_t nbSides;
+        uint32_t widthSegs;
+        uint32_t depthSegs;
+        uint32_t heightSegs;
         uint32_t meshID;
         float materialID;
         uint32_t vertexOffset;
@@ -253,12 +274,22 @@ static VKAPI_ATTR VkBool32 VKAPI_CALL DebugCallback(
     LogLevel level = LogLevel::Info;
     if (messageSeverity >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) {
         level = LogLevel::Error;
-        __debugbreak();
     }
     else if (messageSeverity >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) {
         level = LogLevel::Warning;
     }
+
+    // ALWAYS log before any break: __debugbreak() without an attached debugger terminates the
+    // process on the spot, and breaking before logging used to kill the app with the validation
+    // message still unwritten -- a validation error then looked like a silent crash right after
+    // whatever the last successful log line happened to be. Breaking is also gated on an actual
+    // debugger being attached, so a plain console launch now logs the error and keeps going
+    // instead of dying on an int3 the user can never see.
     Logger::Log(level, pCallbackData->pMessage);
+
+    if (messageSeverity >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT && IsDebuggerPresent()) {
+        __debugbreak();
+    }
     return VK_FALSE;
 }
 
@@ -306,9 +337,9 @@ void VulkanContext::Init(std::string_view appName, GLFWwindow* window) {
     // pool (created above, CreateCommandPool()/AllocateCommandBuffer()) exist.
     UploadEntityData();
 
-    // Allocate Procedural Geometry Buffers (512KB vertices, 128KB indices, 256B for internal parameters)
+    // Allocate Procedural Geometry Buffers (see kVertexBufferBytes/kIndexBufferBytes; 256B for internal parameters)
     VkBufferCreateInfo vInfo{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
-    vInfo.size = 512 * 1024;
+    vInfo.size = kVertexBufferBytes;
     // TRANSFER_SRC_BIT is required for the DEBUG readback (vkCmdCopyBuffer) in DebugReadbackGeometrySample()
     vInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
     VmaAllocationCreateInfo vAlloc{ .usage = VMA_MEMORY_USAGE_GPU_ONLY };
@@ -317,7 +348,7 @@ void VulkanContext::Init(std::string_view appName, GLFWwindow* window) {
     }
 
     VkBufferCreateInfo iInfo{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
-    iInfo.size = 128 * 1024;
+    iInfo.size = kIndexBufferBytes;
     // TRANSFER_SRC_BIT is required for the DEBUG readback (vkCmdCopyBuffer) in DebugReadbackGeometrySample()
     iInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
     if (vmaCreateBuffer(m_Allocator, &iInfo, &vAlloc, &m_IndexBuffer, &m_IndexAllocation, nullptr) != VK_SUCCESS) {
@@ -382,6 +413,53 @@ void VulkanContext::Init(std::string_view appName, GLFWwindow* window) {
     if (vkCreateImageView(m_Device, &depthViewInfo, nullptr, &m_DepthImageView) != VK_SUCCESS) {
         throw std::runtime_error("Failed to create depth image view!");
     }
+
+    // Create Visibility Buffer attachments (ClusterID + local TriangleID, see VulkanContext.h's
+    // GetVisBufferClusterIDImage()/GetVisBufferTriangleIDImage() comment). Two separate
+    // single-channel R32_UINT images rather than one 2-channel image, sized to the swapchain
+    // extent exactly like the depth image above (no runtime resize support in this engine, see
+    // CreateSwapchain()'s non-resizable GLFW window). STORAGE_BIT is required because
+    // renderer::ClusterResolvePass binds both images as plain storage images (imageLoad, not a
+    // sampler read -- see ClusterResolve.comp's g_HWClusterIDImage/g_HWTriangleIDImage) once
+    // renderer::ClusterRenderPipeline transitions them to VK_IMAGE_LAYOUT_GENERAL after the hybrid
+    // raster passes; SAMPLED_BIT is kept alongside for any future pass that prefers a filtered/
+    // sampler-based read instead.
+    auto createVisBufferImage = [&](VkImage& outImage, VmaAllocation& outAllocation, VkImageView& outView, const char* debugName) {
+        VkImageCreateInfo visBufferImageInfo{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+        visBufferImageInfo.imageType = VK_IMAGE_TYPE_2D;
+        visBufferImageInfo.format = kVisBufferFormat;
+        visBufferImageInfo.extent = { m_SwapchainExtent.width, m_SwapchainExtent.height, 1 };
+        visBufferImageInfo.mipLevels = 1;
+        visBufferImageInfo.arrayLayers = 1;
+        visBufferImageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+        visBufferImageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+        visBufferImageInfo.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
+        visBufferImageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+        VmaAllocationCreateInfo visBufferAllocInfo{};
+        visBufferAllocInfo.usage = VMA_MEMORY_USAGE_GPU_ONLY;
+
+        if (vmaCreateImage(m_Allocator, &visBufferImageInfo, &visBufferAllocInfo, &outImage, &outAllocation, nullptr) != VK_SUCCESS) {
+            throw std::runtime_error(std::string("Failed to create Visibility Buffer image: ") + debugName);
+        }
+
+        VkImageViewCreateInfo visBufferViewInfo{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+        visBufferViewInfo.image = outImage;
+        visBufferViewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        visBufferViewInfo.format = kVisBufferFormat;
+        visBufferViewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        visBufferViewInfo.subresourceRange.baseMipLevel = 0;
+        visBufferViewInfo.subresourceRange.levelCount = 1;
+        visBufferViewInfo.subresourceRange.baseArrayLayer = 0;
+        visBufferViewInfo.subresourceRange.layerCount = 1;
+
+        if (vkCreateImageView(m_Device, &visBufferViewInfo, nullptr, &outView) != VK_SUCCESS) {
+            throw std::runtime_error(std::string("Failed to create Visibility Buffer image view: ") + debugName);
+        }
+        };
+
+    createVisBufferImage(m_VisBufferClusterIDImage, m_VisBufferClusterIDAllocation, m_VisBufferClusterIDImageView, "ClusterID");
+    createVisBufferImage(m_VisBufferTriangleIDImage, m_VisBufferTriangleIDAllocation, m_VisBufferTriangleIDImageView, "TriangleID");
 
     CreateSyncObjects();
 
@@ -475,15 +553,47 @@ void VulkanContext::CreateLogicalDevice() {
     features13.synchronization2 = VK_TRUE;
     features13.dynamicRendering = VK_TRUE;
 
+    // renderer::ClusterHardwareRasterPass / renderer::ClusterOcclusionCullingPass consume this
+    // feature's vkCmdDrawIndexedIndirectCount (the whole point of driving the hardware raster
+    // path's draw count from a GPU-written buffer instead of a CPU readback) -- without it the
+    // Vulkan 1.3 core function is present but every call is a validation error / undefined
+    // behavior (VUID-vkCmdDrawIndexedIndirectCount-None-04445), and no hardware-routed cluster
+    // ever actually draws.
+    VkPhysicalDeviceVulkan12Features features12{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES };
+    features12.drawIndirectCount = VK_TRUE;
+
+    // renderer::ClusterSoftwareRasterPass's atomic Visibility Buffer (ClusterSoftwareRaster.comp /
+    // ClearVisBufferAtomic.comp) needs imageAtomicMax on a VK_FORMAT_R64_UINT storage image --
+    // SPIR-V's Int64ImageEXT capability, gated behind this extension's shaderImageInt64Atomics
+    // feature (VK_EXT_shader_image_atomic_int64, widely supported on desktop GPUs). shaderInt64
+    // (core Vulkan 1.0 feature, below) is the separate prerequisite for the uint64_t scalar type
+    // itself (GL_EXT_shader_explicit_arithmetic_types_int64), used to pack/unpack the atomic word.
+    VkPhysicalDeviceShaderImageAtomicInt64FeaturesEXT imageAtomicInt64Features{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_IMAGE_ATOMIC_INT64_FEATURES_EXT };
+    imageAtomicInt64Features.shaderImageInt64Atomics = VK_TRUE;
+    features12.pNext = &imageAtomicInt64Features;
+    features13.pNext = &features12;
+
     VkPhysicalDeviceFeatures2 deviceFeatures2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
     deviceFeatures2.pNext = &features13;
+    // geometryShader: NOT used for an actual geometry-shader pipeline stage anywhere in this
+    // engine -- required purely because SPIR-V's PrimitiveId BuiltIn (gl_PrimitiveID), read by
+    // ClusterRaster.frag to derive each cluster's local TriangleID for the Visibility Buffer,
+    // mandates the SPIR-V "Geometry" capability even when only used in a fragment shader with no
+    // geometry stage present in the pipeline (see the Vulkan/SPIR-V spec's BuiltIn table). A
+    // near-universally-supported core Vulkan 1.0 feature bit on desktop GPUs, so enabled
+    // unconditionally here, matching this function's existing feature-enablement rigor (
+    // synchronization2/dynamicRendering above are requested the same way, with no prior
+    // vkGetPhysicalDeviceFeatures support query).
+    deviceFeatures2.features.geometryShader = VK_TRUE;
+    // shaderInt64: see imageAtomicInt64Features's comment above.
+    deviceFeatures2.features.shaderInt64 = VK_TRUE;
 
     VkDeviceCreateInfo createInfo{ VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO };
     createInfo.pNext = &deviceFeatures2;
     createInfo.queueCreateInfoCount = 1;
     createInfo.pQueueCreateInfos = &queueCreateInfo;
 
-    const std::vector<const char*> deviceExtensions = { VK_KHR_SWAPCHAIN_EXTENSION_NAME };
+    const std::vector<const char*> deviceExtensions = { VK_KHR_SWAPCHAIN_EXTENSION_NAME, VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME };
     createInfo.enabledExtensionCount = static_cast<uint32_t>(deviceExtensions.size());
     createInfo.ppEnabledExtensionNames = deviceExtensions.data();
 
@@ -598,9 +708,19 @@ void VulkanContext::CreateImageViews() {
 
 void VulkanContext::CreateSyncObjects() {
     VkSemaphoreCreateInfo semaphoreInfo{ VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
-    if (vkCreateSemaphore(m_Device, &semaphoreInfo, nullptr, &m_ImageAvailableSemaphore) != VK_SUCCESS ||
-        vkCreateSemaphore(m_Device, &semaphoreInfo, nullptr, &m_RenderFinishedSemaphore) != VK_SUCCESS) {
+    if (vkCreateSemaphore(m_Device, &semaphoreInfo, nullptr, &m_ImageAvailableSemaphore) != VK_SUCCESS) {
         throw std::runtime_error("Failed to create synchronization semaphores!");
+    }
+
+    // One render-finished semaphore per swapchain image -- see GetRenderFinishedSemaphore()'s
+    // header comment for why a single shared one is unsafe once the per-frame vkDeviceWaitIdle is
+    // gone. Requires m_SwapchainImages to already be populated (CreateSwapchain() runs before
+    // CreateSyncObjects() in Init()).
+    m_RenderFinishedSemaphores.resize(m_SwapchainImages.size());
+    for (VkSemaphore& semaphore : m_RenderFinishedSemaphores) {
+        if (vkCreateSemaphore(m_Device, &semaphoreInfo, nullptr, &semaphore) != VK_SUCCESS) {
+            throw std::runtime_error("Failed to create synchronization semaphores!");
+        }
     }
 }
 
@@ -803,7 +923,10 @@ void VulkanContext::CreatePipelinesAndDescriptors() {
     VkShaderModule vertModule = VulkanPipeline::CreateShaderModule(m_Device, vertCode);
     VkShaderModule fragModule = VulkanPipeline::CreateShaderModule(m_Device, fragCode);
 
-    m_GraphicsPipeline = VulkanPipeline::CreateGraphicsPipeline(m_Device, m_GraphicsPipelineLayout, vertModule, fragModule, m_SwapchainImageFormat, m_DepthFormat);
+    // Visibility Buffer: 2 color attachments (ClusterID, local TriangleID) instead of the
+    // swapchain's own presentable format -- see VulkanContext.h's kVisBufferFormat comment.
+    std::array<VkFormat, 2> visBufferFormats{ kVisBufferFormat, kVisBufferFormat };
+    m_GraphicsPipeline = VulkanPipeline::CreateGraphicsPipeline(m_Device, m_GraphicsPipelineLayout, vertModule, fragModule, visBufferFormats, m_DepthFormat);
 
     vkDestroyShaderModule(m_Device, vertModule, nullptr);
     vkDestroyShaderModule(m_Device, fragModule, nullptr);
@@ -993,16 +1116,31 @@ void VulkanContext::GenerateGeometry() {
 
     Logger::Log(LogLevel::Info, "[GenerateGeometry] Generating 12 procedural primitives on a 3-wide grid...");
 
-    // ---------------------------------------------------------------------------------
+    // -------------------------------------------------------------------------
     // ICOSPHERE (slot 2 visually) — generated first so it occupies buffer offset 0.
-    // ---------------------------------------------------------------------------------
+    // -------------------------------------------------------------------------
     uint32_t icosphereVertsPerFace = 0;
     uint32_t icosphereIndexCount = 0;
+    uint32_t icosphereBaseFaceCount = 20u;
     {
         maths::vec2 slot = gridSlot(2);
+        
+        // Target parameters to accept and strictly validate:
+        // IcoSphere: Radius, Segments, Tetra, Octa, Icosa
+        float Radius = 0.8f;
+        uint32_t Segments = 8u;
+        bool Tetra = false;
+        bool Octa = false;
+        bool Icosa = true;
+
+        assert(Radius > 0.0f);
+        assert(Segments > 0u);
+        assert((Tetra ? 1 : 0) + (Octa ? 1 : 0) + (Icosa ? 1 : 0) == 1);
+
         IcosphereParams params{};
-        params.radius = 0.8f;
-        params.subdiv = 8u;
+        params.radius = Radius;
+        params.subdiv = Segments;
+        params.baseType = Tetra ? 0u : (Octa ? 1u : 2u);
         params.meshID = m_EntityData[2].meshID;
         params.materialID = 0.0f;
         params.vertexOffset = runningVertexOffset;
@@ -1011,23 +1149,21 @@ void VulkanContext::GenerateGeometry() {
         params.worldOffsetY = 0.0f;
         params.worldOffsetZ = slot.y;
 
+        icosphereBaseFaceCount = params.baseType == 0u ? 4u : (params.baseType == 1u ? 8u : 20u);
+
         // Dispatch sizing must match geom_icosphere.comp's local_size = (8, 8, 1): X and Y
-        // cover the triangular grid coordinates (i, j) in [0, subdiv], Z covers the 20 base
-        // icosahedron faces (one face per Z-invocation since local_size_z = 1).
-        constexpr uint32_t kIcosphereFaceCount = 20u;
+        // cover the triangular grid coordinates (i, j) in [0, subdiv], Z covers the base faces.
         constexpr uint32_t kLocalSizeXY = 8u;
         uint32_t gridExtent = params.subdiv + 1u; // valid i,j range is [0, subdiv] inclusive
         uint32_t groupCountXY = (gridExtent + kLocalSizeXY - 1u) / kLocalSizeXY;
 
         DispatchGeometryCompute(m_IcospherePipeline, m_ComputePipelineLayout,
             &params, sizeof(params), nullptr, 0,
-            groupCountXY, groupCountXY, kIcosphereFaceCount);
+            groupCountXY, groupCountXY, icosphereBaseFaceCount);
 
         icosphereVertsPerFace = (params.subdiv + 1u) * (params.subdiv + 2u) / 2u;
-        uint32_t totalVerts = icosphereVertsPerFace * kIcosphereFaceCount;
-        // Each face writes subdiv*subdiv triangles (barycentric subdivision), 3 indices each —
-        // NOT subdiv*subdiv*6 as an earlier debug estimate assumed for the single-primitive case.
-        icosphereIndexCount = kIcosphereFaceCount * params.subdiv * params.subdiv * 3u;
+        uint32_t totalVerts = icosphereVertsPerFace * icosphereBaseFaceCount;
+        icosphereIndexCount = icosphereBaseFaceCount * params.subdiv * params.subdiv * 3u;
 
         runningVertexOffset += totalVerts;
         runningIndexOffset += icosphereIndexCount;
@@ -1036,21 +1172,53 @@ void VulkanContext::GenerateGeometry() {
     // regressions in the (still buffer-offset-0) icosphere generation.
     DebugReadbackGeometrySample(icosphereVertsPerFace, icosphereIndexCount);
 
-    // ---------------------------------------------------------------------------------
+    // -------------------------------------------------------------------------
     // BOX (slot 0) — 6 compute dispatches, one per cube face, chained onto the same meshID.
-    // ---------------------------------------------------------------------------------
+    // -------------------------------------------------------------------------
     {
         maths::vec2 slot = gridSlot(0);
-        constexpr float kHalfSize = 0.7f;
-        constexpr uint32_t kSegs = 2u; // a flat face only needs its 4 corners
+
+        // Target parameters to accept and strictly validate:
+        // Box: Width, Length, Height, WidthSegments, LengthSegments, HeightSegments
+        float Width = 1.4f;
+        float Length = 1.4f;
+        float Height = 1.4f;
+        uint32_t WidthSegments = 2u;
+        uint32_t LengthSegments = 2u;
+        uint32_t HeightSegments = 2u;
+
+        assert(Width > 0.0f);
+        assert(Length > 0.0f);
+        assert(Height > 0.0f);
+        assert(WidthSegments > 0u);
+        assert(LengthSegments > 0u);
+        assert(HeightSegments > 0u);
 
         for (uint32_t face = 0; face < 6u; ++face) {
             BoxPushConstants params{};
-            params.faceWidth = kHalfSize * 2.0f;
-            params.faceHeight = kHalfSize * 2.0f;
-            params.lengthOffset = kBoxFaceLengthOffsetSign[face] * kHalfSize;
-            params.uSegsCount = kSegs;
-            params.vSegsCount = kSegs;
+            uint32_t uSegs = 0, vSegs = 0;
+            if (face == 0u || face == 1u) {
+                params.faceWidth = Width;
+                params.faceHeight = Height;
+                params.lengthOffset = kBoxFaceLengthOffsetSign[face] * Length * 0.5f;
+                uSegs = WidthSegments;
+                vSegs = HeightSegments;
+            } else if (face == 2u || face == 3u) {
+                params.faceWidth = Width;
+                params.faceHeight = Length;
+                params.lengthOffset = kBoxFaceLengthOffsetSign[face] * Height * 0.5f;
+                uSegs = WidthSegments;
+                vSegs = LengthSegments;
+            } else {
+                params.faceWidth = Height;
+                params.faceHeight = Length;
+                params.lengthOffset = kBoxFaceLengthOffsetSign[face] * Width * 0.5f;
+                uSegs = HeightSegments;
+                vSegs = LengthSegments;
+            }
+
+            params.uSegsCount = uSegs + 1u;
+            params.vSegsCount = vSegs + 1u;
             params.meshID = m_EntityData[0].meshID;
             params.materialID = 0.0f;
             params.vertexOffset = runningVertexOffset;
@@ -1060,27 +1228,47 @@ void VulkanContext::GenerateGeometry() {
             params.worldOffsetZ = slot.y;
 
             constexpr uint32_t kLocalSizeXY = 8u; // geom_box.comp local_size = (8, 8, 1)
-            uint32_t groupCount = (kSegs + kLocalSizeXY - 1u) / kLocalSizeXY;
+            uint32_t groupCountX = (params.uSegsCount + kLocalSizeXY - 1u) / kLocalSizeXY;
+            uint32_t groupCountY = (params.vSegsCount + kLocalSizeXY - 1u) / kLocalSizeXY;
 
             DispatchGeometryCompute(m_BoxFacePipelines[face], m_BoxComputePipelineLayout,
                 nullptr, 0, &params, sizeof(params),
-                groupCount, groupCount, 1);
+                groupCountX, groupCountY, 1);
 
-            runningVertexOffset += kSegs * kSegs;
-            runningIndexOffset += (kSegs - 1u) * (kSegs - 1u) * 6u;
+            runningVertexOffset += params.uSegsCount * params.vSegsCount;
+            runningIndexOffset += uSegs * vSegs * 6u;
         }
     }
 
-    // ---------------------------------------------------------------------------------
+    // -------------------------------------------------------------------------
     // CONE (slot 1)
-    // ---------------------------------------------------------------------------------
+    // -------------------------------------------------------------------------
     {
         maths::vec2 slot = gridSlot(1);
+
+        // Target parameters to accept and strictly validate:
+        // Cone: Radius 1, Radius 2, Height, HeightSegments, CapSegments, Sides
+        float Radius1 = 0.7f;
+        float Radius2 = 0.35f;
+        float Height = 1.4f;
+        uint32_t HeightSegments = 4u;
+        uint32_t CapSegments = 4u;
+        uint32_t Sides = 32u;
+
+        assert(Radius1 > 0.0f);
+        assert(Radius2 > 0.0f);
+        assert(Height > 0.0f);
+        assert(HeightSegments > 0u);
+        assert(CapSegments > 0u);
+        assert(Sides >= 3u);
+
         ConeParams params{};
-        params.height = 1.4f;
-        params.bottomRadius = 0.7f;
-        params.topRadius = 0.35f;
-        params.nbSides = 32u;
+        params.bottomRadius = Radius1;
+        params.topRadius = Radius2;
+        params.height = Height;
+        params.nbHeightSegs = HeightSegments;
+        params.nbCapSegs = CapSegments;
+        params.nbSides = Sides;
         params.meshID = m_EntityData[1].meshID;
         params.materialID = 0.0f;
         params.vertexOffset = runningVertexOffset;
@@ -1089,7 +1277,10 @@ void VulkanContext::GenerateGeometry() {
         params.worldOffsetY = -params.height * 0.5f; // recenter: geometry spans y=[0,height]
         params.worldOffsetZ = slot.y;
 
-        uint32_t totalVerts = 4u * (params.nbSides + 1u); // geom_cone.comp local_size_x = 64
+        uint32_t sideVertCount = (params.nbSides + 1u) * (params.nbHeightSegs + 1u);
+        uint32_t capVertCount = 1u + params.nbCapSegs * (params.nbSides + 1u);
+        uint32_t totalVerts = sideVertCount + 2u * capVertCount;
+
         constexpr uint32_t kLocalSizeX = 64u;
         uint32_t groupCount = (totalVerts + kLocalSizeX - 1u) / kLocalSizeX;
 
@@ -1097,19 +1288,32 @@ void VulkanContext::GenerateGeometry() {
             &params, sizeof(params), nullptr, 0, groupCount, 1, 1);
 
         runningVertexOffset += totalVerts;
-        runningIndexOffset += 12u * params.nbSides;
+        runningIndexOffset += params.nbSides * params.nbHeightSegs * 6u + 2u * params.nbCapSegs * params.nbSides * 6u;
     }
 
-    // ---------------------------------------------------------------------------------
+    // -------------------------------------------------------------------------
     // PLANE (slot 3)
-    // ---------------------------------------------------------------------------------
+    // -------------------------------------------------------------------------
     {
         maths::vec2 slot = gridSlot(3);
+
+        // Target parameters to accept and strictly validate:
+        // Plane: Length, Width, LengthSegments, WidthSegments
+        float Length = 1.4f;
+        float Width = 1.4f;
+        uint32_t LengthSegments = 2u;
+        uint32_t WidthSegments = 2u;
+
+        assert(Length > 0.0f);
+        assert(Width > 0.0f);
+        assert(LengthSegments > 0u);
+        assert(WidthSegments > 0u);
+
         PlaneParams params{};
-        params.width = 1.4f;
-        params.length_ = 1.4f;
-        params.widthSegs = 2u; // flat surface: 4 corners is all that's needed
-        params.lengthSegs = 2u;
+        params.width = Width;
+        params.length_ = Length;
+        params.widthSegs = WidthSegments + 1u;
+        params.lengthSegs = LengthSegments + 1u;
         params.meshID = m_EntityData[3].meshID;
         params.materialID = 0.0f;
         params.vertexOffset = runningVertexOffset;
@@ -1129,15 +1333,23 @@ void VulkanContext::GenerateGeometry() {
         runningIndexOffset += 6u * (params.widthSegs - 1u) * (params.lengthSegs - 1u);
     }
 
-    // ---------------------------------------------------------------------------------
+    // -------------------------------------------------------------------------
     // SPHERE / UV sphere (slot 4)
-    // ---------------------------------------------------------------------------------
+    // -------------------------------------------------------------------------
     {
         maths::vec2 slot = gridSlot(4);
+
+        // Target parameters to accept and strictly validate:
+        // Sphere: Radius, Segments
+        float Radius = 0.8f;
+        uint32_t Segments = 24u;
+
+        assert(Radius > 0.0f);
+        assert(Segments >= 3u);
+
         SphereParams params{};
-        params.radius = 0.8f;
-        params.sideSegs = 24u;
-        params.heightSegs = 16u;
+        params.radius = Radius;
+        params.segments = Segments;
         params.meshID = m_EntityData[4].meshID;
         params.materialID = 0.0f;
         params.vertexOffset = runningVertexOffset;
@@ -1146,8 +1358,8 @@ void VulkanContext::GenerateGeometry() {
         params.worldOffsetY = 0.0f;
         params.worldOffsetZ = slot.y;
 
-        uint32_t ringCount = params.heightSegs - 2u; // interior latitude rings (excludes poles)
-        uint32_t ringStride = params.sideSegs + 1u;
+        uint32_t ringCount = params.segments - 2u; // interior latitude rings (excludes poles)
+        uint32_t ringStride = params.segments + 1u;
         uint32_t vertCount = ringCount * ringStride + 2u;
         constexpr uint32_t kLocalSizeX = 64u; // geom_sphere.comp local_size_x = 64
         uint32_t groupCount = (vertCount + kLocalSizeX - 1u) / kLocalSizeX;
@@ -1156,21 +1368,37 @@ void VulkanContext::GenerateGeometry() {
             &params, sizeof(params), nullptr, 0, groupCount, 1, 1);
 
         runningVertexOffset += vertCount;
-        // Dense packing after the geom_sphere.comp bottom-cap fix: sideSegs*3 (top fan) +
-        // (ringCount-1)*sideSegs*6 (middle quads) + sideSegs*3 (bottom fan) = 6*sideSegs*ringCount.
-        runningIndexOffset += 6u * params.sideSegs * ringCount;
+        runningIndexOffset += 6u * params.segments * ringCount;
     }
 
-    // ---------------------------------------------------------------------------------
+    // -------------------------------------------------------------------------
     // TORUS (slot 5)
-    // ---------------------------------------------------------------------------------
+    // -------------------------------------------------------------------------
     {
         maths::vec2 slot = gridSlot(5);
+
+        // Target parameters to accept and strictly validate:
+        // Torus: Radius 1, Radius 2, Rotation, Twist, Segments, Sides
+        float Radius1 = 0.7f;
+        float Radius2 = 0.22f;
+        float Rotation = 0.0f;
+        float Twist = 0.0f;
+        uint32_t Segments = 32u;
+        uint32_t Sides = 16u;
+
+        assert(Radius1 > 0.0f);
+        assert(Radius2 > 0.0f);
+        assert(Radius1 > Radius2);
+        assert(Segments > 0u);
+        assert(Sides >= 3u);
+
         TorusParams params{};
-        params.radius1 = 0.7f; // major (ring) radius
-        params.radius2 = 0.22f; // minor (tube) radius
-        params.nbRadSeg = 32u;
-        params.nbSides = 16u;
+        params.radius1 = Radius1;
+        params.radius2 = Radius2;
+        params.rotation = Rotation;
+        params.twist = Twist;
+        params.nbRadSeg = Segments;
+        params.nbSides = Sides;
         params.meshID = m_EntityData[5].meshID;
         params.materialID = 0.0f;
         params.vertexOffset = runningVertexOffset;
@@ -1190,18 +1418,36 @@ void VulkanContext::GenerateGeometry() {
         runningIndexOffset += 6u * params.nbRadSeg * params.nbSides;
     }
 
-    // ---------------------------------------------------------------------------------
+    // -------------------------------------------------------------------------
     // TUBE (slot 6) — hollow cylinder (pipe): outer/inner wall + top/bottom rings.
-    // ---------------------------------------------------------------------------------
+    // -------------------------------------------------------------------------
     {
         maths::vec2 slot = gridSlot(6);
+
+        // Target parameters to accept and strictly validate:
+        // Tube: Radius 1, Radius 2, Height, HeightSegments, CapSegments, Sides
+        float Radius1 = 0.7f; // outer
+        float Radius2 = 0.5f; // inner
+        float Height = 1.4f;
+        uint32_t HeightSegments = 4u;
+        uint32_t CapSegments = 4u;
+        uint32_t Sides = 24u;
+
+        assert(Radius1 > 0.0f);
+        assert(Radius2 > 0.0f);
+        assert(Radius1 > Radius2);
+        assert(Height > 0.0f);
+        assert(HeightSegments > 0u);
+        assert(CapSegments > 0u);
+        assert(Sides >= 3u);
+
         TubeParams params{};
-        params.height = 1.4f;
-        params.nbSides = 24u;
-        params.bottomRadius1 = 0.7f;
-        params.bottomRadius2 = 0.18f; // wall thickness
-        params.topRadius1 = 0.7f;
-        params.topRadius2 = 0.18f;
+        params.radius1 = Radius1;
+        params.radius2 = Radius2;
+        params.height = Height;
+        params.nbHeightSegs = HeightSegments;
+        params.nbCapSegs = CapSegments;
+        params.nbSides = Sides;
         params.meshID = m_EntityData[6].meshID;
         params.materialID = 0.0f;
         params.vertexOffset = runningVertexOffset;
@@ -1210,8 +1456,13 @@ void VulkanContext::GenerateGeometry() {
         params.worldOffsetY = -params.height * 0.5f; // recenter: geometry spans y=[0,height]
         params.worldOffsetZ = slot.y;
 
-        uint32_t capCount = params.nbSides * 2u + 2u;
-        uint32_t totalVerts = capCount * 4u; // geom_tube.comp local_size_x = 64
+        uint32_t sideColumns = params.nbSides + 1u;
+        uint32_t outerSideVertCount = sideColumns * (params.nbHeightSegs + 1u);
+        uint32_t innerSideVertCount = sideColumns * (params.nbHeightSegs + 1u);
+        uint32_t bottomCapVertCount = sideColumns * (params.nbCapSegs + 1u);
+        uint32_t topCapVertCount    = sideColumns * (params.nbCapSegs + 1u);
+        uint32_t totalVerts = outerSideVertCount + innerSideVertCount + bottomCapVertCount + topCapVertCount;
+
         constexpr uint32_t kLocalSizeX = 64u;
         uint32_t groupCount = (totalVerts + kLocalSizeX - 1u) / kLocalSizeX;
 
@@ -1219,12 +1470,12 @@ void VulkanContext::GenerateGeometry() {
             &params, sizeof(params), nullptr, 0, groupCount, 1, 1);
 
         runningVertexOffset += totalVerts;
-        runningIndexOffset += 24u * params.nbSides;
+        runningIndexOffset += 12u * params.nbSides * params.nbHeightSegs + 12u * params.nbSides * params.nbCapSegs;
     }
 
-    // ---------------------------------------------------------------------------------
+    // -------------------------------------------------------------------------
     // CAPSULE (slot 7) — cylindrical body + two hemispherical caps.
-    // ---------------------------------------------------------------------------------
+    // -------------------------------------------------------------------------
     {
         maths::vec2 slot = gridSlot(7);
         CapsuleParams params{};
@@ -1256,17 +1507,32 @@ void VulkanContext::GenerateGeometry() {
         runningIndexOffset += 6u * params.nbSides * (2u * params.nbCapSegs + params.nbHeightSegs);
     }
 
-    // ---------------------------------------------------------------------------------
+    // -------------------------------------------------------------------------
     // CYLINDER (slot 8) — flat top/bottom caps (unlike TUBE, which is hollow).
-    // ---------------------------------------------------------------------------------
+    // -------------------------------------------------------------------------
     {
         maths::vec2 slot = gridSlot(8);
+
+        // Target parameters to accept and strictly validate:
+        // Cylinder: Radius, Height, HeightSegments, CapSegments, Sides
+        float Radius = 0.7f;
+        float Height = 1.4f;
+        uint32_t HeightSegments = 4u;
+        uint32_t CapSegments = 4u;
+        uint32_t Sides = 24u;
+
+        assert(Radius > 0.0f);
+        assert(Height > 0.0f);
+        assert(HeightSegments > 0u);
+        assert(CapSegments > 0u);
+        assert(Sides >= 3u);
+
         CylinderParams params{};
-        params.radius = 0.7f;
-        params.height = 1.4f;
-        params.nbSides = 24u;
-        params.nbHeightSegs = 4u;
-        params.nbCapSegs = 4u;
+        params.radius = Radius;
+        params.height = Height;
+        params.nbSides = Sides;
+        params.nbHeightSegs = HeightSegments;
+        params.nbCapSegs = CapSegments;
         params.meshID = m_EntityData[8].meshID;
         params.materialID = 0.0f;
         params.vertexOffset = runningVertexOffset;
@@ -1290,15 +1556,35 @@ void VulkanContext::GenerateGeometry() {
         runningIndexOffset += 6u * params.nbSides * (params.nbHeightSegs + 2u * params.nbCapSegs);
     }
 
-    // ---------------------------------------------------------------------------------
+    // -------------------------------------------------------------------------
     // PYRAMID (slot 9) — square (4-sided) flat-shaded pyramid.
-    // ---------------------------------------------------------------------------------
+    // -------------------------------------------------------------------------
     {
         maths::vec2 slot = gridSlot(9);
+
+        // Target parameters to accept and strictly validate:
+        // Pyramide: Width, Depth, Height, WidthSegments, DepthSegments, HeightSegments
+        float Width = 1.4f;
+        float Depth = 1.4f;
+        float Height = 1.2f;
+        uint32_t WidthSegments = 4u;
+        uint32_t DepthSegments = 4u;
+        uint32_t HeightSegments = 4u;
+
+        assert(Width > 0.0f);
+        assert(Depth > 0.0f);
+        assert(Height > 0.0f);
+        assert(WidthSegments > 0u);
+        assert(DepthSegments > 0u);
+        assert(HeightSegments > 0u);
+
         PyramidParams params{};
-        params.height = 1.2f;
-        params.radius = 0.85f;
-        params.nbSides = 4u;
+        params.width = Width;
+        params.depth = Depth;
+        params.height = Height;
+        params.widthSegs = WidthSegments;
+        params.depthSegs = DepthSegments;
+        params.heightSegs = HeightSegments;
         params.meshID = m_EntityData[9].meshID;
         params.materialID = 0.0f;
         params.vertexOffset = runningVertexOffset;
@@ -1307,21 +1593,32 @@ void VulkanContext::GenerateGeometry() {
         params.worldOffsetY = -params.height * 0.5f; // recenter: geometry spans y=[0,height]
         params.worldOffsetZ = slot.y;
 
-        uint32_t capCount = params.nbSides + 1u;
-        uint32_t totalVerts = capCount + params.nbSides * 3u; // geom_pyramide.comp local_size_x = 64
-        constexpr uint32_t kLocalSizeX = 64u;
+        uint32_t baseColumns = params.widthSegs + 1u;
+        uint32_t baseRows    = params.depthSegs + 1u;
+        uint32_t baseVertCount = baseColumns * baseRows;
+
+        uint32_t sideZCols = params.widthSegs + 1u;
+        uint32_t sideZRows = params.heightSegs + 1u;
+        uint32_t sideZVerts = sideZCols * sideZRows;
+
+        uint32_t sideXCols = params.depthSegs + 1u;
+        uint32_t sideXRows = params.heightSegs + 1u;
+        uint32_t sideXVerts = sideXCols * sideXRows;
+
+        uint32_t totalVerts = baseVertCount + 2u * sideZVerts + 2u * sideXVerts;
+        constexpr uint32_t kLocalSizeX = 64u; // geom_pyramide.comp local_size_x = 64
         uint32_t groupCount = (totalVerts + kLocalSizeX - 1u) / kLocalSizeX;
 
         DispatchGeometryCompute(m_PyramidPipeline, m_ComputePipelineLayout,
             &params, sizeof(params), nullptr, 0, groupCount, 1, 1);
 
         runningVertexOffset += totalVerts;
-        runningIndexOffset += 6u * params.nbSides; // base fan (nbSides tris) + side faces (nbSides tris)
+        runningIndexOffset += 6u * params.widthSegs * params.depthSegs + 12u * params.widthSegs * params.heightSegs + 12u * params.depthSegs * params.heightSegs;
     }
 
-    // ---------------------------------------------------------------------------------
+    // -------------------------------------------------------------------------
     // TORUS KNOT (slot 10) — (p,q) knotted tube.
-    // ---------------------------------------------------------------------------------
+    // -------------------------------------------------------------------------
     {
         maths::vec2 slot = gridSlot(10);
         TorusKnotParams params{};
@@ -1350,9 +1647,9 @@ void VulkanContext::GenerateGeometry() {
         runningIndexOffset += 6u * params.nbRadSeg * params.nbSides;
     }
 
-    // ---------------------------------------------------------------------------------
+    // -------------------------------------------------------------------------
     // CHAMFER BOX (slot 11) — rounded/chamfered box built as a superellipsoid.
-    // ---------------------------------------------------------------------------------
+    // -------------------------------------------------------------------------
     {
         maths::vec2 slot = gridSlot(11);
         ChamferBoxParams params{};
@@ -1387,11 +1684,24 @@ void VulkanContext::GenerateGeometry() {
 
     m_TotalVertexCount = runningVertexOffset;
     m_TotalIndexCount = runningIndexOffset;
+
+    const VkDeviceSize vertexBytesUsed = static_cast<VkDeviceSize>(m_TotalVertexCount) * sizeof(renderer::Vertex);
+    const VkDeviceSize indexBytesUsed = static_cast<VkDeviceSize>(m_TotalIndexCount) * sizeof(uint32_t);
+    if (vertexBytesUsed > kVertexBufferBytes || indexBytesUsed > kIndexBufferBytes) {
+        Logger::Log(LogLevel::Critical, std::format(
+            "[GenerateGeometry] Procedural geometry OVERFLOWED its fixed-size SSBOs: "
+            "vertices used {}/{} bytes, indices used {}/{} bytes. GPU writes past this point are "
+            "undefined behavior (silent corruption of adjacent buffers). Increase kVertexBufferBytes/"
+            "kIndexBufferBytes in VulkanContext.cpp.",
+            vertexBytesUsed, kVertexBufferBytes, indexBytesUsed, kIndexBufferBytes));
+        throw std::runtime_error("Procedural geometry buffers overflowed -- see log for exact sizes.");
+    }
+
     Logger::Log(LogLevel::Info, std::format(
         "[GenerateGeometry] All 12 primitives generated: totalVertexCount={} totalIndexCount={} "
         "(buffers hold {} verts / {} indices max)",
         runningVertexOffset, runningIndexOffset,
-        (512u * 1024u) / sizeof(renderer::Vertex), (128u * 1024u) / sizeof(uint32_t)));
+        kVertexBufferBytes / sizeof(renderer::Vertex), kIndexBufferBytes / sizeof(uint32_t)));
 }
 
 void VulkanContext::UpdateEntityRotations(float timeSeconds) {
@@ -1439,7 +1749,7 @@ void VulkanContext::UpdateEntityRotations(float timeSeconds) {
 void VulkanContext::DebugReadbackGeometrySample(uint32_t vertsPerFace, uint32_t expectedIndexCount) {
     // Sample window: covers the tail of face 0 and the head of face 1, so the log proves
     // (or disproves) that the compute dispatch wrote data past the first face.
-    const uint32_t maxVertsInBuffer = (512u * 1024u) / sizeof(renderer::Vertex);
+    const uint32_t maxVertsInBuffer = static_cast<uint32_t>(kVertexBufferBytes / sizeof(renderer::Vertex));
     const uint32_t sampleVertexCount = std::min<uint32_t>(vertsPerFace + 8u, maxVertsInBuffer);
     const uint32_t sampleIndexCount = std::min<uint32_t>(12u, expectedIndexCount);
 
@@ -1579,6 +1889,25 @@ void VulkanContext::Shutdown() {
         m_DepthAllocation = VK_NULL_HANDLE;
     }
 
+    if (m_VisBufferClusterIDImageView != VK_NULL_HANDLE) {
+        vkDestroyImageView(m_Device, m_VisBufferClusterIDImageView, nullptr);
+        m_VisBufferClusterIDImageView = VK_NULL_HANDLE;
+    }
+    if (m_VisBufferClusterIDImage != VK_NULL_HANDLE) {
+        vmaDestroyImage(m_Allocator, m_VisBufferClusterIDImage, m_VisBufferClusterIDAllocation);
+        m_VisBufferClusterIDImage = VK_NULL_HANDLE;
+        m_VisBufferClusterIDAllocation = VK_NULL_HANDLE;
+    }
+    if (m_VisBufferTriangleIDImageView != VK_NULL_HANDLE) {
+        vkDestroyImageView(m_Device, m_VisBufferTriangleIDImageView, nullptr);
+        m_VisBufferTriangleIDImageView = VK_NULL_HANDLE;
+    }
+    if (m_VisBufferTriangleIDImage != VK_NULL_HANDLE) {
+        vmaDestroyImage(m_Allocator, m_VisBufferTriangleIDImage, m_VisBufferTriangleIDAllocation);
+        m_VisBufferTriangleIDImage = VK_NULL_HANDLE;
+        m_VisBufferTriangleIDAllocation = VK_NULL_HANDLE;
+    }
+
     if (m_VertexBuffer != VK_NULL_HANDLE) {
         vmaDestroyBuffer(m_Allocator, m_VertexBuffer, m_VertexAllocation);
     }
@@ -1598,9 +1927,10 @@ void VulkanContext::Shutdown() {
     if (m_ImageAvailableSemaphore != VK_NULL_HANDLE) {
         vkDestroySemaphore(m_Device, m_ImageAvailableSemaphore, nullptr);
     }
-    if (m_RenderFinishedSemaphore != VK_NULL_HANDLE) {
-        vkDestroySemaphore(m_Device, m_RenderFinishedSemaphore, nullptr);
+    for (VkSemaphore semaphore : m_RenderFinishedSemaphores) {
+        vkDestroySemaphore(m_Device, semaphore, nullptr);
     }
+    m_RenderFinishedSemaphores.clear();
 
     for (VkPipeline pipeline : { m_ConePipeline, m_IcospherePipeline, m_PlanePipeline,
                                   m_SpherePipeline, m_TorusPipeline, m_TubePipeline,

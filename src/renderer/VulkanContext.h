@@ -23,10 +23,29 @@ public:
     const std::vector<VkImageView>& GetSwapchainImageViews() const { return m_SwapchainImageViews; }
     VkImageView GetDepthImageView() const { return m_DepthImageView; }
     VkImage GetDepthImage() const { return m_DepthImage; }
+    VkFormat GetDepthFormat() const { return m_DepthFormat; }
     VkCommandBuffer GetCommandBuffer() const { return m_CommandBuffer; }
 
+    // Visibility Buffer attachments (replaces the classic lit-color G-Buffer target): two
+    // single-channel R32_UINT images, index-aligned per-pixel -- ClusterID and local TriangleID
+    // written together by draw.frag form one logical 64-bit visibility ID, split across two
+    // mandatory-format images instead of one VK_FORMAT_R64_UINT attachment (whose color-attachment
+    // support is NOT guaranteed by the Vulkan spec, unlike R32_UINT). See CreatePipelinesAndDescriptors()
+    // and draw.vert/draw.frag.
+    VkImage GetVisBufferClusterIDImage() const { return m_VisBufferClusterIDImage; }
+    VkImageView GetVisBufferClusterIDView() const { return m_VisBufferClusterIDImageView; }
+    VkImage GetVisBufferTriangleIDImage() const { return m_VisBufferTriangleIDImage; }
+    VkImageView GetVisBufferTriangleIDView() const { return m_VisBufferTriangleIDImageView; }
+    static constexpr VkFormat GetVisBufferFormat() { return kVisBufferFormat; }
+
     VkSemaphore GetImageAvailableSemaphore() const { return m_ImageAvailableSemaphore; }
-    VkSemaphore GetRenderFinishedSemaphore() const { return m_RenderFinishedSemaphore; }
+    // One render-finished semaphore per swapchain image (indexed by the acquired image index),
+    // NOT a single shared one: vkQueuePresentKHR's wait on this semaphore is not guaranteed
+    // retired by the time a later frame's vkQueueSubmit would re-signal it (a frame's own fence
+    // only guards that frame's GPU work, not the present engine's internal semaphore consumption),
+    // so a single semaphore reused across the swapchain's images racily double-signals
+    // (VUID-vkQueueSubmit-pSignalSemaphores-00067). See VulkanContext.cpp's CreateSyncObjects.
+    VkSemaphore GetRenderFinishedSemaphore(uint32_t imageIndex) const { return m_RenderFinishedSemaphores[imageIndex]; }
     VkQueue GetGraphicsQueue() const { return m_GraphicsQueue; }
 
     VkPipeline GetGraphicsPipeline() const { return m_GraphicsPipeline; }
@@ -82,7 +101,7 @@ private:
     std::vector<VkImageView> m_SwapchainImageViews;
 
     VkSemaphore m_ImageAvailableSemaphore = VK_NULL_HANDLE;
-    VkSemaphore m_RenderFinishedSemaphore = VK_NULL_HANDLE;
+    std::vector<VkSemaphore> m_RenderFinishedSemaphores; // One per swapchain image -- see GetRenderFinishedSemaphore's comment.
 
     VkBuffer m_EntityBuffer = VK_NULL_HANDLE;
     VmaAllocation m_EntityAllocation = VK_NULL_HANDLE;
@@ -103,6 +122,19 @@ private:
     VmaAllocation m_DepthAllocation = VK_NULL_HANDLE;
     VkImageView m_DepthImageView = VK_NULL_HANDLE;
     VkFormat m_DepthFormat = VK_FORMAT_D32_SFLOAT;
+
+    // Visibility Buffer attachments -- VK_FORMAT_R32_UINT is mandated by the Vulkan 1.3 core spec
+    // to support VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT (unlike R64_UINT, whose color-attachment
+    // support is optional and would require a runtime VkFormatProperties query), so no
+    // format-support query is needed before using it as a render target here -- the same reasoning
+    // HZBPass documents for its own R32G32_SFLOAT pyramid format.
+    static constexpr VkFormat kVisBufferFormat = VK_FORMAT_R32_UINT;
+    VkImage m_VisBufferClusterIDImage = VK_NULL_HANDLE;
+    VmaAllocation m_VisBufferClusterIDAllocation = VK_NULL_HANDLE;
+    VkImageView m_VisBufferClusterIDImageView = VK_NULL_HANDLE;
+    VkImage m_VisBufferTriangleIDImage = VK_NULL_HANDLE;
+    VmaAllocation m_VisBufferTriangleIDAllocation = VK_NULL_HANDLE;
+    VkImageView m_VisBufferTriangleIDImageView = VK_NULL_HANDLE;
 
     // One compute pipeline per non-box primitive, all sharing m_ComputePipelineLayout and
     // reading their per-dispatch parameters from the shared Params UBO (m_ParamsBuffer).

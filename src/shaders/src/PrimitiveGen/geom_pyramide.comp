@@ -2,20 +2,8 @@
 #version 460
 #extension GL_GOOGLE_include_directive : enable
 
-// Inclure tes structures partagées
 #include "include/struct_custo.glsl"
 #include "include/math_utils.glsl"
-
-// N-sided pyramid: a flat-shaded polygonal base (circumradius, nbSides corners, fan-triangulated
-// like geom_cone.comp's caps) extruded to a single apex point. nbSides = 4 gives the classic
-// square (Egyptian) pyramid; any N is supported. Differs from geom_cone.comp's topRadius = 0
-// case by using one hard per-face normal per side triangle instead of a smooth radial normal —
-// that hard edge between faces is what reads as a faceted pyramid rather than a smooth cone tip.
-//
-// Vertex layout: [0] base fan center, [1 .. nbSides] base fan rim (no seam duplicate, matching
-// geom_cone.comp's cap convention), [nbSides+1 .. nbSides+1+3*nbSides-1] side faces (3 unique
-// vertices per face so each face gets its own flat normal: left base corner, apex, right base
-// corner).
 
 layout(local_size_x = 64) in;
 
@@ -24,15 +12,16 @@ layout(std430, binding = 1) writeonly buffer IndexBuffer  { uint indices[]; };
 
 layout(std140, binding = 2) uniform Params
 {
+    float width;
+    float depth;
     float height;
-    float radius;    // base circumradius
-    uint  nbSides;   // 4 = square pyramid; supports any N-gon base
+    uint  widthSegs;
+    uint  depthSegs;
+    uint  heightSegs;
     uint  meshID;
     float materialID;
     uint  vertexOffset;
     uint  indexOffset;
-    // World-space translation baked into the generated geometry, used to place multiple
-    // instances of this primitive at different grid slots without a separate transform stage.
     float worldOffsetX;
     float worldOffsetY;
     float worldOffsetZ;
@@ -42,82 +31,214 @@ void main()
 {
     uint id = gl_GlobalInvocationID.x;
 
-    uint capCount   = nbSides + 1u; // base fan: center + nbSides rim points
-    uint sideVerts  = nbSides * 3u; // 3 unique verts per side face (hard-edged / flat shaded)
-    uint totalVerts = capCount + sideVerts;
+    uint baseColumns = widthSegs + 1u;
+    uint baseRows    = depthSegs + 1u;
+    uint baseVertCount = baseColumns * baseRows;
+
+    uint sideZCols = widthSegs + 1u;
+    uint sideZRows = heightSegs + 1u;
+    uint sideZVerts = sideZCols * sideZRows; // vertices for one Z-aligned side
+
+    uint sideXCols = depthSegs + 1u;
+    uint sideXRows = heightSegs + 1u;
+    uint sideXVerts = sideXCols * sideXRows; // vertices for one X-aligned side
+
+    uint totalVerts = baseVertCount + 2u * sideZVerts + 2u * sideXVerts;
     if (id >= totalVerts) return;
 
     Vertex v;
     v.meshID = meshID;
     v.materialID = materialID;
 
-    if (id == 0u) // base fan center
+    // -------------------------------------------------------------------------
+    // VERTEX GENERATION
+    // -------------------------------------------------------------------------
+    if (id < baseVertCount)
     {
-        v.position = vec3(0.0);
+        // Base Face
+        uint col = id % baseColumns;
+        uint row = id / baseColumns;
+        float tx = float(col) / float(widthSegs);
+        float tz = float(row) / float(depthSegs);
+        v.position = vec3(mix(-width * 0.5, width * 0.5, tx), 0.0, mix(-depth * 0.5, depth * 0.5, tz));
         v.normal   = vec3(0.0, -1.0, 0.0);
-        v.uv       = vec2(0.5, 0.5);
+        v.uv       = vec2(tx, tz);
     }
-    else if (id < capCount) // base fan rim
+    else if (id < baseVertCount + sideZVerts)
     {
-        uint rim = id - 1u;
-        float rad = float(rim) / float(nbSides) * TAU;
-        v.position = vec3(cos(rad) * radius, 0.0, sin(rad) * radius);
-        v.normal   = vec3(0.0, -1.0, 0.0);
-        v.uv       = vec2(cos(rad) * 0.5 + 0.5, sin(rad) * 0.5 + 0.5);
+        // +Z Side Face (facing positive Z direction)
+        uint local = id - baseVertCount;
+        uint col = local % sideZCols;
+        uint row = local / sideZCols;
+        float tx = float(col) / float(widthSegs);
+        float ty = float(row) / float(heightSegs);
+        
+        v.position = vec3(
+            mix(-width * 0.5, width * 0.5, tx) * (1.0 - ty),
+            ty * height,
+            depth * 0.5 * (1.0 - ty)
+        );
+        v.normal   = normalize(vec3(0.0, depth * 0.5, height));
+        v.uv       = vec2(tx, ty);
     }
-    else // side face: 3 unique verts (left base corner, apex, right base corner)
+    else if (id < baseVertCount + 2u * sideZVerts)
     {
-        uint local = id - capCount;
-        uint face  = local / 3u;
-        uint slot  = local % 3u;
-
-        float rad0 = float(face) / float(nbSides) * TAU;
-        float rad1 = float(face + 1u) / float(nbSides) * TAU;
-        vec3 p0   = vec3(cos(rad0) * radius, 0.0, sin(rad0) * radius);
-        vec3 p1   = vec3(cos(rad1) * radius, 0.0, sin(rad1) * radius);
-        vec3 apex = vec3(0.0, height, 0.0);
-
-        // Flat face normal shared by all 3 verts of this face (hard edges between faces).
-        // Vertex order (p0, apex, p1) mirrors geom_cone.comp's side-quad winding (b0, t0, t1)
-        // with the top ring collapsed to a single apex (t0 == t1 == apex), so the outward-facing
-        // winding that shader relies on carries over unchanged here.
-        vec3 faceNormal = normalize(cross(apex - p0, p1 - p0));
-
-        if (slot == 0u)      { v.position = p0;   v.uv = vec2(float(face) / float(nbSides), 0.0); }
-        else if (slot == 1u) { v.position = apex; v.uv = vec2((float(face) + 0.5) / float(nbSides), 1.0); }
-        else                 { v.position = p1;   v.uv = vec2(float(face + 1u) / float(nbSides), 0.0); }
-
-        v.normal = faceNormal;
+        // -Z Side Face (facing negative Z direction)
+        uint local = id - (baseVertCount + sideZVerts);
+        uint col = local % sideZCols;
+        uint row = local / sideZCols;
+        float tx = float(col) / float(widthSegs);
+        float ty = float(row) / float(heightSegs);
+        
+        v.position = vec3(
+            mix(width * 0.5, -width * 0.5, tx) * (1.0 - ty),
+            ty * height,
+            -depth * 0.5 * (1.0 - ty)
+        );
+        v.normal   = normalize(vec3(0.0, depth * 0.5, -height));
+        v.uv       = vec2(tx, ty);
+    }
+    else if (id < baseVertCount + 2u * sideZVerts + sideXVerts)
+    {
+        // +X Side Face
+        uint local = id - (baseVertCount + 2u * sideZVerts);
+        uint col = local % sideXCols;
+        uint row = local / sideXCols;
+        float tx = float(col) / float(depthSegs);
+        float ty = float(row) / float(heightSegs);
+        
+        v.position = vec3(
+            width * 0.5 * (1.0 - ty),
+            ty * height,
+            mix(depth * 0.5, -depth * 0.5, tx) * (1.0 - ty)
+        );
+        v.normal   = normalize(vec3(height, width * 0.5, 0.0));
+        v.uv       = vec2(tx, ty);
+    }
+    else
+    {
+        // -X Side Face
+        uint local = id - (baseVertCount + 2u * sideZVerts + sideXVerts);
+        uint col = local % sideXCols;
+        uint row = local / sideXCols;
+        float tx = float(col) / float(depthSegs);
+        float ty = float(row) / float(heightSegs);
+        
+        v.position = vec3(
+            -width * 0.5 * (1.0 - ty),
+            ty * height,
+            mix(-depth * 0.5, depth * 0.5, tx) * (1.0 - ty)
+        );
+        v.normal   = normalize(vec3(-height, width * 0.5, 0.0));
+        v.uv       = vec2(tx, ty);
     }
 
     v.uv2 = v.uv;
-
-    // Translate the generated vertex to its grid slot in world space before writing it out.
     v.position += vec3(worldOffsetX, worldOffsetY, worldOffsetZ);
     vertices[vertexOffset + id] = v;
 
-    // --- Indices ---
-    if (id >= 1u && id < capCount) // base fan triangle
+    // -------------------------------------------------------------------------
+    // INDEX GENERATION (One thread per quad)
+    // -------------------------------------------------------------------------
+    uint baseQuads = widthSegs * depthSegs;
+    uint sideZQuads = widthSegs * heightSegs;
+    uint sideXQuads = depthSegs * heightSegs;
+
+    if (id < baseQuads)
     {
-        uint rim  = id - 1u;
-        uint next = (rim + 1u) % nbSides;
-        uint tIdx = indexOffset + rim * 3u;
-        indices[tIdx + 0u] = vertexOffset;
-        indices[tIdx + 1u] = vertexOffset + 1u + rim;
-        indices[tIdx + 2u] = vertexOffset + 1u + next;
+        // Base Face Indices (pointing downwards, so Y-normal is negative)
+        uint col = id % widthSegs;
+        uint row = id / widthSegs;
+        uint b0 = row * baseColumns + col;
+        uint b1 = b0 + 1u;
+        uint t0 = (row + 1u) * baseColumns + col;
+        uint t1 = t0 + 1u;
+        uint tIdx = indexOffset + id * 6u;
+        indices[tIdx + 0u] = vertexOffset + b0;
+        indices[tIdx + 1u] = vertexOffset + b1;
+        indices[tIdx + 2u] = vertexOffset + t1;
+        indices[tIdx + 3u] = vertexOffset + b0;
+        indices[tIdx + 4u] = vertexOffset + t1;
+        indices[tIdx + 5u] = vertexOffset + t0;
     }
-    if (id >= capCount) // side face triangle (emitted once per face, on its first vertex)
+
+    uint sideZ1_IndexOffset = baseQuads * 6u;
+    if (id < sideZQuads)
     {
-        uint local = id - capCount;
-        uint face  = local / 3u;
-        uint slot  = local % 3u;
-        if (slot == 0u)
-        {
-            uint tIdx = indexOffset + nbSides * 3u + face * 3u;
-            uint base = vertexOffset + capCount + face * 3u;
-            indices[tIdx + 0u] = base + 0u;
-            indices[tIdx + 1u] = base + 1u;
-            indices[tIdx + 2u] = base + 2u;
-        }
+        // +Z Side Face Indices (wind CCW in X-Y projection for +Z normal)
+        uint col = id % widthSegs;
+        uint row = id / widthSegs;
+        uint baseOffset = baseVertCount;
+        uint b0 = baseOffset + row * sideZCols + col;
+        uint b1 = b0 + 1u;
+        uint t0 = baseOffset + (row + 1u) * sideZCols + col;
+        uint t1 = t0 + 1u;
+        uint tIdx = indexOffset + sideZ1_IndexOffset + id * 6u;
+        indices[tIdx + 0u] = vertexOffset + b0;
+        indices[tIdx + 1u] = vertexOffset + t0;
+        indices[tIdx + 2u] = vertexOffset + t1;
+        indices[tIdx + 3u] = vertexOffset + b0;
+        indices[tIdx + 4u] = vertexOffset + t1;
+        indices[tIdx + 5u] = vertexOffset + b1;
+    }
+
+    uint sideZ2_IndexOffset = sideZ1_IndexOffset + sideZQuads * 6u;
+    if (id < sideZQuads)
+    {
+        // -Z Side Face Indices (wind CW in X-Y projection for -Z normal)
+        uint col = id % widthSegs;
+        uint row = id / widthSegs;
+        uint baseOffset = baseVertCount + sideZVerts;
+        uint b0 = baseOffset + row * sideZCols + col;
+        uint b1 = b0 + 1u;
+        uint t0 = baseOffset + (row + 1u) * sideZCols + col;
+        uint t1 = t0 + 1u;
+        uint tIdx = indexOffset + sideZ2_IndexOffset + id * 6u;
+        indices[tIdx + 0u] = vertexOffset + b0;
+        indices[tIdx + 1u] = vertexOffset + t1;
+        indices[tIdx + 2u] = vertexOffset + b1;
+        indices[tIdx + 3u] = vertexOffset + b0;
+        indices[tIdx + 4u] = vertexOffset + t0;
+        indices[tIdx + 5u] = vertexOffset + t1;
+    }
+
+    uint sideX1_IndexOffset = sideZ2_IndexOffset + sideZQuads * 6u;
+    if (id < sideXQuads)
+    {
+        // +X Side Face Indices (wind CCW in Z-Y projection for +X normal)
+        uint col = id % depthSegs;
+        uint row = id / depthSegs;
+        uint baseOffset = baseVertCount + 2u * sideZVerts;
+        uint b0 = baseOffset + row * sideXCols + col;
+        uint b1 = b0 + 1u;
+        uint t0 = baseOffset + (row + 1u) * sideXCols + col;
+        uint t1 = t0 + 1u;
+        uint tIdx = indexOffset + sideX1_IndexOffset + id * 6u;
+        indices[tIdx + 0u] = vertexOffset + b0;
+        indices[tIdx + 1u] = vertexOffset + t0;
+        indices[tIdx + 2u] = vertexOffset + t1;
+        indices[tIdx + 3u] = vertexOffset + b0;
+        indices[tIdx + 4u] = vertexOffset + t1;
+        indices[tIdx + 5u] = vertexOffset + b1;
+    }
+
+    uint sideX2_IndexOffset = sideX1_IndexOffset + sideXQuads * 6u;
+    if (id < sideXQuads)
+    {
+        // -X Side Face Indices (wind CW in Z-Y projection for -X normal)
+        uint col = id % depthSegs;
+        uint row = id / depthSegs;
+        uint baseOffset = baseVertCount + 2u * sideZVerts + sideXVerts;
+        uint b0 = baseOffset + row * sideXCols + col;
+        uint b1 = b0 + 1u;
+        uint t0 = baseOffset + (row + 1u) * sideXCols + col;
+        uint t1 = t0 + 1u;
+        uint tIdx = indexOffset + sideX2_IndexOffset + id * 6u;
+        indices[tIdx + 0u] = vertexOffset + b0;
+        indices[tIdx + 1u] = vertexOffset + t1;
+        indices[tIdx + 2u] = vertexOffset + b1;
+        indices[tIdx + 3u] = vertexOffset + b0;
+        indices[tIdx + 4u] = vertexOffset + t0;
+        indices[tIdx + 5u] = vertexOffset + t1;
     }
 }

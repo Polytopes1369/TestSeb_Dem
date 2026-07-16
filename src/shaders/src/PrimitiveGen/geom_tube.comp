@@ -1,7 +1,6 @@
 #version 460
 #extension GL_GOOGLE_include_directive : enable
 
-// Inclure tes structures partagées
 #include "include/struct_custo.glsl"
 #include "include/math_utils.glsl"
 
@@ -12,18 +11,16 @@ layout(std430, binding = 1) writeonly buffer IndexBuffer  { uint indices[]; };
 
 layout(std140, binding = 2) uniform Params
 {
+    float radius1; // outer radius
+    float radius2; // inner radius
     float height;
+    uint  nbHeightSegs;
+    uint  nbCapSegs;
     uint  nbSides;
-    float bottomRadius1;
-    float bottomRadius2;
-    float topRadius1;
-    float topRadius2;
     uint  meshID;
     float materialID;
     uint  vertexOffset;
     uint  indexOffset;
-    // World-space translation baked into the generated geometry, used to place multiple
-    // instances of this primitive at different grid slots without a separate transform stage.
     float worldOffsetX;
     float worldOffsetY;
     float worldOffsetZ;
@@ -32,99 +29,150 @@ layout(std140, binding = 2) uniform Params
 void main()
 {
     uint id = gl_GlobalInvocationID.x;
-    uint capCount   = nbSides * 2u + 2u;
-    uint sideCount  = nbSides * 2u + 2u;
-    uint totalVerts = capCount * 2u + sideCount * 2u;
-    if (id >= totalVerts) return;
 
-    uint side  = (id % capCount) / 2u;
-    float t    = float(side) / float(nbSides);
-    float rad  = t * TAU;
-    float c = cos(rad), s = sin(rad);
-    bool outer = (id % 2u) == 1u;
+    uint sideColumns = nbSides + 1u;
+    uint outerSideVertCount = sideColumns * (nbHeightSegs + 1u);
+    uint innerSideVertCount = sideColumns * (nbHeightSegs + 1u);
+    uint bottomCapVertCount = sideColumns * (nbCapSegs + 1u);
+    uint topCapVertCount    = sideColumns * (nbCapSegs + 1u);
+    uint totalVerts = outerSideVertCount + innerSideVertCount + bottomCapVertCount + topCapVertCount;
+
+    if (id >= totalVerts) return;
 
     Vertex v;
     v.meshID = meshID;
     v.materialID = materialID;
 
-    if (id < capCount) // bottom cap
+    if (id < outerSideVertCount)
     {
-        float r = bottomRadius1 + (outer ? 1.0 : -1.0) * bottomRadius2 * 0.5;
-        v.position = vec3(c * r, 0.0, s * r);
+        uint col = id % sideColumns;
+        uint row = id / sideColumns;
+        float t = float(col == nbSides ? 0u : col) / float(nbSides);
+        float ang = t * TAU;
+        float y = (float(row) / float(nbHeightSegs)) * height;
+        v.position = vec3(cos(ang) * radius1, y, sin(ang) * radius1);
+        v.normal   = vec3(cos(ang), 0.0, sin(ang));
+        v.uv       = vec2(float(col) / float(nbSides), float(row) / float(nbHeightSegs));
+    }
+    else if (id < outerSideVertCount + innerSideVertCount)
+    {
+        uint local = id - outerSideVertCount;
+        uint col = local % sideColumns;
+        uint row = local / sideColumns;
+        float t = float(col == nbSides ? 0u : col) / float(nbSides);
+        float ang = t * TAU;
+        float y = (float(row) / float(nbHeightSegs)) * height;
+        v.position = vec3(cos(ang) * radius2, y, sin(ang) * radius2);
+        v.normal   = -vec3(cos(ang), 0.0, sin(ang));
+        v.uv       = vec2(float(col) / float(nbSides), float(row) / float(nbHeightSegs));
+    }
+    else if (id < outerSideVertCount + innerSideVertCount + bottomCapVertCount)
+    {
+        uint local = id - (outerSideVertCount + innerSideVertCount);
+        uint col = local % sideColumns;
+        uint ring = local / sideColumns;
+        float t = float(col == nbSides ? 0u : col) / float(nbSides);
+        float ang = t * TAU;
+        float r = mix(radius2, radius1, float(ring) / float(nbCapSegs));
+        v.position = vec3(cos(ang) * r, 0.0, sin(ang) * r);
         v.normal   = vec3(0.0, -1.0, 0.0);
-        v.uv       = vec2(outer ? 1.0 : 0.0, t);
+        v.uv       = vec2(cos(ang) * 0.5 * (r / radius1) + 0.5, sin(ang) * 0.5 * (r / radius1) + 0.5);
     }
-    else if (id < capCount * 2u) // top cap
+    else
     {
-        float r = topRadius1 + (outer ? 1.0 : -1.0) * topRadius2 * 0.5;
-        v.position = vec3(c * r, height, s * r);
+        uint local = id - (outerSideVertCount + innerSideVertCount + bottomCapVertCount);
+        uint col = local % sideColumns;
+        uint ring = local / sideColumns;
+        float t = float(col == nbSides ? 0u : col) / float(nbSides);
+        float ang = t * TAU;
+        float r = mix(radius2, radius1, float(ring) / float(nbCapSegs));
+        v.position = vec3(cos(ang) * r, height, sin(ang) * r);
         v.normal   = vec3(0.0, 1.0, 0.0);
-        v.uv       = vec2(outer ? 1.0 : 0.0, t);
-    }
-    else if (id < capCount * 2u + sideCount) // side (out)
-    {
-        float rTop = topRadius1 + topRadius2 * 0.5;
-        float rBot = bottomRadius1 + bottomRadius2 * 0.5;
-        bool isTop = ((id - capCount * 2u) % 2u) == 0u;
-        v.position = isTop ? vec3(c * rTop, height, s * rTop) : vec3(c * rBot, 0.0, s * rBot);
-        v.normal   = vec3(c, 0.0, s);
-        v.uv       = vec2(t, isTop ? 1.0 : 0.0);
-    }
-    else // side (in)
-    {
-        float rTop = topRadius1 - topRadius2 * 0.5;
-        float rBot = bottomRadius1 - bottomRadius2 * 0.5;
-        bool isTop = ((id - capCount * 2u - sideCount) % 2u) == 0u;
-        v.position = isTop ? vec3(c * rTop, height, s * rTop) : vec3(c * rBot, 0.0, s * rBot);
-        v.normal   = -vec3(c, 0.0, s);
-        v.uv       = vec2(t, isTop ? 1.0 : 0.0);
+        v.uv       = vec2(cos(ang) * 0.5 * (r / radius1) + 0.5, sin(ang) * 0.5 * (r / radius1) + 0.5);
     }
 
     v.uv2 = v.uv;
-
-    // Translate the generated vertex to its grid slot in world space before writing it out.
     v.position += vec3(worldOffsetX, worldOffsetY, worldOffsetZ);
     vertices[vertexOffset + id] = v;
 
-    // --- Indices : one thread per side-quad (id < nbSides), covers all 4 sections ---
-    if (id < nbSides)
+    // --- Index generation ---
+    uint sideQuadsCount = nbSides * nbHeightSegs;
+    uint capQuadsCount  = nbSides * nbCapSegs;
+
+    if (id < sideQuadsCount)
     {
-        uint cur  = id * 2u;
-        uint next = id * 2u + 2u;
+        // Outer side quads
+        uint seg = id / nbSides;
+        uint col = id % nbSides;
+        uint b0 = seg * sideColumns + col;
+        uint b1 = b0 + 1u;
+        uint t0 = (seg + 1u) * sideColumns + col;
+        uint t1 = t0 + 1u;
+        uint tIdx = indexOffset + id * 6u;
+        indices[tIdx + 0u] = vertexOffset + b0;
+        indices[tIdx + 1u] = vertexOffset + t0;
+        indices[tIdx + 2u] = vertexOffset + t1;
+        indices[tIdx + 3u] = vertexOffset + b0;
+        indices[tIdx + 4u] = vertexOffset + t1;
+        indices[tIdx + 5u] = vertexOffset + b1;
+    }
+    
+    uint innerSideIndexOffset = sideQuadsCount * 6u;
+    if (id < sideQuadsCount)
+    {
+        // Inner side quads
+        uint seg = id / nbSides;
+        uint col = id % nbSides;
+        uint b0 = outerSideVertCount + seg * sideColumns + col;
+        uint b1 = b0 + 1u;
+        uint t0 = outerSideVertCount + (seg + 1u) * sideColumns + col;
+        uint t1 = t0 + 1u;
+        uint tIdx = indexOffset + innerSideIndexOffset + id * 6u;
+        indices[tIdx + 0u] = vertexOffset + b0;
+        indices[tIdx + 1u] = vertexOffset + t1;
+        indices[tIdx + 2u] = vertexOffset + t0;
+        indices[tIdx + 3u] = vertexOffset + b0;
+        indices[tIdx + 4u] = vertexOffset + b1;
+        indices[tIdx + 5u] = vertexOffset + t1;
+    }
 
-        uint b0 = indexOffset + id * 6u;
-        indices[b0 + 0u] = vertexOffset + next + 1u;
-        indices[b0 + 1u] = vertexOffset + next;
-        indices[b0 + 2u] = vertexOffset + cur;
-        indices[b0 + 3u] = vertexOffset + cur + 1u;
-        indices[b0 + 4u] = vertexOffset + next + 1u;
-        indices[b0 + 5u] = vertexOffset + cur;
+    uint bottomCapIndexOffset = (sideQuadsCount * 2u) * 6u;
+    if (id < capQuadsCount)
+    {
+        // Bottom cap ring quads
+        uint ring = id / nbSides;
+        uint col  = id % nbSides;
+        uint capBase = outerSideVertCount + innerSideVertCount;
+        uint i0 = capBase + ring * sideColumns + col;
+        uint i1 = i0 + 1u;
+        uint o0 = capBase + (ring + 1u) * sideColumns + col;
+        uint o1 = o0 + 1u;
+        uint tIdx = indexOffset + bottomCapIndexOffset + id * 6u;
+        indices[tIdx + 0u] = vertexOffset + o0;
+        indices[tIdx + 1u] = vertexOffset + i1;
+        indices[tIdx + 2u] = vertexOffset + i0;
+        indices[tIdx + 3u] = vertexOffset + o0;
+        indices[tIdx + 4u] = vertexOffset + o1;
+        indices[tIdx + 5u] = vertexOffset + i1;
+    }
 
-        uint tOff = capCount;
-        uint t0 = indexOffset + nbSides * 6u + id * 6u;
-        indices[t0 + 0u] = vertexOffset + tOff + cur;
-        indices[t0 + 1u] = vertexOffset + tOff + next;
-        indices[t0 + 2u] = vertexOffset + tOff + next + 1u;
-        indices[t0 + 3u] = vertexOffset + tOff + cur;
-        indices[t0 + 4u] = vertexOffset + tOff + next + 1u;
-        indices[t0 + 5u] = vertexOffset + tOff + cur + 1u;
-
-        uint oOff = capCount * 2u;
-        uint o0 = indexOffset + nbSides * 12u + id * 6u;
-        indices[o0 + 0u] = vertexOffset + oOff + cur;
-        indices[o0 + 1u] = vertexOffset + oOff + next;
-        indices[o0 + 2u] = vertexOffset + oOff + next + 1u;
-        indices[o0 + 3u] = vertexOffset + oOff + cur;
-        indices[o0 + 4u] = vertexOffset + oOff + next + 1u;
-        indices[o0 + 5u] = vertexOffset + oOff + cur + 1u;
-
-        uint iOff = capCount * 2u + sideCount;
-        uint i0 = indexOffset + nbSides * 18u + id * 6u;
-        indices[i0 + 0u] = vertexOffset + iOff + next + 1u;
-        indices[i0 + 1u] = vertexOffset + iOff + next;
-        indices[i0 + 2u] = vertexOffset + iOff + cur;
-        indices[i0 + 3u] = vertexOffset + iOff + cur + 1u;
-        indices[i0 + 4u] = vertexOffset + iOff + next + 1u;
-        indices[i0 + 5u] = vertexOffset + iOff + cur;
+    uint topCapIndexOffset = (sideQuadsCount * 2u + capQuadsCount) * 6u;
+    if (id < capQuadsCount)
+    {
+        // Top cap ring quads
+        uint ring = id / nbSides;
+        uint col  = id % nbSides;
+        uint capBase = outerSideVertCount + innerSideVertCount + bottomCapVertCount;
+        uint i0 = capBase + ring * sideColumns + col;
+        uint i1 = i0 + 1u;
+        uint o0 = capBase + (ring + 1u) * sideColumns + col;
+        uint o1 = o0 + 1u;
+        uint tIdx = indexOffset + topCapIndexOffset + id * 6u;
+        indices[tIdx + 0u] = vertexOffset + o0;
+        indices[tIdx + 1u] = vertexOffset + i0;
+        indices[tIdx + 2u] = vertexOffset + i1;
+        indices[tIdx + 3u] = vertexOffset + o0;
+        indices[tIdx + 4u] = vertexOffset + i1;
+        indices[tIdx + 5u] = vertexOffset + o1;
     }
 }

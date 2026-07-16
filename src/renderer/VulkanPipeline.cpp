@@ -24,7 +24,7 @@ VkPipelineLayout VulkanPipeline::CreatePipelineLayout(VkDevice device, VkDescrip
     return layout;
 }
 
-VkPipeline VulkanPipeline::CreateGraphicsPipeline(VkDevice device, VkPipelineLayout layout, VkShaderModule vertShader, VkShaderModule fragShader, VkFormat colorFormat, VkFormat depthFormat) {
+VkPipeline VulkanPipeline::CreateGraphicsPipeline(VkDevice device, VkPipelineLayout layout, VkShaderModule vertShader, VkShaderModule fragShader, const std::array<VkFormat, 2>& colorFormats, VkFormat depthFormat) {
     VkPipelineShaderStageCreateInfo stages[2]{};
     stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT; // Using standard Vertex stage for now
@@ -70,15 +70,21 @@ VkPipeline VulkanPipeline::CreateGraphicsPipeline(VkDevice device, VkPipelineLay
     multisampling.sampleShadingEnable = VK_FALSE;
     multisampling.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
 
-    VkPipelineColorBlendAttachmentState colorBlendAttachment{};
-    colorBlendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-    colorBlendAttachment.blendEnable = VK_FALSE;
+    // Visibility Buffer output: both attachments are single-channel R32_UINT ID buffers, not a
+    // classic lit RGBA color -- colorWriteMask is restricted to the R component (the only channel
+    // these formats have) and blendEnable is left VK_FALSE, since blending is not defined (and
+    // would be a validation error to enable) for an integer format in the first place.
+    VkPipelineColorBlendAttachmentState colorBlendAttachments[2]{};
+    colorBlendAttachments[0].colorWriteMask = VK_COLOR_COMPONENT_R_BIT;
+    colorBlendAttachments[0].blendEnable = VK_FALSE;
+    colorBlendAttachments[1].colorWriteMask = VK_COLOR_COMPONENT_R_BIT;
+    colorBlendAttachments[1].blendEnable = VK_FALSE;
 
     VkPipelineColorBlendStateCreateInfo colorBlending{};
     colorBlending.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
     colorBlending.logicOpEnable = VK_FALSE;
-    colorBlending.attachmentCount = 1;
-    colorBlending.pAttachments = &colorBlendAttachment;
+    colorBlending.attachmentCount = 2;
+    colorBlending.pAttachments = colorBlendAttachments;
 
     std::vector<VkDynamicState> dynamicStates = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
     VkPipelineDynamicStateCreateInfo dynamicState{};
@@ -86,11 +92,12 @@ VkPipeline VulkanPipeline::CreateGraphicsPipeline(VkDevice device, VkPipelineLay
     dynamicState.dynamicStateCount = static_cast<uint32_t>(dynamicStates.size());
     dynamicState.pDynamicStates = dynamicStates.data();
 
-    // Dynamic Rendering configuration
+    // Dynamic Rendering configuration -- 2 color attachments (Visibility Buffer: ClusterID +
+    // local TriangleID) instead of 1.
     VkPipelineRenderingCreateInfo pipelineRendering{};
     pipelineRendering.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
-    pipelineRendering.colorAttachmentCount = 1;
-    pipelineRendering.pColorAttachmentFormats = &colorFormat;
+    pipelineRendering.colorAttachmentCount = static_cast<uint32_t>(colorFormats.size());
+    pipelineRendering.pColorAttachmentFormats = colorFormats.data();
     pipelineRendering.depthAttachmentFormat = depthFormat;
 
     VkPipelineDepthStencilStateCreateInfo depthStencil{};

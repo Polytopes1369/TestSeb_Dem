@@ -1,0 +1,62 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+
+// Sibling to DecompressClusterVertices.comp: expands one resident cluster's compact on-disk local
+// triangle-list indices (geometry::ClusterData::indices, uint8_t[384], see ClusterFormat.h) into a
+// GPU-native, directly bindable VK_INDEX_TYPE_UINT32 index buffer.
+//
+// Why this cannot be decoded on the fly like DecodeClusterPosition/Normal/UV: hardware indexed
+// rendering (vkCmdDrawIndexed / vkCmdDrawIndexedIndirectCount) fetches indices through a
+// fixed-function stage that runs *before* any shader invocation -- there is no shader hook to
+// decompress a packed uint8 index into a real one at fetch time. The expansion must therefore
+// happen once, ahead of time (when a page is bound), into an ordinary index buffer the fixed-
+// function stage can read directly.
+//
+// Dispatched as exactly one workgroup of CLUSTER_MAX_INDICES (384) threads per resident page --
+// see renderer::GeometryDecompressionPass::DecompressPage, which issues this dispatch alongside
+// DecompressClusterVertices.comp's, sharing the same push-constant block (only physicalPageIndex
+// is read here; the bounds fields are irrelevant to index expansion).
+
+#define COMPRESSED_POOL_SET 0
+#define COMPRESSED_POOL_BINDING 0
+#include "include/cluster_vertex_decode.glsl"
+
+// Fully-expanded local triangle-list indices, index-aligned 1:1 with the compressed pool's
+// physical page slots: physical page P's CLUSTER_MAX_INDICES indices live at
+// [P * CLUSTER_MAX_INDICES, (P + 1) * CLUSTER_MAX_INDICES) here -- matches
+// renderer::GeometryDecompressionPass::GetDecompressedIndexPoolBuffer()'s documented layout and
+// renderer::ClusterCullMetadata::firstIndex's contract (ClusterCullingPass.h). Every value stored
+// is still a *local* vertex index in [0, CLUSTER_MAX_VERTICES) -- exactly the raw uint8_t value
+// from ClusterData::indices, only widened to 32 bits, never combined with vertexOffset here: the
+// fixed-function index-fetch-plus-vertexOffset addition (see VkDrawIndexedIndirectCommand's own
+// vertexOffset field) is what turns this local index into an absolute vertex-pool slot at draw
+// time, not this shader.
+layout(std430, set = 0, binding = 2) writeonly buffer DecompressedIndexPoolSSBO {
+    uint indices[];
+} g_DecompressedIndexPool;
+
+layout(push_constant) uniform DecompressIndicesPushConstants {
+    uint physicalPageIndex;
+    uint _pad0;
+    uint _pad1;
+    uint _pad2;
+    vec4 boundsMin; // Unused by this shader -- shares renderer::GeometryDecompressionPass's
+    vec4 boundsMax; // single push-constant layout with DecompressClusterVertices.comp's.
+} pc;
+
+layout(local_size_x = CLUSTER_MAX_INDICES) in;
+
+void main() {
+    // One workgroup == one cluster's page, one invocation == one of its CLUSTER_MAX_INDICES local
+    // triangle-list index slots (the dispatch is always exactly 1x1x1 workgroups -- see
+    // GeometryDecompressionPass::DecompressPage). Clusters with fewer than CLUSTER_MAX_TRIANGLES
+    // triangles still get every slot expanded (harmless -- ClusterCullMetadata::indexCount bounds
+    // how many of them a draw call actually reads via VkDrawIndexedIndirectCommand::indexCount).
+    uint localIndexOrdinal = gl_GlobalInvocationID.x;
+    uint pageByteBase = pc.physicalPageIndex * CLUSTER_PAGE_SIZE_BYTES;
+
+    uint localVertexIndex = ClusterLoadByte(pageByteBase + CLUSTER_INDICES_BASE_BYTES + localIndexOrdinal);
+
+    uint outIndex = pc.physicalPageIndex * CLUSTER_MAX_INDICES + localIndexOrdinal;
+    g_DecompressedIndexPool.indices[outIndex] = localVertexIndex;
+}

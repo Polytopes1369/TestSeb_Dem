@@ -15,6 +15,7 @@
 #include <future>
 #include <limits>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace geometry {
@@ -260,6 +261,39 @@ namespace geometry {
             totalVertexCount, totalIndexCount, allVertices, allIndices)) {
             Logger::Log(LogLevel::Error, "[GeometryCacheTest] Aborting: full geometry readback failed.");
             return false;
+        }
+
+        // --- DIAGNOSTIC: per-meshID vertex/triangle histogram -------------------------------
+        // Temporary instrumentation to determine whether missing geometry (e.g. cone/torus
+        // knot reported as "produced zero clusters") is caused by vertices never landing in
+        // the readback with the expected meshID (a generation-side bug) or by vertices being
+        // present but not matched by ClusterPartitioner's index-triangle filter (a
+        // partitioning-side bug). Mirrors PartitionMeshIntoClusters's exact filter
+        // (allVertices[i0].meshID) so the triangle counts reproduce what it sees.
+        {
+            std::unordered_map<uint32_t, uint32_t> vertsByMeshID;
+            for (const renderer::Vertex& v : allVertices) {
+                ++vertsByMeshID[v.meshID];
+            }
+            std::unordered_map<uint32_t, uint32_t> trisByMeshID;
+            for (size_t t = 0; t + 2 < allIndices.size(); t += 3) {
+                uint32_t i0 = allIndices[t + 0];
+                ++trisByMeshID[allVertices[i0].meshID];
+            }
+            Logger::Log(LogLevel::Info, "[GeometryCacheTest] Per-meshID diagnostic histogram:");
+            for (uint32_t id = 0; id < entityCount; ++id) {
+                uint32_t vc = vertsByMeshID.count(id) ? vertsByMeshID[id] : 0u;
+                uint32_t tc = trisByMeshID.count(id) ? trisByMeshID[id] : 0u;
+                Logger::Log(LogLevel::Info, std::format(
+                    "[GeometryCacheTest]   meshID={}: vertices={} triangles={}", id, vc, tc));
+            }
+            for (const auto& [id, vc] : vertsByMeshID) {
+                if (id >= entityCount) {
+                    Logger::Log(LogLevel::Warning, std::format(
+                        "[GeometryCacheTest]   OUT-OF-RANGE meshID={} found on {} vertices (expected range [0,{}))! "
+                        "This indicates memory corruption (likely a buffer capacity overflow).", id, vc, entityCount));
+                }
+            }
         }
 
         CacheFileManager cacheManager;

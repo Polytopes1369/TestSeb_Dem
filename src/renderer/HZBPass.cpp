@@ -57,6 +57,34 @@ namespace renderer {
             return std::max(1u, (dim + 1) / 2);
         }
 
+        // floor(log2(dim)) for dim >= 1 (0 for dim == 1). Used to cap the mip chain at the exact
+        // count VkImageCreateInfo::mipLevels is allowed to request (see MaxMipCountForExtent) --
+        // computed by repeated right-shift rather than std::log2 to avoid any floating-point
+        // rounding landing on the wrong side of a power-of-two boundary.
+        uint32_t FloorLog2(uint32_t dim) {
+            uint32_t levels = 0;
+            while (dim > 1u) {
+                dim >>= 1;
+                ++levels;
+            }
+            return levels;
+        }
+
+        // The Vulkan spec (VUID-VkImageCreateInfo-mipLevels-00958) mandates mipLevels <=
+        // floor(log2(max(width, height))) + 1 -- the count of the *standard* floor-halving mip
+        // chain (960 -> 480 -> ... -> 1, 10 levels). NextMipDim's ceil-halving above walks a
+        // slightly different sequence (e.g. 15 -> 8 -> 4 -> ... instead of 15 -> 7 -> 3 -> ...),
+        // which can take one extra step to reach 1x1 whenever an odd dimension is halved -- e.g.
+        // starting from 960x540 the ceil chain needs 11 steps, one more than the 10 the spec
+        // allows for that extent, and vkCreateImage rejects it outright. Capping the loop below at
+        // this count (even if the last level generated isn't literally 1x1 yet) keeps every
+        // requested mipLevels value spec-legal; a final mip slightly larger than 1x1 texel is
+        // harmless for HZB occlusion queries, which only ever pick a coarse-enough level, never
+        // require an exact 1x1 apex.
+        uint32_t MaxMipCountForExtent(VkExtent2D extent) {
+            return FloorLog2(std::max(extent.width, extent.height)) + 1u;
+        }
+
         constexpr uint32_t kWorkgroupSize = 8;
 
         uint32_t DispatchGroupCount(uint32_t dim) {
@@ -74,14 +102,19 @@ namespace renderer {
         m_SourceExtent = sourceDepthExtent;
 
         // --- Mip chain sizing: mip 0 is half the source depth resolution; every following mip
-        // halves the one before it until reaching 1x1 (inclusive). See the class comment for why
-        // mip 0 is not a full-resolution copy of the source depth buffer. ---
+        // halves the one before it until reaching 1x1 (inclusive), capped at
+        // MaxMipCountForExtent(mip0) -- see that function's comment for why the ceil-halving
+        // sequence below can otherwise request one more level than VkImageCreateInfo::mipLevels
+        // is legally allowed to have for this extent. The cap is the *only* new behavior here: for
+        // any extent whose ceil-halving chain does not include an odd intermediate dimension, it
+        // never triggers and this loop is unchanged from before. ---
         VkExtent2D mip0{ NextMipDim(sourceDepthExtent.width), NextMipDim(sourceDepthExtent.height) };
+        uint32_t maxMipCount = MaxMipCountForExtent(mip0);
         m_MipExtents.clear();
         VkExtent2D cur = mip0;
         for (;;) {
             m_MipExtents.push_back(cur);
-            if (cur.width == 1 && cur.height == 1) {
+            if ((cur.width == 1 && cur.height == 1) || m_MipExtents.size() >= maxMipCount) {
                 break;
             }
             cur = VkExtent2D{ NextMipDim(cur.width), NextMipDim(cur.height) };

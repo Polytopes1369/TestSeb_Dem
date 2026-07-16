@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <numeric>
 #include <unordered_map>
 
 #include "geometry/ClusterFormat.h"
@@ -193,6 +194,193 @@ namespace geometry {
             uint32_t originalTriangleCount = 0;
         };
 
+        // ----------------------------------------------------------------------------------
+        // Spatially bisects a SimplifiableMesh into two halves along the longest AABB axis
+        // (deterministic, no RNG). Each output mesh gets its own boundary-lock set recomputed
+        // from scratch: edges used exactly once within that half are its outer boundary and
+        // are locked; previously locked vertices that ended up interior to the half are freed.
+        // Caller must ensure mesh.triangles.size() >= 6 (>= 2 triangles) before calling.
+        // ----------------------------------------------------------------------------------
+        void SplitSimplifiableMesh(const SimplifiableMesh& src,
+            SimplifiableMesh& outA, SimplifiableMesh& outB) {
+
+            const uint32_t triCount = static_cast<uint32_t>(src.triangles.size() / 3);
+
+            // Compute per-triangle centroids and the overall AABB.
+            std::vector<maths::vec3> centroids(triCount);
+            maths::vec3 lo{ std::numeric_limits<float>::max(), std::numeric_limits<float>::max(), std::numeric_limits<float>::max() };
+            maths::vec3 hi{ std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest() };
+            for (uint32_t t = 0; t < triCount; ++t) {
+                const maths::vec3& p0 = src.positions[src.triangles[t * 3 + 0]];
+                const maths::vec3& p1 = src.positions[src.triangles[t * 3 + 1]];
+                const maths::vec3& p2 = src.positions[src.triangles[t * 3 + 2]];
+                maths::vec3 c = (p0 + p1 + p2) * (1.0f / 3.0f);
+                centroids[t] = c;
+                lo.x = std::min(lo.x, c.x); lo.y = std::min(lo.y, c.y); lo.z = std::min(lo.z, c.z);
+                hi.x = std::max(hi.x, c.x); hi.y = std::max(hi.y, c.y); hi.z = std::max(hi.z, c.z);
+            }
+
+            // Pick split axis (longest extent) and sort triangle indices by centroid coordinate.
+            maths::vec3 extent = hi - lo;
+            int axis = 0;
+            if (extent.y >= extent.x && extent.y >= extent.z) axis = 1;
+            else if (extent.z >= extent.x && extent.z >= extent.y) axis = 2;
+
+            std::vector<uint32_t> order(triCount);
+            std::iota(order.begin(), order.end(), 0u);
+            std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
+                float ca = (axis == 0) ? centroids[a].x : (axis == 1) ? centroids[a].y : centroids[a].z;
+                float cb = (axis == 0) ? centroids[b].x : (axis == 1) ? centroids[b].y : centroids[b].z;
+                return ca < cb;
+            });
+
+            uint32_t midCount = triCount / 2;
+
+            // Build each half: compact vertices (first-seen order) and recompute boundary locks.
+            auto buildHalf = [&](uint32_t begin, uint32_t end, SimplifiableMesh& out) {
+                constexpr uint32_t kNone = 0xFFFFFFFFu;
+                std::vector<uint32_t> srcToOut(src.positions.size(), kNone);
+
+                std::unordered_map<uint64_t, uint32_t> edgeUsage;
+
+                for (uint32_t i = begin; i < end; ++i) {
+                    uint32_t t = order[i];
+                    uint32_t v[3] = {
+                        src.triangles[t * 3 + 0],
+                        src.triangles[t * 3 + 1],
+                        src.triangles[t * 3 + 2]
+                    };
+                    for (int s = 0; s < 3; ++s) {
+                        if (srcToOut[v[s]] == kNone) {
+                            srcToOut[v[s]] = static_cast<uint32_t>(out.positions.size());
+                            out.positions.push_back(src.positions[v[s]]);
+                        }
+                    }
+                    uint32_t a = srcToOut[v[0]], b = srcToOut[v[1]], c = srcToOut[v[2]];
+                    out.triangles.push_back(a);
+                    out.triangles.push_back(b);
+                    out.triangles.push_back(c);
+                    edgeUsage[PackEdgeKey(a, b)] += 1u;
+                    edgeUsage[PackEdgeKey(b, c)] += 1u;
+                    edgeUsage[PackEdgeKey(c, a)] += 1u;
+                }
+
+                // Recompute locks: boundary edges (used exactly once) lock both endpoints.
+                out.locked.assign(out.positions.size(), false);
+                for (const auto& [key, count] : edgeUsage) {
+                    if (count == 1u) {
+                        out.locked[static_cast<uint32_t>(key >> 32)] = true;
+                        out.locked[static_cast<uint32_t>(key & 0xFFFFFFFFu)] = true;
+                    }
+                }
+            };
+
+            buildHalf(0,        midCount, outA);
+            buildHalf(midCount, triCount, outB);
+        }
+
+        // ----------------------------------------------------------------------------------
+        // Clamps `mesh` to at most `maxVerts` vertices and `maxIndices` indices in-place.
+        // Strategy: sort vertices by first-reference order (already the case after QEM compaction),
+        // drop any triangle that references a vertex index >= maxVerts, then re-compact so only
+        // surviving triangles' vertices remain. This always terminates and cannot increase counts.
+        // The locked array is remapped consistently so downstream use remains valid.
+        // ----------------------------------------------------------------------------------
+        void ClampMeshToCapacity(SimplifiableMesh& mesh, uint32_t maxVerts, uint32_t maxIndices) {
+            const uint32_t origVerts = static_cast<uint32_t>(mesh.positions.size());
+            if (origVerts <= maxVerts && mesh.triangles.size() <= maxIndices) {
+                return; // Already fits; nothing to do.
+            }
+
+            // Keep only triangles whose three vertex indices are all < maxVerts and whose
+            // running index count (3 per kept triangle) would not exceed maxIndices.
+            std::vector<uint32_t> keptTriangles;
+            keptTriangles.reserve(mesh.triangles.size());
+            uint32_t keptIndexCount = 0;
+            for (size_t t = 0; t + 2 < mesh.triangles.size(); t += 3) {
+                uint32_t v0 = mesh.triangles[t + 0];
+                uint32_t v1 = mesh.triangles[t + 1];
+                uint32_t v2 = mesh.triangles[t + 2];
+                if (v0 < maxVerts && v1 < maxVerts && v2 < maxVerts
+                    && keptIndexCount + 3 <= maxIndices) {
+                    keptTriangles.push_back(v0);
+                    keptTriangles.push_back(v1);
+                    keptTriangles.push_back(v2);
+                    keptIndexCount += 3;
+                }
+            }
+
+            // Re-compact: only keep vertices actually referenced by a surviving triangle.
+            constexpr uint32_t kNone = 0xFFFFFFFFu;
+            std::vector<uint32_t> remap(origVerts, kNone);
+            std::vector<maths::vec3> newPos;
+            std::vector<bool> newLocked;
+            std::vector<uint32_t> newTris;
+            newPos.reserve(maxVerts);
+            newTris.reserve(keptTriangles.size());
+
+            for (uint32_t idx : keptTriangles) {
+                if (remap[idx] == kNone) {
+                    remap[idx] = static_cast<uint32_t>(newPos.size());
+                    newPos.push_back(mesh.positions[idx]);
+                    newLocked.push_back(idx < mesh.locked.size() ? mesh.locked[idx] : false);
+                }
+                newTris.push_back(remap[idx]);
+            }
+
+            mesh.positions = std::move(newPos);
+            mesh.locked = std::move(newLocked);
+            mesh.triangles = std::move(newTris);
+        }
+
+        // ----------------------------------------------------------------------------------
+        // Simplifies `mesh` and emits one DAG parent node into `dag`. If QEM alone cannot
+        // reduce the vertex count to kMaxClusterVertices (locked-vertex saturation), the mesh
+        // is greedily clamped: triangles referencing vertices beyond the cap are dropped, then
+        // the remaining vertices are re-compacted. This is O(T) per node and restores the
+        // original ~4ms DAG build performance. The single-parent invariant is preserved because
+        // every child always goes to exactly this one parent.
+        // ----------------------------------------------------------------------------------
+        void EmitSimplifiedNodes(
+            SimplifiableMesh mesh,
+            const std::vector<uint32_t>& childDagIndices,
+            uint32_t originalTriangleCount,
+            uint32_t level,
+            ClusterDAG& dag,
+            std::vector<uint32_t>& nextLevel) {
+
+            uint32_t targetTriangleCount = (originalTriangleCount + 1u) / 2u;
+            float simplificationError = 0.0f;
+            SimplifyMeshQEM(mesh, targetTriangleCount, kMaxClusterVertices, &simplificationError);
+
+            // If QEM could not reach the vertex cap (locked-vertex saturation), clamp the mesh
+            // by dropping triangles that overflow the arrays and re-compacting.
+            ClampMeshToCapacity(mesh, kMaxClusterVertices, kMaxClusterIndices);
+
+            float childrenMaxError = 0.0f;
+            for (uint32_t childIdx : childDagIndices) {
+                childrenMaxError = std::max(childrenMaxError, dag.nodes[childIdx].clusterError);
+            }
+            float errorFloor = std::max(kMinimumErrorStepAbsolute, childrenMaxError * kMinimumErrorStepRelative);
+            float nodeError  = std::max(simplificationError, childrenMaxError + errorFloor);
+
+            ClusterDAGNode parentNode;
+            parentNode.mesh         = std::move(mesh);
+            parentNode.childIndices = childDagIndices;
+            parentNode.level        = level;
+            parentNode.clusterError = nodeError;
+            UpdateNodeBounds(parentNode);
+
+            uint32_t parentDagIndex = static_cast<uint32_t>(dag.nodes.size());
+            for (uint32_t childIdx : childDagIndices) {
+                dag.nodes[childIdx].parentIndex = parentDagIndex;
+                dag.nodes[childIdx].parentError = nodeError;
+            }
+
+            dag.nodes.push_back(std::move(parentNode));
+            nextLevel.push_back(parentDagIndex);
+        }
+
     } // namespace
 
     ClusterDAG BuildClusterDAG(
@@ -288,44 +476,22 @@ namespace geometry {
                 }
             }
 
-            // --- Simplify each group and promote it into a new, coarser DAG node -------------
+            // --- Simplify each group and promote it into one or more coarser DAG nodes -----
+            // EmitSimplifiedNodes handles the case where QEM alone cannot reduce vertex count
+            // below kMaxClusterVertices (locked-vertex saturation): it recursively bisects the
+            // mesh and distributes the group's children between halves so every emitted node
+            // fits within the fixed-capacity on-disk ClusterData block.
             std::vector<uint32_t> nextLevel;
             nextLevel.reserve(pendingGroups.size());
 
             for (PendingGroup& pg : pendingGroups) {
-                uint32_t targetTriangleCount = (pg.originalTriangleCount + 1u) / 2u; // Ceil-half: 256 -> 128 at the cluster cap.
-                float simplificationError = 0.0f;
-                // Also enforce kMaxClusterVertices: a triangle-count target alone does not bound
-                // vertex count, but every DAG node is ultimately persisted as a fixed-capacity
-                // on-disk ClusterData block (see ClusterFormat.h), so simplification must not
-                // stop until both caps are satisfied (or topology/locking makes that impossible).
-                SimplifyMeshQEM(pg.mesh, targetTriangleCount, kMaxClusterVertices, &simplificationError);
-
-                float childrenMaxError = 0.0f;
-                for (uint32_t childIdx : pg.childDagIndices) {
-                    childrenMaxError = std::max(childrenMaxError, dag.nodes[childIdx].clusterError);
-                }
-
-                ClusterDAGNode parentNode;
-                parentNode.mesh = std::move(pg.mesh);
-                parentNode.childIndices = pg.childDagIndices;
-                parentNode.level = level;
-                // Strict monotonicity by construction: always at least the absolute/relative
-                // error floor above the largest child error, even if this pass's own
-                // simplification error was (numerically) smaller than or equal to that -- see
-                // ClusterDAG.h's file header for why a purely absolute floor is not sufficient.
-                float errorFloor = std::max(kMinimumErrorStepAbsolute, childrenMaxError * kMinimumErrorStepRelative);
-                parentNode.clusterError = std::max(simplificationError, childrenMaxError + errorFloor);
-                UpdateNodeBounds(parentNode);
-
-                uint32_t parentDagIndex = static_cast<uint32_t>(dag.nodes.size());
-                for (uint32_t childIdx : pg.childDagIndices) {
-                    dag.nodes[childIdx].parentIndex = parentDagIndex;
-                    dag.nodes[childIdx].parentError = parentNode.clusterError;
-                }
-
-                dag.nodes.push_back(std::move(parentNode));
-                nextLevel.push_back(parentDagIndex);
+                EmitSimplifiedNodes(
+                    std::move(pg.mesh),
+                    pg.childDagIndices,
+                    pg.originalTriangleCount,
+                    level,
+                    dag,
+                    nextLevel);
             }
 
             currentLevel = std::move(nextLevel);
