@@ -1,5 +1,7 @@
 #include "renderer/TransparentForwardPass.h"
 
+#include <format>
+
 #include "core/Logger.h"
 #include "geometry/GpuPageTable.h"
 #include "renderer/VirtualShadowMapPass.h"
@@ -67,7 +69,7 @@ namespace renderer {
         }
 
         m_ClusterCount = static_cast<uint32_t>(hostEntries.size());
-        LOG_INFO("[TransparentForwardPass] {} transparent leaf cluster(s) found across every entity.", m_ClusterCount);
+        LOG_INFO(std::format("[TransparentForwardPass] {} transparent leaf cluster(s) found across every entity.", m_ClusterCount));
         if (m_ClusterCount == 0) {
             return; // Nothing to draw this run -- RecordDraw() checks GetTransparentClusterCount() itself.
         }
@@ -297,7 +299,7 @@ namespace renderer {
             vkDestroyShaderModule(m_Device, fragModule, nullptr);
         }
 
-        LOG_INFO("[TransparentForwardPass] Initialized ({} static leaf cluster(s)).", m_ClusterCount);
+        LOG_INFO(std::format("[TransparentForwardPass] Initialized ({} static leaf cluster(s)).", m_ClusterCount));
     }
 
     void TransparentForwardPass::Shutdown() {
