@@ -192,7 +192,7 @@ void main() {
     vec3 indirect = albedo * (accumulated / max(float(pc.sampleCount), 1.0));
 
     // Read-modify-write the secondary bounce directly into this texel's own radiance atlas entry
-    // -- "réinjecte-la comme rebond secondaire dans le texel d'origine." Recomputed fresh from
+    // -- "re-inject it as a secondary bounce into the original texel." Recomputed fresh from
     // this texel's own emissive atlas value every call (not accumulated against the previous
     // imageLoad) so repeated injection passes stay idempotent instead of compounding drift.
     imageStore(g_RadianceStorage, atlasTexel, vec4(emissive + indirect, 1.0));

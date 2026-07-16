@@ -39,7 +39,7 @@
 #include <vulkan/vulkan.h>
 #include <vk_mem_alloc.h>
 
-#include "renderer/GpuBuffer.h"
+#include "renderer/vulkan/GpuBuffer.h"
 
 namespace renderer {
     class ClusterOcclusionCullingPass;

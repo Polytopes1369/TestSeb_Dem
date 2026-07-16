@@ -85,7 +85,7 @@ namespace renderer {
         std::uniform_real_distribution<float> unit(0.0f, 1.0f);
 
         // HSV -> RGB (standard 6-sector formula). Procedural color generation (CLAUDE.md's own
-        // "couleurs/textures procédurales" mandate) needs to keep saturation/value under control
+        // "procedural colors/textures" mandate) needs to keep saturation/value under control
         // while still randomizing hue freely -- sampling R/G/B independently biases hard toward
         // muddy, desaturated colors instead of the vivid, distinct-per-primitive palette a demo
         // scene wants.

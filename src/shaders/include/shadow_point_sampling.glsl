@@ -1,10 +1,9 @@
 #ifndef SHADOW_POINT_SAMPLING_GLSL
 #define SHADOW_POINT_SAMPLING_GLSL
 
-// Phase 3 (UE5.8 parity roadmap): point light shadow lookup against renderer::
 // VirtualShadowMapPass's per-light 6-face cube of Virtual Shadow Maps. Built even though this
-// demo's SceneLights::pointLightCount is 0 by default (see this phase's plan -- "fait exactement
-// comme dans UE 5.8" tie-breaker) with one verification light authored in
+// demo's SceneLights::pointLightCount is 0 by default (see this phase's plan -- "done exactly
+// as in UE 5.8" tie-breaker) with one verification light authored in
 // ClusterRenderPipeline::Init(). VSM indices [0, SHADOW_SUN_LEVEL_COUNT) belong to the sun's
 // clipmap (shadow_sun_sampling.glsl); point light face VSMs start right after, at
 // SHADOW_SUN_LEVEL_COUNT + pointLightSlot*6 + face -- must match renderer::VirtualShadowMapPass's

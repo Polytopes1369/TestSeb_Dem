@@ -6,8 +6,8 @@
 #include <format>
 
 #include "core/Logger.h"
-#include "renderer/VulkanPipeline.h"
-#include "renderer/VulkanUtils.h"
+#include "renderer/vulkan/VulkanPipeline.h"
+#include "renderer/vulkan/VulkanUtils.h"
 #include "renderer/debug/BitmapFont8x8.h"
 
 namespace renderer::debug {

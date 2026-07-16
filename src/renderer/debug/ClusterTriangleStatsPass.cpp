@@ -5,7 +5,7 @@
 #include <format>
 
 #include "core/Logger.h"
-#include "renderer/VulkanPipeline.h"
+#include "renderer/vulkan/VulkanPipeline.h"
 
 namespace renderer::debug {
 

@@ -26,7 +26,7 @@
 #include <vk_mem_alloc.h>
 
 #include "core/maths/Maths.h"
-#include "renderer/GpuBuffer.h"
+#include "renderer/vulkan/GpuBuffer.h"
 
 namespace renderer::debug {
 

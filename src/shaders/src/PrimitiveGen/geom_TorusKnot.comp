@@ -2,7 +2,7 @@
 #version 460
 #extension GL_GOOGLE_include_directive : enable
 
-// Inclure tes structures partagées
+// Include shared structures
 #include "include/struct_custo.glsl"
 #include "include/math_utils.glsl"
 

@@ -64,34 +64,34 @@
 #include "core/Camera.h"
 #include "core/EngineConfig.h"
 #include "core/maths/Maths.h"
-#include "renderer/ATrousDenoisePass.h"
-#include "renderer/ClusterHardwareRasterPass.h"
-#include "renderer/ClusterLODSelectionPass.h"
-#include "renderer/ClusterOcclusionCullingPass.h"
-#include "renderer/ClusterResolvePass.h"
-#include "renderer/ClusterShadingBinPass.h"
-#include "renderer/ClusterSoftwareRasterPass.h"
-#include "renderer/GeometryDecompressionPass.h"
-#include "renderer/GeometryStreamingCoordinator.h"
-#include "renderer/GlobalSDFPass.h"
-#include "renderer/GpuBuffer.h"
-#include "renderer/GpuGeometryPagePool.h"
-#include "renderer/HZBPass.h"
+#include "renderer/passes/ATrousDenoisePass.h"
+#include "renderer/passes/ClusterHardwareRasterPass.h"
+#include "renderer/passes/ClusterLODSelectionPass.h"
+#include "renderer/passes/ClusterOcclusionCullingPass.h"
+#include "renderer/passes/ClusterResolvePass.h"
+#include "renderer/passes/ClusterShadingBinPass.h"
+#include "renderer/passes/ClusterSoftwareRasterPass.h"
+#include "renderer/passes/GeometryDecompressionPass.h"
+#include "renderer/streaming/GeometryStreamingCoordinator.h"
+#include "renderer/passes/GlobalSDFPass.h"
+#include "renderer/vulkan/GpuBuffer.h"
+#include "renderer/streaming/GpuGeometryPagePool.h"
+#include "renderer/passes/HZBPass.h"
 #include "renderer/LightingTypes.h"
-#include "renderer/ProceduralMaskGenerator.h"
-#include "renderer/ReflectionPass.h"
-#include "renderer/ScreenProbeGIPass.h"
-#include "renderer/SurfaceCacheGIInjectPass.h"
-#include "renderer/SurfaceCachePass.h"
-#include "renderer/SurfaceCacheRayTracingPass.h"
-#include "renderer/SurfaceCacheTraceContext.h"
-#include "renderer/TransparentForwardPass.h"
-#include "renderer/VirtualShadowMapPass.h"
-#include "renderer/WorldProbeGridPass.h"
+#include "renderer/passes/ProceduralMaskGenerator.h"
+#include "renderer/passes/ReflectionPass.h"
+#include "renderer/passes/ScreenProbeGIPass.h"
+#include "renderer/passes/SurfaceCacheGIInjectPass.h"
+#include "renderer/passes/SurfaceCachePass.h"
+#include "renderer/passes/SurfaceCacheRayTracingPass.h"
+#include "renderer/passes/SurfaceCacheTraceContext.h"
+#include "renderer/passes/TransparentForwardPass.h"
+#include "renderer/passes/VirtualShadowMapPass.h"
+#include "renderer/passes/WorldProbeGridPass.h"
 #ifndef NDEBUG
 #include "renderer/debug/ClusterTriangleStatsPass.h"
 #include "renderer/debug/DebugTextOverlay.h"
-#include "renderer/SDFRayMarchPass.h"
+#include "renderer/passes/SDFRayMarchPass.h"
 #endif
 
 namespace renderer {
@@ -158,7 +158,7 @@ namespace renderer {
         // visibly wrap a corner within a single frame without tripling GI cost for a barely-visible
         // 4th+ bounce (each bounce's marginal energy contribution falls off quickly against typical
         // scene albedo).
-        static constexpr uint32_t kRadiosityBounceCount = 3;
+        static constexpr uint32_t kRadiosityBounceCount = config::lumen::RADIOSITY_BOUNCE_COUNT;
 
         // Reads the .cache file's header/tables, streams every cluster's 4 KB geometry page into
         // the physical pool (one staging buffer, one setup command buffer, one blocking submit --

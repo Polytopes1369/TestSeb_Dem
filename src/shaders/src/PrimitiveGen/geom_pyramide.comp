@@ -28,7 +28,7 @@ layout(std140, binding = 2) uniform Params
 
 void main()
 {
-    // Validation stricte des paramètres d'entrée
+    // Strict validation of input parameters
     if (width <= 0.0 || depth <= 0.0 || height <= 0.0 ||
         widthSegments == 0 || depthSegments == 0 || heightSegments == 0)
     {
@@ -37,7 +37,7 @@ void main()
 
     uint id = gl_GlobalInvocationID.x;
 
-    // Définition de la topologie des sommets
+    // Definition of vertex topology
     uint baseColumns = widthSegments + 1u;
     uint baseRows    = depthSegments + 1u;
     uint baseVertCount = baseColumns * baseRows;
@@ -52,7 +52,7 @@ void main()
 
     uint totalVerts = baseVertCount + 2u * sideZVerts + 2u * sideXVerts;
 
-    // Étape 1 : Génération des Sommets (uniquement si le thread correspond à un vertex valide)
+    // Step 1: Vertex Generation (only if the thread corresponds to a valid vertex)
     if (id < totalVerts)
     {
         Vertex v;
@@ -61,7 +61,7 @@ void main()
 
         if (id < baseVertCount)
         {
-            // --- BASE (Y = 0, orientée vers le bas) ---
+            // --- BASE (Y = 0, oriented downwards) ---
             uint col = id % baseColumns;
             uint row = id / baseColumns;
             float tx = float(col) / float(widthSegments);
@@ -73,28 +73,28 @@ void main()
         }
         else if (id < baseVertCount + sideZVerts)
         {
-            // --- FACE +Z (Pente vers le haut) ---
+            // --- +Z FACE (Sloped upwards) ---
             uint local = id - baseVertCount;
             uint col = local % sideZCols;
             uint row = local / sideZCols;
             float tx = float(col) / float(widthSegments);
             float ty = float(row) / float(heightSegments);
             
-            // Pincement linéaire des coordonnées X et Z vers l'apex
+            // Linear pinching of X and Z coordinates towards the apex
             float factor = 1.0 - ty;
             v.position = vec3(
                 mix(-width * 0.5, width * 0.5, tx) * factor,
                 ty * height,
                 (depth * 0.5) * factor
             );
-            // Calcul mathématique exact de la normale de la pente
+            // Exact mathematical calculation of the slope normal
             float slopeAngleX = atan(height, depth * 0.5);
             v.normal = normalize(vec3(0.0, cos(slopeAngleX), sin(slopeAngleX)));
             v.uv = vec2(tx, ty);
         }
         else if (id < baseVertCount + 2u * sideZVerts)
         {
-            // --- FACE -Z (Pente vers le haut) ---
+            // --- -Z FACE (Sloped upwards) ---
             uint local = id - (baseVertCount + sideZVerts);
             uint col = local % sideZCols;
             uint row = local / sideZCols;
@@ -113,7 +113,7 @@ void main()
         }
         else if (id < baseVertCount + 2u * sideZVerts + sideXVerts)
         {
-            // --- FACE +X (Pente vers le haut) ---
+            // --- +X FACE (Sloped upwards) ---
             uint local = id - (baseVertCount + 2u * sideZVerts);
             uint col = local % sideXCols;
             uint row = local / sideXCols;
@@ -132,7 +132,7 @@ void main()
         }
         else
         {
-            // --- FACE -X (Pente vers le haut) ---
+            // --- -X FACE (Sloped upwards) ---
             uint local = id - (baseVertCount + 2u * sideZVerts + sideXVerts);
             uint col = local % sideXCols;
             uint row = local / sideXCols;
@@ -155,12 +155,12 @@ void main()
         vertices[vertexOffset + id] = v;
     }
 
-    // Étape 2 : Génération des Indices (sécurisée par face pour éviter l'écriture hors-limites)
+    // Step 2: Index Generation (secured per face to prevent out-of-bounds writes)
     uint baseQuads = widthSegments * depthSegments;
     uint sideZQuads = widthSegments * heightSegments;
     uint sideXQuads = depthSegments * heightSegments;
 
-    // Indices Base (Uniquement si le thread gère un quad de la base)
+    // Base Indices (Only if the thread handles a base quad)
     if (id < baseQuads)
     {
         uint col = id % widthSegments;
@@ -171,7 +171,7 @@ void main()
         uint t1 = t0 + 1u;
         
         uint tIdx = indexOffset + id * 6u;
-        // Inversion de l'enroulement (CCW vu du dessous) pour éviter le culling
+        // Winding inversion (CCW seen from below) to prevent backface culling
         indices[tIdx + 0u] = vertexOffset + b0;
         indices[tIdx + 1u] = vertexOffset + t1;
         indices[tIdx + 2u] = vertexOffset + b1;

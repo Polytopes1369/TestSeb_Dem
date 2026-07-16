@@ -1,7 +1,7 @@
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
 #include "core/Logger.h"
-#include "renderer/VulkanContext.h"
+#include "renderer/vulkan/VulkanContext.h"
 #include "renderer/ClusterRenderPipeline.h"
 #include "core/maths/Maths.h"
 #include "core/Camera.h"

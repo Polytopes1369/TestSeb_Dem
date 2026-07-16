@@ -1,7 +1,7 @@
 #version 460
 
-// CORRIGÉ : On repasse sur 'rgba8' qui est le seul format 8-bits par canal 
-// reconnu nativement par le compilateur glslc
+// FIXED: Switch back to 'rgba8' which is the only 8-bit per channel format 
+// natively recognized by the glslc compiler
 layout(set = 0, binding = 0, rgba8) uniform writeonly image2D outputImage;
 
 layout(local_size_x = 16, local_size_y = 16) in;
@@ -11,7 +11,7 @@ void main() {
     ivec2 size = imageSize(outputImage);
 
     if (texelCoord.x < size.x && texelCoord.y < size.y) {
-        // Dégradé procédural
+        // Procedural gradient
         vec4 color = vec4(float(texelCoord.x) / size.x, float(texelCoord.y) / size.y, 0.5, 1.0);
         imageStore(outputImage, texelCoord, color);
     }

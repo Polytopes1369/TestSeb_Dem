@@ -12,8 +12,8 @@
 #include "core/Logger.h"
 #include "geometry/ClusterFormat.h"
 #include "io/CacheFileManager.h"
-#include "renderer/GpuBuffer.h"
-#include "renderer/VulkanUtils.h"
+#include "renderer/vulkan/GpuBuffer.h"
+#include "renderer/vulkan/VulkanUtils.h"
 
 namespace renderer {
 
@@ -1160,8 +1160,8 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
 
   // =========================================================================================
   // [12c] World Probe grid: fully rebuilt every frame from the Surface Cache radiance atlas
-  // [1z] already re-injected into this frame ("Propage l'éclairage du Surface Cache directement
-  // dans cette grille 3D à chaque frame") -- INTENDED as what dynamic/off-screen objects would
+  // [1z] already re-injected into this frame ("Propagate Surface Cache lighting directly
+  // into this 3D grid at each frame") -- INTENDED as what dynamic/off-screen objects would
   // sample for indirect light (world_probe_sampling.glsl's SampleWorldProbeGrid), since
   // m_ScreenProbeGI's screen-space probes only exist for on-screen pixels. Independent GPU work
   // from [12b] above (no data dependency either way), just recorded after it for locality with

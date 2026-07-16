@@ -224,7 +224,7 @@ namespace maths {
         float x = 0.0f;
         float y = 0.0f;
         float z = 0.0f;
-        float w = 1.0f; // Identité : w=1, x=y=z=0
+        float w = 1.0f; // Identity: w=1, x=y=z=0
 
         constexpr quat() = default;
         constexpr quat(float _x, float _y, float _z, float _w) : x(_x), y(_y), z(_z), w(_w) {}
