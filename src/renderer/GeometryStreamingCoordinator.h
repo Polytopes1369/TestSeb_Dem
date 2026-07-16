@@ -66,14 +66,21 @@ namespace renderer {
         // At most this many new disk reads are issued per frame (bounds this frame's I/O
         // submission cost, not the total number of misses -- excess misses simply wait in
         // geometry::StreamingRequestQueue for a future frame's budget).
-        static constexpr uint32_t kMaxNewReadsPerFrame = 8;
+        // Tuned for the original ~1-2K-cluster scene; config::FLOOR_VERTEX_SPACING = 0.5f raised
+        // the floor alone to ~5-9K clusters, and at the old budget of 4-8/frame full residency
+        // took thousands of frames (tens of seconds) to converge, reading as "holes that never
+        // load". Each unit of budget costs one kPageSizeBytes (4 KB) raw buffer and one staging-
+        // ring slot -- trivial (this jump costs ~224 KB of host memory total) -- so there is no
+        // capacity reason to keep these low; only I/O submission / command-recording cost per
+        // frame, which stays cheap even at this size for a local SSD-backed cache file.
+        static constexpr uint32_t kMaxNewReadsPerFrame = 64;
         // At most this many completed reads are bound/decompressed per frame (bounds this frame's
         // extra command-recording cost; a completed read that misses this budget just waits in
         // m_CompletedReads for the next frame -- it is never dropped).
-        static constexpr uint32_t kMaxPagesBoundPerFrame = 4;
+        static constexpr uint32_t kMaxPagesBoundPerFrame = 64;
         // Number of concurrent in-flight disk reads this coordinator allows -- also the size of
         // the raw aligned I/O destination buffer pool.
-        static constexpr uint32_t kMaxInFlightReads = 8;
+        static constexpr uint32_t kMaxInFlightReads = 64;
 
         // Opens `cacheFilePath` for async reads (geometry::AsyncFileStreamer) and copies
         // `indexEntries` (needed every frame to resolve a clusterID -> virtualAddress/bounds,
