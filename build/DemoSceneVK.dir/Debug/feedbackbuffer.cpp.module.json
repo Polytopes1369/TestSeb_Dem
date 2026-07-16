@@ -1,0 +1,14 @@
+{
+    "version": 1,
+    "revision": 0,
+    "rules": [
+        {
+            "primary-output": "DemoSceneVK.dir\\Debug\\FeedbackBuffer.obj",
+            "outputs": [
+                "D:\\DemoScene\\DemoScene_Vulkan2026_BaseArchi\\DemoScene_2026\\build\\DemoSceneVK.dir\\Debug\\vc145.pdb",
+                "DemoSceneVK.dir\\Debug\\"
+            ],
+            "requires": []
+        }
+    ]
+}

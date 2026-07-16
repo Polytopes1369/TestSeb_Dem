@@ -1,0 +1,13 @@
+{
+    "version": 1,
+    "revision": 0,
+    "rules": [
+        {
+            "primary-output": "ClusterDAGTests.dir\\Release\\MeshSimplifier.obj",
+            "outputs": [
+                "ClusterDAGTests.dir\\Release\\"
+            ],
+            "requires": []
+        }
+    ]
+}

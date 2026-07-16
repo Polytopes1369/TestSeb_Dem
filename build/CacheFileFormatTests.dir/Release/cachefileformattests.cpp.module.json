@@ -1,0 +1,13 @@
+{
+    "version": 1,
+    "revision": 0,
+    "rules": [
+        {
+            "primary-output": "CacheFileFormatTests.dir\\Release\\CacheFileFormatTests.obj",
+            "outputs": [
+                "CacheFileFormatTests.dir\\Release\\"
+            ],
+            "requires": []
+        }
+    ]
+}

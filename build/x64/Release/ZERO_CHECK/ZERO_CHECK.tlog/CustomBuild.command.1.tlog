@@ -1,0 +1,10 @@
+^D:\DEMOSCENE\DEMOSCENE_VULKAN2026_BASEARCHI\DEMOSCENE_2026\BUILD\CMAKEFILES\5BD29A4056886E992CF1763A54FA032F\GENERATE.STAMP.RULE
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -SD:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026 -BD:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build --check-stamp-list CMakeFiles/generate.stamp.list --vs-solution-file D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/DemoSceneVK.slnx
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd

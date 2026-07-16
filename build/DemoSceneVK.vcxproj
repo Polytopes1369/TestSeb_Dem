@@ -1,0 +1,1932 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" ToolsVersion="18.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup>
+    <PreferredToolArchitecture>x64</PreferredToolArchitecture>
+  </PropertyGroup>
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="MinSizeRel|x64">
+      <Configuration>MinSizeRel</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="RelWithDebInfo|x64">
+      <Configuration>RelWithDebInfo</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{D63394D4-E78E-32EF-A189-B4630F4406F3}</ProjectGuid>
+    <Keyword>Win32Proj</Keyword>
+    <WindowsTargetPlatformVersion>10.0.26100.0</WindowsTargetPlatformVersion>
+    <Platform>x64</Platform>
+    <ProjectName>DemoSceneVK</ProjectName>
+    <VCProjectUpgraderObjectName>NoUpgrade</VCProjectUpgraderObjectName>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <CharacterSet>MultiByte</CharacterSet>
+    <PlatformToolset>v145</PlatformToolset>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <CharacterSet>MultiByte</CharacterSet>
+    <PlatformToolset>v145</PlatformToolset>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='MinSizeRel|x64'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <CharacterSet>MultiByte</CharacterSet>
+    <PlatformToolset>v145</PlatformToolset>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='RelWithDebInfo|x64'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <CharacterSet>MultiByte</CharacterSet>
+    <PlatformToolset>v145</PlatformToolset>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="ExtensionSettings">
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <PropertyGroup Label="UserMacros" />
+  <PropertyGroup>
+    <_ProjectFileVersion>10.0.20506.1</_ProjectFileVersion>
+    <OutDir Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\Debug\</OutDir>
+    <IntDir Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">DemoSceneVK.dir\Debug\</IntDir>
+    <TargetName Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">DemoSceneVK</TargetName>
+    <TargetExt Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">.exe</TargetExt>
+    <LinkIncremental Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">true</LinkIncremental>
+    <GenerateManifest Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">true</GenerateManifest>
+    <OutDir Condition="'$(Configuration)|$(Platform)'=='Release|x64'">D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\Release\</OutDir>
+    <IntDir Condition="'$(Configuration)|$(Platform)'=='Release|x64'">DemoSceneVK.dir\Release\</IntDir>
+    <TargetName Condition="'$(Configuration)|$(Platform)'=='Release|x64'">DemoSceneVK</TargetName>
+    <TargetExt Condition="'$(Configuration)|$(Platform)'=='Release|x64'">.exe</TargetExt>
+    <LinkIncremental Condition="'$(Configuration)|$(Platform)'=='Release|x64'">false</LinkIncremental>
+    <GenerateManifest Condition="'$(Configuration)|$(Platform)'=='Release|x64'">true</GenerateManifest>
+    <OutDir Condition="'$(Configuration)|$(Platform)'=='MinSizeRel|x64'">D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\MinSizeRel\</OutDir>
+    <IntDir Condition="'$(Configuration)|$(Platform)'=='MinSizeRel|x64'">DemoSceneVK.dir\MinSizeRel\</IntDir>
+    <TargetName Condition="'$(Configuration)|$(Platform)'=='MinSizeRel|x64'">DemoSceneVK</TargetName>
+    <TargetExt Condition="'$(Configuration)|$(Platform)'=='MinSizeRel|x64'">.exe</TargetExt>
+    <LinkIncremental Condition="'$(Configuration)|$(Platform)'=='MinSizeRel|x64'">false</LinkIncremental>
+    <GenerateManifest Condition="'$(Configuration)|$(Platform)'=='MinSizeRel|x64'">true</GenerateManifest>
+    <OutDir Condition="'$(Configuration)|$(Platform)'=='RelWithDebInfo|x64'">D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\RelWithDebInfo\</OutDir>
+    <IntDir Condition="'$(Configuration)|$(Platform)'=='RelWithDebInfo|x64'">DemoSceneVK.dir\RelWithDebInfo\</IntDir>
+    <TargetName Condition="'$(Configuration)|$(Platform)'=='RelWithDebInfo|x64'">DemoSceneVK</TargetName>
+    <TargetExt Condition="'$(Configuration)|$(Platform)'=='RelWithDebInfo|x64'">.exe</TargetExt>
+    <LinkIncremental Condition="'$(Configuration)|$(Platform)'=='RelWithDebInfo|x64'">true</LinkIncremental>
+    <GenerateManifest Condition="'$(Configuration)|$(Platform)'=='RelWithDebInfo|x64'">true</GenerateManifest>
+  </PropertyGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <ClCompile>
+      <AdditionalIncludeDirectories>D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src;D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\vendor\vma;D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\vendor\glfw\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalOptions>%(AdditionalOptions) /external:I "C:/VulkanSDK/1.4.350.0/include"</AdditionalOptions>
+      <AssemblerListingLocation>$(IntDir)</AssemblerListingLocation>
+      <BasicRuntimeChecks>EnableFastChecks</BasicRuntimeChecks>
+      <BufferSecurityCheck></BufferSecurityCheck>
+      <CallingConvention></CallingConvention>
+      <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
+      <ExceptionHandling>Sync</ExceptionHandling>
+      <ExternalWarningLevel>TurnOffAllWarnings</ExternalWarningLevel>
+      <FloatingPointModel></FloatingPointModel>
+      <ForceConformanceInForLoopScope></ForceConformanceInForLoopScope>
+      <InlineFunctionExpansion>Disabled</InlineFunctionExpansion>
+      <LanguageStandard>stdcpplatest</LanguageStandard>
+      <MinimalRebuild></MinimalRebuild>
+      <Optimization>Disabled</Optimization>
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <RemoveUnreferencedCodeData></RemoveUnreferencedCodeData>
+      <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
+      <SupportJustMyCode></SupportJustMyCode>
+      <TreatWChar_tAsBuiltInType></TreatWChar_tAsBuiltInType>
+      <UseFullPaths>false</UseFullPaths>
+      <PreprocessorDefinitions>%(PreprocessorDefinitions);WIN32;_WINDOWS;CMAKE_INTDIR="Debug"</PreprocessorDefinitions>
+      <ObjectFileName>$(IntDir)</ObjectFileName>
+      <ScanSourceForModuleDependencies>true</ScanSourceForModuleDependencies>
+    </ClCompile>
+    <ResourceCompile>
+      <PreprocessorDefinitions>%(PreprocessorDefinitions);WIN32;_DEBUG;_WINDOWS;CMAKE_INTDIR=\"Debug\"</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src;D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\vendor\vma;D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\vendor\glfw\include;C:\VulkanSDK\1.4.350.0\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ResourceCompile>
+    <Midl>
+      <AdditionalIncludeDirectories>D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src;D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\vendor\vma;D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\vendor\glfw\include;C:\VulkanSDK\1.4.350.0\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <OutputDirectory>$(ProjectDir)/$(IntDir)</OutputDirectory>
+      <HeaderFileName>%(Filename).h</HeaderFileName>
+      <TypeLibraryName>%(Filename).tlb</TypeLibraryName>
+      <InterfaceIdentifierFileName>%(Filename)_i.c</InterfaceIdentifierFileName>
+      <ProxyFileName>%(Filename)_p.c</ProxyFileName>
+    </Midl>
+    <PostBuildEvent>
+      <Message>Deploying shader BuildDispatchIndirectArgs.comp.spv to executable directory	Deploying shader ClearVisBufferAtomic.comp.spv to executable directory	Deploying shader ClusterDAGScreenError.comp.spv to executable directory	Deploying shader ClusterFrustumCull.comp.spv to executable directory	Deploying shader ClusterHZBOcclusionCull.comp.spv to executable directory	Deploying shader ClusterLODCompact.comp.spv to executable directory	Deploying shader ClusterLODResidencyFallback.comp.spv to executable directory	Deploying shader ClusterResidencyCheck.comp.spv to executable directory	Deploying shader ClusterSoftwareRaster.comp.spv to executable directory	Deploying shader ClusterSoftwareRasterOpaque.comp.spv to executable directory	Deploying shader HZBBuildInit.comp.spv to executable directory	Deploying shader HZBReduce.comp.spv to executable directory	Deploying shader ComputeTriangleStats.comp.spv to executable directory	Deploying shader DebugText.frag.spv to executable directory	Deploying shader DebugText.vert.spv to executable directory	Deploying shader GlobalSDFComposite.comp.spv to executable directory	Deploying shader draw.comp.spv to executable directory	Deploying shader geom_TorusKnot.comp.spv to executable directory	Deploying shader geom_box.comp.spv to executable directory	Deploying shader geom_capsule.comp.spv to executable directory	Deploying shader geom_chamferBox.comp.spv to executable directory	Deploying shader geom_cone.comp.spv to executable directory	Deploying shader geom_cylinder.comp.spv to executable directory	Deploying shader geom_icosphere.comp.spv to executable directory	Deploying shader geom_plane.comp.spv to executable directory	Deploying shader geom_pyramide.comp.spv to executable directory	Deploying shader geom_sphere.comp.spv to executable directory	Deploying shader geom_torus.comp.spv to executable directory	Deploying shader geom_tube.comp.spv to executable directory	Deploying shader ClusterRaster.frag.spv to executable directory	Deploying shader ClusterRaster.vert.spv to executable directory	Deploying shader ClusterRasterOpaque.frag.spv to executable directory	Deploying shader ClusterResolve.comp.spv to executable directory	Deploying shader SurfaceCacheCapture.frag.spv to executable directory	Deploying shader SurfaceCacheCapture.vert.spv to executable directory	Deploying shader draw.frag.spv to executable directory	Deploying shader draw.vert.spv to executable directory	Deploying shader DecompressClusterIndices.comp.spv to executable directory	Deploying shader DecompressClusterVertices.comp.spv to executable directory	Deploying shader ProceduralMaskGenerate.comp.spv to executable directory</Message>
+      <Command>setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/BuildDispatchIndirectArgs.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Debug/shaders/BuildDispatchIndirectArgs.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/ClearVisBufferAtomic.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Debug/shaders/ClearVisBufferAtomic.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/ClusterDAGScreenError.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Debug/shaders/ClusterDAGScreenError.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/ClusterFrustumCull.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Debug/shaders/ClusterFrustumCull.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/ClusterHZBOcclusionCull.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Debug/shaders/ClusterHZBOcclusionCull.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/ClusterLODCompact.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Debug/shaders/ClusterLODCompact.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/ClusterLODResidencyFallback.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Debug/shaders/ClusterLODResidencyFallback.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/ClusterResidencyCheck.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Debug/shaders/ClusterResidencyCheck.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/ClusterSoftwareRaster.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Debug/shaders/ClusterSoftwareRaster.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/ClusterSoftwareRasterOpaque.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Debug/shaders/ClusterSoftwareRasterOpaque.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/HZBBuildInit.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Debug/shaders/HZBBuildInit.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/HZBReduce.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Debug/shaders/HZBReduce.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/ComputeTriangleStats.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Debug/shaders/ComputeTriangleStats.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/DebugText.frag.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Debug/shaders/DebugText.frag.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/DebugText.vert.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Debug/shaders/DebugText.vert.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/GlobalSDFComposite.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Debug/shaders/GlobalSDFComposite.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/draw.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Debug/shaders/draw.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/geom_TorusKnot.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Debug/shaders/geom_TorusKnot.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/geom_box.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Debug/shaders/geom_box.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/geom_capsule.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Debug/shaders/geom_capsule.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/geom_chamferBox.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Debug/shaders/geom_chamferBox.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/geom_cone.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Debug/shaders/geom_cone.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/geom_cylinder.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Debug/shaders/geom_cylinder.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/geom_icosphere.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Debug/shaders/geom_icosphere.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/geom_plane.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Debug/shaders/geom_plane.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/geom_pyramide.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Debug/shaders/geom_pyramide.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/geom_sphere.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Debug/shaders/geom_sphere.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/geom_torus.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Debug/shaders/geom_torus.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/geom_tube.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Debug/shaders/geom_tube.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/ClusterRaster.frag.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Debug/shaders/ClusterRaster.frag.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/ClusterRaster.vert.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Debug/shaders/ClusterRaster.vert.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/ClusterRasterOpaque.frag.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Debug/shaders/ClusterRasterOpaque.frag.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/ClusterResolve.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Debug/shaders/ClusterResolve.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/SurfaceCacheCapture.frag.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Debug/shaders/SurfaceCacheCapture.frag.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/SurfaceCacheCapture.vert.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Debug/shaders/SurfaceCacheCapture.vert.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/draw.frag.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Debug/shaders/draw.frag.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/draw.vert.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Debug/shaders/draw.vert.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/DecompressClusterIndices.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Debug/shaders/DecompressClusterIndices.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/DecompressClusterVertices.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Debug/shaders/DecompressClusterVertices.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/ProceduralMaskGenerate.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Debug/shaders/ProceduralMaskGenerate.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd</Command>
+    </PostBuildEvent>
+    <Link>
+      <AdditionalDependencies>vendor\glfw\src\Debug\glfw3.lib;C:\VulkanSDK\1.4.350.0\Lib\vulkan-1.lib;kernel32.lib;user32.lib;gdi32.lib;winspool.lib;shell32.lib;ole32.lib;oleaut32.lib;uuid.lib;comdlg32.lib;advapi32.lib</AdditionalDependencies>
+      <AdditionalLibraryDirectories>%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalOptions>%(AdditionalOptions) /machine:x64</AdditionalOptions>
+      <DataExecutionPrevention></DataExecutionPrevention>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <IgnoreSpecificDefaultLibraries>%(IgnoreSpecificDefaultLibraries)</IgnoreSpecificDefaultLibraries>
+      <ImageHasSafeExceptionHandlers></ImageHasSafeExceptionHandlers>
+      <ImportLibrary>D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Debug/DemoSceneVK.lib</ImportLibrary>
+      <LinkErrorReporting></LinkErrorReporting>
+      <ProgramDataBaseFile>D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Debug/DemoSceneVK.pdb</ProgramDataBaseFile>
+      <RandomizedBaseAddress></RandomizedBaseAddress>
+      <SubSystem>Console</SubSystem>
+    </Link>
+    <ProjectReference>
+      <LinkLibraryDependencies>false</LinkLibraryDependencies>
+    </ProjectReference>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <ClCompile>
+      <AdditionalIncludeDirectories>D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src;D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\vendor\vma;D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\vendor\glfw\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalOptions>%(AdditionalOptions) /external:I "C:/VulkanSDK/1.4.350.0/include"</AdditionalOptions>
+      <AssemblerListingLocation>$(IntDir)</AssemblerListingLocation>
+      <BasicRuntimeChecks>Default</BasicRuntimeChecks>
+      <BufferSecurityCheck></BufferSecurityCheck>
+      <CallingConvention></CallingConvention>
+      <ExceptionHandling>Sync</ExceptionHandling>
+      <ExternalWarningLevel>TurnOffAllWarnings</ExternalWarningLevel>
+      <FloatingPointModel></FloatingPointModel>
+      <ForceConformanceInForLoopScope></ForceConformanceInForLoopScope>
+      <InlineFunctionExpansion>AnySuitable</InlineFunctionExpansion>
+      <LanguageStandard>stdcpplatest</LanguageStandard>
+      <MinimalRebuild></MinimalRebuild>
+      <Optimization>MaxSpeed</Optimization>
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <RemoveUnreferencedCodeData></RemoveUnreferencedCodeData>
+      <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
+      <SupportJustMyCode></SupportJustMyCode>
+      <TreatWChar_tAsBuiltInType></TreatWChar_tAsBuiltInType>
+      <UseFullPaths>false</UseFullPaths>
+      <PreprocessorDefinitions>%(PreprocessorDefinitions);WIN32;_WINDOWS;NDEBUG;CMAKE_INTDIR="Release"</PreprocessorDefinitions>
+      <ObjectFileName>$(IntDir)</ObjectFileName>
+      <DebugInformationFormat>
+      </DebugInformationFormat>
+      <ScanSourceForModuleDependencies>true</ScanSourceForModuleDependencies>
+    </ClCompile>
+    <ResourceCompile>
+      <PreprocessorDefinitions>%(PreprocessorDefinitions);WIN32;_WINDOWS;NDEBUG;CMAKE_INTDIR=\"Release\"</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src;D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\vendor\vma;D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\vendor\glfw\include;C:\VulkanSDK\1.4.350.0\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ResourceCompile>
+    <Midl>
+      <AdditionalIncludeDirectories>D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src;D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\vendor\vma;D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\vendor\glfw\include;C:\VulkanSDK\1.4.350.0\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <OutputDirectory>$(ProjectDir)/$(IntDir)</OutputDirectory>
+      <HeaderFileName>%(Filename).h</HeaderFileName>
+      <TypeLibraryName>%(Filename).tlb</TypeLibraryName>
+      <InterfaceIdentifierFileName>%(Filename)_i.c</InterfaceIdentifierFileName>
+      <ProxyFileName>%(Filename)_p.c</ProxyFileName>
+    </Midl>
+    <PostBuildEvent>
+      <Message>Deploying shader BuildDispatchIndirectArgs.comp.spv to executable directory	Deploying shader ClearVisBufferAtomic.comp.spv to executable directory	Deploying shader ClusterDAGScreenError.comp.spv to executable directory	Deploying shader ClusterFrustumCull.comp.spv to executable directory	Deploying shader ClusterHZBOcclusionCull.comp.spv to executable directory	Deploying shader ClusterLODCompact.comp.spv to executable directory	Deploying shader ClusterLODResidencyFallback.comp.spv to executable directory	Deploying shader ClusterResidencyCheck.comp.spv to executable directory	Deploying shader ClusterSoftwareRaster.comp.spv to executable directory	Deploying shader ClusterSoftwareRasterOpaque.comp.spv to executable directory	Deploying shader HZBBuildInit.comp.spv to executable directory	Deploying shader HZBReduce.comp.spv to executable directory	Deploying shader ComputeTriangleStats.comp.spv to executable directory	Deploying shader DebugText.frag.spv to executable directory	Deploying shader DebugText.vert.spv to executable directory	Deploying shader GlobalSDFComposite.comp.spv to executable directory	Deploying shader draw.comp.spv to executable directory	Deploying shader geom_TorusKnot.comp.spv to executable directory	Deploying shader geom_box.comp.spv to executable directory	Deploying shader geom_capsule.comp.spv to executable directory	Deploying shader geom_chamferBox.comp.spv to executable directory	Deploying shader geom_cone.comp.spv to executable directory	Deploying shader geom_cylinder.comp.spv to executable directory	Deploying shader geom_icosphere.comp.spv to executable directory	Deploying shader geom_plane.comp.spv to executable directory	Deploying shader geom_pyramide.comp.spv to executable directory	Deploying shader geom_sphere.comp.spv to executable directory	Deploying shader geom_torus.comp.spv to executable directory	Deploying shader geom_tube.comp.spv to executable directory	Deploying shader ClusterRaster.frag.spv to executable directory	Deploying shader ClusterRaster.vert.spv to executable directory	Deploying shader ClusterRasterOpaque.frag.spv to executable directory	Deploying shader ClusterResolve.comp.spv to executable directory	Deploying shader SurfaceCacheCapture.frag.spv to executable directory	Deploying shader SurfaceCacheCapture.vert.spv to executable directory	Deploying shader draw.frag.spv to executable directory	Deploying shader draw.vert.spv to executable directory	Deploying shader DecompressClusterIndices.comp.spv to executable directory	Deploying shader DecompressClusterVertices.comp.spv to executable directory	Deploying shader ProceduralMaskGenerate.comp.spv to executable directory</Message>
+      <Command>setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/BuildDispatchIndirectArgs.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Release/shaders/BuildDispatchIndirectArgs.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/ClearVisBufferAtomic.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Release/shaders/ClearVisBufferAtomic.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/ClusterDAGScreenError.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Release/shaders/ClusterDAGScreenError.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/ClusterFrustumCull.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Release/shaders/ClusterFrustumCull.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/ClusterHZBOcclusionCull.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Release/shaders/ClusterHZBOcclusionCull.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/ClusterLODCompact.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Release/shaders/ClusterLODCompact.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/ClusterLODResidencyFallback.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Release/shaders/ClusterLODResidencyFallback.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/ClusterResidencyCheck.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Release/shaders/ClusterResidencyCheck.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/ClusterSoftwareRaster.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Release/shaders/ClusterSoftwareRaster.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/ClusterSoftwareRasterOpaque.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Release/shaders/ClusterSoftwareRasterOpaque.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/HZBBuildInit.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Release/shaders/HZBBuildInit.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/HZBReduce.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Release/shaders/HZBReduce.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/ComputeTriangleStats.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Release/shaders/ComputeTriangleStats.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/DebugText.frag.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Release/shaders/DebugText.frag.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/DebugText.vert.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Release/shaders/DebugText.vert.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/GlobalSDFComposite.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Release/shaders/GlobalSDFComposite.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/draw.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Release/shaders/draw.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/geom_TorusKnot.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Release/shaders/geom_TorusKnot.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/geom_box.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Release/shaders/geom_box.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/geom_capsule.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Release/shaders/geom_capsule.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/geom_chamferBox.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Release/shaders/geom_chamferBox.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/geom_cone.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Release/shaders/geom_cone.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/geom_cylinder.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Release/shaders/geom_cylinder.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/geom_icosphere.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Release/shaders/geom_icosphere.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/geom_plane.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Release/shaders/geom_plane.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/geom_pyramide.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Release/shaders/geom_pyramide.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/geom_sphere.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Release/shaders/geom_sphere.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/geom_torus.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Release/shaders/geom_torus.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/geom_tube.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Release/shaders/geom_tube.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/ClusterRaster.frag.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Release/shaders/ClusterRaster.frag.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/ClusterRaster.vert.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Release/shaders/ClusterRaster.vert.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/ClusterRasterOpaque.frag.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Release/shaders/ClusterRasterOpaque.frag.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/ClusterResolve.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Release/shaders/ClusterResolve.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/SurfaceCacheCapture.frag.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Release/shaders/SurfaceCacheCapture.frag.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/SurfaceCacheCapture.vert.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Release/shaders/SurfaceCacheCapture.vert.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/draw.frag.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Release/shaders/draw.frag.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/draw.vert.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Release/shaders/draw.vert.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/DecompressClusterIndices.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Release/shaders/DecompressClusterIndices.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/DecompressClusterVertices.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Release/shaders/DecompressClusterVertices.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/ProceduralMaskGenerate.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Release/shaders/ProceduralMaskGenerate.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd</Command>
+    </PostBuildEvent>
+    <Link>
+      <AdditionalDependencies>vendor\glfw\src\Release\glfw3.lib;C:\VulkanSDK\1.4.350.0\Lib\vulkan-1.lib;kernel32.lib;user32.lib;gdi32.lib;winspool.lib;shell32.lib;ole32.lib;oleaut32.lib;uuid.lib;comdlg32.lib;advapi32.lib</AdditionalDependencies>
+      <AdditionalLibraryDirectories>%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalOptions>%(AdditionalOptions) /machine:x64</AdditionalOptions>
+      <DataExecutionPrevention></DataExecutionPrevention>
+      <GenerateDebugInformation>false</GenerateDebugInformation>
+      <IgnoreSpecificDefaultLibraries>%(IgnoreSpecificDefaultLibraries)</IgnoreSpecificDefaultLibraries>
+      <ImageHasSafeExceptionHandlers></ImageHasSafeExceptionHandlers>
+      <ImportLibrary>D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Release/DemoSceneVK.lib</ImportLibrary>
+      <LinkErrorReporting></LinkErrorReporting>
+      <ProgramDataBaseFile>D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Release/DemoSceneVK.pdb</ProgramDataBaseFile>
+      <RandomizedBaseAddress></RandomizedBaseAddress>
+      <SubSystem>Console</SubSystem>
+    </Link>
+    <ProjectReference>
+      <LinkLibraryDependencies>false</LinkLibraryDependencies>
+    </ProjectReference>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='MinSizeRel|x64'">
+    <ClCompile>
+      <AdditionalIncludeDirectories>D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src;D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\vendor\vma;D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\vendor\glfw\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalOptions>%(AdditionalOptions) /external:I "C:/VulkanSDK/1.4.350.0/include"</AdditionalOptions>
+      <AssemblerListingLocation>$(IntDir)</AssemblerListingLocation>
+      <BasicRuntimeChecks>Default</BasicRuntimeChecks>
+      <BufferSecurityCheck></BufferSecurityCheck>
+      <CallingConvention></CallingConvention>
+      <ExceptionHandling>Sync</ExceptionHandling>
+      <ExternalWarningLevel>TurnOffAllWarnings</ExternalWarningLevel>
+      <FloatingPointModel></FloatingPointModel>
+      <ForceConformanceInForLoopScope></ForceConformanceInForLoopScope>
+      <InlineFunctionExpansion>OnlyExplicitInline</InlineFunctionExpansion>
+      <LanguageStandard>stdcpplatest</LanguageStandard>
+      <MinimalRebuild></MinimalRebuild>
+      <Optimization>MinSpace</Optimization>
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <RemoveUnreferencedCodeData></RemoveUnreferencedCodeData>
+      <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
+      <SupportJustMyCode></SupportJustMyCode>
+      <TreatWChar_tAsBuiltInType></TreatWChar_tAsBuiltInType>
+      <UseFullPaths>false</UseFullPaths>
+      <PreprocessorDefinitions>%(PreprocessorDefinitions);WIN32;_WINDOWS;NDEBUG;CMAKE_INTDIR="MinSizeRel"</PreprocessorDefinitions>
+      <ObjectFileName>$(IntDir)</ObjectFileName>
+      <DebugInformationFormat>
+      </DebugInformationFormat>
+      <ScanSourceForModuleDependencies>true</ScanSourceForModuleDependencies>
+    </ClCompile>
+    <ResourceCompile>
+      <PreprocessorDefinitions>%(PreprocessorDefinitions);WIN32;_WINDOWS;NDEBUG;CMAKE_INTDIR=\"MinSizeRel\"</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src;D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\vendor\vma;D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\vendor\glfw\include;C:\VulkanSDK\1.4.350.0\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ResourceCompile>
+    <Midl>
+      <AdditionalIncludeDirectories>D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src;D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\vendor\vma;D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\vendor\glfw\include;C:\VulkanSDK\1.4.350.0\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <OutputDirectory>$(ProjectDir)/$(IntDir)</OutputDirectory>
+      <HeaderFileName>%(Filename).h</HeaderFileName>
+      <TypeLibraryName>%(Filename).tlb</TypeLibraryName>
+      <InterfaceIdentifierFileName>%(Filename)_i.c</InterfaceIdentifierFileName>
+      <ProxyFileName>%(Filename)_p.c</ProxyFileName>
+    </Midl>
+    <PostBuildEvent>
+      <Message>Deploying shader BuildDispatchIndirectArgs.comp.spv to executable directory	Deploying shader ClearVisBufferAtomic.comp.spv to executable directory	Deploying shader ClusterDAGScreenError.comp.spv to executable directory	Deploying shader ClusterFrustumCull.comp.spv to executable directory	Deploying shader ClusterHZBOcclusionCull.comp.spv to executable directory	Deploying shader ClusterLODCompact.comp.spv to executable directory	Deploying shader ClusterLODResidencyFallback.comp.spv to executable directory	Deploying shader ClusterResidencyCheck.comp.spv to executable directory	Deploying shader ClusterSoftwareRaster.comp.spv to executable directory	Deploying shader ClusterSoftwareRasterOpaque.comp.spv to executable directory	Deploying shader HZBBuildInit.comp.spv to executable directory	Deploying shader HZBReduce.comp.spv to executable directory	Deploying shader ComputeTriangleStats.comp.spv to executable directory	Deploying shader DebugText.frag.spv to executable directory	Deploying shader DebugText.vert.spv to executable directory	Deploying shader GlobalSDFComposite.comp.spv to executable directory	Deploying shader draw.comp.spv to executable directory	Deploying shader geom_TorusKnot.comp.spv to executable directory	Deploying shader geom_box.comp.spv to executable directory	Deploying shader geom_capsule.comp.spv to executable directory	Deploying shader geom_chamferBox.comp.spv to executable directory	Deploying shader geom_cone.comp.spv to executable directory	Deploying shader geom_cylinder.comp.spv to executable directory	Deploying shader geom_icosphere.comp.spv to executable directory	Deploying shader geom_plane.comp.spv to executable directory	Deploying shader geom_pyramide.comp.spv to executable directory	Deploying shader geom_sphere.comp.spv to executable directory	Deploying shader geom_torus.comp.spv to executable directory	Deploying shader geom_tube.comp.spv to executable directory	Deploying shader ClusterRaster.frag.spv to executable directory	Deploying shader ClusterRaster.vert.spv to executable directory	Deploying shader ClusterRasterOpaque.frag.spv to executable directory	Deploying shader ClusterResolve.comp.spv to executable directory	Deploying shader SurfaceCacheCapture.frag.spv to executable directory	Deploying shader SurfaceCacheCapture.vert.spv to executable directory	Deploying shader draw.frag.spv to executable directory	Deploying shader draw.vert.spv to executable directory	Deploying shader DecompressClusterIndices.comp.spv to executable directory	Deploying shader DecompressClusterVertices.comp.spv to executable directory	Deploying shader ProceduralMaskGenerate.comp.spv to executable directory</Message>
+      <Command>setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/BuildDispatchIndirectArgs.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/MinSizeRel/shaders/BuildDispatchIndirectArgs.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/ClearVisBufferAtomic.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/MinSizeRel/shaders/ClearVisBufferAtomic.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/ClusterDAGScreenError.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/MinSizeRel/shaders/ClusterDAGScreenError.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/ClusterFrustumCull.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/MinSizeRel/shaders/ClusterFrustumCull.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/ClusterHZBOcclusionCull.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/MinSizeRel/shaders/ClusterHZBOcclusionCull.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/ClusterLODCompact.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/MinSizeRel/shaders/ClusterLODCompact.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/ClusterLODResidencyFallback.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/MinSizeRel/shaders/ClusterLODResidencyFallback.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/ClusterResidencyCheck.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/MinSizeRel/shaders/ClusterResidencyCheck.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/ClusterSoftwareRaster.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/MinSizeRel/shaders/ClusterSoftwareRaster.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/ClusterSoftwareRasterOpaque.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/MinSizeRel/shaders/ClusterSoftwareRasterOpaque.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/HZBBuildInit.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/MinSizeRel/shaders/HZBBuildInit.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/HZBReduce.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/MinSizeRel/shaders/HZBReduce.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/ComputeTriangleStats.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/MinSizeRel/shaders/ComputeTriangleStats.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/DebugText.frag.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/MinSizeRel/shaders/DebugText.frag.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/DebugText.vert.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/MinSizeRel/shaders/DebugText.vert.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/GlobalSDFComposite.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/MinSizeRel/shaders/GlobalSDFComposite.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/draw.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/MinSizeRel/shaders/draw.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/geom_TorusKnot.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/MinSizeRel/shaders/geom_TorusKnot.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/geom_box.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/MinSizeRel/shaders/geom_box.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/geom_capsule.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/MinSizeRel/shaders/geom_capsule.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/geom_chamferBox.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/MinSizeRel/shaders/geom_chamferBox.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/geom_cone.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/MinSizeRel/shaders/geom_cone.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/geom_cylinder.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/MinSizeRel/shaders/geom_cylinder.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/geom_icosphere.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/MinSizeRel/shaders/geom_icosphere.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/geom_plane.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/MinSizeRel/shaders/geom_plane.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/geom_pyramide.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/MinSizeRel/shaders/geom_pyramide.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/geom_sphere.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/MinSizeRel/shaders/geom_sphere.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/geom_torus.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/MinSizeRel/shaders/geom_torus.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/geom_tube.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/MinSizeRel/shaders/geom_tube.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/ClusterRaster.frag.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/MinSizeRel/shaders/ClusterRaster.frag.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/ClusterRaster.vert.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/MinSizeRel/shaders/ClusterRaster.vert.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/ClusterRasterOpaque.frag.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/MinSizeRel/shaders/ClusterRasterOpaque.frag.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/ClusterResolve.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/MinSizeRel/shaders/ClusterResolve.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/SurfaceCacheCapture.frag.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/MinSizeRel/shaders/SurfaceCacheCapture.frag.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/SurfaceCacheCapture.vert.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/MinSizeRel/shaders/SurfaceCacheCapture.vert.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/draw.frag.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/MinSizeRel/shaders/draw.frag.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/draw.vert.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/MinSizeRel/shaders/draw.vert.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/DecompressClusterIndices.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/MinSizeRel/shaders/DecompressClusterIndices.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/DecompressClusterVertices.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/MinSizeRel/shaders/DecompressClusterVertices.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/ProceduralMaskGenerate.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/MinSizeRel/shaders/ProceduralMaskGenerate.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd</Command>
+    </PostBuildEvent>
+    <Link>
+      <AdditionalDependencies>vendor\glfw\src\MinSizeRel\glfw3.lib;C:\VulkanSDK\1.4.350.0\Lib\vulkan-1.lib;kernel32.lib;user32.lib;gdi32.lib;winspool.lib;shell32.lib;ole32.lib;oleaut32.lib;uuid.lib;comdlg32.lib;advapi32.lib</AdditionalDependencies>
+      <AdditionalLibraryDirectories>%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalOptions>%(AdditionalOptions) /machine:x64</AdditionalOptions>
+      <DataExecutionPrevention></DataExecutionPrevention>
+      <GenerateDebugInformation>false</GenerateDebugInformation>
+      <IgnoreSpecificDefaultLibraries>%(IgnoreSpecificDefaultLibraries)</IgnoreSpecificDefaultLibraries>
+      <ImageHasSafeExceptionHandlers></ImageHasSafeExceptionHandlers>
+      <ImportLibrary>D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/MinSizeRel/DemoSceneVK.lib</ImportLibrary>
+      <LinkErrorReporting></LinkErrorReporting>
+      <ProgramDataBaseFile>D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/MinSizeRel/DemoSceneVK.pdb</ProgramDataBaseFile>
+      <RandomizedBaseAddress></RandomizedBaseAddress>
+      <SubSystem>Console</SubSystem>
+    </Link>
+    <ProjectReference>
+      <LinkLibraryDependencies>false</LinkLibraryDependencies>
+    </ProjectReference>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='RelWithDebInfo|x64'">
+    <ClCompile>
+      <AdditionalIncludeDirectories>D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src;D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\vendor\vma;D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\vendor\glfw\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalOptions>%(AdditionalOptions) /external:I "C:/VulkanSDK/1.4.350.0/include"</AdditionalOptions>
+      <AssemblerListingLocation>$(IntDir)</AssemblerListingLocation>
+      <BasicRuntimeChecks>Default</BasicRuntimeChecks>
+      <BufferSecurityCheck></BufferSecurityCheck>
+      <CallingConvention></CallingConvention>
+      <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
+      <ExceptionHandling>Sync</ExceptionHandling>
+      <ExternalWarningLevel>TurnOffAllWarnings</ExternalWarningLevel>
+      <FloatingPointModel></FloatingPointModel>
+      <ForceConformanceInForLoopScope></ForceConformanceInForLoopScope>
+      <InlineFunctionExpansion>OnlyExplicitInline</InlineFunctionExpansion>
+      <LanguageStandard>stdcpplatest</LanguageStandard>
+      <MinimalRebuild></MinimalRebuild>
+      <Optimization>MaxSpeed</Optimization>
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <RemoveUnreferencedCodeData></RemoveUnreferencedCodeData>
+      <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
+      <SupportJustMyCode></SupportJustMyCode>
+      <TreatWChar_tAsBuiltInType></TreatWChar_tAsBuiltInType>
+      <UseFullPaths>false</UseFullPaths>
+      <PreprocessorDefinitions>%(PreprocessorDefinitions);WIN32;_WINDOWS;NDEBUG;CMAKE_INTDIR="RelWithDebInfo"</PreprocessorDefinitions>
+      <ObjectFileName>$(IntDir)</ObjectFileName>
+      <ScanSourceForModuleDependencies>true</ScanSourceForModuleDependencies>
+    </ClCompile>
+    <ResourceCompile>
+      <PreprocessorDefinitions>%(PreprocessorDefinitions);WIN32;_WINDOWS;NDEBUG;CMAKE_INTDIR=\"RelWithDebInfo\"</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src;D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\vendor\vma;D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\vendor\glfw\include;C:\VulkanSDK\1.4.350.0\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ResourceCompile>
+    <Midl>
+      <AdditionalIncludeDirectories>D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src;D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\vendor\vma;D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\vendor\glfw\include;C:\VulkanSDK\1.4.350.0\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <OutputDirectory>$(ProjectDir)/$(IntDir)</OutputDirectory>
+      <HeaderFileName>%(Filename).h</HeaderFileName>
+      <TypeLibraryName>%(Filename).tlb</TypeLibraryName>
+      <InterfaceIdentifierFileName>%(Filename)_i.c</InterfaceIdentifierFileName>
+      <ProxyFileName>%(Filename)_p.c</ProxyFileName>
+    </Midl>
+    <PostBuildEvent>
+      <Message>Deploying shader BuildDispatchIndirectArgs.comp.spv to executable directory	Deploying shader ClearVisBufferAtomic.comp.spv to executable directory	Deploying shader ClusterDAGScreenError.comp.spv to executable directory	Deploying shader ClusterFrustumCull.comp.spv to executable directory	Deploying shader ClusterHZBOcclusionCull.comp.spv to executable directory	Deploying shader ClusterLODCompact.comp.spv to executable directory	Deploying shader ClusterLODResidencyFallback.comp.spv to executable directory	Deploying shader ClusterResidencyCheck.comp.spv to executable directory	Deploying shader ClusterSoftwareRaster.comp.spv to executable directory	Deploying shader ClusterSoftwareRasterOpaque.comp.spv to executable directory	Deploying shader HZBBuildInit.comp.spv to executable directory	Deploying shader HZBReduce.comp.spv to executable directory	Deploying shader ComputeTriangleStats.comp.spv to executable directory	Deploying shader DebugText.frag.spv to executable directory	Deploying shader DebugText.vert.spv to executable directory	Deploying shader GlobalSDFComposite.comp.spv to executable directory	Deploying shader draw.comp.spv to executable directory	Deploying shader geom_TorusKnot.comp.spv to executable directory	Deploying shader geom_box.comp.spv to executable directory	Deploying shader geom_capsule.comp.spv to executable directory	Deploying shader geom_chamferBox.comp.spv to executable directory	Deploying shader geom_cone.comp.spv to executable directory	Deploying shader geom_cylinder.comp.spv to executable directory	Deploying shader geom_icosphere.comp.spv to executable directory	Deploying shader geom_plane.comp.spv to executable directory	Deploying shader geom_pyramide.comp.spv to executable directory	Deploying shader geom_sphere.comp.spv to executable directory	Deploying shader geom_torus.comp.spv to executable directory	Deploying shader geom_tube.comp.spv to executable directory	Deploying shader ClusterRaster.frag.spv to executable directory	Deploying shader ClusterRaster.vert.spv to executable directory	Deploying shader ClusterRasterOpaque.frag.spv to executable directory	Deploying shader ClusterResolve.comp.spv to executable directory	Deploying shader SurfaceCacheCapture.frag.spv to executable directory	Deploying shader SurfaceCacheCapture.vert.spv to executable directory	Deploying shader draw.frag.spv to executable directory	Deploying shader draw.vert.spv to executable directory	Deploying shader DecompressClusterIndices.comp.spv to executable directory	Deploying shader DecompressClusterVertices.comp.spv to executable directory	Deploying shader ProceduralMaskGenerate.comp.spv to executable directory</Message>
+      <Command>setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/BuildDispatchIndirectArgs.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/RelWithDebInfo/shaders/BuildDispatchIndirectArgs.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/ClearVisBufferAtomic.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/RelWithDebInfo/shaders/ClearVisBufferAtomic.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/ClusterDAGScreenError.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/RelWithDebInfo/shaders/ClusterDAGScreenError.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/ClusterFrustumCull.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/RelWithDebInfo/shaders/ClusterFrustumCull.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/ClusterHZBOcclusionCull.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/RelWithDebInfo/shaders/ClusterHZBOcclusionCull.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/ClusterLODCompact.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/RelWithDebInfo/shaders/ClusterLODCompact.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/ClusterLODResidencyFallback.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/RelWithDebInfo/shaders/ClusterLODResidencyFallback.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/ClusterResidencyCheck.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/RelWithDebInfo/shaders/ClusterResidencyCheck.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/ClusterSoftwareRaster.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/RelWithDebInfo/shaders/ClusterSoftwareRaster.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/ClusterSoftwareRasterOpaque.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/RelWithDebInfo/shaders/ClusterSoftwareRasterOpaque.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/HZBBuildInit.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/RelWithDebInfo/shaders/HZBBuildInit.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/HZBReduce.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/RelWithDebInfo/shaders/HZBReduce.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/ComputeTriangleStats.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/RelWithDebInfo/shaders/ComputeTriangleStats.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/DebugText.frag.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/RelWithDebInfo/shaders/DebugText.frag.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/DebugText.vert.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/RelWithDebInfo/shaders/DebugText.vert.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/GlobalSDFComposite.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/RelWithDebInfo/shaders/GlobalSDFComposite.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/draw.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/RelWithDebInfo/shaders/draw.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/geom_TorusKnot.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/RelWithDebInfo/shaders/geom_TorusKnot.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/geom_box.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/RelWithDebInfo/shaders/geom_box.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/geom_capsule.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/RelWithDebInfo/shaders/geom_capsule.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/geom_chamferBox.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/RelWithDebInfo/shaders/geom_chamferBox.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/geom_cone.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/RelWithDebInfo/shaders/geom_cone.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/geom_cylinder.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/RelWithDebInfo/shaders/geom_cylinder.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/geom_icosphere.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/RelWithDebInfo/shaders/geom_icosphere.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/geom_plane.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/RelWithDebInfo/shaders/geom_plane.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/geom_pyramide.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/RelWithDebInfo/shaders/geom_pyramide.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/geom_sphere.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/RelWithDebInfo/shaders/geom_sphere.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/geom_torus.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/RelWithDebInfo/shaders/geom_torus.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/geom_tube.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/RelWithDebInfo/shaders/geom_tube.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/ClusterRaster.frag.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/RelWithDebInfo/shaders/ClusterRaster.frag.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/ClusterRaster.vert.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/RelWithDebInfo/shaders/ClusterRaster.vert.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/ClusterRasterOpaque.frag.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/RelWithDebInfo/shaders/ClusterRasterOpaque.frag.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/ClusterResolve.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/RelWithDebInfo/shaders/ClusterResolve.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/SurfaceCacheCapture.frag.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/RelWithDebInfo/shaders/SurfaceCacheCapture.frag.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/SurfaceCacheCapture.vert.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/RelWithDebInfo/shaders/SurfaceCacheCapture.vert.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/draw.frag.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/RelWithDebInfo/shaders/draw.frag.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/draw.vert.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/RelWithDebInfo/shaders/draw.vert.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/DecompressClusterIndices.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/RelWithDebInfo/shaders/DecompressClusterIndices.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/DecompressClusterVertices.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/RelWithDebInfo/shaders/DecompressClusterVertices.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/ProceduralMaskGenerate.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/RelWithDebInfo/shaders/ProceduralMaskGenerate.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd</Command>
+    </PostBuildEvent>
+    <Link>
+      <AdditionalDependencies>vendor\glfw\src\RelWithDebInfo\glfw3.lib;C:\VulkanSDK\1.4.350.0\Lib\vulkan-1.lib;kernel32.lib;user32.lib;gdi32.lib;winspool.lib;shell32.lib;ole32.lib;oleaut32.lib;uuid.lib;comdlg32.lib;advapi32.lib</AdditionalDependencies>
+      <AdditionalLibraryDirectories>%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalOptions>%(AdditionalOptions) /machine:x64</AdditionalOptions>
+      <DataExecutionPrevention></DataExecutionPrevention>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <IgnoreSpecificDefaultLibraries>%(IgnoreSpecificDefaultLibraries)</IgnoreSpecificDefaultLibraries>
+      <ImageHasSafeExceptionHandlers></ImageHasSafeExceptionHandlers>
+      <ImportLibrary>D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/RelWithDebInfo/DemoSceneVK.lib</ImportLibrary>
+      <LinkErrorReporting></LinkErrorReporting>
+      <ProgramDataBaseFile>D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/RelWithDebInfo/DemoSceneVK.pdb</ProgramDataBaseFile>
+      <RandomizedBaseAddress></RandomizedBaseAddress>
+      <SubSystem>Console</SubSystem>
+    </Link>
+    <ProjectReference>
+      <LinkLibraryDependencies>false</LinkLibraryDependencies>
+    </ProjectReference>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <CustomBuild Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\CMakeLists.txt">
+      <UseUtf8Encoding>Always</UseUtf8Encoding>
+      <Message Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">Building Custom Rule D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/CMakeLists.txt</Message>
+      <Command Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -SD:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026 -BD:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build --check-stamp-file D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/CMakeFiles/generate.stamp
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd</Command>
+      <AdditionalInputs Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">C:\Program Files\CMake\share\cmake-4.4\Modules\CMakeCXXInformation.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\CMakeCommonLanguageInclude.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\CMakeGenericSystem.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\CMakeInitializeConfigs.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\CMakeLanguageInformation.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\CMakeRCInformation.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\CMakeSystemSpecificInformation.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\CMakeSystemSpecificInitialize.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\Compiler\CMakeCommonCompilerMacros.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\Compiler\MSVC-CXX.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\Compiler\MSVC.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\FindPackageHandleStandardArgs.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\FindPackageMessage.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\FindVulkan.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\Internal\CMakeCXXLinkerInformation.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\Internal\CMakeCommonLinkerInformation.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\Linker\MSVC-CXX.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\Linker\MSVC.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\Platform\Linker\Windows-MSVC-CXX.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\Platform\Linker\Windows-MSVC.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\Platform\Windows-Initialize.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\Platform\Windows-MSVC-CXX.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\Platform\Windows-MSVC.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\Platform\Windows.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\Platform\WindowsPaths.cmake;D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\CMakeFiles\4.4.0\CMakeCXXCompiler.cmake;D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\CMakeFiles\4.4.0\CMakeRCCompiler.cmake;D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\CMakeFiles\4.4.0\CMakeSystem.cmake;D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\CMakeFiles\cmake.verify_globs;%(AdditionalInputs)</AdditionalInputs>
+      <Outputs Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\CMakeFiles\generate.stamp</Outputs>
+      <LinkObjects Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">false</LinkObjects>
+      <Message Condition="'$(Configuration)|$(Platform)'=='Release|x64'">Building Custom Rule D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/CMakeLists.txt</Message>
+      <Command Condition="'$(Configuration)|$(Platform)'=='Release|x64'">setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -SD:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026 -BD:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build --check-stamp-file D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/CMakeFiles/generate.stamp
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd</Command>
+      <AdditionalInputs Condition="'$(Configuration)|$(Platform)'=='Release|x64'">C:\Program Files\CMake\share\cmake-4.4\Modules\CMakeCXXInformation.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\CMakeCommonLanguageInclude.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\CMakeGenericSystem.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\CMakeInitializeConfigs.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\CMakeLanguageInformation.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\CMakeRCInformation.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\CMakeSystemSpecificInformation.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\CMakeSystemSpecificInitialize.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\Compiler\CMakeCommonCompilerMacros.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\Compiler\MSVC-CXX.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\Compiler\MSVC.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\FindPackageHandleStandardArgs.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\FindPackageMessage.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\FindVulkan.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\Internal\CMakeCXXLinkerInformation.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\Internal\CMakeCommonLinkerInformation.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\Linker\MSVC-CXX.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\Linker\MSVC.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\Platform\Linker\Windows-MSVC-CXX.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\Platform\Linker\Windows-MSVC.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\Platform\Windows-Initialize.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\Platform\Windows-MSVC-CXX.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\Platform\Windows-MSVC.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\Platform\Windows.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\Platform\WindowsPaths.cmake;D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\CMakeFiles\4.4.0\CMakeCXXCompiler.cmake;D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\CMakeFiles\4.4.0\CMakeRCCompiler.cmake;D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\CMakeFiles\4.4.0\CMakeSystem.cmake;D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\CMakeFiles\cmake.verify_globs;%(AdditionalInputs)</AdditionalInputs>
+      <Outputs Condition="'$(Configuration)|$(Platform)'=='Release|x64'">D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\CMakeFiles\generate.stamp</Outputs>
+      <LinkObjects Condition="'$(Configuration)|$(Platform)'=='Release|x64'">false</LinkObjects>
+      <Message Condition="'$(Configuration)|$(Platform)'=='MinSizeRel|x64'">Building Custom Rule D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/CMakeLists.txt</Message>
+      <Command Condition="'$(Configuration)|$(Platform)'=='MinSizeRel|x64'">setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -SD:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026 -BD:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build --check-stamp-file D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/CMakeFiles/generate.stamp
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd</Command>
+      <AdditionalInputs Condition="'$(Configuration)|$(Platform)'=='MinSizeRel|x64'">C:\Program Files\CMake\share\cmake-4.4\Modules\CMakeCXXInformation.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\CMakeCommonLanguageInclude.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\CMakeGenericSystem.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\CMakeInitializeConfigs.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\CMakeLanguageInformation.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\CMakeRCInformation.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\CMakeSystemSpecificInformation.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\CMakeSystemSpecificInitialize.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\Compiler\CMakeCommonCompilerMacros.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\Compiler\MSVC-CXX.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\Compiler\MSVC.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\FindPackageHandleStandardArgs.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\FindPackageMessage.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\FindVulkan.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\Internal\CMakeCXXLinkerInformation.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\Internal\CMakeCommonLinkerInformation.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\Linker\MSVC-CXX.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\Linker\MSVC.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\Platform\Linker\Windows-MSVC-CXX.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\Platform\Linker\Windows-MSVC.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\Platform\Windows-Initialize.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\Platform\Windows-MSVC-CXX.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\Platform\Windows-MSVC.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\Platform\Windows.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\Platform\WindowsPaths.cmake;D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\CMakeFiles\4.4.0\CMakeCXXCompiler.cmake;D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\CMakeFiles\4.4.0\CMakeRCCompiler.cmake;D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\CMakeFiles\4.4.0\CMakeSystem.cmake;D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\CMakeFiles\cmake.verify_globs;%(AdditionalInputs)</AdditionalInputs>
+      <Outputs Condition="'$(Configuration)|$(Platform)'=='MinSizeRel|x64'">D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\CMakeFiles\generate.stamp</Outputs>
+      <LinkObjects Condition="'$(Configuration)|$(Platform)'=='MinSizeRel|x64'">false</LinkObjects>
+      <Message Condition="'$(Configuration)|$(Platform)'=='RelWithDebInfo|x64'">Building Custom Rule D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/CMakeLists.txt</Message>
+      <Command Condition="'$(Configuration)|$(Platform)'=='RelWithDebInfo|x64'">setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -SD:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026 -BD:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build --check-stamp-file D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/CMakeFiles/generate.stamp
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd</Command>
+      <AdditionalInputs Condition="'$(Configuration)|$(Platform)'=='RelWithDebInfo|x64'">C:\Program Files\CMake\share\cmake-4.4\Modules\CMakeCXXInformation.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\CMakeCommonLanguageInclude.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\CMakeGenericSystem.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\CMakeInitializeConfigs.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\CMakeLanguageInformation.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\CMakeRCInformation.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\CMakeSystemSpecificInformation.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\CMakeSystemSpecificInitialize.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\Compiler\CMakeCommonCompilerMacros.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\Compiler\MSVC-CXX.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\Compiler\MSVC.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\FindPackageHandleStandardArgs.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\FindPackageMessage.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\FindVulkan.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\Internal\CMakeCXXLinkerInformation.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\Internal\CMakeCommonLinkerInformation.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\Linker\MSVC-CXX.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\Linker\MSVC.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\Platform\Linker\Windows-MSVC-CXX.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\Platform\Linker\Windows-MSVC.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\Platform\Windows-Initialize.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\Platform\Windows-MSVC-CXX.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\Platform\Windows-MSVC.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\Platform\Windows.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\Platform\WindowsPaths.cmake;D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\CMakeFiles\4.4.0\CMakeCXXCompiler.cmake;D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\CMakeFiles\4.4.0\CMakeRCCompiler.cmake;D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\CMakeFiles\4.4.0\CMakeSystem.cmake;D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\CMakeFiles\cmake.verify_globs;%(AdditionalInputs)</AdditionalInputs>
+      <Outputs Condition="'$(Configuration)|$(Platform)'=='RelWithDebInfo|x64'">D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\CMakeFiles\generate.stamp</Outputs>
+      <LinkObjects Condition="'$(Configuration)|$(Platform)'=='RelWithDebInfo|x64'">false</LinkObjects>
+    </CustomBuild>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\core\Camera.cpp" />
+    <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\core\Logger.cpp" />
+    <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\geometry\CardGenerator.cpp" />
+    <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\geometry\ClusterDAG.cpp" />
+    <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\geometry\ClusterGrouping.cpp" />
+    <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\geometry\ClusterPartitioner.cpp" />
+    <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\geometry\FallbackMeshBuilder.cpp" />
+    <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\geometry\GpuPageTable.cpp" />
+    <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\geometry\MeshSDFGenerator.cpp" />
+    <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\geometry\MeshSimplifier.cpp" />
+    <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\geometry\VirtualGeometryCacheTest.cpp" />
+    <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\io\AsyncFileStreamer.cpp" />
+    <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\io\CacheFileManager.cpp" />
+    <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\io\ObjExport.cpp" />
+    <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\io\StreamingRequestQueue.cpp" />
+    <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\main.cpp" />
+    <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\ClusterCullingPass.cpp" />
+    <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\ClusterHardwareRasterPass.cpp" />
+    <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\ClusterLODSelectionPass.cpp" />
+    <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\ClusterOcclusionCullingPass.cpp" />
+    <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\ClusterRenderPipeline.cpp" />
+    <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\ClusterResolvePass.cpp" />
+    <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\ClusterSoftwareRasterPass.cpp" />
+    <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\FeedbackBuffer.cpp" />
+    <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\GeometryDecompressionPass.cpp" />
+    <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\GeometryStreamingCoordinator.cpp" />
+    <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\GlobalSDFPass.cpp" />
+    <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\GpuBuffer.cpp" />
+    <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\GpuGeometryPagePool.cpp" />
+    <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\HZBPass.cpp" />
+    <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\ProceduralMaskGenerator.cpp" />
+    <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\SurfaceCachePass.cpp" />
+    <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\VmaUsage.cpp" />
+    <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\VulkanContext.cpp" />
+    <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\VulkanPipeline.cpp" />
+    <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\debug\ClusterTriangleStatsPass.cpp" />
+    <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\debug\DebugTextOverlay.cpp" />
+    <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\core\Camera.h" />
+    <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\core\EngineConfig.h" />
+    <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\core\EntityData.h" />
+    <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\core\IDManager.h" />
+    <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\core\Logger.h" />
+    <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\core\maths\Maths.h" />
+    <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\geometry\CardGenerator.h" />
+    <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\geometry\ClusterDAG.h" />
+    <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\geometry\ClusterFormat.h" />
+    <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\geometry\ClusterGrouping.h" />
+    <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\geometry\ClusterPartitioner.h" />
+    <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\geometry\EntityMaterialTable.h" />
+    <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\geometry\FallbackMeshBuilder.h" />
+    <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\geometry\GeometryEncoding.h" />
+    <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\geometry\GpuPageTable.h" />
+    <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\geometry\MeshSDFGenerator.h" />
+    <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\geometry\MeshSimplifier.h" />
+    <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\geometry\ProceduralMaskSampler.h" />
+    <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\geometry\VirtualGeometryCacheTest.h" />
+    <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\io\AsyncFileStreamer.h" />
+    <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\io\CacheFileManager.h" />
+    <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\io\ObjExport.h" />
+    <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\io\StreamingRequestQueue.h" />
+    <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\ClusterCullingPass.h" />
+    <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\ClusterHardwareRasterPass.h" />
+    <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\ClusterLODSelectionPass.h" />
+    <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\ClusterOcclusionCullingPass.h" />
+    <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\ClusterRenderPipeline.h" />
+    <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\ClusterResolvePass.h" />
+    <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\ClusterSoftwareRasterPass.h" />
+    <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\FeedbackBuffer.h" />
+    <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\GeometryDecompressionPass.h" />
+    <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\GeometryStreamingCoordinator.h" />
+    <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\GlobalSDFPass.h" />
+    <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\GpuBuffer.h" />
+    <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\GpuGeometryPagePool.h" />
+    <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\HZBPass.h" />
+    <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\ProceduralMaskGenerator.h" />
+    <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\RenderTypes.h" />
+    <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\SurfaceCachePass.h" />
+    <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\VulkanContext.h" />
+    <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\VulkanPipeline.h" />
+    <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\debug\BitmapFont8x8.h" />
+    <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\debug\ClusterTriangleStatsPass.h" />
+    <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\debug\DebugTextOverlay.h" />
+  </ItemGroup>
+  <ItemGroup />
+  <ItemGroup>
+    <ProjectReference Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\ZERO_CHECK.vcxproj">
+      <Project>{A46E0CC8-A266-3551-AC55-2D6288CE347A}</Project>
+      <Name>ZERO_CHECK</Name>
+      <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
+      <CopyToOutputDirectory>Never</CopyToOutputDirectory>
+    </ProjectReference>
+    <ProjectReference Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\CompileShaders.vcxproj">
+      <Project>{D3C9CB5E-317F-3042-9ABE-875E10EE37FE}</Project>
+      <Name>CompileShaders</Name>
+      <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
+      <CopyToOutputDirectory>Never</CopyToOutputDirectory>
+    </ProjectReference>
+    <ProjectReference Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\vendor\glfw\src\glfw.vcxproj">
+      <Project>{86E722F7-8EA1-3A05-A772-7B98C8E7E617}</Project>
+      <Name>glfw</Name>
+    </ProjectReference>
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ImportGroup Label="ExtensionTargets">
+  </ImportGroup>
+</Project>

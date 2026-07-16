@@ -1,0 +1,13 @@
+{
+    "version": 1,
+    "revision": 0,
+    "rules": [
+        {
+            "primary-output": "DemoSceneVK.dir\\Release\\VulkanPipeline.obj",
+            "outputs": [
+                "DemoSceneVK.dir\\Release\\"
+            ],
+            "requires": []
+        }
+    ]
+}

@@ -1,0 +1,38 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project>
+  <ProjectOutputs>
+    <ProjectOutput>
+      <FullPath>D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\x64\Debug\ZERO_CHECK</FullPath>
+    </ProjectOutput>
+    <ProjectOutput>
+      <FullPath>D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\Debug\CacheFileFormatTests.exe</FullPath>
+    </ProjectOutput>
+    <ProjectOutput>
+      <FullPath>D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\Debug\ClusterDAGTests.exe</FullPath>
+    </ProjectOutput>
+    <ProjectOutput>
+      <FullPath>D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\Debug\ClusterMaskSplitTests.exe</FullPath>
+    </ProjectOutput>
+    <ProjectOutput>
+      <FullPath>D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\Debug\ClusterPartitionerTests.exe</FullPath>
+    </ProjectOutput>
+    <ProjectOutput>
+      <FullPath>D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\Debug\ClusterSimplificationTests.exe</FullPath>
+    </ProjectOutput>
+    <ProjectOutput>
+      <FullPath>D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\x64\Debug\CompileShaders</FullPath>
+    </ProjectOutput>
+    <ProjectOutput>
+      <FullPath>D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\Debug\DemoSceneVK.exe</FullPath>
+    </ProjectOutput>
+    <ProjectOutput>
+      <FullPath>D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\Debug\MeshSDFTests.exe</FullPath>
+    </ProjectOutput>
+    <ProjectOutput>
+      <FullPath>D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\x64\Debug\ALL_BUILD</FullPath>
+    </ProjectOutput>
+  </ProjectOutputs>
+  <ContentFiles />
+  <SatelliteDlls />
+  <NonRecipeFileRefs />
+</Project>

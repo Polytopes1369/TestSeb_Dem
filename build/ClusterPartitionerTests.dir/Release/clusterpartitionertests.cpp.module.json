@@ -1,0 +1,13 @@
+{
+    "version": 1,
+    "revision": 0,
+    "rules": [
+        {
+            "primary-output": "ClusterPartitionerTests.dir\\Release\\ClusterPartitionerTests.obj",
+            "outputs": [
+                "ClusterPartitionerTests.dir\\Release\\"
+            ],
+            "requires": []
+        }
+    ]
+}

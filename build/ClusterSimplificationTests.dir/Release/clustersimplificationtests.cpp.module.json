@@ -1,0 +1,13 @@
+{
+    "version": 1,
+    "revision": 0,
+    "rules": [
+        {
+            "primary-output": "ClusterSimplificationTests.dir\\Release\\ClusterSimplificationTests.obj",
+            "outputs": [
+                "ClusterSimplificationTests.dir\\Release\\"
+            ],
+            "requires": []
+        }
+    ]
+}

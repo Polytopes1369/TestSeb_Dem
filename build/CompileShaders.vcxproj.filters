@@ -1,0 +1,137 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="18.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <CustomBuild Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\CMakeFiles\464bebe9036cd9d7930658470a378270\BuildDispatchIndirectArgs.comp.spv.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\CMakeFiles\464bebe9036cd9d7930658470a378270\ClearVisBufferAtomic.comp.spv.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\CMakeFiles\464bebe9036cd9d7930658470a378270\ClusterDAGScreenError.comp.spv.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\CMakeFiles\464bebe9036cd9d7930658470a378270\ClusterFrustumCull.comp.spv.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\CMakeFiles\464bebe9036cd9d7930658470a378270\ClusterHZBOcclusionCull.comp.spv.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\CMakeFiles\464bebe9036cd9d7930658470a378270\ClusterLODCompact.comp.spv.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\CMakeFiles\464bebe9036cd9d7930658470a378270\ClusterLODResidencyFallback.comp.spv.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\CMakeFiles\464bebe9036cd9d7930658470a378270\ClusterRaster.frag.spv.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\CMakeFiles\464bebe9036cd9d7930658470a378270\ClusterRaster.vert.spv.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\CMakeFiles\464bebe9036cd9d7930658470a378270\ClusterRasterOpaque.frag.spv.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\CMakeFiles\464bebe9036cd9d7930658470a378270\ClusterResidencyCheck.comp.spv.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\CMakeFiles\464bebe9036cd9d7930658470a378270\ClusterResolve.comp.spv.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\CMakeFiles\464bebe9036cd9d7930658470a378270\ClusterSoftwareRaster.comp.spv.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\CMakeFiles\464bebe9036cd9d7930658470a378270\ClusterSoftwareRasterOpaque.comp.spv.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\CMakeFiles\464bebe9036cd9d7930658470a378270\ComputeTriangleStats.comp.spv.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\CMakeFiles\464bebe9036cd9d7930658470a378270\DebugText.frag.spv.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\CMakeFiles\464bebe9036cd9d7930658470a378270\DebugText.vert.spv.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\CMakeFiles\464bebe9036cd9d7930658470a378270\DecompressClusterIndices.comp.spv.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\CMakeFiles\464bebe9036cd9d7930658470a378270\DecompressClusterVertices.comp.spv.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\CMakeFiles\464bebe9036cd9d7930658470a378270\GlobalSDFComposite.comp.spv.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\CMakeFiles\464bebe9036cd9d7930658470a378270\HZBBuildInit.comp.spv.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\CMakeFiles\464bebe9036cd9d7930658470a378270\HZBReduce.comp.spv.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\CMakeFiles\464bebe9036cd9d7930658470a378270\ProceduralMaskGenerate.comp.spv.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\CMakeFiles\464bebe9036cd9d7930658470a378270\SurfaceCacheCapture.frag.spv.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\CMakeFiles\464bebe9036cd9d7930658470a378270\SurfaceCacheCapture.vert.spv.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\CMakeFiles\464bebe9036cd9d7930658470a378270\draw.comp.spv.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\CMakeFiles\464bebe9036cd9d7930658470a378270\draw.frag.spv.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\CMakeFiles\464bebe9036cd9d7930658470a378270\draw.vert.spv.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\CMakeFiles\464bebe9036cd9d7930658470a378270\geom_TorusKnot.comp.spv.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\CMakeFiles\464bebe9036cd9d7930658470a378270\geom_box.comp.spv.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\CMakeFiles\464bebe9036cd9d7930658470a378270\geom_capsule.comp.spv.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\CMakeFiles\464bebe9036cd9d7930658470a378270\geom_chamferBox.comp.spv.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\CMakeFiles\464bebe9036cd9d7930658470a378270\geom_cone.comp.spv.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\CMakeFiles\464bebe9036cd9d7930658470a378270\geom_cylinder.comp.spv.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\CMakeFiles\464bebe9036cd9d7930658470a378270\geom_icosphere.comp.spv.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\CMakeFiles\464bebe9036cd9d7930658470a378270\geom_plane.comp.spv.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\CMakeFiles\464bebe9036cd9d7930658470a378270\geom_pyramide.comp.spv.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\CMakeFiles\464bebe9036cd9d7930658470a378270\geom_sphere.comp.spv.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\CMakeFiles\464bebe9036cd9d7930658470a378270\geom_torus.comp.spv.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\CMakeFiles\464bebe9036cd9d7930658470a378270\geom_tube.comp.spv.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\CMakeFiles\5bd29a4056886e992cf1763a54fa032f\CompileShaders.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\CMakeLists.txt" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\CMakeFiles\CompileShaders" />
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="CMake Rules">
+      <UniqueIdentifier>{A65BC517-CF60-3C17-B951-DDDFCAB10035}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+</Project>
