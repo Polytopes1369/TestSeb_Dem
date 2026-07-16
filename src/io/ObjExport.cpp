@@ -1,4 +1,4 @@
-#include "geometry/ObjExport.h"
+#include "io/ObjExport.h"
 
 #include <fstream>
 

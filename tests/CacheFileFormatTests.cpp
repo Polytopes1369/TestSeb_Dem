@@ -18,7 +18,7 @@
 // Exits 0 if every check passes, non-zero otherwise, so it can be registered with CTest without
 // pulling in any external test framework or requiring a window/device.
 
-#include "geometry/CacheFileManager.h"
+#include "io/CacheFileManager.h"
 #include "geometry/ClusterDAG.h"
 #include "geometry/ClusterFormat.h"
 #include "geometry/GeometryEncoding.h"

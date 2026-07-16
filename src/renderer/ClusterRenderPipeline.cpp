@@ -9,7 +9,7 @@
 #include <string>
 
 #include "core/Logger.h"
-#include "geometry/CacheFileManager.h"
+#include "io/CacheFileManager.h"
 #include "geometry/ClusterFormat.h"
 #include "renderer/GpuBuffer.h"
 

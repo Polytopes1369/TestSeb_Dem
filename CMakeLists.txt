@@ -1,4 +1,4 @@
-﻿cmake_minimum_required(VERSION 3.28)
+cmake_minimum_required(VERSION 3.28)
 project(DemoSceneVK VERSION 1.0 LANGUAGES CXX)
 
 # --- Configuration Standard ---
@@ -59,7 +59,7 @@ add_executable(ClusterSimplificationTests
     src/geometry/ClusterPartitioner.cpp
     src/geometry/ClusterGrouping.cpp
     src/geometry/MeshSimplifier.cpp
-    src/geometry/ObjExport.cpp
+    src/io/ObjExport.cpp
     tests/ClusterSimplificationTests.cpp
 )
 target_include_directories(ClusterSimplificationTests PRIVATE src)
@@ -80,7 +80,7 @@ add_executable(CacheFileFormatTests
     src/geometry/ClusterGrouping.cpp
     src/geometry/MeshSimplifier.cpp
     src/geometry/ClusterDAG.cpp
-    src/geometry/CacheFileManager.cpp
+    src/io/CacheFileManager.cpp
     src/core/Logger.cpp
     tests/CacheFileFormatTests.cpp
 )
@@ -145,3 +145,4 @@ if(Vulkan_GLSLC_EXECUTABLE)
 else()
     message(FATAL_ERROR "glslc not found! Check Vulkan SDK installation.")
 endif()
+

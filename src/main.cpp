@@ -30,7 +30,6 @@ int main() {
         return -1;
     }
 
-    // Initialize Vulkan Context (Instance, GPU, Logic Device, Surface, Swapchain, Pipelines, VMA)
     VulkanContext vkContext;
     vkContext.Init("DemoScene", window);
 
@@ -129,7 +128,6 @@ int main() {
         // distance of 14m at a 45° FOV leaves a comfortable margin.
         camera.CameraOrbit({ 0.0f, 0.0f, 0.0f }, 14.0f, azimuth, 28.0f);
 
-        // Update aspect ratio
         float aspect = static_cast<float>(vkContext.GetSwapchainExtent().width) /
             static_cast<float>(vkContext.GetSwapchainExtent().height);
         camera.Update(aspect);
@@ -179,7 +177,6 @@ int main() {
             projectPoint({ 0.0f, 0.0f, 1.0f });
         }
 
-        // Retrieve synchronization semaphores
         VkSemaphore imgAvailable = vkContext.GetImageAvailableSemaphore();
 
         // 1. Wait for the PREVIOUS frame's submission only (never a full device drain): the fence
@@ -189,7 +186,6 @@ int main() {
         VK_CHECK(vkWaitForFences(vkContext.GetDevice(), 1, &frameFence, VK_TRUE, UINT64_MAX));
         VK_CHECK(vkResetFences(vkContext.GetDevice(), 1, &frameFence));
 
-        // 2. Acquire next Swapchain image
         uint32_t imageIndex;
         vkAcquireNextImageKHR(vkContext.GetDevice(), vkContext.GetSwapchain(),
             UINT64_MAX, imgAvailable, VK_NULL_HANDLE, &imageIndex);
@@ -228,7 +224,6 @@ int main() {
 
         VK_CHECK(vkQueueSubmit(vkContext.GetGraphicsQueue(), 1, &submitInfo, frameFence));
 
-        // 5. Present to Screen
         VkSwapchainKHR swapchain = vkContext.GetSwapchain();
         VkPresentInfoKHR presentInfo{ VK_STRUCTURE_TYPE_PRESENT_INFO_KHR };
         presentInfo.waitSemaphoreCount = 1;

@@ -1,6 +1,6 @@
 #include "geometry/VirtualGeometryCacheTest.h"
 
-#include "geometry/CacheFileManager.h"
+#include "io/CacheFileManager.h"
 #include "geometry/ClusterDAG.h"
 #include "geometry/ClusterFormat.h"
 #include "geometry/GeometryEncoding.h"

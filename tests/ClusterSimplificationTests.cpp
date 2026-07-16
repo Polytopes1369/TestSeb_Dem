@@ -24,7 +24,7 @@
 #include "geometry/ClusterGrouping.h"
 #include "geometry/ClusterPartitioner.h"
 #include "geometry/MeshSimplifier.h"
-#include "geometry/ObjExport.h"
+#include "io/ObjExport.h"
 #include "core/maths/Maths.h"
 #include "renderer/RenderTypes.h"
 #include "SyntheticMesh.h"
