@@ -5,6 +5,7 @@
 #include <format>
 #include <limits>
 #include <stdexcept>
+#include <thread>
 
 #include "core/Logger.h"
 #include "geometry/MeshSDFGenerator.h"
@@ -81,7 +82,7 @@ namespace renderer {
     } // namespace
 
     bool GlobalSDFPass::Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
-        const std::filesystem::path& cacheFilePath) {
+        const std::filesystem::path& cacheFilePath, core::LoadingManager& loadingManager) {
         Shutdown();
 
         m_Device = device;
@@ -89,7 +90,10 @@ namespace renderer {
 
         // =====================================================================================
         // STEP 1 -- Read every fallback mesh's geometry and build one CPU-side Mesh SDF per
-        // entity (geometry::BuildMeshSDF, see MeshSDFGenerator.h) from it.
+        // entity (geometry::BuildMeshSDF, see MeshSDFGenerator.h) from it. Fanned out across
+        // `loadingManager`'s worker threads (one job per entity) instead of a single-threaded
+        // loop -- see Init()'s own header comment for why this stays a blocking WaitIdle() rather
+        // than a progressive, frame-spread arrival.
         // =====================================================================================
         geometry::CacheFileManager cacheManager;
         geometry::CacheFileHeader header{};
@@ -107,56 +111,82 @@ namespace renderer {
             std::vector<float> decodedGrid; // resolution^3, voxel-linear (x fastest), world-unit distances.
             maths::vec3 volumeMin{};
             float voxelSize = 0.0f;
-            uint32_t resolution = 0;
+            uint32_t resolution = 0; // 0 == this entity's bake failed/produced an empty mesh; skipped below.
             uint32_t entityID = 0;
+            bool readFailed = false; // Distinguishes a hard I/O error (Init() must fail) from a benign empty mesh.
         };
-        std::vector<PendingUpload> uploads;
-        uploads.reserve(fallbackTable.size());
+        // Pre-sized, one disjoint slot per fallback-table entry: every worker job below only ever
+        // writes to its own index, so no locking is needed between jobs (the same discipline a
+        // plain parallel-for would use) -- WaitIdle() below is the only synchronization point.
+        std::vector<PendingUpload> uploads(fallbackTable.size());
 
-        for (const geometry::FallbackMeshIndexEntry& entry : fallbackTable) {
-            std::vector<geometry::FallbackVertex> vertices;
-            std::vector<uint32_t> indices;
-            if (!cacheManager.ReadFallbackMeshGeometry(cacheFilePath, entry, vertices, indices)) {
-                LOG_ERROR(std::format(
-                    "[GlobalSDFPass] Failed to read fallback mesh geometry for entityID={}.", entry.entityID));
-                return false;
-            }
-            if (vertices.empty() || indices.size() < 3) {
-                continue;
-            }
+        for (size_t i = 0; i < fallbackTable.size(); ++i) {
+            const geometry::FallbackMeshIndexEntry& entry = fallbackTable[i];
+            uploads[i].entityID = entry.entityID;
+            loadingManager.Submit([&uploads, i, cacheFilePath, entry]() {
+                // Runs on a worker thread. geometry::CacheFileManager holds no member state (every
+                // method is effectively a free function bundled in a class, see CacheFileManager.h),
+                // so constructing one per job and reading the same file concurrently from many
+                // threads is safe -- each call opens/reads/closes its own OS file handle.
+                geometry::CacheFileManager workerCacheManager;
+                std::vector<geometry::FallbackVertex> vertices;
+                std::vector<uint32_t> indices;
+                if (!workerCacheManager.ReadFallbackMeshGeometry(cacheFilePath, entry, vertices, indices)) {
+                    uploads[i].readFailed = true;
+                    return;
+                }
+                if (vertices.empty() || indices.size() < 3) {
+                    return; // resolution stays 0 -- benign "no fallback geometry" case, not an error.
+                }
 
-            std::vector<maths::vec3> positions;
-            positions.reserve(vertices.size());
-            for (const geometry::FallbackVertex& v : vertices) {
-                positions.push_back(maths::vec3{ v.position[0], v.position[1], v.position[2] });
-            }
+                std::vector<maths::vec3> positions;
+                positions.reserve(vertices.size());
+                for (const geometry::FallbackVertex& v : vertices) {
+                    positions.push_back(maths::vec3{ v.position[0], v.position[1], v.position[2] });
+                }
 
-            geometry::MeshSDF sdf = geometry::BuildMeshSDF(positions, indices, kEntitySDFResolution);
-            if (sdf.resolution == 0) {
-                LOG_WARNING(std::format(
-                    "[GlobalSDFPass] BuildMeshSDF produced an empty SDF for entityID={}; skipping.", entry.entityID));
-                continue;
-            }
+                geometry::MeshSDF sdf = geometry::BuildMeshSDF(positions, indices, kEntitySDFResolution);
+                if (sdf.resolution == 0) {
+                    return; // BuildMeshSDF's own empty-SDF sentinel -- resolution stays 0, skipped below.
+                }
 
-            PendingUpload upload;
-            upload.volumeMin = sdf.volumeMin;
-            upload.voxelSize = sdf.voxelSize;
-            upload.resolution = sdf.resolution;
-            upload.entityID = entry.entityID;
-            upload.decodedGrid.resize(static_cast<size_t>(sdf.resolution) * sdf.resolution * sdf.resolution);
-            for (uint32_t z = 0; z < sdf.resolution; ++z) {
-                for (uint32_t y = 0; y < sdf.resolution; ++y) {
-                    for (uint32_t x = 0; x < sdf.resolution; ++x) {
-                        upload.decodedGrid[(static_cast<size_t>(z) * sdf.resolution + y) * sdf.resolution + x] =
-                            geometry::DecodeMeshSDFVoxel(sdf, x, y, z);
+                uploads[i].volumeMin = sdf.volumeMin;
+                uploads[i].voxelSize = sdf.voxelSize;
+                uploads[i].resolution = sdf.resolution;
+                uploads[i].decodedGrid.resize(static_cast<size_t>(sdf.resolution) * sdf.resolution * sdf.resolution);
+                for (uint32_t z = 0; z < sdf.resolution; ++z) {
+                    for (uint32_t y = 0; y < sdf.resolution; ++y) {
+                        for (uint32_t x = 0; x < sdf.resolution; ++x) {
+                            uploads[i].decodedGrid[(static_cast<size_t>(z) * sdf.resolution + y) * sdf.resolution + x] =
+                                geometry::DecodeMeshSDFVoxel(sdf, x, y, z);
+                        }
                     }
                 }
-            }
-            uploads.push_back(std::move(upload));
+                });
         }
+        // Blocks until every entity's bake above has actually finished running -- see Init()'s own
+        // header comment for why this pass cannot let entities keep arriving after this point.
+        loadingManager.WaitIdle();
 
-        LOG_INFO(std::format("[GlobalSDFPass] Built {} entity Mesh SDF(s) at {}^3 for Global SDF compositing.",
-            uploads.size(), kEntitySDFResolution));
+        for (const PendingUpload& upload : uploads) {
+            if (upload.readFailed) {
+                LOG_ERROR(std::format(
+                    "[GlobalSDFPass] Failed to read fallback mesh geometry for entityID={}.", upload.entityID));
+                return false;
+            }
+        }
+        std::erase_if(uploads, [](const PendingUpload& upload) {
+            if (upload.resolution == 0) {
+                LOG_WARNING(std::format(
+                    "[GlobalSDFPass] BuildMeshSDF produced an empty SDF for entityID={}; skipping.", upload.entityID));
+                return true;
+            }
+            return false;
+            });
+
+        LOG_INFO(std::format(
+            "[GlobalSDFPass] Built {} entity Mesh SDF(s) at {}^3 for Global SDF compositing ({} worker thread(s)).",
+            uploads.size(), kEntitySDFResolution, std::thread::hardware_concurrency()));
 
         // =====================================================================================
         // STEP 2 -- GPU resources: per-entity sampled 3D SDF textures, kLevelCount clipmap

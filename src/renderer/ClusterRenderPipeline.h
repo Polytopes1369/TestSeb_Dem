@@ -63,6 +63,7 @@
 
 #include "core/Camera.h"
 #include "core/EngineConfig.h"
+#include "core/LoadingManager.h"
 #include "core/maths/Maths.h"
 #include "renderer/ATrousDenoisePass.h"
 #include "renderer/ClusterHardwareRasterPass.h"
@@ -264,6 +265,19 @@ namespace renderer {
         // time, before any raster/resolve pass is initialized -- see ProceduralMaskGenerator's own
         // class comment. GetMaskImageInfos() is threaded into all three passes below.
         ProceduralMaskGenerator m_MaskGenerator;
+
+        // Generic multithreaded background-job pool (hardware_concurrency worker threads) -- see
+        // core::LoadingManager's own class comment. Currently consumed by m_GlobalSDF::Init() to
+        // fan its per-entity Mesh SDF bake out across every core instead of a single-threaded loop
+        // (see GlobalSDFPass::Init's own comment for why that stays a blocking WaitIdle() rather
+        // than a frame-spread arrival); owned at this pipeline-wide scope, not inside GlobalSDFPass
+        // itself, so any future CPU-bound generator (procedural terrain/tree/texture systems -- see
+        // CLAUDE.md's stated scope) can share the same worker pool instead of each spinning up its
+        // own threads. Deliberately NOT torn down by Shutdown() (which also runs defensively at the
+        // top of every Init() call, unlike this pool's intended whole-pipeline-lifetime scope) --
+        // see Shutdown()'s own comment in the .cpp for why. Only core::LoadingManager's own
+        // destructor ever joins its worker threads, exactly once, when this object is destructed.
+        core::LoadingManager m_LoadingManager;
 
         // Owned pipeline stages, in rough execution order.
         GpuGeometryPagePool m_PagePool;

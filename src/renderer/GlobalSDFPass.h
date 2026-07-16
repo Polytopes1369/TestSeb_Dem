@@ -44,6 +44,7 @@
 #include <vulkan/vulkan.h>
 #include <vk_mem_alloc.h>
 
+#include "core/LoadingManager.h"
 #include "core/maths/Maths.h"
 
 namespace renderer {
@@ -77,18 +78,33 @@ namespace renderer {
 
         static constexpr VkFormat kClipmapFormat = VK_FORMAT_R32_SFLOAT;
 
-        // Reads every fallback mesh's geometry from `cacheFilePath`, builds one CPU-side
+        // Reads every fallback mesh's geometry from `cacheFilePath` and builds one CPU-side
         // geometry::MeshSDF per entity (geometry::BuildMeshSDF over that entity's Fallback Mesh),
-        // decodes each into a plain filterable 3D texture (VK_FORMAT_R32_SFLOAT, uploaded once),
-        // allocates the kLevelCount clipmap 3D images (also R32_SFLOAT, read/write via
-        // imageLoad/imageStore, kept in VK_IMAGE_LAYOUT_GENERAL for their entire lifetime), and
+        // fanning the (file read + BuildMeshSDF + decode) work for every entity out across
+        // `loadingManager`'s worker threads -- previously a single-threaded loop, now genuinely
+        // parallel across every available core -- then blocks (core::LoadingManager::WaitIdle())
+        // until every entity's bake has actually finished before proceeding, exactly like a
+        // parallel-for: each entity writes into its own disjoint output slot, so no locking is
+        // needed between jobs. Init() must still return with every entity's SDF fully resident
+        // (renderer::SurfaceCacheTraceContext::Init, called immediately afterward by
+        // ClusterRenderPipeline::Init, snapshots this pass's final GetTracedEntityInfos() list
+        // once and builds a FIXED-size trace descriptor set from it -- so entities cannot be
+        // allowed to keep arriving progressively across later frames without also re-architecting
+        // that downstream consumer, which is out of scope here); what this parallelization buys is
+        // wall-clock Init() speed (bounded by the slowest single entity's bake instead of the sum
+        // of all of them), not a frame-spread arrival -- see core::LoadingManager's own class
+        // comment for the frame-budgeted PumpCompletions() mode this same worker pool also
+        // supports, for a future consumer whose downstream dependents don't have this constraint.
+        // Decodes each entity's baked SDF into a plain filterable 3D texture (VK_FORMAT_R32_SFLOAT,
+        // uploaded once), allocates the kLevelCount clipmap 3D images (also R32_SFLOAT, read/write
+        // via imageLoad/imageStore, kept in VK_IMAGE_LAYOUT_GENERAL for their entire lifetime), and
         // builds the compositing compute pipeline. Every level starts with no valid window (the
         // first RecordUpdate() call treats every level as entirely dirty -- see the class
         // comment). Returns false (logged) only on an actual cache-file I/O failure; a scene with
         // zero fallback meshes is valid (Init() succeeds, every clipmap simply stays at
         // kFarValue).
         bool Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
-            const std::filesystem::path& cacheFilePath);
+            const std::filesystem::path& cacheFilePath, core::LoadingManager& loadingManager);
 
         void Shutdown();
 

@@ -8,10 +8,18 @@
 #include <fstream>
 #include <format>
 #include <chrono>
+#include <mutex>
 #include <vulkan/vk_enum_string_helper.h> // Provided by LunarG Vulkan SDK
 
 namespace {
     std::ofstream s_LogFile;
+    // Guards every access to s_LogFile (a plain std::ofstream has no built-in thread safety) plus
+    // the std::cout/std::cerr writes below, so they stay atomic as a whole line -- needed now that
+    // core::LoadingManager lets background work (e.g. geometry::BuildMeshSDF, called concurrently
+    // from renderer::GlobalSDFPass::Init's per-entity worker jobs) log from more than one thread at
+    // once; without this, two threads racing on s_LogFile's internal buffer state is undefined
+    // behavior (observed in practice as the whole process hanging, not merely garbled output).
+    std::mutex s_LogMutex;
 
     constexpr std::string_view GetLevelString(LogLevel level) {
         switch (level) {
@@ -54,6 +62,8 @@ void Logger::Log(LogLevel level, std::string_view message, const std::source_loc
 
     std::string formattedMsg = std::format("[{:%Y-%m-%d %H:%M:%S}.{:03}] {} {}:{} - {}\n",
         localTimeSec, ms.count(), GetLevelString(level), file, loc.line(), message);
+
+    std::lock_guard<std::mutex> lock(s_LogMutex);
 
     if (level == LogLevel::Error || level == LogLevel::Critical) {
         std::cerr << formattedMsg;
