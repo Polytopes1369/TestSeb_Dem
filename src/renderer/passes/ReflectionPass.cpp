@@ -36,35 +36,6 @@ namespace renderer {
         };
         static_assert(sizeof(TracePushConstants) == 12, "TracePushConstants must match ReflectionTrace.comp's push_constant block exactly");
 
-        // One ping-pong field image: STORAGE_BIT (imageLoad/imageStore) | SAMPLED_BIT (history
-        // reprojection taps via m_ReflectionSampler) | TRANSFER_DST_BIT (the one-time neutral-
-        // default clear below) -- same usage set as ScreenProbeGIPass's own CreateProbeImage.
-        void CreateReflectionImage(VmaAllocator allocator, VkDevice device, VkFormat format, VkExtent2D extent,
-            VkImage& outImage, VmaAllocation& outAllocation, VkImageView& outView) {
-            VkImageCreateInfo imageInfo{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
-            imageInfo.imageType = VK_IMAGE_TYPE_2D;
-            imageInfo.format = format;
-            imageInfo.extent = { extent.width, extent.height, 1 };
-            imageInfo.mipLevels = 1;
-            imageInfo.arrayLayers = 1;
-            imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
-            imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
-            imageInfo.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-            imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-            imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-
-            VmaAllocationCreateInfo allocInfo{};
-            allocInfo.usage = VMA_MEMORY_USAGE_GPU_ONLY;
-            VK_CHECK(vmaCreateImage(allocator, &imageInfo, &allocInfo, &outImage, &outAllocation, nullptr));
-
-            VkImageViewCreateInfo viewInfo{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
-            viewInfo.image = outImage;
-            viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-            viewInfo.format = format;
-            viewInfo.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-            VK_CHECK(vkCreateImageView(device, &viewInfo, nullptr, &outView));
-        }
-
     } // namespace
 
     bool ReflectionPass::Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
@@ -80,9 +51,9 @@ namespace renderer {
         // STEP 1 -- Ping-pong images (2 slots x 3 fields, full resolution) + shared sampler + UBO.
         // =====================================================================================
         for (ReflectionSlot& slot : m_Slots) {
-            CreateReflectionImage(allocator, device, kRadianceFormat, renderExtent, slot.radianceImage, slot.radianceAllocation, slot.radianceView);
-            CreateReflectionImage(allocator, device, kWorldPosFormat, renderExtent, slot.worldPosImage, slot.worldPosAllocation, slot.worldPosView);
-            CreateReflectionImage(allocator, device, kNormalFormat, renderExtent, slot.normalImage, slot.normalAllocation, slot.normalView);
+            VulkanUtils::CreateStorageSampledImage2D(allocator, device, kRadianceFormat, renderExtent, slot.radianceImage, slot.radianceAllocation, slot.radianceView);
+            VulkanUtils::CreateStorageSampledImage2D(allocator, device, kWorldPosFormat, renderExtent, slot.worldPosImage, slot.worldPosAllocation, slot.worldPosView);
+            VulkanUtils::CreateStorageSampledImage2D(allocator, device, kNormalFormat, renderExtent, slot.normalImage, slot.normalAllocation, slot.normalView);
         }
 
         VkSamplerCreateInfo samplerInfo{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
@@ -107,20 +78,12 @@ namespace renderer {
         VulkanUtils::ExecuteOneShotCommands(m_Device, commandPool, queue, [&](VkCommandBuffer cmd) {
             VkClearColorValue zeroClear{}; zeroClear.float32[0] = 0.0f; zeroClear.float32[1] = 0.0f; zeroClear.float32[2] = 0.0f; zeroClear.float32[3] = 0.0f;
             VkClearColorValue normalClear{}; normalClear.float32[0] = 0.5f; normalClear.float32[1] = 0.5f; normalClear.float32[2] = 0.0f; normalClear.float32[3] = 0.0f;
-            VkImageSubresourceRange colorRange{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-
             for (ReflectionSlot& slot : m_Slots) {
                 struct { VkImage image; const VkClearColorValue* clear; } clears[3] = {
                     { slot.radianceImage, &zeroClear }, { slot.worldPosImage, &zeroClear }, { slot.normalImage, &normalClear }
                 };
                 for (auto& entry : clears) {
-                    VulkanUtils::TransitionImageLayout(cmd, entry.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                        VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0, VK_PIPELINE_STAGE_2_CLEAR_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
-                    vkCmdClearColorImage(cmd, entry.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, entry.clear, 1, &colorRange);
-                    VulkanUtils::TransitionImageLayout(cmd, entry.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
-                        VK_PIPELINE_STAGE_2_CLEAR_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
-                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                        VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+                    VulkanUtils::ClearComputeImageToGeneral(cmd, entry.image, *entry.clear);
                 }
             }
             });
@@ -428,15 +391,9 @@ namespace renderer {
         ubo.viewportHeight = static_cast<float>(m_RenderExtent.height);
         vkCmdUpdateBuffer(cmd, m_ViewParamsBuffer.Handle(), 0, sizeof(ubo), &ubo);
 
-        VkMemoryBarrier2 barrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
-        barrier.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
-        barrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-        barrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-        barrier.dstAccessMask = VK_ACCESS_2_UNIFORM_READ_BIT;
-        VkDependencyInfo depInfo{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-        depInfo.memoryBarrierCount = 1;
-        depInfo.pMemoryBarriers = &barrier;
-        vkCmdPipelineBarrier2(cmd, &depInfo);
+        VulkanUtils::RecordMemoryBarrier(cmd,
+            VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_UNIFORM_READ_BIT);
     }
 
     void ReflectionPass::RecordTrace(VkCommandBuffer cmd, const SurfaceCacheTraceContext& traceContext,
@@ -459,15 +416,10 @@ namespace renderer {
         uint32_t groupCountY = (m_RenderExtent.height + kGridWorkgroupSize - 1u) / kGridWorkgroupSize;
         vkCmdDispatch(cmd, groupCountX, groupCountY, 1);
 
-        VkMemoryBarrier2 barrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
-        barrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-        barrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-        barrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-        barrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
-        VkDependencyInfo depInfo{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-        depInfo.memoryBarrierCount = 1;
-        depInfo.pMemoryBarriers = &barrier;
-        vkCmdPipelineBarrier2(cmd, &depInfo);
+        VulkanUtils::RecordMemoryBarrier(cmd,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
     }
 
     void ReflectionPass::RecordTemporal(VkCommandBuffer cmd) {
@@ -478,15 +430,9 @@ namespace renderer {
         uint32_t groupCountY = (m_RenderExtent.height + kGridWorkgroupSize - 1u) / kGridWorkgroupSize;
         vkCmdDispatch(cmd, groupCountX, groupCountY, 1);
 
-        VkMemoryBarrier2 barrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
-        barrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-        barrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-        barrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-        barrier.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
-        VkDependencyInfo depInfo{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-        depInfo.memoryBarrierCount = 1;
-        depInfo.pMemoryBarriers = &barrier;
-        vkCmdPipelineBarrier2(cmd, &depInfo);
+        VulkanUtils::RecordMemoryBarrier(cmd,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
     }
 
     void ReflectionPass::RecordGather(VkCommandBuffer cmd) {
@@ -497,15 +443,10 @@ namespace renderer {
         uint32_t groupCountY = (m_RenderExtent.height + kGridWorkgroupSize - 1u) / kGridWorkgroupSize;
         vkCmdDispatch(cmd, groupCountX, groupCountY, 1);
 
-        VkMemoryBarrier2 barrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
-        barrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-        barrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-        barrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_COPY_BIT;
-        barrier.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_TRANSFER_READ_BIT;
-        VkDependencyInfo depInfo{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-        depInfo.memoryBarrierCount = 1;
-        depInfo.pMemoryBarriers = &barrier;
-        vkCmdPipelineBarrier2(cmd, &depInfo);
+        VulkanUtils::RecordMemoryBarrier(cmd,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_COPY_BIT,
+            VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_TRANSFER_READ_BIT);
     }
 
 }

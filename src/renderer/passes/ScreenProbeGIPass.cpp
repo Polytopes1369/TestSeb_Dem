@@ -50,35 +50,6 @@ namespace renderer {
 #endif
         };
 
-        // One probe-field image: STORAGE_BIT (RecordTrace's/RecordTemporal's imageLoad/imageStore)
-        // | SAMPLED_BIT (history reprojection + bilateral gather taps, both via texelFetch/texture
-        // through m_ProbeSampler) | TRANSFER_DST_BIT (the one-time neutral-default clear below).
-        void CreateProbeImage(VmaAllocator allocator, VkDevice device, VkFormat format, VkExtent2D extent,
-            VkImage& outImage, VmaAllocation& outAllocation, VkImageView& outView) {
-            VkImageCreateInfo imageInfo{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
-            imageInfo.imageType = VK_IMAGE_TYPE_2D;
-            imageInfo.format = format;
-            imageInfo.extent = { extent.width, extent.height, 1 };
-            imageInfo.mipLevels = 1;
-            imageInfo.arrayLayers = 1;
-            imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
-            imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
-            imageInfo.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-            imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-            imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-
-            VmaAllocationCreateInfo allocInfo{};
-            allocInfo.usage = VMA_MEMORY_USAGE_GPU_ONLY;
-            VK_CHECK(vmaCreateImage(allocator, &imageInfo, &allocInfo, &outImage, &outAllocation, nullptr));
-
-            VkImageViewCreateInfo viewInfo{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
-            viewInfo.image = outImage;
-            viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-            viewInfo.format = format;
-            viewInfo.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-            VK_CHECK(vkCreateImageView(device, &viewInfo, nullptr, &outView));
-        }
-
     } // namespace
 
     bool ScreenProbeGIPass::Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
@@ -97,11 +68,11 @@ namespace renderer {
         // STEP 1 -- Probe ping-pong images (2 slots x 5 fields) + shared sampler + view-params UBO.
         // =====================================================================================
         for (ProbeSlot& slot : m_Slots) {
-            CreateProbeImage(allocator, device, kSHFormat, probeExtent, slot.shRImage, slot.shRAllocation, slot.shRView);
-            CreateProbeImage(allocator, device, kSHFormat, probeExtent, slot.shGImage, slot.shGAllocation, slot.shGView);
-            CreateProbeImage(allocator, device, kSHFormat, probeExtent, slot.shBImage, slot.shBAllocation, slot.shBView);
-            CreateProbeImage(allocator, device, kWorldPosFormat, probeExtent, slot.worldPosImage, slot.worldPosAllocation, slot.worldPosView);
-            CreateProbeImage(allocator, device, kNormalFormat, probeExtent, slot.normalImage, slot.normalAllocation, slot.normalView);
+            VulkanUtils::CreateStorageSampledImage2D(allocator, device, kSHFormat, probeExtent, slot.shRImage, slot.shRAllocation, slot.shRView);
+            VulkanUtils::CreateStorageSampledImage2D(allocator, device, kSHFormat, probeExtent, slot.shGImage, slot.shGAllocation, slot.shGView);
+            VulkanUtils::CreateStorageSampledImage2D(allocator, device, kSHFormat, probeExtent, slot.shBImage, slot.shBAllocation, slot.shBView);
+            VulkanUtils::CreateStorageSampledImage2D(allocator, device, kWorldPosFormat, probeExtent, slot.worldPosImage, slot.worldPosAllocation, slot.worldPosView);
+            VulkanUtils::CreateStorageSampledImage2D(allocator, device, kNormalFormat, probeExtent, slot.normalImage, slot.normalAllocation, slot.normalView);
         }
 
         VkSamplerCreateInfo samplerInfo{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
@@ -126,7 +97,6 @@ namespace renderer {
         VulkanUtils::ExecuteOneShotCommands(m_Device, commandPool, queue, [&](VkCommandBuffer cmd) {
             VkClearColorValue zeroClear{}; zeroClear.float32[0] = 0.0f; zeroClear.float32[1] = 0.0f; zeroClear.float32[2] = 0.0f; zeroClear.float32[3] = 0.0f;
             VkClearColorValue normalClear{}; normalClear.float32[0] = 0.5f; normalClear.float32[1] = 0.5f; normalClear.float32[2] = 0.0f; normalClear.float32[3] = 0.0f;
-            VkImageSubresourceRange colorRange{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
 
             for (ProbeSlot& slot : m_Slots) {
                 struct { VkImage image; const VkClearColorValue* clear; } clears[5] = {
@@ -134,13 +104,7 @@ namespace renderer {
                     { slot.worldPosImage, &zeroClear }, { slot.normalImage, &normalClear }
                 };
                 for (auto& entry : clears) {
-                    VulkanUtils::TransitionImageLayout(cmd, entry.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                        VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0, VK_PIPELINE_STAGE_2_CLEAR_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
-                    vkCmdClearColorImage(cmd, entry.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, entry.clear, 1, &colorRange);
-                    VulkanUtils::TransitionImageLayout(cmd, entry.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
-                        VK_PIPELINE_STAGE_2_CLEAR_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
-                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                        VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+                    VulkanUtils::ClearComputeImageToGeneral(cmd, entry.image, *entry.clear);
                 }
             }
         });
@@ -471,15 +435,9 @@ namespace renderer {
         ubo.probeCountY = static_cast<float>(m_ProbeCountY);
         vkCmdUpdateBuffer(cmd, m_ViewParamsBuffer.Handle(), 0, sizeof(ubo), &ubo);
 
-        VkMemoryBarrier2 barrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
-        barrier.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
-        barrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-        barrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-        barrier.dstAccessMask = VK_ACCESS_2_UNIFORM_READ_BIT;
-        VkDependencyInfo depInfo{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-        depInfo.memoryBarrierCount = 1;
-        depInfo.pMemoryBarriers = &barrier;
-        vkCmdPipelineBarrier2(cmd, &depInfo);
+        VulkanUtils::RecordMemoryBarrier(cmd,
+            VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_UNIFORM_READ_BIT);
     }
 
     void ScreenProbeGIPass::RecordTrace(VkCommandBuffer cmd, const SurfaceCacheTraceContext& traceContext,
@@ -502,15 +460,10 @@ namespace renderer {
 
         vkCmdDispatch(cmd, m_ProbeCountX, m_ProbeCountY, 1);
 
-        VkMemoryBarrier2 barrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
-        barrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-        barrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-        barrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-        barrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
-        VkDependencyInfo depInfo{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-        depInfo.memoryBarrierCount = 1;
-        depInfo.pMemoryBarriers = &barrier;
-        vkCmdPipelineBarrier2(cmd, &depInfo);
+        VulkanUtils::RecordMemoryBarrier(cmd,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
     }
 
     void ScreenProbeGIPass::RecordTemporal(VkCommandBuffer cmd) {
@@ -526,15 +479,9 @@ namespace renderer {
         uint32_t groupCountY = (m_ProbeCountY + kGridWorkgroupSize - 1u) / kGridWorkgroupSize;
         vkCmdDispatch(cmd, groupCountX, groupCountY, 1);
 
-        VkMemoryBarrier2 barrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
-        barrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-        barrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-        barrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-        barrier.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
-        VkDependencyInfo depInfo{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-        depInfo.memoryBarrierCount = 1;
-        depInfo.pMemoryBarriers = &barrier;
-        vkCmdPipelineBarrier2(cmd, &depInfo);
+        VulkanUtils::RecordMemoryBarrier(cmd,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
     }
 
     void ScreenProbeGIPass::RecordGather(VkCommandBuffer cmd
@@ -557,15 +504,10 @@ namespace renderer {
         uint32_t groupCountY = (m_RenderExtent.height + kGridWorkgroupSize - 1u) / kGridWorkgroupSize;
         vkCmdDispatch(cmd, groupCountX, groupCountY, 1);
 
-        VkMemoryBarrier2 barrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
-        barrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-        barrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-        barrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_COPY_BIT;
-        barrier.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_TRANSFER_READ_BIT;
-        VkDependencyInfo depInfo{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-        depInfo.memoryBarrierCount = 1;
-        depInfo.pMemoryBarriers = &barrier;
-        vkCmdPipelineBarrier2(cmd, &depInfo);
+        VulkanUtils::RecordMemoryBarrier(cmd,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_COPY_BIT,
+            VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_TRANSFER_READ_BIT);
     }
 
 }
