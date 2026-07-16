@@ -1,0 +1,49 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+
+// GPU culling-pass residency check: consumes the list of clusters the current frame's LOD cut
+// selected as required (produced upstream by whatever DAG-cut-selection pass picks the
+// resolution-appropriate clusters for the current view -- the CPU-side equivalent lives in
+// geometry::ClusterDAG.h; a GPU port of that cut selection is future work this shader is designed
+// to sit downstream of) and, for every one of them not currently resident in the geometry page
+// table, reports it through the feedback buffer so the CPU-side
+// geometry::StreamingRequestQueue can queue a disk read for it.
+//
+// One invocation evaluates exactly one candidate cluster; g_RequiredClusters and
+// g_RequiredLogicalPageIDs are index-aligned (element i of both describes the same candidate).
+// g_RequiredLogicalPageIDs[i] is precomputed on the CPU as
+// geometry::GpuPageTable::LogicalAddressToPageID(clusterVirtualAddress) from the cluster index
+// table (see ClusterFormat.h), so this shader never has to handle a 64-bit virtual address.
+
+#define PAGE_TABLE_SET 0
+#define PAGE_TABLE_BINDING 0
+#include "include/geometry_page_table.glsl"
+
+#define FEEDBACK_BUFFER_SET 0
+#define FEEDBACK_BUFFER_BINDING 1
+#include "include/feedback_buffer.glsl"
+
+// geometry::ClusterIndexEntry::clusterID for each candidate this dispatch evaluates.
+layout(std430, set = 0, binding = 2) readonly buffer LODRequiredClustersSSBO {
+    uint clusterID[];
+} g_RequiredClusters;
+
+// geometry::GpuPageTable::LogicalAddressToPageID(virtualAddress) for the same candidates,
+// index-aligned with g_RequiredClusters.clusterID.
+layout(std430, set = 0, binding = 3) readonly buffer LODRequiredPageIDsSSBO {
+    uint logicalPageID[];
+} g_RequiredPageIDs;
+
+layout(local_size_x = 64) in;
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    if (index >= g_RequiredClusters.clusterID.length()) {
+        return;
+    }
+
+    uint logicalPageID = g_RequiredPageIDs.logicalPageID[index];
+    if (!IsClusterResident(logicalPageID)) {
+        RequestClusterResidency(g_RequiredClusters.clusterID[index]);
+    }
+}

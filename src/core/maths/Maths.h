@@ -27,7 +27,6 @@ namespace maths {
         constexpr float Dot(const vec2& v) const { return x * v.x + y * v.y; }
     };
 
-    // 3D Vector Structure aligned for simple operations
     struct vec3 {
         float x = 0.0f;
         float y = 0.0f;
@@ -36,7 +35,6 @@ namespace maths {
         constexpr vec3() = default;
         constexpr vec3(float _x, float _y, float _z) : x(_x), y(_y), z(_z) {}
 
-        // Basic Vector Math Operators
         constexpr vec3 operator-(const vec3& v) const { return { x - v.x, y - v.y, z - v.z }; }
         constexpr vec3 operator+(const vec3& v) const { return { x + v.x, y + v.y, z + v.z }; }
         constexpr vec3 operator*(float scalar) const { return { x * scalar, y * scalar, z * scalar }; }
@@ -66,8 +64,6 @@ namespace maths {
         }
     };
 
-    // 4x4 Column-Major Matrix Structure matching Vulkan/SPIR-V expected memory layout
-    // 4x4 Column-Major Matrix Structure
     struct mat4 {
         std::array<float, 16> m{};
 
@@ -76,7 +72,6 @@ namespace maths {
             m[0] = 1.0f; m[5] = 1.0f; m[10] = 1.0f; m[15] = 1.0f;
         }
 
-        // Multiplication (Column-Major)
         constexpr mat4 operator*(const mat4& other) const {
             mat4 result;
             for (int col = 0; col < 4; ++col) {
@@ -95,9 +90,6 @@ namespace maths {
             return result;
         }
 
-        // Pure rotation matrices around the principal axes (column-major, angle in radians).
-        // Used to build per-entity "tumble" transforms (RotateY * RotateX * RotateZ) so a
-        // procedural primitive can be seen from every angle without touching its baked geometry.
         static inline mat4 RotateX(float angleRadians) {
             mat4 result;
             float c = std::cos(angleRadians);
@@ -138,7 +130,6 @@ namespace maths {
             return result;
         }
 
-        // UNE SEULE DÉFINITION ICI :
         static inline mat4 PerspectiveVulkan(float fovRadians, float aspect, float zNear, float zFar) {
             float g = 1.0f / std::tan(fovRadians * 0.5f);
             mat4 result;
@@ -146,8 +137,6 @@ namespace maths {
 
             result.m[0] = g / aspect;
             result.m[5] = -g;
-            // View space looks down -Z (LookAt produces negative z_view in front of the camera),
-            // so w must equal -z_view (positive) for in-view points to survive clipping.
             result.m[10] = zFar / (zNear - zFar);
             result.m[11] = -1.0f;
             result.m[14] = -(zFar * zNear) / (zFar - zNear);
@@ -164,7 +153,6 @@ namespace maths {
         constexpr quat() = default;
         constexpr quat(float _x, float _y, float _z, float _w) : x(_x), y(_y), z(_z), w(_w) {}
 
-        // Utile pour créer une rotation depuis un axe et un angle
         static quat FromAxisAngle(vec3 axis, float angleRadians) {
             float s = std::sin(angleRadians * 0.5f);
             return { axis.x * s, axis.y * s, axis.z * s, std::cos(angleRadians * 0.5f) };

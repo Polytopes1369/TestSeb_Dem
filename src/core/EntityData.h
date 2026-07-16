@@ -4,7 +4,6 @@
 
 namespace core {
     struct EntityData {
-        // [0-15] Bloc unique de 16 octets
         uint32_t meshID;
         uint32_t materialID;
         uint32_t cellID;

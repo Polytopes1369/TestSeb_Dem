@@ -354,7 +354,11 @@ void VulkanContext::Init(std::string_view appName, GLFWwindow* window) {
     depthImageInfo.arrayLayers = 1;
     depthImageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
     depthImageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
-    depthImageInfo.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+    // SAMPLED_BIT (in addition to the attachment usage) lets renderer::HZBPass read this image's
+    // resolved depth through a combined image sampler when building the Hierarchical Z-Buffer
+    // pyramid -- D32_SFLOAT is mandated to support both DEPTH_STENCIL_ATTACHMENT and SAMPLED_IMAGE
+    // optimal-tiling usage, so this adds no extra format-support risk.
+    depthImageInfo.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
     depthImageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
     VmaAllocationCreateInfo depthAllocInfo{};

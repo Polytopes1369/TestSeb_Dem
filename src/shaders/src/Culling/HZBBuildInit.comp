@@ -1,0 +1,65 @@
+#version 460
+
+// Hierarchical Z-Buffer (HZB) pyramid construction -- FIRST pass (mip level 0).
+//
+// Driven by renderer::HZBPass::Generate() (see src/renderer/HZBPass.h/.cpp), this is the entry
+// point of the HZB build: it reduces the full-resolution source depth buffer (the previous frame's
+// rasterized depth attachment, sampled here through a plain nearest-filter sampler since Vulkan
+// forbids sampling an image that is simultaneously bound as a writable depth attachment) into mip
+// level 0 of the HZB pyramid, one non-overlapping 2x2 source texel block per destination texel.
+//
+// Every subsequent mip level is built by HZBReduce.comp applying the exact same 2x2 reduction rule
+// to the mip directly below it -- so mip 0 here is treated as "half the source resolution",
+// deliberately NOT a 1:1 copy of the source depth buffer. This keeps the whole pyramid uniform
+// (one reduction rule from top to bottom) instead of special-casing level 0 as a full-resolution
+// copy pass.
+//
+// Standard (non-reversed) depth convention is assumed throughout this codebase: 0.0 = near plane,
+// 1.0 = far plane (see VulkanPipeline::CreateGraphicsPipeline's VK_COMPARE_OP_LESS and the
+// depthAttachment.clearValue.depthStencil = {1.0f, 0} clear in main.cpp). Both the nearest (min)
+// and farthest (max) depth of every reduced footprint are kept -- not just the conservative max a
+// classic single-channel Hi-Z uses -- so a future occlusion-culling pass can pick whichever bound
+// its test needs (a far-bound test against the max channel, a near-bound/depth-bounds test against
+// the min channel) without having to rebuild the pyramid.
+
+layout(set = 0, binding = 0) uniform sampler2D u_SourceDepth;
+layout(set = 0, binding = 1, rg32f) writeonly uniform image2D u_HZBMip0;
+
+layout(push_constant) uniform HZBPushConstants {
+    uvec2 srcSize; // Full-resolution source depth buffer dimensions, in texels.
+    uvec2 dstSize; // Mip 0 dimensions, in texels (== ceil(srcSize / 2), computed on the CPU).
+} pc;
+
+// 8x8 workgroups: each thread reduces exactly one non-overlapping 2x2 source block into one
+// destination texel, so consecutive threads within a workgroup touch tightly-neighboring source
+// texels -- good spatial locality for the texture cache, and enough independent work per dispatch
+// to fully occupy the GPU even on the pyramid's larger mip levels.
+layout(local_size_x = 8, local_size_y = 8) in;
+
+void main() {
+    uvec2 dstCoord = gl_GlobalInvocationID.xy;
+    // Guard against the dispatch's workgroup grid overshooting dstSize on non-multiple-of-8
+    // dimensions -- every mip level (barring pathological 1x1 source depth buffers) has at least
+    // one edge that isn't an exact multiple of the 8x8 workgroup size.
+    if (dstCoord.x >= pc.dstSize.x || dstCoord.y >= pc.dstSize.y) {
+        return;
+    }
+
+    // Each destination texel reduces the 2x2 source block starting at (dstCoord * 2). Odd source
+    // dimensions are handled by clamping every sample coordinate to the last valid source texel
+    // instead of reading out of bounds: this duplicates the edge texel rather than sampling
+    // undefined/adjacent-image memory, which keeps the reduction conservative -- a duplicated real
+    // depth value can only ever tighten min/max, never fabricate a spurious one.
+    ivec2 maxSrcCoord = ivec2(pc.srcSize) - ivec2(1, 1);
+    ivec2 base = ivec2(dstCoord) * 2;
+
+    float d00 = texelFetch(u_SourceDepth, min(base + ivec2(0, 0), maxSrcCoord), 0).r;
+    float d10 = texelFetch(u_SourceDepth, min(base + ivec2(1, 0), maxSrcCoord), 0).r;
+    float d01 = texelFetch(u_SourceDepth, min(base + ivec2(0, 1), maxSrcCoord), 0).r;
+    float d11 = texelFetch(u_SourceDepth, min(base + ivec2(1, 1), maxSrcCoord), 0).r;
+
+    float minDepth = min(min(d00, d10), min(d01, d11));
+    float maxDepth = max(max(d00, d10), max(d01, d11));
+
+    imageStore(u_HZBMip0, ivec2(dstCoord), vec4(minDepth, maxDepth, 0.0, 0.0));
+}

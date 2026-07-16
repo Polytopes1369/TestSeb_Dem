@@ -1,0 +1,56 @@
+#version 460
+
+// Hierarchical Z-Buffer (HZB) pyramid construction -- REDUCTION pass (mip levels 1..N-1).
+//
+// Driven by renderer::HZBPass::Generate() (see src/renderer/HZBPass.h/.cpp), this shader is
+// dispatched once per mip level above level 0, always reducing the mip directly below it (level
+// N-1) into the current one (level N) via the exact same non-overlapping 2x2 min/max reduction
+// HZBBuildInit.comp used to build mip 0 from the source depth buffer. Both source and destination
+// are single-mip-level views of the very same HZB image (see renderer::HZBPass::m_MipViews), bound
+// as two separate storage-image descriptors so this shader can read one level while writing the
+// next without any image layout transition (the whole HZB image stays in VK_IMAGE_LAYOUT_GENERAL
+// for its entire lifetime).
+//
+// Correctness of the pyramid depends on renderer::HZBPass::Generate() recording an explicit
+// VkImageMemoryBarrier2 -- scoped to the exact mip subresource just written -- between every
+// dispatch of this shader (and after HZBBuildInit.comp's dispatch): each level's imageLoad here
+// must never race the previous dispatch's imageStore into that same level. See
+// HZBPass::BarrierAfterMipWrite in HZBPass.cpp for the barrier this shader's correctness relies on.
+
+layout(set = 0, binding = 0, rg32f) readonly uniform image2D u_SrcMip;
+layout(set = 0, binding = 1, rg32f) writeonly uniform image2D u_DstMip;
+
+layout(push_constant) uniform HZBPushConstants {
+    uvec2 srcSize; // u_SrcMip dimensions, in texels.
+    uvec2 dstSize; // u_DstMip dimensions, in texels (== ceil(srcSize / 2), computed on the CPU).
+} pc;
+
+// Matches HZBBuildInit.comp's workgroup shape so both passes' dispatch-size math
+// ((dim + 7) / 8 workgroups) is identical -- see renderer::HZBPass::Generate().
+layout(local_size_x = 8, local_size_y = 8) in;
+
+void main() {
+    uvec2 dstCoord = gl_GlobalInvocationID.xy;
+    if (dstCoord.x >= pc.dstSize.x || dstCoord.y >= pc.dstSize.y) {
+        return;
+    }
+
+    // Same edge-clamping rationale as HZBBuildInit.comp: duplicating the last valid source texel
+    // on odd mip dimensions keeps the reduction conservative instead of reading past the mip's
+    // valid region.
+    ivec2 maxSrcCoord = ivec2(pc.srcSize) - ivec2(1, 1);
+    ivec2 base = ivec2(dstCoord) * 2;
+
+    vec2 s00 = imageLoad(u_SrcMip, min(base + ivec2(0, 0), maxSrcCoord)).rg;
+    vec2 s10 = imageLoad(u_SrcMip, min(base + ivec2(1, 0), maxSrcCoord)).rg;
+    vec2 s01 = imageLoad(u_SrcMip, min(base + ivec2(0, 1), maxSrcCoord)).rg;
+    vec2 s11 = imageLoad(u_SrcMip, min(base + ivec2(1, 1), maxSrcCoord)).rg;
+
+    // .x carries the running min, .y the running max (see HZBBuildInit.comp) -- reducing across
+    // four already-reduced (min, max) pairs composes correctly without ever re-touching the
+    // original source depth texels.
+    float minDepth = min(min(s00.x, s10.x), min(s01.x, s11.x));
+    float maxDepth = max(max(s00.y, s10.y), max(s01.y, s11.y));
+
+    imageStore(u_DstMip, ivec2(dstCoord), vec4(minDepth, maxDepth, 0.0, 0.0));
+}

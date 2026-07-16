@@ -1,0 +1,68 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+
+// Decompression pass for the virtual geometry streaming pipeline: unpacks one resident cluster's
+// compact on-disk vertex format (geometry::ClusterData, see ClusterFormat.h/GeometryEncoding.h --
+// 3x uint16 normalized positions, a 3-byte octahedral-packed normal, 2x half-float UV per vertex)
+// directly out of renderer::GpuGeometryPagePool's physical page pool and into
+// renderer::GeometryDecompressionPass's final, fully-decompressed vertex pool, so a later
+// rasterization/mesh-shading stage never has to decode a compressed vertex itself.
+//
+// Dispatched as exactly one workgroup of CLUSTER_MAX_VERTICES (64) threads per resident page --
+// see renderer::GeometryDecompressionPass::DecompressPage, called once per
+// renderer::GpuGeometryPagePool::BindPage.
+
+#define COMPRESSED_POOL_SET 0
+#define COMPRESSED_POOL_BINDING 0
+#include "include/cluster_vertex_decode.glsl"
+
+// Fully-decompressed vertex, index-aligned 1:1 with the compressed pool's physical page slots:
+// physical page P's CLUSTER_MAX_VERTICES decompressed vertices live at
+// [P * CLUSTER_MAX_VERTICES, (P + 1) * CLUSTER_MAX_VERTICES) here. The trailing pad fields exist
+// only to keep every vec3 16-byte-aligned under std430 (the same trick struct_custo.glsl's own
+// Vertex/EntityTransform structs use) -- layout matches
+// renderer::GeometryDecompressionPass's documented 48-byte-per-vertex stride exactly.
+struct DecompressedClusterVertex {
+    vec3 position;
+    float _padPosition;
+    vec3 normal;
+    float _padNormal;
+    vec2 uv;
+    vec2 _padUV;
+};
+
+layout(std430, set = 0, binding = 1) writeonly buffer DecompressedVertexPoolSSBO {
+    DecompressedClusterVertex vertices[];
+} g_DecompressedVertexPool;
+
+layout(push_constant) uniform DecompressPushConstants {
+    uint physicalPageIndex;
+    uint _pad0;
+    uint _pad1;
+    uint _pad2;
+    vec4 boundsMin; // xyz used, w unused
+    vec4 boundsMax; // xyz used, w unused
+} pc;
+
+layout(local_size_x = CLUSTER_MAX_VERTICES) in;
+
+void main() {
+    // One workgroup == one cluster's page, one invocation == one of its CLUSTER_MAX_VERTICES
+    // vertices (the dispatch is always exactly 1x1x1 workgroups -- see DecompressPage).
+    uint vertexIndex = gl_GlobalInvocationID.x;
+    uint pageByteBase = pc.physicalPageIndex * CLUSTER_PAGE_SIZE_BYTES;
+
+    vec3 boundsMin = pc.boundsMin.xyz;
+    vec3 boundsMax = pc.boundsMax.xyz;
+
+    DecompressedClusterVertex outVertex;
+    outVertex.position = DecodeClusterPosition(pageByteBase, vertexIndex, boundsMin, boundsMax);
+    outVertex._padPosition = 0.0;
+    outVertex.normal = DecodeClusterNormal(pageByteBase, vertexIndex);
+    outVertex._padNormal = 0.0;
+    outVertex.uv = DecodeClusterUV(pageByteBase, vertexIndex);
+    outVertex._padUV = vec2(0.0);
+
+    uint outIndex = pc.physicalPageIndex * CLUSTER_MAX_VERTICES + vertexIndex;
+    g_DecompressedVertexPool.vertices[outIndex] = outVertex;
+}

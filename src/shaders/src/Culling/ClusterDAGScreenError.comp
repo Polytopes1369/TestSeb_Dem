@@ -1,0 +1,105 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+
+// GPU-side DAG LOD cut evaluation for cluster-level screen-space error. The shader consumes a
+// compact per-node payload that mirrors the runtime DAG semantics already used by the CPU-side
+// geometry::ClusterDAG and geometry::DAGNodeEntry data model: each node carries its own
+// geometric error (e_local), the parent error (e_parent), and a proxy sphere center/radius in
+// world space. From that, it projects each error term into screen-space pixels using the camera
+// view/projection and decides whether the cluster should be drawn, subdivided, or skipped in
+// favor of its parent.
+//
+// Output semantics:
+//   decision = 0 -> draw this cluster (local error below the pixel threshold while the parent
+//                   error still exceeds it)
+//   decision = 1 -> subdivide this cluster (local error is above the threshold and should be
+//                   refined further)
+//   decision = 2 -> skip this cluster (the parent is already accurate enough; let the coarser
+//                   ancestor represent the region)
+//
+// The shader is intentionally format-stable and can be bound by a future GPU-driven LOD pass
+// that fills the input SSBOs from CPU-side DAG data.
+
+#define DAG_DECISION_DRAW      0u
+#define DAG_DECISION_SUBDIVIDE 1u
+#define DAG_DECISION_SKIP      2u
+
+struct DAGNodePayload {
+    uint clusterID;
+    uint parentClusterID;
+    uint childClusterID0;
+    uint childClusterID1;
+    uint level;
+
+    float clusterError;
+    float parentError;
+
+    vec3 sphereCenter;
+    float sphereRadius;
+};
+
+struct DAGScreenErrorViewParams {
+    mat4 view;
+    mat4 proj;
+
+    float pixelThreshold;
+    float fovYRadians;
+    float viewportHeight;
+    float aspectRatio;
+};
+
+layout(std430, set = 0, binding = 0) readonly buffer DAGNodesSSBO {
+    DAGNodePayload nodes[];
+} g_DAGNodes;
+
+layout(std430, set = 0, binding = 1) writeonly buffer DAGDecisionSSBO {
+    uint decisions[];
+} g_DAGDecisions;
+
+layout(std430, set = 0, binding = 2) writeonly buffer DAGLocalErrorSSBO {
+    float projectedLocalErrors[];
+} g_DAGLocalErrors;
+
+layout(std430, set = 0, binding = 3) writeonly buffer DAGParentErrorSSBO {
+    float projectedParentErrors[];
+} g_DAGParentErrors;
+
+layout(std140, set = 0, binding = 4) uniform DAGViewParamsUBO {
+    DAGScreenErrorViewParams data;
+} g_ViewParams;
+
+layout(local_size_x = 64) in;
+
+float ProjectedErrorToPixels(float geometricError, vec3 worldPosition) {
+    vec4 viewPosition = g_ViewParams.data.view * vec4(worldPosition, 1.0);
+    float viewDepth = -viewPosition.z;
+    viewDepth = max(viewDepth, 1.0e-4);
+
+    float halfHeight = tan(g_ViewParams.data.fovYRadians * 0.5);
+    float projScale = g_ViewParams.data.viewportHeight * 0.5 / halfHeight;
+
+    return geometricError * projScale / viewDepth;
+}
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    if (index >= g_DAGNodes.nodes.length()) {
+        return;
+    }
+
+    DAGNodePayload node = g_DAGNodes.nodes[index];
+
+    float localPixelError = ProjectedErrorToPixels(node.clusterError, node.sphereCenter);
+    float parentPixelError = ProjectedErrorToPixels(node.parentError, node.sphereCenter);
+
+    uint decision = DAG_DECISION_SKIP;
+    if (localPixelError < g_ViewParams.data.pixelThreshold && parentPixelError >= g_ViewParams.data.pixelThreshold) {
+        decision = DAG_DECISION_DRAW;
+    } else if (localPixelError >= g_ViewParams.data.pixelThreshold) {
+        decision = DAG_DECISION_SUBDIVIDE;
+    }
+
+    g_DAGDecisions.decisions[index] = decision;
+    g_DAGLocalErrors.projectedLocalErrors[index] = localPixelError;
+    g_DAGParentErrors.projectedParentErrors[index] = parentPixelError;
+}
