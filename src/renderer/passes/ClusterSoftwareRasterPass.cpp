@@ -147,14 +147,7 @@ namespace renderer {
         clearLayoutInfo.pBindings = clearBindings;
         VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &clearLayoutInfo, nullptr, &m_ClearSetLayout));
 
-        VkDescriptorSetLayoutBinding buildArgsBindings[2]{};
-        buildArgsBindings[0] = { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // SourceCountSSBO
-        buildArgsBindings[1] = { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // DispatchArgsSSBO
-
-        VkDescriptorSetLayoutCreateInfo buildArgsLayoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-        buildArgsLayoutInfo.bindingCount = 2;
-        buildArgsLayoutInfo.pBindings = buildArgsBindings;
-        VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &buildArgsLayoutInfo, nullptr, &m_BuildArgsSetLayout));
+        m_BuildArgsSetLayout = VulkanPipeline::CreateBuildDispatchIndirectArgsSetLayout(m_Device);
 
         // --- One shared descriptor pool for all 5 sets ---
         VkDescriptorPoolSize poolSizes[4]{};
@@ -311,21 +304,8 @@ namespace renderer {
         m_ClearPipeline = VulkanPipeline::CreateComputePipeline(m_Device, m_ClearPipelineLayout, clearShaderModule);
         vkDestroyShaderModule(m_Device, clearShaderModule, nullptr);
 
-        VkPushConstantRange buildArgsPushConstantRange{};
-        buildArgsPushConstantRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-        buildArgsPushConstantRange.offset = 0;
-        buildArgsPushConstantRange.size = 2 * sizeof(uint32_t); // Matches BuildDispatchArgsPushConstants { workgroupSize; perElementMultiplier; }.
-
-        VkPipelineLayoutCreateInfo buildArgsPipelineLayoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-        buildArgsPipelineLayoutInfo.setLayoutCount = 1;
-        buildArgsPipelineLayoutInfo.pSetLayouts = &m_BuildArgsSetLayout;
-        buildArgsPipelineLayoutInfo.pushConstantRangeCount = 1;
-        buildArgsPipelineLayoutInfo.pPushConstantRanges = &buildArgsPushConstantRange;
-        VK_CHECK(vkCreatePipelineLayout(m_Device, &buildArgsPipelineLayoutInfo, nullptr, &m_BuildArgsPipelineLayout));
-
-        VkShaderModule buildArgsShaderModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/BuildDispatchIndirectArgs.comp.spv");
-        m_BuildArgsPipeline = VulkanPipeline::CreateComputePipeline(m_Device, m_BuildArgsPipelineLayout, buildArgsShaderModule);
-        vkDestroyShaderModule(m_Device, buildArgsShaderModule, nullptr);
+        VulkanPipeline::CreateBuildDispatchIndirectArgsPipeline(
+            m_Device, m_BuildArgsSetLayout, m_BuildArgsPipelineLayout, m_BuildArgsPipeline);
 
         LOG_INFO(std::format("[ClusterSoftwareRasterPass] Initialized software raster pass: size={}x{}, maskTextures={}",
             renderExtent.width, renderExtent.height, maskTextureCount));
@@ -403,16 +383,9 @@ namespace renderer {
 
         // The clear's write must be visible to RecordRaster()'s imageAtomicMax (both a read and a
         // write of the same texel).
-        VkMemoryBarrier2 barrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
-        barrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-        barrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-        barrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-        barrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-
-        VkDependencyInfo depInfo{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-        depInfo.memoryBarrierCount = 1;
-        depInfo.pMemoryBarriers = &barrier;
-        vkCmdPipelineBarrier2(cmd, &depInfo);
+        VulkanUtils::RecordMemoryBarrier(cmd,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
     }
 
     void ClusterSoftwareRasterPass::RecordRaster(VkCommandBuffer cmd, const maths::mat4& viewProj) {
@@ -423,16 +396,9 @@ namespace renderer {
         viewParams.viewportHeight = static_cast<float>(m_RenderExtent.height);
         vkCmdUpdateBuffer(cmd, m_ViewParamsBuffer.Handle(), 0, sizeof(SoftwareRasterViewParams), &viewParams);
 
-        VkMemoryBarrier2 uboBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
-        uboBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
-        uboBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-        uboBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-        uboBarrier.dstAccessMask = VK_ACCESS_2_UNIFORM_READ_BIT;
-
-        VkDependencyInfo uboDependency{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-        uboDependency.memoryBarrierCount = 1;
-        uboDependency.pMemoryBarriers = &uboBarrier;
-        vkCmdPipelineBarrier2(cmd, &uboDependency);
+        VulkanUtils::RecordMemoryBarrier(cmd,
+            VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_UNIFORM_READ_BIT);
 
         // --- Build BOTH dispatches' indirect args from each list's own atomic count --
         // perElementMultiplier = geometry::kMaxClusterTriangles for both, since both
@@ -451,16 +417,9 @@ namespace renderer {
         vkCmdPushConstants(cmd, m_BuildArgsPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(buildArgsPushConstants), buildArgsPushConstants);
         vkCmdDispatch(cmd, 1, 1, 1);
 
-        VkMemoryBarrier2 argsBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
-        argsBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-        argsBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-        argsBarrier.dstStageMask = VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT;
-        argsBarrier.dstAccessMask = VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT;
-
-        VkDependencyInfo argsDependency{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-        argsDependency.memoryBarrierCount = 1;
-        argsDependency.pMemoryBarriers = &argsBarrier;
-        vkCmdPipelineBarrier2(cmd, &argsDependency);
+        VulkanUtils::RecordMemoryBarrier(cmd,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT, VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT);
 
         // --- Indirect rasterization dispatches: masked list against the mask-sampling pipeline,
         // opaque list against the mask-free pipeline. Both write the same atomic VisBuffer image;
@@ -480,16 +439,9 @@ namespace renderer {
 
         // Both rasterization dispatches' atomic writes must be visible to a later compute read
         // (renderer::ClusterResolvePass).
-        VkMemoryBarrier2 outputBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
-        outputBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-        outputBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-        outputBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-        outputBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
-
-        VkDependencyInfo outputDependency{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-        outputDependency.memoryBarrierCount = 1;
-        outputDependency.pMemoryBarriers = &outputBarrier;
-        vkCmdPipelineBarrier2(cmd, &outputDependency);
+        VulkanUtils::RecordMemoryBarrier(cmd,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
     }
 
 }

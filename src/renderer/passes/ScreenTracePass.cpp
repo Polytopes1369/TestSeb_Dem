@@ -27,16 +27,6 @@ namespace renderer {
         static_assert(sizeof(ScreenTraceViewParams) == 160,
             "ScreenTraceViewParams must match ScreenTraceViewParamsUBO in ScreenTrace.comp exactly (std140 layout)");
 
-        // Byte-for-byte mirror of world_probe_sampling.glsl's WorldProbeGridParamsUBO (std140).
-        struct WorldProbeGridParams {
-            float gridOriginX = 0.0f, gridOriginY = 0.0f, gridOriginZ = 0.0f;
-            float probeSpacing = 0.0f;
-            float gridResolution = 0.0f;
-            float _pad0 = 0.0f, _pad1 = 0.0f, _pad2 = 0.0f;
-        };
-        static_assert(sizeof(WorldProbeGridParams) == 32,
-            "WorldProbeGridParams must match world_probe_sampling.glsl's WorldProbeGridParamsUBO exactly (std140 layout)");
-
     } // namespace
 
     void ScreenTracePass::Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,

@@ -168,14 +168,7 @@ namespace renderer {
         VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &layoutInfo, nullptr, &m_SetLayout));
 
         // --- BuildDispatchIndirectArgs set layout: 2 bindings ---
-        VkDescriptorSetLayoutBinding buildArgsBindings[2]{};
-        buildArgsBindings[0] = { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // SourceCountSSBO
-        buildArgsBindings[1] = { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // DispatchArgsSSBO
-
-        VkDescriptorSetLayoutCreateInfo buildArgsLayoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-        buildArgsLayoutInfo.bindingCount = 2;
-        buildArgsLayoutInfo.pBindings = buildArgsBindings;
-        VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &buildArgsLayoutInfo, nullptr, &m_BuildArgsSetLayout));
+        m_BuildArgsSetLayout = VulkanPipeline::CreateBuildDispatchIndirectArgsSetLayout(m_Device);
 
         // --- One shared descriptor pool for both sets ---
         VkDescriptorPoolSize poolSizes[3]{};
@@ -321,28 +314,8 @@ namespace renderer {
         vkDestroyShaderModule(m_Device, occlusionShaderModule, nullptr);
 
         // --- BuildDispatchIndirectArgs pipeline ---
-        VkPushConstantRange buildArgsPushConstantRange{};
-        buildArgsPushConstantRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-        buildArgsPushConstantRange.offset = 0;
-        buildArgsPushConstantRange.size = 2 * sizeof(uint32_t); // Matches BuildDispatchArgsPushConstants { workgroupSize; perElementMultiplier; }.
-
-        VkPipelineLayoutCreateInfo buildArgsPipelineLayoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-        buildArgsPipelineLayoutInfo.setLayoutCount = 1;
-        buildArgsPipelineLayoutInfo.pSetLayouts = &m_BuildArgsSetLayout;
-        buildArgsPipelineLayoutInfo.pushConstantRangeCount = 1;
-        buildArgsPipelineLayoutInfo.pPushConstantRanges = &buildArgsPushConstantRange;
-        VK_CHECK(vkCreatePipelineLayout(m_Device, &buildArgsPipelineLayoutInfo, nullptr, &m_BuildArgsPipelineLayout));
-
-        VkShaderModule buildArgsShaderModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/BuildDispatchIndirectArgs.comp.spv");
-
-        VkComputePipelineCreateInfo buildArgsPipelineInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
-        buildArgsPipelineInfo.layout = m_BuildArgsPipelineLayout;
-        buildArgsPipelineInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        buildArgsPipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-        buildArgsPipelineInfo.stage.module = buildArgsShaderModule;
-        buildArgsPipelineInfo.stage.pName = "main";
-        VK_CHECK(vkCreateComputePipelines(m_Device, VK_NULL_HANDLE, 1, &buildArgsPipelineInfo, nullptr, &m_BuildArgsPipeline));
-        vkDestroyShaderModule(m_Device, buildArgsShaderModule, nullptr);
+        VulkanPipeline::CreateBuildDispatchIndirectArgsPipeline(
+            m_Device, m_BuildArgsSetLayout, m_BuildArgsPipelineLayout, m_BuildArgsPipeline);
     }
 
     void ClusterOcclusionCullingPass::Shutdown() {
@@ -422,16 +395,9 @@ namespace renderer {
     void ClusterOcclusionCullingPass::ClearPersistedVisibility(VkCommandBuffer cmd) {
         vkCmdFillBuffer(cmd, m_VisibleLastFrameBuffer.Handle(), 0, VK_WHOLE_SIZE, 0u);
 
-        VkMemoryBarrier2 barrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
-        barrier.srcStageMask = VK_PIPELINE_STAGE_2_CLEAR_BIT;
-        barrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-        barrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-        barrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-
-        VkDependencyInfo depInfo{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-        depInfo.memoryBarrierCount = 1;
-        depInfo.pMemoryBarriers = &barrier;
-        vkCmdPipelineBarrier2(cmd, &depInfo);
+        VulkanUtils::RecordMemoryBarrier(cmd,
+            VK_PIPELINE_STAGE_2_CLEAR_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
     }
 
     void ClusterOcclusionCullingPass::RecordClearFrame(VkCommandBuffer cmd) {
@@ -446,16 +412,9 @@ namespace renderer {
         vkCmdFillBuffer(cmd, m_LateDrawCountOpaqueBuffer.Handle(), 0, sizeof(uint32_t), 0u);
         vkCmdFillBuffer(cmd, m_SoftwareClusterListOpaqueBuffer.Handle(), 0, sizeof(uint32_t), 0u);
 
-        VkMemoryBarrier2 barrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
-        barrier.srcStageMask = VK_PIPELINE_STAGE_2_CLEAR_BIT;
-        barrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-        barrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-        barrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-
-        VkDependencyInfo depInfo{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-        depInfo.memoryBarrierCount = 1;
-        depInfo.pMemoryBarriers = &barrier;
-        vkCmdPipelineBarrier2(cmd, &depInfo);
+        VulkanUtils::RecordMemoryBarrier(cmd,
+            VK_PIPELINE_STAGE_2_CLEAR_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
     }
 
     void ClusterOcclusionCullingPass::RecordEarlyPass(VkCommandBuffer cmd, const ClusterCullViewParams& viewParams, const maths::mat4& viewProj,
@@ -474,16 +433,9 @@ namespace renderer {
         hzbParams.projScaleY = projScaleY;
         vkCmdUpdateBuffer(cmd, m_HZBParamsBuffer.Handle(), 0, sizeof(HZBOcclusionViewParams), &hzbParams);
 
-        VkMemoryBarrier2 uboBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
-        uboBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
-        uboBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-        uboBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-        uboBarrier.dstAccessMask = VK_ACCESS_2_UNIFORM_READ_BIT;
-
-        VkDependencyInfo uboDependency{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-        uboDependency.memoryBarrierCount = 1;
-        uboDependency.pMemoryBarriers = &uboBarrier;
-        vkCmdPipelineBarrier2(cmd, &uboDependency);
+        VulkanUtils::RecordMemoryBarrier(cmd,
+            VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_UNIFORM_READ_BIT);
 
         // --- Dispatch: one invocation per this frame's GPU-compacted candidate (count only ever
         // known on the GPU -- see CandidateCountSSBO, binding 11 -- hence the indirect dispatch),
@@ -503,16 +455,10 @@ namespace renderer {
         // pending list all visible to a later vkCmdDrawIndexedIndirectCount /
         // RecordBuildLateDispatchArgs() / RecordLatePass() / renderer::ClusterSoftwareRasterPass
         // compute reads. ---
-        VkMemoryBarrier2 outputBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
-        outputBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-        outputBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-        outputBarrier.dstStageMask = VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-        outputBarrier.dstAccessMask = VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
-
-        VkDependencyInfo outputDependency{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-        outputDependency.memoryBarrierCount = 1;
-        outputDependency.pMemoryBarriers = &outputBarrier;
-        vkCmdPipelineBarrier2(cmd, &outputDependency);
+        VulkanUtils::RecordMemoryBarrier(cmd,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
     }
 
     void ClusterOcclusionCullingPass::RecordBuildLateDispatchArgs(VkCommandBuffer cmd) {
@@ -529,16 +475,9 @@ namespace renderer {
         // The dispatch args must be visible to RecordLatePass()'s vkCmdDispatchIndirect --
         // classified the same as vkCmdDrawIndirect's indirect-buffer read
         // (VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT / VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT).
-        VkMemoryBarrier2 barrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
-        barrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-        barrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-        barrier.dstStageMask = VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT;
-        barrier.dstAccessMask = VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT;
-
-        VkDependencyInfo depInfo{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-        depInfo.memoryBarrierCount = 1;
-        depInfo.pMemoryBarriers = &barrier;
-        vkCmdPipelineBarrier2(cmd, &depInfo);
+        VulkanUtils::RecordMemoryBarrier(cmd,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT, VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT);
     }
 
     void ClusterOcclusionCullingPass::RecordLatePass(VkCommandBuffer cmd, uint32_t disableOcclusionCulling) {
@@ -564,16 +503,9 @@ namespace renderer {
 
         // --- Make the late indirect-draw list + its count visible to a later
         // vkCmdDrawIndexedIndirectCount. ---
-        VkMemoryBarrier2 outputBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
-        outputBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-        outputBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-        outputBarrier.dstStageMask = VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT;
-        outputBarrier.dstAccessMask = VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT;
-
-        VkDependencyInfo outputDependency{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-        outputDependency.memoryBarrierCount = 1;
-        outputDependency.pMemoryBarriers = &outputBarrier;
-        vkCmdPipelineBarrier2(cmd, &outputDependency);
+        VulkanUtils::RecordMemoryBarrier(cmd,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT, VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT);
     }
 
 }

@@ -286,16 +286,9 @@ namespace renderer {
 
             // The copy's writes must be visible to the culling shader's readonly SSBO reads before its
             // next dispatch.
-            VkMemoryBarrier2 memBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
-            memBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
-            memBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-            memBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-            memBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
-
-            VkDependencyInfo depInfo{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-            depInfo.memoryBarrierCount = 1;
-            depInfo.pMemoryBarriers = &memBarrier;
-            vkCmdPipelineBarrier2(cmd, &depInfo);
+            VulkanUtils::RecordMemoryBarrier(cmd,
+                VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
         });
 
         vmaDestroyBuffer(m_Allocator, stagingBuffer, stagingAllocation);
@@ -309,16 +302,9 @@ namespace renderer {
 
         // The clear's write must be visible to the culling shader's atomicAdd (both a read and a
         // write of the same word) before its dispatch runs.
-        VkMemoryBarrier2 barrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
-        barrier.srcStageMask = VK_PIPELINE_STAGE_2_CLEAR_BIT;
-        barrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-        barrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-        barrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-
-        VkDependencyInfo depInfo{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-        depInfo.memoryBarrierCount = 1;
-        depInfo.pMemoryBarriers = &barrier;
-        vkCmdPipelineBarrier2(cmd, &depInfo);
+        VulkanUtils::RecordMemoryBarrier(cmd,
+            VK_PIPELINE_STAGE_2_CLEAR_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
     }
 
     void ClusterCullingPass::RecordCull(VkCommandBuffer cmd, const ClusterCullViewParams& viewParams, uint32_t clusterCount) {
@@ -330,16 +316,9 @@ namespace renderer {
         // vkCmdUpdateBuffer is classified as a copy/transfer operation by the Vulkan
         // synchronization chapter (VK_PIPELINE_STAGE_2_COPY_BIT / VK_ACCESS_2_TRANSFER_WRITE_BIT),
         // distinct from vkCmdFillBuffer's VK_PIPELINE_STAGE_2_CLEAR_BIT used in RecordClear().
-        VkMemoryBarrier2 uboBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
-        uboBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
-        uboBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-        uboBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-        uboBarrier.dstAccessMask = VK_ACCESS_2_UNIFORM_READ_BIT;
-
-        VkDependencyInfo uboDependency{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-        uboDependency.memoryBarrierCount = 1;
-        uboDependency.pMemoryBarriers = &uboBarrier;
-        vkCmdPipelineBarrier2(cmd, &uboDependency);
+        VulkanUtils::RecordMemoryBarrier(cmd,
+            VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_UNIFORM_READ_BIT);
 
         // --- Step 2: dispatch one invocation per candidate cluster ---
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_Pipeline);
@@ -353,16 +332,9 @@ namespace renderer {
 
         // --- Step 3: make every surviving cluster's indirect command + the final draw count
         // visible to a subsequent vkCmdDrawIndexedIndirect(Count). ---
-        VkMemoryBarrier2 outputBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
-        outputBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-        outputBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-        outputBarrier.dstStageMask = VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT;
-        outputBarrier.dstAccessMask = VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT;
-
-        VkDependencyInfo outputDependency{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-        outputDependency.memoryBarrierCount = 1;
-        outputDependency.pMemoryBarriers = &outputBarrier;
-        vkCmdPipelineBarrier2(cmd, &outputDependency);
+        VulkanUtils::RecordMemoryBarrier(cmd,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT, VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT);
     }
 
 }

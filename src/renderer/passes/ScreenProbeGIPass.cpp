@@ -188,9 +188,6 @@ namespace renderer {
             VK_CHECK(vkAllocateDescriptorSets(m_Device, &setAllocInfo, m_TraceSet));
 
             VkAccelerationStructureKHR tlasHandle = rtPass.GetTLASHandle();
-            VkDescriptorBufferInfo vertexBufferInfo{ surfaceCache.GetVertexBuffer(), 0, VK_WHOLE_SIZE };
-            VkDescriptorBufferInfo indexBufferInfo{ surfaceCache.GetIndexBuffer(), 0, VK_WHOLE_SIZE };
-            VkDescriptorBufferInfo drawRangeBufferInfo{ rtPass.GetDrawRangeBuffer(), 0, VK_WHOLE_SIZE };
             VkDescriptorBufferInfo viewParamsInfo{ m_ViewParamsBuffer.Handle(), 0, m_ViewParamsBuffer.Size() };
             VkDescriptorImageInfo gbufferNormalInfo{ VK_NULL_HANDLE, resolvePass.GetOutputNormalView(), VK_IMAGE_LAYOUT_GENERAL };
             VkDescriptorImageInfo gbufferDepthInfo{ VK_NULL_HANDLE, resolvePass.GetOutputDepthView(), VK_IMAGE_LAYOUT_GENERAL };
@@ -203,20 +200,16 @@ namespace renderer {
                 VkDescriptorImageInfo worldPosInfo{ VK_NULL_HANDLE, slot.worldPosView, VK_IMAGE_LAYOUT_GENERAL };
                 VkDescriptorImageInfo normalInfo{ VK_NULL_HANDLE, slot.normalView, VK_IMAGE_LAYOUT_GENERAL };
 
-                VkWriteDescriptorSet writes[12]{};
+                VkWriteDescriptorSet writes[8]{};
                 VkDescriptorImageInfo* imageInfos[7] = { &shRInfo, &shGInfo, &shBInfo, &worldPosInfo, &normalInfo, &gbufferNormalInfo, &gbufferDepthInfo };
                 for (uint32_t b = 0; b <= 6; ++b) {
                     writes[b] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_TraceSet[slotIndex], b, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, imageInfos[b], nullptr, nullptr };
                 }
-                VkWriteDescriptorSetAccelerationStructureKHR accelWrite{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR };
-                accelWrite.accelerationStructureCount = 1;
-                accelWrite.pAccelerationStructures = &tlasHandle;
-                writes[7] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, &accelWrite, m_TraceSet[slotIndex], 7, 0, 1, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, nullptr, nullptr, nullptr };
-                writes[8] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_TraceSet[slotIndex], 8, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &vertexBufferInfo, nullptr };
-                writes[9] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_TraceSet[slotIndex], 9, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &indexBufferInfo, nullptr };
-                writes[10] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_TraceSet[slotIndex], 10, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &drawRangeBufferInfo, nullptr };
-                writes[11] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_TraceSet[slotIndex], 11, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &viewParamsInfo, nullptr };
-                vkUpdateDescriptorSets(m_Device, 12, writes, 0, nullptr);
+                writes[7] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_TraceSet[slotIndex], 11, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &viewParamsInfo, nullptr };
+                vkUpdateDescriptorSets(m_Device, 8, writes, 0, nullptr);
+
+                VulkanUtils::WriteSharedGeometryBindings(m_Device, m_TraceSet[slotIndex], 7, tlasHandle,
+                    surfaceCache.GetVertexBuffer(), surfaceCache.GetIndexBuffer(), rtPass.GetDrawRangeBuffer());
             }
 
             VkDescriptorSetLayout traceSetLayouts[3] = { m_TraceSetLayout, traceContext.GetMeshSdfTraceSetLayout(), traceContext.GetSurfaceCacheSamplingSetLayout() };
