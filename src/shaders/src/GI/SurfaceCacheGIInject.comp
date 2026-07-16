@@ -1,0 +1,199 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+#extension GL_EXT_ray_query : require
+
+// Part 3 deliverable: Surface Cache GI injection. Dispatched per-card
+// (renderer::SurfaceCacheGIInjectPass mirrors renderer::SurfaceCachePass::RecordCapture's own
+// per-frame-budgeted round-robin discipline -- see that class' own comment), one invocation per
+// valid texel of the currently-processed card's atlas rect. For each such texel: reads its
+// already-captured world-space hit position + normal + albedo (SurfaceCacheCapture.frag's own
+// worldPos/normal/albedo atlases), fires pc.sampleCount cosine-weighted hemisphere rays
+// (Halton(2,3) sequence) from that position, traces each in either SWRT (sphere-tracing every
+// entity's Mesh SDF, mesh_sdf_trace.glsl) or HWRT (inline rayQueryEXT against the Fallback Mesh
+// TLAS -- an actual hardware trace callable from a plain compute shader, unlike
+// vkCmdTraceRaysKHR, which only a ray tracing pipeline / vkCmdTraceRaysKHR command can issue)
+// depending on pc.traceMode, samples the hit's Surface Cache Card radiance
+// (surface_cache_sampling.glsl) for every ray that lands on a surface, and re-injects
+// albedo * average(hit radiance) + this texel's own captured emissive as a secondary bounce back
+// into the origin texel of the radiance atlas.
+//
+// --- Same-dispatch read/write aliasing on g_SurfaceCacheRadiance (intentional) ---
+// This shader both imageStore's a hemisphere-ray ORIGIN texel (g_RadianceStorage, set 0) and,
+// via SampleCardRadiance, texelFetch's whatever card a ray HAPPENS to land on (through
+// g_SurfaceCacheRadiance, set 2) -- the exact same underlying VkImage, bound twice with two
+// different descriptor types. A landed-on texel could, within the same dispatch, be an origin
+// texel some OTHER invocation is concurrently writing; Vulkan's memory model makes no guarantee
+// about which value (old or freshly-written) that read observes, but either is an equally valid
+// operand for a single-bounce Monte Carlo estimator -- exactly the same order-independent
+// same-frame injection behavior production Lumen-style radiosity passes rely on, not a bug.
+
+#include "include/math_utils.glsl"
+#include "include/mesh_sdf_trace.glsl"        // set 1
+#include "include/surface_cache_sampling.glsl" // set 2
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0, rgba16f) uniform image2D g_RadianceStorage; // read-modify-write target -- see this file's own header comment on aliasing g_SurfaceCacheRadiance (set 2).
+layout(set = 0, binding = 1) uniform sampler2D g_AlbedoAtlas;
+layout(set = 0, binding = 2) uniform sampler2D g_NormalAtlas;
+layout(set = 0, binding = 3) uniform sampler2D g_WorldPosAtlas;
+layout(set = 0, binding = 4) uniform sampler2D g_EmissiveAtlas;
+layout(set = 0, binding = 5) uniform accelerationStructureEXT g_TLAS;
+
+// Mirrors SurfaceCacheHWRT.rchit's own vertex/index/draw-range bindings exactly (same struct
+// layouts, same underlying buffers -- renderer::SurfaceCachePass::GetVertexBuffer()/
+// GetIndexBuffer(), renderer::SurfaceCacheRayTracingPass's own draw-range SSBO) so the HWRT trace
+// path below (TraceHWRT) computes a geometric hit normal exactly the same way the full ray
+// tracing pipeline's closest-hit shader does.
+struct FallbackVertexGpu { float posX, posY, posZ; float normX, normY, normZ; float u, v; };
+layout(std430, set = 0, binding = 6) readonly buffer FallbackVertexBuffer { FallbackVertexGpu g_Vertices[]; };
+layout(std430, set = 0, binding = 7) readonly buffer FallbackIndexBuffer { uint g_Indices[]; };
+struct EntityDrawRangeGpu { int vertexOffset; uint firstIndex; uint indexCount; uint _pad; };
+layout(std430, set = 0, binding = 8) readonly buffer EntityDrawRangeBuffer { EntityDrawRangeGpu g_DrawRanges[]; };
+
+layout(push_constant) uniform GIInjectPushConstants {
+    uvec2 atlasOffset; // This dispatch's card's atlasOffset (renderer::SurfaceCacheGIInjectPass::RecordInject()).
+    uvec2 atlasSize;   // This dispatch's card's atlasSize -- also the dispatch's own bounds check.
+    uint entityCount;  // Dynamically uniform -- see mesh_sdf_trace.glsl's own requirement.
+    uint sampleCount;  // Hemisphere rays traced per texel this call.
+    uint frameIndex;   // Halton sequence temporal offset, advanced by the caller across calls for temporal variety.
+    uint traceMode;    // 0 = SWRT (TraceMeshSDFScene), 1 = HWRT (TraceHWRT, inline ray query).
+} pc;
+
+// Inverse of SurfaceCacheCapture.frag's OctEncode -- the standard octahedral decode.
+vec3 OctDecode(vec2 e) {
+    e = e * 2.0 - 1.0;
+    vec3 n = vec3(e.xy, 1.0 - abs(e.x) - abs(e.y));
+    float t = clamp(-n.z, 0.0, 1.0);
+    n.xy += mix(vec2(t, t), vec2(-t, -t), greaterThanEqual(n.xy, vec2(0.0)));
+    return normalize(n);
+}
+
+float RadicalInverse(uint index, uint base) {
+    float result = 0.0;
+    float f = 1.0 / float(base);
+    uint i = index;
+    while (i > 0u) {
+        result += f * float(i % base);
+        i /= base;
+        f /= float(base);
+    }
+    return result;
+}
+
+vec2 Halton23(uint index) {
+    return vec2(RadicalInverse(index, 2u), RadicalInverse(index, 3u));
+}
+
+// Malley's method: a uniform sample on the unit disk, lifted onto the hemisphere by
+// sqrt(1 - r^2), IS a cosine-weighted hemisphere sample -- oriented here by the tangent frame
+// built from `normal` (Duff et al.'s branchless orthonormal-basis construction, avoiding the
+// classic "up vector nearly parallel to normal" degenerate case some simpler constructions hit).
+vec3 CosineWeightedHemisphereSample(vec2 xi, vec3 normal) {
+    float r = sqrt(xi.x);
+    float phi = TAU * xi.y;
+    vec3 localDir = vec3(r * cos(phi), r * sin(phi), sqrt(max(0.0, 1.0 - xi.x)));
+
+    float sign_ = normal.z >= 0.0 ? 1.0 : -1.0;
+    float a = -1.0 / (sign_ + normal.z);
+    float b = normal.x * normal.y * a;
+    vec3 tangent = vec3(1.0 + sign_ * normal.x * normal.x * a, sign_ * b, -sign_ * normal.x);
+    vec3 bitangent = vec3(b, sign_ + normal.y * normal.y * a, -normal.y);
+
+    return normalize(tangent * localDir.x + bitangent * localDir.y + normal * localDir.z);
+}
+
+vec3 FetchPosition(uint globalVertexIndex) {
+    FallbackVertexGpu v = g_Vertices[globalVertexIndex];
+    return vec3(v.posX, v.posY, v.posZ);
+}
+
+// HWRT path: inline ray tracing (VK_KHR_ray_query) against the same Fallback Mesh TLAS
+// renderer::SurfaceCacheRayTracingPass builds for the full ray tracing pipeline path -- the only
+// way to issue a hardware trace from a plain compute shader (vkCmdTraceRaysKHR itself is a
+// command, not something callable from inside a compute invocation).
+bool TraceHWRT(vec3 rayOrigin, vec3 rayDir, float tMax, out uint outEntityIndex, out vec3 outLocalPos, out vec3 outLocalNormal) {
+    rayQueryEXT rq;
+    rayQueryInitializeEXT(rq, g_TLAS, gl_RayFlagsOpaqueEXT, 0xFF, rayOrigin, 1.0e-3, rayDir, tMax);
+    while (rayQueryProceedEXT(rq)) {
+        // Every BLAS triangle in this TLAS is unconditionally opaque (see
+        // renderer::AccelerationStructure::BuildBLAS's own comment) and gl_RayFlagsOpaqueEXT is
+        // set above, so every candidate is auto-committed by the implementation -- nothing to
+        // confirm/reject manually inside this loop.
+    }
+    if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionNoneEXT) {
+        return false;
+    }
+
+    outEntityIndex = uint(rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true));
+    int primitiveID = rayQueryGetIntersectionPrimitiveIndexEXT(rq, true);
+    float hitT = rayQueryGetIntersectionTEXT(rq, true);
+    vec3 objOrigin = rayQueryGetIntersectionObjectRayOriginEXT(rq, true);
+    vec3 objDir = rayQueryGetIntersectionObjectRayDirectionEXT(rq, true);
+    outLocalPos = objOrigin + objDir * hitT;
+
+    EntityDrawRangeGpu range = g_DrawRanges[outEntityIndex];
+    uint triangleFirstIndex = range.firstIndex + uint(primitiveID) * 3u;
+    uint i0 = uint(range.vertexOffset) + g_Indices[triangleFirstIndex + 0u];
+    uint i1 = uint(range.vertexOffset) + g_Indices[triangleFirstIndex + 1u];
+    uint i2 = uint(range.vertexOffset) + g_Indices[triangleFirstIndex + 2u];
+    vec3 p0 = FetchPosition(i0);
+    vec3 p1 = FetchPosition(i1);
+    vec3 p2 = FetchPosition(i2);
+    outLocalNormal = normalize(cross(p1 - p0, p2 - p0));
+    return true;
+}
+
+void main() {
+    uvec2 localTexel = gl_GlobalInvocationID.xy;
+    if (localTexel.x >= pc.atlasSize.x || localTexel.y >= pc.atlasSize.y) {
+        return;
+    }
+    ivec2 atlasTexel = ivec2(pc.atlasOffset + localTexel);
+
+    vec4 worldPosSample = texelFetch(g_WorldPosAtlas, atlasTexel, 0);
+    if (worldPosSample.a < 0.5) {
+        // Never captured (see renderer::SurfaceCachePass's own worldPosClear comment: alpha 0
+        // outside every card rect) -- no surface here to bounce light from.
+        return;
+    }
+    vec3 origin = worldPosSample.rgb;
+    vec3 normal = OctDecode(texelFetch(g_NormalAtlas, atlasTexel, 0).rg);
+    vec3 albedo = texelFetch(g_AlbedoAtlas, atlasTexel, 0).rgb;
+    vec3 emissive = texelFetch(g_EmissiveAtlas, atlasTexel, 0).rgb;
+
+    // Bias the origin along the normal so the very first sphere-trace step / ray-query cast does
+    // not immediately re-intersect the origin texel's own surface.
+    vec3 biasedOrigin = origin + normal * 1.0e-2;
+
+    vec3 accumulated = vec3(0.0);
+    for (uint s = 0u; s < pc.sampleCount; ++s) {
+        vec2 xi = Halton23(pc.frameIndex * pc.sampleCount + s + 1u);
+        vec3 dir = CosineWeightedHemisphereSample(xi, normal);
+
+        uint hitEntityIndex;
+        vec3 hitLocalPos, hitLocalNormal;
+        bool hit;
+        if (pc.traceMode == 0u) {
+            hit = TraceMeshSDFScene(biasedOrigin, dir, kFarDistance, pc.entityCount, hitEntityIndex, hitLocalPos, hitLocalNormal);
+        } else {
+            hit = TraceHWRT(biasedOrigin, dir, kFarDistance, hitEntityIndex, hitLocalPos, hitLocalNormal);
+        }
+
+        if (hit) {
+            EntityInfo hitEntity = g_Entities[hitEntityIndex];
+            accumulated += SampleCardRadiance(hitLocalPos, hitLocalNormal, hitEntity.firstCardIndex, hitEntity.cardCount);
+        }
+    }
+
+    // Cosine-weighted importance sampling's PDF (cos(theta)/PI) exactly cancels the Lambertian
+    // BRDF's own cos(theta)/PI term in the reflectance integral, leaving a plain sample average --
+    // the standard cosine-weighted Monte Carlo estimator for diffuse indirect irradiance.
+    vec3 indirect = albedo * (accumulated / max(float(pc.sampleCount), 1.0));
+
+    // Read-modify-write the secondary bounce directly into this texel's own radiance atlas entry
+    // -- "réinjecte-la comme rebond secondaire dans le texel d'origine." Recomputed fresh from
+    // this texel's own emissive atlas value every call (not accumulated against the previous
+    // imageLoad) so repeated injection passes stay idempotent instead of compounding drift.
+    imageStore(g_RadianceStorage, atlasTexel, vec4(emissive + indirect, 1.0));
+}

@@ -2,14 +2,14 @@
 #extension GL_GOOGLE_include_directive : enable
 
 // Surface Cache capture fragment shader (see renderer::SurfaceCachePass): writes albedo/normal/
-// emissive/direct-lighting for one texel of the global surface-cache atlas, at whatever position
-// within the currently-bound Card's exclusive rect this invocation's pixel maps to (the render
-// area/viewport/scissor are all set to exactly that rect by RecordCapture(), so gl_FragCoord never
-// needs to be consulted here). This codebase has no texture/material-binding system (see
-// ClusterResolve.comp's own comment) -- this reuses the exact same procedural-material approach
-// every other shading pass already uses (procedural_material.glsl's HashID/HsvToRgb, keyed by
-// entityID) plus a small triplanar value-noise modulation so a captured card is not perfectly
-// flat-shaded.
+// emissive/direct-lighting/radiance/world-position for one texel of the global surface-cache
+// atlas, at whatever position within the currently-bound Card's exclusive rect this invocation's
+// pixel maps to (the render area/viewport/scissor are all set to exactly that rect by
+// RecordCapture(), so gl_FragCoord never needs to be consulted here). This codebase has no
+// texture/material-binding system (see ClusterResolve.comp's own comment) -- this reuses the
+// exact same procedural-material approach every other shading pass already uses
+// (procedural_material.glsl's HashID/HsvToRgb, keyed by entityID) plus a small triplanar
+// value-noise modulation so a captured card is not perfectly flat-shaded.
 //
 // --- Direct lighting ---
 // outDirectLighting accumulates the sun (shadowed, via renderer::ShadowMapPass's depth map, PCF-
@@ -18,6 +18,16 @@
 // multiplied by albedo -- that multiply happens in whatever future pass reads this atlas, exactly
 // like a deferred-lighting G-buffer keeps albedo and lighting separate so lighting alone can be
 // re-used/blurred/probed without re-deriving material color).
+//
+// --- Radiance + world position ---
+// outRadiance is exactly that "future pass": the albedo-multiplied direct lighting plus emissive,
+// i.e. this texel's full outgoing radiance as of THIS capture -- what a GI trace (SWRT/HWRT, see
+// SurfaceCacheSWRTPass / SurfaceCacheRayTracingPass) samples as "the luminance stored here," and
+// what SurfaceCacheGIInject.comp later read-modify-writes a secondary bounce into on top of.
+// outWorldPos is the plain world-space (== local-space, see this shader's own header comment on
+// entity transforms) hit position, full precision -- the 3D origin a GI injection pass fires its
+// hemisphere rays from, since the capture pass's own depth buffer is a same-lifetime scratch image
+// with no sampled-read usage (see renderer::SurfaceCachePass's class comment).
 
 #include "include/procedural_material.glsl"
 #include "include/math_utils.glsl"
@@ -53,6 +63,8 @@ layout(location = 0) out vec4 outAlbedo;
 layout(location = 1) out vec4 outNormal;
 layout(location = 2) out vec4 outEmissive;
 layout(location = 3) out vec4 outDirectLighting;
+layout(location = 4) out vec4 outRadiance;
+layout(location = 5) out vec4 outWorldPos;
 
 // Octahedral encoding of a unit vector into [0,1]^2 -- the same compact normal encoding this
 // codebase already uses for cluster vertex normals (geometry::ClusterVertexNormal /
@@ -169,7 +181,14 @@ void main() {
     // end-to-end rather than always writing zero -- no material system flags entities as
     // emissive/non-emissive yet (geometry::EntityMaterialProperties only carries WPO/mask data),
     // so every card gets the same small glow rather than an arbitrary on/off split.
-    outEmissive = vec4(baseColor * 0.04, 1.0);
+    vec3 emissive = baseColor * 0.04;
+    outEmissive = vec4(emissive, 1.0);
 
-    outDirectLighting = vec4(ComputeDirectLighting(inWorldPos, n), 1.0);
+    vec3 directLighting = ComputeDirectLighting(inWorldPos, n);
+    outDirectLighting = vec4(directLighting, 1.0);
+
+    // Fold albedo into the direct-lighting term here (see this shader's own "Radiance + world
+    // position" header comment) -- the combined, GI-ready outgoing radiance for this texel.
+    outRadiance = vec4(emissive + albedo * directLighting, 1.0);
+    outWorldPos = vec4(inWorldPos, 1.0);
 }

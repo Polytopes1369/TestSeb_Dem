@@ -226,17 +226,27 @@ namespace renderer {
             m_Cards.size(), fallbackTable.size(), hostVertices.size(), hostIndices.size()));
 
         // =====================================================================================
-        // STEP 2 -- GPU resources: combined vertex/index buffers, 3 atlas images + 1 shared depth
+        // STEP 2 -- GPU resources: combined vertex/index buffers, 6 atlas images + 1 shared depth
         // image, one shared sampler, the capture pipeline.
         // =====================================================================================
         VkDeviceSize vertexBytes = static_cast<VkDeviceSize>(hostVertices.size()) * sizeof(geometry::FallbackVertex);
         VkDeviceSize indexBytes = static_cast<VkDeviceSize>(hostIndices.size()) * sizeof(uint32_t);
 
+        // ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR | SHADER_DEVICE_ADDRESS_BIT: lets
+        // renderer::SurfaceCacheRayTracingPass build BLAS geometry directly against these buffers
+        // (see GetVertexBuffer()/GetIndexBuffer()'s own comment) without a second upload of the
+        // same Fallback Mesh geometry. Valid usage even though this pass itself never builds an
+        // acceleration structure, because VulkanContext::CreateLogicalDevice enables
+        // VK_KHR_acceleration_structure + bufferDeviceAddress unconditionally at device creation.
         if (vertexBytes > 0 && indexBytes > 0) {
             m_VertexBuffer.Create(allocator, vertexBytes,
-                VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
+                VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                VMA_MEMORY_USAGE_GPU_ONLY);
             m_IndexBuffer.Create(allocator, indexBytes,
-                VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
+                VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                VMA_MEMORY_USAGE_GPU_ONLY);
         }
 
         VkImageCreateInfo atlasImageInfo{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
@@ -262,6 +272,17 @@ namespace renderer {
         atlasImageInfo.format = kDirectLightingFormat;
         VK_CHECK(vmaCreateImage(allocator, &atlasImageInfo, &gpuOnlyAlloc, &m_DirectLightingImage, &m_DirectLightingAllocation, nullptr));
 
+        // Radiance also needs STORAGE_BIT: SurfaceCacheGIInject.comp imageLoad/imageStore's this
+        // image directly (read-modify-write of the accumulated bounce), not just a sampled read.
+        VkImageCreateInfo radianceImageInfo = atlasImageInfo;
+        radianceImageInfo.format = kRadianceFormat;
+        radianceImageInfo.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        VK_CHECK(vmaCreateImage(allocator, &radianceImageInfo, &gpuOnlyAlloc, &m_RadianceImage, &m_RadianceAllocation, nullptr));
+
+        atlasImageInfo.format = kWorldPosFormat;
+        VK_CHECK(vmaCreateImage(allocator, &atlasImageInfo, &gpuOnlyAlloc, &m_WorldPosImage, &m_WorldPosAllocation, nullptr));
+
         VkImageCreateInfo depthImageInfo = atlasImageInfo;
         depthImageInfo.format = kDepthFormat;
         depthImageInfo.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
@@ -281,6 +302,8 @@ namespace renderer {
         m_NormalView = makeView(m_NormalImage, kNormalFormat, VK_IMAGE_ASPECT_COLOR_BIT);
         m_EmissiveView = makeView(m_EmissiveImage, kEmissiveFormat, VK_IMAGE_ASPECT_COLOR_BIT);
         m_DirectLightingView = makeView(m_DirectLightingImage, kDirectLightingFormat, VK_IMAGE_ASPECT_COLOR_BIT);
+        m_RadianceView = makeView(m_RadianceImage, kRadianceFormat, VK_IMAGE_ASPECT_COLOR_BIT);
+        m_WorldPosView = makeView(m_WorldPosImage, kWorldPosFormat, VK_IMAGE_ASPECT_COLOR_BIT);
         m_DepthView = makeView(m_DepthImage, kDepthFormat, VK_IMAGE_ASPECT_DEPTH_BIT);
 
         VkSamplerCreateInfo samplerInfo{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
@@ -300,8 +323,8 @@ namespace renderer {
 
         // =====================================================================================
         // STEP 3 -- One-time setup command buffer: upload the combined geometry (if any), clear
-        // the 3 atlas images to a neutral default, and transition every image to its permanent
-        // layout (GENERAL for the 3 atlas images, DEPTH_ATTACHMENT_OPTIMAL for the depth image --
+        // the 6 atlas images to a neutral default, and transition every image to its permanent
+        // layout (GENERAL for the 6 atlas images, DEPTH_ATTACHMENT_OPTIMAL for the depth image --
         // see the class comment's atlas layout convention).
         // =====================================================================================
         {
@@ -355,11 +378,17 @@ namespace renderer {
             VkClearColorValue normalClear{}; normalClear.float32[0] = 0.5f; normalClear.float32[1] = 0.5f; normalClear.float32[2] = 0.0f; normalClear.float32[3] = 1.0f;
             VkClearColorValue emissiveClear{}; emissiveClear.float32[0] = 0.0f; emissiveClear.float32[1] = 0.0f; emissiveClear.float32[2] = 0.0f; emissiveClear.float32[3] = 1.0f;
             VkClearColorValue directLightingClear{}; directLightingClear.float32[0] = 0.0f; directLightingClear.float32[1] = 0.0f; directLightingClear.float32[2] = 0.0f; directLightingClear.float32[3] = 1.0f;
+            // Radiance/world-position texels not yet covered by any captured card start at zero --
+            // SurfaceCacheGIInject.comp only ever visits texels inside a real, RESIDENT card's rect
+            // (worldPos alpha guards this, see SurfaceCacheGIInject.comp's own check), so a zeroed
+            // texel outside every card rect is simply never read.
+            VkClearColorValue radianceClear{}; radianceClear.float32[0] = 0.0f; radianceClear.float32[1] = 0.0f; radianceClear.float32[2] = 0.0f; radianceClear.float32[3] = 1.0f;
+            VkClearColorValue worldPosClear{}; worldPosClear.float32[0] = 0.0f; worldPosClear.float32[1] = 0.0f; worldPosClear.float32[2] = 0.0f; worldPosClear.float32[3] = 0.0f;
             VkImageSubresourceRange colorRange{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
 
-            struct { VkImage image; const VkClearColorValue* clear; } atlasClears[4] = {
+            struct { VkImage image; const VkClearColorValue* clear; } atlasClears[6] = {
                 { m_AlbedoImage, &albedoClear }, { m_NormalImage, &normalClear }, { m_EmissiveImage, &emissiveClear },
-                { m_DirectLightingImage, &directLightingClear }
+                { m_DirectLightingImage, &directLightingClear }, { m_RadianceImage, &radianceClear }, { m_WorldPosImage, &worldPosClear }
             };
             for (auto& entry : atlasClears) {
                 TransitionImageLayout(cmd, entry.image, VK_IMAGE_ASPECT_COLOR_BIT,
@@ -367,11 +396,19 @@ namespace renderer {
                     VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
                     VK_PIPELINE_STAGE_2_CLEAR_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
                 vkCmdClearColorImage(cmd, entry.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, entry.clear, 1, &colorRange);
+                // COMPUTE_SHADER stage + STORAGE read/write access included unconditionally (even
+                // though only m_RadianceImage actually carries STORAGE_BIT usage): this same
+                // barrier covers all 6 atlas images, and SurfaceCacheGIInject.comp's
+                // imageLoad/imageStore of the radiance atlas is exactly the access this transition
+                // must make visible-from/available-to, on top of every image's existing sampled-
+                // read consumers (SWRT/HWRT trace shaders, SurfaceCacheCapture.frag's own MRT
+                // writes on a later RecordCapture() call).
                 TransitionImageLayout(cmd, entry.image, VK_IMAGE_ASPECT_COLOR_BIT,
                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
                     VK_PIPELINE_STAGE_2_CLEAR_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
-                    VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
-                    VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+                    VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                    VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_SHADER_SAMPLED_READ_BIT |
+                    VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
             }
 
             TransitionImageLayout(cmd, m_DepthImage, VK_IMAGE_ASPECT_DEPTH_BIT,
@@ -455,8 +492,8 @@ namespace renderer {
 
         // =====================================================================================
         // STEP 5 -- Capture pipeline: plain vertex-buffer input (geometry::FallbackVertex), set 0
-        // = the lighting descriptor set above, 4-attachment MRT (albedo/normal/emissive/direct-
-        // lighting) + depth test.
+        // = the lighting descriptor set above, 6-attachment MRT (albedo/normal/emissive/direct-
+        // lighting/radiance/world-position) + depth test.
         // =====================================================================================
         VkPushConstantRange pushConstantRange{};
         pushConstantRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
@@ -520,13 +557,13 @@ namespace renderer {
         VkPipelineMultisampleStateCreateInfo multisampling{ VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
         multisampling.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
 
-        VkPipelineColorBlendAttachmentState colorBlendAttachments[4]{};
+        VkPipelineColorBlendAttachmentState colorBlendAttachments[6]{};
         for (auto& attachment : colorBlendAttachments) {
             attachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
             attachment.blendEnable = VK_FALSE;
         }
         VkPipelineColorBlendStateCreateInfo colorBlending{ VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
-        colorBlending.attachmentCount = 4;
+        colorBlending.attachmentCount = 6;
         colorBlending.pAttachments = colorBlendAttachments;
 
         std::vector<VkDynamicState> dynamicStates = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
@@ -534,9 +571,9 @@ namespace renderer {
         dynamicState.dynamicStateCount = static_cast<uint32_t>(dynamicStates.size());
         dynamicState.pDynamicStates = dynamicStates.data();
 
-        VkFormat colorFormats[4] = { kAlbedoFormat, kNormalFormat, kEmissiveFormat, kDirectLightingFormat };
+        VkFormat colorFormats[6] = { kAlbedoFormat, kNormalFormat, kEmissiveFormat, kDirectLightingFormat, kRadianceFormat, kWorldPosFormat };
         VkPipelineRenderingCreateInfo pipelineRendering{ VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO };
-        pipelineRendering.colorAttachmentCount = 4;
+        pipelineRendering.colorAttachmentCount = 6;
         pipelineRendering.pColorAttachmentFormats = colorFormats;
         pipelineRendering.depthAttachmentFormat = kDepthFormat;
 
@@ -578,6 +615,8 @@ namespace renderer {
             if (m_NormalView != VK_NULL_HANDLE) vkDestroyImageView(m_Device, m_NormalView, nullptr);
             if (m_EmissiveView != VK_NULL_HANDLE) vkDestroyImageView(m_Device, m_EmissiveView, nullptr);
             if (m_DirectLightingView != VK_NULL_HANDLE) vkDestroyImageView(m_Device, m_DirectLightingView, nullptr);
+            if (m_RadianceView != VK_NULL_HANDLE) vkDestroyImageView(m_Device, m_RadianceView, nullptr);
+            if (m_WorldPosView != VK_NULL_HANDLE) vkDestroyImageView(m_Device, m_WorldPosView, nullptr);
             if (m_DepthView != VK_NULL_HANDLE) vkDestroyImageView(m_Device, m_DepthView, nullptr);
         }
         if (m_Allocator != VK_NULL_HANDLE) {
@@ -585,6 +624,8 @@ namespace renderer {
             if (m_NormalImage != VK_NULL_HANDLE) vmaDestroyImage(m_Allocator, m_NormalImage, m_NormalAllocation);
             if (m_EmissiveImage != VK_NULL_HANDLE) vmaDestroyImage(m_Allocator, m_EmissiveImage, m_EmissiveAllocation);
             if (m_DirectLightingImage != VK_NULL_HANDLE) vmaDestroyImage(m_Allocator, m_DirectLightingImage, m_DirectLightingAllocation);
+            if (m_RadianceImage != VK_NULL_HANDLE) vmaDestroyImage(m_Allocator, m_RadianceImage, m_RadianceAllocation);
+            if (m_WorldPosImage != VK_NULL_HANDLE) vmaDestroyImage(m_Allocator, m_WorldPosImage, m_WorldPosAllocation);
             if (m_DepthImage != VK_NULL_HANDLE) vmaDestroyImage(m_Allocator, m_DepthImage, m_DepthAllocation);
         }
         m_VertexBuffer.Destroy();
@@ -601,6 +642,8 @@ namespace renderer {
         m_NormalImage = VK_NULL_HANDLE; m_NormalAllocation = VK_NULL_HANDLE; m_NormalView = VK_NULL_HANDLE;
         m_EmissiveImage = VK_NULL_HANDLE; m_EmissiveAllocation = VK_NULL_HANDLE; m_EmissiveView = VK_NULL_HANDLE;
         m_DirectLightingImage = VK_NULL_HANDLE; m_DirectLightingAllocation = VK_NULL_HANDLE; m_DirectLightingView = VK_NULL_HANDLE;
+        m_RadianceImage = VK_NULL_HANDLE; m_RadianceAllocation = VK_NULL_HANDLE; m_RadianceView = VK_NULL_HANDLE;
+        m_WorldPosImage = VK_NULL_HANDLE; m_WorldPosAllocation = VK_NULL_HANDLE; m_WorldPosView = VK_NULL_HANDLE;
         m_DepthImage = VK_NULL_HANDLE; m_DepthAllocation = VK_NULL_HANDLE; m_DepthView = VK_NULL_HANDLE;
         m_Cards.clear();
         m_CardStates.clear();
@@ -857,7 +900,7 @@ namespace renderer {
         vkCmdBindVertexBuffers(cmd, 0, 1, &vertexBuffer, &vertexOffset0);
         vkCmdBindIndexBuffer(cmd, m_IndexBuffer.Handle(), 0, VK_INDEX_TYPE_UINT32);
 
-        VkRenderingAttachmentInfo colorAttachments[4]{};
+        VkRenderingAttachmentInfo colorAttachments[6]{};
         colorAttachments[0].sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
         colorAttachments[0].imageView = m_AlbedoView;
         colorAttachments[0].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
@@ -871,6 +914,19 @@ namespace renderer {
         colorAttachments[2].imageView = m_EmissiveView;
         colorAttachments[3] = colorAttachments[0];
         colorAttachments[3].imageView = m_DirectLightingView;
+        // Radiance/world-position: same LOAD_OP_CLEAR + STORE discipline as the other 4 -- every
+        // (re-)capture of a card fully re-seeds its radiance with the fresh
+        // emissive+albedo*directLighting value (SurfaceCacheCapture.frag), discarding whatever a
+        // prior GI injection pass had accumulated there. This is deliberate: a card is only ever
+        // re-captured because its underlying material/lighting data changed (or it was just
+        // (re-)placed in the atlas -- see ApplyCardPlacement()), at which point a stale
+        // accumulated bounce is no longer trustworthy either -- the next
+        // SurfaceCacheGIInject.comp pass over this card rebuilds it from the fresh seed.
+        colorAttachments[4] = colorAttachments[0];
+        colorAttachments[4].imageView = m_RadianceView;
+        colorAttachments[5] = colorAttachments[0];
+        colorAttachments[5].imageView = m_WorldPosView;
+        colorAttachments[5].clearValue.color = { { 0.0f, 0.0f, 0.0f, 0.0f } };
 
         VkRenderingAttachmentInfo depthAttachment{ VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
         depthAttachment.imageView = m_DepthView;
@@ -911,7 +967,7 @@ namespace renderer {
             VkRenderingInfo renderingInfo{ VK_STRUCTURE_TYPE_RENDERING_INFO };
             renderingInfo.renderArea = cardRect;
             renderingInfo.layerCount = 1;
-            renderingInfo.colorAttachmentCount = 4;
+            renderingInfo.colorAttachmentCount = 6;
             renderingInfo.pColorAttachments = colorAttachments;
             renderingInfo.pDepthAttachment = &depthAttachment;
             vkCmdBeginRendering(cmd, &renderingInfo);
@@ -949,8 +1005,11 @@ namespace renderer {
         VkMemoryBarrier2 barrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
         barrier.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
         barrier.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
-        barrier.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-        barrier.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+        barrier.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
+        // SHADER_STORAGE_READ: SurfaceCacheGIInject.comp's imageLoad of the radiance atlas it is
+        // about to read-modify-write, on top of every atlas's existing sampled-read consumers
+        // (SWRT/HWRT trace shaders' card sampling).
+        barrier.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
         VkDependencyInfo depInfo{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
         depInfo.memoryBarrierCount = 1;
         depInfo.pMemoryBarriers = &barrier;

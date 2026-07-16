@@ -4,6 +4,7 @@
 #include "core/EntityData.h"
 #include "core/Logger.h"
 #include "renderer/RenderTypes.h" // renderer::Vertex, used to interpret the DEBUG readback bytes
+#include "renderer/RayTracingFunctions.h"
 #include <algorithm>
 #include <cassert>
 #include <cmath>
@@ -648,6 +649,11 @@ void VulkanContext::CreateLogicalDevice() {
   VkPhysicalDeviceVulkan12Features features12{
       VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
   features12.drawIndirectCount = VK_TRUE;
+  // Required by VK_KHR_acceleration_structure (BLAS/TLAS build input buffers and the
+  // acceleration structure's own backing buffer are addressed by GPU virtual address, not bound
+  // via a descriptor) -- see renderer::AccelerationStructure / SurfaceCachePass's vertex/index
+  // buffers, both created with VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT for exactly this reason.
+  features12.bufferDeviceAddress = VK_TRUE;
 
   // renderer::SDFRayMarchPass's compute shader (SDFRayMarch.comp) samples one of a fixed-size
   // array of per-entity Mesh SDF textures, picking WHICH element per invocation from a CPU-built
@@ -673,6 +679,28 @@ void VulkanContext::CreateLogicalDevice() {
   VkPhysicalDeviceShaderImageAtomicInt64FeaturesEXT imageAtomicInt64Features{
       VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_IMAGE_ATOMIC_INT64_FEATURES_EXT};
   imageAtomicInt64Features.shaderImageInt64Atomics = VK_TRUE;
+
+  // Ray Tracing feature trio, per CLAUDE.md's mandatory "Extensions Matérielles Requises" list --
+  // consumed by renderer::AccelerationStructure (BLAS/TLAS builder), renderer::
+  // SurfaceCacheRayTracingPass (the VK_KHR_ray_tracing_pipeline SBT/rgen-rchit-rmiss pipeline,
+  // Lumen-style Surface Cache hit lighting) and SurfaceCacheGIInject.comp's inline
+  // rayQueryEXT-based hardware trace path (VK_KHR_ray_query -- an HWRT path callable from a plain
+  // compute shader, which vkCmdTraceRaysKHR itself cannot be).
+  VkPhysicalDeviceAccelerationStructureFeaturesKHR accelStructFeatures{
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR};
+  accelStructFeatures.accelerationStructure = VK_TRUE;
+
+  VkPhysicalDeviceRayTracingPipelineFeaturesKHR rayTracingPipelineFeatures{
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR};
+  rayTracingPipelineFeatures.rayTracingPipeline = VK_TRUE;
+
+  VkPhysicalDeviceRayQueryFeaturesKHR rayQueryFeatures{
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR};
+  rayQueryFeatures.rayQuery = VK_TRUE;
+
+  imageAtomicInt64Features.pNext = &accelStructFeatures;
+  accelStructFeatures.pNext = &rayTracingPipelineFeatures;
+  rayTracingPipelineFeatures.pNext = &rayQueryFeatures;
   features12.pNext = &imageAtomicInt64Features;
   features13.pNext = &features12;
 
@@ -701,7 +729,17 @@ void VulkanContext::CreateLogicalDevice() {
 
   const std::vector<const char *> deviceExtensions = {
       VK_KHR_SWAPCHAIN_EXTENSION_NAME,
-      VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME};
+      VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME,
+      // VK_KHR_deferred_host_operations: required dependency of both extensions below (the
+      // Vulkan spec lets a BLAS/TLAS build or an RT pipeline compile run as a deferred host
+      // operation; this codebase never actually defers one -- every build/compile below passes
+      // VK_NULL_HANDLE for the VkDeferredOperationKHR parameter and blocks -- but the extension
+      // must still be enabled, since VK_KHR_acceleration_structure and
+      // VK_KHR_ray_tracing_pipeline both declare it as a required device extension).
+      VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME,
+      VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME,
+      VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME,
+      VK_KHR_RAY_QUERY_EXTENSION_NAME};
   createInfo.enabledExtensionCount =
       static_cast<uint32_t>(deviceExtensions.size());
   createInfo.ppEnabledExtensionNames = deviceExtensions.data();
@@ -712,6 +750,12 @@ void VulkanContext::CreateLogicalDevice() {
   }
 
   vkGetDeviceQueue(m_Device, m_GraphicsQueueFamilyIndex, 0, &m_GraphicsQueue);
+
+  // See RayTracingFunctions.h's own comment: VK_KHR_acceleration_structure /
+  // VK_KHR_ray_tracing_pipeline's entry points are not re-exported by this SDK's loader import
+  // library, so they must be resolved via vkGetDeviceProcAddr right here, once, immediately after
+  // the device (which just enabled both extensions above) comes up.
+  renderer::LoadRayTracingFunctions(m_Device, renderer::g_RTFunctions);
 }
 
 void VulkanContext::CreateCommandPool() {

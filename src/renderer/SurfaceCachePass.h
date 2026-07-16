@@ -2,11 +2,14 @@
 // Surface Cache capture pass (Lumen-style): projects each entity's Fallback Mesh (the same coarse
 // BVH proxy geometry built for ray tracing, geometry::BuildFallbackMesh / FallbackMeshBuilder.h)
 // through its pre-packed orthographic "Cards" (geometry::SurfaceCacheCardEntry, ClusterFormat.h)
-// into a shared global texture atlas, injecting albedo/normal/emissive/direct-lighting per texel
-// (the last shaded against renderer::ShadowMapPass's sun shadow map plus any active point lights,
-// see SetShadowMap/UpdateLighting and SurfaceCacheCapture.frag). A future GI pass samples this
-// atlas by reprojecting a world position through a card's stored UV rect (uvMin/uvMax) instead of
-// re-evaluating heavy cluster geometry at every light bounce.
+// into a shared global texture atlas, injecting albedo/normal/emissive/direct-lighting/radiance/
+// world-position per texel (direct-lighting shaded against renderer::ShadowMapPass's sun shadow
+// map plus any active point lights, see SetShadowMap/UpdateLighting and SurfaceCacheCapture.frag).
+// renderer::SurfaceCacheSWRTPass / SurfaceCacheRayTracingPass / SurfaceCacheGIInjectPass are the
+// GI consumers: they sample this atlas by reprojecting a hit position through a card's stored UV
+// rect (uvMin/uvMax) instead of re-evaluating heavy cluster geometry at every light bounce, and
+// SurfaceCacheGIInjectPass writes a secondary hemisphere-sampled bounce back into the radiance
+// atlas (see that pass' own class comment).
 //
 // --- Why "asynchronous" ---
 // Every card is captured through its own tiny, disjoint vkCmdBeginRendering/EndRendering scope
@@ -28,14 +31,26 @@
 // flat-shaded -- a genuinely complete (if intentionally simple) procedural material, not a stub.
 //
 // --- Atlas layout convention ---
-// The 3 atlas images (albedo/normal/emissive) are allocated with COLOR_ATTACHMENT_BIT |
-// SAMPLED_BIT and kept in VK_IMAGE_LAYOUT_GENERAL for their ENTIRE lifetime after Init() (both a
-// valid color-attachment layout for dynamic rendering and a valid sampled-image layout, mirroring
-// renderer::ClusterResolvePass's own output image, which is likewise written by one stage and
-// meant to be sampled by a later one without ping-ponging layouts every frame) -- RecordCapture()
-// never transitions them, only inserts a memory barrier at the end. The shared depth image stays
-// in VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL for its entire lifetime (purely an internal scratch
-// buffer for this pass, never sampled externally).
+// The 6 atlas images (albedo/normal/emissive/direct-lighting/radiance/world-position) are
+// allocated with COLOR_ATTACHMENT_BIT | SAMPLED_BIT (radiance additionally STORAGE_BIT -- see
+// kRadianceFormat's own comment) and kept in VK_IMAGE_LAYOUT_GENERAL for their ENTIRE lifetime
+// after Init() (both a valid color-attachment layout for dynamic rendering and a valid sampled-
+// image layout, mirroring renderer::ClusterResolvePass's own output image, which is likewise
+// written by one stage and meant to be sampled by a later one without ping-ponging layouts every
+// frame) -- RecordCapture() never transitions them, only inserts a memory barrier at the end. The
+// shared depth image stays in VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL for its entire lifetime
+// (purely an internal scratch buffer for this pass, never sampled externally).
+//
+// --- Dynamic atlas residency ---
+// Cards are NOT all resident in the atlas simultaneously: UpdateVisibility() frustum-culls every
+// card's entity AABB each frame and grants/revokes atlas pages via m_AtlasAllocator (geometry::
+// SurfaceCacheAtlasAllocator) as cards enter/leave the camera's view, evicting a card only after
+// kEvictionFrameDelay consecutive unwanted frames (absorbing frustum-edge flicker) and
+// defragmenting the atlas as a last resort before failing an allocation outright (graceful
+// degradation -- see UpdateVisibility()'s own comment). GetCards()' returned atlasOffset/uvMin/
+// uvMax are therefore only valid while IsCardResident(cardIndex) is true; a GI trace consumer
+// (renderer::SurfaceCacheTraceContext) must re-derive its own card index tables whenever residency
+// changes, not just once at Init().
 
 #include <cstdint>
 #include <deque>
@@ -64,10 +79,28 @@ namespace renderer {
         static constexpr VkFormat kAlbedoFormat = VK_FORMAT_R8G8B8A8_UNORM;
         static constexpr VkFormat kNormalFormat = VK_FORMAT_R8G8B8A8_UNORM; // Octahedral-encoded world-space normal in RG.
         static constexpr VkFormat kEmissiveFormat = VK_FORMAT_R8G8B8A8_UNORM;
-        // HDR-capable (unlike the other 3, UNORM, atlas images): accumulated direct-light radiance
+        // HDR-capable (unlike the 3 above, UNORM, atlas images): accumulated direct-light radiance
         // (sun + point lights, see SurfaceCacheCapture.frag's ComputeDirectLighting) can exceed 1.0
-        // well before any tone mapping happens in a later GI-consuming pass.
+        // well before any tone mapping happens in a later GI-consuming pass. Stored UN-multiplied
+        // by albedo (see that function's own comment) -- kRadianceFormat below is where the
+        // albedo-multiplied, GI-ready combined value lives.
         static constexpr VkFormat kDirectLightingFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
+        // HDR outgoing-radiance atlas: what a GI trace (SWRT/HWRT, see SurfaceCacheSWRTPass /
+        // SurfaceCacheRayTracingPass) samples as "the luminance stored at this texel," and what
+        // SurfaceCacheGIInject.comp read-modify-writes a secondary bounce into. Seeded at capture
+        // time (SurfaceCacheCapture.frag) to emissive + albedo*directLighting -- the same "fold
+        // albedo into the lighting atlas" step ComputeDirectLighting's own comment defers to "a
+        // future pass," which this atlas IS. STORAGE_BIT (unlike the other 5) because the
+        // injection compute shader needs imageLoad/imageStore, not just a sampled read.
+        static constexpr VkFormat kRadianceFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
+        // World-space (== local-space, this codebase's entities carry no runtime transform --
+        // see SurfaceCacheCapture.vert's own comment) hit position atlas: full float precision
+        // because a demoscene-scale local position is not reliably representable in fp16. This is
+        // the "where in 3D space does this texel's captured surface actually sit" a GI injection
+        // pass needs to originate its hemisphere rays from -- the capture pass's own depth buffer
+        // is a same-lifetime scratch image (see class comment) with no sampled-read usage, so it
+        // cannot serve that purpose.
+        static constexpr VkFormat kWorldPosFormat = VK_FORMAT_R32G32B32A32_SFLOAT;
         static constexpr VkFormat kDepthFormat = VK_FORMAT_D32_SFLOAT;
 
         // How many cards RecordCapture() (re-)captures per call -- see the class comment's
@@ -83,7 +116,7 @@ namespace renderer {
 
         // Reads the surface-cache card table + every fallback mesh's geometry from
         // `cacheFilePath` (written by geometry::CacheFileManager::WriteCacheFile), uploads one
-        // combined vertex/index GPU buffer covering every entity's Fallback Mesh, allocates the 3
+        // combined vertex/index GPU buffer covering every entity's Fallback Mesh, allocates the 6
         // atlas images + 1 shared depth image (all geometry::kSurfaceCacheAtlasSize^2), clears the
         // atlas images to a neutral default (so a card not yet captured samples something sane
         // rather than undefined memory), and builds the capture graphics pipeline. A scene with
@@ -151,18 +184,36 @@ namespace renderer {
         VkImageView GetEmissiveView() const { return m_EmissiveView; }
         VkImage GetDirectLightingImage() const { return m_DirectLightingImage; }
         VkImageView GetDirectLightingView() const { return m_DirectLightingView; }
+        VkImage GetRadianceImage() const { return m_RadianceImage; }
+        VkImageView GetRadianceView() const { return m_RadianceView; }
+        VkImage GetWorldPosImage() const { return m_WorldPosImage; }
+        VkImageView GetWorldPosView() const { return m_WorldPosView; }
         VkSampler GetAtlasSampler() const { return m_AtlasSampler; }
 
-    private:
         // One entity's span inside the combined vertex/index buffers -- vkCmdDrawIndexed's own
         // (vertexOffset, firstIndex, indexCount) triple, so a per-card draw is one indexed draw
-        // call with no further indirection.
+        // call with no further indirection. Public (unlike the rest of this class' internals) so
+        // renderer::SurfaceCacheRayTracingPass can build one BLAS per entity directly against this
+        // pass' own combined vertex/index buffers -- see GetVertexBuffer()/GetIndexBuffer().
         struct EntityDrawRange {
             int32_t vertexOffset = 0;
             uint32_t firstIndex = 0;
             uint32_t indexCount = 0;
         };
+        const std::unordered_map<uint32_t, EntityDrawRange>& GetEntityRanges() const { return m_EntityRanges; }
 
+        // The combined Fallback Mesh vertex/index buffers every entity's cards are captured from
+        // (geometry::FallbackVertex / uint32_t, see EntityDrawRange). Created with
+        // VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
+        // VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT in addition to their vertex/index-buffer usage
+        // (see Init()) precisely so renderer::SurfaceCacheRayTracingPass can build BLAS geometry
+        // directly against them -- no duplicate upload of the same geometry for ray tracing.
+        VkBuffer GetVertexBuffer() const { return m_VertexBuffer.Handle(); }
+        VkBuffer GetIndexBuffer() const { return m_IndexBuffer.Handle(); }
+        VkDeviceSize GetVertexBufferSize() const { return m_VertexBuffer.Size(); }
+        VkDeviceSize GetIndexBufferSize() const { return m_IndexBuffer.Size(); }
+
+    private:
         // Per-card runtime residency state -- parallel to m_Cards (same index), populated lazily:
         // a card that has never been visible has resident == false and an all-zero rect, which is
         // exactly the state it would have right after eviction, so no separate "never allocated"
@@ -224,6 +275,12 @@ namespace renderer {
         VkImage m_DirectLightingImage = VK_NULL_HANDLE;
         VmaAllocation m_DirectLightingAllocation = VK_NULL_HANDLE;
         VkImageView m_DirectLightingView = VK_NULL_HANDLE;
+        VkImage m_RadianceImage = VK_NULL_HANDLE;
+        VmaAllocation m_RadianceAllocation = VK_NULL_HANDLE;
+        VkImageView m_RadianceView = VK_NULL_HANDLE;
+        VkImage m_WorldPosImage = VK_NULL_HANDLE;
+        VmaAllocation m_WorldPosAllocation = VK_NULL_HANDLE;
+        VkImageView m_WorldPosView = VK_NULL_HANDLE;
         VkImage m_DepthImage = VK_NULL_HANDLE;
         VmaAllocation m_DepthAllocation = VK_NULL_HANDLE;
         VkImageView m_DepthView = VK_NULL_HANDLE;

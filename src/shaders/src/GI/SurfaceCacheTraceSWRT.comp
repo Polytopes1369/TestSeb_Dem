@@ -1,0 +1,80 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+
+// Software Ray Tracing (SWRT) against per-object Mesh SDFs (renderer::GlobalSDFPass), Lumen-style:
+// one invocation per ray request. Sphere-traces every traced entity's Mesh SDF (see
+// mesh_sdf_trace.glsl's TraceMeshSDFScene -- no BVH, a plain ray-AABB-pruned linear scan, matching
+// this codebase's existing software-simplicity bias at demoscene entity-count scale) to find the
+// closest surface intersection, then -- once that intersection is found -- resolves the hit
+// entity's best-fit Surface Cache Card, projects the local-space hit position into that card's UV
+// space, and bilinearly samples the card's stored radiance (surface_cache_sampling.glsl) as this
+// ray's impact color. renderer::SurfaceCacheSWRTPass owns the pipeline/descriptor sets this shader
+// binds against; renderer::SurfaceCacheTraceContext owns the descriptor data itself (sets 1/2,
+// shared unmodified with SurfaceCacheHWRT.rchit and SurfaceCacheGIInject.comp).
+
+#include "include/mesh_sdf_trace.glsl"
+#include "include/surface_cache_sampling.glsl"
+
+layout(local_size_x = 64) in;
+
+// One traced ray, 32 bytes, std430: origin (vec3, 16-byte aligned) + tMax, then dir (vec3,
+// 16-byte aligned) + an explicit pad float so the struct's stride matches what a C++-side caller
+// (a future screen-space final-gather pass) uploads with zero ambiguity.
+struct RayRequest {
+    vec3 origin;
+    float tMax;
+    vec3 dir;
+    float _pad;
+};
+
+// One traced ray's outcome: the sampled Surface Cache radiance (rgb) if a surface was hit within
+// tMax, plus an explicit hit flag (0.0/1.0, not a bool -- std430 has no scalar bool storage type)
+// so a caller can distinguish "hit but the surface's radiance happens to be black" from "no hit
+// at all, treat as scene-miss/sky".
+struct RayResult {
+    vec3 color;
+    float hit;
+};
+
+layout(std430, set = 0, binding = 0) readonly buffer RayRequestBuffer {
+    RayRequest g_Rays[];
+};
+layout(std430, set = 0, binding = 1) writeonly buffer RayResultBuffer {
+    RayResult g_Results[];
+};
+
+layout(push_constant) uniform SWRTPushConstants {
+    uint rayCount;
+    // Must be dynamically uniform across the whole dispatch (see mesh_sdf_trace.glsl's
+    // TraceMeshSDFScene comment) -- a push constant, read identically by every invocation,
+    // satisfies that trivially.
+    uint entityCount;
+} pc;
+
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    if (id >= pc.rayCount) {
+        return;
+    }
+
+    RayRequest ray = g_Rays[id];
+    vec3 rayDir = normalize(ray.dir);
+
+    uint hitEntityIndex;
+    vec3 hitLocalPos;
+    vec3 hitLocalNormal;
+    bool hit = TraceMeshSDFScene(ray.origin, rayDir, ray.tMax, pc.entityCount,
+        hitEntityIndex, hitLocalPos, hitLocalNormal);
+
+    RayResult result;
+    if (hit) {
+        EntityInfo hitEntity = g_Entities[hitEntityIndex];
+        result.color = SampleCardRadiance(hitLocalPos, hitLocalNormal, hitEntity.firstCardIndex, hitEntity.cardCount);
+        result.hit = 1.0;
+    } else {
+        result.color = vec3(0.0);
+        result.hit = 0.0;
+    }
+
+    g_Results[id] = result;
+}
