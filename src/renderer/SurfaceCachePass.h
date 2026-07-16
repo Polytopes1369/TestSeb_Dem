@@ -2,9 +2,11 @@
 // Surface Cache capture pass (Lumen-style): projects each entity's Fallback Mesh (the same coarse
 // BVH proxy geometry built for ray tracing, geometry::BuildFallbackMesh / FallbackMeshBuilder.h)
 // through its pre-packed orthographic "Cards" (geometry::SurfaceCacheCardEntry, ClusterFormat.h)
-// into a shared global texture atlas, injecting albedo/normal/emissive per texel. A future GI pass
-// samples this atlas by reprojecting a world position through a card's stored UV rect (uvMin/
-// uvMax) instead of re-evaluating heavy cluster geometry at every light bounce.
+// into a shared global texture atlas, injecting albedo/normal/emissive/direct-lighting per texel
+// (the last shaded against renderer::ShadowMapPass's sun shadow map plus any active point lights,
+// see SetShadowMap/UpdateLighting and SurfaceCacheCapture.frag). A future GI pass samples this
+// atlas by reprojecting a world position through a card's stored UV rect (uvMin/uvMax) instead of
+// re-evaluating heavy cluster geometry at every light bounce.
 //
 // --- Why "asynchronous" ---
 // Every card is captured through its own tiny, disjoint vkCmdBeginRendering/EndRendering scope
@@ -36,6 +38,7 @@
 // buffer for this pass, never sampled externally).
 
 #include <cstdint>
+#include <deque>
 #include <filesystem>
 #include <unordered_map>
 #include <vector>
@@ -43,8 +46,11 @@
 #include <vk_mem_alloc.h>
 
 #include "core/maths/Maths.h"
+#include "geometry/CardGenerator.h" // geometry::kSurfaceCacheAtlasSize
 #include "geometry/ClusterFormat.h"
+#include "geometry/SurfaceCacheAtlasAllocator.h"
 #include "renderer/GpuBuffer.h"
+#include "renderer/LightingTypes.h"
 
 namespace renderer {
 
@@ -58,12 +64,22 @@ namespace renderer {
         static constexpr VkFormat kAlbedoFormat = VK_FORMAT_R8G8B8A8_UNORM;
         static constexpr VkFormat kNormalFormat = VK_FORMAT_R8G8B8A8_UNORM; // Octahedral-encoded world-space normal in RG.
         static constexpr VkFormat kEmissiveFormat = VK_FORMAT_R8G8B8A8_UNORM;
+        // HDR-capable (unlike the other 3, UNORM, atlas images): accumulated direct-light radiance
+        // (sun + point lights, see SurfaceCacheCapture.frag's ComputeDirectLighting) can exceed 1.0
+        // well before any tone mapping happens in a later GI-consuming pass.
+        static constexpr VkFormat kDirectLightingFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
         static constexpr VkFormat kDepthFormat = VK_FORMAT_D32_SFLOAT;
 
         // How many cards RecordCapture() (re-)captures per call -- see the class comment's
         // "asynchronous" note. Small enough that even a full command buffer's worth of capture
         // draws costs a handful of tiny (card-sized, not full-screen) rasterization scopes.
         static constexpr uint32_t kCardsPerFrameBudget = 4;
+
+        // How many consecutive UpdateVisibility() calls a resident card is allowed to go unwanted
+        // before its atlas page is actually freed -- see UpdateVisibility()'s own comment. A short
+        // grace period absorbs a card flickering in and out of the frustum (e.g. an entity near
+        // the screen edge) without paying a re-capture every single time it comes back.
+        static constexpr uint32_t kEvictionFrameDelay = 120;
 
         // Reads the surface-cache card table + every fallback mesh's geometry from
         // `cacheFilePath` (written by geometry::CacheFileManager::WriteCacheFile), uploads one
@@ -78,15 +94,54 @@ namespace renderer {
 
         void Shutdown();
 
-        // Records up to kCardsPerFrameBudget cards' worth of capture draws into `cmd`, advancing
-        // the internal round-robin cursor so repeated calls eventually cover every card. See the
-        // class comment for the atlas images' fixed GENERAL layout contract (no caller-side
-        // transition needed, before or between calls). Ends with a VkMemoryBarrier2 making every
-        // texel captured THIS call visible to a later fragment/compute sampled read.
+        // Runtime residency update (see the class comment's "Dynamic atlas residency" section):
+        // tests every card's entity AABB against the 6 planes of the view frustum described by
+        // `cameraPosition`/`cameraForward`/`cameraUp` (need not be re-orthonormalized -- cameraUp
+        // is only used via cameraForward.Cross(cameraUp) to derive right, then re-crossed for an
+        // orthonormal up, so small numerical drift in cameraUp is harmless), `fovYRadians`,
+        // `aspectRatio` (width/height) and [nearZ, farZ]. A newly-visible, not-yet-resident card is
+        // allocated a page from m_AtlasAllocator (evicting unwanted cards, and if still short of
+        // contiguous space, fully defragmenting -- see the .cpp's AllocateCardPage) and queued for
+        // capture; a card unwanted for more than kEvictionFrameDelay consecutive calls has its page
+        // freed. Must be called once per frame, before RecordCapture() (which only captures cards
+        // this call has queued).
+        void UpdateVisibility(const maths::vec3& cameraPosition, const maths::vec3& cameraForward,
+            const maths::vec3& cameraUp, float fovYRadians, float aspectRatio, float nearZ, float farZ);
+
+        // Binds the sun's shadow map (renderer::ShadowMapPass::GetShadowMapView/GetShadowMapSampler)
+        // into this pass's lighting descriptor set (set 0, binding 1 -- see SurfaceCacheCapture.frag).
+        // Must be called exactly once after Init(), before the first RecordCapture() call, and
+        // before any UpdateLighting() call -- the shadow map image itself is never recreated after
+        // ShadowMapPass::Init(), so this binding does not need to be refreshed again afterward
+        // (only the UBO contents change per frame, via UpdateLighting()).
+        void SetShadowMap(VkImageView shadowMapView, VkSampler shadowMapSampler);
+
+        // Writes `lights` and `lightViewProj` (renderer::ShadowMapPass::GetLightViewProj() from
+        // the SAME frame's ShadowMapPass::RecordCapture() call) into the persistently-mapped
+        // lighting UBO (set 0, binding 0) that every SurfaceCacheCapture.frag invocation reads.
+        // Call once per frame before RecordCapture() -- a plain memcpy into host-visible/coherent
+        // memory, no descriptor-set update needed (only SetShadowMap() touches the descriptor set
+        // itself).
+        void UpdateLighting(const SceneLights& lights, const maths::mat4& lightViewProj);
+
+        // Records up to kCardsPerFrameBudget cards' worth of capture draws into `cmd`, draining
+        // from the front of the dirty-card queue UpdateVisibility() fills (a card is dirty exactly
+        // once, right after (re)gaining residency -- there is no periodic re-capture of an
+        // already-captured resident card, since this engine's entities are static, see
+        // renderer::GlobalSDFPass's own "Scope" note). See the class comment for the atlas images'
+        // fixed GENERAL layout contract (no caller-side transition needed, before or between
+        // calls). Ends with a VkMemoryBarrier2 making every texel captured THIS call visible to a
+        // later fragment/compute sampled read.
         void RecordCapture(VkCommandBuffer cmd);
 
         uint32_t GetCardCount() const { return static_cast<uint32_t>(m_Cards.size()); }
+        // NOTE: atlasOffset/uvMin/uvMax are now a DYNAMIC placement (see UpdateVisibility()), not
+        // the static one geometry::CardGenerator::PackCardsIntoAtlas originally baked into the
+        // .cache file -- valid only for a card where IsCardResident() is true.
         const std::vector<geometry::SurfaceCacheCardEntry>& GetCards() const { return m_Cards; }
+        bool IsCardResident(uint32_t cardIndex) const {
+            return cardIndex < m_CardStates.size() && m_CardStates[cardIndex].resident;
+        }
 
         VkImage GetAlbedoImage() const { return m_AlbedoImage; }
         VkImageView GetAlbedoView() const { return m_AlbedoView; }
@@ -94,6 +149,8 @@ namespace renderer {
         VkImageView GetNormalView() const { return m_NormalView; }
         VkImage GetEmissiveImage() const { return m_EmissiveImage; }
         VkImageView GetEmissiveView() const { return m_EmissiveView; }
+        VkImage GetDirectLightingImage() const { return m_DirectLightingImage; }
+        VkImageView GetDirectLightingView() const { return m_DirectLightingView; }
         VkSampler GetAtlasSampler() const { return m_AtlasSampler; }
 
     private:
@@ -106,12 +163,51 @@ namespace renderer {
             uint32_t indexCount = 0;
         };
 
+        // Per-card runtime residency state -- parallel to m_Cards (same index), populated lazily:
+        // a card that has never been visible has resident == false and an all-zero rect, which is
+        // exactly the state it would have right after eviction, so no separate "never allocated"
+        // flag is needed.
+        struct CardRuntimeState {
+            bool resident = false;
+            bool dirty = false; // Queued in m_DirtyCardQueue, awaiting its first/next capture.
+            uint32_t framesSinceVisible = 0; // Reset to 0 every UpdateVisibility() call the card is wanted in.
+            geometry::AtlasRect rect{}; // The gutter-PADDED allocation (what must be passed to Free()); valid only while resident == true.
+        };
+
+        // Tries to place `card` (its atlasSize, gutter-padded) into m_AtlasAllocator, evicting
+        // unwanted resident cards and, if that alone is not enough contiguous space, fully
+        // defragmenting first. Returns false only if the atlas genuinely cannot fit `card` even
+        // once every unwanted card is evicted and the atlas is fully repacked -- logged, not fatal
+        // (see UpdateVisibility()'s class-comment note on graceful degradation).
+        bool AllocateCardPage(uint32_t cardIndex, geometry::AtlasRect& outRect);
+
+        // Marks `cardIndex` resident at the given gutter-padded atlas rect, stamping the
+        // corresponding unpadded atlasOffset/uvMin/uvMax into m_Cards[cardIndex] (the public,
+        // GI-facing placement -- see GetCards()'s own comment) and queuing it for capture exactly
+        // once (idempotent: calling this again on an already-dirty card does not requeue it).
+        void ApplyCardPlacement(uint32_t cardIndex, const geometry::AtlasRect& paddedRect);
+
+        // Frees every resident card whose framesSinceVisible > 0 (i.e. not wanted THIS call),
+        // regardless of kEvictionFrameDelay -- the fallback AllocateCardPage() reaches for once a
+        // plain eviction-by-delay pass was not enough contiguous space for a new arrival.
+        void EvictAllUnwantedCards();
+
+        // Full defragmentation rebuild: resets m_AtlasAllocator to one whole-atlas free rect, then
+        // re-Allocate()s every still-resident card's existing (gutter-padded) size, largest first
+        // (mirrors CardGenerator::PackCardsIntoAtlas's own tallest-first ordering), writing each
+        // card's new rect back into its CardRuntimeState. Only called from AllocateCardPage() as a
+        // last resort, since it touches (and marks dirty for re-capture) every resident card, not
+        // just the one being allocated for.
+        void DefragmentAtlas();
+
         VkDevice m_Device = VK_NULL_HANDLE;
         VmaAllocator m_Allocator = VK_NULL_HANDLE;
 
         std::vector<geometry::SurfaceCacheCardEntry> m_Cards;
+        std::vector<CardRuntimeState> m_CardStates; // Parallel to m_Cards.
         std::unordered_map<uint32_t, EntityDrawRange> m_EntityRanges; // Keyed by entityID.
-        uint32_t m_CaptureCursor = 0;
+        geometry::SurfaceCacheAtlasAllocator m_AtlasAllocator{ geometry::kSurfaceCacheAtlasSize };
+        std::deque<uint32_t> m_DirtyCardQueue; // Card indices queued for capture by UpdateVisibility(), drained by RecordCapture().
 
         GpuBuffer m_VertexBuffer; // geometry::FallbackVertex[], GPU_ONLY.
         GpuBuffer m_IndexBuffer;  // uint32_t[], GPU_ONLY.
@@ -125,10 +221,22 @@ namespace renderer {
         VkImage m_EmissiveImage = VK_NULL_HANDLE;
         VmaAllocation m_EmissiveAllocation = VK_NULL_HANDLE;
         VkImageView m_EmissiveView = VK_NULL_HANDLE;
+        VkImage m_DirectLightingImage = VK_NULL_HANDLE;
+        VmaAllocation m_DirectLightingAllocation = VK_NULL_HANDLE;
+        VkImageView m_DirectLightingView = VK_NULL_HANDLE;
         VkImage m_DepthImage = VK_NULL_HANDLE;
         VmaAllocation m_DepthAllocation = VK_NULL_HANDLE;
         VkImageView m_DepthView = VK_NULL_HANDLE;
         VkSampler m_AtlasSampler = VK_NULL_HANDLE;
+
+        // Lighting: one UBO (set 0 binding 0, SurfaceCacheLightingUBO -- see the .cpp) written by
+        // UpdateLighting(), one combined image sampler (set 0 binding 1, the sun's shadow map)
+        // bound once by SetShadowMap(). Both stay in the SAME descriptor set for the pass's whole
+        // lifetime; only the UBO's CONTENTS change per frame.
+        GpuBuffer m_LightingUBO; // Persistently mapped, CPU_TO_GPU.
+        VkDescriptorSetLayout m_LightingSetLayout = VK_NULL_HANDLE;
+        VkDescriptorPool m_LightingDescriptorPool = VK_NULL_HANDLE;
+        VkDescriptorSet m_LightingDescriptorSet = VK_NULL_HANDLE;
 
         VkPipelineLayout m_PipelineLayout = VK_NULL_HANDLE;
         VkPipeline m_Pipeline = VK_NULL_HANDLE;

@@ -1,0 +1,325 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+#extension GL_EXT_nonuniform_qualifier : require
+
+// Two-tier Lumen-style SDF ray march (see renderer::SDFRayMarchPass / geometry::EntityBVH.h's own
+// "why this exists" note): one invocation per output pixel.
+//   1. Sphere-trace the coarse Global SDF clipmap (renderer::GlobalSDFPass) in large steps
+//      (SampleClipmap/SelectLevel) until within a voxel-relative epsilon of a surface, or give up
+//      as a sky miss.
+//   2. From that approximate hit, walk geometry::EntityBVH (bvhNodes/leafEntityIndices) with a
+//      small fixed stack, pruning by a ray-AABB test against each node's world bounds (expanded by
+//      a margin -- the coarse step above is only accurate to about one clipmap voxel).
+//   3. For every candidate leaf entity, sphere-trace its own precise per-entity Mesh SDF
+//      (uEntitySDFs) to find the exact hit distance; keep the nearest one found.
+//   4. Shade the winning hit (SDF-gradient normal + a per-entity procedural tint, matching this
+//      codebase's existing HashID/HsvToRgb convention) or a simple sky gradient on a miss.
+//
+// --- Why nonuniformEXT ---
+// uEntitySDFs[entityIdx] is indexed by a per-invocation ray march RESULT -- two neighboring pixels'
+// rays routinely resolve to different entities -- so the index is not dynamically uniform across
+// the invocation group. GL_EXT_nonuniform_qualifier + nonuniformEXT() is what makes that legal
+// (VulkanContext.cpp enables the matching shaderSampledImageArrayNonUniformIndexing feature bit
+// specifically for this shader -- see that file's own comment).
+//
+// --- Toroidal clipmap addressing ---
+// SampleClipmap() reproduces renderer::GlobalSDFPass.h's own fixed-lattice convention exactly:
+// level L's voxel (i,j,k) always denotes world position (i,j,k) * levelVoxelSize[L], and the GPU
+// image is addressed by (that voxel index) mod clipmapResolution, regardless of which window the
+// level currently covers -- SelectLevel() is the only place the level's CURRENT window (its
+// snapped center) matters, to decide whether a world position is even validly covered right now.
+
+#include "include/procedural_material.glsl"
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+// --- Set 0: BVH + per-entity Mesh SDFs. ---
+struct BVHNode {
+    float boundsMin[3];
+    int leftFirst; // Interior (count == 0): left child is ALWAYS nodeIndex + 1; this field holds the RIGHT child's node index instead. Leaf (count > 0): first index into leafEntityIndices.
+    float boundsMax[3];
+    int count;     // 0 == interior node; > 0 == leaf, holding this many entities starting at leftFirst.
+};
+layout(std430, set = 0, binding = 0) readonly buffer BVHNodesBuffer {
+    BVHNode bvhNodes[];
+};
+layout(std430, set = 0, binding = 1) readonly buffer LeafEntityIndicesBuffer {
+    uint leafEntityIndices[];
+};
+struct EntitySDFParams {
+    float volumeMin[3];
+    float voxelSize;
+    int resolution;
+    uint entityID;
+    int _pad0[2];
+};
+layout(std430, set = 0, binding = 2) readonly buffer EntityParamsBuffer {
+    EntitySDFParams entityParams[];
+};
+// Must match renderer::SDFRayMarchPass::kMaxEntitySDFs exactly.
+layout(set = 0, binding = 3) uniform sampler3D uEntitySDFs[64];
+
+// --- Set 1: Global SDF clipmap levels + output image. ---
+// Must match renderer::GlobalSDFPass::kLevelCount exactly.
+layout(set = 1, binding = 0) uniform sampler3D uGlobalClipmaps[4];
+layout(rgba8, set = 1, binding = 1) uniform writeonly image2D uOutput;
+
+layout(push_constant) uniform SDFRayMarchPC {
+    float cameraPosition[3];
+    float tanHalfFovY;
+    float cameraForward[3];
+    float aspectRatio;
+    float cameraRight[3];
+    float nearZ;
+    float cameraUp[3];
+    float farZ;
+    float levelVoxelSize[4];
+    int levelCenterVoxel[12]; // 4 levels * (x,y,z), flattened.
+    int clipmapResolution;
+    int rootNodeIndex;        // -1 if the scene has zero entities (BVH is empty).
+    int entitySamplerCount;   // How many of uEntitySDFs' 64 slots are real entities (rest are the far-value placeholder).
+    int _pad0;
+} pc;
+
+vec3 GetCameraPosition() { return vec3(pc.cameraPosition[0], pc.cameraPosition[1], pc.cameraPosition[2]); }
+vec3 GetCameraForward()  { return vec3(pc.cameraForward[0], pc.cameraForward[1], pc.cameraForward[2]); }
+vec3 GetCameraRight()    { return vec3(pc.cameraRight[0], pc.cameraRight[1], pc.cameraRight[2]); }
+vec3 GetCameraUp()       { return vec3(pc.cameraUp[0], pc.cameraUp[1], pc.cameraUp[2]); }
+vec3 GetLevelCenterVoxel(int level) {
+    return vec3(pc.levelCenterVoxel[level * 3 + 0], pc.levelCenterVoxel[level * 3 + 1], pc.levelCenterVoxel[level * 3 + 2]);
+}
+
+// Which (if any) clipmap level currently covers world position `p` -- the FINEST (smallest) level
+// whose camera-centered window contains it, so the coarse march gets the most detail available at
+// every point along the ray. Returns -1 if `p` is outside even the coarsest level's window
+// entirely (a ray that has left the streamed volume altogether -- treated as a sky miss).
+int SelectLevel(vec3 p) {
+    for (int level = 0; level < 4; ++level) {
+        float halfExtent = float(pc.clipmapResolution) * 0.5 * pc.levelVoxelSize[level];
+        vec3 center = GetLevelCenterVoxel(level) * pc.levelVoxelSize[level];
+        vec3 d = abs(p - center);
+        if (d.x < halfExtent && d.y < halfExtent && d.z < halfExtent) {
+            return level;
+        }
+    }
+    return -1;
+}
+
+// World-unit signed distance at `p` from `level`'s clipmap -- see the class comment's "Toroidal
+// clipmap addressing" note for why this needs no knowledge of the level's current window at all.
+float SampleClipmap(int level, vec3 p) {
+    float voxelSize = pc.levelVoxelSize[level];
+    ivec3 worldVoxel = ivec3(floor(p / voxelSize));
+    int res = pc.clipmapResolution;
+    ivec3 wrapped = ((worldVoxel % res) + res) % res;
+    vec3 uvw = (vec3(wrapped) + 0.5) / float(res);
+    return texture(uGlobalClipmaps[level], uvw).r;
+}
+
+// Robust slab-method ray-AABB test (Kay/Kajiya): correct regardless of the sign of `dir`'s
+// components, including a ray parallel to a slab (division by ~0 produces +-inf, which min/max
+// still resolve correctly under IEEE-754).
+bool RayIntersectsAABB(vec3 origin, vec3 dir, vec3 bmin, vec3 bmax, float tMin, float tMax) {
+    vec3 invDir = 1.0 / dir;
+    vec3 t0 = (bmin - origin) * invDir;
+    vec3 t1 = (bmax - origin) * invDir;
+    vec3 tSmall = min(t0, t1);
+    vec3 tBig = max(t0, t1);
+    float tNear = max(max(tSmall.x, tSmall.y), max(tSmall.z, tMin));
+    float tFar = min(min(tBig.x, tBig.y), min(tBig.z, tMax));
+    return tNear <= tFar;
+}
+
+// Precise sphere-trace of entity `entityIdx`'s own Mesh SDF over the ray segment [tMin, tMax].
+// Returns true (and `outT`) on a hit; false if the ray leaves this entity's own SDF volume, or
+// exhausts its step budget, or exceeds tMax, without ever finding one -- exactly geometry::
+// SampleMeshSDF's own uvw convention (localPos / (voxelSize * resolution), no extra +/-0.5 term --
+// see GlobalSDFComposite.comp's own derivation notes), which is what makes this agree with how
+// renderer::GlobalSDFPass itself samples an object's Mesh SDF.
+bool RefineEntitySDF(uint entityIdx, vec3 rayOrigin, vec3 rayDir, float tMin, float tMax, out float outT) {
+    EntitySDFParams params = entityParams[entityIdx];
+    vec3 volumeMin = vec3(params.volumeMin[0], params.volumeMin[1], params.volumeMin[2]);
+    float extent = float(params.resolution) * params.voxelSize;
+    float epsilon = params.voxelSize * 0.1;
+
+    float t = tMin;
+    const int kMaxLocalSteps = 64;
+    for (int i = 0; i < kMaxLocalSteps; ++i) {
+        vec3 p = rayOrigin + rayDir * t;
+        vec3 local = p - volumeMin;
+        if (any(lessThan(local, vec3(0.0))) || any(greaterThanEqual(local, vec3(extent)))) {
+            return false;
+        }
+        vec3 uvw = local / extent;
+        float d = texture(uEntitySDFs[nonuniformEXT(entityIdx)], uvw).r;
+        if (d < epsilon) {
+            outT = t;
+            return true;
+        }
+        t += max(d, epsilon);
+        if (t > tMax) {
+            return false;
+        }
+    }
+    return false;
+}
+
+// SDF-gradient world-space normal at `worldPos`, assumed to lie on (or very near) entity
+// `entityIdx`'s own surface -- central differences, one voxel-size step per axis.
+vec3 ComputeEntityNormal(uint entityIdx, vec3 worldPos) {
+    EntitySDFParams params = entityParams[entityIdx];
+    vec3 volumeMin = vec3(params.volumeMin[0], params.volumeMin[1], params.volumeMin[2]);
+    float extent = float(params.resolution) * params.voxelSize;
+    vec3 local = worldPos - volumeMin;
+    vec3 uvw = local / extent;
+    vec3 duvw = vec3(params.voxelSize) / extent;
+
+    // Local `sampler3D` variables are not allowed (opaque types may only be uniforms or function
+    // parameters) -- the array access is repeated per tap instead.
+    float dx = texture(uEntitySDFs[nonuniformEXT(entityIdx)], uvw + vec3(duvw.x, 0.0, 0.0)).r
+             - texture(uEntitySDFs[nonuniformEXT(entityIdx)], uvw - vec3(duvw.x, 0.0, 0.0)).r;
+    float dy = texture(uEntitySDFs[nonuniformEXT(entityIdx)], uvw + vec3(0.0, duvw.y, 0.0)).r
+             - texture(uEntitySDFs[nonuniformEXT(entityIdx)], uvw - vec3(0.0, duvw.y, 0.0)).r;
+    float dz = texture(uEntitySDFs[nonuniformEXT(entityIdx)], uvw + vec3(0.0, 0.0, duvw.z)).r
+             - texture(uEntitySDFs[nonuniformEXT(entityIdx)], uvw - vec3(0.0, 0.0, duvw.z)).r;
+    vec3 n = vec3(dx, dy, dz);
+    float len = length(n);
+    return len > 1.0e-8 ? n / len : vec3(0.0, 1.0, 0.0);
+}
+
+// Walks geometry::EntityBVH (see BVHNode's own layout comment) from pc.rootNodeIndex, refining
+// every leaf entity whose (margin-expanded) AABB the segment [tMin, tMax] can reach, and keeping
+// the nearest hit found. Returns false (untouched outT/outEntityIdx) if pc.rootNodeIndex < 0 (an
+// entity-less scene) or no candidate entity actually hits.
+bool TraceBVH(vec3 rayOrigin, vec3 rayDir, float tMin, float tMax, float aabbMargin, out float outT, out uint outEntityIdx) {
+    if (pc.rootNodeIndex < 0) {
+        return false;
+    }
+
+    bool found = false;
+    float bestT = tMax;
+    uint bestEntity = 0u;
+
+    // Fixed-size stack: geometry::EntityBVH's own median-split build keeps the tree shallow
+    // (depth ~= log2(entityCount / kBVHMaxEntitiesPerLeaf)), so 32 entries is generous headroom
+    // even for kMaxEntitySDFs' worth of entities.
+    int stack[32];
+    int sp = 0;
+    stack[sp++] = pc.rootNodeIndex;
+
+    while (sp > 0) {
+        int nodeIdx = stack[--sp];
+        BVHNode node = bvhNodes[nodeIdx];
+        vec3 bmin = vec3(node.boundsMin[0], node.boundsMin[1], node.boundsMin[2]) - vec3(aabbMargin);
+        vec3 bmax = vec3(node.boundsMax[0], node.boundsMax[1], node.boundsMax[2]) + vec3(aabbMargin);
+
+        if (!RayIntersectsAABB(rayOrigin, rayDir, bmin, bmax, tMin, bestT)) {
+            continue;
+        }
+
+        if (node.count > 0) {
+            for (int k = 0; k < node.count; ++k) {
+                uint entityIdx = leafEntityIndices[node.leftFirst + k];
+                if (entityIdx >= uint(pc.entitySamplerCount)) {
+                    continue; // Defensive -- see EntityParamsBuffer's own comment; should never trigger.
+                }
+                float hitT;
+                if (RefineEntitySDF(entityIdx, rayOrigin, rayDir, tMin, bestT, hitT) && hitT < bestT) {
+                    bestT = hitT;
+                    bestEntity = entityIdx;
+                    found = true;
+                }
+            }
+        } else if (sp < 30) { // Headroom guard -- see stack[] declaration comment.
+            stack[sp++] = nodeIdx + 1;    // Left child (see BVHNode's own layout comment).
+            stack[sp++] = node.leftFirst; // Right child.
+        }
+    }
+
+    outT = bestT;
+    outEntityIdx = bestEntity;
+    return found;
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 outSize = imageSize(uOutput);
+    if (pixel.x >= outSize.x || pixel.y >= outSize.y) {
+        return;
+    }
+
+    // Per-pixel camera ray: standard tan(fovY/2)-based reconstruction, Y flipped so pixel row 0
+    // (image top) maps to +up, matching this codebase's other Y-down-NDC-aware conventions (e.g.
+    // maths::mat4::PerspectiveVulkan/OrthoVulkan's own Y negation).
+    vec2 uv = (vec2(pixel) + 0.5) / vec2(outSize);
+    float ndcX = uv.x * 2.0 - 1.0;
+    float ndcY = 1.0 - uv.y * 2.0;
+
+    vec3 rayOrigin = GetCameraPosition();
+    vec3 rayDir = normalize(GetCameraForward()
+        + ndcX * pc.aspectRatio * pc.tanHalfFovY * GetCameraRight()
+        + ndcY * pc.tanHalfFovY * GetCameraUp());
+
+    // --- Stage 1: coarse Global SDF march, large steps. ---
+    const int kMaxGlobalSteps = 128;
+    const float kGlobalHitEpsilonScale = 1.5;
+    float t = pc.nearZ;
+    bool foundCandidate = false;
+    int hitLevel = -1;
+
+    for (int i = 0; i < kMaxGlobalSteps; ++i) {
+        vec3 p = rayOrigin + rayDir * t;
+        int level = SelectLevel(p);
+        if (level < 0) {
+            break;
+        }
+        float dist = SampleClipmap(level, p);
+        float voxelSize = pc.levelVoxelSize[level];
+        if (dist < kGlobalHitEpsilonScale * voxelSize) {
+            foundCandidate = true;
+            hitLevel = level;
+            break;
+        }
+        t += max(dist, voxelSize * 0.5);
+        if (t > pc.farZ) {
+            break;
+        }
+    }
+
+    bool gotHit = false;
+    float hitT = 0.0;
+    uint hitEntity = 0u;
+
+    // --- Stage 2 + 3: BVH traversal + precise per-entity local refine. ---
+    if (foundCandidate) {
+        float margin = pc.levelVoxelSize[hitLevel] * 4.0; // The coarse step above is only accurate to about one voxel.
+        float tMin = max(pc.nearZ, t - margin);
+        float tMax = min(pc.farZ, t + margin);
+        gotHit = TraceBVH(rayOrigin, rayDir, tMin, tMax, margin, hitT, hitEntity);
+    }
+
+    // --- Stage 4: shade. ---
+    vec3 color;
+    if (gotHit) {
+        vec3 hitPos = rayOrigin + rayDir * hitT;
+        vec3 normal = ComputeEntityNormal(hitEntity, hitPos);
+
+        uint entityID = entityParams[hitEntity].entityID;
+        float hue = float(HashID(entityID) & 0xFFFFu) / 65536.0;
+        vec3 baseColor = HsvToRgb(vec3(hue, 0.55, 0.85));
+
+        // Simple single-directional Lambertian debug shade -- this is a visualization image (see
+        // renderer::SDFRayMarchPass's own class comment), not the Surface Cache's own lit result.
+        vec3 lightDir = normalize(vec3(0.5, 1.0, 0.5));
+        float ndotl = max(dot(normal, lightDir), 0.0);
+        color = baseColor * (0.2 + 0.8 * ndotl);
+    } else {
+        // Sky miss: a simple vertical gradient, matching this codebase's "genuinely complete if
+        // intentionally simple" procedural-fallback convention (see SurfaceCacheCapture.frag's own
+        // comment) rather than a flat undefined color.
+        float skyT = clamp(rayDir.y * 0.5 + 0.5, 0.0, 1.0);
+        color = mix(vec3(0.05, 0.07, 0.12), vec3(0.5, 0.65, 0.9), skyT);
+    }
+
+    imageStore(uOutput, pixel, vec4(color, 1.0));
+}

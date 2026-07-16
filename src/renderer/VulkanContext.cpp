@@ -649,6 +649,18 @@ void VulkanContext::CreateLogicalDevice() {
       VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
   features12.drawIndirectCount = VK_TRUE;
 
+  // renderer::SDFRayMarchPass's compute shader (SDFRayMarch.comp) samples one of a fixed-size
+  // array of per-entity Mesh SDF textures, picking WHICH element per invocation from a CPU-built
+  // BVH traversal result (geometry::EntityBVH) -- a genuinely bindless-style access pattern per
+  // CLAUDE.md's "Descriptor Array massif (Bindless)" architecture mandate, the first consumer of
+  // it in this codebase. Because the chosen array index varies per shader invocation (two
+  // neighboring rays can easily pick different entities) rather than being uniform across the
+  // whole subgroup, GLSL requires the access be wrapped in nonuniformEXT()
+  // (GL_EXT_nonuniform_qualifier) to avoid undefined behavior on hardware that would otherwise
+  // assume a uniform index -- and that qualifier itself requires this feature bit enabled at
+  // device creation (VUID-RuntimeSpirv-NonUniform-06274 without it).
+  features12.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
+
   // renderer::ClusterSoftwareRasterPass's atomic Visibility Buffer
   // (ClusterSoftwareRaster.comp / ClearVisBufferAtomic.comp) needs
   // imageAtomicMax on a VK_FORMAT_R64_UINT storage image -- SPIR-V's
