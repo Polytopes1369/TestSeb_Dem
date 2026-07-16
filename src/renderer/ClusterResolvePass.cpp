@@ -67,7 +67,13 @@ namespace renderer {
         // the swapchain -- neither is wired up by this change (see the class comment), but the
         // usage flags are pre-positioned exactly like VulkanContext's swapchain TRANSFER_DST_BIT
         // was pre-positioned ahead of the VisBuffer conversion that later needed it.
-        imageInfo.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        // COLOR_ATTACHMENT_BIT: renderer::DebugTextOverlay::RecordDraw (Debug-only, see
+        // ClusterRenderPipeline.cpp's #ifndef NDEBUG call site) draws the frame's debug HUD text
+        // directly into this image via vkCmdBeginRendering, which requires the color-attachment
+        // usage bit on top of the storage/sampled/transfer-src ones above -- without it, every
+        // frame's HUD draw is a VUID-VkRenderingInfo-colorAttachmentCount-06087 validation error.
+        imageInfo.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+            VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
         imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
         imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
