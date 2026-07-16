@@ -32,15 +32,11 @@ namespace geometry {
             const uint32_t nodeIndex = static_cast<uint32_t>(nodes.size());
             nodes.emplace_back();
 
-            maths::vec3 boundsMin{ FLT_MAX, FLT_MAX, FLT_MAX };
-            maths::vec3 boundsMax{ -FLT_MAX, -FLT_MAX, -FLT_MAX };
+            maths::vec3 boundsMin, boundsMax;
+            maths::ResetAABB(boundsMin, boundsMax);
             for (uint32_t i = begin; i < end; ++i) {
-                boundsMin.x = std::min(boundsMin.x, items[i].boundsMin.x);
-                boundsMin.y = std::min(boundsMin.y, items[i].boundsMin.y);
-                boundsMin.z = std::min(boundsMin.z, items[i].boundsMin.z);
-                boundsMax.x = std::max(boundsMax.x, items[i].boundsMax.x);
-                boundsMax.y = std::max(boundsMax.y, items[i].boundsMax.y);
-                boundsMax.z = std::max(boundsMax.z, items[i].boundsMax.z);
+                maths::ExpandAABB(boundsMin, boundsMax, items[i].boundsMin);
+                maths::ExpandAABB(boundsMin, boundsMax, items[i].boundsMax);
             }
             nodes[nodeIndex].boundsMin[0] = boundsMin.x;
             nodes[nodeIndex].boundsMin[1] = boundsMin.y;
@@ -63,15 +59,10 @@ namespace geometry {
             // -- centroid spread is what actually determines whether a median split separates the
             // items usefully; a set of large, heavily overlapping AABBs can have a huge combined
             // AABB extent while all their centroids sit nearly on top of each other).
-            maths::vec3 centroidMin{ FLT_MAX, FLT_MAX, FLT_MAX };
-            maths::vec3 centroidMax{ -FLT_MAX, -FLT_MAX, -FLT_MAX };
+            maths::vec3 centroidMin, centroidMax;
+            maths::ResetAABB(centroidMin, centroidMax);
             for (uint32_t i = begin; i < end; ++i) {
-                centroidMin.x = std::min(centroidMin.x, items[i].centroid.x);
-                centroidMin.y = std::min(centroidMin.y, items[i].centroid.y);
-                centroidMin.z = std::min(centroidMin.z, items[i].centroid.z);
-                centroidMax.x = std::max(centroidMax.x, items[i].centroid.x);
-                centroidMax.y = std::max(centroidMax.y, items[i].centroid.y);
-                centroidMax.z = std::max(centroidMax.z, items[i].centroid.z);
+                maths::ExpandAABB(centroidMin, centroidMax, items[i].centroid);
             }
             const maths::vec3 centroidExtent = centroidMax - centroidMin;
             int axis = 0;

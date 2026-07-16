@@ -1,4 +1,5 @@
 #include "geometry/MeshSimplifier.h"
+#include "geometry/GeometryHashUtil.h"
 
 #include <algorithm>
 #include <cmath>
@@ -103,15 +104,6 @@ namespace geometry {
 
             outPos = maths::vec3{ static_cast<float>(x), static_cast<float>(y), static_cast<float>(z) };
             return true;
-        }
-
-        // -----------------------------------------------------------------------------------
-        // Canonical (unordered) edge key, packed into a single 64-bit value for the dedup set.
-        // -----------------------------------------------------------------------------------
-        uint64_t PackEdgeKey(uint32_t a, uint32_t b) {
-            uint32_t lo = (a < b) ? a : b;
-            uint32_t hi = (a < b) ? b : a;
-            return (static_cast<uint64_t>(lo) << 32) | static_cast<uint64_t>(hi);
         }
 
         // One candidate edge collapse sitting in the priority queue. `keep`/`remove` are fixed
@@ -330,7 +322,7 @@ namespace geometry {
 
         std::unordered_set<uint64_t> seenEdges;
         auto pushEdgeIfNew = [&](uint32_t a, uint32_t b) {
-            uint64_t packed = PackEdgeKey(a, b);
+            uint64_t packed = PackOrderedPair(a, b);
             if (!seenEdges.insert(packed).second) {
                 return;
             }
@@ -472,6 +464,23 @@ namespace geometry {
         }
 
         return static_cast<uint32_t>(mesh.triangles.size() / 3);
+    }
+
+    std::vector<maths::vec3> ComputeFaceAccumulatedNormals(const SimplifiableMesh& mesh) {
+        std::vector<maths::vec3> normals(mesh.positions.size(), maths::vec3{ 0.0f, 0.0f, 0.0f });
+        for (size_t t = 0; t + 2 < mesh.triangles.size(); t += 3) {
+            uint32_t i0 = mesh.triangles[t + 0];
+            uint32_t i1 = mesh.triangles[t + 1];
+            uint32_t i2 = mesh.triangles[t + 2];
+            maths::vec3 faceNormal = (mesh.positions[i1] - mesh.positions[i0]).Cross(mesh.positions[i2] - mesh.positions[i0]);
+            normals[i0] = normals[i0] + faceNormal;
+            normals[i1] = normals[i1] + faceNormal;
+            normals[i2] = normals[i2] + faceNormal;
+        }
+        for (maths::vec3& n : normals) {
+            n = n.Normalize();
+        }
+        return normals;
     }
 
 }

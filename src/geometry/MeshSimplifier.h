@@ -78,4 +78,12 @@ namespace geometry {
         SimplifiableMesh& mesh, uint32_t targetTriangleCount,
         uint32_t targetVertexCount = 0xFFFFFFFFu, float* outMaxError = nullptr);
 
+    // Area-weighted (face-accumulated, then normalized) per-vertex normals derived directly from
+    // `mesh`'s own triangle geometry. Needed because SimplifiableMesh only tracks positions/UVs,
+    // never normals -- carrying real per-vertex normals through cluster grouping and QEM
+    // simplification would need an attribute-aware quadric (a la Hoppe), a separate, larger piece
+    // of work than this cache-format pass. Correct and complete for any SimplifiableMesh, at any
+    // DAG level (leaf or simplified) or merge stage (e.g. the Fallback Mesh's fully-welded merge).
+    std::vector<maths::vec3> ComputeFaceAccumulatedNormals(const SimplifiableMesh& mesh);
+
 }

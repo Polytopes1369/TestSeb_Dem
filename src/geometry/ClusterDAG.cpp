@@ -12,55 +12,22 @@
 #include "geometry/ClusterFormat.h"
 #include "geometry/ClusterGrouping.h"
 #include "geometry/ClusterPartitioner.h"
+#include "geometry/GeometryHashUtil.h"
 
 namespace geometry {
 
     namespace {
 
-        // -----------------------------------------------------------------------------------
-        // Exact (bit-value, not epsilon) position equality/hash. Valid here specifically because
-        // locked-vertex positions are never arithmetically touched anywhere in this pipeline
-        // (MeshSimplifier never writes to a locked vertex's position slot) -- two locked vertices
-        // genuinely descending from the same original mesh vertex are bit-for-bit identical, not
-        // merely close.
-        // -----------------------------------------------------------------------------------
-        struct PositionKey {
-            float x, y, z;
-            bool operator==(const PositionKey& o) const { return x == o.x && y == o.y && z == o.z; }
-        };
-        struct PositionKeyHash {
-            size_t operator()(const PositionKey& p) const {
-                auto normalizeZero = [](float f) { return f == 0.0f ? 0.0f : f; }; // -0.0 == +0.0
-                float nx = normalizeZero(p.x), ny = normalizeZero(p.y), nz = normalizeZero(p.z);
-                uint32_t bx, by, bz;
-                std::memcpy(&bx, &nx, sizeof(bx));
-                std::memcpy(&by, &ny, sizeof(by));
-                std::memcpy(&bz, &nz, sizeof(bz));
-                uint64_t h = 1469598103934665603ull;
-                auto mix = [&](uint32_t v) { h ^= v; h *= 1099511628211ull; };
-                mix(bx); mix(by); mix(bz);
-                return static_cast<size_t>(h);
-            }
-        };
-        PositionKey MakePositionKey(const maths::vec3& p) { return PositionKey{ p.x, p.y, p.z }; }
-
-        uint64_t PackEdgeKey(uint32_t a, uint32_t b) {
-            uint32_t lo = (a < b) ? a : b;
-            uint32_t hi = (a < b) ? b : a;
-            return (static_cast<uint64_t>(lo) << 32) | static_cast<uint64_t>(hi);
-        }
-
         void UpdateNodeBounds(ClusterDAGNode& node) {
-            maths::vec3 boundsMin{ std::numeric_limits<float>::max(), std::numeric_limits<float>::max(), std::numeric_limits<float>::max() };
-            maths::vec3 boundsMax{ std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest() };
+            maths::vec3 boundsMin, boundsMax;
+            maths::ResetAABB(boundsMin, boundsMax);
             for (const maths::vec3& p : node.mesh.positions) {
-                boundsMin.x = std::min(boundsMin.x, p.x); boundsMin.y = std::min(boundsMin.y, p.y); boundsMin.z = std::min(boundsMin.z, p.z);
-                boundsMax.x = std::max(boundsMax.x, p.x); boundsMax.y = std::max(boundsMax.y, p.y); boundsMax.z = std::max(boundsMax.z, p.z);
+                maths::ExpandAABB(boundsMin, boundsMax, p);
             }
             node.boundsMin = boundsMin;
             node.boundsMax = boundsMax;
-            node.sphereCenter = (boundsMin + boundsMax) * 0.5f;
-            node.sphereRadius = (boundsMax - boundsMin).Length() * 0.5f;
+            node.sphereCenter = maths::AABBCenter(boundsMin, boundsMax);
+            node.sphereRadius = maths::AABBRadius(boundsMin, boundsMax);
         }
 
         // Adjacency between same-level (level >= 1) DAG nodes: two nodes are adjacent if they
@@ -182,9 +149,9 @@ namespace geometry {
 
             std::unordered_map<uint64_t, uint32_t> edgeUsageCount;
             for (size_t t = 0; t + 2 < triangles.size(); t += 3) {
-                edgeUsageCount[PackEdgeKey(triangles[t + 0], triangles[t + 1])] += 1u;
-                edgeUsageCount[PackEdgeKey(triangles[t + 1], triangles[t + 2])] += 1u;
-                edgeUsageCount[PackEdgeKey(triangles[t + 2], triangles[t + 0])] += 1u;
+                edgeUsageCount[PackOrderedPair(triangles[t + 0], triangles[t + 1])] += 1u;
+                edgeUsageCount[PackOrderedPair(triangles[t + 1], triangles[t + 2])] += 1u;
+                edgeUsageCount[PackOrderedPair(triangles[t + 2], triangles[t + 0])] += 1u;
             }
             std::vector<bool> locked(positions.size(), false);
             for (const auto& [edgeKey, count] : edgeUsageCount) {
@@ -277,9 +244,9 @@ namespace geometry {
                     out.triangles.push_back(a);
                     out.triangles.push_back(b);
                     out.triangles.push_back(c);
-                    edgeUsage[PackEdgeKey(a, b)] += 1u;
-                    edgeUsage[PackEdgeKey(b, c)] += 1u;
-                    edgeUsage[PackEdgeKey(c, a)] += 1u;
+                    edgeUsage[PackOrderedPair(a, b)] += 1u;
+                    edgeUsage[PackOrderedPair(b, c)] += 1u;
+                    edgeUsage[PackOrderedPair(c, a)] += 1u;
                 }
 
                 // Recompute locks: boundary edges (used exactly once) lock both endpoints.

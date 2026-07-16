@@ -2,15 +2,21 @@
 
 #include <cmath>
 #include <array>
+#include <limits>
 
 namespace maths {
 
     constexpr float PI = 3.14159265358979323846f;
     constexpr int SEED_GENERAL = 1;
 
-    constexpr float ToRadians(float degrees) 
+    constexpr float ToRadians(float degrees)
     {
         return degrees * (PI / 180.0f);
+    }
+
+    constexpr float ToDegrees(float radians)
+    {
+        return radians * (180.0f / PI);
     }
 
     struct vec2 {
@@ -63,6 +69,29 @@ namespace maths {
             };
         }
     };
+
+    // Resets an accumulating AABB to its identity (inverted-infinite) extent, ready for a sequence
+    // of ExpandAABB calls.
+    inline void ResetAABB(vec3& boundsMin, vec3& boundsMax) {
+        boundsMin = vec3{ std::numeric_limits<float>::max(), std::numeric_limits<float>::max(), std::numeric_limits<float>::max() };
+        boundsMax = vec3{ std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest() };
+    }
+
+    // Grows [boundsMin, boundsMax] to also cover point p. Calling this with both corners of a
+    // second AABB (its own boundsMin and boundsMax) correctly merges the two AABBs, since each
+    // axis's min/max is independent of which corner contributed it.
+    inline void ExpandAABB(vec3& boundsMin, vec3& boundsMax, const vec3& p) {
+        boundsMin.x = std::min(boundsMin.x, p.x); boundsMin.y = std::min(boundsMin.y, p.y); boundsMin.z = std::min(boundsMin.z, p.z);
+        boundsMax.x = std::max(boundsMax.x, p.x); boundsMax.y = std::max(boundsMax.y, p.y); boundsMax.z = std::max(boundsMax.z, p.z);
+    }
+
+    constexpr vec3 AABBCenter(const vec3& boundsMin, const vec3& boundsMax) {
+        return (boundsMin + boundsMax) * 0.5f;
+    }
+
+    inline float AABBRadius(const vec3& boundsMin, const vec3& boundsMax) {
+        return (boundsMax - boundsMin).Length() * 0.5f;
+    }
 
     struct mat4 {
         std::array<float, 16> m{};

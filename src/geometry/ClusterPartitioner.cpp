@@ -206,17 +206,15 @@ namespace geometry {
                 cluster.originalTriangleIndices.push_back(tri.originalIndex);
             }
 
-            maths::vec3 boundsMin{ std::numeric_limits<float>::max(), std::numeric_limits<float>::max(), std::numeric_limits<float>::max() };
-            maths::vec3 boundsMax{ std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest() };
+            maths::vec3 boundsMin, boundsMax;
+            maths::ResetAABB(boundsMin, boundsMax);
             for (uint32_t g : cluster.globalVertexIndices) {
-                const maths::vec3& p = allVertices[g].position;
-                boundsMin.x = std::min(boundsMin.x, p.x); boundsMin.y = std::min(boundsMin.y, p.y); boundsMin.z = std::min(boundsMin.z, p.z);
-                boundsMax.x = std::max(boundsMax.x, p.x); boundsMax.y = std::max(boundsMax.y, p.y); boundsMax.z = std::max(boundsMax.z, p.z);
+                maths::ExpandAABB(boundsMin, boundsMax, allVertices[g].position);
             }
             cluster.boundsMin = boundsMin;
             cluster.boundsMax = boundsMax;
-            cluster.sphereCenter = (boundsMin + boundsMax) * 0.5f;
-            cluster.sphereRadius = (boundsMax - boundsMin).Length() * 0.5f;
+            cluster.sphereCenter = maths::AABBCenter(boundsMin, boundsMax);
+            cluster.sphereRadius = maths::AABBRadius(boundsMin, boundsMax);
 
             return cluster;
         }
@@ -284,17 +282,15 @@ namespace geometry {
                 out.originalTriangleIndices.push_back(src.originalTriangleIndices[t]);
             }
 
-            maths::vec3 boundsMin{ std::numeric_limits<float>::max(), std::numeric_limits<float>::max(), std::numeric_limits<float>::max() };
-            maths::vec3 boundsMax{ std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest() };
+            maths::vec3 boundsMin, boundsMax;
+            maths::ResetAABB(boundsMin, boundsMax);
             for (uint32_t g : out.globalVertexIndices) {
-                const maths::vec3& p = allVertices[g].position;
-                boundsMin.x = std::min(boundsMin.x, p.x); boundsMin.y = std::min(boundsMin.y, p.y); boundsMin.z = std::min(boundsMin.z, p.z);
-                boundsMax.x = std::max(boundsMax.x, p.x); boundsMax.y = std::max(boundsMax.y, p.y); boundsMax.z = std::max(boundsMax.z, p.z);
+                maths::ExpandAABB(boundsMin, boundsMax, allVertices[g].position);
             }
             out.boundsMin = boundsMin;
             out.boundsMax = boundsMax;
-            out.sphereCenter = (boundsMin + boundsMax) * 0.5f;
-            out.sphereRadius = (boundsMax - boundsMin).Length() * 0.5f;
+            out.sphereCenter = maths::AABBCenter(boundsMin, boundsMax);
+            out.sphereRadius = maths::AABBRadius(boundsMin, boundsMax);
 
             return out;
         }

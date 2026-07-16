@@ -1,5 +1,6 @@
 #include "geometry/FallbackMeshBuilder.h"
 #include "core/Logger.h"
+#include "geometry/GeometryHashUtil.h"
 
 #include <algorithm>
 #include <cstring>
@@ -11,33 +12,6 @@
 namespace geometry {
 
     namespace {
-
-        // Exact (bit-value) position equality/hash, duplicated from ClusterDAG.cpp's own private
-        // PositionKey/PositionKeyHash rather than shared across files -- matching this codebase's
-        // established per-file self-containment convention (see e.g. ProceduralMaskGenerator.cpp's
-        // ReadShaderFile doc comment). Valid here for the same reason it is valid there: a DAG root's
-        // vertex positions were never arithmetically perturbed by anything downstream of the
-        // simplification pass that produced them, so two roots genuinely sharing a seam have
-        // bit-for-bit identical positions there, not merely close ones.
-        struct PositionKey {
-            float x, y, z;
-            bool operator==(const PositionKey& o) const { return x == o.x && y == o.y && z == o.z; }
-        };
-        struct PositionKeyHash {
-            size_t operator()(const PositionKey& p) const {
-                auto normalizeZero = [](float f) { return f == 0.0f ? 0.0f : f; };
-                float nx = normalizeZero(p.x), ny = normalizeZero(p.y), nz = normalizeZero(p.z);
-                uint32_t bx, by, bz;
-                std::memcpy(&bx, &nx, sizeof(bx));
-                std::memcpy(&by, &ny, sizeof(by));
-                std::memcpy(&bz, &nz, sizeof(bz));
-                uint64_t h = 1469598103934665603ull;
-                auto mix = [&](uint32_t v) { h ^= v; h *= 1099511628211ull; };
-                mix(bx); mix(by); mix(bz);
-                return static_cast<size_t>(h);
-            }
-        };
-        PositionKey MakePositionKey(const maths::vec3& p) { return PositionKey{ p.x, p.y, p.z }; }
 
         // Merges every dag.rootIndices mesh into one SimplifiableMesh, welding ALL coincident
         // vertices by exact position -- unlike ClusterDAG.cpp's own MergeLevelMeshes, which only
@@ -90,27 +64,6 @@ namespace geometry {
                 }
             }
             return count;
-        }
-
-        // Face-accumulated per-vertex normals -- identical algorithm to VirtualGeometryCacheTest
-        // .cpp's ComputeVertexNormals (SimplifiableMesh carries positions/UVs only, never normals;
-        // see that function's own doc comment for why), duplicated here per this codebase's
-        // established per-file self-containment convention rather than shared across files.
-        std::vector<maths::vec3> ComputeFaceAccumulatedNormals(const SimplifiableMesh& mesh) {
-            std::vector<maths::vec3> normals(mesh.positions.size(), maths::vec3{ 0.0f, 0.0f, 0.0f });
-            for (size_t t = 0; t + 2 < mesh.triangles.size(); t += 3) {
-                uint32_t i0 = mesh.triangles[t + 0];
-                uint32_t i1 = mesh.triangles[t + 1];
-                uint32_t i2 = mesh.triangles[t + 2];
-                maths::vec3 faceNormal = (mesh.positions[i1] - mesh.positions[i0]).Cross(mesh.positions[i2] - mesh.positions[i0]);
-                normals[i0] = normals[i0] + faceNormal;
-                normals[i1] = normals[i1] + faceNormal;
-                normals[i2] = normals[i2] + faceNormal;
-            }
-            for (maths::vec3& n : normals) {
-                n = n.Normalize();
-            }
-            return normals;
         }
 
     } // namespace

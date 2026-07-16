@@ -1,5 +1,6 @@
 #include "geometry/ClusterGrouping.h"
 #include "core/Logger.h"
+#include "geometry/GeometryHashUtil.h"
 
 #include <algorithm>
 #include <array>
@@ -9,9 +10,7 @@
 namespace geometry {
 
     uint64_t PackIndexPairKey(uint32_t a, uint32_t b) {
-        uint32_t lo = (a < b) ? a : b;
-        uint32_t hi = (a < b) ? b : a;
-        return (static_cast<uint64_t>(lo) << 32) | static_cast<uint64_t>(hi);
+        return PackOrderedPair(a, b);
     }
 
     std::vector<std::vector<uint32_t>> GreedyPairByWeight(
@@ -63,12 +62,6 @@ namespace geometry {
     }
 
     namespace {
-
-        uint64_t PackEdgeKey(uint32_t a, uint32_t b) {
-            uint32_t lo = (a < b) ? a : b;
-            uint32_t hi = (a < b) ? b : a;
-            return (static_cast<uint64_t>(lo) << 32) | static_cast<uint64_t>(hi);
-        }
 
         // Builds, for every unordered cluster pair sharing at least one global vertex, the count
         // of shared global vertices -- used both as the adjacency test (count > 0) and as the
@@ -136,9 +129,9 @@ namespace geometry {
 
             std::unordered_map<uint64_t, uint32_t> edgeUsageCount;
             for (const auto& tri : globalTriangles) {
-                edgeUsageCount[PackEdgeKey(tri[0], tri[1])] += 1u;
-                edgeUsageCount[PackEdgeKey(tri[1], tri[2])] += 1u;
-                edgeUsageCount[PackEdgeKey(tri[2], tri[0])] += 1u;
+                edgeUsageCount[PackOrderedPair(tri[0], tri[1])] += 1u;
+                edgeUsageCount[PackOrderedPair(tri[1], tri[2])] += 1u;
+                edgeUsageCount[PackOrderedPair(tri[2], tri[0])] += 1u;
             }
             std::unordered_map<uint32_t, bool> lockedGlobal;
             for (const auto& [edgeKey, count] : edgeUsageCount) {

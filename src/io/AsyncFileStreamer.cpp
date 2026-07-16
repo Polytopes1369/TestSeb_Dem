@@ -1,5 +1,6 @@
 #include "io/AsyncFileStreamer.h"
 #include "core/Logger.h"
+#include "core/ThreadingUtil.h"
 
 #include <format>
 
@@ -37,11 +38,7 @@ namespace geometry {
     } // namespace
 
     AsyncFileStreamer::AsyncFileStreamer(uint32_t workerThreadCount) {
-        if (workerThreadCount == 0) {
-            unsigned int detected = std::thread::hardware_concurrency();
-            workerThreadCount = (detected > 0) ? detected : 1u;
-        }
-        m_WorkerThreadCount = workerThreadCount;
+        m_WorkerThreadCount = core::GetDefaultWorkerThreadCount(workerThreadCount);
     }
 
     AsyncFileStreamer::~AsyncFileStreamer() {

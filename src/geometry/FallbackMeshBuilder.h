@@ -31,7 +31,7 @@ namespace geometry {
     // once at startup for BVH construction, and never paged/streamed.
     struct FallbackMesh {
         std::vector<maths::vec3> positions;
-        std::vector<maths::vec3> normals; // Face-accumulated, like VirtualGeometryCacheTest.cpp's ComputeVertexNormals.
+        std::vector<maths::vec3> normals; // Face-accumulated via geometry::ComputeFaceAccumulatedNormals.
         std::vector<maths::vec2> uvs;
         std::vector<uint32_t> triangles; // 3 indices per triangle, into the arrays above.
     };

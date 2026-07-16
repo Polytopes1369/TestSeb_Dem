@@ -1,5 +1,6 @@
 #include "geometry/MeshSDFGenerator.h"
 #include "core/Logger.h"
+#include "geometry/GeometryHashUtil.h"
 
 #include <algorithm>
 #include <cmath>
@@ -75,13 +76,6 @@ namespace geometry {
             return a + ab * v + ac * w;
         }
 
-        // Key for the edge -> accumulated-face-normal map: the two vertex indices, order-independent.
-        uint64_t EdgeKey(uint32_t i0, uint32_t i1) {
-            const uint64_t lo = std::min(i0, i1);
-            const uint64_t hi = std::max(i0, i1);
-            return (hi << 32) | lo;
-        }
-
         // Interior angle of the triangle corner at `apex` -- the weight the angle-weighted vertex
         // pseudo-normal assigns to this triangle's face normal at that vertex.
         float CornerAngle(const maths::vec3& apex, const maths::vec3& v1, const maths::vec3& v2) {
@@ -136,9 +130,9 @@ namespace geometry {
                     : maths::vec3{ 0.0f, 0.0f, 0.0f };
                 ctx.faceNormals[t] = n;
 
-                ctx.edgePseudoNormals[EdgeKey(i0, i1)] = ctx.edgePseudoNormals[EdgeKey(i0, i1)] + n;
-                ctx.edgePseudoNormals[EdgeKey(i1, i2)] = ctx.edgePseudoNormals[EdgeKey(i1, i2)] + n;
-                ctx.edgePseudoNormals[EdgeKey(i2, i0)] = ctx.edgePseudoNormals[EdgeKey(i2, i0)] + n;
+                ctx.edgePseudoNormals[PackOrderedPair(i0, i1)] = ctx.edgePseudoNormals[PackOrderedPair(i0, i1)] + n;
+                ctx.edgePseudoNormals[PackOrderedPair(i1, i2)] = ctx.edgePseudoNormals[PackOrderedPair(i1, i2)] + n;
+                ctx.edgePseudoNormals[PackOrderedPair(i2, i0)] = ctx.edgePseudoNormals[PackOrderedPair(i2, i0)] + n;
 
                 ctx.vertexPseudoNormals[i0] = ctx.vertexPseudoNormals[i0] + n * CornerAngle(a, b, c);
                 ctx.vertexPseudoNormals[i1] = ctx.vertexPseudoNormals[i1] + n * CornerAngle(b, c, a);
@@ -162,9 +156,9 @@ namespace geometry {
             const uint32_t i2 = tris[t * 3 + 2];
             switch (feature) {
             case TriangleFeature::Face:    return ctx.faceNormals[t];
-            case TriangleFeature::EdgeAB:  return ctx.edgePseudoNormals.at(EdgeKey(i0, i1));
-            case TriangleFeature::EdgeBC:  return ctx.edgePseudoNormals.at(EdgeKey(i1, i2));
-            case TriangleFeature::EdgeCA:  return ctx.edgePseudoNormals.at(EdgeKey(i2, i0));
+            case TriangleFeature::EdgeAB:  return ctx.edgePseudoNormals.at(PackOrderedPair(i0, i1));
+            case TriangleFeature::EdgeBC:  return ctx.edgePseudoNormals.at(PackOrderedPair(i1, i2));
+            case TriangleFeature::EdgeCA:  return ctx.edgePseudoNormals.at(PackOrderedPair(i2, i0));
             case TriangleFeature::VertexA: return ctx.vertexPseudoNormals[i0];
             case TriangleFeature::VertexB: return ctx.vertexPseudoNormals[i1];
             default:                       return ctx.vertexPseudoNormals[i2];
@@ -251,11 +245,10 @@ namespace geometry {
         MeshSDF sdf;
 
         // --- Volume fit: cubic voxels, mesh AABB centered, kSDFVolumeMarginVoxels margin -------
-        maths::vec3 boundsMin{ std::numeric_limits<float>::max(), std::numeric_limits<float>::max(), std::numeric_limits<float>::max() };
-        maths::vec3 boundsMax{ std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest() };
+        maths::vec3 boundsMin, boundsMax;
+        maths::ResetAABB(boundsMin, boundsMax);
         for (const maths::vec3& p : positions) {
-            boundsMin.x = std::min(boundsMin.x, p.x); boundsMin.y = std::min(boundsMin.y, p.y); boundsMin.z = std::min(boundsMin.z, p.z);
-            boundsMax.x = std::max(boundsMax.x, p.x); boundsMax.y = std::max(boundsMax.y, p.y); boundsMax.z = std::max(boundsMax.z, p.z);
+            maths::ExpandAABB(boundsMin, boundsMax, p);
         }
         const maths::vec3 extent = boundsMax - boundsMin;
         const float maxExtent = std::max({ extent.x, extent.y, extent.z, 1.0e-4f });

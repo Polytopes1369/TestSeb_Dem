@@ -1,15 +1,10 @@
 #include "core/LoadingManager.h"
+#include "core/ThreadingUtil.h"
 
 namespace core {
 
     LoadingManager::LoadingManager(uint32_t workerThreadCount) {
-        uint32_t count = workerThreadCount;
-        if (count == 0) {
-            count = std::thread::hardware_concurrency();
-            if (count == 0) {
-                count = 1; // hardware_concurrency() is allowed to return 0 when it cannot tell.
-            }
-        }
+        uint32_t count = GetDefaultWorkerThreadCount(workerThreadCount);
 
         m_WorkerThreads.reserve(count);
         for (uint32_t i = 0; i < count; ++i) {

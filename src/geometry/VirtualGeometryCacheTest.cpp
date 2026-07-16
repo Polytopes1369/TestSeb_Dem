@@ -123,35 +123,6 @@ namespace geometry {
             return ok;
         }
 
-        // -------------------------------------------------------------------------------------
-        // Computes area-weighted per-vertex normals directly from a DAG node's own triangle
-        // geometry. Needed because SimplifiableMesh (ClusterGrouping/MeshSimplifier/ClusterDAG's
-        // shared working type) only tracks vertex positions/UVs, not normals -- carrying real
-        // per-vertex normals through cluster grouping and QEM simplification would need an
-        // attribute-aware quadric (à la Hoppe), a separate, larger piece of work than this
-        // .cache-format pass. Recomputing a face-derived normal here is correct and complete for
-        // every DAG level (leaf or simplified). UV, unlike normals, IS carried through grouping/
-        // simplification as a genuine mesh attribute (SimplifiableMesh::uvs, midpoint-blended
-        // across each QEM collapse) -- see EncodeClusterData below, which reads node.mesh.uvs
-        // directly instead of needing a geometric fallback.
-        // -------------------------------------------------------------------------------------
-        std::vector<maths::vec3> ComputeVertexNormals(const SimplifiableMesh& mesh) {
-            std::vector<maths::vec3> normals(mesh.positions.size(), maths::vec3{ 0.0f, 0.0f, 0.0f });
-            for (size_t t = 0; t + 2 < mesh.triangles.size(); t += 3) {
-                uint32_t i0 = mesh.triangles[t + 0];
-                uint32_t i1 = mesh.triangles[t + 1];
-                uint32_t i2 = mesh.triangles[t + 2];
-                maths::vec3 faceNormal = (mesh.positions[i1] - mesh.positions[i0]).Cross(mesh.positions[i2] - mesh.positions[i0]);
-                normals[i0] = normals[i0] + faceNormal;
-                normals[i1] = normals[i1] + faceNormal;
-                normals[i2] = normals[i2] + faceNormal;
-            }
-            for (maths::vec3& n : normals) {
-                n = n.Normalize();
-            }
-            return normals;
-        }
-
         // Encodes one DAG node's geometry into a fixed-size, quantized ClusterData block. Returns
         // false (after logging why) if the node's vertex/index count would overflow the
         // fixed-size on-disk arrays: SimplifyMeshQEM only targets a triangle-count budget today
@@ -170,7 +141,7 @@ namespace geometry {
                 return false;
             }
 
-            std::vector<maths::vec3> normals = ComputeVertexNormals(node.mesh);
+            std::vector<maths::vec3> normals = ComputeFaceAccumulatedNormals(node.mesh);
 
             outData = ClusterData{};
             for (uint32_t v = 0; v < vertexCount; ++v) {
@@ -262,14 +233,13 @@ namespace geometry {
             data.indexEntry.vertexDataOffset = 0;
             data.indexEntry.indexDataOffset = 0;
 
-            maths::vec3 boundsMin{ std::numeric_limits<float>::max(), std::numeric_limits<float>::max(), std::numeric_limits<float>::max() };
-            maths::vec3 boundsMax{ std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest() };
+            maths::vec3 boundsMin, boundsMax;
+            maths::ResetAABB(boundsMin, boundsMax);
 
             data.vertices.reserve(mesh.positions.size());
             for (size_t v = 0; v < mesh.positions.size(); ++v) {
                 const maths::vec3& p = mesh.positions[v];
-                boundsMin.x = std::min(boundsMin.x, p.x); boundsMin.y = std::min(boundsMin.y, p.y); boundsMin.z = std::min(boundsMin.z, p.z);
-                boundsMax.x = std::max(boundsMax.x, p.x); boundsMax.y = std::max(boundsMax.y, p.y); boundsMax.z = std::max(boundsMax.z, p.z);
+                maths::ExpandAABB(boundsMin, boundsMax, p);
 
                 FallbackVertex fv{};
                 fv.position[0] = p.x; fv.position[1] = p.y; fv.position[2] = p.z;
