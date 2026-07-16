@@ -1,0 +1,158 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+
+// Screen-Space Ray Tracing (SSRT), Lumen-style "Screen Trace" -- see renderer::ScreenTracePass's
+// own class comment for the full design rationale (why a plain linear march, why the World Probe
+// grid fallback). One invocation per output pixel: reconstructs this pixel's world-space position
+// from the depth buffer + this frame's inverse view-projection, marches kScreenTraceSteps fixed
+// steps along a cosine-weighted hemisphere direction (oriented by this pixel's own G-buffer
+// normal) up to kScreenTraceMaxDistance world units, and at each step re-projects the marched
+// world position back to screen space to compare against the depth buffer (a classic linear SSR-
+// style march). A hit samples the direct-lit color at the hit pixel; a miss (ray escapes the
+// screen, or exhausts its step budget without ever crossing the depth buffer) falls back to
+// world_probe_sampling.glsl's SampleWorldProbeGrid at this pixel's own world position.
+
+#include "include/math_utils.glsl"
+
+#define WORLD_PROBE_GRID_SET 0
+#define WORLD_PROBE_GRID_BINDING 5
+#define WORLD_PROBE_GRID_PARAMS_BINDING 6
+#include "include/world_probe_sampling.glsl"
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(rgba16f, set = 0, binding = 0) uniform writeonly image2D g_NoisyGIOutput;
+layout(set = 0, binding = 1) uniform sampler2D g_Depth;
+layout(set = 0, binding = 2) uniform sampler2D g_Normal;
+layout(set = 0, binding = 3) uniform sampler2D g_DirectColor;
+
+layout(std140, set = 0, binding = 4) uniform ScreenTraceViewParamsUBO {
+    mat4 viewProj;
+    mat4 invViewProj;
+    vec3 cameraPos;
+    uint frameIndex;
+    vec2 viewportSize;
+    float _pad0;
+    float _pad1;
+} g_ViewParams;
+
+// set 0 bindings 5/6 (g_WorldProbeGrid, WorldProbeGridParamsUBO) declared by world_probe_sampling.glsl.
+
+const uint kScreenTraceSteps = 24u;
+const float kScreenTraceMaxDistance = 3.0;
+const float kDepthThicknessNDC = 0.01;
+
+// Inverse of ClusterResolve.comp's own OctEncode.
+vec3 OctDecode(vec2 e) {
+    e = e * 2.0 - 1.0;
+    vec3 n = vec3(e.xy, 1.0 - abs(e.x) - abs(e.y));
+    float t = clamp(-n.z, 0.0, 1.0);
+    n.xy += mix(vec2(t, t), vec2(-t, -t), greaterThanEqual(n.xy, vec2(0.0)));
+    return normalize(n);
+}
+
+float RadicalInverse(uint index, uint base) {
+    float result = 0.0;
+    float f = 1.0 / float(base);
+    uint i = index;
+    while (i > 0u) {
+        result += f * float(i % base);
+        i /= base;
+        f /= float(base);
+    }
+    return result;
+}
+
+vec2 Halton23(uint index) {
+    return vec2(RadicalInverse(index, 2u), RadicalInverse(index, 3u));
+}
+
+// Malley's method cosine-weighted hemisphere sample -- identical shape to
+// SurfaceCacheGIInject.comp's own CosineWeightedHemisphereSample (see that shader's own comment
+// for the derivation), duplicated locally per this codebase's established self-contained-shader
+// convention.
+vec3 CosineWeightedHemisphereSample(vec2 xi, vec3 normal) {
+    float r = sqrt(xi.x);
+    float phi = TAU * xi.y;
+    vec3 localDir = vec3(r * cos(phi), r * sin(phi), sqrt(max(0.0, 1.0 - xi.x)));
+
+    float sign_ = normal.z >= 0.0 ? 1.0 : -1.0;
+    float a = -1.0 / (sign_ + normal.z);
+    float b = normal.x * normal.y * a;
+    vec3 tangent = vec3(1.0 + sign_ * normal.x * normal.x * a, sign_ * b, -sign_ * normal.x);
+    vec3 bitangent = vec3(b, sign_ + normal.y * normal.y * a, -normal.y);
+
+    return normalize(tangent * localDir.x + bitangent * localDir.y + normal * localDir.z);
+}
+
+// Reconstructs the world-space position at `pixel` from its stored NDC depth (already in Vulkan's
+// [0,1] convention, see mat4::PerspectiveVulkan's own comment) via this frame's invViewProj.
+vec3 ReconstructWorldPos(ivec2 pixel, float ndcDepth) {
+    vec2 ndcXY = (vec2(pixel) + 0.5) / g_ViewParams.viewportSize * 2.0 - 1.0;
+    vec4 clip = vec4(ndcXY, ndcDepth, 1.0);
+    vec4 world = g_ViewParams.invViewProj * clip;
+    return world.xyz / world.w;
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (pixel.x >= int(g_ViewParams.viewportSize.x) || pixel.y >= int(g_ViewParams.viewportSize.y)) {
+        return;
+    }
+
+    vec2 encodedNormal = texelFetch(g_Normal, pixel, 0).rg;
+    if (encodedNormal == vec2(0.0)) {
+        // No geometry at this pixel (sky/background, see ClusterResolve.comp's own G-buffer-normal
+        // clear comment) -- nothing to trace from.
+        imageStore(g_NoisyGIOutput, pixel, vec4(0.0));
+        return;
+    }
+    vec3 normal = OctDecode(encodedNormal);
+
+    float ndcDepth = texelFetch(g_Depth, pixel, 0).r;
+    vec3 worldPos = ReconstructWorldPos(pixel, ndcDepth);
+    // Bias along the normal so the very first marched step does not immediately re-intersect this
+    // pixel's own surface -- same rationale as SurfaceCacheGIInject.comp's own biasedOrigin.
+    vec3 biasedOrigin = worldPos + normal * 1.0e-2;
+
+    vec2 xi = Halton23(g_ViewParams.frameIndex + 1u);
+    vec3 rayDir = CosineWeightedHemisphereSample(xi, normal);
+    float stepSize = kScreenTraceMaxDistance / float(kScreenTraceSteps);
+
+    vec3 result = vec3(0.0);
+    bool hit = false;
+    for (uint step = 1u; step <= kScreenTraceSteps && !hit; ++step) {
+        vec3 marchedPos = biasedOrigin + rayDir * (stepSize * float(step));
+
+        vec4 marchedClip = g_ViewParams.viewProj * vec4(marchedPos, 1.0);
+        if (marchedClip.w <= 0.0) {
+            break; // Marched behind the camera -- the screen trace cannot possibly see this sample.
+        }
+        vec3 marchedNdc = marchedClip.xyz / marchedClip.w;
+        if (abs(marchedNdc.x) > 1.0 || abs(marchedNdc.y) > 1.0 || marchedNdc.z < 0.0 || marchedNdc.z > 1.0) {
+            break; // Marched off-screen -- no further step can re-enter the visible frame.
+        }
+
+        ivec2 marchedPixel = ivec2((marchedNdc.xy * 0.5 + 0.5) * g_ViewParams.viewportSize);
+        float bufferedDepth = texelFetch(g_Depth, marchedPixel, 0).r;
+
+        // A hit: the marched sample's own NDC depth is AT OR BEHIND the depth buffer's stored
+        // value at that screen pixel (i.e. the march has just passed behind existing geometry),
+        // within kDepthThicknessNDC of it (rejects a march that has gone so far behind that it is
+        // now behind some entirely different, much farther surface -- see kDepthThicknessNDC's own
+        // comment).
+        if (marchedNdc.z >= bufferedDepth && marchedNdc.z - bufferedDepth < kDepthThicknessNDC) {
+            result = texelFetch(g_DirectColor, marchedPixel, 0).rgb;
+            hit = true;
+        }
+    }
+
+    if (!hit) {
+        // Tiered fallback: no near-field screen hit -- sample the low-resolution World Probe grid
+        // at this pixel's own (unbiased) world position instead ("fusionne ce résultat avec
+        // l'éclairage des sondes globales").
+        result = SampleWorldProbeGrid(worldPos);
+    }
+
+    imageStore(g_NoisyGIOutput, pixel, vec4(result, hit ? 1.0 : 0.0));
+}

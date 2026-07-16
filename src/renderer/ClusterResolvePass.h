@@ -52,6 +52,13 @@ namespace renderer {
         // ClusterResolve.comp currently performs (see that shader's class comment on why no real
         // material/texture system exists yet).
         static constexpr VkFormat kOutputColorFormat = VK_FORMAT_R8G8B8A8_UNORM;
+        // Octahedral-encoded world-space normal (RG only, same encoding convention
+        // SurfaceCacheCapture.frag already uses for its own normal atlas) -- the geometry-aware
+        // guide renderer::ScreenTracePass and renderer::ATrousDenoisePass both need and that this
+        // pipeline previously had nowhere persistent to read (ClusterResolve.comp used to
+        // reconstruct `normal` purely locally, then discard it after shading -- see that shader's
+        // own comment on where the store was added).
+        static constexpr VkFormat kNormalFormat = VK_FORMAT_R16G16_SFLOAT;
 
         // Allocates the output color image (sized to `renderExtent`, transitioned once to
         // VK_IMAGE_LAYOUT_GENERAL via a blocking one-time submit, mirroring HZBPass::Init /
@@ -86,6 +93,8 @@ namespace renderer {
 
         VkImage GetOutputColorImage() const { return m_OutputColorImage; }
         VkImageView GetOutputColorView() const { return m_OutputColorView; }
+        VkImage GetOutputNormalImage() const { return m_OutputNormalImage; }
+        VkImageView GetOutputNormalView() const { return m_OutputNormalView; }
 
     private:
         static constexpr uint32_t kWorkgroupSize = 8; // Matches ClusterResolve.comp's local_size_x/y.
@@ -97,6 +106,10 @@ namespace renderer {
         VkImage m_OutputColorImage = VK_NULL_HANDLE;
         VmaAllocation m_OutputColorAllocation = VK_NULL_HANDLE;
         VkImageView m_OutputColorView = VK_NULL_HANDLE;
+
+        VkImage m_OutputNormalImage = VK_NULL_HANDLE;
+        VmaAllocation m_OutputNormalAllocation = VK_NULL_HANDLE;
+        VkImageView m_OutputNormalView = VK_NULL_HANDLE;
 
         VkSampler m_DepthSampler = VK_NULL_HANDLE; // Nearest filtering, matching HZBPass's own depth-sampling convention.
 

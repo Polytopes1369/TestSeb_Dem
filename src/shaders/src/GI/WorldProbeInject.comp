@@ -1,0 +1,130 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+#extension GL_EXT_ray_query : require
+
+// World Probe grid injection: one invocation per probe of renderer::WorldProbeGridPass's
+// kGridResolution^3 grid, fully rebuilt every RecordUpdate() call (see that class' own "why a full
+// rebuild" comment). For each probe: fires kProbeSampleDirections fixed, evenly-spread-over-the-
+// sphere rays (SWRT sphere-tracing every entity's Mesh SDF, mesh_sdf_trace.glsl, or HWRT inline
+// rayQueryEXT against the shared Fallback Mesh TLAS, depending on pc.traceMode -- same two back-
+// ends and same TraceHWRT shape as SurfaceCacheGIInject.comp), samples the hit's Surface Cache
+// Card radiance (surface_cache_sampling.glsl) for every ray that lands on a surface, and writes
+// the averaged result as this probe's ambient irradiance.
+//
+// --- Why 14 fixed directions instead of importance-sampled hemisphere rays ---
+// A Surface Cache texel has a known surface normal to orient a cosine-weighted hemisphere around
+// (see SurfaceCacheGIInject.comp's own CosineWeightedHemisphereSample). A World Probe floats in
+// open space with no normal at all, and needs to capture light arriving from EVERY direction, not
+// just one hemisphere -- so this shader instead samples a small, fixed, omnidirectional direction
+// set: the 6 axis directions plus the 8 cube-diagonal directions (all normalized), a standard
+// low-discrepancy spread over the full sphere cheap enough to fire from all 32768 probes every
+// single frame.
+
+#include "include/math_utils.glsl"
+#include "include/mesh_sdf_trace.glsl"        // set 1
+#include "include/surface_cache_sampling.glsl" // set 2
+
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+
+layout(set = 0, binding = 0, rgba16f) uniform writeonly image3D g_ProbeGrid;
+layout(set = 0, binding = 1) uniform accelerationStructureEXT g_TLAS;
+
+// Mirrors SurfaceCacheGIInject.comp's own vertex/index/draw-range bindings exactly (same struct
+// layouts, same underlying buffers) so the HWRT trace path below computes a geometric hit normal
+// exactly the same way that shader's own TraceHWRT does.
+struct FallbackVertexGpu { float posX, posY, posZ; float normX, normY, normZ; float u, v; };
+layout(std430, set = 0, binding = 2) readonly buffer FallbackVertexBuffer { FallbackVertexGpu g_Vertices[]; };
+layout(std430, set = 0, binding = 3) readonly buffer FallbackIndexBuffer { uint g_Indices[]; };
+struct EntityDrawRangeGpu { int vertexOffset; uint firstIndex; uint indexCount; uint _pad; };
+layout(std430, set = 0, binding = 4) readonly buffer EntityDrawRangeBuffer { EntityDrawRangeGpu g_DrawRanges[]; };
+
+layout(push_constant) uniform WorldProbeInjectPushConstants {
+    vec3 gridOrigin;   // World-space position of this grid's texel (0,0,0) corner (renderer::WorldProbeGridPass::GetGridOriginWorld()).
+    float probeSpacing;
+    uint entityCount;  // Dynamically uniform -- see mesh_sdf_trace.glsl's own requirement.
+    uint frameIndex;   // Halton sequence temporal offset, advanced by the caller across calls.
+    uint traceMode;    // 0 = SWRT (TraceMeshSDFScene), 1 = HWRT (TraceHWRT, inline ray query).
+} pc;
+
+const uint kProbeSampleDirections = 14u;
+const vec3 kSampleDirections[14] = vec3[14](
+    // 6 axis directions.
+    vec3( 1.0,  0.0,  0.0), vec3(-1.0,  0.0,  0.0),
+    vec3( 0.0,  1.0,  0.0), vec3( 0.0, -1.0,  0.0),
+    vec3( 0.0,  0.0,  1.0), vec3( 0.0,  0.0, -1.0),
+    // 8 cube-diagonal directions, pre-normalized (1/sqrt(3)).
+    vec3( 0.57735,  0.57735,  0.57735), vec3(-0.57735,  0.57735,  0.57735),
+    vec3( 0.57735, -0.57735,  0.57735), vec3(-0.57735, -0.57735,  0.57735),
+    vec3( 0.57735,  0.57735, -0.57735), vec3(-0.57735,  0.57735, -0.57735),
+    vec3( 0.57735, -0.57735, -0.57735), vec3(-0.57735, -0.57735, -0.57735)
+);
+
+vec3 FetchPosition(uint globalVertexIndex) {
+    FallbackVertexGpu v = g_Vertices[globalVertexIndex];
+    return vec3(v.posX, v.posY, v.posZ);
+}
+
+// Identical shape to SurfaceCacheGIInject.comp's own TraceHWRT -- see that shader's comment for
+// why this is the only way to issue a hardware trace from a plain compute shader.
+bool TraceHWRT(vec3 rayOrigin, vec3 rayDir, float tMax, out uint outEntityIndex, out vec3 outLocalPos, out vec3 outLocalNormal) {
+    rayQueryEXT rq;
+    rayQueryInitializeEXT(rq, g_TLAS, gl_RayFlagsOpaqueEXT, 0xFF, rayOrigin, 1.0e-3, rayDir, tMax);
+    while (rayQueryProceedEXT(rq)) {
+        // Every BLAS triangle in this TLAS is unconditionally opaque -- see
+        // renderer::AccelerationStructure::BuildBLAS's own comment.
+    }
+    if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionNoneEXT) {
+        return false;
+    }
+
+    outEntityIndex = uint(rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true));
+    int primitiveID = rayQueryGetIntersectionPrimitiveIndexEXT(rq, true);
+    float hitT = rayQueryGetIntersectionTEXT(rq, true);
+    vec3 objOrigin = rayQueryGetIntersectionObjectRayOriginEXT(rq, true);
+    vec3 objDir = rayQueryGetIntersectionObjectRayDirectionEXT(rq, true);
+    outLocalPos = objOrigin + objDir * hitT;
+
+    EntityDrawRangeGpu range = g_DrawRanges[outEntityIndex];
+    uint triangleFirstIndex = range.firstIndex + uint(primitiveID) * 3u;
+    uint i0 = uint(range.vertexOffset) + g_Indices[triangleFirstIndex + 0u];
+    uint i1 = uint(range.vertexOffset) + g_Indices[triangleFirstIndex + 1u];
+    uint i2 = uint(range.vertexOffset) + g_Indices[triangleFirstIndex + 2u];
+    vec3 p0 = FetchPosition(i0);
+    vec3 p1 = FetchPosition(i1);
+    vec3 p2 = FetchPosition(i2);
+    outLocalNormal = normalize(cross(p1 - p0, p2 - p0));
+    return true;
+}
+
+void main() {
+    uvec3 probeCoord = gl_GlobalInvocationID.xyz;
+    if (probeCoord.x >= 32u || probeCoord.y >= 32u || probeCoord.z >= 32u) {
+        return; // Robustness only -- 32 / local_size(4) divides exactly, so this never actually trips.
+    }
+
+    vec3 probePos = pc.gridOrigin + (vec3(probeCoord) + 0.5) * pc.probeSpacing;
+
+    vec3 accumulated = vec3(0.0);
+    for (uint s = 0u; s < kProbeSampleDirections; ++s) {
+        vec3 dir = kSampleDirections[s];
+
+        uint hitEntityIndex;
+        vec3 hitLocalPos, hitLocalNormal;
+        bool hit;
+        if (pc.traceMode == 0u) {
+            hit = TraceMeshSDFScene(probePos, dir, kFarDistance, pc.entityCount, hitEntityIndex, hitLocalPos, hitLocalNormal);
+        } else {
+            hit = TraceHWRT(probePos, dir, kFarDistance, hitEntityIndex, hitLocalPos, hitLocalNormal);
+        }
+
+        if (hit) {
+            EntityInfo hitEntity = g_Entities[hitEntityIndex];
+            accumulated += SampleCardRadiance(hitLocalPos, hitLocalNormal, hitEntity.firstCardIndex, hitEntity.cardCount);
+        }
+        // A miss (ray escapes to the sky) contributes 0 -- physically correct for an ambient
+        // average over the full sphere, not an error case to special-case.
+    }
+
+    vec3 irradiance = accumulated / float(kProbeSampleDirections);
+    imageStore(g_ProbeGrid, ivec3(probeCoord), vec4(irradiance, 1.0));
+}

@@ -1,0 +1,103 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+
+// À-Trous wavelet spatial denoiser -- one pass of a 5x5 sparse kernel, dilated by pc.stepSize
+// texels between taps, with three SVGF-style edge-stopping weights (normal, depth, luminance) so
+// the filter averages only where the underlying signal is actually expected to be smooth. See
+// renderer::ATrousDenoisePass's own class comment for the full "why À-Trous, why 3 weights"
+// rationale -- this shader is deliberately generic (no coupling to how g_Input was produced).
+
+#include "include/math_utils.glsl"
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform sampler2D g_Input;
+layout(rgba16f, set = 0, binding = 1) uniform writeonly image2D g_Output;
+layout(set = 0, binding = 2) uniform sampler2D g_Depth;
+layout(set = 0, binding = 3) uniform sampler2D g_Normal;
+
+layout(push_constant) uniform ATrousPushConstants {
+    int stepSize;
+} pc;
+
+// Separable 5-tap B3 spline kernel (Dammertz et al.'s "Edge-Avoiding À-Trous Wavelet Transform"),
+// outer-producted below into the full 5x5 2D kernel.
+const float kKernel1D[5] = float[5](1.0 / 16.0, 1.0 / 4.0, 3.0 / 8.0, 1.0 / 4.0, 1.0 / 16.0);
+
+// Edge-stopping sensitivities -- larger sigmaNormal = sharper (more tolerant of small normal
+// differences before its weight collapses); larger sigmaDepth/sigmaLuminance = MORE tolerant of
+// depth/luminance differences (a looser stop). Tuned for this pipeline's own units: `g_Depth` is
+// raw NDC [0,1] (see ClusterResolve.comp's own "smaller is nearer" convention), and the noisy GI
+// signal is a plain linear radiance value, not pre-tonemapped.
+const float kSigmaNormal = 32.0;
+const float kSigmaDepth = 0.002;
+const float kSigmaLuminance = 4.0;
+
+// Inverse of ClusterResolve.comp's own OctEncode.
+vec3 OctDecode(vec2 e) {
+    e = e * 2.0 - 1.0;
+    vec3 n = vec3(e.xy, 1.0 - abs(e.x) - abs(e.y));
+    float t = clamp(-n.z, 0.0, 1.0);
+    n.xy += mix(vec2(t, t), vec2(-t, -t), greaterThanEqual(n.xy, vec2(0.0)));
+    return normalize(n);
+}
+
+float Luminance(vec3 c) {
+    return dot(c, vec3(0.2126, 0.7152, 0.0722));
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 res = textureSize(g_Input, 0);
+    if (pixel.x >= res.x || pixel.y >= res.y) {
+        return;
+    }
+
+    vec2 centerEncodedNormal = texelFetch(g_Normal, pixel, 0).rg;
+    if (centerEncodedNormal == vec2(0.0)) {
+        // No geometry at this pixel (sky/background) -- nothing to denoise, pass the input through
+        // unfiltered rather than blending sky with whatever noisy value neighboring geometry left.
+        imageStore(g_Output, pixel, texelFetch(g_Input, pixel, 0));
+        return;
+    }
+
+    vec3 centerColor = texelFetch(g_Input, pixel, 0).rgb;
+    vec3 centerNormal = OctDecode(centerEncodedNormal);
+    float centerDepth = texelFetch(g_Depth, pixel, 0).r;
+    float centerLuminance = Luminance(centerColor);
+
+    vec3 sum = vec3(0.0);
+    float weightSum = 0.0;
+
+    for (int j = -2; j <= 2; ++j) {
+        for (int i = -2; i <= 2; ++i) {
+            ivec2 tapPixel = pixel + ivec2(i, j) * pc.stepSize;
+            if (tapPixel.x < 0 || tapPixel.y < 0 || tapPixel.x >= res.x || tapPixel.y >= res.y) {
+                continue;
+            }
+
+            vec2 tapEncodedNormal = texelFetch(g_Normal, tapPixel, 0).rg;
+            if (tapEncodedNormal == vec2(0.0)) {
+                continue; // Never let a background texel bleed into a foreground denoise.
+            }
+
+            vec3 tapColor = texelFetch(g_Input, tapPixel, 0).rgb;
+            vec3 tapNormal = OctDecode(tapEncodedNormal);
+            float tapDepth = texelFetch(g_Depth, tapPixel, 0).r;
+            float tapLuminance = Luminance(tapColor);
+
+            float kernelWeight = kKernel1D[i + 2] * kKernel1D[j + 2];
+
+            float normalWeight = pow(max(0.0, dot(centerNormal, tapNormal)), kSigmaNormal);
+            float depthWeight = exp(-abs(centerDepth - tapDepth) / kSigmaDepth);
+            float luminanceWeight = exp(-abs(centerLuminance - tapLuminance) / kSigmaLuminance);
+
+            float w = kernelWeight * normalWeight * depthWeight * luminanceWeight;
+            sum += tapColor * w;
+            weightSum += w;
+        }
+    }
+
+    vec3 result = (weightSum > 1.0e-6) ? (sum / weightSum) : centerColor;
+    imageStore(g_Output, pixel, vec4(result, 1.0));
+}

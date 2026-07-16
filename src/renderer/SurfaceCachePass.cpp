@@ -238,13 +238,18 @@ namespace renderer {
         // same Fallback Mesh geometry. Valid usage even though this pass itself never builds an
         // acceleration structure, because VulkanContext::CreateLogicalDevice enables
         // VK_KHR_acceleration_structure + bufferDeviceAddress unconditionally at device creation.
+        // STORAGE_BUFFER_BIT: SurfaceCacheGIInject.comp / WorldProbeInject.comp's HWRT trace path
+        // (TraceHWRT) and SurfaceCacheHWRT.rchit all bind these same two buffers as plain readonly
+        // SSBOs (FallbackVertexBuffer/FallbackIndexBuffer) to re-fetch a hit triangle's vertices --
+        // a VkDescriptorType::STORAGE_BUFFER write against a buffer not created with this usage bit
+        // is invalid, regardless of the buffer's OTHER usage flags.
         if (vertexBytes > 0 && indexBytes > 0) {
             m_VertexBuffer.Create(allocator, vertexBytes,
-                VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                 VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
                 VMA_MEMORY_USAGE_GPU_ONLY);
             m_IndexBuffer.Create(allocator, indexBytes,
-                VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                 VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
                 VMA_MEMORY_USAGE_GPU_ONLY);
         }
@@ -658,7 +663,13 @@ namespace renderer {
         VkDescriptorImageInfo shadowImageInfo{};
         shadowImageInfo.sampler = shadowMapSampler;
         shadowImageInfo.imageView = shadowMapView;
-        shadowImageInfo.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL; // Still a valid sampled layout, matching renderer::ShadowMapPass's own permanent-layout convention.
+        // renderer::ShadowMapPass keeps its depth image in VK_IMAGE_LAYOUT_GENERAL for its ENTIRE
+        // lifetime (valid for both its own depth-attachment writes and this sampled read, so it
+        // never ping-pongs layouts -- see that class' own Init() doc comment) -- NOT
+        // DEPTH_ATTACHMENT_OPTIMAL, which is write-only and not a legal sampled-image layout at
+        // all. This descriptor's declared imageLayout must match the image's actual layout at
+        // every draw that samples it, or the validation layer (correctly) rejects it.
+        shadowImageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
         VkWriteDescriptorSet shadowWrite{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
         shadowWrite.dstSet = m_LightingDescriptorSet;

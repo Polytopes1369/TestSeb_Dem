@@ -82,9 +82,23 @@ namespace renderer {
         viewInfo.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
         VK_CHECK(vkCreateImageView(m_Device, &viewInfo, nullptr, &m_OutputColorView));
 
+        // --- G-buffer normal image: same extent/tiling/usage shape as the color image above, just
+        // a 2-channel octahedral-encoded format -- the persistent per-pixel world-space normal
+        // renderer::ScreenTracePass / renderer::ATrousDenoisePass read as their geometry-aware
+        // guide (see kNormalFormat's own comment). ---
+        VkImageCreateInfo normalImageInfo = imageInfo;
+        normalImageInfo.format = kNormalFormat;
+        VK_CHECK(vmaCreateImage(allocator, &normalImageInfo, &imageAllocInfo, &m_OutputNormalImage, &m_OutputNormalAllocation, nullptr));
+
+        VkImageViewCreateInfo normalViewInfo = viewInfo;
+        normalViewInfo.image = m_OutputNormalImage;
+        normalViewInfo.format = kNormalFormat;
+        VK_CHECK(vkCreateImageView(m_Device, &normalViewInfo, nullptr, &m_OutputNormalView));
+
         // --- One-time UNDEFINED -> GENERAL transition (mirrors HZBPass::Init /
         // ClusterSoftwareRasterPass::Init's own one-shot pattern) -- stays in GENERAL for its
-        // entire lifetime, touched only by this class's own compute shader. ---
+        // entire lifetime, touched only by this class's own compute shader. Both the color and
+        // normal images are transitioned together in the same one-shot command buffer. ---
         {
             VkCommandBufferAllocateInfo cmdAllocInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
             cmdAllocInfo.commandPool = commandPool;
@@ -98,21 +112,25 @@ namespace renderer {
             beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
             vkBeginCommandBuffer(cmd, &beginInfo);
 
-            VkImageMemoryBarrier2 barrier{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
-            barrier.srcStageMask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
-            barrier.srcAccessMask = 0;
-            barrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-            barrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-            barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-            barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-            barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            barrier.image = m_OutputColorImage;
-            barrier.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+            VkImageMemoryBarrier2 barriers[2]{};
+            barriers[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+            barriers[0].srcStageMask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
+            barriers[0].srcAccessMask = 0;
+            barriers[0].dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+            barriers[0].dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+            barriers[0].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            barriers[0].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            barriers[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barriers[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barriers[0].image = m_OutputColorImage;
+            barriers[0].subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+
+            barriers[1] = barriers[0];
+            barriers[1].image = m_OutputNormalImage;
 
             VkDependencyInfo depInfo{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-            depInfo.imageMemoryBarrierCount = 1;
-            depInfo.pImageMemoryBarriers = &barrier;
+            depInfo.imageMemoryBarrierCount = 2;
+            depInfo.pImageMemoryBarriers = barriers;
             vkCmdPipelineBarrier2(cmd, &depInfo);
 
             vkEndCommandBuffer(cmd);
@@ -149,9 +167,9 @@ namespace renderer {
             VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
             VMA_MEMORY_USAGE_GPU_ONLY);
 
-        // --- Descriptor set layout: 9 bindings, matching ClusterResolve.comp's set = 0 bindings
-        // 0..8 exactly. ---
-        VkDescriptorSetLayoutBinding bindings[9]{};
+        // --- Descriptor set layout: 10 bindings, matching ClusterResolve.comp's set = 0 bindings
+        // 0..9 exactly (binding 9 added for the new G-buffer normal output). ---
+        VkDescriptorSetLayoutBinding bindings[10]{};
         bindings[0] = { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };         // ClusterCullMetadataSSBO
         bindings[1] = { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };         // CompressedClusterPoolSSBO
         bindings[2] = { 2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };          // g_HWClusterIDImage (r32ui)
@@ -161,15 +179,16 @@ namespace renderer {
         bindings[6] = { 6, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };          // g_OutputColor (rgba8)
         bindings[7] = { 7, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };         // ResolveViewParamsUBO
         bindings[8] = { 8, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, maskTextureCount, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // g_MaskTextures[]
+        bindings[9] = { 9, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };          // g_OutputNormal (rg16f)
 
         VkDescriptorSetLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-        layoutInfo.bindingCount = 9;
+        layoutInfo.bindingCount = 10;
         layoutInfo.pBindings = bindings;
         VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &layoutInfo, nullptr, &m_SetLayout));
 
         VkDescriptorPoolSize poolSizes[4]{};
         poolSizes[0] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 };
-        poolSizes[1] = { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 4 };
+        poolSizes[1] = { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 5 };
         poolSizes[2] = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1 + maskTextureCount };
         poolSizes[3] = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 };
 
@@ -210,7 +229,11 @@ namespace renderer {
         outputColorInfo.imageView = m_OutputColorView;
         outputColorInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
-        VkWriteDescriptorSet writes[9]{};
+        VkDescriptorImageInfo outputNormalInfo{};
+        outputNormalInfo.imageView = m_OutputNormalView;
+        outputNormalInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+        VkWriteDescriptorSet writes[10]{};
         writes[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_DescriptorSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &clusterMetadataInfo, nullptr };
         writes[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_DescriptorSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &compressedPoolInfo, nullptr };
         writes[2] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_DescriptorSet, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &hwClusterIDInfo, nullptr, nullptr };
@@ -220,7 +243,8 @@ namespace renderer {
         writes[6] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_DescriptorSet, 6, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &outputColorInfo, nullptr, nullptr };
         writes[7] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_DescriptorSet, 7, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &viewParamsInfo, nullptr };
         writes[8] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_DescriptorSet, 8, 0, maskTextureCount, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, maskImageInfos.data(), nullptr, nullptr };
-        vkUpdateDescriptorSets(m_Device, 9, writes, 0, nullptr);
+        writes[9] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_DescriptorSet, 9, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &outputNormalInfo, nullptr, nullptr };
+        vkUpdateDescriptorSets(m_Device, 10, writes, 0, nullptr);
 
         // --- Pipeline layout + pipeline ---
         VkPipelineLayoutCreateInfo pipelineLayoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
@@ -255,6 +279,7 @@ namespace renderer {
             if (m_SetLayout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(m_Device, m_SetLayout, nullptr);
             if (m_DepthSampler != VK_NULL_HANDLE) vkDestroySampler(m_Device, m_DepthSampler, nullptr);
             if (m_OutputColorView != VK_NULL_HANDLE) vkDestroyImageView(m_Device, m_OutputColorView, nullptr);
+            if (m_OutputNormalView != VK_NULL_HANDLE) vkDestroyImageView(m_Device, m_OutputNormalView, nullptr);
         }
 
         m_Pipeline = VK_NULL_HANDLE;
@@ -264,6 +289,7 @@ namespace renderer {
         m_DescriptorSet = VK_NULL_HANDLE;
         m_DepthSampler = VK_NULL_HANDLE;
         m_OutputColorView = VK_NULL_HANDLE;
+        m_OutputNormalView = VK_NULL_HANDLE;
 
         m_ViewParamsBuffer.Destroy();
 
@@ -271,9 +297,12 @@ namespace renderer {
         // GpuBuffer::Destroy()'s own null-safe convention.
         if (m_Allocator != VK_NULL_HANDLE) {
             vmaDestroyImage(m_Allocator, m_OutputColorImage, m_OutputColorAllocation);
+            vmaDestroyImage(m_Allocator, m_OutputNormalImage, m_OutputNormalAllocation);
         }
         m_OutputColorImage = VK_NULL_HANDLE;
         m_OutputColorAllocation = VK_NULL_HANDLE;
+        m_OutputNormalImage = VK_NULL_HANDLE;
+        m_OutputNormalAllocation = VK_NULL_HANDLE;
 
         m_RenderExtent = { 0, 0 };
         m_Allocator = VK_NULL_HANDLE;

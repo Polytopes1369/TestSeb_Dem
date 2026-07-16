@@ -17,6 +17,10 @@ public:
     void Shutdown();
 
     VkDevice GetDevice() const { return m_Device; }
+    // Needed by renderer::SurfaceCacheRayTracingPass::Init, which queries
+    // VkPhysicalDeviceRayTracingPipelinePropertiesKHR (Shader Binding Table alignment) -- the one
+    // consumer in this codebase that needs the physical device handle outside VulkanContext itself.
+    VkPhysicalDevice GetPhysicalDevice() const { return m_PhysicalDevice; }
     VkSwapchainKHR GetSwapchain() const { return m_Swapchain; }
     VkExtent2D GetSwapchainExtent() const { return m_SwapchainExtent; }
     const std::vector<VkImage>& GetSwapchainImages() const { return m_SwapchainImages; }

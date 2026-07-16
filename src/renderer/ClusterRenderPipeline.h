@@ -60,17 +60,27 @@
 
 #include "core/Camera.h"
 #include "core/maths/Maths.h"
+#include "renderer/ATrousDenoisePass.h"
 #include "renderer/ClusterHardwareRasterPass.h"
 #include "renderer/ClusterLODSelectionPass.h"
 #include "renderer/ClusterOcclusionCullingPass.h"
 #include "renderer/ClusterResolvePass.h"
 #include "renderer/ClusterSoftwareRasterPass.h"
+#include "renderer/GICompositePass.h"
 #include "renderer/GeometryDecompressionPass.h"
 #include "renderer/GeometryStreamingCoordinator.h"
+#include "renderer/GlobalSDFPass.h"
 #include "renderer/GpuBuffer.h"
 #include "renderer/GpuGeometryPagePool.h"
 #include "renderer/HZBPass.h"
 #include "renderer/ProceduralMaskGenerator.h"
+#include "renderer/ScreenTracePass.h"
+#include "renderer/ShadowMapPass.h"
+#include "renderer/SurfaceCacheGIInjectPass.h"
+#include "renderer/SurfaceCachePass.h"
+#include "renderer/SurfaceCacheRayTracingPass.h"
+#include "renderer/SurfaceCacheTraceContext.h"
+#include "renderer/WorldProbeGridPass.h"
 #ifndef NDEBUG
 #include "renderer/debug/ClusterTriangleStatsPass.h"
 #include "renderer/debug/DebugTextOverlay.h"
@@ -82,6 +92,10 @@ namespace renderer {
     // (owned by VulkanContext), only the passes/buffers this class creates itself are owned.
     struct ClusterRenderPipelineCreateInfo {
         VkDevice device = VK_NULL_HANDLE;
+        // Needed only for renderer::SurfaceCacheRayTracingPass::Init's BLAS/TLAS build (queries
+        // VkPhysicalDeviceRayTracingPipelinePropertiesKHR for SBT alignment) -- every other pass
+        // this class owns needs only the logical device.
+        VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
         VmaAllocator allocator = VK_NULL_HANDLE;
         VkCommandPool commandPool = VK_NULL_HANDLE;
         VkQueue queue = VK_NULL_HANDLE;
@@ -138,8 +152,13 @@ namespace renderer {
         // identically from ClusterRaster.vert and ClusterSoftwareRaster.comp) -- uploaded once per
         // frame into m_WPOGlobalsBuffer before either raster pass runs. The caller only
         // begins/ends/submits the command buffer and presents.
+        // `sunDirection` drives BOTH renderer::ShadowMapPass's light view-projection AND (matching
+        // ClusterResolve.comp's own hardcoded vec3(0.5,1,0.5) sun so the raster pass's direct light
+        // and the Surface Cache capture's shadow-tested sun term agree visually) defaults to that
+        // exact direction, normalized, when the caller does not override it.
         void RecordFrame(VkCommandBuffer cmd, const CameraPushConstants& camera,
-            const maths::vec3& cameraPositionWorld, float globalTimeSeconds, VkImage swapchainImage);
+            const maths::vec3& cameraPositionWorld, float globalTimeSeconds, VkImage swapchainImage,
+            const maths::vec3& sunDirection = maths::vec3{ 0.5f, 1.0f, 0.5f }.Normalize());
 
         // Upper bound on this frame's actual candidate count (the DAG's total leaf count) -- NOT
         // this frame's real candidate count, which only ever exists on the GPU now that
@@ -196,6 +215,28 @@ namespace renderer {
         ClusterHardwareRasterPass m_HardwareRaster;
         ClusterSoftwareRasterPass m_SoftwareRaster;
         ClusterResolvePass m_Resolve;
+
+        // --- Lumen-style GI chain (previously self-contained but orphaned -- see this class'
+        // own comment: this is where it actually gets driven, in the dependency order each of
+        // these classes' own header already documents). ---
+        GlobalSDFPass m_GlobalSDF;
+        SurfaceCachePass m_SurfaceCache;
+        ShadowMapPass m_ShadowMap;
+        SurfaceCacheTraceContext m_TraceContext;
+        SurfaceCacheRayTracingPass m_SurfaceCacheRT;
+        SurfaceCacheGIInjectPass m_GIInject;
+
+        // --- New: SSRT + World Probe grid + spatial denoiser + final composite (see this class'
+        // own comment for exactly where these sit in the per-frame sequence). ---
+        WorldProbeGridPass m_WorldProbes;
+        ScreenTracePass m_ScreenTrace;
+        ATrousDenoisePass m_Denoiser;
+        GICompositePass m_GIComposite;
+
+        // Advances once per RecordFrame() call -- the Halton-sequence temporal offset threaded
+        // into both m_GIInject::RecordInject and m_ScreenTrace::RecordTrace, exactly like
+        // SurfaceCacheGIInjectPass's own internal m_FrameIndex.
+        uint32_t m_GIFrameIndex = 0;
 
 #ifndef NDEBUG
         // Real-time stat overlay (GPU memory used, pending SSD page loads, disk read throughput,

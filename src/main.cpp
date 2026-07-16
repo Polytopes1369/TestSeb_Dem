@@ -129,6 +129,7 @@ int main() {
     // resolve -> blit to swapchain. See renderer::ClusterRenderPipeline for the frame graph. ---
     renderer::ClusterRenderPipelineCreateInfo pipelineInfo{};
     pipelineInfo.device = vkContext.GetDevice();
+    pipelineInfo.physicalDevice = vkContext.GetPhysicalDevice();
     pipelineInfo.allocator = vkContext.GetAllocator();
     pipelineInfo.commandPool = vkContext.GetCommandPool();
     pipelineInfo.queue = vkContext.GetGraphicsQueue();

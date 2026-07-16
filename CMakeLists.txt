@@ -144,21 +144,31 @@ if(Vulkan_GLSLC_EXECUTABLE)
         # Ray tracing / ray query stages need SPIR-V 1.4+ (the RayTracingKHR and RayQueryKHR
         # SPIR-V capabilities -- gl_InstanceCustomIndexEXT / traceRayEXT / rayPayloadEXT /
         # rayQueryEXT etc. -- are not representable in SPIR-V 1.0-1.3): the 3 .rgen/.rchit/.rmiss
-        # files unconditionally, plus SurfaceCacheGIInject.comp specifically (the one .comp file
-        # in this codebase that uses GL_EXT_ray_query for its inline HWRT trace path -- see that
-        # file's own TraceHWRT). Every other shader stage keeps glslc's default target-env/
-        # target-spv untouched.
+        # files unconditionally, plus SurfaceCacheGIInject.comp and WorldProbeInject.comp
+        # specifically (the two .comp files in this codebase that use GL_EXT_ray_query for their
+        # own inline HWRT trace path -- see each file's own TraceHWRT). Every other shader stage
+        # keeps glslc's default target-env/target-spv untouched.
         get_filename_component(SHADER_EXT ${SHADER_SRC} EXT)
         set(GLSLC_EXTRA_FLAGS "")
         if(SHADER_EXT STREQUAL ".rgen" OR SHADER_EXT STREQUAL ".rchit" OR SHADER_EXT STREQUAL ".rmiss"
-                OR SHADER_NAME STREQUAL "SurfaceCacheGIInject.comp")
+                OR SHADER_NAME STREQUAL "SurfaceCacheGIInject.comp" OR SHADER_NAME STREQUAL "WorldProbeInject.comp")
             set(GLSLC_EXTRA_FLAGS --target-env=vulkan1.3 --target-spv=spv1.4)
         endif()
 
-        # Command to compile shader
+        # Command to compile shader.
+        #
+        # -D_DEBUG, Debug config only (via a generator expression so this works correctly under
+        # both single-config Makefile/Ninja generators AND multi-config generators like Visual
+        # Studio, where CMAKE_BUILD_TYPE is not set at configure time at all): mirrors the C++
+        # side's own _DEBUG/NDEBUG convention (CLAUDE.md's Debug/Release separation rule) for every
+        # shader's `#ifdef _DEBUG` visualization branch (ClusterResolve.comp's own debug view
+        # modes, and every new GI pass shader's DEBUG_VIEW_LUMEN/SPATIAL_PROBES branch) -- without
+        # this flag, glslc never defines _DEBUG at all, regardless of the C++ build configuration,
+        # silently stripping every one of those branches out of the compiled SPIR-V even in a
+        # Debug build.
         add_custom_command(
             OUTPUT ${SHADER_SPV}
-            COMMAND ${Vulkan_GLSLC_EXECUTABLE} -I "${SHADER_INCLUDE_DIR}" ${GLSLC_EXTRA_FLAGS} ${SHADER_SRC} -o ${SHADER_SPV}
+            COMMAND ${Vulkan_GLSLC_EXECUTABLE} -I "${SHADER_INCLUDE_DIR}" ${GLSLC_EXTRA_FLAGS} "$<$<CONFIG:Debug>:-D_DEBUG>" ${SHADER_SRC} -o ${SHADER_SPV}
             DEPENDS ${SHADER_SRC}
             COMMENT "Compiling shader: ${SHADER_NAME}"
         )

@@ -71,6 +71,24 @@ layout(std140, set = 0, binding = 7) uniform ResolveViewParamsUBO {
     float _pad1;
 } g_ViewParams;
 
+// G-buffer world-space normal, octahedral-encoded RG -- the persistent geometry-aware guide
+// renderer::ScreenTracePass / renderer::ATrousDenoisePass read (see ClusterResolvePass::
+// kNormalFormat's own comment for why this codebase previously had nowhere persistent to store
+// the `normal` this shader already reconstructs below).
+layout(rg16f, set = 0, binding = 9) uniform writeonly image2D g_OutputNormal;
+
+// Standard octahedral encode (inverse of SurfaceCacheGIInject.comp's own OctDecode) -- duplicated
+// locally rather than shared via an include, matching this codebase's established "self-contained
+// shader" convention (see mesh_sdf_trace.glsl's own header comment on why SurfaceCacheGIInject.comp
+// duplicates OctDecode instead of importing SurfaceCacheCapture.frag's OctEncode).
+vec2 OctEncode(vec3 n) {
+    vec2 p = n.xy * (1.0 / (abs(n.x) + abs(n.y) + abs(n.z)));
+    if (n.z < 0.0) {
+        p = (1.0 - abs(p.yx)) * mix(vec2(-1.0), vec2(1.0), greaterThanEqual(p, vec2(0.0)));
+    }
+    return p * 0.5 + 0.5;
+}
+
 #ifdef _DEBUG
 layout(push_constant) uniform DebugPC {
     uint viewMode;
@@ -210,6 +228,10 @@ void main() {
         vec3 normal = normalize(pw0 * n0 + pw1 * n1 + pw2 * n2);
         vec2 uv = pw0 * uv0 + pw1 * uv1 + pw2 * uv2;
 
+        // Persist the reconstructed normal for renderer::ScreenTracePass / renderer::ATrousDenoisePass
+        // to read as their geometry-aware guide -- see g_OutputNormal's own binding comment.
+        imageStore(g_OutputNormal, pixel, vec4(OctEncode(normal), 0.0, 0.0));
+
         // --- Step 3: procedural material evaluation (see the class comment for why no texture
         // sampling happens here yet) ---
         vec3 lightDir = normalize(vec3(0.5, 1.0, 0.5));
@@ -253,6 +275,12 @@ void main() {
         }
 #endif
     } else {
+        // No geometry at this pixel (sky/background): a degenerate all-zero octahedral code, which
+        // OctDecode's -- see world_probe_sampling.glsl / ScreenTrace.comp consumers -- never
+        // produces from a real encoded unit vector, so it doubles as this G-buffer's own "no
+        // surface here" sentinel for the denoiser's edge-stopping normal weight.
+        imageStore(g_OutputNormal, pixel, vec4(0.0));
+
 #ifdef _DEBUG
         if (pc.viewMode == 10) { // DEBUG_VIEW_DEPTH
             // For depth view, empty background should render as white/1.0
