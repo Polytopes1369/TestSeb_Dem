@@ -4,10 +4,12 @@ D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\geometry\CardGene
 D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\geometry\ClusterDAG.cpp;D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\DemoSceneVK.dir\Debug\ClusterDAG.obj
 D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\geometry\ClusterGrouping.cpp;D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\DemoSceneVK.dir\Debug\ClusterGrouping.obj
 D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\geometry\ClusterPartitioner.cpp;D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\DemoSceneVK.dir\Debug\ClusterPartitioner.obj
+D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\geometry\EntityBVH.cpp;D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\DemoSceneVK.dir\Debug\EntityBVH.obj
 D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\geometry\FallbackMeshBuilder.cpp;D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\DemoSceneVK.dir\Debug\FallbackMeshBuilder.obj
 D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\geometry\GpuPageTable.cpp;D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\DemoSceneVK.dir\Debug\GpuPageTable.obj
 D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\geometry\MeshSDFGenerator.cpp;D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\DemoSceneVK.dir\Debug\MeshSDFGenerator.obj
 D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\geometry\MeshSimplifier.cpp;D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\DemoSceneVK.dir\Debug\MeshSimplifier.obj
+D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\geometry\SurfaceCacheAtlasAllocator.cpp;D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\DemoSceneVK.dir\Debug\SurfaceCacheAtlasAllocator.obj
 D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\geometry\VirtualGeometryCacheTest.cpp;D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\DemoSceneVK.dir\Debug\VirtualGeometryCacheTest.obj
 D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\io\AsyncFileStreamer.cpp;D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\DemoSceneVK.dir\Debug\AsyncFileStreamer.obj
 D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\io\CacheFileManager.cpp;D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\DemoSceneVK.dir\Debug\CacheFileManager.obj
@@ -29,6 +31,8 @@ D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\GpuBuffe
 D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\GpuGeometryPagePool.cpp;D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\DemoSceneVK.dir\Debug\GpuGeometryPagePool.obj
 D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\HZBPass.cpp;D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\DemoSceneVK.dir\Debug\HZBPass.obj
 D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\ProceduralMaskGenerator.cpp;D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\DemoSceneVK.dir\Debug\ProceduralMaskGenerator.obj
+D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\SDFRayMarchPass.cpp;D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\DemoSceneVK.dir\Debug\SDFRayMarchPass.obj
+D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\ShadowMapPass.cpp;D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\DemoSceneVK.dir\Debug\ShadowMapPass.obj
 D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\SurfaceCachePass.cpp;D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\DemoSceneVK.dir\Debug\SurfaceCachePass.obj
 D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\VmaUsage.cpp;D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\DemoSceneVK.dir\Debug\VmaUsage.obj
 D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\VulkanContext.cpp;D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\DemoSceneVK.dir\Debug\VulkanContext.obj

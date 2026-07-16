@@ -70,6 +70,12 @@
     <CustomBuild Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\CMakeFiles\464bebe9036cd9d7930658470a378270\ProceduralMaskGenerate.comp.spv.rule">
       <Filter>CMake Rules</Filter>
     </CustomBuild>
+    <CustomBuild Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\CMakeFiles\464bebe9036cd9d7930658470a378270\SDFRayMarch.comp.spv.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\CMakeFiles\464bebe9036cd9d7930658470a378270\ShadowMapCapture.vert.spv.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
     <CustomBuild Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\CMakeFiles\464bebe9036cd9d7930658470a378270\SurfaceCacheCapture.frag.spv.rule">
       <Filter>CMake Rules</Filter>
     </CustomBuild>

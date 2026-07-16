@@ -228,6 +228,26 @@ endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
 exit /b %1
 :cmDone
 if %errorlevel% neq 0 goto :VCEnd
+^D:\DEMOSCENE\DEMOSCENE_VULKAN2026_BASEARCHI\DEMOSCENE_2026\BUILD\CMAKEFILES\464BEBE9036CD9D7930658470A378270\SDFRAYMARCH.COMP.SPV.RULE
+setlocal
+C:\VulkanSDK\1.4.350.0\Bin\glslc.exe -I D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/shaders D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/shaders/src/GI/SDFRayMarch.comp -o D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/SDFRayMarch.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+^D:\DEMOSCENE\DEMOSCENE_VULKAN2026_BASEARCHI\DEMOSCENE_2026\BUILD\CMAKEFILES\464BEBE9036CD9D7930658470A378270\SHADOWMAPCAPTURE.VERT.SPV.RULE
+setlocal
+C:\VulkanSDK\1.4.350.0\Bin\glslc.exe -I D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/shaders D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/shaders/src/Renderer/ShadowMapCapture.vert -o D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/ShadowMapCapture.vert.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
 ^D:\DEMOSCENE\DEMOSCENE_VULKAN2026_BASEARCHI\DEMOSCENE_2026\BUILD\CMAKEFILES\464BEBE9036CD9D7930658470A378270\SURFACECACHECAPTURE.FRAG.SPV.RULE
 setlocal
 C:\VulkanSDK\1.4.350.0\Bin\glslc.exe -I D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/shaders D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/src/shaders/src/Renderer/SurfaceCacheCapture.frag -o D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/SurfaceCacheCapture.frag.spv

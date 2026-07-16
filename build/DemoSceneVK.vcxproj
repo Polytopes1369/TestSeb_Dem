@@ -124,7 +124,7 @@
       <ProxyFileName>%(Filename)_p.c</ProxyFileName>
     </Midl>
     <PostBuildEvent>
-      <Message>Deploying shader BuildDispatchIndirectArgs.comp.spv to executable directory	Deploying shader ClearVisBufferAtomic.comp.spv to executable directory	Deploying shader ClusterDAGScreenError.comp.spv to executable directory	Deploying shader ClusterFrustumCull.comp.spv to executable directory	Deploying shader ClusterHZBOcclusionCull.comp.spv to executable directory	Deploying shader ClusterLODCompact.comp.spv to executable directory	Deploying shader ClusterLODResidencyFallback.comp.spv to executable directory	Deploying shader ClusterResidencyCheck.comp.spv to executable directory	Deploying shader ClusterSoftwareRaster.comp.spv to executable directory	Deploying shader ClusterSoftwareRasterOpaque.comp.spv to executable directory	Deploying shader HZBBuildInit.comp.spv to executable directory	Deploying shader HZBReduce.comp.spv to executable directory	Deploying shader ComputeTriangleStats.comp.spv to executable directory	Deploying shader DebugText.frag.spv to executable directory	Deploying shader DebugText.vert.spv to executable directory	Deploying shader GlobalSDFComposite.comp.spv to executable directory	Deploying shader draw.comp.spv to executable directory	Deploying shader geom_TorusKnot.comp.spv to executable directory	Deploying shader geom_box.comp.spv to executable directory	Deploying shader geom_capsule.comp.spv to executable directory	Deploying shader geom_chamferBox.comp.spv to executable directory	Deploying shader geom_cone.comp.spv to executable directory	Deploying shader geom_cylinder.comp.spv to executable directory	Deploying shader geom_icosphere.comp.spv to executable directory	Deploying shader geom_plane.comp.spv to executable directory	Deploying shader geom_pyramide.comp.spv to executable directory	Deploying shader geom_sphere.comp.spv to executable directory	Deploying shader geom_torus.comp.spv to executable directory	Deploying shader geom_tube.comp.spv to executable directory	Deploying shader ClusterRaster.frag.spv to executable directory	Deploying shader ClusterRaster.vert.spv to executable directory	Deploying shader ClusterRasterOpaque.frag.spv to executable directory	Deploying shader ClusterResolve.comp.spv to executable directory	Deploying shader SurfaceCacheCapture.frag.spv to executable directory	Deploying shader SurfaceCacheCapture.vert.spv to executable directory	Deploying shader draw.frag.spv to executable directory	Deploying shader draw.vert.spv to executable directory	Deploying shader DecompressClusterIndices.comp.spv to executable directory	Deploying shader DecompressClusterVertices.comp.spv to executable directory	Deploying shader ProceduralMaskGenerate.comp.spv to executable directory</Message>
+      <Message>Deploying shader BuildDispatchIndirectArgs.comp.spv to executable directory	Deploying shader ClearVisBufferAtomic.comp.spv to executable directory	Deploying shader ClusterDAGScreenError.comp.spv to executable directory	Deploying shader ClusterFrustumCull.comp.spv to executable directory	Deploying shader ClusterHZBOcclusionCull.comp.spv to executable directory	Deploying shader ClusterLODCompact.comp.spv to executable directory	Deploying shader ClusterLODResidencyFallback.comp.spv to executable directory	Deploying shader ClusterResidencyCheck.comp.spv to executable directory	Deploying shader ClusterSoftwareRaster.comp.spv to executable directory	Deploying shader ClusterSoftwareRasterOpaque.comp.spv to executable directory	Deploying shader HZBBuildInit.comp.spv to executable directory	Deploying shader HZBReduce.comp.spv to executable directory	Deploying shader ComputeTriangleStats.comp.spv to executable directory	Deploying shader DebugText.frag.spv to executable directory	Deploying shader DebugText.vert.spv to executable directory	Deploying shader GlobalSDFComposite.comp.spv to executable directory	Deploying shader SDFRayMarch.comp.spv to executable directory	Deploying shader draw.comp.spv to executable directory	Deploying shader geom_TorusKnot.comp.spv to executable directory	Deploying shader geom_box.comp.spv to executable directory	Deploying shader geom_capsule.comp.spv to executable directory	Deploying shader geom_chamferBox.comp.spv to executable directory	Deploying shader geom_cone.comp.spv to executable directory	Deploying shader geom_cylinder.comp.spv to executable directory	Deploying shader geom_icosphere.comp.spv to executable directory	Deploying shader geom_plane.comp.spv to executable directory	Deploying shader geom_pyramide.comp.spv to executable directory	Deploying shader geom_sphere.comp.spv to executable directory	Deploying shader geom_torus.comp.spv to executable directory	Deploying shader geom_tube.comp.spv to executable directory	Deploying shader ClusterRaster.frag.spv to executable directory	Deploying shader ClusterRaster.vert.spv to executable directory	Deploying shader ClusterRasterOpaque.frag.spv to executable directory	Deploying shader ClusterResolve.comp.spv to executable directory	Deploying shader ShadowMapCapture.vert.spv to executable directory	Deploying shader SurfaceCacheCapture.frag.spv to executable directory	Deploying shader SurfaceCacheCapture.vert.spv to executable directory	Deploying shader draw.frag.spv to executable directory	Deploying shader draw.vert.spv to executable directory	Deploying shader DecompressClusterIndices.comp.spv to executable directory	Deploying shader DecompressClusterVertices.comp.spv to executable directory	Deploying shader ProceduralMaskGenerate.comp.spv to executable directory</Message>
       <Command>setlocal
 "C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/BuildDispatchIndirectArgs.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Debug/shaders/BuildDispatchIndirectArgs.comp.spv
 if %errorlevel% neq 0 goto :cmEnd
@@ -262,6 +262,15 @@ exit /b %1
 if %errorlevel% neq 0 goto :VCEnd
 setlocal
 "C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/GlobalSDFComposite.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Debug/shaders/GlobalSDFComposite.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/SDFRayMarch.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Debug/shaders/SDFRayMarch.comp.spv
 if %errorlevel% neq 0 goto :cmEnd
 :cmEnd
 endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
@@ -423,6 +432,15 @@ exit /b %1
 :cmDone
 if %errorlevel% neq 0 goto :VCEnd
 setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/ShadowMapCapture.vert.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Debug/shaders/ShadowMapCapture.vert.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
 "C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/SurfaceCacheCapture.frag.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Debug/shaders/SurfaceCacheCapture.frag.spv
 if %errorlevel% neq 0 goto :cmEnd
 :cmEnd
@@ -545,7 +563,7 @@ if %errorlevel% neq 0 goto :VCEnd</Command>
       <ProxyFileName>%(Filename)_p.c</ProxyFileName>
     </Midl>
     <PostBuildEvent>
-      <Message>Deploying shader BuildDispatchIndirectArgs.comp.spv to executable directory	Deploying shader ClearVisBufferAtomic.comp.spv to executable directory	Deploying shader ClusterDAGScreenError.comp.spv to executable directory	Deploying shader ClusterFrustumCull.comp.spv to executable directory	Deploying shader ClusterHZBOcclusionCull.comp.spv to executable directory	Deploying shader ClusterLODCompact.comp.spv to executable directory	Deploying shader ClusterLODResidencyFallback.comp.spv to executable directory	Deploying shader ClusterResidencyCheck.comp.spv to executable directory	Deploying shader ClusterSoftwareRaster.comp.spv to executable directory	Deploying shader ClusterSoftwareRasterOpaque.comp.spv to executable directory	Deploying shader HZBBuildInit.comp.spv to executable directory	Deploying shader HZBReduce.comp.spv to executable directory	Deploying shader ComputeTriangleStats.comp.spv to executable directory	Deploying shader DebugText.frag.spv to executable directory	Deploying shader DebugText.vert.spv to executable directory	Deploying shader GlobalSDFComposite.comp.spv to executable directory	Deploying shader draw.comp.spv to executable directory	Deploying shader geom_TorusKnot.comp.spv to executable directory	Deploying shader geom_box.comp.spv to executable directory	Deploying shader geom_capsule.comp.spv to executable directory	Deploying shader geom_chamferBox.comp.spv to executable directory	Deploying shader geom_cone.comp.spv to executable directory	Deploying shader geom_cylinder.comp.spv to executable directory	Deploying shader geom_icosphere.comp.spv to executable directory	Deploying shader geom_plane.comp.spv to executable directory	Deploying shader geom_pyramide.comp.spv to executable directory	Deploying shader geom_sphere.comp.spv to executable directory	Deploying shader geom_torus.comp.spv to executable directory	Deploying shader geom_tube.comp.spv to executable directory	Deploying shader ClusterRaster.frag.spv to executable directory	Deploying shader ClusterRaster.vert.spv to executable directory	Deploying shader ClusterRasterOpaque.frag.spv to executable directory	Deploying shader ClusterResolve.comp.spv to executable directory	Deploying shader SurfaceCacheCapture.frag.spv to executable directory	Deploying shader SurfaceCacheCapture.vert.spv to executable directory	Deploying shader draw.frag.spv to executable directory	Deploying shader draw.vert.spv to executable directory	Deploying shader DecompressClusterIndices.comp.spv to executable directory	Deploying shader DecompressClusterVertices.comp.spv to executable directory	Deploying shader ProceduralMaskGenerate.comp.spv to executable directory</Message>
+      <Message>Deploying shader BuildDispatchIndirectArgs.comp.spv to executable directory	Deploying shader ClearVisBufferAtomic.comp.spv to executable directory	Deploying shader ClusterDAGScreenError.comp.spv to executable directory	Deploying shader ClusterFrustumCull.comp.spv to executable directory	Deploying shader ClusterHZBOcclusionCull.comp.spv to executable directory	Deploying shader ClusterLODCompact.comp.spv to executable directory	Deploying shader ClusterLODResidencyFallback.comp.spv to executable directory	Deploying shader ClusterResidencyCheck.comp.spv to executable directory	Deploying shader ClusterSoftwareRaster.comp.spv to executable directory	Deploying shader ClusterSoftwareRasterOpaque.comp.spv to executable directory	Deploying shader HZBBuildInit.comp.spv to executable directory	Deploying shader HZBReduce.comp.spv to executable directory	Deploying shader ComputeTriangleStats.comp.spv to executable directory	Deploying shader DebugText.frag.spv to executable directory	Deploying shader DebugText.vert.spv to executable directory	Deploying shader GlobalSDFComposite.comp.spv to executable directory	Deploying shader SDFRayMarch.comp.spv to executable directory	Deploying shader draw.comp.spv to executable directory	Deploying shader geom_TorusKnot.comp.spv to executable directory	Deploying shader geom_box.comp.spv to executable directory	Deploying shader geom_capsule.comp.spv to executable directory	Deploying shader geom_chamferBox.comp.spv to executable directory	Deploying shader geom_cone.comp.spv to executable directory	Deploying shader geom_cylinder.comp.spv to executable directory	Deploying shader geom_icosphere.comp.spv to executable directory	Deploying shader geom_plane.comp.spv to executable directory	Deploying shader geom_pyramide.comp.spv to executable directory	Deploying shader geom_sphere.comp.spv to executable directory	Deploying shader geom_torus.comp.spv to executable directory	Deploying shader geom_tube.comp.spv to executable directory	Deploying shader ClusterRaster.frag.spv to executable directory	Deploying shader ClusterRaster.vert.spv to executable directory	Deploying shader ClusterRasterOpaque.frag.spv to executable directory	Deploying shader ClusterResolve.comp.spv to executable directory	Deploying shader ShadowMapCapture.vert.spv to executable directory	Deploying shader SurfaceCacheCapture.frag.spv to executable directory	Deploying shader SurfaceCacheCapture.vert.spv to executable directory	Deploying shader draw.frag.spv to executable directory	Deploying shader draw.vert.spv to executable directory	Deploying shader DecompressClusterIndices.comp.spv to executable directory	Deploying shader DecompressClusterVertices.comp.spv to executable directory	Deploying shader ProceduralMaskGenerate.comp.spv to executable directory</Message>
       <Command>setlocal
 "C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/BuildDispatchIndirectArgs.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Release/shaders/BuildDispatchIndirectArgs.comp.spv
 if %errorlevel% neq 0 goto :cmEnd
@@ -683,6 +701,15 @@ exit /b %1
 if %errorlevel% neq 0 goto :VCEnd
 setlocal
 "C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/GlobalSDFComposite.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Release/shaders/GlobalSDFComposite.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/SDFRayMarch.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Release/shaders/SDFRayMarch.comp.spv
 if %errorlevel% neq 0 goto :cmEnd
 :cmEnd
 endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
@@ -844,6 +871,15 @@ exit /b %1
 :cmDone
 if %errorlevel% neq 0 goto :VCEnd
 setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/ShadowMapCapture.vert.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Release/shaders/ShadowMapCapture.vert.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
 "C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/SurfaceCacheCapture.frag.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/Release/shaders/SurfaceCacheCapture.frag.spv
 if %errorlevel% neq 0 goto :cmEnd
 :cmEnd
@@ -966,7 +1002,7 @@ if %errorlevel% neq 0 goto :VCEnd</Command>
       <ProxyFileName>%(Filename)_p.c</ProxyFileName>
     </Midl>
     <PostBuildEvent>
-      <Message>Deploying shader BuildDispatchIndirectArgs.comp.spv to executable directory	Deploying shader ClearVisBufferAtomic.comp.spv to executable directory	Deploying shader ClusterDAGScreenError.comp.spv to executable directory	Deploying shader ClusterFrustumCull.comp.spv to executable directory	Deploying shader ClusterHZBOcclusionCull.comp.spv to executable directory	Deploying shader ClusterLODCompact.comp.spv to executable directory	Deploying shader ClusterLODResidencyFallback.comp.spv to executable directory	Deploying shader ClusterResidencyCheck.comp.spv to executable directory	Deploying shader ClusterSoftwareRaster.comp.spv to executable directory	Deploying shader ClusterSoftwareRasterOpaque.comp.spv to executable directory	Deploying shader HZBBuildInit.comp.spv to executable directory	Deploying shader HZBReduce.comp.spv to executable directory	Deploying shader ComputeTriangleStats.comp.spv to executable directory	Deploying shader DebugText.frag.spv to executable directory	Deploying shader DebugText.vert.spv to executable directory	Deploying shader GlobalSDFComposite.comp.spv to executable directory	Deploying shader draw.comp.spv to executable directory	Deploying shader geom_TorusKnot.comp.spv to executable directory	Deploying shader geom_box.comp.spv to executable directory	Deploying shader geom_capsule.comp.spv to executable directory	Deploying shader geom_chamferBox.comp.spv to executable directory	Deploying shader geom_cone.comp.spv to executable directory	Deploying shader geom_cylinder.comp.spv to executable directory	Deploying shader geom_icosphere.comp.spv to executable directory	Deploying shader geom_plane.comp.spv to executable directory	Deploying shader geom_pyramide.comp.spv to executable directory	Deploying shader geom_sphere.comp.spv to executable directory	Deploying shader geom_torus.comp.spv to executable directory	Deploying shader geom_tube.comp.spv to executable directory	Deploying shader ClusterRaster.frag.spv to executable directory	Deploying shader ClusterRaster.vert.spv to executable directory	Deploying shader ClusterRasterOpaque.frag.spv to executable directory	Deploying shader ClusterResolve.comp.spv to executable directory	Deploying shader SurfaceCacheCapture.frag.spv to executable directory	Deploying shader SurfaceCacheCapture.vert.spv to executable directory	Deploying shader draw.frag.spv to executable directory	Deploying shader draw.vert.spv to executable directory	Deploying shader DecompressClusterIndices.comp.spv to executable directory	Deploying shader DecompressClusterVertices.comp.spv to executable directory	Deploying shader ProceduralMaskGenerate.comp.spv to executable directory</Message>
+      <Message>Deploying shader BuildDispatchIndirectArgs.comp.spv to executable directory	Deploying shader ClearVisBufferAtomic.comp.spv to executable directory	Deploying shader ClusterDAGScreenError.comp.spv to executable directory	Deploying shader ClusterFrustumCull.comp.spv to executable directory	Deploying shader ClusterHZBOcclusionCull.comp.spv to executable directory	Deploying shader ClusterLODCompact.comp.spv to executable directory	Deploying shader ClusterLODResidencyFallback.comp.spv to executable directory	Deploying shader ClusterResidencyCheck.comp.spv to executable directory	Deploying shader ClusterSoftwareRaster.comp.spv to executable directory	Deploying shader ClusterSoftwareRasterOpaque.comp.spv to executable directory	Deploying shader HZBBuildInit.comp.spv to executable directory	Deploying shader HZBReduce.comp.spv to executable directory	Deploying shader ComputeTriangleStats.comp.spv to executable directory	Deploying shader DebugText.frag.spv to executable directory	Deploying shader DebugText.vert.spv to executable directory	Deploying shader GlobalSDFComposite.comp.spv to executable directory	Deploying shader SDFRayMarch.comp.spv to executable directory	Deploying shader draw.comp.spv to executable directory	Deploying shader geom_TorusKnot.comp.spv to executable directory	Deploying shader geom_box.comp.spv to executable directory	Deploying shader geom_capsule.comp.spv to executable directory	Deploying shader geom_chamferBox.comp.spv to executable directory	Deploying shader geom_cone.comp.spv to executable directory	Deploying shader geom_cylinder.comp.spv to executable directory	Deploying shader geom_icosphere.comp.spv to executable directory	Deploying shader geom_plane.comp.spv to executable directory	Deploying shader geom_pyramide.comp.spv to executable directory	Deploying shader geom_sphere.comp.spv to executable directory	Deploying shader geom_torus.comp.spv to executable directory	Deploying shader geom_tube.comp.spv to executable directory	Deploying shader ClusterRaster.frag.spv to executable directory	Deploying shader ClusterRaster.vert.spv to executable directory	Deploying shader ClusterRasterOpaque.frag.spv to executable directory	Deploying shader ClusterResolve.comp.spv to executable directory	Deploying shader ShadowMapCapture.vert.spv to executable directory	Deploying shader SurfaceCacheCapture.frag.spv to executable directory	Deploying shader SurfaceCacheCapture.vert.spv to executable directory	Deploying shader draw.frag.spv to executable directory	Deploying shader draw.vert.spv to executable directory	Deploying shader DecompressClusterIndices.comp.spv to executable directory	Deploying shader DecompressClusterVertices.comp.spv to executable directory	Deploying shader ProceduralMaskGenerate.comp.spv to executable directory</Message>
       <Command>setlocal
 "C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/BuildDispatchIndirectArgs.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/MinSizeRel/shaders/BuildDispatchIndirectArgs.comp.spv
 if %errorlevel% neq 0 goto :cmEnd
@@ -1104,6 +1140,15 @@ exit /b %1
 if %errorlevel% neq 0 goto :VCEnd
 setlocal
 "C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/GlobalSDFComposite.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/MinSizeRel/shaders/GlobalSDFComposite.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/SDFRayMarch.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/MinSizeRel/shaders/SDFRayMarch.comp.spv
 if %errorlevel% neq 0 goto :cmEnd
 :cmEnd
 endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
@@ -1265,6 +1310,15 @@ exit /b %1
 :cmDone
 if %errorlevel% neq 0 goto :VCEnd
 setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/ShadowMapCapture.vert.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/MinSizeRel/shaders/ShadowMapCapture.vert.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
 "C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/SurfaceCacheCapture.frag.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/MinSizeRel/shaders/SurfaceCacheCapture.frag.spv
 if %errorlevel% neq 0 goto :cmEnd
 :cmEnd
@@ -1386,7 +1440,7 @@ if %errorlevel% neq 0 goto :VCEnd</Command>
       <ProxyFileName>%(Filename)_p.c</ProxyFileName>
     </Midl>
     <PostBuildEvent>
-      <Message>Deploying shader BuildDispatchIndirectArgs.comp.spv to executable directory	Deploying shader ClearVisBufferAtomic.comp.spv to executable directory	Deploying shader ClusterDAGScreenError.comp.spv to executable directory	Deploying shader ClusterFrustumCull.comp.spv to executable directory	Deploying shader ClusterHZBOcclusionCull.comp.spv to executable directory	Deploying shader ClusterLODCompact.comp.spv to executable directory	Deploying shader ClusterLODResidencyFallback.comp.spv to executable directory	Deploying shader ClusterResidencyCheck.comp.spv to executable directory	Deploying shader ClusterSoftwareRaster.comp.spv to executable directory	Deploying shader ClusterSoftwareRasterOpaque.comp.spv to executable directory	Deploying shader HZBBuildInit.comp.spv to executable directory	Deploying shader HZBReduce.comp.spv to executable directory	Deploying shader ComputeTriangleStats.comp.spv to executable directory	Deploying shader DebugText.frag.spv to executable directory	Deploying shader DebugText.vert.spv to executable directory	Deploying shader GlobalSDFComposite.comp.spv to executable directory	Deploying shader draw.comp.spv to executable directory	Deploying shader geom_TorusKnot.comp.spv to executable directory	Deploying shader geom_box.comp.spv to executable directory	Deploying shader geom_capsule.comp.spv to executable directory	Deploying shader geom_chamferBox.comp.spv to executable directory	Deploying shader geom_cone.comp.spv to executable directory	Deploying shader geom_cylinder.comp.spv to executable directory	Deploying shader geom_icosphere.comp.spv to executable directory	Deploying shader geom_plane.comp.spv to executable directory	Deploying shader geom_pyramide.comp.spv to executable directory	Deploying shader geom_sphere.comp.spv to executable directory	Deploying shader geom_torus.comp.spv to executable directory	Deploying shader geom_tube.comp.spv to executable directory	Deploying shader ClusterRaster.frag.spv to executable directory	Deploying shader ClusterRaster.vert.spv to executable directory	Deploying shader ClusterRasterOpaque.frag.spv to executable directory	Deploying shader ClusterResolve.comp.spv to executable directory	Deploying shader SurfaceCacheCapture.frag.spv to executable directory	Deploying shader SurfaceCacheCapture.vert.spv to executable directory	Deploying shader draw.frag.spv to executable directory	Deploying shader draw.vert.spv to executable directory	Deploying shader DecompressClusterIndices.comp.spv to executable directory	Deploying shader DecompressClusterVertices.comp.spv to executable directory	Deploying shader ProceduralMaskGenerate.comp.spv to executable directory</Message>
+      <Message>Deploying shader BuildDispatchIndirectArgs.comp.spv to executable directory	Deploying shader ClearVisBufferAtomic.comp.spv to executable directory	Deploying shader ClusterDAGScreenError.comp.spv to executable directory	Deploying shader ClusterFrustumCull.comp.spv to executable directory	Deploying shader ClusterHZBOcclusionCull.comp.spv to executable directory	Deploying shader ClusterLODCompact.comp.spv to executable directory	Deploying shader ClusterLODResidencyFallback.comp.spv to executable directory	Deploying shader ClusterResidencyCheck.comp.spv to executable directory	Deploying shader ClusterSoftwareRaster.comp.spv to executable directory	Deploying shader ClusterSoftwareRasterOpaque.comp.spv to executable directory	Deploying shader HZBBuildInit.comp.spv to executable directory	Deploying shader HZBReduce.comp.spv to executable directory	Deploying shader ComputeTriangleStats.comp.spv to executable directory	Deploying shader DebugText.frag.spv to executable directory	Deploying shader DebugText.vert.spv to executable directory	Deploying shader GlobalSDFComposite.comp.spv to executable directory	Deploying shader SDFRayMarch.comp.spv to executable directory	Deploying shader draw.comp.spv to executable directory	Deploying shader geom_TorusKnot.comp.spv to executable directory	Deploying shader geom_box.comp.spv to executable directory	Deploying shader geom_capsule.comp.spv to executable directory	Deploying shader geom_chamferBox.comp.spv to executable directory	Deploying shader geom_cone.comp.spv to executable directory	Deploying shader geom_cylinder.comp.spv to executable directory	Deploying shader geom_icosphere.comp.spv to executable directory	Deploying shader geom_plane.comp.spv to executable directory	Deploying shader geom_pyramide.comp.spv to executable directory	Deploying shader geom_sphere.comp.spv to executable directory	Deploying shader geom_torus.comp.spv to executable directory	Deploying shader geom_tube.comp.spv to executable directory	Deploying shader ClusterRaster.frag.spv to executable directory	Deploying shader ClusterRaster.vert.spv to executable directory	Deploying shader ClusterRasterOpaque.frag.spv to executable directory	Deploying shader ClusterResolve.comp.spv to executable directory	Deploying shader ShadowMapCapture.vert.spv to executable directory	Deploying shader SurfaceCacheCapture.frag.spv to executable directory	Deploying shader SurfaceCacheCapture.vert.spv to executable directory	Deploying shader draw.frag.spv to executable directory	Deploying shader draw.vert.spv to executable directory	Deploying shader DecompressClusterIndices.comp.spv to executable directory	Deploying shader DecompressClusterVertices.comp.spv to executable directory	Deploying shader ProceduralMaskGenerate.comp.spv to executable directory</Message>
       <Command>setlocal
 "C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/BuildDispatchIndirectArgs.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/RelWithDebInfo/shaders/BuildDispatchIndirectArgs.comp.spv
 if %errorlevel% neq 0 goto :cmEnd
@@ -1524,6 +1578,15 @@ exit /b %1
 if %errorlevel% neq 0 goto :VCEnd
 setlocal
 "C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/GlobalSDFComposite.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/RelWithDebInfo/shaders/GlobalSDFComposite.comp.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/SDFRayMarch.comp.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/RelWithDebInfo/shaders/SDFRayMarch.comp.spv
 if %errorlevel% neq 0 goto :cmEnd
 :cmEnd
 endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
@@ -1685,6 +1748,15 @@ exit /b %1
 :cmDone
 if %errorlevel% neq 0 goto :VCEnd
 setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/ShadowMapCapture.vert.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/RelWithDebInfo/shaders/ShadowMapCapture.vert.spv
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+setlocal
 "C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/shaders_gen/SurfaceCacheCapture.frag.spv D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/RelWithDebInfo/shaders/SurfaceCacheCapture.frag.spv
 if %errorlevel% neq 0 goto :cmEnd
 :cmEnd
@@ -1830,10 +1902,12 @@ if %errorlevel% neq 0 goto :VCEnd</Command>
     <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\geometry\ClusterDAG.cpp" />
     <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\geometry\ClusterGrouping.cpp" />
     <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\geometry\ClusterPartitioner.cpp" />
+    <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\geometry\EntityBVH.cpp" />
     <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\geometry\FallbackMeshBuilder.cpp" />
     <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\geometry\GpuPageTable.cpp" />
     <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\geometry\MeshSDFGenerator.cpp" />
     <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\geometry\MeshSimplifier.cpp" />
+    <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\geometry\SurfaceCacheAtlasAllocator.cpp" />
     <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\geometry\VirtualGeometryCacheTest.cpp" />
     <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\io\AsyncFileStreamer.cpp" />
     <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\io\CacheFileManager.cpp" />
@@ -1855,6 +1929,8 @@ if %errorlevel% neq 0 goto :VCEnd</Command>
     <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\GpuGeometryPagePool.cpp" />
     <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\HZBPass.cpp" />
     <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\ProceduralMaskGenerator.cpp" />
+    <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\SDFRayMarchPass.cpp" />
+    <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\ShadowMapPass.cpp" />
     <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\SurfaceCachePass.cpp" />
     <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\VmaUsage.cpp" />
     <ClCompile Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\VulkanContext.cpp" />
@@ -1872,6 +1948,7 @@ if %errorlevel% neq 0 goto :VCEnd</Command>
     <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\geometry\ClusterFormat.h" />
     <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\geometry\ClusterGrouping.h" />
     <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\geometry\ClusterPartitioner.h" />
+    <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\geometry\EntityBVH.h" />
     <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\geometry\EntityMaterialTable.h" />
     <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\geometry\FallbackMeshBuilder.h" />
     <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\geometry\GeometryEncoding.h" />
@@ -1879,6 +1956,7 @@ if %errorlevel% neq 0 goto :VCEnd</Command>
     <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\geometry\MeshSDFGenerator.h" />
     <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\geometry\MeshSimplifier.h" />
     <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\geometry\ProceduralMaskSampler.h" />
+    <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\geometry\SurfaceCacheAtlasAllocator.h" />
     <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\geometry\VirtualGeometryCacheTest.h" />
     <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\io\AsyncFileStreamer.h" />
     <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\io\CacheFileManager.h" />
@@ -1898,8 +1976,11 @@ if %errorlevel% neq 0 goto :VCEnd</Command>
     <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\GpuBuffer.h" />
     <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\GpuGeometryPagePool.h" />
     <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\HZBPass.h" />
+    <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\LightingTypes.h" />
     <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\ProceduralMaskGenerator.h" />
     <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\RenderTypes.h" />
+    <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\SDFRayMarchPass.h" />
+    <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\ShadowMapPass.h" />
     <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\SurfaceCachePass.h" />
     <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\VulkanContext.h" />
     <ClInclude Include="D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\VulkanPipeline.h" />
