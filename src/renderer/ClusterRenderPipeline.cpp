@@ -1034,24 +1034,39 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
   // =========================================================================================
   // [12c] World Probe grid: fully rebuilt every frame from the Surface Cache radiance atlas
   // [1z] already re-injected into this frame ("Propage l'éclairage du Surface Cache directement
-  // dans cette grille 3D à chaque frame") -- what dynamic/off-screen objects sample for indirect
-  // light (world_probe_sampling.glsl's SampleWorldProbeGrid), since m_ScreenProbeGI's screen-
-  // space probes only exist for on-screen pixels. Independent GPU work from [12b] above (no data
-  // dependency either way), just recorded after it for locality with the rest of this frame's new
-  // GI additions.
+  // dans cette grille 3D à chaque frame") -- INTENDED as what dynamic/off-screen objects would
+  // sample for indirect light (world_probe_sampling.glsl's SampleWorldProbeGrid), since
+  // m_ScreenProbeGI's screen-space probes only exist for on-screen pixels. Independent GPU work
+  // from [12b] above (no data dependency either way), just recorded after it for locality with
+  // the rest of this frame's GI additions.
+  //
+  // `worldProbesEnabled` (debug-only toggle, main.cpp's 'H' key) gates this dispatch entirely --
+  // see SetDebugWorldProbesEnabled()'s own comment. UNLIKE radiosityEnabled/ssrtEnabled above,
+  // this system has no live consumer yet (SampleWorldProbeGrid() is called only by the dead
+  // ScreenTracePass/GICompositePass, per the 2026-07-16 UE5.8-parity audit) -- so Release
+  // hardcodes this OFF instead of ON, skipping the dispatch (and its trailing barrier, since
+  // nothing this frame reads the grid either way) rather than paying its GPU cost for zero visual
+  // effect. Flip Release's hardcoded default once a real consumer samples this grid.
   // =========================================================================================
-  m_WorldProbes.RecordUpdate(cmd, cameraFrameInfo.position, m_TraceContext, traceMode);
-  {
-    VkMemoryBarrier2 barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
-    barrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-    barrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-    barrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-    barrier.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+#ifndef NDEBUG
+  bool worldProbesEnabled = m_DebugWorldProbesEnabled;
+#else
+  bool worldProbesEnabled = false;
+#endif
+  if (worldProbesEnabled) {
+    m_WorldProbes.RecordUpdate(cmd, cameraFrameInfo.position, m_TraceContext, traceMode);
+    {
+      VkMemoryBarrier2 barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+      barrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+      barrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+      barrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+      barrier.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
 
-    VkDependencyInfo depInfo{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
-    depInfo.memoryBarrierCount = 1;
-    depInfo.pMemoryBarriers = &barrier;
-    vkCmdPipelineBarrier2(cmd, &depInfo);
+      VkDependencyInfo depInfo{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+      depInfo.memoryBarrierCount = 1;
+      depInfo.pMemoryBarriers = &barrier;
+      vkCmdPipelineBarrier2(cmd, &depInfo);
+    }
   }
 
   // =========================================================================================
@@ -1157,7 +1172,8 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
     m_LastStatsSampleBytes = totalBytesCompleted;
 
     m_DebugOverlay.BuildFrameText(gpuMemUsedMB, pendingPageLoads, bytesPerSecond, hwTriangleCount, swTriangleCount,
-        fps, static_cast<float>(m_RenderExtent.width), m_DebugRadiosityEnabled, m_DebugSSRTEnabled, traceMode);
+        fps, static_cast<float>(m_RenderExtent.width), m_DebugRadiosityEnabled, m_DebugSSRTEnabled, traceMode,
+        m_DebugWorldProbesEnabled);
     // Drawn onto whichever image [14]'s blit will actually read below (m_Denoiser's output when
     // [12d] applied it, m_Resolve's own color image otherwise -- same `applyDenoise` condition) --
     // the overlay text must land on the real final image, not on a buffer already bypassed.

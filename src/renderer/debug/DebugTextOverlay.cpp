@@ -292,7 +292,7 @@ namespace renderer::debug {
 
     void DebugTextOverlay::BuildFrameText(float gpuMemUsedMB, uint32_t pendingPageLoads, float bytesPerSecond,
         uint32_t hwTriangleCount, uint32_t swTriangleCount, float fps, float viewportWidthPixels,
-        bool radiosityEnabled, bool ssrtEnabled, uint32_t traceMode) {
+        bool radiosityEnabled, bool ssrtEnabled, uint32_t traceMode, bool worldProbesEnabled) {
         m_PendingGlyphs.clear();
 
         constexpr float kMarginX = 8.0f;
@@ -307,6 +307,12 @@ namespace renderer::debug {
         AppendLine(std::format("SW TRIS: {}", swTriangleCount), kMarginX, y); y += kLineHeight;
         AppendLine(std::format("GI: RADIOSITY={} SSRT={} TRACE={}",
             radiosityEnabled ? "ON" : "OFF", ssrtEnabled ? "ON" : "OFF", traceMode == 0u ? "SWRT" : "HWRT"),
+            kMarginX, y); y += kLineHeight;
+        // Unlike the RADIOSITY/SSRT/TRACE line above (all real, consumed GI terms), WORLDPROBES
+        // reflects a system that is computed but has no live consumer yet -- see
+        // ClusterRenderPipeline::m_DebugWorldProbesEnabled's own comment. Shown on its own line so
+        // that fact stays visible instead of implying parity with the other three.
+        AppendLine(std::format("WORLDPROBES={} (not yet sampled)", worldProbesEnabled ? "ON" : "OFF"),
             kMarginX, y); y += kLineHeight;
 
         // Top-right FPS counter -- right-aligned against the render extent's own width using
