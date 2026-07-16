@@ -17,15 +17,18 @@
 // (see renderer::ShadowMapPass's own class comment on why it re-reads SurfaceCachePass's geometry
 // too) -- rather than depend on GlobalSDFPass's coarser textures and blur the two tiers together.
 //
-// --- Fixed-size entity sampler array, not bindless ---
-// This codebase does not enable descriptor indexing (see CLAUDE.md's Bindless pipeline note vs.
-// VulkanContext.cpp's actual, more modest deviceExtensions list) -- SDFRayMarch.comp instead
-// declares a plain, compile-time-sized `sampler3D uEntitySDFs[kMaxEntitySDFs]` array (ordinary core
-// Vulkan 1.0 descriptor arrays, no extension required), with every slot written at Init() (a real
-// entity's view for slots < the entity count, a shared 1x1x1 "always far" placeholder texture for
-// the rest) so validation never sees an unwritten descriptor. A scene with more entities than
-// kMaxEntitySDFs truncates (logged) rather than growing the array at runtime -- a documented scope
-// limit, matching kMaxPointLights/kLevelCount's own fixed-cap convention elsewhere in this codebase.
+// --- Fixed-size, bindless-indexed entity sampler array ---
+// SDFRayMarch.comp declares a plain, compile-time-sized `sampler3D uEntitySDFs[kMaxEntitySDFs]`
+// array (ordinary core Vulkan 1.0 descriptor array, not VK_EXT_descriptor_indexing's runtime-sized
+// arrays), with every slot written at Init() (a real entity's view for slots < the entity count, a
+// shared 1x1x1 "always far" placeholder texture for the rest) so validation never sees an
+// unwritten descriptor. Which slot a given ray march step samples is still a genuinely
+// per-invocation decision (the BVH traversal result), so the shader indexes it with
+// nonuniformEXT() (GL_EXT_nonuniform_qualifier) -- see VulkanContext.cpp's
+// shaderSampledImageArrayNonUniformIndexing feature enable, which this requires regardless of the
+// array itself being fixed-size. A scene with more entities than kMaxEntitySDFs truncates (logged)
+// rather than growing the array at runtime -- a documented scope limit, matching kMaxPointLights/
+// kLevelCount's own fixed-cap convention elsewhere in this codebase.
 //
 // --- Coupling to renderer::GlobalSDFPass ---
 // Unlike the geometry-loading duplication above, this pass DOES directly depend on GlobalSDFPass's
@@ -35,6 +38,15 @@
 // binds its 4 level views (with THIS pass's own nearest-filter sampler, not GlobalSDFPass's -- see
 // SetGlobalSDFViews()'s own comment); RecordRayMarch() reads its per-level voxel size/window every
 // call, since those can change every frame as the camera moves.
+//
+// --- Debug-only (whole file compiled out in Release) ---
+// This pass's entire output is, by its own class comment, "a full-screen debug-visualization
+// image" -- it never feeds production lighting, unlike renderer::SurfaceCachePass/GlobalSDFPass
+// (real GI infrastructure that stays compiled in Release). Matches CLAUDE.md's build-separation
+// rule for "modes de visualisation (Lumen/Nanite)" and this codebase's existing convention for
+// debug-only passes (see renderer::debug::ClusterTriangleStatsPass's own identical guard).
+
+#ifndef NDEBUG
 
 #include <array>
 #include <cstdint>
@@ -139,18 +151,8 @@ namespace renderer {
         GpuBuffer m_EntityParamsBuffer;    // EntitySDFParamsGPU[] (SDFRayMarchPass.cpp), GPU_ONLY (>= 1 element even if empty).
         int32_t m_RootNodeIndex = -1;
 
-        // Per-level (voxelSize, snappedCenterVoxel.xyz) -- GlobalSDFPass::kLevelCount entries, a
-        // UBO (not a push-constant field) purely to keep SDFRayMarchConstants comfortably under
-        // the 128-byte push-constant size Vulkan guarantees on every implementation (this data
-        // alone is 64 bytes; folding it into push constants alongside the camera/ray-gen fields
-        // would exceed that guaranteed minimum). Persistently mapped; SetGlobalSDFViews() writes it
-        // once (an empty-scene-safe default), RecordRayMarch() rewrites it every call from
-        // `globalSDF`'s then-current per-level window (see that method's own comment on why this
-        // cannot be cached from SetGlobalSDFViews() alone).
-        GpuBuffer m_LevelParamsUBO;
-
         VkDescriptorSetLayout m_EntitySetLayout = VK_NULL_HANDLE;  // set 0: BVH + entity SDFs.
-        VkDescriptorSetLayout m_ClipmapSetLayout = VK_NULL_HANDLE; // set 1: Global SDF clipmaps + level params UBO + output image.
+        VkDescriptorSetLayout m_ClipmapSetLayout = VK_NULL_HANDLE; // set 1: Global SDF clipmaps + output image.
         VkDescriptorPool m_DescriptorPool = VK_NULL_HANDLE;
         VkDescriptorSet m_EntitySet = VK_NULL_HANDLE;
         VkDescriptorSet m_ClipmapSet = VK_NULL_HANDLE;
@@ -160,3 +162,5 @@ namespace renderer {
     };
 
 }
+
+#endif // NDEBUG

@@ -1,0 +1,161 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+
+// Screen Space Probe GI -- final gather (renderer::ScreenProbeGIPass, Part 2 deliverable): one
+// invocation per output pixel. Reconstructs this pixel's world position/normal/albedo from
+// renderer::ClusterResolvePass's GBuffer, finds the bilinear 2x2 probe neighborhood covering it
+// (the same "screen pixel -> continuous probe-space coordinate" mapping ScreenProbeTemporal.comp
+// uses for reprojection, so a pixel's neighborhood always agrees with which probes actually cover
+// it), weights each of the 4 candidate probes by bilinear-position weight * world-space-distance
+// weight * normal-similarity weight (the bilateral terms that stop light leaking through thin
+// walls -- a probe on the far side of a wall has a very different world position/normal from this
+// pixel's own, so its weight collapses to ~0), evaluates each surviving probe's L1 SH irradiance
+// at this pixel's own normal, and additively read-modify-writes the result (modulated by this
+// pixel's albedo) into renderer::ClusterResolvePass's own output color image.
+
+#include "include/octahedral.glsl"
+#include "include/sh_probe.glsl"
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+const uint kProbeTileSize = 8u;
+// World-space falloff rate for the bilateral depth/position weight -- see this file's own header
+// comment; tuned against the same ~14m scene-scale assumption as ScreenProbeTemporal.comp's own
+// kDisocclusionDistanceThreshold.
+const float kBilateralDistanceFalloff = 2.0;
+
+layout(set = 0, binding = 0) uniform sampler2D g_ProbeSHR;
+layout(set = 0, binding = 1) uniform sampler2D g_ProbeSHG;
+layout(set = 0, binding = 2) uniform sampler2D g_ProbeSHB;
+layout(set = 0, binding = 3) uniform sampler2D g_ProbeWorldPos;
+layout(set = 0, binding = 4) uniform sampler2D g_ProbeNormal;
+layout(rg16f, set = 0, binding = 5) uniform readonly image2D g_GBufferNormal;
+layout(r32f, set = 0, binding = 6) uniform readonly image2D g_GBufferDepth;
+layout(rgba8, set = 0, binding = 7) uniform readonly image2D g_GBufferAlbedo;
+layout(rgba8, set = 0, binding = 8) uniform image2D g_OutputColor; // Read-modify-write.
+
+layout(std140, set = 0, binding = 9) uniform ScreenProbeViewParamsUBO {
+    mat4 invViewProj;
+    mat4 prevViewProj; // Unused here.
+    vec2 viewportSize;
+    vec2 probeGridSize;
+} g_ViewParams;
+
+layout(push_constant) uniform GatherPushConstants {
+    uint probeCountX;
+    uint probeCountY;
+#ifdef _DEBUG
+    uint debugViewMode;
+#endif
+} pc;
+
+// One bilateral-weighted probe tap: returns false (weight untouched) if the probe never traced
+// anything valid (worldPos.a < 0.5, see ScreenProbeTrace.comp's own "invalid probe" comment).
+bool SampleProbeIrradiance(ivec2 probeTexel, float bilinearWeight, vec3 pixelWorldPos, vec3 pixelNormal,
+    out vec3 outIrradiance, out float outWeight) {
+    vec4 probeWorldPos = texelFetch(g_ProbeWorldPos, probeTexel, 0);
+    if (probeWorldPos.a < 0.5) {
+        return false;
+    }
+    vec3 probeNormal = OctDecode(texelFetch(g_ProbeNormal, probeTexel, 0).rg);
+
+    float distanceWeight = exp(-distance(probeWorldPos.xyz, pixelWorldPos) * kBilateralDistanceFalloff);
+    float normalWeight = max(0.0, dot(probeNormal, pixelNormal));
+    outWeight = bilinearWeight * distanceWeight * normalWeight;
+    if (outWeight <= 1.0e-5) {
+        return false;
+    }
+
+    vec4 shR = texelFetch(g_ProbeSHR, probeTexel, 0);
+    vec4 shG = texelFetch(g_ProbeSHG, probeTexel, 0);
+    vec4 shB = texelFetch(g_ProbeSHB, probeTexel, 0);
+    outIrradiance = EvaluateIrradianceSH(shR, shG, shB, pixelNormal);
+    return true;
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (pixel.x >= int(g_ViewParams.viewportSize.x) || pixel.y >= int(g_ViewParams.viewportSize.y)) {
+        return;
+    }
+
+    float depth = imageLoad(g_GBufferDepth, pixel).r;
+    if (depth >= 1.0) {
+        return; // Sky/background -- nothing to add.
+    }
+
+    vec3 normal = OctDecode(imageLoad(g_GBufferNormal, pixel).rg);
+    vec3 albedo = imageLoad(g_GBufferAlbedo, pixel).rgb;
+
+    vec2 ndcXY = ((vec2(pixel) + 0.5) / g_ViewParams.viewportSize) * 2.0 - 1.0;
+    vec4 worldPos4 = g_ViewParams.invViewProj * vec4(ndcXY, depth, 1.0);
+    vec3 worldPos = worldPos4.xyz / worldPos4.w;
+
+    // Same continuous probe-space mapping as ScreenProbeTemporal.comp's own reprojection (probe i's
+    // representative pixel is i*kProbeTileSize + kProbeTileSize/2 -- see ScreenProbeTrace.comp).
+    vec2 probeSpace = (vec2(pixel) - vec2(float(kProbeTileSize) * 0.5)) / float(kProbeTileSize);
+    vec2 base = floor(probeSpace);
+    vec2 frac = fract(probeSpace);
+
+    ivec2 probeGridMax = ivec2(pc.probeCountX, pc.probeCountY) - ivec2(1);
+    ivec2 taps[4] = ivec2[4](
+        clamp(ivec2(base), ivec2(0), probeGridMax),
+        clamp(ivec2(base) + ivec2(1, 0), ivec2(0), probeGridMax),
+        clamp(ivec2(base) + ivec2(0, 1), ivec2(0), probeGridMax),
+        clamp(ivec2(base) + ivec2(1, 1), ivec2(0), probeGridMax)
+    );
+    float bilinearWeights[4] = float[4](
+        (1.0 - frac.x) * (1.0 - frac.y),
+        frac.x * (1.0 - frac.y),
+        (1.0 - frac.x) * frac.y,
+        frac.x * frac.y
+    );
+
+    vec3 totalIrradiance = vec3(0.0);
+    float totalWeight = 0.0;
+    for (int i = 0; i < 4; ++i) {
+        vec3 irradiance;
+        float weight;
+        if (SampleProbeIrradiance(taps[i], bilinearWeights[i], worldPos, normal, irradiance, weight)) {
+            totalIrradiance += irradiance * weight;
+            totalWeight += weight;
+        }
+    }
+
+    vec3 indirect;
+    if (totalWeight > 1.0e-5) {
+        indirect = totalIrradiance / totalWeight;
+    } else {
+        // Every bilateral tap collapsed to ~0 (e.g. a thin foreground sliver whose 4 nearest
+        // probes all belong to background geometry behind it) -- fall back to the single nearest
+        // probe, ignoring the bilateral test entirely, rather than leave this pixel with zero
+        // indirect light (the standard light-leak-avoidance fallback).
+        ivec2 nearest = clamp(ivec2(round(probeSpace)), ivec2(0), probeGridMax);
+        vec4 nearestWorldPos = texelFetch(g_ProbeWorldPos, nearest, 0);
+        if (nearestWorldPos.a >= 0.5) {
+            vec4 shR = texelFetch(g_ProbeSHR, nearest, 0);
+            vec4 shG = texelFetch(g_ProbeSHG, nearest, 0);
+            vec4 shB = texelFetch(g_ProbeSHB, nearest, 0);
+            indirect = EvaluateIrradianceSH(shR, shG, shB, normal);
+        } else {
+            indirect = vec3(0.0);
+        }
+    }
+
+    vec4 baseColor = imageLoad(g_OutputColor, pixel);
+    vec3 finalColor = baseColor.rgb + albedo * indirect;
+
+#ifdef _DEBUG
+    if (pc.debugViewMode == 14) { // DEBUG_VIEW_SPATIAL_PROBES
+        // Raw indirect irradiance only (no base color), plus probe-tile boundary lines, so the
+        // probe grid placement and its reconstructed lighting are directly visible.
+        finalColor = indirect;
+        ivec2 tileLocal = pixel % ivec2(kProbeTileSize);
+        if (tileLocal.x == 0 || tileLocal.y == 0) {
+            finalColor = mix(finalColor, vec3(1.0, 0.0, 0.0), 0.35);
+        }
+    }
+#endif
+
+    imageStore(g_OutputColor, pixel, vec4(finalColor, baseColor.a));
+}

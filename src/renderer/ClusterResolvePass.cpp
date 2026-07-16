@@ -28,17 +28,18 @@ namespace renderer {
         }
 
         // Byte-for-byte mirror of ResolveViewParamsUBO in ClusterResolve.comp (std140): mat4 (64
-        // bytes) + vec2 (8 bytes) + 2 pad floats rounding up to the struct's own 16-byte base
-        // alignment (80 bytes total) -- same shape as ClusterSoftwareRasterPass.cpp's
-        // SoftwareRasterViewParams.
+        // bytes) + mat4 (64 bytes, prevViewProj -- DEBUG_VIEW_MOTION_VECTORS' own reprojection) +
+        // vec2 (8 bytes) + 2 pad floats rounding up to the struct's own 16-byte base alignment
+        // (144 bytes total) -- same shape as ClusterSoftwareRasterPass.cpp's SoftwareRasterViewParams.
         struct ResolveViewParams {
             maths::mat4 viewProj;
+            maths::mat4 prevViewProj;
             float viewportWidth = 0.0f;
             float viewportHeight = 0.0f;
             float _pad0 = 0.0f;
             float _pad1 = 0.0f;
         };
-        static_assert(sizeof(ResolveViewParams) == 80,
+        static_assert(sizeof(ResolveViewParams) == 144,
             "ResolveViewParams must match ResolveViewParamsUBO in ClusterResolve.comp exactly (std140 layout)");
 
     } // namespace
@@ -67,7 +68,13 @@ namespace renderer {
         // the swapchain -- neither is wired up by this change (see the class comment), but the
         // usage flags are pre-positioned exactly like VulkanContext's swapchain TRANSFER_DST_BIT
         // was pre-positioned ahead of the VisBuffer conversion that later needed it.
-        imageInfo.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        // COLOR_ATTACHMENT_BIT: renderer::DebugTextOverlay::RecordDraw (Debug-only, see
+        // ClusterRenderPipeline.cpp's #ifndef NDEBUG call site) draws the frame's debug HUD text
+        // directly into this image via vkCmdBeginRendering, which requires the color-attachment
+        // usage bit on top of the storage/sampled/transfer-src ones above -- without it, every
+        // frame's HUD draw is a VUID-VkRenderingInfo-colorAttachmentCount-06087 validation error.
+        imageInfo.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+            VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
         imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
         imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
@@ -82,23 +89,32 @@ namespace renderer {
         viewInfo.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
         VK_CHECK(vkCreateImageView(m_Device, &viewInfo, nullptr, &m_OutputColorView));
 
-        // --- G-buffer normal image: same extent/tiling/usage shape as the color image above, just
-        // a 2-channel octahedral-encoded format -- the persistent per-pixel world-space normal
-        // renderer::ScreenTracePass / renderer::ATrousDenoisePass read as their geometry-aware
-        // guide (see kNormalFormat's own comment). ---
-        VkImageCreateInfo normalImageInfo = imageInfo;
-        normalImageInfo.format = kNormalFormat;
-        VK_CHECK(vmaCreateImage(allocator, &normalImageInfo, &imageAllocInfo, &m_OutputNormalImage, &m_OutputNormalAllocation, nullptr));
+        // --- Minimal GBuffer: normal/depth/albedo, same extent, same STORAGE|SAMPLED usage as the
+        // color image above (renderer::ScreenProbeGIPass samples all 3; only this shader ever
+        // writes them) minus COLOR_ATTACHMENT_BIT -- none of these 3 images is ever bound as a
+        // render attachment, unlike the color image above (see its own usage-flags comment). ---
+        VkImageCreateInfo gbufferImageInfo = imageInfo;
+        gbufferImageInfo.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        gbufferImageInfo.format = kOutputNormalFormat;
+        VK_CHECK(vmaCreateImage(allocator, &gbufferImageInfo, &imageAllocInfo, &m_OutputNormalImage, &m_OutputNormalAllocation, nullptr));
+        gbufferImageInfo.format = kOutputDepthFormat;
+        VK_CHECK(vmaCreateImage(allocator, &gbufferImageInfo, &imageAllocInfo, &m_OutputDepthImage, &m_OutputDepthAllocation, nullptr));
+        gbufferImageInfo.format = kOutputAlbedoFormat;
+        VK_CHECK(vmaCreateImage(allocator, &gbufferImageInfo, &imageAllocInfo, &m_OutputAlbedoImage, &m_OutputAlbedoAllocation, nullptr));
 
-        VkImageViewCreateInfo normalViewInfo = viewInfo;
-        normalViewInfo.image = m_OutputNormalImage;
-        normalViewInfo.format = kNormalFormat;
-        VK_CHECK(vkCreateImageView(m_Device, &normalViewInfo, nullptr, &m_OutputNormalView));
+        viewInfo.image = m_OutputNormalImage;
+        viewInfo.format = kOutputNormalFormat;
+        VK_CHECK(vkCreateImageView(m_Device, &viewInfo, nullptr, &m_OutputNormalView));
+        viewInfo.image = m_OutputDepthImage;
+        viewInfo.format = kOutputDepthFormat;
+        VK_CHECK(vkCreateImageView(m_Device, &viewInfo, nullptr, &m_OutputDepthView));
+        viewInfo.image = m_OutputAlbedoImage;
+        viewInfo.format = kOutputAlbedoFormat;
+        VK_CHECK(vkCreateImageView(m_Device, &viewInfo, nullptr, &m_OutputAlbedoView));
 
         // --- One-time UNDEFINED -> GENERAL transition (mirrors HZBPass::Init /
         // ClusterSoftwareRasterPass::Init's own one-shot pattern) -- stays in GENERAL for its
-        // entire lifetime, touched only by this class's own compute shader. Both the color and
-        // normal images are transitioned together in the same one-shot command buffer. ---
+        // entire lifetime, touched only by this class's own compute shader. ---
         {
             VkCommandBufferAllocateInfo cmdAllocInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
             cmdAllocInfo.commandPool = commandPool;
@@ -112,24 +128,26 @@ namespace renderer {
             beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
             vkBeginCommandBuffer(cmd, &beginInfo);
 
-            VkImageMemoryBarrier2 barriers[2]{};
-            barriers[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-            barriers[0].srcStageMask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
-            barriers[0].srcAccessMask = 0;
-            barriers[0].dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-            barriers[0].dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-            barriers[0].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-            barriers[0].newLayout = VK_IMAGE_LAYOUT_GENERAL;
-            barriers[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            barriers[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            VkImageMemoryBarrier2 barriers[4]{};
+            for (auto& barrier : barriers) {
+                barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+                barrier.srcStageMask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
+                barrier.srcAccessMask = 0;
+                barrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+                barrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+                barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+                barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+                barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                barrier.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+            }
             barriers[0].image = m_OutputColorImage;
-            barriers[0].subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-
-            barriers[1] = barriers[0];
             barriers[1].image = m_OutputNormalImage;
+            barriers[2].image = m_OutputDepthImage;
+            barriers[3].image = m_OutputAlbedoImage;
 
             VkDependencyInfo depInfo{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-            depInfo.imageMemoryBarrierCount = 2;
+            depInfo.imageMemoryBarrierCount = 4;
             depInfo.pImageMemoryBarriers = barriers;
             vkCmdPipelineBarrier2(cmd, &depInfo);
 
@@ -167,9 +185,9 @@ namespace renderer {
             VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
             VMA_MEMORY_USAGE_GPU_ONLY);
 
-        // --- Descriptor set layout: 10 bindings, matching ClusterResolve.comp's set = 0 bindings
-        // 0..9 exactly (binding 9 added for the new G-buffer normal output). ---
-        VkDescriptorSetLayoutBinding bindings[10]{};
+        // --- Descriptor set layout: 12 bindings, matching ClusterResolve.comp's set = 0 bindings
+        // 0..11 exactly (9..11 are the new GBuffer outputs from this feature). ---
+        VkDescriptorSetLayoutBinding bindings[12]{};
         bindings[0] = { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };         // ClusterCullMetadataSSBO
         bindings[1] = { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };         // CompressedClusterPoolSSBO
         bindings[2] = { 2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };          // g_HWClusterIDImage (r32ui)
@@ -180,15 +198,17 @@ namespace renderer {
         bindings[7] = { 7, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };         // ResolveViewParamsUBO
         bindings[8] = { 8, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, maskTextureCount, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // g_MaskTextures[]
         bindings[9] = { 9, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };          // g_OutputNormal (rg16f)
+        bindings[10] = { 10, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };        // g_OutputDepth (r32f)
+        bindings[11] = { 11, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };        // g_OutputAlbedo (rgba8)
 
         VkDescriptorSetLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-        layoutInfo.bindingCount = 10;
+        layoutInfo.bindingCount = 12;
         layoutInfo.pBindings = bindings;
         VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &layoutInfo, nullptr, &m_SetLayout));
 
         VkDescriptorPoolSize poolSizes[4]{};
         poolSizes[0] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 };
-        poolSizes[1] = { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 5 };
+        poolSizes[1] = { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 7 };
         poolSizes[2] = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1 + maskTextureCount };
         poolSizes[3] = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 };
 
@@ -233,7 +253,15 @@ namespace renderer {
         outputNormalInfo.imageView = m_OutputNormalView;
         outputNormalInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
-        VkWriteDescriptorSet writes[10]{};
+        VkDescriptorImageInfo outputDepthInfo{};
+        outputDepthInfo.imageView = m_OutputDepthView;
+        outputDepthInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+        VkDescriptorImageInfo outputAlbedoInfo{};
+        outputAlbedoInfo.imageView = m_OutputAlbedoView;
+        outputAlbedoInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+        VkWriteDescriptorSet writes[12]{};
         writes[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_DescriptorSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &clusterMetadataInfo, nullptr };
         writes[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_DescriptorSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &compressedPoolInfo, nullptr };
         writes[2] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_DescriptorSet, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &hwClusterIDInfo, nullptr, nullptr };
@@ -244,7 +272,9 @@ namespace renderer {
         writes[7] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_DescriptorSet, 7, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &viewParamsInfo, nullptr };
         writes[8] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_DescriptorSet, 8, 0, maskTextureCount, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, maskImageInfos.data(), nullptr, nullptr };
         writes[9] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_DescriptorSet, 9, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &outputNormalInfo, nullptr, nullptr };
-        vkUpdateDescriptorSets(m_Device, 10, writes, 0, nullptr);
+        writes[10] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_DescriptorSet, 10, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &outputDepthInfo, nullptr, nullptr };
+        writes[11] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_DescriptorSet, 11, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &outputAlbedoInfo, nullptr, nullptr };
+        vkUpdateDescriptorSets(m_Device, 12, writes, 0, nullptr);
 
         // --- Pipeline layout + pipeline ---
         VkPipelineLayoutCreateInfo pipelineLayoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
@@ -280,6 +310,8 @@ namespace renderer {
             if (m_DepthSampler != VK_NULL_HANDLE) vkDestroySampler(m_Device, m_DepthSampler, nullptr);
             if (m_OutputColorView != VK_NULL_HANDLE) vkDestroyImageView(m_Device, m_OutputColorView, nullptr);
             if (m_OutputNormalView != VK_NULL_HANDLE) vkDestroyImageView(m_Device, m_OutputNormalView, nullptr);
+            if (m_OutputDepthView != VK_NULL_HANDLE) vkDestroyImageView(m_Device, m_OutputDepthView, nullptr);
+            if (m_OutputAlbedoView != VK_NULL_HANDLE) vkDestroyImageView(m_Device, m_OutputAlbedoView, nullptr);
         }
 
         m_Pipeline = VK_NULL_HANDLE;
@@ -290,6 +322,8 @@ namespace renderer {
         m_DepthSampler = VK_NULL_HANDLE;
         m_OutputColorView = VK_NULL_HANDLE;
         m_OutputNormalView = VK_NULL_HANDLE;
+        m_OutputDepthView = VK_NULL_HANDLE;
+        m_OutputAlbedoView = VK_NULL_HANDLE;
 
         m_ViewParamsBuffer.Destroy();
 
@@ -298,20 +332,27 @@ namespace renderer {
         if (m_Allocator != VK_NULL_HANDLE) {
             vmaDestroyImage(m_Allocator, m_OutputColorImage, m_OutputColorAllocation);
             vmaDestroyImage(m_Allocator, m_OutputNormalImage, m_OutputNormalAllocation);
+            vmaDestroyImage(m_Allocator, m_OutputDepthImage, m_OutputDepthAllocation);
+            vmaDestroyImage(m_Allocator, m_OutputAlbedoImage, m_OutputAlbedoAllocation);
         }
         m_OutputColorImage = VK_NULL_HANDLE;
         m_OutputColorAllocation = VK_NULL_HANDLE;
         m_OutputNormalImage = VK_NULL_HANDLE;
         m_OutputNormalAllocation = VK_NULL_HANDLE;
+        m_OutputDepthImage = VK_NULL_HANDLE;
+        m_OutputDepthAllocation = VK_NULL_HANDLE;
+        m_OutputAlbedoImage = VK_NULL_HANDLE;
+        m_OutputAlbedoAllocation = VK_NULL_HANDLE;
 
         m_RenderExtent = { 0, 0 };
         m_Allocator = VK_NULL_HANDLE;
         m_Device = VK_NULL_HANDLE;
     }
 
-    void ClusterResolvePass::RecordResolve(VkCommandBuffer cmd, const maths::mat4& viewProj, uint32_t debugViewMode) {
+    void ClusterResolvePass::RecordResolve(VkCommandBuffer cmd, const maths::mat4& viewProj, const maths::mat4& prevViewProj, uint32_t debugViewMode) {
         ResolveViewParams viewParams{};
         viewParams.viewProj = viewProj;
+        viewParams.prevViewProj = prevViewProj;
         viewParams.viewportWidth = static_cast<float>(m_RenderExtent.width);
         viewParams.viewportHeight = static_cast<float>(m_RenderExtent.height);
         vkCmdUpdateBuffer(cmd, m_ViewParamsBuffer.Handle(), 0, sizeof(ResolveViewParams), &viewParams);
@@ -341,11 +382,15 @@ namespace renderer {
         // GetOutputColorImage() visible to a later sampled read (a future preview/blit pass) or a
         // transfer-based blit to the swapchain -- whichever a caller ends up using; both dst
         // stage/access pairs are included since this class does not itself know which.
+        // SHADER_STORAGE_READ is additionally included (on top of SAMPLED_READ) because
+        // renderer::ScreenProbeGIPass reads the 3 new GBuffer outputs (normal/depth/albedo) via
+        // plain imageLoad, not a sampler -- and read-modify-writes GetOutputColorImage() itself
+        // the same way.
         VkMemoryBarrier2 outputBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
         outputBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
         outputBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
         outputBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_COPY_BIT;
-        outputBarrier.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_TRANSFER_READ_BIT;
+        outputBarrier.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_TRANSFER_READ_BIT;
 
         VkDependencyInfo outputDependency{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
         outputDependency.memoryBarrierCount = 1;

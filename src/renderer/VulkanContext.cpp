@@ -336,12 +336,13 @@ void VulkanContext::Init(std::string_view appName, GLFWwindow *window) {
   allocatorInfo.instance = m_Instance;
   allocatorInfo.physicalDevice = m_PhysicalDevice;
   allocatorInfo.device = m_Device;
-  // Required because renderer::SurfaceCachePass / ShadowMapPass create buffers with
-  // VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT (their combined Fallback Mesh vertex/index buffers,
-  // read directly as BLAS build input by renderer::SurfaceCacheRayTracingPass -- see those
-  // classes' own comments) -- VMA asserts on any such buffer creation unless the allocator itself
-  // was created with this flag, matching the bufferDeviceAddress physical device feature already
-  // enabled unconditionally in CreateLogicalDevice() below.
+  // Required by VMA itself (a hard assert, not just a validation warning) for any
+  // vmaCreateBuffer() call using VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT -- SurfaceCachePass's
+  // vertex/index buffers and every renderer::AccelerationStructure/SurfaceCacheTraceContext
+  // buffer use that flag (see SurfaceCachePass::GetVertexBuffer()'s own comment), on top of the
+  // bufferDeviceAddress DEVICE feature already enabled in CreateLogicalDevice above -- VMA needs
+  // to be told separately, at allocator-creation time, that it is allowed to service such
+  // requests.
   allocatorInfo.flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
   if (vmaCreateAllocator(&allocatorInfo, &m_Allocator) != VK_SUCCESS) {
     throw std::runtime_error("Failed to create VMA allocator!");

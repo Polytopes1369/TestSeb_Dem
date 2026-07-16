@@ -1,10 +1,12 @@
 #pragma once
 // À-Trous ("with holes") wavelet spatial denoiser: a generic, reusable `image in -> image out`
-// filter with no coupling to any specific producer -- renderer::ScreenTracePass's noisy combined
-// GI signal is its only consumer today, but this class knows nothing about SSRT, the World Probe
-// grid, or Surface Cache sampling; it just denoises whatever `rgba16f` image it is given, guided
-// by a depth image and an octahedral-encoded normal image (the same two G-buffer inputs
-// renderer::ClusterResolvePass now produces).
+// filter with no coupling to any specific producer -- renderer::ClusterRenderPipeline applies it
+// to renderer::ClusterResolvePass's fully composited output color image (direct light +
+// renderer::ScreenProbeGIPass's own temporally-accumulated indirect term, already blended in by
+// the time this pass runs) as a final spatial cleanup, guided by a depth image and an octahedral-
+// encoded normal image (the same G-buffer inputs renderer::ClusterResolvePass already produces).
+// This class itself knows nothing about Screen Probes, the World Probe grid, or Surface Cache
+// sampling; it just denoises whatever image it is given.
 //
 // --- Why À-Trous instead of a plain box/Gaussian blur ---
 // A dumb spatial blur would smear the denoised GI signal ACROSS a depth/material discontinuity
@@ -37,15 +39,23 @@ namespace renderer {
         // the O(radius^2) cost a single, equivalently-wide dense kernel would have).
         static constexpr uint32_t kIterations = 5;
 
-        static constexpr VkFormat kFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
+        // RGBA8, matching renderer::ClusterResolvePass::kOutputColorFormat exactly (not a higher-
+        // precision HDR format): this pass' own output image is a candidate blit source AND a
+        // candidate renderer::debug::DebugTextOverlay draw target (both selected by
+        // ClusterRenderPipeline's own `applyDenoise` condition, see RecordFrame's own comment) --
+        // DebugTextOverlay's graphics pipeline is compiled once at Init() against a FIXED
+        // attachment format, so this pass' output must format-match m_Resolve's own output color
+        // image for that Debug-only draw to remain valid regardless of which image ends up chosen.
+        static constexpr VkFormat kFormat = VK_FORMAT_R8G8B8A8_UNORM;
 
         // Allocates the 2 ping-pong images (renderExtent-sized) and the 3 descriptor sets this
         // class alternates between across kIterations passes (external-input -> ping A, ping A ->
         // ping B, ping B -> ping A -- see the .cpp's own iteration-order comment), all sharing one
-        // descriptor set LAYOUT. `noisyInputView` (the FIRST iteration's source -- a producer's
-        // output image, e.g. renderer::ScreenTracePass::GetOutputView()), `depthView` and
-        // `normalView` are borrowed and must stay valid for this pass' entire lifetime (bound once,
-        // here, like every other static resource in this codebase's compute passes).
+        // descriptor set LAYOUT. `noisyInputView` (the FIRST iteration's source -- e.g.
+        // renderer::ClusterResolvePass::GetOutputColorView(), the fully composited direct+indirect
+        // frame), `depthView` and `normalView` are borrowed and must stay valid for this pass' entire
+        // lifetime (bound once, here, like every other static resource in this codebase's compute
+        // passes).
         void Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
             VkExtent2D renderExtent, VkImageView noisyInputView, VkImageView depthView, VkImageView normalView);
 
@@ -64,6 +74,7 @@ namespace renderer {
         // ping-pong images every RecordDenoise() call in a fixed, deterministic pattern -- always
         // the SAME image after kIterations=5, an odd count, so this is a stable getter, not one
         // that changes identity between calls).
+        VkImage GetOutputImage() const { return m_PingImages[0]; }
         VkImageView GetOutputView() const { return m_PingViews[0]; }
 
     private:

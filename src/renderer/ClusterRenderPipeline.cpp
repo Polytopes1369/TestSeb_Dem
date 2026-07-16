@@ -283,65 +283,96 @@ bool ClusterRenderPipeline::Init(
       m_MaskGenerator.GetMaskImageInfos());
 
   // =========================================================================================
-  // STEP 7 -- Lumen-style GI chain: previously self-contained, orphaned classes, wired for real
-  // here in the exact dependency order each one's own header already documents (see this class'
-  // own comment). A scene with zero fallback meshes/cards is a valid, degenerate case for every
-  // one of these (each class' own Init() doc already covers it) -- only an actual cache-file I/O
-  // failure is fatal here, matching every other STEP above.
+  // STEP 7 -- Lumen-style GI infrastructure: sun shadow map, Surface Cache, Global SDF clipmap
+  // (see ClusterRenderPipeline.h's own class-comment addendum on why these are unconditional,
+  // not Debug-only, unlike the stats/overlay block and m_SDFRayMarch below). Each pass re-reads
+  // the same consolidated .cache file independently (this codebase's established "self-contained
+  // pass" convention -- see e.g. renderer::ShadowMapPass's own class comment).
   // =========================================================================================
-  if (!m_GlobalSDF.Init(createInfo.device, createInfo.allocator, createInfo.commandPool,
-                        createInfo.queue, createInfo.cacheFilePath)) {
-    LOG_ERROR("[ClusterRenderPipeline] GlobalSDFPass::Init failed.");
+  if (!m_ShadowMap.Init(createInfo.device, createInfo.allocator,
+                        createInfo.commandPool, createInfo.queue,
+                        createInfo.cacheFilePath)) {
+    LOG_ERROR("[ClusterRenderPipeline] Failed to initialize ShadowMapPass.");
     return false;
   }
-  if (!m_SurfaceCache.Init(createInfo.device, createInfo.allocator, createInfo.commandPool,
-                           createInfo.queue, createInfo.cacheFilePath)) {
-    LOG_ERROR("[ClusterRenderPipeline] SurfaceCachePass::Init failed.");
+  if (!m_SurfaceCache.Init(createInfo.device, createInfo.allocator,
+                           createInfo.commandPool, createInfo.queue,
+                           createInfo.cacheFilePath)) {
+    LOG_ERROR("[ClusterRenderPipeline] Failed to initialize SurfaceCachePass.");
     return false;
   }
-  if (!m_ShadowMap.Init(createInfo.device, createInfo.allocator, createInfo.commandPool,
-                        createInfo.queue, createInfo.cacheFilePath)) {
-    LOG_ERROR("[ClusterRenderPipeline] ShadowMapPass::Init failed.");
-    return false;
-  }
-  // Must happen before the first RecordFrame() call -- see SurfaceCachePass::SetShadowMap's own
-  // "exactly once after Init()" contract.
+  // One-time wiring (see SurfaceCachePass::SetShadowMap's own comment): the shadow map's view/
+  // sampler never change again after ShadowMapPass::Init(), so this binding is never refreshed.
   m_SurfaceCache.SetShadowMap(m_ShadowMap.GetShadowMapView(), m_ShadowMap.GetShadowMapSampler());
 
-  if (!m_TraceContext.Init(createInfo.device, createInfo.allocator, createInfo.commandPool,
-                           createInfo.queue, m_GlobalSDF, m_SurfaceCache)) {
-    LOG_ERROR("[ClusterRenderPipeline] SurfaceCacheTraceContext::Init failed.");
-    return false;
-  }
-  if (!m_SurfaceCacheRT.Init(createInfo.physicalDevice, createInfo.device, createInfo.allocator,
-                             createInfo.commandPool, createInfo.queue, m_TraceContext, m_SurfaceCache)) {
-    LOG_ERROR("[ClusterRenderPipeline] SurfaceCacheRayTracingPass::Init failed.");
-    return false;
-  }
-  if (!m_GIInject.Init(createInfo.device, createInfo.allocator, m_TraceContext, m_SurfaceCache, m_SurfaceCacheRT)) {
-    LOG_ERROR("[ClusterRenderPipeline] SurfaceCacheGIInjectPass::Init failed.");
+  if (!m_GlobalSDF.Init(createInfo.device, createInfo.allocator,
+                        createInfo.commandPool, createInfo.queue,
+                        createInfo.cacheFilePath)) {
+    LOG_ERROR("[ClusterRenderPipeline] Failed to initialize GlobalSDFPass.");
     return false;
   }
 
-  // =========================================================================================
-  // STEP 8 -- New: World Probe grid (fed from the Surface Cache above), SSRT (falls back to the
-  // World Probe grid on a screen-trace miss), the spatial denoiser (guided by m_Resolve's new
-  // G-buffer normal + the depth image), and the final composite -- see this class' own comment
-  // for exactly why this order.
-  // =========================================================================================
-  if (!m_WorldProbes.Init(createInfo.device, createInfo.allocator, createInfo.commandPool,
-                          createInfo.queue, m_TraceContext, m_SurfaceCache, m_SurfaceCacheRT)) {
-    LOG_ERROR("[ClusterRenderPipeline] WorldProbeGridPass::Init failed.");
+  // Shared trace-scene descriptor sets (mesh SDF trace scene + Surface Cache sampling), built
+  // once from m_GlobalSDF's per-entity SDF images and m_SurfaceCache's card table/atlases (both
+  // already Init'd above) -- reused unmodified by m_SurfaceCacheRT/m_GIInject/m_ScreenProbeGI.
+  if (!m_TraceContext.Init(createInfo.device, createInfo.allocator, createInfo.commandPool,
+                           createInfo.queue, m_GlobalSDF, m_SurfaceCache)) {
+    LOG_ERROR("[ClusterRenderPipeline] Failed to initialize SurfaceCacheTraceContext.");
     return false;
   }
-  m_ScreenTrace.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
-      createInfo.renderExtent, createInfo.depthImageView, m_Resolve.GetOutputNormalView(),
-      m_Resolve.GetOutputColorView(), m_WorldProbes);
+  // HWRT back-end: one BLAS per traced entity + one TLAS, built once against m_SurfaceCache's own
+  // Fallback Mesh vertex/index buffers (the scene is static -- see this class' own "Entity self-
+  // rotation" scope note -- so no per-frame rebuild is needed).
+  if (!m_SurfaceCacheRT.Init(createInfo.physicalDevice, createInfo.device, createInfo.allocator,
+                             createInfo.commandPool, createInfo.queue, m_TraceContext, m_SurfaceCache)) {
+    LOG_ERROR("[ClusterRenderPipeline] Failed to initialize SurfaceCacheRayTracingPass.");
+    return false;
+  }
+  // Per-card secondary-bounce injection into m_SurfaceCache's own radiance atlas -- makes that
+  // atlas genuinely multi-bounce over time, which m_ScreenProbeGI's single-hit-sample final
+  // gather then benefits from directly.
+  if (!m_GIInject.Init(createInfo.device, createInfo.allocator, m_TraceContext, m_SurfaceCache, m_SurfaceCacheRT)) {
+    LOG_ERROR("[ClusterRenderPipeline] Failed to initialize SurfaceCacheGIInjectPass.");
+    return false;
+  }
+  // Screen Space Probe GI -- needs m_Resolve's GBuffer (already Init'd, STEP 6 above) for the
+  // probe placement/gather passes, and m_TraceContext/m_SurfaceCacheRT for its own trace pass.
+  if (!m_ScreenProbeGI.Init(createInfo.device, createInfo.allocator, createInfo.commandPool,
+                            createInfo.queue, createInfo.renderExtent, m_TraceContext, m_SurfaceCache,
+                            m_SurfaceCacheRT, m_Resolve)) {
+    LOG_ERROR("[ClusterRenderPipeline] Failed to initialize ScreenProbeGIPass.");
+    return false;
+  }
+  // World Probe grid (Lumen "Translucency Volume") -- reuses the same shared trace-scene sets and
+  // HWRT/BLAS/TLAS as every other GI consumer above; see ClusterRenderPipeline.h's own comment on
+  // why this is a separate system from m_ScreenProbeGI, not a duplicate of it.
+  if (!m_WorldProbes.Init(createInfo.device, createInfo.allocator, createInfo.commandPool,
+                          createInfo.queue, m_TraceContext, m_SurfaceCache, m_SurfaceCacheRT)) {
+    LOG_ERROR("[ClusterRenderPipeline] Failed to initialize WorldProbeGridPass.");
+    return false;
+  }
+  // Final spatial denoiser: denoises m_Resolve's own output color image (direct light +, after
+  // RecordFrame()'s own [12b] step, m_ScreenProbeGI's gathered indirect term), guided by
+  // m_Resolve's own G-buffer normal/depth -- both already Init'd (STEP 6 above).
   m_Denoiser.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
-      createInfo.renderExtent, m_ScreenTrace.GetOutputView(), createInfo.depthImageView, m_Resolve.GetOutputNormalView());
-  m_GIComposite.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
-      createInfo.renderExtent, m_Resolve.GetOutputColorView(), m_Denoiser.GetOutputView(),
-      createInfo.depthImageView, m_WorldProbes);
+      createInfo.renderExtent, m_Resolve.GetOutputColorView(), m_Resolve.GetOutputDepthView(),
+      m_Resolve.GetOutputNormalView());
+
+#ifndef NDEBUG
+  // Two-tier SDF ray march DEBUG VISUALIZATION (see ClusterRenderPipeline.h's own comment on
+  // m_SDFRayMarch) -- output sized to match the render extent so its debug image is a 1:1
+  // resolution match for whatever m_Resolve would otherwise have produced.
+  if (!m_SDFRayMarch.Init(createInfo.device, createInfo.allocator,
+                          createInfo.commandPool, createInfo.queue,
+                          createInfo.cacheFilePath, createInfo.renderExtent.width,
+                          createInfo.renderExtent.height)) {
+    LOG_ERROR("[ClusterRenderPipeline] Failed to initialize SDFRayMarchPass.");
+    return false;
+  }
+  // One-time wiring (see SDFRayMarchPass::SetGlobalSDFViews's own comment): the 4 clipmap level
+  // views never change again after GlobalSDFPass::Init().
+  m_SDFRayMarch.SetGlobalSDFViews(m_GlobalSDF);
+#endif
 
 #ifndef NDEBUG
   // Debug-only stat overlay: triangle-count compute pass (reads ONLY m_OcclusionCulling's already-
@@ -383,18 +414,23 @@ void ClusterRenderPipeline::Shutdown() {
   m_Allocator = VK_NULL_HANDLE;
   m_LastStatsSampleTime = 0.0f;
   m_LastStatsSampleBytes = 0;
+  m_SDFRayMarch.Shutdown();
 #endif
-  m_GIComposite.Shutdown();
+  m_ScreenProbeGI.Shutdown();
   m_Denoiser.Shutdown();
-  m_ScreenTrace.Shutdown();
   m_WorldProbes.Shutdown();
   m_GIInject.Shutdown();
   m_SurfaceCacheRT.Shutdown();
   m_TraceContext.Shutdown();
-  m_ShadowMap.Shutdown();
-  m_SurfaceCache.Shutdown();
   m_GlobalSDF.Shutdown();
-  m_GIFrameIndex = 0;
+  m_SurfaceCache.Shutdown();
+  m_ShadowMap.Shutdown();
+  m_PrevViewProj = maths::mat4{};
+  m_HasPrevViewProj = false;
+  m_FrameIndex = 0;
+#ifndef NDEBUG
+  m_DebugTraceMode = 0;
+#endif
 
   m_Resolve.Shutdown();
   m_SoftwareRaster.Shutdown();
@@ -462,9 +498,9 @@ void ClusterRenderPipeline::BeginVisBufferRendering(
 void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
                                         const CameraPushConstants &camera,
                                         const maths::vec3 &cameraPositionWorld,
+                                        const CameraFrameInfo &cameraFrameInfo,
                                         float globalTimeSeconds,
-                                        VkImage swapchainImage,
-                                        const maths::vec3 &sunDirection) {
+                                        VkImage swapchainImage) {
   assert(m_ClusterCount > 0 && "RecordFrame called before a successful Init");
 
   // Every stage of this frame consumes the SAME combined matrix -- this is what
@@ -480,6 +516,15 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
   // the screen size classification needs the positive scale.
   float projScaleY = std::abs(camera.proj.m[5]);
 
+  // SWRT/HWRT back-end shared by m_GIInject ([1z] below) and m_ScreenProbeGI ([12b] below) --
+  // debug-only toggle (main.cpp's 'T' key via SetDebugTraceMode), Release always uses HWRT (no
+  // debug toggle to switch back to SWRT).
+#ifndef NDEBUG
+  uint32_t traceMode = m_DebugTraceMode;
+#else
+  uint32_t traceMode = 1u;
+#endif
+
   // =========================================================================================
   // [1] Per-frame worklist clears. Each Record*() carries its own
   // CLEAR->COMPUTE barrier, so the culling/raster dispatches below can never
@@ -488,6 +533,84 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
   m_OcclusionCulling.RecordClearFrame(cmd);
   m_SoftwareRaster.RecordClear(cmd);
   m_LODSelection.RecordClear(cmd);
+
+  // =========================================================================================
+  // [1z] Lumen-style GI infrastructure: sun shadow map -> Surface Cache capture -> Global SDF
+  // clipmap streaming -> (Debug-only) SDF ray march debug visualization. Independent of the
+  // Nanite VisBuffer/HZB machinery above and below (no shared images, no fence contention -- see
+  // ClusterRenderPipeline.h's own class-comment addendum), so it can run anywhere in the frame;
+  // placed early, right after the worklist clears, so it overlaps with the GPU's own internal
+  // scheduling of the culling/streaming work that follows rather than sitting at the tail end.
+  // =========================================================================================
+  {
+    // Sun direction is fixed for now (m_SceneLights' own default, see LightingTypes.h) -- a
+    // future day/night system would rotate it per frame instead.
+    const maths::vec3 sunDirection = m_SceneLights.sun.direction;
+
+    // 1. Shadow map first: SurfaceCachePass's shadow lookup (below) needs THIS frame's light
+    // view-projection, and ShadowMapPass::RecordCapture's own trailing barrier already makes its
+    // depth writes visible to a fragment-shader sampled read (see that method's own comment).
+    m_ShadowMap.RecordCapture(cmd, sunDirection);
+
+    // 2. Surface Cache: feed this frame's light data (the light view-proj THIS frame's shadow map
+    // was just rendered with, not a stale one) before the visibility-driven capture draws.
+    m_SurfaceCache.UpdateLighting(m_SceneLights, m_ShadowMap.GetLightViewProj());
+    m_SurfaceCache.UpdateVisibility(cameraFrameInfo.position, cameraFrameInfo.forward,
+                                    maths::vec3{0.0f, 1.0f, 0.0f}, cameraFrameInfo.fovYRadians,
+                                    cameraFrameInfo.aspectRatio, cameraFrameInfo.nearZ,
+                                    cameraFrameInfo.farZ);
+    m_SurfaceCache.RecordCapture(cmd);
+
+    // 3. Global SDF clipmap streaming, from this frame's camera position.
+    m_GlobalSDF.RecordUpdate(cmd, cameraFrameInfo.position);
+
+    // 4. Secondary-bounce injection into m_SurfaceCache's own radiance atlas (budgeted, a handful
+    // of cards per call -- see SurfaceCacheGIInjectPass::kCardsPerFrameBudget) via m_TraceContext's
+    // shared trace-scene sets against m_SurfaceCacheRT's static TLAS or the per-entity mesh SDFs,
+    // depending on `traceMode`.
+    m_GIInject.RecordInject(cmd, m_TraceContext, m_SurfaceCache, traceMode);
+
+    // Unlike SurfaceCachePass::RecordCapture/ShadowMapPass::RecordCapture/GlobalSDFPass::
+    // RecordUpdate, SurfaceCacheGIInjectPass::RecordInject does NOT end with its own trailing
+    // barrier -- its read-modify-write of the radiance atlas (imageLoad/imageStore, STORAGE
+    // access) must be made visible here, explicitly, before m_ScreenProbeGI's own trace pass
+    // samples that same atlas (surface_cache_sampling.glsl's g_SurfaceCacheRadiance) later this
+    // frame.
+    VkMemoryBarrier2 giInjectBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    giInjectBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    giInjectBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+    giInjectBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
+    giInjectBarrier.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+    VkDependencyInfo giInjectDepInfo{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    giInjectDepInfo.memoryBarrierCount = 1;
+    giInjectDepInfo.pMemoryBarriers = &giInjectBarrier;
+    vkCmdPipelineBarrier2(cmd, &giInjectDepInfo);
+
+#ifndef NDEBUG
+    // GlobalSDFPass::RecordUpdate's own trailing barrier only extends visibility to
+    // SHADER_STORAGE_READ/WRITE (its own compositing dispatches read/write the clipmap via
+    // imageLoad/imageStore) -- SDFRayMarchPass instead samples it through a COMBINED IMAGE
+    // SAMPLER (SetGlobalSDFViews), which needs SHADER_SAMPLED_READ, a distinct access flag the
+    // barrier above does not cover. Same "STORAGE_WRITE -> SAMPLED_READ" extension this class's
+    // own HZB rebuilds already need (see the barriers around m_HZB.Generate() below).
+    VkMemoryBarrier2 globalSDFToSampledBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    globalSDFToSampledBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    globalSDFToSampledBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+    globalSDFToSampledBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    globalSDFToSampledBarrier.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+    VkDependencyInfo globalSDFToSampledDep{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    globalSDFToSampledDep.memoryBarrierCount = 1;
+    globalSDFToSampledDep.pMemoryBarriers = &globalSDFToSampledBarrier;
+    vkCmdPipelineBarrier2(cmd, &globalSDFToSampledDep);
+
+    // 4. Two-tier SDF ray march DEBUG VISUALIZATION -- only its OUTPUT IMAGE is ever displayed
+    // (via the DEBUG_VIEW_LUMEN blit-swap below), but it is always recorded so the debug view
+    // shows this frame's state the instant it's selected, with no one-frame lag.
+    m_SDFRayMarch.RecordRayMarch(cmd, m_GlobalSDF, cameraFrameInfo.position, cameraFrameInfo.forward,
+                                 maths::vec3{0.0f, 1.0f, 0.0f}, cameraFrameInfo.fovYRadians,
+                                 cameraFrameInfo.aspectRatio, cameraFrameInfo.nearZ, cameraFrameInfo.farZ);
+#endif
+  }
 
   // =========================================================================================
   // [1a] Async streaming triage: read back LAST frame's residency misses (captured by this
@@ -835,77 +958,41 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
   // output image. The software rasterizer's atomic writes are already visible
   // (RecordRaster's trailing COMPUTE -> COMPUTE barrier).
   // =========================================================================================
-  m_Resolve.RecordResolve(cmd, viewProj
+  maths::mat4 prevViewProjForResolve = m_HasPrevViewProj ? m_PrevViewProj : viewProj;
+  m_Resolve.RecordResolve(cmd, viewProj, prevViewProjForResolve
 #ifndef NDEBUG
     , camera.debugViewMode
 #endif
   );
 
+  // [12b] Screen Space Probe GI: trace -> temporal reprojection/accumulation -> bilateral
+  // gather, read-modify-writing m_Resolve's own output color image directly (see
+  // renderer::ScreenProbeGIPass's own class comment for the exact per-frame call contract). Runs
+  // after [12] Resolve (needs its GBuffer) and after [1z]'s GI injection (this frame's Surface
+  // Cache radiance atlas already reflects this frame's own lighting/capture/injection updates).
   // =========================================================================================
-  // [12.1] Lumen-style GI chain (see this class' own comment for the dependency order each
-  // pass's header already documents). Depth is still DEPTH_STENCIL_READ_ONLY_OPTIMAL from [11]
-  // (m_Resolve does not further transition it), which is exactly the layout every new pass below
-  // was bound against at Init() time.
-  // =========================================================================================
-  m_GlobalSDF.RecordUpdate(cmd, cameraPositionWorld);
-  m_ShadowMap.RecordCapture(cmd, sunDirection);
-
   {
-    // Derived from the view matrix's own row-vectors (mat4::LookAt's convention: row 1 = up,
-    // row 2 = -forward -- see maths::mat4::LookAt's own comment), since RecordFrame is only
-    // handed the raw CameraPushConstants, not a renderer::Camera reference with its own
-    // GetForwardVector(). nearZ/farZ mirror core/Camera.h's own hardcoded, non-configurable
-    // m_Near/m_Far (0.1f / 1000.0f -- that class exposes no getter/setter for either, so these
-    // are not independently derivable from CameraPushConstants at all).
-    maths::vec3 cameraForward = maths::vec3{ -camera.view.m[2], -camera.view.m[6], -camera.view.m[10] }.Normalize();
-    maths::vec3 cameraUp = maths::vec3{ camera.view.m[1], camera.view.m[5], camera.view.m[9] }.Normalize();
-    float fovYRadians = 2.0f * std::atan(1.0f / projScaleY);
-    float aspectRatio = static_cast<float>(m_RenderExtent.width) / static_cast<float>(m_RenderExtent.height);
-    constexpr float kNearZ = 0.1f;
-    constexpr float kFarZ = 1000.0f;
-
-    m_SurfaceCache.UpdateVisibility(cameraPositionWorld, cameraForward, cameraUp, fovYRadians, aspectRatio, kNearZ, kFarZ);
-  }
-
-  {
-    // renderer::LightingTypes.h's DirectionalLight::direction points FROM the light TOWARD the
-    // scene, the opposite convention from this function's own `sunDirection` parameter (surface-
-    // to-light, matching ClusterResolve.comp's own `lightDir` -- see LightingTypes.h's own
-    // comment) -- negated here so the Surface Cache capture's shadow-tested sun term and
-    // ClusterResolve.comp's hardcoded direct light agree on where the sun actually is.
-    SceneLights lights{};
-    lights.sun.direction = sunDirection * -1.0f;
-    m_SurfaceCache.UpdateLighting(lights, m_ShadowMap.GetLightViewProj());
-  }
-  m_SurfaceCache.RecordCapture(cmd);
-
-  // Cheap, host-side only (memcpy into already-allocated buffers) -- see
-  // SurfaceCacheTraceContext::RefreshCardTable's own "must be called every frame" contract.
-  m_TraceContext.RefreshCardTable(m_SurfaceCache);
-
-  // traceMode = 0 (SWRT): see this class' own comment on why HWRT stays unused by default.
-  m_GIInject.RecordInject(cmd, m_TraceContext, m_SurfaceCache, /*traceMode=*/0);
-  {
-    // Makes the just-re-injected radiance atlas (m_GIInject writes it via the SAME image
-    // aliased as both set-0 storage and set-2 sampled -- see SurfaceCacheGIInject.comp's own
-    // header comment on that intentional aliasing) visible to the World Probe grid update next.
-    VkMemoryBarrier2 barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
-    barrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-    barrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-    barrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-    barrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
-
-    VkDependencyInfo depInfo{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
-    depInfo.memoryBarrierCount = 1;
-    depInfo.pMemoryBarriers = &barrier;
-    vkCmdPipelineBarrier2(cmd, &depInfo);
+    maths::mat4 prevViewProjForProbes = m_HasPrevViewProj ? m_PrevViewProj : maths::mat4{};
+    m_ScreenProbeGI.RecordUpdateViewParams(cmd, viewProj, prevViewProjForProbes);
+    m_ScreenProbeGI.RecordTrace(cmd, m_TraceContext, m_TraceContext.GetEntityCount(), traceMode, m_FrameIndex);
+    m_ScreenProbeGI.RecordTemporal(cmd);
+    m_ScreenProbeGI.RecordGather(cmd
+#ifndef NDEBUG
+      , camera.debugViewMode
+#endif
+    );
   }
 
   // =========================================================================================
-  // [12.2] World Probe grid: fully rebuilt every frame from the Surface Cache radiance atlas
-  // just re-injected above.
+  // [12c] World Probe grid: fully rebuilt every frame from the Surface Cache radiance atlas
+  // [1z] already re-injected into this frame ("Propage l'éclairage du Surface Cache directement
+  // dans cette grille 3D à chaque frame") -- what dynamic/off-screen objects sample for indirect
+  // light (world_probe_sampling.glsl's SampleWorldProbeGrid), since m_ScreenProbeGI's screen-
+  // space probes only exist for on-screen pixels. Independent GPU work from [12b] above (no data
+  // dependency either way), just recorded after it for locality with the rest of this frame's new
+  // GI additions.
   // =========================================================================================
-  m_WorldProbes.RecordUpdate(cmd, cameraPositionWorld, m_TraceContext, /*traceMode=*/0);
+  m_WorldProbes.RecordUpdate(cmd, cameraFrameInfo.position, m_TraceContext, traceMode);
   {
     VkMemoryBarrier2 barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
     barrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
@@ -920,18 +1007,23 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
   }
 
   // =========================================================================================
-  // [12.3] SSRT (tiered with the World Probe grid as its own fallback) -> spatial denoiser ->
-  // final composite. m_Resolve's G-buffer normal + color, and the depth image, are all already
-  // visible from [11]/[12]'s own trailing barriers.
+  // [12d] Final spatial denoiser (À-Trous wavelet): only in the normal (non-debug-visualization)
+  // view path -- DEBUG_VIEW_LUMEN substitutes a completely different image at the blit ([14]
+  // below) and DEBUG_VIEW_SPATIAL_PROBES's own gridline overlay (drawn directly into m_Resolve's
+  // color image by [12b] above) would be blurred by an edge-aware filter whose depth/normal
+  // guides know nothing about that artificial overlay -- so denoising either would only degrade
+  // an existing debug tool for no benefit. m_Resolve's own G-buffer normal/depth (already visible
+  // from [11]/[12]'s own trailing barriers) guide the filter; ends with its own trailing barrier
+  // (COMPUTE_SHADER/STORAGE_WRITE -> COMPUTE_SHADER/SHADER_SAMPLED_READ) for [14]'s blit read.
   // =========================================================================================
-  m_ScreenTrace.RecordTrace(cmd, camera, cameraPositionWorld, m_WorldProbes.GetGridOriginWorld(), m_GIFrameIndex);
-  m_Denoiser.RecordDenoise(cmd);
-  m_GIComposite.RecordComposite(cmd
 #ifndef NDEBUG
-    , camera, cameraPositionWorld, m_WorldProbes.GetGridOriginWorld()
+  bool applyDenoise = (camera.debugViewMode == DEBUG_VIEW_NORMAL);
+#else
+  bool applyDenoise = true;
 #endif
-  );
-  ++m_GIFrameIndex;
+  if (applyDenoise) {
+    m_Denoiser.RecordDenoise(cmd);
+  }
 
   // =========================================================================================
   // [13] Second HZB rebuild, from the now-complete (early + late) depth: this
@@ -1014,22 +1106,39 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
     m_LastStatsSampleBytes = totalBytesCompleted;
 
     m_DebugOverlay.BuildFrameText(gpuMemUsedMB, pendingPageLoads, bytesPerSecond, hwTriangleCount, swTriangleCount);
-    // Drawn onto m_GIComposite's output (NOT m_Resolve's own direct-lit image) -- this now runs
-    // after the GI composite step, so the overlay text must land on the actual final image the
-    // blit below reads from, not on a color buffer the composite has already snapshotted past.
-    m_DebugOverlay.RecordDraw(cmd, m_GIComposite.GetOutputImage(), m_GIComposite.GetOutputView(), m_RenderExtent);
+    // Drawn onto whichever image [14]'s blit will actually read below (m_Denoiser's output when
+    // [12d] applied it, m_Resolve's own color image otherwise -- same `applyDenoise` condition) --
+    // the overlay text must land on the real final image, not on a buffer already bypassed.
+    VkImage overlayTargetImage = applyDenoise ? m_Denoiser.GetOutputImage() : m_Resolve.GetOutputColorImage();
+    VkImageView overlayTargetView = applyDenoise ? m_Denoiser.GetOutputView() : m_Resolve.GetOutputColorView();
+    m_DebugOverlay.RecordDraw(cmd, overlayTargetImage, overlayTargetView, m_RenderExtent);
   }
 #endif
 
   // =========================================================================================
-  // [14] Blit the FINAL GI COMPOSITE image (m_GIComposite -- direct light + denoised indirect,
-  // see [12.3]; NOT m_Resolve's own direct-lit-only output anymore) to the swapchain image and
-  // hand it to present. The composite output stays in GENERAL (valid blit source layout); its
-  // own trailing barrier targeted the BLIT stage already (see GICompositePass::RecordComposite's
-  // own trailing barrier), but is re-stated here explicitly for the same reason every other
-  // cross-pass barrier in this function is: the dependency must not silently vanish if an
-  // intermediate pass's barriers change.
+  // [14] Blit the final image (m_Denoiser's own denoised output, when [12d] applied it; otherwise
+  // m_Resolve's own color image directly -- see `applyDenoise`/`blitSourceImage` above) to the
+  // swapchain image and hand it to present. Every candidate image stays in GENERAL (valid blit
+  // source layout); each one's own trailing barrier already targeted the BLIT stage, but is
+  // re-stated here explicitly for the same reason every other cross-pass barrier in this function
+  // is: the dependency must not silently vanish if an intermediate pass's barriers change.
   // =========================================================================================
+  // DEBUG_VIEW_LUMEN swaps the blit SOURCE to m_SDFRayMarch's own debug-visualization image
+  // instead of m_Resolve's normal lit output -- see ClusterRenderPipeline.h's own comment on why
+  // this (not sampling it from within ClusterResolve.comp) is the chosen mechanism. Both images
+  // share the exact same format (VK_FORMAT_R8G8B8A8_UNORM) and permanent layout (GENERAL), and
+  // both are last written by a compute shader's imageStore, so the SAME barrier below (targeting
+  // COMPUTE_SHADER_BIT/SHADER_STORAGE_WRITE_BIT -> BLIT_BIT/TRANSFER_READ_BIT) covers either
+  // choice with no changes needed -- only which VkImage is actually blitted differs.
+  // Denoised (see [12d] above) unless a debug view substitutes a different image entirely
+  // (DEBUG_VIEW_LUMEN) or would have its own overlay blurred by the filter (DEBUG_VIEW_SPATIAL_
+  // PROBES) -- applyDenoise (computed at [12d]) tracks exactly the same condition.
+  VkImage blitSourceImage = applyDenoise ? m_Denoiser.GetOutputImage() : m_Resolve.GetOutputColorImage();
+#ifndef NDEBUG
+  if (camera.debugViewMode == DEBUG_VIEW_LUMEN) {
+    blitSourceImage = m_SDFRayMarch.GetOutputImage();
+  }
+#endif
   {
     VkMemoryBarrier2 resolveToBlitBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
     resolveToBlitBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
@@ -1068,7 +1177,7 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
                               static_cast<int32_t>(m_RenderExtent.height), 1};
   // Same extent both sides -- the "blit" is a 1:1 copy that also performs the
   // RGBA8 -> B8G8R8A8 component reordering the swapchain format requires.
-  vkCmdBlitImage(cmd, m_GIComposite.GetOutputImage(), VK_IMAGE_LAYOUT_GENERAL,
+  vkCmdBlitImage(cmd, blitSourceImage, VK_IMAGE_LAYOUT_GENERAL,
                  swapchainImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
                  &blitRegion, VK_FILTER_NEAREST);
 
@@ -1091,6 +1200,13 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
     depInfo.pImageMemoryBarriers = &presentBarrier;
     vkCmdPipelineBarrier2(cmd, &depInfo);
   }
+
+  // Recorded last, after every consumer of "the previous frame's" viewProj above (m_Resolve's own
+  // motion-vector debug view, m_ScreenProbeGI's temporal reprojection) has already read it --
+  // this frame's own matrix becomes "the previous frame's" for the NEXT RecordFrame() call.
+  m_PrevViewProj = viewProj;
+  m_HasPrevViewProj = true;
+  ++m_FrameIndex;
 }
 
 } // namespace renderer

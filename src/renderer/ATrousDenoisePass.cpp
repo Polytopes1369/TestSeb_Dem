@@ -63,7 +63,17 @@ namespace renderer {
         imageInfo.arrayLayers = 1;
         imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
         imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
-        imageInfo.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        // TRANSFER_SRC_BIT: this pass' output can be the final blit source (renderer::
+        // ClusterRenderPipeline's own `blitSourceImage` selection). COLOR_ATTACHMENT_BIT, Debug
+        // builds only: renderer::debug::DebugTextOverlay::RecordDraw draws its stat overlay
+        // directly onto this image via a graphics pipeline / vkCmdBeginRendering (see that class'
+        // own comment) whenever ClusterRenderPipeline's `applyDenoise` selects it -- a Release
+        // build never calls RecordDraw at all, so this extra usage flag would be pure waste there.
+        imageInfo.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+#ifndef NDEBUG
+            | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
+#endif
+            ;
         imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
         imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
@@ -178,7 +188,12 @@ namespace renderer {
         for (uint32_t i = 0; i < 3; ++i) {
             VkDescriptorImageInfo inputInfo{ m_NearestSampler, setInputs[i], VK_IMAGE_LAYOUT_GENERAL };
             VkDescriptorImageInfo outputInfo{ VK_NULL_HANDLE, setOutputs[i], VK_IMAGE_LAYOUT_GENERAL };
-            VkDescriptorImageInfo depthInfo{ m_NearestSampler, depthView, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL };
+            // GENERAL, not DEPTH_STENCIL_READ_ONLY_OPTIMAL: `depthView` is renderer::
+            // ClusterResolvePass::GetOutputDepthView(), a plain COLOR-aspect R32_SFLOAT GBuffer
+            // image (the winning hw-vs-sw arbitrated NDC depth, not a real depth-attachment image)
+            // kept in VK_IMAGE_LAYOUT_GENERAL for its entire lifetime, like every other GBuffer
+            // image renderer::ClusterResolvePass owns.
+            VkDescriptorImageInfo depthInfo{ m_NearestSampler, depthView, VK_IMAGE_LAYOUT_GENERAL };
             VkDescriptorImageInfo normalInfo{ m_NearestSampler, normalView, VK_IMAGE_LAYOUT_GENERAL };
 
             VkWriteDescriptorSet writes[4]{};

@@ -66,15 +66,15 @@
 #include "renderer/ClusterOcclusionCullingPass.h"
 #include "renderer/ClusterResolvePass.h"
 #include "renderer/ClusterSoftwareRasterPass.h"
-#include "renderer/GICompositePass.h"
 #include "renderer/GeometryDecompressionPass.h"
 #include "renderer/GeometryStreamingCoordinator.h"
 #include "renderer/GlobalSDFPass.h"
 #include "renderer/GpuBuffer.h"
 #include "renderer/GpuGeometryPagePool.h"
 #include "renderer/HZBPass.h"
+#include "renderer/LightingTypes.h"
 #include "renderer/ProceduralMaskGenerator.h"
-#include "renderer/ScreenTracePass.h"
+#include "renderer/ScreenProbeGIPass.h"
 #include "renderer/ShadowMapPass.h"
 #include "renderer/SurfaceCacheGIInjectPass.h"
 #include "renderer/SurfaceCachePass.h"
@@ -84,6 +84,7 @@
 #ifndef NDEBUG
 #include "renderer/debug/ClusterTriangleStatsPass.h"
 #include "renderer/debug/DebugTextOverlay.h"
+#include "renderer/SDFRayMarchPass.h"
 #endif
 
 namespace renderer {
@@ -91,11 +92,10 @@ namespace renderer {
     // Everything Init() needs from the outside world, in one struct -- all handles are borrowed
     // (owned by VulkanContext), only the passes/buffers this class creates itself are owned.
     struct ClusterRenderPipelineCreateInfo {
-        VkDevice device = VK_NULL_HANDLE;
-        // Needed only for renderer::SurfaceCacheRayTracingPass::Init's BLAS/TLAS build (queries
-        // VkPhysicalDeviceRayTracingPipelinePropertiesKHR for SBT alignment) -- every other pass
-        // this class owns needs only the logical device.
+        // Needed only by renderer::SurfaceCacheRayTracingPass::Init (VkPhysicalDeviceRayTracingPipelinePropertiesKHR
+        // query -- shaderGroupBaseAlignment/shaderGroupHandleSize for the Shader Binding Table).
         VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
+        VkDevice device = VK_NULL_HANDLE;
         VmaAllocator allocator = VK_NULL_HANDLE;
         VkCommandPool commandPool = VK_NULL_HANDLE;
         VkQueue queue = VK_NULL_HANDLE;
@@ -152,18 +152,22 @@ namespace renderer {
         // identically from ClusterRaster.vert and ClusterSoftwareRaster.comp) -- uploaded once per
         // frame into m_WPOGlobalsBuffer before either raster pass runs. The caller only
         // begins/ends/submits the command buffer and presents.
-        // `sunDirection` drives BOTH renderer::ShadowMapPass's light view-projection AND (matching
-        // ClusterResolve.comp's own hardcoded vec3(0.5,1,0.5) sun so the raster pass's direct light
-        // and the Surface Cache capture's shadow-tested sun term agree visually) defaults to that
-        // exact direction, normalized, when the caller does not override it.
         void RecordFrame(VkCommandBuffer cmd, const CameraPushConstants& camera,
-            const maths::vec3& cameraPositionWorld, float globalTimeSeconds, VkImage swapchainImage,
-            const maths::vec3& sunDirection = maths::vec3{ 0.5f, 1.0f, 0.5f }.Normalize());
+            const maths::vec3& cameraPositionWorld, const CameraFrameInfo& cameraFrameInfo,
+            float globalTimeSeconds, VkImage swapchainImage);
 
         // Upper bound on this frame's actual candidate count (the DAG's total leaf count) -- NOT
         // this frame's real candidate count, which only ever exists on the GPU now that
         // m_LODSelection computes a dynamic per-frame cut (see ClusterLODSelectionPass).
         uint32_t GetClusterCount() const { return m_ClusterCount; }
+
+#ifndef NDEBUG
+        // SWRT/HWRT back-end toggle shared by m_GIInject and m_ScreenProbeGI (0 = SWRT mesh-SDF
+        // sphere tracing, 1 = HWRT inline rayQueryEXT against m_SurfaceCacheRT's TLAS) -- debug-only
+        // (main.cpp numpad/T key) so both back-ends stay exercised; Release always uses HWRT (see
+        // RecordFrame()'s own use of this member).
+        void SetDebugTraceMode(uint32_t traceMode) { m_DebugTraceMode = traceMode; }
+#endif
 
     private:
         // Records the vkCmdBeginRendering block shared by the early and late hardware raster
@@ -216,27 +220,69 @@ namespace renderer {
         ClusterSoftwareRasterPass m_SoftwareRaster;
         ClusterResolvePass m_Resolve;
 
-        // --- Lumen-style GI chain (previously self-contained but orphaned -- see this class'
-        // own comment: this is where it actually gets driven, in the dependency order each of
-        // these classes' own header already documents). ---
-        GlobalSDFPass m_GlobalSDF;
-        SurfaceCachePass m_SurfaceCache;
+        // Lumen-style GI infrastructure -- unlike the debug-only stats/overlay block below, these
+        // are real (if not yet light-transport-consuming) systems, not visualization tools, so
+        // they compile in Release too (matching how the actual Nanite cluster pipeline above is
+        // likewise unconditional; only the NUMPAD-DRIVEN DEBUG VIEW SWITCHING is Debug-only, per
+        // CLAUDE.md's build-separation rule). Recorded every frame in RecordFrame() regardless of
+        // camera.debugViewMode.
         ShadowMapPass m_ShadowMap;
+        SurfaceCachePass m_SurfaceCache;
+        GlobalSDFPass m_GlobalSDF;
+        // Fixed sun-only lighting for now (default-constructed SceneLights: no point lights) --
+        // see renderer::LightingTypes.h's own comment; a future scene-authoring system would
+        // populate this instead of leaving it default.
+        SceneLights m_SceneLights;
+
+        // Shared trace-scene descriptor sets (mesh SDF trace + Surface Cache sampling, see
+        // SurfaceCacheTraceContext's own class comment) built once from m_GlobalSDF + m_SurfaceCache,
+        // reused unmodified by m_SurfaceCacheRT, m_GIInject, m_ScreenProbeGI's own trace pass, and
+        // m_WorldProbes' own trace pass.
         SurfaceCacheTraceContext m_TraceContext;
+        // HWRT back-end: one BLAS per traced entity + one TLAS, built once (static scene) against
+        // m_SurfaceCache's own Fallback Mesh vertex/index buffers.
         SurfaceCacheRayTracingPass m_SurfaceCacheRT;
+        // Per-card hemisphere-sampled secondary-bounce injection into m_SurfaceCache's own radiance
+        // atlas -- makes that atlas genuinely multi-bounce over time, which is what
+        // m_ScreenProbeGI's single-hit-sample final gather then benefits from.
         SurfaceCacheGIInjectPass m_GIInject;
 
-        // --- New: SSRT + World Probe grid + spatial denoiser + final composite (see this class'
-        // own comment for exactly where these sit in the per-frame sequence). ---
-        WorldProbeGridPass m_WorldProbes;
-        ScreenTracePass m_ScreenTrace;
-        ATrousDenoisePass m_Denoiser;
-        GICompositePass m_GIComposite;
+        // Screen Space Probe GI (Lumen "Screen Probe Gather"): traces Fibonacci-sphere rays per
+        // 8x8-pixel probe (sampling m_SurfaceCache's radiance atlas at each hit via m_TraceContext/
+        // m_SurfaceCacheRT), temporally accumulates, and gathers the result back into m_Resolve's
+        // output color image -- see ScreenProbeGIPass's own class comment.
+        ScreenProbeGIPass m_ScreenProbeGI;
 
-        // Advances once per RecordFrame() call -- the Halton-sequence temporal offset threaded
-        // into both m_GIInject::RecordInject and m_ScreenTrace::RecordTrace, exactly like
-        // SurfaceCacheGIInjectPass's own internal m_FrameIndex.
-        uint32_t m_GIFrameIndex = 0;
+        // World Probe grid (Lumen "Translucency Volume" / global illumination volume): a low-
+        // resolution, camera-centered 3D grid of ambient irradiance probes, fully rebuilt every
+        // frame from m_SurfaceCache's radiance atlas -- what dynamic/off-screen objects (particle
+        // systems, animated characters, anything m_ScreenProbeGI's screen-space probes cannot cover
+        // because they have no on-screen presence of their own) sample for indirect light, via
+        // world_probe_sampling.glsl's SampleWorldProbeGrid(). See WorldProbeGridPass's own class
+        // comment for why this is a SEPARATE system from m_ScreenProbeGI, not a duplicate of it.
+        WorldProbeGridPass m_WorldProbes;
+
+        // Final spatial denoiser (À-Trous wavelet, edge-guided by m_Resolve's own G-buffer normal/
+        // depth): a spatial cleanup pass over the fully composited frame (direct light +
+        // m_ScreenProbeGI's own temporally-accumulated indirect term), applied only in the normal
+        // (non-debug-visualization) view path -- see RecordFrame()'s own comment for exactly why.
+        ATrousDenoisePass m_Denoiser;
+
+        // Previous frame's combined view-projection matrix -- ScreenProbeGIPass's temporal pass
+        // (and ClusterResolve.comp's DEBUG_VIEW_MOTION_VECTORS) reprojects a probe's/pixel's
+        // (static, see this class' own "Entity self-rotation" scope note) world position with this
+        // matrix to find its screen position last frame. Updated at the very end of RecordFrame(),
+        // after every consumer of "the previous frame's" value has run.
+        maths::mat4 m_PrevViewProj{};
+        bool m_HasPrevViewProj = false;
+
+        // Advances once per RecordFrame() call -- ScreenProbeTrace.comp's own per-frame Fibonacci-
+        // sphere jitter rotation (include/sh_probe.glsl's JitterDirection).
+        uint32_t m_FrameIndex = 0;
+
+#ifndef NDEBUG
+        uint32_t m_DebugTraceMode = 0;
+#endif
 
 #ifndef NDEBUG
         // Real-time stat overlay (GPU memory used, pending SSD page loads, disk read throughput,
@@ -251,6 +297,13 @@ namespace renderer {
         // derived) and GeometryStreamingCoordinator::GetTotalBytesCompleted()'s running total.
         float m_LastStatsSampleTime = 0.0f;
         uint64_t m_LastStatsSampleBytes = 0;
+
+        // Two-tier SDF ray march DEBUG VISUALIZATION (see renderer::SDFRayMarchPass's own class
+        // comment: its whole output is "a full-screen debug-visualization image", never consumed
+        // by production lighting) -- Debug-only per CLAUDE.md's build-separation rule, exactly
+        // like m_TriangleStats/m_DebugOverlay above. Only recorded (and only ever blitted to the
+        // swapchain in place of m_Resolve's output) when camera.debugViewMode == DEBUG_VIEW_LUMEN.
+        SDFRayMarchPass m_SDFRayMarch;
 #endif
     };
 

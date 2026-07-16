@@ -30,6 +30,21 @@ struct CameraPushConstants {
 #endif
 };
 
+// Plain per-frame camera parameters needed by CPU-side passes that must reconstruct a view
+// frustum or per-pixel ray themselves instead of just consuming Camera's own view/proj matrices
+// (renderer::SurfaceCachePass::UpdateVisibility's frustum-plane test, renderer::SDFRayMarchPass::
+// RecordRayMarch's per-pixel ray reconstruction) -- both compiled unconditionally (Debug and
+// Release), unlike CameraPushConstants' debugViewMode/disableOcclusionCulling fields above, since
+// renderer::SurfaceCachePass itself is not a debug-only visualization.
+struct CameraFrameInfo {
+  maths::vec3 position;
+  maths::vec3 forward;
+  float fovYRadians;
+  float aspectRatio;
+  float nearZ;
+  float farZ;
+};
+
 class Camera {
 public:
   Camera(maths::vec3 position = {10.0f, 2.0f, 0.0f},
@@ -53,6 +68,20 @@ public:
 
   const CameraPushConstants &GetPushConstants() const {
     return m_PushConstants;
+  }
+
+  // See CameraFrameInfo's own comment -- `aspectRatio` is passed in rather than stored, matching
+  // Update()'s own convention (the caller already recomputes it every frame from the current
+  // swapchain extent).
+  CameraFrameInfo GetFrameInfo(float aspectRatio) const {
+    CameraFrameInfo info{};
+    info.position = m_Position;
+    info.forward = GetForwardVector();
+    info.fovYRadians = m_FovDegrees * (3.14159265358979323846f / 180.0f);
+    info.aspectRatio = aspectRatio;
+    info.nearZ = m_Near;
+    info.farZ = m_Far;
+    return info;
   }
 
   maths::vec3 GetPosition() const { return m_Position; }

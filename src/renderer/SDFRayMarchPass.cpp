@@ -1,3 +1,6 @@
+// Debug-only (whole file compiled out in Release) -- see SDFRayMarchPass.h's own guard comment.
+#ifndef NDEBUG
+
 #include "renderer/SDFRayMarchPass.h"
 
 #include <algorithm>
@@ -254,7 +257,11 @@ namespace renderer {
         outputImageInfo.arrayLayers = 1;
         outputImageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
         outputImageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
-        outputImageInfo.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        // TRANSFER_SRC_BIT: renderer::ClusterRenderPipeline's DEBUG_VIEW_LUMEN blit-swap sources
+        // this image directly via vkCmdBlitImage (see that class's own comment), which requires
+        // the source image to carry this usage flag -- matching renderer::ClusterResolvePass's
+        // own output image, the blit's normal (non-debug) source.
+        outputImageInfo.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
         outputImageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
         outputImageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         VK_CHECK(vmaCreateImage(allocator, &outputImageInfo, &gpuOnlyAlloc, &m_OutputImage, &m_OutputAllocation, nullptr));
@@ -653,3 +660,5 @@ namespace renderer {
     }
 
 }
+
+#endif // NDEBUG
