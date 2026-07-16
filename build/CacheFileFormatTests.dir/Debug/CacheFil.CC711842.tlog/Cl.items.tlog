@@ -1,9 +1,0 @@
-D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\geometry\ClusterPartitioner.cpp;D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\CacheFileFormatTests.dir\Debug\ClusterPartitioner.obj
-D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\geometry\ClusterGrouping.cpp;D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\CacheFileFormatTests.dir\Debug\ClusterGrouping.obj
-D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\geometry\MeshSimplifier.cpp;D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\CacheFileFormatTests.dir\Debug\MeshSimplifier.obj
-D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\geometry\ClusterDAG.cpp;D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\CacheFileFormatTests.dir\Debug\ClusterDAG.obj
-D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\geometry\CardGenerator.cpp;D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\CacheFileFormatTests.dir\Debug\CardGenerator.obj
-D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\geometry\FallbackMeshBuilder.cpp;D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\CacheFileFormatTests.dir\Debug\FallbackMeshBuilder.obj
-D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\io\CacheFileManager.cpp;D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\CacheFileFormatTests.dir\Debug\CacheFileManager.obj
-D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\core\Logger.cpp;D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\CacheFileFormatTests.dir\Debug\Logger.obj
-D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\tests\CacheFileFormatTests.cpp;D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\CacheFileFormatTests.dir\Debug\CacheFileFormatTests.obj

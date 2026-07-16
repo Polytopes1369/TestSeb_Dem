@@ -1,6 +1,0 @@
-1:ClusterPartitionerTests
-2:ClusterSimplificationTests
-3:ClusterDAGTests
-4:CacheFileFormatTests
-5:MeshSDFTests
-6:ClusterMaskSplitTests

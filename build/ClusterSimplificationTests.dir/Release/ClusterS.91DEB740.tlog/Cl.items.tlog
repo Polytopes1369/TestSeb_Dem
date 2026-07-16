@@ -1,6 +1,0 @@
-D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\geometry\ClusterPartitioner.cpp;D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\ClusterSimplificationTests.dir\Release\ClusterPartitioner.obj
-D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\geometry\ClusterGrouping.cpp;D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\ClusterSimplificationTests.dir\Release\ClusterGrouping.obj
-D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\geometry\MeshSimplifier.cpp;D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\ClusterSimplificationTests.dir\Release\MeshSimplifier.obj
-D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\io\ObjExport.cpp;D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\ClusterSimplificationTests.dir\Release\ObjExport.obj
-D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\core\Logger.cpp;D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\ClusterSimplificationTests.dir\Release\Logger.obj
-D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\tests\ClusterSimplificationTests.cpp;D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\ClusterSimplificationTests.dir\Release\ClusterSimplificationTests.obj
