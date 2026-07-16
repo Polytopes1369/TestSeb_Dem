@@ -27,13 +27,14 @@
 #define DAG_DECISION_SUBDIVIDE 1u
 #define DAG_DECISION_SKIP      2u
 
-// Field order is deliberate: sphereCenter (the only vec3) comes first so it naturally lands at
-// offset 0 (already a multiple of its own 16-byte std430 base alignment) -- every field after it
-// is a plain 4-byte scalar with no alignment needs of its own. entityID's trailing 3-word pad
-// rounds the struct up to 64 bytes (its actual std430 array stride) -- the C++ mirror
-// (renderer::DAGNodePayload, ClusterLODSelectionPass.h) matches it field-for-field, declaring that
-// same padding explicitly. See renderer::ClusterLODSelectionPass for the driver that populates
-// this SSBO from geometry::ClusterIndexEntry / DAGNodeEntry.
+// Field order is deliberate: sphereCenter (the only leading vec3) comes first so it naturally
+// lands at offset 0 (already a multiple of its own 16-byte std430 base alignment) -- every scalar
+// field after it packs tightly until parentSphereCenter, itself a vec3, which therefore needs to
+// start back on a 16-byte boundary (offset 64, already aligned) -- its own trailing pad brings the
+// struct to 80 bytes (its actual std430 array stride). The C++ mirror (renderer::DAGNodePayload,
+// ClusterLODSelectionPass.h) matches it field-for-field, declaring that same padding explicitly.
+// See renderer::ClusterLODSelectionPass for the driver that populates this SSBO from
+// geometry::ClusterIndexEntry / DAGNodeEntry.
 struct DAGNodePayload {
     vec3 sphereCenter;
     float sphereRadius;
@@ -55,12 +56,26 @@ struct DAGNodePayload {
     float maxWPOAmplitude;
 
     // geometry::ClusterIndexEntry::entityID -- the owning entity's meshID, used below to rotate
-    // sphereCenter into its current (not rest-pose) world position before projecting error to
-    // pixels -- see cluster_entity_transform.glsl's own comment for why this matters.
+    // sphereCenter/parentSphereCenter into their current (not rest-pose) world positions before
+    // projecting error to pixels -- see cluster_entity_transform.glsl's own comment for why this
+    // matters.
     uint entityID;
     uint _pad0;
     uint _pad1;
     uint _pad2;
+
+    // The DIRECT PARENT's own sphereCenter (geometry::ClusterIndexEntry::sphereCenter at
+    // parentClusterID, NOT this node's own center) -- parentError must be projected from the
+    // parent's own position, not this node's. Using this node's sphereCenter for both projections
+    // (the original approach) implicitly assumes parent and child sit at the same world position,
+    // which is false in general (a DAG merge's centroid drifts as clusters combine upward) -- on a
+    // large, near-continuously-curving-away surface like a 300m floor seen at a grazing angle, that
+    // drift is large enough that the SAME clusterError value projects on two different sides of
+    // pixelThreshold depending on which of the two positions is used, opening a gap where NEITHER
+    // this node NOR its parent gets DAG_DECISION_DRAW -- a real, observed bug (see project memory
+    // project_persistent_cluster_holes_open_bug.md), not a hypothetical one.
+    vec3 parentSphereCenter;
+    float _pad3;
 };
 
 struct DAGScreenErrorViewParams {
@@ -126,13 +141,18 @@ void main() {
     float clusterError = node.clusterError + node.maxWPOAmplitude;
     float parentError = node.parentError + node.maxWPOAmplitude;
 
-    // Rotate the rest-pose sphere center into its current world position before projecting: a
+    // Rotate the rest-pose sphere centers into their current world positions before projecting: a
     // rotating entity's clusters would otherwise have their on-screen size estimated from a stale
     // position, drifting further out of sync with the actual render every frame it keeps spinning.
-    vec3 currentSphereCenter = TransformClusterCenterByEntity(node.sphereCenter, entityTransforms[node.entityID]);
+    EntityTransform xform = entityTransforms[node.entityID];
+    vec3 currentSphereCenter = TransformClusterCenterByEntity(node.sphereCenter, xform);
+    // Project the parent's error from the PARENT's own position, not this node's -- see
+    // DAGNodePayload::parentSphereCenter's own comment for why using this node's position here
+    // (the original approach) opens a DAG-cut gap.
+    vec3 currentParentSphereCenter = TransformClusterCenterByEntity(node.parentSphereCenter, xform);
 
     float localPixelError = ProjectedErrorToPixels(clusterError, currentSphereCenter);
-    float parentPixelError = ProjectedErrorToPixels(parentError, currentSphereCenter);
+    float parentPixelError = ProjectedErrorToPixels(parentError, currentParentSphereCenter);
 
     uint decision = DAG_DECISION_SKIP;
     if (localPixelError < g_ViewParams.data.pixelThreshold && parentPixelError >= g_ViewParams.data.pixelThreshold) {

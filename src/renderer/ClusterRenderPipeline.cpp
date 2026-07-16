@@ -660,6 +660,17 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
 
     m_LODSelection.RecordEvaluateAndCompact(cmd, lodViewParams);
 
+#ifndef NDEBUG
+    // See RequestDebugDAGCutGapsDump()'s own comment: state 1 means main.cpp's 'K' key armed a
+    // dump this frame -- record the DAGDecisionSSBO readback now (right after the dispatch that
+    // just wrote this frame's decisions) and advance to state 2 so PumpDebugDAGCutGapsDump() logs
+    // it once this frame's fence confirms the copy has landed.
+    if (m_DebugDAGCutGapsDumpState == 1) {
+        m_LODSelection.RecordDebugReadback(cmd);
+        m_DebugDAGCutGapsDumpState = 2;
+    }
+#endif
+
     // Captures THIS frame's residency-miss reports (ClusterLODResidencyFallback.comp, just
     // dispatched above) into the feedback buffer's host-visible readback half, for [1a]'s
     // ProcessFeedbackAndDrainCompletions() to consume next frame -- see FeedbackBuffer::
