@@ -29,6 +29,7 @@
 //      reconstruction exactly matches the one that determined pixel coverage originally. Ends with
 //      the barrier making GetOutputColorImage() visible to a later sampled read or blit.
 
+#include <array>
 #include <cstdint>
 #include <vector>
 #include <vulkan/vulkan.h>
@@ -36,6 +37,7 @@
 
 #include "core/maths/Maths.h"
 #include "renderer/GpuBuffer.h"
+#include "renderer/MaterialParameterTable.h"
 
 namespace renderer {
 
@@ -92,11 +94,15 @@ namespace renderer {
         // deformation (wpo_deformation.glsl's ApplyWPODeformation) that both rasterizers already
         // applied to the vertices they actually drew, so its own re-projection for barycentric
         // reconstruction operates on the same deformed triangle, not the rest-pose one.
+        // `materialTable` is renderer::GenerateRandomMaterialTable()'s result (see
+        // ClusterRenderPipelineCreateInfo::materialTable) -- copied once into the GPU SSBO here,
+        // not retained by reference (the caller's own copy may not outlive this call).
         void Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue, VkExtent2D renderExtent,
             VkBuffer clusterMetadataBuffer, VkBuffer compressedPhysicalPoolBuffer,
             VkImageView hwClusterIDView, VkImageView hwTriangleIDView, VkImageView hwDepthView,
             VkImageView swVisBufferAtomicView, const std::vector<VkDescriptorImageInfo>& maskImageInfos,
-            VkBuffer wpoGlobalsBuffer, VkBuffer entityTransformBuffer, VkBuffer entityDataBuffer);
+            VkBuffer wpoGlobalsBuffer, VkBuffer entityTransformBuffer, VkBuffer entityDataBuffer,
+            const std::array<MaterialParameters, kMaxMaterials>& materialTable);
 
         void Shutdown();
 
@@ -188,10 +194,9 @@ namespace renderer {
         VkSampler m_DepthSampler = VK_NULL_HANDLE; // Nearest filtering, matching HZBPass's own depth-sampling convention.
 
         GpuBuffer m_ViewParamsBuffer;     // ResolveViewParamsUBO, std140, GPU_ONLY.
-        // renderer::MaterialParameters[kMaxMaterials] (renderer::kMaterialParameterTable), filled
-        // once at Init() time via vkCmdUpdateBuffer -- a CPU-authored constexpr table, not a
-        // per-frame upload (unlike m_ViewParamsBuffer above), so Init() needs no extra caller-
-        // supplied parameter for it.
+        // renderer::MaterialParameters[kMaxMaterials], filled once at Init() time via
+        // vkCmdUpdateBuffer from Init()'s own `materialTable` parameter -- not a per-frame upload
+        // (unlike m_ViewParamsBuffer above).
         GpuBuffer m_MaterialParamsBuffer;
 
         VkDescriptorSetLayout m_SetLayout = VK_NULL_HANDLE;

@@ -206,6 +206,7 @@ int main() {
     pipelineInfo.cacheFilePath = "scene.cache";
     pipelineInfo.entityTransformBuffer = vkContext.GetEntityTransformBuffer();
     pipelineInfo.entityDataBuffer = vkContext.GetEntityBuffer();
+    pipelineInfo.materialTable = vkContext.GetMaterialTable();
 
     // Init is wrapped so an uncaught std::runtime_error (GpuBuffer allocation failure, missing
     // SPIR-V file, ...) surfaces as a logged message instead of a silent std::terminate -- the

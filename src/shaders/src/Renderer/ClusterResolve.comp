@@ -119,8 +119,8 @@ layout(std140, set = 0, binding = 12) uniform WPOGlobalsUBO {
     float _pad2;
 } g_WPOGlobals;
 
-// renderer::kMaterialParameterTable (renderer/MaterialParameterTable.h), filled once at
-// renderer::ClusterResolvePass::Init() -- see material_params.glsl's own comment.
+// renderer::GenerateRandomMaterialTable()'s result (renderer/MaterialParameterTable.h), filled
+// once at renderer::ClusterResolvePass::Init() -- see material_params.glsl's own comment.
 layout(std430, set = 0, binding = 13) readonly buffer MaterialParamsSSBO {
     MaterialParams params[];
 } g_MaterialParams;

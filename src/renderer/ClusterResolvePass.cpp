@@ -41,7 +41,8 @@ namespace renderer {
         VkBuffer clusterMetadataBuffer, VkBuffer compressedPhysicalPoolBuffer,
         VkImageView hwClusterIDView, VkImageView hwTriangleIDView, VkImageView hwDepthView,
         VkImageView swVisBufferAtomicView, const std::vector<VkDescriptorImageInfo>& maskImageInfos,
-        VkBuffer wpoGlobalsBuffer, VkBuffer entityTransformBuffer, VkBuffer entityDataBuffer) {
+        VkBuffer wpoGlobalsBuffer, VkBuffer entityTransformBuffer, VkBuffer entityDataBuffer,
+        const std::array<MaterialParameters, kMaxMaterials>& materialTable) {
         Shutdown();
 
         m_Device = device;
@@ -149,18 +150,19 @@ namespace renderer {
             depInfo.pImageMemoryBarriers = barriers;
             vkCmdPipelineBarrier2(cmd, &depInfo);
 
-            // --- Material parameter table: a small, CPU-authored constexpr array (renderer::
-            // kMaterialParameterTable, renderer/MaterialParameterTable.h), not a per-frame value --
-            // filled once, here, in the same one-time command buffer as the image transitions above
-            // (no ordering dependency between them, so recording order doesn't matter). Well under
-            // vkCmdUpdateBuffer's 65536-byte limit (kMaxMaterials * sizeof(MaterialParameters) =
-            // 32 * 32 = 1024 bytes). No intra-command-buffer barrier is needed after this write --
-            // ExecuteOneShotCommands' own vkQueueWaitIdle fully orders it before any later-submitted
-            // command buffer's reads, exactly like ClusterRenderPipeline::Init()'s own one-time setup submit.
+            // --- Material parameter table: renderer::GenerateRandomMaterialTable()'s result
+            // (passed in via `materialTable`, generated once by VulkanContext -- see this method's
+            // own doc comment), not a per-frame value -- filled once, here, in the same one-time
+            // command buffer as the image transitions above (no ordering dependency between them,
+            // so recording order doesn't matter). Well under vkCmdUpdateBuffer's 65536-byte limit
+            // (kMaxMaterials * sizeof(MaterialParameters) = 32 * 48 = 1536 bytes). No intra-
+            // command-buffer barrier is needed after this write -- ExecuteOneShotCommands' own
+            // vkQueueWaitIdle fully orders it before any later-submitted command buffer's reads,
+            // exactly like ClusterRenderPipeline::Init()'s own one-time setup submit.
             m_MaterialParamsBuffer.Create(allocator, sizeof(MaterialParameters) * kMaxMaterials,
                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
             vkCmdUpdateBuffer(cmd, m_MaterialParamsBuffer.Handle(), 0,
-                sizeof(MaterialParameters) * kMaxMaterials, kMaterialParameterTable.data());
+                sizeof(MaterialParameters) * kMaxMaterials, materialTable.data());
         });
 
         // --- Depth sampler: nearest filtering, matching HZBPass's own depth-sampling convention
@@ -282,10 +284,10 @@ namespace renderer {
         // like the two raster passes already borrow it.
         VkDescriptorBufferInfo wpoGlobalsInfo{ wpoGlobalsBuffer, 0, VK_WHOLE_SIZE };
 
-        // renderer::kMaterialParameterTable, already fully filled by the one-time command buffer
-        // above (m_MaterialParamsBuffer.Handle() is valid the moment Create() returns -- the fill
-        // itself is only ORDERED, not required to have already executed, by the time this VkBuffer
-        // handle is written into a descriptor).
+        // The material table passed into Init(), already fully filled by the one-time command
+        // buffer above (m_MaterialParamsBuffer.Handle() is valid the moment Create() returns -- the
+        // fill itself is only ORDERED, not required to have already executed, by the time this
+        // VkBuffer handle is written into a descriptor).
         VkDescriptorBufferInfo materialParamsInfo{ m_MaterialParamsBuffer.Handle(), 0, m_MaterialParamsBuffer.Size() };
 
         VkDescriptorImageInfo outputRoughnessMetallicInfo{};

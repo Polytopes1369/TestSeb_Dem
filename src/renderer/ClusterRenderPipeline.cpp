@@ -263,7 +263,8 @@ bool ClusterRenderPipeline::Init(
       m_MaskGenerator.GetMaskImageInfos(),
       m_WPOGlobalsBuffer.Handle(),
       createInfo.entityTransformBuffer,
-      createInfo.entityDataBuffer);
+      createInfo.entityDataBuffer,
+      createInfo.materialTable.params);
 
   // Phase 1b: the shading-bin sort pass needs m_Resolve's own 5 output image views (its Classify
   // stage writes background pixels directly into them, see ClusterShadingBinPass's own class
@@ -308,6 +309,21 @@ bool ClusterRenderPipeline::Init(
   // m_Resolve's descriptor sets to already exist) -- see the call further below.
   m_SurfaceCache.SetVirtualShadowMap(m_VirtualShadowMap);
   m_Resolve.SetVirtualShadowMap(m_VirtualShadowMap);
+
+  // Sun orientation: Toronto (lat 43.6532N, lon 79.3832W), July 16, 16:30 local (EDT, UTC-4) --
+  // a standard NOAA solar-position computation (equation of time + hour angle + declination for
+  // day-of-year 197) gives solar elevation ~45.5 degrees and azimuth ~255.3 degrees (measured
+  // clockwise from North -- i.e. WSW, past due-south/solar-noon since 16:30 EDT is mid-afternoon).
+  // Axis convention chosen for this scene (no real-world map exists, Y is up): +X = East, -Z =
+  // North, so azimuth Az and elevation El convert to the unit vector FROM the scene TOWARD the sun
+  // as (cos(El)*sin(Az), sin(El), -cos(El)*cos(Az)); DirectionalLight::direction is the reverse of
+  // that (points FROM the light TOWARD the scene, see LightingTypes.h's own convention comment).
+  // The lower afternoon elevation (vs. a near-overhead default) is what actually produces long,
+  // clearly readable cast shadows instead of short near-vertical ones.
+  m_SceneLights.sun.direction = maths::vec3(0.678f, -0.713f, -0.178f).Normalize();
+  // Mild warm tint for late-afternoon sunlight (intensity left at its existing default -- a 45
+  // degree summer sun is still strong, not golden-hour-grazing).
+  m_SceneLights.sun.color = maths::vec3(1.0f, 0.88f, 0.72f);
 
   // Phase 3 (UE5.8 parity roadmap) verification: SceneLights::pointLights defaults to an empty
   // array (see LightingTypes.h) -- with zero point lights ever authored, Phase 3's point-light

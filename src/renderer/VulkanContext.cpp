@@ -3,7 +3,7 @@
 #include "core/EngineConfig.h" // Centralized engine configurations (config::WINDOW_WIDTH, etc.)
 #include "core/EntityData.h"
 #include "core/Logger.h"
-#include "renderer/MaterialParameterTable.h" // renderer::kAuthoredMaterialRecipeCount, for BuildEntityData()'s materialID assignment
+#include "renderer/MaterialParameterTable.h" // renderer::GenerateRandomMaterialTable, for BuildEntityData()'s per-entity material generation
 #include "renderer/RenderTypes.h" // renderer::Vertex, used to interpret the DEBUG readback bytes
 #include "renderer/RayTracingFunctions.h"
 #include "VulkanUtils.h"
@@ -1229,20 +1229,31 @@ void VulkanContext::BuildEntityData() {
   // kEntityCount's dense-index requirement.
   core::IDManager::Init(0);
 
+  // One unique randomly-generated material per entity (materialID == entity index) instead of
+  // cycling through a handful of hand-authored recipes -- see GenerateRandomMaterialTable's own
+  // comment for why the seed is fixed rather than truly random.
+  constexpr uint32_t kMaterialRandomSeed = 1337u;
+  m_MaterialTable = renderer::GenerateRandomMaterialTable(kEntityCount, kMaterialRandomSeed);
+
   for (uint32_t i = 0; i < kEntityCount; ++i) {
     core::EntityID id = core::IDManager::GetNextID();
 
     core::EntityData &entity = m_EntityData[i];
     entity.meshID = static_cast<uint32_t>(id & 0xFFFFFFFFu);
-    // Cycles through renderer::kMaterialParameterTable's authored recipes (renderer::
-    // MaterialParameterTable.h) so this demo grid actually exercises multiple materials -- was
-    // hardcoded to 0u before real PBR materials existed, which would otherwise leave Phase 1a
-    // compiling clean but visually indistinguishable from the old procedural-hash shading (every
-    // entity resolving to the same single default material).
-    entity.materialID = i % renderer::kAuthoredMaterialRecipeCount;
+    entity.materialID = i;
     entity.cellID = 0u;
     entity.flags = 0u;
     core::SetFlag(entity.flags, core::EntityFlags::CastShadows, true);
+
+    bool isTransparent = m_MaterialTable.isTransparent[i];
+    if (i == kFloorEntityIndex && isTransparent) {
+      // Force the floor opaque regardless of what GenerateRandomMaterialTable() rolled for it --
+      // see kFloorEntityIndex's own comment.
+      m_MaterialTable.params[i].alpha = 1.0f;
+      m_MaterialTable.isTransparent[i] = false;
+      isTransparent = false;
+    }
+    core::SetFlag(entity.flags, core::EntityFlags::IsTransparent, isTransparent);
   }
 }
 

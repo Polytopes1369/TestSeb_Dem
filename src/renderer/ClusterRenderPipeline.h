@@ -123,6 +123,11 @@ namespace renderer {
         // Entity transform and data buffers for dynamic primitive rotations
         VkBuffer entityTransformBuffer = VK_NULL_HANDLE;
         VkBuffer entityDataBuffer = VK_NULL_HANDLE;
+
+        // Randomly-generated PBR materials (renderer::VulkanContext::GetMaterialTable(), itself
+        // built by renderer::GenerateRandomMaterialTable) -- uploaded once into ClusterResolvePass's
+        // GPU SSBO and TransparentForwardPass's own descriptor set.
+        MaterialTable materialTable{};
     };
 
     class ClusterRenderPipeline {
