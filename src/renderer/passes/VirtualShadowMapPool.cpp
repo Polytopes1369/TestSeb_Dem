@@ -8,13 +8,41 @@
 
 namespace renderer {
 
-    bool VirtualShadowMapPool::Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
-        uint32_t totalVSMCount, uint32_t physicalPageCapacity) {
+    bool VirtualShadowMapPool::Init(VkPhysicalDevice physicalDevice, VkDevice device, VmaAllocator allocator,
+        VkCommandPool commandPool, VkQueue queue, uint32_t totalVSMCount, uint32_t physicalPageCapacity) {
         Shutdown();
 
         m_Device = device;
         m_Allocator = allocator;
         m_TotalVSMCount = totalVSMCount;
+
+        // =====================================================================================
+        // STEP 0 -- Query the device's actual maxArrayLayers for this exact image configuration
+        // (format/type/tiling/usage) and clamp the requested capacity to it. Unlike
+        // VkPhysicalDeviceLimits::maxImageArrayLayers (a single, format-independent number),
+        // VkImageFormatProperties::maxArrayLayers is per-format and can legitimately be lower --
+        // trusting `physicalPageCapacity` unconditionally caused vkCreateImage() to request more
+        // array layers than VK_FORMAT_D32_SFLOAT supports on at least one real device/driver
+        // combination (2026-07-16 investigation).
+        // =====================================================================================
+        VkImageFormatProperties formatProps{};
+        VkResult formatQueryResult = vkGetPhysicalDeviceImageFormatProperties(
+            physicalDevice, VK_FORMAT_D32_SFLOAT, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL,
+            VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, 0, &formatProps);
+        if (formatQueryResult != VK_SUCCESS) {
+            LOG_ERROR(std::format("[VirtualShadowMapPool] vkGetPhysicalDeviceImageFormatProperties failed "
+                "for VK_FORMAT_D32_SFLOAT (result={}) -- this format/usage combination is not supported at all.",
+                static_cast<int>(formatQueryResult)));
+            return false;
+        }
+        if (physicalPageCapacity > formatProps.maxArrayLayers) {
+            LOG_WARNING(std::format("[VirtualShadowMapPool] Requested physicalPageCapacity ({}) exceeds this "
+                "device's VK_FORMAT_D32_SFLOAT maxArrayLayers ({}) -- clamping. Fewer resident shadow pages "
+                "than config::lumen::VSM_PHYSICAL_PAGE_CAPACITY means more frequent eviction/streaming, not "
+                "a correctness issue.",
+                physicalPageCapacity, formatProps.maxArrayLayers));
+            physicalPageCapacity = formatProps.maxArrayLayers;
+        }
         m_PhysicalPageCapacity = physicalPageCapacity;
 
         // =====================================================================================

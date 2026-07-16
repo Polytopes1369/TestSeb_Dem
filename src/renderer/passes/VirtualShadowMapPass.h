@@ -86,8 +86,11 @@ namespace renderer {
         // STEP 1 exactly -- same combined position-only vertex/index buffer, same scene-bounding-
         // sphere derivation), builds the depth-only capture pipeline (reuses ShadowMapCapture.vert
         // unchanged), and initializes the physical page pool + feedback buffer + request queue.
-        bool Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
-            const std::filesystem::path& cacheFilePath);
+        // `physicalDevice` is forwarded to VirtualShadowMapPool::Init, which queries the device's
+        // actual maxArrayLayers for the pool's D32_SFLOAT image format before sizing it -- see
+        // that function's own comment on why kPhysicalPageCapacity cannot just be trusted as-is.
+        bool Init(VkPhysicalDevice physicalDevice, VkDevice device, VmaAllocator allocator,
+            VkCommandPool commandPool, VkQueue queue, const std::filesystem::path& cacheFilePath);
 
         void Shutdown();
 

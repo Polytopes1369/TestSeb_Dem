@@ -62,16 +62,19 @@ namespace renderer {
         VirtualShadowMapPool& operator=(const VirtualShadowMapPool&) = delete;
 
         // `totalVSMCount` sizes the GPU page table (`totalVSMCount * kShadowPagesPerVSM` entries);
-        // `physicalPageCapacity` is the shared physical pool's layer count. No runtime validation
-        // of the per-page virtual-viewport technique's dimensions (kShadowPagesPerAxis *
-        // kShadowPageTexels = 2048) against VkPhysicalDeviceLimits::maxViewportDimensions /
-        // viewportBoundsRange is needed: the Vulkan 1.0+ spec's own REQUIRED minimum for
-        // maxViewportDimensions is 4096 (and viewportBoundsRange at least [-8192, 8191]) on every
-        // conformant implementation, so a virtual resolution of 2048 (max negative viewport offset
-        // -1920) is guaranteed safe on any Vulkan 1.3 device without a capability query -- see
-        // renderer::VirtualShadowMapPass::RenderPage's own comment.
-        bool Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
-            uint32_t totalVSMCount, uint32_t physicalPageCapacity);
+        // `physicalPageCapacity` is the shared physical pool's REQUESTED layer count. Unlike the
+        // per-page virtual-viewport technique's dimensions (kShadowPagesPerAxis * kShadowPageTexels
+        // = 2048, safe on any conformant Vulkan 1.3 device without a query -- see
+        // renderer::VirtualShadowMapPass::RenderPage's own comment), there is no spec-guaranteed
+        // minimum for VK_FORMAT_D32_SFLOAT's maxArrayLayers: it is a per-format, per-device limit
+        // (VkImageFormatProperties::maxArrayLayers), independent of and can be lower than
+        // VkPhysicalDeviceLimits::maxImageArrayLayers. Init() queries
+        // vkGetPhysicalDeviceImageFormatProperties with this pool's exact image parameters and
+        // clamps the ACTUAL layer count to whatever the device reports, logging a warning if
+        // clamping occurred -- `physicalPageCapacity` is therefore a requested ceiling, not a
+        // guarantee; call GetPhysicalCapacity() after Init() to learn the real value.
+        bool Init(VkPhysicalDevice physicalDevice, VkDevice device, VmaAllocator allocator,
+            VkCommandPool commandPool, VkQueue queue, uint32_t totalVSMCount, uint32_t physicalPageCapacity);
 
         void Shutdown();
 

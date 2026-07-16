@@ -43,8 +43,8 @@ namespace renderer {
 
     } // namespace
 
-    bool VirtualShadowMapPass::Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
-        const std::filesystem::path& cacheFilePath) {
+    bool VirtualShadowMapPass::Init(VkPhysicalDevice physicalDevice, VkDevice device, VmaAllocator allocator,
+        VkCommandPool commandPool, VkQueue queue, const std::filesystem::path& cacheFilePath) {
         Shutdown();
 
         m_Device = device;
@@ -175,7 +175,7 @@ namespace renderer {
         // STEP 3 -- Physical page pool + feedback buffer (own dedicated instance, see class
         // comment on why not shared with the geometry streaming system's own).
         // =====================================================================================
-        if (!m_Pool.Init(device, allocator, commandPool, queue, kTotalVSMCount, kPhysicalPageCapacity)) {
+        if (!m_Pool.Init(physicalDevice, device, allocator, commandPool, queue, kTotalVSMCount, kPhysicalPageCapacity)) {
             LOG_ERROR("[VirtualShadowMapPass] Failed to initialize VirtualShadowMapPool.");
             return false;
         }

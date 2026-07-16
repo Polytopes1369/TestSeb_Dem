@@ -94,7 +94,7 @@ namespace renderer {
         // =====================================================================================
         VkDescriptorPoolSize poolSizes[3]{};
         poolSizes[0] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8 };            // Compact(3) + Forward(5: entries, pool, entityXform, entityData, materialParams).
-        poolSizes[1] = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2 };            // Forward: WPOGlobals, ViewParams.
+        poolSizes[1] = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 3 };            // Forward: WPOGlobals, ViewParams, g_ShadowSunLevels (binding 10, wired in by SetVirtualShadowMap).
         poolSizes[2] = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1 };    // Forward: shadow physical atlas.
 
         VkDescriptorPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };

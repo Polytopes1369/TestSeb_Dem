@@ -292,7 +292,7 @@ bool ClusterRenderPipeline::Init(
   // established "self-contained pass" convention -- see e.g. renderer::VirtualShadowMapPass's own
   // class comment).
   // =========================================================================================
-  if (!m_VirtualShadowMap.Init(createInfo.device, createInfo.allocator,
+  if (!m_VirtualShadowMap.Init(createInfo.physicalDevice, createInfo.device, createInfo.allocator,
                                createInfo.commandPool, createInfo.queue,
                                createInfo.cacheFilePath)) {
     LOG_ERROR("[ClusterRenderPipeline] Failed to initialize VirtualShadowMapPass.");
