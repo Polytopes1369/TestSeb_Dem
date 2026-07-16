@@ -85,6 +85,7 @@
 #include "renderer/SurfaceCachePass.h"
 #include "renderer/SurfaceCacheRayTracingPass.h"
 #include "renderer/SurfaceCacheTraceContext.h"
+#include "renderer/TransparentForwardPass.h"
 #include "renderer/VirtualShadowMapPass.h"
 #include "renderer/WorldProbeGridPass.h"
 #ifndef NDEBUG
@@ -289,6 +290,12 @@ namespace renderer {
         // NUMPAD-DRIVEN DEBUG VIEW SWITCHING that picks between this path and m_Resolve's original
         // RecordResolve() is Debug-only, not the pass itself (Release always uses this path).
         ClusterShadingBinPass m_ShadingBin;
+        // Forward-rendered translucent/transparent materials -- see TransparentForwardPass's own
+        // class comment for why this is a completely separate path from the opaque VisBuffer
+        // pipeline above. Recorded once GI/reflections have fully composited the opaque scene (so
+        // transparency draws on top of the final lit result), always initialized (not Debug-only),
+        // same build-separation rule as m_ShadingBin above.
+        TransparentForwardPass m_TransparentForward;
 
         // Lumen-style GI infrastructure -- unlike the debug-only stats/overlay block below, these
         // are real (if not yet light-transport-consuming) systems, not visualization tools, so

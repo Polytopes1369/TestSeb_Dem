@@ -310,6 +310,17 @@ bool ClusterRenderPipeline::Init(
   m_SurfaceCache.SetVirtualShadowMap(m_VirtualShadowMap);
   m_Resolve.SetVirtualShadowMap(m_VirtualShadowMap);
 
+  // Forward-rendered translucent/transparent materials (see TransparentForwardPass's own class
+  // comment) -- reuses the SAME indexEntries/dagEntries this function loaded above for
+  // m_LODSelection.Init(), and the SAME page pool/compressed pool/entity/WPO buffer handles every
+  // opaque pass already borrows.
+  m_TransparentForward.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
+                            m_PagePool.GetPageTableBuffer(), m_PagePool.GetPhysicalPoolBuffer(),
+                            createInfo.entityTransformBuffer, createInfo.entityDataBuffer, m_WPOGlobalsBuffer.Handle(),
+                            createInfo.materialTable.params, indexEntries, dagEntries,
+                            ClusterResolvePass::kOutputColorFormat, createInfo.depthFormat);
+  m_TransparentForward.SetVirtualShadowMap(m_VirtualShadowMap);
+
   // Sun orientation: Toronto (lat 43.6532N, lon 79.3832W), July 16, 16:30 local (EDT, UTC-4) --
   // a standard NOAA solar-position computation (equation of time + hour angle + declination for
   // day-of-year 197) gives solar elevation ~45.5 degrees and azimuth ~255.3 degrees (measured
@@ -478,6 +489,7 @@ void ClusterRenderPipeline::Shutdown() {
   m_DebugTraceMode = 0;
 #endif
 
+  m_TransparentForward.Shutdown();
   m_ShadingBin.Shutdown();
   m_Resolve.Shutdown();
   m_SoftwareRaster.Shutdown();
@@ -1228,6 +1240,22 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
     depInfo.memoryBarrierCount = 1;
     depInfo.pMemoryBarriers = &barrier;
     vkCmdPipelineBarrier2(cmd, &depInfo);
+  }
+
+  // =========================================================================================
+  // [13c] Forward-rendered translucent/transparent materials -- drawn onto whichever image [14]'s
+  // blit will actually read (m_Denoiser's output when [12d] applied it, m_Resolve's own color
+  // image otherwise -- same `applyDenoise` condition the debug overlay below and the blit itself
+  // both use), so transparency composites on top of the fully-lit (GI/reflections included) opaque
+  // scene. No-op internally if TransparentForwardPass::Init() found zero transparent leaf clusters
+  // this run. Must run before the debug overlay below so the HUD stays on top of everything.
+  // =========================================================================================
+  {
+    VkImage transparentTargetImage = applyDenoise ? m_Denoiser.GetOutputImage() : m_Resolve.GetOutputColorImage();
+    VkImageView transparentTargetView = applyDenoise ? m_Denoiser.GetOutputView() : m_Resolve.GetOutputColorView();
+    m_TransparentForward.RecordDraw(cmd, transparentTargetImage, transparentTargetView, m_DepthImageView,
+        m_RenderExtent, camera.view, camera.proj, m_Decompression.GetDecompressedIndexPoolBuffer(),
+        m_SceneLights.sun.direction);
   }
 
 #ifndef NDEBUG

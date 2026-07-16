@@ -1,0 +1,81 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+
+// renderer::TransparentForwardPass's own tiny per-frame preparation step -- NOT a LOD/frustum/
+// occlusion decision (see that class's own comment for why this path skips all three): every
+// entry in g_Entries is a STATIC list (built once at Init() from leaf-level DAG nodes), so the
+// only thing that can change frame to frame is which entries' pages are CURRENTLY resident and
+// which physical page slot each currently occupies (the streaming system can page clusters in/out
+// at any time). One thread per entry: resolves its current physical page index and writes exactly
+// one VkDrawIndexedIndirectCommand (mirrored below) -- a zero-indexCount command for a non-resident
+// entry is a well-defined Vulkan no-op draw, so every entry always gets a command written (no
+// atomic compaction/count needed, unlike ClusterLODCompact.comp's per-frame-varying candidate set).
+
+#define PAGE_TABLE_SET 0
+#define PAGE_TABLE_BINDING 0
+#include "include/geometry_page_table.glsl"
+
+// Matches geometry::kMaxClusterVertices/kMaxClusterTriangles (ClusterFormat.h) -- duplicated here
+// rather than #included via cluster_vertex_decode.glsl, same reasoning as ClusterLODCompact.comp's
+// own identical duplication (this shader does not decode any vertex data itself).
+#define CLUSTER_MAX_VERTICES 64u
+#define CLUSTER_MAX_INDICES 384u
+
+// Mirrors renderer::TransparentClusterEntry (TransparentForwardPass.h) field-for-field.
+struct TransparentClusterEntry {
+    vec3 boundsMin; float maxWPOAmplitude;
+    vec3 boundsMax; float _pad0;
+    uint logicalPageID;
+    uint indexCount;
+    uint clusterID;
+    uint entityID;
+    uint materialID;
+    uint maskTextureIndex;
+    float _pad1;
+    float _pad2;
+};
+
+layout(std430, set = 0, binding = 1) readonly buffer TransparentClusterEntriesSSBO {
+    TransparentClusterEntry entries[];
+} g_Entries;
+
+// Byte-for-byte mirror of VkDrawIndexedIndirectCommand (20 bytes: 5x uint32 -- vertexOffset is
+// int32, but bit-identical to uint32 for the values this shader ever writes).
+struct DrawIndexedIndirectCommand {
+    uint indexCount;
+    uint instanceCount;
+    uint firstIndex;
+    uint vertexOffset;
+    uint firstInstance;
+};
+
+layout(std430, set = 0, binding = 2) writeonly buffer IndirectCommandsSSBO {
+    DrawIndexedIndirectCommand commands[];
+} g_Commands;
+
+layout(local_size_x = 64) in;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= g_Entries.entries.length()) {
+        return;
+    }
+
+    TransparentClusterEntry entry = g_Entries.entries[i];
+
+    if (!IsClusterResident(entry.logicalPageID)) {
+        // Zero indexCount: a defined Vulkan no-op sub-draw within vkCmdDrawIndexedIndirect, exactly
+        // like ClusterHardwareRasterPass's own opaque path treats a non-surviving candidate slot.
+        g_Commands.commands[i] = DrawIndexedIndirectCommand(0u, 0u, 0u, 0u, i);
+        return;
+    }
+
+    uint physicalPageIndex = g_GeometryPageTable.physicalPageIndex[entry.logicalPageID];
+    DrawIndexedIndirectCommand cmd;
+    cmd.indexCount = entry.indexCount;
+    cmd.instanceCount = 1u;
+    cmd.firstIndex = physicalPageIndex * CLUSTER_MAX_INDICES;
+    cmd.vertexOffset = physicalPageIndex * CLUSTER_MAX_VERTICES;
+    cmd.firstInstance = i; // Re-indexes g_Entries.entries[] in TransparentForward.vert via gl_InstanceIndex.
+    g_Commands.commands[i] = cmd;
+}
