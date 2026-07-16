@@ -359,41 +359,48 @@ namespace renderer {
 
         // --- Process LAST frame's page-miss reports (one-frame lag, see class comment): dedup,
         // allocate + render up to kMaxPagesRenderedPerFrame this frame. ---
-        std::vector<uint32_t> missedPages = m_Feedback.ReadRequestedClusterIDs();
-        m_RequestQueue.SubmitFrameRequests(missedPages);
-
+        // config::lumen::BUILD_SHADOWS temporary kill-switch: skipping this entire block leaves
+        // every shadow page permanently non-resident, which shadow_sun_sampling.glsl/
+        // shadow_point_sampling.glsl already interpret as "fully lit" -- see EngineConfig.h's own
+        // comment on this flag. m_SunLevelsUBO/m_PointFacesUBO above still get this frame's valid
+        // view-projection matrices either way, so re-enabling this flag later needs no other change.
         bool renderedAnyPage = false;
-        for (uint32_t processed = 0; processed < kMaxPagesRenderedPerFrame; ++processed) {
-            uint32_t logicalPageID = 0;
-            if (!m_RequestQueue.PopNextRequest(logicalPageID)) {
-                break;
-            }
+        if constexpr (config::lumen::BUILD_SHADOWS) {
+            std::vector<uint32_t> missedPages = m_Feedback.ReadRequestedClusterIDs();
+            m_RequestQueue.SubmitFrameRequests(missedPages);
 
-            uint32_t vsmIndex = logicalPageID / kShadowPagesPerVSM;
-            uint32_t localPageIndex = logicalPageID % kShadowPagesPerVSM;
+            for (uint32_t processed = 0; processed < kMaxPagesRenderedPerFrame; ++processed) {
+                uint32_t logicalPageID = 0;
+                if (!m_RequestQueue.PopNextRequest(logicalPageID)) {
+                    break;
+                }
 
-            const maths::mat4* viewProj = nullptr;
-            if (vsmIndex < kSunLevelCount) {
-                viewProj = &m_SunLevelViewProj[vsmIndex];
-            } else {
-                uint32_t faceSlot = vsmIndex - kSunLevelCount;
-                if (faceSlot >= m_ActivePointLightCount * 6u) {
-                    // Stale report for a now-inactive point light slot -- nothing to render.
-                    m_RequestQueue.MarkRequestCompleted(logicalPageID);
+                uint32_t vsmIndex = logicalPageID / kShadowPagesPerVSM;
+                uint32_t localPageIndex = logicalPageID % kShadowPagesPerVSM;
+
+                const maths::mat4* viewProj = nullptr;
+                if (vsmIndex < kSunLevelCount) {
+                    viewProj = &m_SunLevelViewProj[vsmIndex];
+                } else {
+                    uint32_t faceSlot = vsmIndex - kSunLevelCount;
+                    if (faceSlot >= m_ActivePointLightCount * 6u) {
+                        // Stale report for a now-inactive point light slot -- nothing to render.
+                        m_RequestQueue.MarkRequestCompleted(logicalPageID);
+                        continue;
+                    }
+                    viewProj = &m_PointFaceViewProj[faceSlot];
+                }
+
+                uint32_t physicalLayer = m_Pool.AllocatePage(cmd, logicalPageID);
+                if (physicalLayer == kInvalidShadowPhysicalPage) {
+                    m_RequestQueue.MarkRequestCompleted(logicalPageID); // Let a future miss report retry it.
                     continue;
                 }
-                viewProj = &m_PointFaceViewProj[faceSlot];
-            }
 
-            uint32_t physicalLayer = m_Pool.AllocatePage(cmd, logicalPageID);
-            if (physicalLayer == kInvalidShadowPhysicalPage) {
-                m_RequestQueue.MarkRequestCompleted(logicalPageID); // Let a future miss report retry it.
-                continue;
+                RenderPage(cmd, vsmIndex, localPageIndex, physicalLayer, *viewProj);
+                renderedAnyPage = true;
+                m_RequestQueue.MarkRequestCompleted(logicalPageID);
             }
-
-            RenderPage(cmd, vsmIndex, localPageIndex, physicalLayer, *viewProj);
-            renderedAnyPage = true;
-            m_RequestQueue.MarkRequestCompleted(logicalPageID);
         }
 
         if (renderedAnyPage) {

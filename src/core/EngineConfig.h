@@ -4,63 +4,65 @@
 namespace config {
 constexpr uint32_t WINDOW_WIDTH = 1920;
 constexpr uint32_t WINDOW_HEIGHT = 1080;
-// Set to 0.2f or 0.25f. Divides the generated vertex count by 4 (or more).
-// Risk of noticeable detail loss on "hero" primitives, but required by RTX 3050
-// bandwidth constraints.
-constexpr float VERTEX_SPACING = 0.25f;
-constexpr float FLOOR_VERTEX_SPACING = 5.0f;
+// Set to 0.05f for ultra-dense procedural geometry, fully supported by the RTX 5080.
+constexpr float VERTEX_SPACING = 0.05f;
+constexpr float FLOOR_VERTEX_SPACING = 1.0f;
 
 namespace nanite {
-// The RTX 3050 has fewer ALUs, so the software rasterizer is the primary
-// bottleneck. We need to shift more workload towards the hardware rasterizer.
-constexpr float SOFTWARE_RASTER_THRESHOLD_PIXELS = 12.0f;
-// Force a more aggressive LOD transition to limit the geometry being processed.
-constexpr float LOD_PIXEL_ERROR_THRESHOLD = 2.0f;
+// Lower threshold shifts more tiny triangles to the software rasterizer.
+constexpr float SOFTWARE_RASTER_THRESHOLD_PIXELS = 8.0f;
+// Cinematic quality LOD error threshold.
+constexpr float LOD_PIXEL_ERROR_THRESHOLD = 0.5f;
 
 constexpr uint32_t MAX_CLUSTER_VERTICES = 64u;
 constexpr uint32_t MAX_CLUSTER_TRIANGLES = 128u;
 constexpr uint32_t PAGE_SIZE_BYTES = 4096u;
 
-constexpr uint64_t VERTEX_BUFFER_BYTES = 128 * 1024 * 1024;
-constexpr uint64_t INDEX_BUFFER_BYTES = 64 * 1024 * 1024;
+// Allocated 1GB / 512MB buffers to store dynamic virtual geometries.
+constexpr uint64_t VERTEX_BUFFER_BYTES = 1024 * 1024 * 1024;
+constexpr uint64_t INDEX_BUFFER_BYTES = 512 * 1024 * 1024;
 } // namespace nanite
 
 namespace lumen {
-// The RTX 3050 Ampere RT cores are limited. Surface cache updates are
-// expensive.
-constexpr uint32_t CARDS_PER_FRAME_BUDGET = 1u; // or 2u maximum
-constexpr uint32_t EVICTION_FRAME_DELAY = 120u;
+// Massively increased card update budget for high-speed dynamic updates.
+constexpr uint32_t CARDS_PER_FRAME_BUDGET = 16u;
+constexpr uint32_t EVICTION_FRAME_DELAY = 600u; // Kept in memory longer.
 
-// This is where you save the most CPU/GPU execution time: 32^3 = 32K probes is
-// untenable; 16^3 = 4K probes.
-constexpr uint32_t PROBE_GRID_RESOLUTION = 16u;
-constexpr float PROBE_SPACING =
-    4.0f; // Expands coverage to compensate for the lower grid resolution.
-constexpr uint32_t PROBE_SAMPLE_DIRECTIONS = 8u; // Fewer rays traced per probe.
+// Ultra-quality 64^3 probe grid (262k probes) for smooth high-end GI.
+constexpr uint32_t PROBE_GRID_RESOLUTION = 64u;
+constexpr float PROBE_SPACING = 1.0f;
+// Matches WorldProbeInject.comp's kProbeSampleDirections array length exactly (14u).
+constexpr uint32_t PROBE_SAMPLE_DIRECTIONS = 14u;
 
-constexpr uint32_t MAX_TRACED_ENTITIES = 32u;
+// Tracing limit raised to 128u.
+constexpr uint32_t MAX_TRACED_ENTITIES = 128u;
 
 // Multi-bounce radiosity loop iteration budget per frame
-constexpr uint32_t RADIOSITY_BOUNCE_COUNT = 3u;
+constexpr uint32_t RADIOSITY_BOUNCE_COUNT = 4u;
 
-// Number of hemisphere Halton samples per Surface Cache texel for secondary
-// bounce irradiance
-constexpr uint32_t SURFACE_CACHE_GI_SAMPLE_COUNT = 8u;
+// Number of hemisphere Halton samples per Surface Cache texel for secondary bounce irradiance
+constexpr uint32_t SURFACE_CACHE_GI_SAMPLE_COUNT = 64u; // Epic quality secondary GI.
 
 // Screen space Probe GI (Lumen Screen Probe Gather) tile dimensions (pixels)
 constexpr uint32_t SCREEN_PROBE_TILE_SIZE = 8u;
 
 // Fibonacci-sphere rays traced per screen space probe per frame
-constexpr uint32_t SCREEN_PROBE_RAY_COUNT = 64u;
+constexpr uint32_t SCREEN_PROBE_RAY_COUNT = 64u; // Must remain 64u to match ScreenProbeTrace.comp hardcoded thread count/SH weight.
 
-// Exponential moving-average blend factor for temporal accumulation of Screen
-// GI
+// Exponential moving-average blend factor for temporal accumulation of Screen GI
 constexpr float SCREEN_PROBE_TEMPORAL_ALPHA = 0.05f;
 
+// Temporary kill-switch: when false, VirtualShadowMapPass never allocates/renders any shadow
+// page (sun clipmap or point light cube faces alike). shadow_sun_sampling.glsl/
+// shadow_point_sampling.glsl already fall back to fully-lit (1.0) for any non-resident page, so
+// leaving every page permanently non-resident disables shadows cleanly with no risk to the rest
+// of the pipeline (view-projection matrices, feedback buffer, etc. keep updating normally).
+constexpr bool BUILD_SHADOWS = false;
+
 // Virtual Shadow Map (VSM) settings
-constexpr uint32_t VSM_SUN_LEVEL_COUNT = 3u;
+constexpr uint32_t VSM_SUN_LEVEL_COUNT = 3u; // Kept at 3u to match shadow_sun_sampling.glsl and ClusterResolve.comp arrays.
 constexpr float VSM_SUN_BASE_RADIUS = 2.0f;
-constexpr uint32_t VSM_PHYSICAL_PAGE_CAPACITY = 256u;
-constexpr uint32_t VSM_MAX_PAGES_RENDERED_PER_FRAME = 32u;
+constexpr uint32_t VSM_PHYSICAL_PAGE_CAPACITY = 4096u; // Large page capacity (4096 * 128^2 * 4B = 256 MB) to prevent any eviction.
+constexpr uint32_t VSM_MAX_PAGES_RENDERED_PER_FRAME = 512u;
 } // namespace lumen
 } // namespace config

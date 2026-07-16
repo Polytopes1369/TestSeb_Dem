@@ -28,7 +28,7 @@
 // that C++ header directly, so this literal has to be kept manually in sync (see
 // SurfaceCacheTraceContext.cpp's own truncation-warning comment for the same requirement stated
 // from the C++ side).
-const uint kMaxTracedEntities = 32u;
+const uint kMaxTracedEntities = 128u;
 const float kFarDistance = 1.0e4;
 const float kSphereTraceEpsilon = 1.0e-3;
 const uint kSphereTraceMaxSteps = 96u;

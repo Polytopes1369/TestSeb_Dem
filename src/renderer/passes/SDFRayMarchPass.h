@@ -71,7 +71,7 @@ namespace renderer {
 
         // Upper bound on entities this pass can sample per ray march -- see the class comment's
         // "fixed-size entity sampler array" note.
-        static constexpr uint32_t kMaxEntitySDFs = 64u;
+        static constexpr uint32_t kMaxEntitySDFs = 128u;
 
         static constexpr VkFormat kOutputFormat = VK_FORMAT_R8G8B8A8_UNORM;
 
