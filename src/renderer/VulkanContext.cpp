@@ -1654,13 +1654,13 @@ void VulkanContext::GeneratePlane(
     float Length, float Width,
     uint32_t meshID, maths::vec2 slot,
     uint32_t& runningVertexOffset, uint32_t& runningIndexOffset,
-    float worldOffsetY) {
+    float worldOffsetY, float spacing) {
   // Validate dimensions are positive and non-zero
   assert(Length > 0.0f);
   assert(Width > 0.0f);
 
-  uint32_t LengthSegments = std::max(2u, static_cast<uint32_t>(std::round(Length / config::VERTEX_SPACING)));
-  uint32_t WidthSegments = std::max(2u, static_cast<uint32_t>(std::round(Width / config::VERTEX_SPACING)));
+  uint32_t LengthSegments = std::max(2u, static_cast<uint32_t>(std::round(Length / spacing)));
+  uint32_t WidthSegments = std::max(2u, static_cast<uint32_t>(std::round(Width / spacing)));
 
   PlaneParams params{};
   params.width = Width;
@@ -1989,8 +1989,12 @@ void VulkanContext::GenerateGeometry() {
   // -------------------------------------------------------------------------
   {
     maths::vec2 slot = {0.0f, 0.0f}; // centered at the world origin
+    // Coarse spacing: geom_plane.comp emits a flat, unlit-detail surface (constant
+    // up-normal, no displacement), so the hero-primitive VERTEX_SPACING (0.1m) would
+    // waste 9M vertices on a 300m span for zero visual gain -- see FLOOR_VERTEX_SPACING.
     GeneratePlane(300.0f, 300.0f, m_EntityData[12].meshID, slot,
-                  runningVertexOffset, runningIndexOffset, -0.8f);
+                  runningVertexOffset, runningIndexOffset, -0.8f,
+                  config::FLOOR_VERTEX_SPACING);
   }
 
   m_TotalVertexCount = runningVertexOffset;

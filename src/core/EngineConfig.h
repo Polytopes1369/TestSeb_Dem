@@ -5,6 +5,13 @@ namespace config {
 constexpr uint32_t WINDOW_WIDTH = 1920;
 constexpr uint32_t WINDOW_HEIGHT = 1080;
 constexpr float VERTEX_SPACING = 0.1f;
+// Tessellation density for large, perfectly flat ground planes (e.g. the world
+// floor). geom_plane.comp emits a constant up-normal with no displacement, so
+// fine subdivision buys nothing visually; reusing VERTEX_SPACING (tuned for
+// ~1-2m hero primitives) on a 300m floor would compute a 3000x3000 grid --
+// 9M vertices -- and overflow the fixed-size geometry SSBOs
+// (nanite::VERTEX_BUFFER_BYTES / INDEX_BUFFER_BYTES below).
+constexpr float FLOOR_VERTEX_SPACING = 10.0f;
 
 namespace nanite {
 constexpr float SOFTWARE_RASTER_THRESHOLD_PIXELS = 6.0f;
