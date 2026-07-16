@@ -175,6 +175,23 @@ namespace renderer {
         FeedbackBuffer& GetFeedbackBuffer() { return m_FeedbackBuffer; }
 
 #ifndef NDEBUG
+        // Per-frame residency-fallback diagnostics (2026-07-16 "clusters missing / wrong LOD"
+        // investigation): mirrors ClusterLODResidencyFallback.comp's LODFallbackStatsSSBO
+        // (binding 5) -- forceDrawSubstitutions counts how many DRAW-decided-but-non-resident
+        // nodes this frame were replaced on screen by a coarser already-resident ancestor (a
+        // "wrong LOD" event); ancestorWalkExhausted counts how many found NO resident ancestor at
+        // all within MAX_ANCESTOR_WALK, meaning that node's screen region is a genuine hole this
+        // frame. Both are one-frame-lagged, same contract as GetFeedbackBuffer(): the values
+        // returned by ReadLODFallbackStats() are from the PREVIOUS call to RecordEvaluateAndCompact(),
+        // which is when this frame's own copy into the readback buffer is recorded.
+        struct LODFallbackStats {
+            uint32_t forceDrawSubstitutions = 0;
+            uint32_t ancestorWalkExhausted = 0;
+        };
+        LODFallbackStats ReadLODFallbackStats() const;
+#endif
+
+#ifndef NDEBUG
         // Investigating the 2026-07-16 "persistent holes" bug (see project memory
         // project_persistent_cluster_holes_open_bug.md): copies this frame's DAGDecisionSSBO/
         // ForceDrawSSBO into host-readable staging buffers. Call once per frame, after
@@ -212,6 +229,11 @@ namespace renderer {
         GpuBuffer m_DAGLocalErrorBuffer;     // float[totalNodeCount] -- ClusterDAGScreenError.comp's diagnostic output, unread by any consumer.
         GpuBuffer m_DAGParentErrorBuffer;    // float[totalNodeCount] -- ditto.
         GpuBuffer m_ForceDrawBuffer;         // uint[totalNodeCount], std430, GPU_ONLY. Cleared every frame.
+        // LODFallbackStatsSSBO mirror (2x uint32: forceDrawSubstitutions, ancestorWalkExhausted).
+        // Created and cleared every frame in both configs (ClusterLODResidencyFallback.comp always
+        // writes it -- this codebase does not compile per-config shader variants), but only ever
+        // read back/logged in Debug builds -- see ReadLODFallbackStats().
+        GpuBuffer m_LODFallbackStatsBuffer;
         GpuBuffer m_ViewParamsBuffer;        // DAGScreenErrorViewParams, std140 UBO, GPU_ONLY.
         GpuBuffer m_CandidateMetadataBuffer; // ClusterCullMetadata[leafCount], std430, GPU_ONLY.
         GpuBuffer m_CandidateCountBuffer;    // single uint32 atomic counter, GPU_ONLY.
@@ -224,6 +246,10 @@ namespace renderer {
         // entityID/sphereCenter to work with -- never touched by any GPU-facing code.
         std::vector<DAGNodePayload> m_DebugDagNodesCopy;
         GpuBuffer m_DebugDecisionReadbackBuffer; // uint[totalNodeCount], CPU_ONLY mapped -- mirrors m_DAGDecisionBuffer.
+
+        // Residency-fallback stats readback (see ReadLODFallbackStats()): 2x uint32, CPU_ONLY
+        // mapped -- mirrors m_LODFallbackStatsBuffer, one frame lagged.
+        GpuBuffer m_LODFallbackStatsReadbackBuffer;
 #endif
 
         // Dispatch 1: ClusterDAGScreenError.comp.

@@ -118,6 +118,10 @@ namespace renderer {
         LOG_INFO(std::format("[GpuGeometryPagePool] Bound logicalAddress {:#x} to physical page slot {} (offset: {:#x})",
             logicalAddress, physicalPage, dstOffset));
 
+#ifndef NDEBUG
+        m_DebugBoundAtFrame[logicalAddress] = m_DebugFrameCounter;
+#endif
+
         return true;
     }
 
@@ -131,6 +135,25 @@ namespace renderer {
 
         LOG_INFO(std::format("[GpuGeometryPagePool] Unbound logicalAddress {:#x} from physical page slot {}",
             logicalAddress, physicalPage));
+
+#ifndef NDEBUG
+        // Eviction-churn check: see this class's DebugAdvanceFrame() doc comment for why a page
+        // evicted only a handful of frames after being bound is suspicious -- it strongly suggests
+        // the page was still being drawn every frame and got evicted purely because nothing ever
+        // called TouchPage()/TouchPages() to refresh its LRU recency, not because it genuinely
+        // stopped being needed.
+        auto boundIt = m_DebugBoundAtFrame.find(logicalAddress);
+        if (boundIt != m_DebugBoundAtFrame.end()) {
+            uint64_t framesSinceBind = m_DebugFrameCounter - boundIt->second;
+            if (framesSinceBind < kDebugChurnThresholdFrames) {
+                LOG_WARNING(std::format("[GpuGeometryPagePool] POSSIBLE THRASHING: logicalAddress {:#x} (physical slot {}) evicted only {} frame(s) after being bound -- "
+                    "TouchPage()/TouchPages() are never called anywhere in the live per-frame path, so a page still in active use has no way to refresh its LRU "
+                    "recency and can be evicted while still needed. If clusters keep flickering between resident/non-resident, this is the likely root cause.",
+                    logicalAddress, physicalPage, framesSinceBind));
+            }
+            m_DebugBoundAtFrame.erase(boundIt);
+        }
+#endif
 
         // Free the CPU-side mapping first: the physical slot is now eligible for reuse by a
         // concurrently-recorded future BindPage() call, but that call will not itself become
@@ -163,7 +186,8 @@ namespace renderer {
         std::vector<uint64_t> candidates = m_PageTable.SelectLeastRecentlyUsedPages(maxPagesToEvict);
 
         if (!candidates.empty()) {
-            LOG_INFO(std::format("[GpuGeometryPagePool] Evicting {} LRU pages from physical pool...", candidates.size()));
+            LOG_INFO(std::format("[GpuGeometryPagePool] Evicting {} LRU pages from physical pool (resident: {}/{} before eviction).",
+                candidates.size(), m_PageTable.GetResidentPageCount(), m_PageTable.GetCapacity()));
         }
 
         for (uint64_t logicalAddress : candidates) {

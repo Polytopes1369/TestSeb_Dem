@@ -45,6 +45,20 @@ layout(std430, set = 0, binding = 3) buffer ForceDrawSSBO {
 
 // binding 4 == g_FeedbackBuffer, declared by feedback_buffer.glsl.
 
+// Debug/diagnostic counters only, read back and logged by renderer::ClusterLODSelectionPass in
+// Debug builds only (see that class's RecordEvaluateAndCompact). The binding itself is declared
+// unconditionally because the C++ side always creates and binds the backing buffer (a valid
+// pipeline needs every declared binding filled in both configs), but the two atomicAdd() writes
+// below are wrapped in #ifdef _DEBUG so they cost nothing in Release -- CMakeLists.txt passes
+// -D_DEBUG to glslc only for the Debug shader compile (see its own comment), the same mechanism
+// this codebase's existing #ifdef _DEBUG shader branches already rely on (project rule 8: no
+// debug/validation-only GPU work in the Release binary).
+layout(std430, set = 0, binding = 5) buffer LODFallbackStatsSSBO {
+    uint forceDrawSubstitutions; // Incremented each time a resident ancestor is found and substituted.
+    uint ancestorWalkExhausted;  // Incremented each time the walk below finds NO resident ancestor --
+                                 // the node's region is missing for this frame (a visible hole).
+} g_LODFallbackStats;
+
 // Bounds the ancestor walk below: comfortably above any realistic DAG depth (this engine's own
 // grouping roughly halves the cluster count per level).
 #define MAX_ANCESTOR_WALK 24u
@@ -79,6 +93,9 @@ void main() {
             // same point writes the same value 1, so a plain atomicOr (no mutual exclusion needed)
             // is sufficient.
             atomicOr(g_ForceDraw.forceDraw[ancestor], 1u);
+#ifdef _DEBUG
+            atomicAdd(g_LODFallbackStats.forceDrawSubstitutions, 1u);
+#endif
             return;
         }
         ancestor = ancestorNode.parentClusterID;
@@ -87,4 +104,7 @@ void main() {
     // exceptionally rare (would require the DAG's own root to be non-resident) -- this node's
     // region is simply absent for this one frame; already requested above, so it resolves once
     // streaming catches up.
+#ifdef _DEBUG
+    atomicAdd(g_LODFallbackStats.ancestorWalkExhausted, 1u);
+#endif
 }
