@@ -238,13 +238,19 @@ namespace renderer {
         // same Fallback Mesh geometry. Valid usage even though this pass itself never builds an
         // acceleration structure, because VulkanContext::CreateLogicalDevice enables
         // VK_KHR_acceleration_structure + bufferDeviceAddress unconditionally at device creation.
+        // STORAGE_BUFFER_BIT: renderer::SurfaceCacheRayTracingPass's .rchit, SurfaceCacheGIInject
+        // .comp's TraceHWRT and renderer::ScreenProbeGIPass's own TraceHWRT (ScreenProbeTrace.comp)
+        // all bind these same buffers as a plain `readonly buffer` SSBO to re-fetch a hit
+        // triangle's vertex positions -- required on top of VERTEX_BUFFER_BIT (which only covers
+        // this pass' own vkCmdBindVertexBuffers capture-draw path, a completely different binding
+        // point) for that separate SSBO descriptor to be valid (VUID-VkWriteDescriptorSet-descriptorType-00331).
         if (vertexBytes > 0 && indexBytes > 0) {
             m_VertexBuffer.Create(allocator, vertexBytes,
-                VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                 VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
                 VMA_MEMORY_USAGE_GPU_ONLY);
             m_IndexBuffer.Create(allocator, indexBytes,
-                VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                 VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
                 VMA_MEMORY_USAGE_GPU_ONLY);
         }

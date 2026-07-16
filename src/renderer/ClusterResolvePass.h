@@ -52,6 +52,14 @@ namespace renderer {
         // ClusterResolve.comp currently performs (see that shader's class comment on why no real
         // material/texture system exists yet).
         static constexpr VkFormat kOutputColorFormat = VK_FORMAT_R8G8B8A8_UNORM;
+        // Minimal GBuffer, written alongside the shaded color above from the exact same per-pixel
+        // normal/albedo/depth this shader already reconstructs in its Step 2/3 (previously computed
+        // and discarded) -- consumed by renderer::ScreenProbeGIPass for probe placement/tracing,
+        // the bilateral gather reconstruction, and the ClusterResolve.comp debug view modes 12
+        // (motion vectors) / 14 (spatial probes).
+        static constexpr VkFormat kOutputNormalFormat = VK_FORMAT_R16G16_SFLOAT;   // Octahedral-encoded world-space normal (include/octahedral.glsl).
+        static constexpr VkFormat kOutputDepthFormat = VK_FORMAT_R32_SFLOAT;       // The winning (hw-vs-sw arbitrated) NDC depth -- not stored anywhere else.
+        static constexpr VkFormat kOutputAlbedoFormat = VK_FORMAT_R8G8B8A8_UNORM;  // The procedural material's base color, pre-lighting.
 
         // Allocates the output color image (sized to `renderExtent`, transitioned once to
         // VK_IMAGE_LAYOUT_GENERAL via a blocking one-time submit, mirroring HZBPass::Init /
@@ -82,10 +90,17 @@ namespace renderer {
         // VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT / VK_ACCESS_2_SHADER_SAMPLED_READ_BIT (a future
         // sampled read) and VK_PIPELINE_STAGE_2_COPY_BIT / VK_ACCESS_2_TRANSFER_READ_BIT (a future
         // blit to the swapchain) -- whichever the caller ends up using.
-        void RecordResolve(VkCommandBuffer cmd, const maths::mat4& viewProj, uint32_t debugViewMode = 0);
+        // `prevViewProj` is the previous frame's combined matrix (renderer::ClusterRenderPipeline's
+        // own m_PrevViewProj) -- used only by DEBUG_VIEW_MOTION_VECTORS to reproject this frame's
+        // reconstructed world position; pass an identity matrix on the very first frame (no
+        // previous frame exists yet).
+        void RecordResolve(VkCommandBuffer cmd, const maths::mat4& viewProj, const maths::mat4& prevViewProj, uint32_t debugViewMode = 0);
 
         VkImage GetOutputColorImage() const { return m_OutputColorImage; }
         VkImageView GetOutputColorView() const { return m_OutputColorView; }
+        VkImageView GetOutputNormalView() const { return m_OutputNormalView; }
+        VkImageView GetOutputDepthView() const { return m_OutputDepthView; }
+        VkImageView GetOutputAlbedoView() const { return m_OutputAlbedoView; }
 
     private:
         static constexpr uint32_t kWorkgroupSize = 8; // Matches ClusterResolve.comp's local_size_x/y.
@@ -97,6 +112,15 @@ namespace renderer {
         VkImage m_OutputColorImage = VK_NULL_HANDLE;
         VmaAllocation m_OutputColorAllocation = VK_NULL_HANDLE;
         VkImageView m_OutputColorView = VK_NULL_HANDLE;
+        VkImage m_OutputNormalImage = VK_NULL_HANDLE;
+        VmaAllocation m_OutputNormalAllocation = VK_NULL_HANDLE;
+        VkImageView m_OutputNormalView = VK_NULL_HANDLE;
+        VkImage m_OutputDepthImage = VK_NULL_HANDLE;
+        VmaAllocation m_OutputDepthAllocation = VK_NULL_HANDLE;
+        VkImageView m_OutputDepthView = VK_NULL_HANDLE;
+        VkImage m_OutputAlbedoImage = VK_NULL_HANDLE;
+        VmaAllocation m_OutputAlbedoAllocation = VK_NULL_HANDLE;
+        VkImageView m_OutputAlbedoView = VK_NULL_HANDLE;
 
         VkSampler m_DepthSampler = VK_NULL_HANDLE; // Nearest filtering, matching HZBPass's own depth-sampling convention.
 

@@ -73,8 +73,12 @@
 #include "renderer/HZBPass.h"
 #include "renderer/LightingTypes.h"
 #include "renderer/ProceduralMaskGenerator.h"
+#include "renderer/ScreenProbeGIPass.h"
 #include "renderer/ShadowMapPass.h"
+#include "renderer/SurfaceCacheGIInjectPass.h"
 #include "renderer/SurfaceCachePass.h"
+#include "renderer/SurfaceCacheRayTracingPass.h"
+#include "renderer/SurfaceCacheTraceContext.h"
 #ifndef NDEBUG
 #include "renderer/debug/ClusterTriangleStatsPass.h"
 #include "renderer/debug/DebugTextOverlay.h"
@@ -86,6 +90,9 @@ namespace renderer {
     // Everything Init() needs from the outside world, in one struct -- all handles are borrowed
     // (owned by VulkanContext), only the passes/buffers this class creates itself are owned.
     struct ClusterRenderPipelineCreateInfo {
+        // Needed only by renderer::SurfaceCacheRayTracingPass::Init (VkPhysicalDeviceRayTracingPipelinePropertiesKHR
+        // query -- shaderGroupBaseAlignment/shaderGroupHandleSize for the Shader Binding Table).
+        VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
         VkDevice device = VK_NULL_HANDLE;
         VmaAllocator allocator = VK_NULL_HANDLE;
         VkCommandPool commandPool = VK_NULL_HANDLE;
@@ -152,6 +159,14 @@ namespace renderer {
         // m_LODSelection computes a dynamic per-frame cut (see ClusterLODSelectionPass).
         uint32_t GetClusterCount() const { return m_ClusterCount; }
 
+#ifndef NDEBUG
+        // SWRT/HWRT back-end toggle shared by m_GIInject and m_ScreenProbeGI (0 = SWRT mesh-SDF
+        // sphere tracing, 1 = HWRT inline rayQueryEXT against m_SurfaceCacheRT's TLAS) -- debug-only
+        // (main.cpp numpad/T key) so both back-ends stay exercised; Release always uses HWRT (see
+        // RecordFrame()'s own use of this member).
+        void SetDebugTraceMode(uint32_t traceMode) { m_DebugTraceMode = traceMode; }
+#endif
+
     private:
         // Records the vkCmdBeginRendering block shared by the early and late hardware raster
         // passes: `clearAttachments` selects between the early pass's CLEAR (VisBuffer sentinel
@@ -216,6 +231,40 @@ namespace renderer {
         // see renderer::LightingTypes.h's own comment; a future scene-authoring system would
         // populate this instead of leaving it default.
         SceneLights m_SceneLights;
+
+        // Shared trace-scene descriptor sets (mesh SDF trace + Surface Cache sampling, see
+        // SurfaceCacheTraceContext's own class comment) built once from m_GlobalSDF + m_SurfaceCache,
+        // reused unmodified by m_SurfaceCacheRT, m_GIInject, and m_ScreenProbeGI's own trace pass.
+        SurfaceCacheTraceContext m_TraceContext;
+        // HWRT back-end: one BLAS per traced entity + one TLAS, built once (static scene) against
+        // m_SurfaceCache's own Fallback Mesh vertex/index buffers.
+        SurfaceCacheRayTracingPass m_SurfaceCacheRT;
+        // Per-card hemisphere-sampled secondary-bounce injection into m_SurfaceCache's own radiance
+        // atlas -- makes that atlas genuinely multi-bounce over time, which is what
+        // m_ScreenProbeGI's single-hit-sample final gather then benefits from.
+        SurfaceCacheGIInjectPass m_GIInject;
+
+        // Screen Space Probe GI (Lumen "Screen Probe Gather"): traces Fibonacci-sphere rays per
+        // 8x8-pixel probe (sampling m_SurfaceCache's radiance atlas at each hit via m_TraceContext/
+        // m_SurfaceCacheRT), temporally accumulates, and gathers the result back into m_Resolve's
+        // output color image -- see ScreenProbeGIPass's own class comment.
+        ScreenProbeGIPass m_ScreenProbeGI;
+
+        // Previous frame's combined view-projection matrix -- ScreenProbeGIPass's temporal pass
+        // (and ClusterResolve.comp's DEBUG_VIEW_MOTION_VECTORS) reprojects a probe's/pixel's
+        // (static, see this class' own "Entity self-rotation" scope note) world position with this
+        // matrix to find its screen position last frame. Updated at the very end of RecordFrame(),
+        // after every consumer of "the previous frame's" value has run.
+        maths::mat4 m_PrevViewProj{};
+        bool m_HasPrevViewProj = false;
+
+        // Advances once per RecordFrame() call -- ScreenProbeTrace.comp's own per-frame Fibonacci-
+        // sphere jitter rotation (include/sh_probe.glsl's JitterDirection).
+        uint32_t m_FrameIndex = 0;
+
+#ifndef NDEBUG
+        uint32_t m_DebugTraceMode = 0;
+#endif
 
 #ifndef NDEBUG
         // Real-time stat overlay (GPU memory used, pending SSD page loads, disk read throughput,

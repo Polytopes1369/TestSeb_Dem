@@ -135,30 +135,41 @@ if(Vulkan_GLSLC_EXECUTABLE)
         # Garder l'extension pour éviter les collisions (ex: draw.vert -> draw.vert.spv)
         get_filename_component(SHADER_NAME ${SHADER_SRC} NAME)
         
-        # Intermediate .spv target inside the build tree
-        set(SHADER_SPV "${CMAKE_CURRENT_BINARY_DIR}/shaders_gen/${SHADER_NAME}.spv")
-        
-        get_filename_component(SHADER_OUT_DIR ${SHADER_SPV} DIRECTORY)
-        file(MAKE_DIRECTORY ${SHADER_OUT_DIR})
+        # Intermediate .spv target inside the build tree -- per-config ($<CONFIG> subdirectory):
+        # see the -D_DEBUG comment below for why a Debug and a Release compile of the SAME source
+        # file can now produce genuinely different SPIR-V, so they can no longer share one output
+        # path (a single shared path across configs -- this project's own multi-config generator
+        # default -- would otherwise let whichever config built first silently "win" the file for
+        # every other config too).
+        set(SHADER_SPV "${CMAKE_CURRENT_BINARY_DIR}/shaders_gen/$<CONFIG>/${SHADER_NAME}.spv")
 
         # Ray tracing / ray query stages need SPIR-V 1.4+ (the RayTracingKHR and RayQueryKHR
         # SPIR-V capabilities -- gl_InstanceCustomIndexEXT / traceRayEXT / rayPayloadEXT /
         # rayQueryEXT etc. -- are not representable in SPIR-V 1.0-1.3): the 3 .rgen/.rchit/.rmiss
-        # files unconditionally, plus SurfaceCacheGIInject.comp specifically (the one .comp file
-        # in this codebase that uses GL_EXT_ray_query for its inline HWRT trace path -- see that
-        # file's own TraceHWRT). Every other shader stage keeps glslc's default target-env/
-        # target-spv untouched.
+        # files unconditionally, plus every .comp file that uses GL_EXT_ray_query for its inline
+        # HWRT trace path (SurfaceCacheGIInject.comp, ScreenProbeTrace.comp). Every other shader
+        # stage keeps glslc's default target-env/target-spv untouched.
         get_filename_component(SHADER_EXT ${SHADER_SRC} EXT)
         set(GLSLC_EXTRA_FLAGS "")
         if(SHADER_EXT STREQUAL ".rgen" OR SHADER_EXT STREQUAL ".rchit" OR SHADER_EXT STREQUAL ".rmiss"
-                OR SHADER_NAME STREQUAL "SurfaceCacheGIInject.comp")
+                OR SHADER_NAME STREQUAL "SurfaceCacheGIInject.comp" OR SHADER_NAME STREQUAL "ScreenProbeTrace.comp")
             set(GLSLC_EXTRA_FLAGS --target-env=vulkan1.3 --target-spv=spv1.4)
         endif()
+
+        # glslc is a standalone tool, not the C++ compiler -- it never sees _DEBUG/NDEBUG on its
+        # own, so every #ifdef _DEBUG shader branch (debug-only view modes, overlays, ...) was
+        # previously dead code in EVERY build config, Debug included. Defining it here, only for
+        # the Debug config (matching CLAUDE.md's build-type-gated debug/Release separation rule
+        # exactly the same way the C++ side's own #ifndef NDEBUG already does), is what makes
+        # those shader branches compile in at all for local iteration while keeping them
+        # unconditionally absent from every other config's SPIR-V.
+        set(GLSLC_DEBUG_DEFINE "$<$<CONFIG:Debug>:-D_DEBUG>")
 
         # Command to compile shader
         add_custom_command(
             OUTPUT ${SHADER_SPV}
-            COMMAND ${Vulkan_GLSLC_EXECUTABLE} -I "${SHADER_INCLUDE_DIR}" ${GLSLC_EXTRA_FLAGS} ${SHADER_SRC} -o ${SHADER_SPV}
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/shaders_gen/$<CONFIG>"
+            COMMAND ${Vulkan_GLSLC_EXECUTABLE} -I "${SHADER_INCLUDE_DIR}" ${GLSLC_EXTRA_FLAGS} ${GLSLC_DEBUG_DEFINE} ${SHADER_SRC} -o ${SHADER_SPV}
             DEPENDS ${SHADER_SRC}
             COMMENT "Compiling shader: ${SHADER_NAME}"
         )

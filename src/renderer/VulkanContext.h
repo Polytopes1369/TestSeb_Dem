@@ -16,6 +16,7 @@ public:
     void Init(std::string_view appName, GLFWwindow* window);
     void Shutdown();
 
+    VkPhysicalDevice GetPhysicalDevice() const { return m_PhysicalDevice; }
     VkDevice GetDevice() const { return m_Device; }
     VkSwapchainKHR GetSwapchain() const { return m_Swapchain; }
     VkExtent2D GetSwapchainExtent() const { return m_SwapchainExtent; }

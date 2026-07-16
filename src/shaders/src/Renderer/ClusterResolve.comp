@@ -47,6 +47,7 @@
 
 #include "include/half_space_raster.glsl"
 #include "include/procedural_material.glsl"
+#include "include/octahedral.glsl"
 
 #define MASK_ARRAY_SET 0
 #define MASK_ARRAY_BINDING 8
@@ -66,10 +67,19 @@ layout(rgba8, set = 0, binding = 6) uniform writeonly image2D g_OutputColor;
 
 layout(std140, set = 0, binding = 7) uniform ResolveViewParamsUBO {
     mat4 viewProj;
+    mat4 prevViewProj; // DEBUG_VIEW_MOTION_VECTORS' own reprojection -- see renderer::ClusterResolvePass::RecordResolve's comment.
     vec2 viewportSize;
     float _pad0;
     float _pad1;
 } g_ViewParams;
+
+// Minimal GBuffer (renderer::ClusterResolvePass -- see its own class comment): written alongside
+// g_OutputColor from the same per-pixel normal/albedo/depth this shader already reconstructs
+// below, consumed by renderer::ScreenProbeGIPass and this shader's own DEBUG_VIEW_MOTION_VECTORS /
+// DEBUG_VIEW_SPATIAL_PROBES modes.
+layout(rg16f, set = 0, binding = 9) uniform writeonly image2D g_OutputNormal;
+layout(r32f, set = 0, binding = 10) uniform writeonly image2D g_OutputDepth;
+layout(rgba8, set = 0, binding = 11) uniform writeonly image2D g_OutputAlbedo;
 
 #ifdef _DEBUG
 layout(push_constant) uniform DebugPC {
@@ -155,6 +165,13 @@ void main() {
     }
 
     vec3 finalColor = vec3(0.05, 0.05, 0.1);
+    // GBuffer defaults for a background (no-geometry) pixel: depth = 1.0 (the far plane, matching
+    // this shader's own hwDepth/swDepth "smaller is nearer" convention) is renderer::
+    // ScreenProbeGIPass's validity sentinel for "do not place/gather a probe against this pixel" --
+    // mirrors renderer::SurfaceCachePass's own worldPosClear alpha=0 "never captured" convention.
+    float gbufferDepth = 1.0;
+    vec3 gbufferNormal = vec3(0.0, 1.0, 0.0);
+    vec3 gbufferAlbedo = vec3(0.0);
 
     if (hasAnyData) {
         // --- Step 2: re-fetch the winning triangle's 3 vertices and reconstruct barycentrics ---
@@ -220,6 +237,13 @@ void main() {
         vec3 albedo = HsvToRgb(vec3(hue, 0.65, 0.85));
         finalColor = albedo * 0.15 + albedo * diff;
 
+        // GBuffer capture (renderer::ClusterResolvePass's new outputs -- see this file's own
+        // binding comment): the same winning (hw-vs-sw arbitrated) depth already used to pick
+        // clusterSlotIndex/triangleOrdinal above, plus the reconstructed normal/albedo.
+        gbufferDepth = (hwHasData && (!swHasData || hwDepth <= swDepth)) ? hwDepth : swDepth;
+        gbufferNormal = normal;
+        gbufferAlbedo = albedo;
+
         // Opacity-mask soft edge feathering: the hard cutout already happened upstream
         // (ClusterRaster.frag's discard / ClusterSoftwareRaster.comp's skipped atomic write), so
         // only pixels whose alpha already cleared that cutoff ever reach this point -- blending
@@ -247,8 +271,31 @@ void main() {
             finalColor = vec3(pow(d, 0.2));
         } else if (pc.viewMode == 11) { // DEBUG_VIEW_NORMALS
             finalColor = normal * 0.5 + 0.5;
-        } else if (pc.viewMode != 0) {
-            // Placeholders
+        } else if (pc.viewMode == 12) { // DEBUG_VIEW_MOTION_VECTORS
+            // Reconstruct this pixel's world position from its own NDC + the winning depth (the
+            // exact same unproject renderer::ScreenProbeGIPass's temporal pass performs for a
+            // probe's world position), then reproject with the PREVIOUS frame's viewProj to see
+            // where this same (static -- see ClusterRenderPipeline.h's own "Entity self-rotation"
+            // scope note) world point was on screen last frame.
+            vec2 ndcXY = (pixelCenter / g_ViewParams.viewportSize) * 2.0 - 1.0;
+            vec4 clipPos = vec4(ndcXY, gbufferDepth, 1.0);
+            vec4 worldPos4 = inverse(g_ViewParams.viewProj) * clipPos;
+            vec3 worldPos = worldPos4.xyz / worldPos4.w;
+
+            vec4 prevClip = g_ViewParams.prevViewProj * vec4(worldPos, 1.0);
+            vec2 prevScreen = (prevClip.xy / prevClip.w * 0.5 + 0.5) * g_ViewParams.viewportSize;
+            vec2 motionVector = pixelCenter - prevScreen;
+
+            // Centered-at-0.5 visualization: a static camera reads as flat mid-grey, motion shows
+            // as a colored gradient whose hue/brightness encodes direction/magnitude.
+            finalColor = vec3(motionVector * 0.05 + 0.5, 0.5);
+        } else if (pc.viewMode == 14) {
+            // DEBUG_VIEW_SPATIAL_PROBES: leave finalColor as normally shaded here --
+            // renderer::ScreenProbeGIPass's gather pass (ScreenProbeGather.comp) overwrites this
+            // pixel with a probe-grid visualization when this view mode is active; this branch
+            // only exists to opt out of the "unhandled view mode" magenta placeholder below.
+        } else if (pc.viewMode != 0 && pc.viewMode != 9 && pc.viewMode != 13) {
+            // Placeholders (Global SDF / Lumen visualizations not implemented by this shader).
             finalColor = vec3(1.0, 0.0, 1.0);
         }
 #endif
@@ -257,12 +304,19 @@ void main() {
         if (pc.viewMode == 10) { // DEBUG_VIEW_DEPTH
             // For depth view, empty background should render as white/1.0
             finalColor = vec3(1.0);
+        } else if (pc.viewMode == 12 || pc.viewMode == 14) {
+            // No geometry here: zero motion / no probe contribution -- leave finalColor at the
+            // plain background color instead of the "unhandled view mode" magenta placeholder.
         } else if (pc.viewMode != 0 && pc.viewMode != 1 && pc.viewMode != 2 && pc.viewMode != 8 && pc.viewMode != 11) {
             // For Lumen / SDF placeholders, render the placeholder color even on background
             finalColor = vec3(1.0, 0.0, 1.0);
         }
 #endif
     }
+
+    imageStore(g_OutputNormal, pixel, vec4(OctEncode(gbufferNormal), 0.0, 0.0));
+    imageStore(g_OutputDepth, pixel, vec4(gbufferDepth, 0.0, 0.0, 0.0));
+    imageStore(g_OutputAlbedo, pixel, vec4(gbufferAlbedo, 1.0));
 
 #ifdef _DEBUG
     ivec2 uiPixel = pixel / 2;

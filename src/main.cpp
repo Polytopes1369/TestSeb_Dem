@@ -16,6 +16,11 @@ struct DebugState {
     uint32_t viewMode = 0;
     bool disableOcclusionCulling = false;
     uint32_t naniteSubMode = 1; // 1 to 7 for Nanite modes
+    // renderer::ClusterRenderPipeline::SetDebugTraceMode -- 0 = SWRT (mesh SDF sphere tracing),
+    // 1 = HWRT (inline rayQueryEXT). Shared by SurfaceCacheGIInjectPass and ScreenProbeGIPass so
+    // both ray tracing back-ends stay exercised. Defaults to HWRT, matching Release's own fixed
+    // choice (see ClusterRenderPipeline::RecordFrame's own comment).
+    uint32_t traceMode = 1;
 };
 static DebugState g_DebugState;
 
@@ -73,6 +78,10 @@ static void KeyCallback(GLFWwindow* window, int key, int scancode, int action, i
         g_DebugState.disableOcclusionCulling = !g_DebugState.disableOcclusionCulling;
         LOG_INFO(std::format("[Debug] Occlusion Culling: {}", g_DebugState.disableOcclusionCulling ? "DISABLED" : "ENABLED"));
         break;
+    case GLFW_KEY_T:
+        g_DebugState.traceMode = 1u - g_DebugState.traceMode;
+        LOG_INFO(std::format("[Debug] GI Trace Mode: {}", g_DebugState.traceMode == 0u ? "SWRT" : "HWRT"));
+        break;
     default:
         break;
     }
@@ -128,6 +137,7 @@ int main() {
     // hybrid (hardware + software) rasterization into the Visibility Buffer -> deferred material
     // resolve -> blit to swapchain. See renderer::ClusterRenderPipeline for the frame graph. ---
     renderer::ClusterRenderPipelineCreateInfo pipelineInfo{};
+    pipelineInfo.physicalDevice = vkContext.GetPhysicalDevice();
     pipelineInfo.device = vkContext.GetDevice();
     pipelineInfo.allocator = vkContext.GetAllocator();
     pipelineInfo.commandPool = vkContext.GetCommandPool();
@@ -207,6 +217,7 @@ int main() {
 #ifndef NDEBUG
         camera.SetDebugViewMode(g_DebugState.viewMode);
         camera.SetDebugOcclusionCullingDisabled(g_DebugState.disableOcclusionCulling);
+        clusterPipeline.SetDebugTraceMode(g_DebugState.traceMode);
 #endif
 
         // --- DEBUG: dump the camera position and the resulting view/proj matrices on the

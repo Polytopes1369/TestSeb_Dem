@@ -312,6 +312,38 @@ bool ClusterRenderPipeline::Init(
     return false;
   }
 
+  // Shared trace-scene descriptor sets (mesh SDF trace scene + Surface Cache sampling), built
+  // once from m_GlobalSDF's per-entity SDF images and m_SurfaceCache's card table/atlases (both
+  // already Init'd above) -- reused unmodified by m_SurfaceCacheRT/m_GIInject/m_ScreenProbeGI.
+  if (!m_TraceContext.Init(createInfo.device, createInfo.allocator, createInfo.commandPool,
+                           createInfo.queue, m_GlobalSDF, m_SurfaceCache)) {
+    LOG_ERROR("[ClusterRenderPipeline] Failed to initialize SurfaceCacheTraceContext.");
+    return false;
+  }
+  // HWRT back-end: one BLAS per traced entity + one TLAS, built once against m_SurfaceCache's own
+  // Fallback Mesh vertex/index buffers (the scene is static -- see this class' own "Entity self-
+  // rotation" scope note -- so no per-frame rebuild is needed).
+  if (!m_SurfaceCacheRT.Init(createInfo.physicalDevice, createInfo.device, createInfo.allocator,
+                             createInfo.commandPool, createInfo.queue, m_TraceContext, m_SurfaceCache)) {
+    LOG_ERROR("[ClusterRenderPipeline] Failed to initialize SurfaceCacheRayTracingPass.");
+    return false;
+  }
+  // Per-card secondary-bounce injection into m_SurfaceCache's own radiance atlas -- makes that
+  // atlas genuinely multi-bounce over time, which m_ScreenProbeGI's single-hit-sample final
+  // gather then benefits from directly.
+  if (!m_GIInject.Init(createInfo.device, createInfo.allocator, m_TraceContext, m_SurfaceCache, m_SurfaceCacheRT)) {
+    LOG_ERROR("[ClusterRenderPipeline] Failed to initialize SurfaceCacheGIInjectPass.");
+    return false;
+  }
+  // Screen Space Probe GI -- needs m_Resolve's GBuffer (already Init'd, STEP 6 above) for the
+  // probe placement/gather passes, and m_TraceContext/m_SurfaceCacheRT for its own trace pass.
+  if (!m_ScreenProbeGI.Init(createInfo.device, createInfo.allocator, createInfo.commandPool,
+                            createInfo.queue, createInfo.renderExtent, m_TraceContext, m_SurfaceCache,
+                            m_SurfaceCacheRT, m_Resolve)) {
+    LOG_ERROR("[ClusterRenderPipeline] Failed to initialize ScreenProbeGIPass.");
+    return false;
+  }
+
 #ifndef NDEBUG
   // Two-tier SDF ray march DEBUG VISUALIZATION (see ClusterRenderPipeline.h's own comment on
   // m_SDFRayMarch) -- output sized to match the render extent so its debug image is a 1:1
@@ -370,9 +402,19 @@ void ClusterRenderPipeline::Shutdown() {
   m_LastStatsSampleBytes = 0;
   m_SDFRayMarch.Shutdown();
 #endif
+  m_ScreenProbeGI.Shutdown();
+  m_GIInject.Shutdown();
+  m_SurfaceCacheRT.Shutdown();
+  m_TraceContext.Shutdown();
   m_GlobalSDF.Shutdown();
   m_SurfaceCache.Shutdown();
   m_ShadowMap.Shutdown();
+  m_PrevViewProj = maths::mat4{};
+  m_HasPrevViewProj = false;
+  m_FrameIndex = 0;
+#ifndef NDEBUG
+  m_DebugTraceMode = 0;
+#endif
   m_Resolve.Shutdown();
   m_SoftwareRaster.Shutdown();
   m_HardwareRaster.Shutdown();
@@ -457,6 +499,15 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
   // the screen size classification needs the positive scale.
   float projScaleY = std::abs(camera.proj.m[5]);
 
+  // SWRT/HWRT back-end shared by m_GIInject ([1z] below) and m_ScreenProbeGI ([12b] below) --
+  // debug-only toggle (main.cpp's 'T' key via SetDebugTraceMode), Release always uses HWRT (no
+  // debug toggle to switch back to SWRT).
+#ifndef NDEBUG
+  uint32_t traceMode = m_DebugTraceMode;
+#else
+  uint32_t traceMode = 1u;
+#endif
+
   // =========================================================================================
   // [1] Per-frame worklist clears. Each Record*() carries its own
   // CLEAR->COMPUTE barrier, so the culling/raster dispatches below can never
@@ -495,6 +546,28 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
 
     // 3. Global SDF clipmap streaming, from this frame's camera position.
     m_GlobalSDF.RecordUpdate(cmd, cameraFrameInfo.position);
+
+    // 4. Secondary-bounce injection into m_SurfaceCache's own radiance atlas (budgeted, a handful
+    // of cards per call -- see SurfaceCacheGIInjectPass::kCardsPerFrameBudget) via m_TraceContext's
+    // shared trace-scene sets against m_SurfaceCacheRT's static TLAS or the per-entity mesh SDFs,
+    // depending on `traceMode`.
+    m_GIInject.RecordInject(cmd, m_TraceContext, m_SurfaceCache, traceMode);
+
+    // Unlike SurfaceCachePass::RecordCapture/ShadowMapPass::RecordCapture/GlobalSDFPass::
+    // RecordUpdate, SurfaceCacheGIInjectPass::RecordInject does NOT end with its own trailing
+    // barrier -- its read-modify-write of the radiance atlas (imageLoad/imageStore, STORAGE
+    // access) must be made visible here, explicitly, before m_ScreenProbeGI's own trace pass
+    // samples that same atlas (surface_cache_sampling.glsl's g_SurfaceCacheRadiance) later this
+    // frame.
+    VkMemoryBarrier2 giInjectBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    giInjectBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    giInjectBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+    giInjectBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
+    giInjectBarrier.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+    VkDependencyInfo giInjectDepInfo{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    giInjectDepInfo.memoryBarrierCount = 1;
+    giInjectDepInfo.pMemoryBarriers = &giInjectBarrier;
+    vkCmdPipelineBarrier2(cmd, &giInjectDepInfo);
 
 #ifndef NDEBUG
     // GlobalSDFPass::RecordUpdate's own trailing barrier only extends visibility to
@@ -868,11 +941,31 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
   // output image. The software rasterizer's atomic writes are already visible
   // (RecordRaster's trailing COMPUTE -> COMPUTE barrier).
   // =========================================================================================
-  m_Resolve.RecordResolve(cmd, viewProj
+  maths::mat4 prevViewProjForResolve = m_HasPrevViewProj ? m_PrevViewProj : viewProj;
+  m_Resolve.RecordResolve(cmd, viewProj, prevViewProjForResolve
 #ifndef NDEBUG
     , camera.debugViewMode
 #endif
   );
+
+  // =========================================================================================
+  // [12b] Screen Space Probe GI: trace -> temporal reprojection/accumulation -> bilateral
+  // gather, read-modify-writing m_Resolve's own output color image directly (see
+  // renderer::ScreenProbeGIPass's own class comment for the exact per-frame call contract). Runs
+  // after [12] Resolve (needs its GBuffer) and after [1z]'s GI injection (this frame's Surface
+  // Cache radiance atlas already reflects this frame's own lighting/capture/injection updates).
+  // =========================================================================================
+  {
+    maths::mat4 prevViewProjForProbes = m_HasPrevViewProj ? m_PrevViewProj : maths::mat4{};
+    m_ScreenProbeGI.RecordUpdateViewParams(cmd, viewProj, prevViewProjForProbes);
+    m_ScreenProbeGI.RecordTrace(cmd, m_TraceContext, m_TraceContext.GetEntityCount(), traceMode, m_FrameIndex);
+    m_ScreenProbeGI.RecordTemporal(cmd);
+    m_ScreenProbeGI.RecordGather(cmd
+#ifndef NDEBUG
+      , camera.debugViewMode
+#endif
+    );
+  }
 
   // =========================================================================================
   // [13] Second HZB rebuild, from the now-complete (early + late) depth: this
@@ -1039,6 +1132,13 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
     depInfo.pImageMemoryBarriers = &presentBarrier;
     vkCmdPipelineBarrier2(cmd, &depInfo);
   }
+
+  // Recorded last, after every consumer of "the previous frame's" viewProj above (m_Resolve's own
+  // motion-vector debug view, m_ScreenProbeGI's temporal reprojection) has already read it --
+  // this frame's own matrix becomes "the previous frame's" for the NEXT RecordFrame() call.
+  m_PrevViewProj = viewProj;
+  m_HasPrevViewProj = true;
+  ++m_FrameIndex;
 }
 
 } // namespace renderer
