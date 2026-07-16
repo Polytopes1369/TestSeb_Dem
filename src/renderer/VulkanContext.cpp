@@ -1292,9 +1292,9 @@ void VulkanContext::GenerateBox(
   assert(Length > 0.0f);
   assert(Height > 0.0f);
 
-  uint32_t WidthSegments = std::max(1u, static_cast<uint32_t>(std::round(Width / 0.01f)));
-  uint32_t LengthSegments = std::max(1u, static_cast<uint32_t>(std::round(Length / 0.01f)));
-  uint32_t HeightSegments = std::max(1u, static_cast<uint32_t>(std::round(Height / 0.01f)));
+  uint32_t WidthSegments = std::max(1u, static_cast<uint32_t>(std::round(Width / config::VERTEX_SPACING)));
+  uint32_t LengthSegments = std::max(1u, static_cast<uint32_t>(std::round(Length / config::VERTEX_SPACING)));
+  uint32_t HeightSegments = std::max(1u, static_cast<uint32_t>(std::round(Height / config::VERTEX_SPACING)));
 
   for (uint32_t face = 0; face < 6u; ++face) {
     BoxPushConstants params{};
@@ -1351,9 +1351,9 @@ void VulkanContext::GenerateCone(
 
   constexpr float PI = 3.1415926535f;
   float maxRadius = std::max(Radius1, Radius2);
-  uint32_t HeightSegments = std::max(1u, static_cast<uint32_t>(std::round(Height / 0.01f)));
-  uint32_t CapSegments = std::max(1u, static_cast<uint32_t>(std::round(maxRadius / 0.01f)));
-  uint32_t Sides = std::max(3u, static_cast<uint32_t>(std::round(2.0f * PI * maxRadius / 0.01f)));
+  uint32_t HeightSegments = std::max(1u, static_cast<uint32_t>(std::round(Height / config::VERTEX_SPACING)));
+  uint32_t CapSegments = std::max(1u, static_cast<uint32_t>(std::round(maxRadius / config::VERTEX_SPACING)));
+  uint32_t Sides = std::max(3u, static_cast<uint32_t>(std::round(2.0f * PI * maxRadius / config::VERTEX_SPACING)));
 
   ConeParams params{};
   params.radius1 = Radius1;
@@ -1393,7 +1393,7 @@ void VulkanContext::GenerateSphere(
   assert(Radius > 0.0f);
 
   constexpr float PI = 3.1415926535f;
-  uint32_t Segments = std::max(3u, static_cast<uint32_t>(std::round(2.0f * PI * Radius / 0.01f)));
+  uint32_t Segments = std::max(3u, static_cast<uint32_t>(std::round(2.0f * PI * Radius / config::VERTEX_SPACING)));
 
   SphereParams params{};
   params.radius = Radius;
@@ -1429,7 +1429,7 @@ void VulkanContext::GenerateIcosphere(
   assert((Tetra ? 1 : 0) + (Octa ? 1 : 0) + (Icosa ? 1 : 0) == 1);
 
   float edgeLength = (Icosa ? 1.05f : (Octa ? 1.41f : 1.63f)) * Radius;
-  uint32_t Segments = std::max(1u, static_cast<uint32_t>(std::round(edgeLength / 0.01f)));
+  uint32_t Segments = std::max(1u, static_cast<uint32_t>(std::round(edgeLength / config::VERTEX_SPACING)));
 
   IcosphereParams params{};
   params.radius = Radius;
@@ -1475,9 +1475,9 @@ void VulkanContext::GenerateCylinder(
   assert(Height > 0.0f);
 
   constexpr float PI = 3.1415926535f;
-  uint32_t HeightSegments = std::max(1u, static_cast<uint32_t>(std::round(Height / 0.01f)));
-  uint32_t CapSegments = std::max(1u, static_cast<uint32_t>(std::round(Radius / 0.01f)));
-  uint32_t Sides = std::max(3u, static_cast<uint32_t>(std::round(2.0f * PI * Radius / 0.01f)));
+  uint32_t HeightSegments = std::max(1u, static_cast<uint32_t>(std::round(Height / config::VERTEX_SPACING)));
+  uint32_t CapSegments = std::max(1u, static_cast<uint32_t>(std::round(Radius / config::VERTEX_SPACING)));
+  uint32_t Sides = std::max(3u, static_cast<uint32_t>(std::round(2.0f * PI * Radius / config::VERTEX_SPACING)));
 
   CylinderParams params{};
   params.radius = Radius;
@@ -1518,9 +1518,9 @@ void VulkanContext::GenerateTube(
   assert(Height > 0.0f);
 
   constexpr float PI = 3.1415926535f;
-  uint32_t HeightSegments = std::max(1u, static_cast<uint32_t>(std::round(Height / 0.01f)));
-  uint32_t CapSegments = std::max(1u, static_cast<uint32_t>(std::round((Radius1 - Radius2) / 0.01f)));
-  uint32_t Sides = std::max(3u, static_cast<uint32_t>(std::round(2.0f * PI * Radius1 / 0.01f)));
+  uint32_t HeightSegments = std::max(1u, static_cast<uint32_t>(std::round(Height / config::VERTEX_SPACING)));
+  uint32_t CapSegments = std::max(1u, static_cast<uint32_t>(std::round((Radius1 - Radius2) / config::VERTEX_SPACING)));
+  uint32_t Sides = std::max(3u, static_cast<uint32_t>(std::round(2.0f * PI * Radius1 / config::VERTEX_SPACING)));
 
   TubeParams params{};
   params.radius1 = Radius1;
@@ -1565,8 +1565,8 @@ void VulkanContext::GenerateTorus(
   assert(Radius2 > 0.0f);
 
   constexpr float PI = 3.1415926535f;
-  uint32_t Segments = std::max(3u, static_cast<uint32_t>(std::round(2.0f * PI * Radius1 / 0.01f)));
-  uint32_t Sides = std::max(3u, static_cast<uint32_t>(std::round(2.0f * PI * Radius2 / 0.01f)));
+  uint32_t Segments = std::max(3u, static_cast<uint32_t>(std::round(2.0f * PI * Radius1 / config::VERTEX_SPACING)));
+  uint32_t Sides = std::max(3u, static_cast<uint32_t>(std::round(2.0f * PI * Radius2 / config::VERTEX_SPACING)));
 
   TorusParams params{};
   params.radius1 = Radius1;
@@ -1604,9 +1604,9 @@ void VulkanContext::GeneratePyramid(
   assert(Depth > 0.0f);
   assert(Height > 0.0f);
 
-  uint32_t WidthSegments = std::max(1u, static_cast<uint32_t>(std::round(Width / 0.01f)));
-  uint32_t DepthSegments = std::max(1u, static_cast<uint32_t>(std::round(Depth / 0.01f)));
-  uint32_t HeightSegments = std::max(1u, static_cast<uint32_t>(std::round(Height / 0.01f)));
+  uint32_t WidthSegments = std::max(1u, static_cast<uint32_t>(std::round(Width / config::VERTEX_SPACING)));
+  uint32_t DepthSegments = std::max(1u, static_cast<uint32_t>(std::round(Depth / config::VERTEX_SPACING)));
+  uint32_t HeightSegments = std::max(1u, static_cast<uint32_t>(std::round(Height / config::VERTEX_SPACING)));
 
   PyramidParams params{};
   params.width = Width;
@@ -1658,8 +1658,8 @@ void VulkanContext::GeneratePlane(
   assert(Length > 0.0f);
   assert(Width > 0.0f);
 
-  uint32_t LengthSegments = std::max(2u, static_cast<uint32_t>(std::round(Length / 0.01f)));
-  uint32_t WidthSegments = std::max(2u, static_cast<uint32_t>(std::round(Width / 0.01f)));
+  uint32_t LengthSegments = std::max(2u, static_cast<uint32_t>(std::round(Length / config::VERTEX_SPACING)));
+  uint32_t WidthSegments = std::max(2u, static_cast<uint32_t>(std::round(Width / config::VERTEX_SPACING)));
 
   PlaneParams params{};
   params.width = Width;
@@ -1695,8 +1695,8 @@ void VulkanContext::GenerateCapsule(
   assert(Height > 0.0f);
 
   constexpr float PI = 3.1415926535f;
-  uint32_t HeightSegs = std::max(1u, static_cast<uint32_t>(std::round(Height / 0.01f)));
-  uint32_t Sides = std::max(3u, static_cast<uint32_t>(std::round(2.0f * PI * Radius / 0.01f)));
+  uint32_t HeightSegs = std::max(1u, static_cast<uint32_t>(std::round(Height / config::VERTEX_SPACING)));
+  uint32_t Sides = std::max(3u, static_cast<uint32_t>(std::round(2.0f * PI * Radius / config::VERTEX_SPACING)));
 
   CapsuleParams params{};
   params.radius = Radius;
@@ -1766,7 +1766,7 @@ void VulkanContext::GenerateGeometry() {
                       icosphereBaseFaceCount, icosphereVertsPerFace);
 
     float edgeLength = (Icosa ? 1.05f : (Octa ? 1.41f : 1.63f)) * Radius;
-    uint32_t Segments = std::max(1u, static_cast<uint32_t>(std::round(edgeLength / 0.01f)));
+    uint32_t Segments = std::max(1u, static_cast<uint32_t>(std::round(edgeLength / config::VERTEX_SPACING)));
     icosphereIndexCount = icosphereBaseFaceCount * Segments * Segments * 3u;
   }
   // DEBUG: sample-readback the icosphere geometry, exactly as before this
@@ -1915,8 +1915,8 @@ void VulkanContext::GenerateGeometry() {
     // Calculate segments based on density: 1 vertex per 0.01m
     constexpr float PI = 3.1415926535f;
     float curveLength = 2.0f * PI * params.radius * std::max(params.p, params.q);
-    params.nbRadSeg = std::max(3u, static_cast<uint32_t>(std::round(curveLength / 0.01f)));
-    params.nbSides = std::max(3u, static_cast<uint32_t>(std::round(2.0f * PI * params.tube / 0.01f)));
+    params.nbRadSeg = std::max(3u, static_cast<uint32_t>(std::round(curveLength / config::VERTEX_SPACING)));
+    params.nbSides = std::max(3u, static_cast<uint32_t>(std::round(2.0f * PI * params.tube / config::VERTEX_SPACING)));
 
     params.meshID = m_EntityData[10].meshID;
     params.materialID = 0.0f;
@@ -1951,8 +1951,8 @@ void VulkanContext::GenerateGeometry() {
     params.depth = 1.4f;
     
     // Calculate segments based on density: 1 vertex per 0.01m
-    params.heightSegs = std::max(3u, static_cast<uint32_t>(std::round(params.height / 0.01f)));
-    params.sideSegs = std::max(3u, static_cast<uint32_t>(std::round(2.0f * (params.width + params.depth) / 0.01f)));
+    params.heightSegs = std::max(3u, static_cast<uint32_t>(std::round(params.height / config::VERTEX_SPACING)));
+    params.sideSegs = std::max(3u, static_cast<uint32_t>(std::round(2.0f * (params.width + params.depth) / config::VERTEX_SPACING)));
 
     params.chamferPower =
         6.0f; // > 2 required (see geom_chamferBox.comp); higher = sharper edges
