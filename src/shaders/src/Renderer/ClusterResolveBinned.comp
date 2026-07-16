@@ -13,6 +13,7 @@
 // own comment for why every debug view instead falls back to the original full-screen shader).
 
 #include "include/cluster_culling_common.glsl"
+#include "include/struct_custo.glsl"
 
 #define COMPRESSED_POOL_SET 0
 #define COMPRESSED_POOL_BINDING 1
@@ -97,6 +98,17 @@ layout(r32f, set = 0, binding = 11) uniform writeonly image2D g_OutputDepth;
 layout(rgba8, set = 0, binding = 12) uniform writeonly image2D g_OutputAlbedo;
 layout(rg8, set = 0, binding = 13) uniform writeonly image2D g_OutputRoughnessMetallic;
 
+// Per-entity self-rotation (dynamic primitive spin) -- appended past the shadow bindings above
+// (14-17) rather than renumbering them; see ClusterResolve.comp's identical bindings 19/20 for
+// the full-screen/debug path this binned/Release path mirrors.
+layout(std430, set = 0, binding = 18) readonly buffer EntityTransformBuffer {
+    EntityTransform entityTransforms[];
+};
+
+layout(std430, set = 0, binding = 19) readonly buffer EntityDataBuffer {
+    EntityData entityData[];
+};
+
 layout(push_constant) uniform BinIndexPC {
     uint binIndex;
 } pc;
@@ -137,15 +149,26 @@ void main() {
     vec3 p1 = DecodeClusterPosition(pageByteBase, i1, cluster.boundsMin, cluster.boundsMax);
     vec3 p2 = DecodeClusterPosition(pageByteBase, i2, cluster.boundsMin, cluster.boundsMax);
 
+    // Apply entity self-rotation -- see ClusterResolve.comp's own identical comment (this
+    // binned/Release path re-derives the exact same barycentrics from the exact same deformed
+    // triangle, so it must reapply the exact same per-entity rotation before re-projecting).
+    EntityData ed = entityData[cluster.entityID];
+    EntityTransform xform = entityTransforms[ed.meshID];
+    mat3 rotation = mat3(xform.rotation);
+
+    p0 = xform.center + rotation * (p0 - xform.center);
+    p1 = xform.center + rotation * (p1 - xform.center);
+    p2 = xform.center + rotation * (p2 - xform.center);
+
     // Reapply the exact same WPO sway both rasterizers already applied -- see
     // ClusterResolve.comp's own comment for why this must happen before re-deriving barycentrics.
     p0 = ApplyWPODeformation(p0, cluster.clusterID, cluster.maxWPOAmplitude, g_WPOGlobals.globalTime);
     p1 = ApplyWPODeformation(p1, cluster.clusterID, cluster.maxWPOAmplitude, g_WPOGlobals.globalTime);
     p2 = ApplyWPODeformation(p2, cluster.clusterID, cluster.maxWPOAmplitude, g_WPOGlobals.globalTime);
 
-    vec3 n0 = DecodeClusterNormal(pageByteBase, i0);
-    vec3 n1 = DecodeClusterNormal(pageByteBase, i1);
-    vec3 n2 = DecodeClusterNormal(pageByteBase, i2);
+    vec3 n0 = rotation * DecodeClusterNormal(pageByteBase, i0);
+    vec3 n1 = rotation * DecodeClusterNormal(pageByteBase, i1);
+    vec3 n2 = rotation * DecodeClusterNormal(pageByteBase, i2);
     vec2 uv0 = DecodeClusterUV(pageByteBase, i0);
     vec2 uv1 = DecodeClusterUV(pageByteBase, i1);
     vec2 uv2 = DecodeClusterUV(pageByteBase, i2);

@@ -54,6 +54,8 @@ namespace renderer {
         m_ClusterMetadataBuffer = clusterMetadataBuffer;
         m_CompressedPoolBuffer = compressedPhysicalPoolBuffer;
         m_WPOGlobalsBuffer = wpoGlobalsBuffer;
+        m_EntityTransformBuffer = entityTransformBuffer;
+        m_EntityDataBuffer = entityDataBuffer;
         m_MaskImageInfos = maskImageInfos;
 
         // --- Output color image: RGBA8 storage image, sized to the render target. ---
@@ -383,6 +385,8 @@ namespace renderer {
         m_ClusterMetadataBuffer = VK_NULL_HANDLE;
         m_CompressedPoolBuffer = VK_NULL_HANDLE;
         m_WPOGlobalsBuffer = VK_NULL_HANDLE;
+        m_EntityTransformBuffer = VK_NULL_HANDLE;
+        m_EntityDataBuffer = VK_NULL_HANDLE;
         m_MaskImageInfos.clear();
 
         m_ViewParamsBuffer.Destroy();
@@ -472,14 +476,18 @@ namespace renderer {
         (void)queue; // Reserved for parity with every other Init()-shaped method; no one-time submit needed here.
         uint32_t maskTextureCount = static_cast<uint32_t>(m_MaskImageInfos.size());
 
-        // --- Descriptor set layout: 18 bindings, matching ClusterResolveBinned.comp's set = 0
-        // bindings 0..17 exactly. Bindings 2-4 (VisBuffer/HW-depth/SW-atomic) from the original
+        // --- Descriptor set layout: 20 bindings, matching ClusterResolveBinned.comp's set = 0
+        // bindings 0..19 exactly. Bindings 2-4 (VisBuffer/HW-depth/SW-atomic) from the original
         // 15-binding layout are absent here -- visibility is already fully resolved by
         // `shadingBinPass` before this pipeline ever runs -- replaced by bindings 2-4 for the
         // sorted-pixel-list/bin-offsets/bin-histogram buffers that carry that resolved visibility
         // forward instead. Bindings 14-17 are Phase 3's renderer::VirtualShadowMapPass resources --
-        // see SetVirtualShadowMap()'s own comment. ---
-        std::array<VkDescriptorSetLayoutBinding, 18> bindings{};
+        // see SetVirtualShadowMap()'s own comment. Bindings 18-19 are the per-entity rotation
+        // buffers (renderer::VulkanContext's dynamic primitive spin) -- this binned/Release path
+        // needs them for the exact same reason ClusterResolve.comp's own full-screen path does
+        // (reapplying entity self-rotation before re-deriving barycentrics), appended past the
+        // shadow bindings rather than renumbering them. ---
+        std::array<VkDescriptorSetLayoutBinding, 20> bindings{};
         bindings[0] = { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };  // ClusterCullMetadataSSBO
         bindings[1] = { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };  // CompressedClusterPoolSSBO
         bindings[2] = { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };  // g_SortedPixelList
@@ -498,6 +506,8 @@ namespace renderer {
         bindings[15] = { 15, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // g_ShadowPageTable
         bindings[16] = { 16, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // g_ShadowFeedback
         bindings[17] = { 17, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // g_ShadowSunLevels
+        bindings[18] = { 18, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // EntityTransformBuffer
+        bindings[19] = { 19, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // EntityDataBuffer
 
         VkDescriptorSetLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
         layoutInfo.bindingCount = static_cast<uint32_t>(bindings.size());
@@ -505,7 +515,7 @@ namespace renderer {
         VK_CHECK(vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &m_ResolveBinnedSetLayout));
 
         std::array<VkDescriptorPoolSize, 4> poolSizes{};
-        poolSizes[0] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8 };  // cluster metadata, compressed pool, sorted list, offsets, histogram, material params, shadow page table, shadow feedback
+        poolSizes[0] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 10 }; // cluster metadata, compressed pool, sorted list, offsets, histogram, material params, shadow page table, shadow feedback, entity transform, entity data
         poolSizes[1] = { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 5 };   // color, normal, depth, albedo, roughness-metallic
         poolSizes[2] = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 3 };  // view params, WPO globals, shadow sun levels
         poolSizes[3] = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, maskTextureCount + 1 }; // + shadow physical atlas
@@ -535,8 +545,10 @@ namespace renderer {
         VkDescriptorImageInfo outputDepthInfo{ VK_NULL_HANDLE, m_OutputDepthView, VK_IMAGE_LAYOUT_GENERAL };
         VkDescriptorImageInfo outputAlbedoInfo{ VK_NULL_HANDLE, m_OutputAlbedoView, VK_IMAGE_LAYOUT_GENERAL };
         VkDescriptorImageInfo outputRMInfo{ VK_NULL_HANDLE, m_OutputRoughnessMetallicView, VK_IMAGE_LAYOUT_GENERAL };
+        VkDescriptorBufferInfo entityTransformInfo{ m_EntityTransformBuffer, 0, VK_WHOLE_SIZE };
+        VkDescriptorBufferInfo entityDataInfo{ m_EntityDataBuffer, 0, VK_WHOLE_SIZE };
 
-        std::array<VkWriteDescriptorSet, 14> writes{};
+        std::array<VkWriteDescriptorSet, 16> writes{};
         writes[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ResolveBinnedSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &clusterMetaInfo, nullptr };
         writes[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ResolveBinnedSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &compressedPoolInfo, nullptr };
         writes[2] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ResolveBinnedSet, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &sortedListInfo, nullptr };
@@ -551,9 +563,13 @@ namespace renderer {
         writes[11] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ResolveBinnedSet, 11, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &outputDepthInfo, nullptr, nullptr };
         writes[12] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ResolveBinnedSet, 12, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &outputAlbedoInfo, nullptr, nullptr };
         writes[13] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ResolveBinnedSet, 13, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &outputRMInfo, nullptr, nullptr };
+        // Array index != dstBinding for these last two on purpose -- bindings 14-17 (Phase 3's
+        // renderer::VirtualShadowMapPass resources) are intentionally left unwritten here (written
+        // later by SetVirtualShadowMap(), same as the primary set above); the per-entity rotation
+        // buffers are appended past them at 18/19.
+        writes[14] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ResolveBinnedSet, 18, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &entityTransformInfo, nullptr };
+        writes[15] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ResolveBinnedSet, 19, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &entityDataInfo, nullptr };
         vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
-        // Bindings 14-17 (Phase 3's renderer::VirtualShadowMapPass resources) are intentionally
-        // left unwritten here -- SetVirtualShadowMap() writes them, same as the primary set above.
 
         VkPushConstantRange pushRange{ VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(uint32_t) }; // binIndex
         VkPipelineLayoutCreateInfo pipelineLayoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };

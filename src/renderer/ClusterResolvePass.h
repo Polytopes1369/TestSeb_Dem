@@ -206,6 +206,8 @@ namespace renderer {
         VkBuffer m_ClusterMetadataBuffer = VK_NULL_HANDLE; // Borrowed, same handle Init() received.
         VkBuffer m_CompressedPoolBuffer = VK_NULL_HANDLE;  // Borrowed, same handle Init() received.
         VkBuffer m_WPOGlobalsBuffer = VK_NULL_HANDLE;      // Borrowed, same handle Init() received.
+        VkBuffer m_EntityTransformBuffer = VK_NULL_HANDLE; // Borrowed, same handle Init() received.
+        VkBuffer m_EntityDataBuffer = VK_NULL_HANDLE;      // Borrowed, same handle Init() received.
         std::vector<VkDescriptorImageInfo> m_MaskImageInfos; // Copy of Init()'s own `maskImageInfos` parameter.
 
         VkDescriptorSetLayout m_ResolveBinnedSetLayout = VK_NULL_HANDLE;
