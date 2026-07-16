@@ -11,7 +11,7 @@ constexpr float VERTEX_SPACING = 0.1f;
 // ~1-2m hero primitives) on a 300m floor would compute a 3000x3000 grid --
 // 9M vertices -- and overflow the fixed-size geometry SSBOs
 // (nanite::VERTEX_BUFFER_BYTES / INDEX_BUFFER_BYTES below).
-constexpr float FLOOR_VERTEX_SPACING = 10.0f;
+constexpr float FLOOR_VERTEX_SPACING = 0.5f;
 
 namespace nanite {
 constexpr float SOFTWARE_RASTER_THRESHOLD_PIXELS = 6.0f;

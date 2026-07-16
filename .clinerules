@@ -1,0 +1,36 @@
+# Cline operating rules for this project
+
+## Local model constraints
+You are running as a local 14B-class model (Qwen3 14B, quantized) via LM Studio on
+an RTX 5080 Laptop GPU (16 GB VRAM), context window 40960 tokens, KV cache Q4_0.
+This is far smaller than a frontier hosted model. Behave accordingly:
+- Work on one file or one focused change at a time. Do not attempt sweeping
+  multi-file refactors in a single step.
+- Prefer targeted reads (specific functions/sections) over reading entire large
+  files when the file is long. Ask before re-reading a file you already have in
+  context.
+- Before a large or ambiguous task, restate your plan in 2-3 sentences and wait
+  for confirmation rather than executing immediately.
+- Do not paste huge generated blobs (build logs, .obj dumps) into context. The
+  build/, out/, vendor/, .git/ directories are excluded via .clineignore for
+  this reason — don't try to read files there.
+
+## Project conventions (from CLAUDE.md, condensed)
+- C++23, CMake, Windows x64, Vulkan 1.3+ with dynamic rendering, mesh shaders,
+  ray tracing, VMA, bindless/GPU-driven architecture.
+- Comments: only where the WHY is non-obvious (tricky Vulkan sync, math).
+  Always in English. No commented-out "TODO: initialize here" placeholders.
+- No raw owning pointers: use RAII (std::unique_ptr/shared_ptr).
+- Every VkResult must be checked explicitly (crash or throw on failure).
+- Debug-only code (Logger, DebugInputRouter, GPU debug buffers, stat overlays,
+  Nanite/Lumen visualization modes) must stay excluded from Release builds via
+  CMake `if(CMAKE_BUILD_TYPE STREQUAL "Debug")` or a file-wide `#ifdef _DEBUG`.
+  Never add verbose strings/logging that would ship in Release.
+- When changing a function, show it as a diff (before/after), not a full file
+  rewrite, unless the file is new.
+
+## Good tasks for this local setup
+Small, scoped, single-file work: adding missing comments, exposing a hardcoded
+value as a named constant/config field, explaining a function, spotting an
+obvious bug in a small snippet. For anything touching multiple systems
+(renderer + shaders + sync), flag that it's better suited to a larger model.
