@@ -1,0 +1,181 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+#extension GL_EXT_ray_query : require
+
+// Phase 2 (UE5.8 parity roadmap), stage A of 3 (Trace -> Temporal -> Gather -- see
+// renderer::ReflectionPass' own class comment for the full pipeline). One invocation PER PIXEL
+// (full resolution, unlike renderer::ScreenProbeGIPass's per-8x8-tile probes -- a reflection must
+// stay sharp at low roughness, which a coarse probe tile would immediately blur away). Reads this
+// pixel's normal/depth/roughness from renderer::ClusterResolvePass's GBuffer, GGX-VNDF-importance-
+// samples ONE reflection ray direction (roughness-weighted, not the cosine-weighted hemisphere
+// renderer::SurfaceCacheGIInjectPass's own diffuse injection uses), traces it via SWRT
+// (mesh_sdf_trace.glsl) or HWRT (inline rayQueryEXT against the shared Surface Cache TLAS,
+// identical to ScreenProbeTrace.comp's own TraceHWRT), samples the hit's Surface Cache radiance
+// (surface_cache_sampling.glsl's SampleCardRadiance -- a miss contributes zero), and writes
+// {radiance, validity} PLUS this shading pixel's own world position and normal into this frame's
+// ping-pong slot -- the latter two are NOT reflection-ray results, they are this pixel's own surface
+// point, stored purely so ReflectionTemporal.comp can run a ScreenProbeTemporal.comp-style world-
+// position/normal disocclusion test without needing a second unproject of the GBuffer depth image.
+
+#include "include/math_utils.glsl"
+#include "include/octahedral.glsl"
+#include "include/ggx_brdf.glsl"
+#include "include/mesh_sdf_trace.glsl"        // set 1
+#include "include/surface_cache_sampling.glsl" // set 2
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+// RGB = traced radiance, A = 1.0 (valid trace, possibly a miss -> black) or 0.0 (background pixel,
+// no geometry -- matches ClusterResolve.comp's own reversed-Z "depth == 0.0" sentinel convention).
+layout(rgba16f, set = 0, binding = 0) uniform writeonly image2D g_ReflectionRadiance;
+
+layout(rg16f, set = 0, binding = 1) uniform readonly image2D g_GBufferNormal;
+layout(r32f, set = 0, binding = 2) uniform readonly image2D g_GBufferDepth;
+layout(rg8, set = 0, binding = 3) uniform readonly image2D g_GBufferRoughnessMetallic; // only .r (roughness) used here.
+
+layout(set = 0, binding = 4) uniform accelerationStructureEXT g_TLAS;
+
+struct FallbackVertexGpu { float posX, posY, posZ; float normX, normY, normZ; float u, v; };
+layout(std430, set = 0, binding = 5) readonly buffer FallbackVertexBuffer { FallbackVertexGpu g_Vertices[]; };
+layout(std430, set = 0, binding = 6) readonly buffer FallbackIndexBuffer { uint g_Indices[]; };
+struct EntityDrawRangeGpu { int vertexOffset; uint firstIndex; uint indexCount; uint _pad; };
+layout(std430, set = 0, binding = 7) readonly buffer EntityDrawRangeBuffer { EntityDrawRangeGpu g_DrawRanges[]; };
+
+layout(std140, set = 0, binding = 8) uniform ReflectionViewParamsUBO {
+    mat4 invViewProj;
+    mat4 prevViewProj; // Unused here -- renderer::ReflectionPass::RecordTemporal's own concern.
+    vec3 cameraPositionWorld;
+    float _pad0;
+    vec2 viewportSize;
+    float _pad1;
+    float _pad2;
+} g_ViewParams;
+
+// rgb = this pixel's own world position, a = validity (1.0 = geometry, 0.0 = background) -- same
+// {xyz, validity} convention as renderer::ScreenProbeGIPass::kWorldPosFormat.
+layout(rgba32f, set = 0, binding = 9) uniform writeonly image2D g_ReflectionWorldPos;
+// This pixel's own octahedral-encoded normal (NOT the reflection ray's direction).
+layout(rg16f, set = 0, binding = 10) uniform writeonly image2D g_ReflectionNormal;
+
+layout(push_constant) uniform TracePushConstants {
+    uint entityCount; // Dynamically uniform -- see mesh_sdf_trace.glsl's own requirement.
+    uint traceMode;   // 0 = SWRT (TraceMeshSDFScene), 1 = HWRT (TraceHWRT, inline ray query).
+    uint frameIndex;
+} pc;
+
+vec3 FetchPosition(uint globalVertexIndex) {
+    FallbackVertexGpu v = g_Vertices[globalVertexIndex];
+    return vec3(v.posX, v.posY, v.posZ);
+}
+
+// Identical to ScreenProbeTrace.comp's own TraceHWRT (itself identical to SurfaceCacheGIInject
+// .comp's) -- see that file's header comment on why inline ray query, not a full ray tracing
+// pipeline, is how this codebase hardware-traces from a plain compute shader. Not factored into a
+// shared include: this codebase already has 3 independent copies of this exact function (see
+// renderer::ReflectionPass' own class comment / this roadmap phase's plan for why a 4th copy here
+// follows the existing convention rather than refactoring 3 already-working files).
+bool TraceHWRT(vec3 rayOrigin, vec3 rayDir, float tMax, out uint outEntityIndex, out vec3 outLocalPos, out vec3 outLocalNormal) {
+    rayQueryEXT rq;
+    rayQueryInitializeEXT(rq, g_TLAS, gl_RayFlagsOpaqueEXT, 0xFF, rayOrigin, 1.0e-3, rayDir, tMax);
+    while (rayQueryProceedEXT(rq)) {
+        // Every BLAS triangle is unconditionally opaque -- nothing to confirm/reject manually.
+    }
+    if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionNoneEXT) {
+        return false;
+    }
+
+    outEntityIndex = uint(rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true));
+    int primitiveID = rayQueryGetIntersectionPrimitiveIndexEXT(rq, true);
+    float hitT = rayQueryGetIntersectionTEXT(rq, true);
+    vec3 objOrigin = rayQueryGetIntersectionObjectRayOriginEXT(rq, true);
+    vec3 objDir = rayQueryGetIntersectionObjectRayDirectionEXT(rq, true);
+    outLocalPos = objOrigin + objDir * hitT;
+
+    EntityDrawRangeGpu range = g_DrawRanges[outEntityIndex];
+    uint triangleFirstIndex = range.firstIndex + uint(primitiveID) * 3u;
+    uint i0 = uint(range.vertexOffset) + g_Indices[triangleFirstIndex + 0u];
+    uint i1 = uint(range.vertexOffset) + g_Indices[triangleFirstIndex + 1u];
+    uint i2 = uint(range.vertexOffset) + g_Indices[triangleFirstIndex + 2u];
+    vec3 p0 = FetchPosition(i0);
+    vec3 p1 = FetchPosition(i1);
+    vec3 p2 = FetchPosition(i2);
+    outLocalNormal = normalize(cross(p1 - p0, p2 - p0));
+    return true;
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 viewportSize = ivec2(g_ViewParams.viewportSize);
+    if (pixel.x >= viewportSize.x || pixel.y >= viewportSize.y) {
+        return;
+    }
+
+    float depth = imageLoad(g_GBufferDepth, pixel).r;
+    if (depth <= 0.0) {
+        // Background pixel (matches ClusterResolve.comp's own reversed-Z "depth == 0.0" sentinel)
+        // -- nothing to reflect; mark invalid so stage B/C both skip it.
+        imageStore(g_ReflectionRadiance, pixel, vec4(0.0));
+        imageStore(g_ReflectionWorldPos, pixel, vec4(0.0));
+        imageStore(g_ReflectionNormal, pixel, vec4(0.5, 0.5, 0.0, 0.0));
+        return;
+    }
+
+    vec3 normal = OctDecode(imageLoad(g_GBufferNormal, pixel).rg);
+    float roughness = imageLoad(g_GBufferRoughnessMetallic, pixel).r;
+
+    vec2 ndcXY = ((vec2(pixel) + 0.5) / g_ViewParams.viewportSize) * 2.0 - 1.0;
+    vec4 worldPos4 = g_ViewParams.invViewProj * vec4(ndcXY, depth, 1.0);
+    vec3 worldPos = worldPos4.xyz / worldPos4.w;
+    vec3 viewDir = normalize(g_ViewParams.cameraPositionWorld - worldPos);
+
+    // This pixel's own surface point -- written unconditionally from here on (every remaining exit
+    // path below has valid geometry), consumed only by ReflectionTemporal.comp's disocclusion test.
+    imageStore(g_ReflectionWorldPos, pixel, vec4(worldPos, 1.0));
+    imageStore(g_ReflectionNormal, pixel, vec4(OctEncode(normal), 0.0, 0.0));
+
+    // GGX VNDF importance sampling in tangent space (Z = normal) -- see ggx_brdf.glsl's own
+    // comment. `xi` is decorrelated both per-pixel and per-frame (hashFloat, math_utils.glsl) so
+    // neighbouring pixels and consecutive frames don't all pick the same relative lobe offset,
+    // which would otherwise show up as visible banding on smooth curved surfaces given only one
+    // sample per pixel per frame.
+    vec3 tangent, bitangent;
+    BuildTangentBasis(normal, tangent, bitangent);
+    vec3 viewDirTangentSpace = vec3(dot(viewDir, tangent), dot(viewDir, bitangent), dot(viewDir, normal));
+
+    uint64_t pixelSeed = uint64_t(uint(pixel.x)) | (uint64_t(uint(pixel.y)) << 32);
+    vec2 xi = vec2(
+        hashFloat(pixelSeed, uint64_t(pc.frameIndex) * 0x9E3779B97F4A7C15UL + 0x517CC1B7UL),
+        hashFloat(pixelSeed, uint64_t(pc.frameIndex) * 0x9E3779B97F4A7C15UL + 0xBF58476D1CE4E5B9UL));
+
+    vec3 halfVectorTangentSpace = SampleGGXVNDF(xi, viewDirTangentSpace, roughness);
+    vec3 halfVectorWorld = normalize(
+        tangent * halfVectorTangentSpace.x + bitangent * halfVectorTangentSpace.y + normal * halfVectorTangentSpace.z);
+    vec3 rayDir = reflect(-viewDir, halfVectorWorld);
+
+    // A grazing-angle reflection whose sampled half-vector points below the macro-surface plane
+    // (dot(rayDir, normal) <= 0) is a well-known GGX-VNDF edge case at high roughness -- treat it
+    // as an immediate miss (radiance = 0) rather than tracing a physically invalid ray.
+    if (dot(rayDir, normal) <= 0.0) {
+        imageStore(g_ReflectionRadiance, pixel, vec4(0.0, 0.0, 0.0, 1.0));
+        return;
+    }
+
+    vec3 biasedOrigin = worldPos + normal * 1.0e-2;
+
+    uint hitEntityIndex;
+    vec3 hitLocalPos, hitLocalNormal;
+    bool hit;
+    if (pc.traceMode == 0u) {
+        hit = TraceMeshSDFScene(biasedOrigin, rayDir, kFarDistance, pc.entityCount, hitEntityIndex, hitLocalPos, hitLocalNormal);
+    } else {
+        hit = TraceHWRT(biasedOrigin, rayDir, kFarDistance, hitEntityIndex, hitLocalPos, hitLocalNormal);
+    }
+
+    vec3 radiance = vec3(0.0);
+    if (hit) {
+        EntityInfo hitEntity = g_Entities[hitEntityIndex];
+        radiance = SampleCardRadiance(hitLocalPos, hitLocalNormal, hitEntity.firstCardIndex, hitEntity.cardCount);
+    }
+
+    imageStore(g_ReflectionRadiance, pixel, vec4(radiance, 1.0));
+}

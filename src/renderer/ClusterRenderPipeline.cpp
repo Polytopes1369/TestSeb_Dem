@@ -360,6 +360,15 @@ bool ClusterRenderPipeline::Init(
     LOG_ERROR("[ClusterRenderPipeline] Failed to initialize ScreenProbeGIPass.");
     return false;
   }
+  // Phase 2 (UE5.8 parity roadmap): specular reflections -- same dependencies as m_ScreenProbeGI
+  // above (needs m_Resolve's GBuffer, including its Phase 1a roughness/metallic channel, plus
+  // m_TraceContext/m_SurfaceCacheRT for its own trace pass).
+  if (!m_Reflection.Init(createInfo.device, createInfo.allocator, createInfo.commandPool,
+                         createInfo.queue, createInfo.renderExtent, m_TraceContext, m_SurfaceCache,
+                         m_SurfaceCacheRT, m_Resolve)) {
+    LOG_ERROR("[ClusterRenderPipeline] Failed to initialize ReflectionPass.");
+    return false;
+  }
   // World Probe grid (Lumen "Translucency Volume") -- reuses the same shared trace-scene sets and
   // HWRT/BLAS/TLAS as every other GI consumer above; see ClusterRenderPipeline.h's own comment on
   // why this is a separate system from m_ScreenProbeGI, not a duplicate of it.
@@ -433,6 +442,7 @@ void ClusterRenderPipeline::Shutdown() {
   m_LastStatsSampleBytes = 0;
   m_SDFRayMarch.Shutdown();
 #endif
+  m_Reflection.Shutdown();
   m_ScreenProbeGI.Shutdown();
   m_Denoiser.Shutdown();
   m_WorldProbes.Shutdown();
@@ -1060,6 +1070,37 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
         , camera.debugViewMode
 #endif
       );
+    }
+  }
+
+  // =========================================================================================
+  // [12b2] Phase 2 (UE5.8 parity roadmap): specular reflections -- trace -> temporal
+  // reprojection/accumulation -> Fresnel-weighted gather, read-modify-writing m_Resolve's own
+  // output color image directly, the exact same convention as [12b] above (see
+  // renderer::ReflectionPass's own class comment for the full per-frame call contract). Grouped
+  // right after [12b] since both read the same GBuffer and compose into the same color image;
+  // runs BEFORE [12d]'s À-Trous denoiser deliberately -- reflections have no dedicated spatial
+  // filter of their own, they inherit whatever spatial smoothing the existing denoiser already
+  // applies to the rest of the composited image (see this phase's approved plan's own "Hors
+  // scope" note).
+  //
+  // `reflectionsEnabled` (debug-only toggle, main.cpp's 'R' key) gates the trio entirely, same
+  // A/B-ability as `ssrtEnabled` above. Release always runs the trio (see
+  // SetDebugReflectionsEnabled()'s own comment for why this differs from worldProbesEnabled).
+  // =========================================================================================
+  {
+    maths::mat4 prevViewProjForReflection = m_HasPrevViewProj ? m_PrevViewProj : maths::mat4{};
+    m_Reflection.RecordUpdateViewParams(cmd, viewProj, prevViewProjForReflection, cameraPositionWorld);
+
+#ifndef NDEBUG
+    bool reflectionsEnabled = m_DebugReflectionsEnabled;
+#else
+    bool reflectionsEnabled = true;
+#endif
+    if (reflectionsEnabled) {
+      m_Reflection.RecordTrace(cmd, m_TraceContext, m_TraceContext.GetEntityCount(), traceMode, m_FrameIndex);
+      m_Reflection.RecordTemporal(cmd);
+      m_Reflection.RecordGather(cmd);
     }
   }
 

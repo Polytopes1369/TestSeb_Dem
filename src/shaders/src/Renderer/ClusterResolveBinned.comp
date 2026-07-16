@@ -167,7 +167,11 @@ void main() {
 
     MaterialParams mat = g_MaterialParams.params[pc.binIndex];
     vec3 albedo = mat.baseColor;
-    vec3 finalColor = albedo * 0.15 + albedo * diff + mat.emissive;
+    // Metallic workflow energy conservation (Phase 2) -- see ClusterResolve.comp's identical fix
+    // for the full rationale (a pure metal has zero diffuse response; without this, metals would
+    // double-count energy against ReflectionGather.comp's specular RMW).
+    vec3 diffuseAlbedo = albedo * (1.0 - mat.metallic);
+    vec3 finalColor = diffuseAlbedo * 0.15 + diffuseAlbedo * diff + mat.emissive;
 
     // Opacity-mask soft edge feathering -- see ClusterResolve.comp's own comment.
     if (cluster.maskTextureIndex != 0xFFFFFFFFu) {

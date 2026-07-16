@@ -78,6 +78,7 @@
 #include "renderer/HZBPass.h"
 #include "renderer/LightingTypes.h"
 #include "renderer/ProceduralMaskGenerator.h"
+#include "renderer/ReflectionPass.h"
 #include "renderer/ScreenProbeGIPass.h"
 #include "renderer/ShadowMapPass.h"
 #include "renderer/SurfaceCacheGIInjectPass.h"
@@ -208,6 +209,15 @@ namespace renderer {
         // default to true once a live consumer samples this grid (e.g. dynamic or off-screen
         // objects with no Surface Cache Card of their own).
         void SetDebugWorldProbesEnabled(bool enabled) { m_DebugWorldProbesEnabled = enabled; }
+
+        // Independently gates RecordFrame()'s [12b2] m_Reflection RecordTrace/RecordTemporal/
+        // RecordGather trio -- see main.cpp's 'R' key. UNLIKE SetDebugWorldProbesEnabled above,
+        // this pass has a real live consumer from its very first frame (m_Resolve's own output
+        // color image, via the same direct-RMW convention as m_ScreenProbeGI), so it defaults to
+        // true here AND Release hardcodes it permanently on (no toggle exists in Release, matching
+        // SetDebugSSRTEnabled/SetDebugRadiosityEnabled's own Release-always-on convention, not
+        // SetDebugWorldProbesEnabled's Release-always-off one).
+        void SetDebugReflectionsEnabled(bool enabled) { m_DebugReflectionsEnabled = enabled; }
 #endif
 
     private:
@@ -303,6 +313,15 @@ namespace renderer {
         // output color image -- see ScreenProbeGIPass's own class comment.
         ScreenProbeGIPass m_ScreenProbeGI;
 
+        // Phase 2 (UE5.8 parity roadmap): specular reflections / GI -- traces ONE GGX-VNDF-
+        // importance-sampled ray per pixel per frame (full resolution, unlike m_ScreenProbeGI's
+        // coarser 8x8-tile probes -- a sharp reflection cannot survive that coarseness), sampling
+        // the same m_SurfaceCache radiance atlas at each hit, and Fresnel-weighted read-modify-
+        // writes the result into m_Resolve's own output color image -- see ReflectionPass's own
+        // class comment for the full pipeline and why its storage is raw RGBA16F radiance, not
+        // m_ScreenProbeGI's spherical harmonics (physically incapable of a narrow specular lobe).
+        ReflectionPass m_Reflection;
+
         // World Probe grid (Lumen "Translucency Volume" / global illumination volume): a low-
         // resolution, camera-centered 3D grid of ambient irradiance probes, fully rebuilt every
         // frame from m_SurfaceCache's radiance atlas -- INTENDED as what dynamic/off-screen objects
@@ -345,6 +364,10 @@ namespace renderer {
         // See SetDebugWorldProbesEnabled()'s own comment for why this defaults to true in Debug
         // while Release hardcodes the equivalent local to false (opposite of the two toggles above).
         bool m_DebugWorldProbesEnabled = true;
+        // See SetDebugReflectionsEnabled()'s own comment: unlike m_DebugWorldProbesEnabled above,
+        // Release hardcodes the equivalent local to true (matching m_DebugSSRTEnabled's own
+        // Release-always-on convention), since this pass has a real live consumer already.
+        bool m_DebugReflectionsEnabled = true;
 #endif
 
 #ifndef NDEBUG

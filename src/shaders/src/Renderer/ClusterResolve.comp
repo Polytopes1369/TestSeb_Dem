@@ -278,7 +278,12 @@ void main() {
         uint materialSlot = min(cluster.materialID, MATERIAL_TABLE_SIZE - 1u);
         MaterialParams mat = g_MaterialParams.params[materialSlot];
         vec3 albedo = mat.baseColor;
-        finalColor = albedo * 0.15 + albedo * diff + mat.emissive;
+        // Metallic workflow energy conservation (Phase 2): a pure metal has zero diffuse response
+        // -- all incident light either reflects specularly or is absorbed, none scatters diffusely.
+        // Without this, a metallic surface would show BOTH a full Lambertian response here AND a
+        // full GGX specular response from ReflectionGather.comp's own RMW, double-counting energy.
+        vec3 diffuseAlbedo = albedo * (1.0 - mat.metallic);
+        finalColor = diffuseAlbedo * 0.15 + diffuseAlbedo * diff + mat.emissive;
 
         // GBuffer capture (renderer::ClusterResolvePass's new outputs -- see this file's own
         // binding comment): the same winning (hw-vs-sw arbitrated) depth already used to pick
