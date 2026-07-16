@@ -1,21 +1,14 @@
 {
   "permissions": {
     "allow": [
-      "Read(//d/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026-ssrt-atrous-worldprobes-worktree/src/renderer/**)",
-      "Read(//d/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026-ssrt-atrous-worldprobes-worktree/src/**)",
-      "Read(//d/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026-ssrt-atrous-worldprobes-worktree/src/shaders/include/**)",
-      "Read(//d/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026-ssrt-atrous-worldprobes-worktree/src/core/**)",
       "Read(//d/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026-ssrt-atrous-worldprobes-worktree/**)",
-      "Read(//d/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026-ssrt-atrous-worldprobes-worktree/src/core/maths/**)",
       "Skill(run)",
-      "Skill(run:*)",
-      "Read(//d/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026-ssrt-atrous-worldprobes-worktree/build_verify/Debug/**)",
-      "Read(//d/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026-ssrt-atrous-worldprobes-worktree/src/renderer/debug/**)"
+      "Skill(run:*)"
     ],
     "deny": [
       "Bash(rm *)",
       "Bash(git rm *)",
-      "Bash(rmdir *)",
+      "Bash(rmdir *)"
     ],
     "additionalDirectories": [
       "d:\\DemoScene\\DemoScene_Vulkan2026_BaseArchi\\DemoScene_2026-lumen-integration-worktree\\src\\core",
