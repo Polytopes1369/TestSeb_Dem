@@ -376,6 +376,24 @@ namespace geometry {
                 continue; // This triangle belongs to a different entity.
             }
 
+#ifndef NDEBUG
+            // Sanity check for the 2026-07-16 "clusters mis-generated during triangulation ->
+            // cluster conversion" investigation: this filter only inspects i0. If a procedural
+            // Generate* function ever emits a triangle whose 3 vertices don't share one meshID
+            // (e.g. an off-by-one in a per-entity vertex/index base offset), it would silently be
+            // attributed whole to i0's entity here, with i1/i2 actually belonging to a neighboring
+            // entity -- exactly the kind of "cluster looks wrong" symptom the hypothesis describes.
+            if (allVertices[i1].meshID != targetMeshID || allVertices[i2].meshID != targetMeshID) {
+                LOG_WARNING(std::format(
+                    "[ClusterPartitioner] Triangle at index buffer offset {} has mixed meshIDs "
+                    "(i0={}, i1={}, i2={}, targetMeshID={}) -- this triangle straddles two entities "
+                    "and was attributed whole to targetMeshID via i0 only. Likely a vertex/index "
+                    "base-offset bug in whichever Generate* function produced entity {}.",
+                    t, allVertices[i0].meshID, allVertices[i1].meshID, allVertices[i2].meshID,
+                    targetMeshID, targetMeshID));
+            }
+#endif
+
             maths::vec3 centroid = (allVertices[i0].position + allVertices[i1].position + allVertices[i2].position) * (1.0f / 3.0f);
             tris.push_back(TriangleRef{ static_cast<uint32_t>(tris.size()), i0, i1, i2, centroid });
         }
@@ -397,6 +415,48 @@ namespace geometry {
         }
 
         ClassifyAndSplitForOpacity(result, maskTextureIndex, allVertices);
+
+#ifndef NDEBUG
+        // Runtime enforcement of this function's own documented guarantee (see the header comment
+        // on PartitionMeshIntoClusters): the union of every cluster's originalTriangleIndices must
+        // be exactly [0, tris.size()) with no gaps and no duplicates. Previously only checked by
+        // ClusterPartitionerTests.cpp against synthetic meshes -- this re-runs the same check
+        // against the REAL procedurally-generated geometry every time the cache is built, which is
+        // the only way to catch a partitioning bug that only manifests on real mesh topology.
+        {
+            std::vector<uint32_t> coverageCount(tris.size(), 0u);
+            for (const MeshCluster& cluster : result) {
+                for (uint32_t originalTriIndex : cluster.originalTriangleIndices) {
+                    if (originalTriIndex >= coverageCount.size()) {
+                        LOG_ERROR(std::format(
+                            "[ClusterPartitioner] mesh {}: originalTriangleIndices contains {}, out of range for {} matched triangles.",
+                            targetMeshID, originalTriIndex, tris.size()));
+                        continue;
+                    }
+                    ++coverageCount[originalTriIndex];
+                }
+            }
+            uint32_t missingCount = 0;
+            uint32_t duplicateCount = 0;
+            uint32_t firstBadIndex = 0xFFFFFFFFu;
+            for (uint32_t i = 0; i < coverageCount.size(); ++i) {
+                if (coverageCount[i] == 0u) {
+                    ++missingCount;
+                    if (firstBadIndex == 0xFFFFFFFFu) firstBadIndex = i;
+                } else if (coverageCount[i] > 1u) {
+                    ++duplicateCount;
+                    if (firstBadIndex == 0xFFFFFFFFu) firstBadIndex = i;
+                }
+            }
+            if (missingCount > 0 || duplicateCount > 0) {
+                LOG_ERROR(std::format(
+                    "[ClusterPartitioner] mesh {}: triangle-coverage bijection VIOLATED -- {} triangle(s) missing "
+                    "from every cluster, {} triangle(s) duplicated across clusters (out of {} total), first bad "
+                    "original triangle index={}. Clusters for this entity are provably mis-generated.",
+                    targetMeshID, missingCount, duplicateCount, tris.size(), firstBadIndex));
+            }
+        }
+#endif
 
         LOG_INFO(std::format("[ClusterPartitioner] Partitioned mesh {} into {} clusters (mask texture index: {}).", targetMeshID, result.size(), maskTextureIndex));
         return result;

@@ -547,6 +547,86 @@ namespace geometry {
             const ClusterDAGNode& node = dag.nodes[nodeIndex];
             const std::string label = "node " + std::to_string(nodeIndex);
 
+#ifndef NDEBUG
+            // --- Geometric sanity (2026-07-16 "clusters mis-generated during triangulation ->
+            // cluster conversion" investigation) --------------------------------------------------
+            // Everything above/below this block checks the DAG's GRAPH structure (indices, error
+            // monotonicity); nothing in ValidateClusterDAG previously looked at a node's actual
+            // mesh data at all. Debug-only (unlike the structural checks above, which are load-
+            // bearing correctness gates main.cpp treats as fatal in every config): these are new,
+            // purely diagnostic checks added to test a specific hypothesis, not an existing invariant
+            // this engine has ever relied on, so they must not change Release behavior.
+            {
+                const SimplifiableMesh& mesh = node.mesh;
+                const uint32_t triangleCount = static_cast<uint32_t>(mesh.triangles.size() / 3);
+
+                // 1. Every triangle vertex index must stay within this node's own positions array.
+                uint32_t outOfRangeIndexCount = 0;
+                for (uint32_t idx : mesh.triangles) {
+                    if (idx >= mesh.positions.size()) {
+                        ++outOfRangeIndexCount;
+                    }
+                }
+                if (outOfRangeIndexCount > 0) {
+                    MarkFailure(outErrors, label + " has " + std::to_string(outOfRangeIndexCount) +
+                        " triangle vertex index/indices out of range for its own " +
+                        std::to_string(mesh.positions.size()) + "-vertex positions array");
+                }
+
+                // 2. Degenerate (near-zero-area) triangles -- only meaningful if every index above
+                // was actually in range (an out-of-range index would make this check itself unsafe).
+                if (outOfRangeIndexCount == 0) {
+                    constexpr float kMinTriangleAreaSq = 1e-14f; // Matches MeshSimplifier.cpp's own threshold.
+                    uint32_t degenerateCount = 0;
+                    for (uint32_t t = 0; t < triangleCount; ++t) {
+                        const maths::vec3& p0 = mesh.positions[mesh.triangles[t * 3 + 0]];
+                        const maths::vec3& p1 = mesh.positions[mesh.triangles[t * 3 + 1]];
+                        const maths::vec3& p2 = mesh.positions[mesh.triangles[t * 3 + 2]];
+                        maths::vec3 cross = (p1 - p0).Cross(p2 - p0);
+                        if (cross.Dot(cross) * 0.25f < kMinTriangleAreaSq) {
+                            ++degenerateCount;
+                        }
+                    }
+                    if (degenerateCount > 0) {
+                        MarkFailure(outErrors, label + " (level " + std::to_string(node.level) + ") contains " +
+                            std::to_string(degenerateCount) + " degenerate (near-zero-area) triangle(s) out of " +
+                            std::to_string(triangleCount));
+                    }
+
+                    // 3. boundsMin/boundsMax must actually enclose every vertex -- this is the exact
+                    // invariant ClusterCullMetadata::boundsMin/boundsMax's dual purpose (culling AABB
+                    // AND vertex dequantization range, see project memory on that bug class) depends
+                    // on; a violation here would silently corrupt vertex decode at render time.
+                    constexpr float kBoundsEpsilon = 1e-4f;
+                    uint32_t outOfBoundsCount = 0;
+                    for (const maths::vec3& p : mesh.positions) {
+                        if (p.x < node.boundsMin.x - kBoundsEpsilon || p.y < node.boundsMin.y - kBoundsEpsilon || p.z < node.boundsMin.z - kBoundsEpsilon ||
+                            p.x > node.boundsMax.x + kBoundsEpsilon || p.y > node.boundsMax.y + kBoundsEpsilon || p.z > node.boundsMax.z + kBoundsEpsilon) {
+                            ++outOfBoundsCount;
+                        }
+                    }
+                    if (outOfBoundsCount > 0) {
+                        MarkFailure(outErrors, label + " has " + std::to_string(outOfBoundsCount) +
+                            " vertex/vertices outside its own cached boundsMin/boundsMax");
+                    }
+                }
+
+                // 4. On-disk format contract: childClusterID is a fixed 2-element array (ClusterFormat.h's
+                // DAGNodeEntry) -- a node with more than 2 children could never be represented on disk.
+                if (node.childIndices.size() > 2) {
+                    MarkFailure(outErrors, label + " has " + std::to_string(node.childIndices.size()) +
+                        " children, more than the on-disk format's 2-child limit");
+                }
+
+                // 5. A leaf (level 0, no children) must carry exactly zero clusterError, per this
+                // struct's own documented invariant -- it IS the exact original geometry.
+                if (node.childIndices.empty() && node.clusterError != 0.0f) {
+                    MarkFailure(outErrors, label + " is a leaf but clusterError is " +
+                        std::to_string(node.clusterError) + " instead of the documented 0.0f");
+                }
+            }
+#endif
+
             // --- Error monotonicity ------------------------------------------------------------
             if (node.parentIndex == kInvalidDAGNodeIndex) {
                 if (!std::isinf(node.parentError) || node.parentError < 0.0f) {

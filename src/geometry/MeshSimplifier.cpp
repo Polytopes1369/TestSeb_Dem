@@ -1,8 +1,10 @@
 #include "geometry/MeshSimplifier.h"
 #include "geometry/GeometryHashUtil.h"
+#include "core/Logger.h"
 
 #include <algorithm>
 #include <cmath>
+#include <format>
 #include <limits>
 #include <queue>
 #include <unordered_set>
@@ -456,6 +458,41 @@ namespace geometry {
         mesh.locked = std::move(newLocked);
         mesh.uvs = std::move(newUVs);
         mesh.triangles = std::move(newTriangles);
+
+#ifndef NDEBUG
+        // Sanity check for the 2026-07-16 "clusters mis-generated during triangulation -> cluster
+        // conversion" investigation: CollapseWouldFoldOver (above) rejects any COLLAPSE that would
+        // CREATE a degenerate/near-zero-area triangle, but a triangle that was ALREADY degenerate in
+        // the input mesh (e.g. cone/cylinder cap-ring index padding -- see
+        // VirtualGeometryCacheTest.cpp's own comment on this) contributes a zero quadric
+        // (PlaneQuadric's kMinTriangleAreaSq-equivalent early-out above) and is simply never touched
+        // by a collapse, so it survives unflagged into the output mesh. This walks the FINAL
+        // triangle list once to report how many (still) are degenerate, so it's possible to tell
+        // whether bad input geometry or the simplifier itself is the source.
+        {
+            uint32_t degenerateCount = 0;
+            uint32_t firstDegenerateTriangle = 0xFFFFFFFFu;
+            for (uint32_t t = 0; t < mesh.triangles.size() / 3; ++t) {
+                const maths::vec3& p0 = mesh.positions[mesh.triangles[t * 3 + 0]];
+                const maths::vec3& p1 = mesh.positions[mesh.triangles[t * 3 + 1]];
+                const maths::vec3& p2 = mesh.positions[mesh.triangles[t * 3 + 2]];
+                maths::vec3 cross = (p1 - p0).Cross(p2 - p0);
+                float areaSq = cross.Dot(cross) * 0.25f;
+                if (areaSq < kMinTriangleAreaSq) {
+                    ++degenerateCount;
+                    if (firstDegenerateTriangle == 0xFFFFFFFFu) firstDegenerateTriangle = t;
+                }
+            }
+            if (degenerateCount > 0) {
+                LOG_WARNING(std::format(
+                    "[MeshSimplifier] output mesh has {} degenerate (near-zero-area) triangle(s) out of {} "
+                    "(first at triangle index {}) -- these were never collapsed away because a zero-area "
+                    "triangle contributes nothing to any vertex's quadric. Likely inherited from the input "
+                    "mesh (e.g. primitive cap-ring padding) rather than introduced by simplification itself.",
+                    degenerateCount, mesh.triangles.size() / 3, firstDegenerateTriangle));
+            }
+        }
+#endif
 
         if (outMaxError) {
             // cost is a squared-distance quadric evaluation; sqrt gives an approximate RMS
