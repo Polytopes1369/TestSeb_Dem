@@ -155,13 +155,25 @@ void main()
     // --- Bottom cap indices ---
     uint sideIndexCount = sides * heightSegments * 6u;
 
+    // The innermost ring (ring 0) is a FAN from the center vertex: exactly one triangle per
+    // column (center, r0, r1), not a quad -- unlike every ring above it, which is a genuine
+    // quad strip between two full rings (2 triangles per column). A uniform 6-indices-per-ring
+    // stride therefore has no second triangle to fill for ring 0; this used to be papered over
+    // with a (center,center,center) placeholder, which is a real, zero-area triangle that
+    // survives untouched through partitioning/simplification into the final cluster data (see
+    // project memory on this exact investigation). Fixed by making the per-ring index stride
+    // itself variable: 3 indices (one triangle) for ring 0, 6 for every ring above -- see
+    // capBotIndexCount's matching formula below and its CPU-side mirror in
+    // VulkanContext::GenerateCylinder.
     if (id < capSegments * sides)
     {
         uint ring = id / sides; // 0 = innermost
         uint col  = id % sides;
 
         uint botBase  = sideVertCount; // first bottom cap vertex (= center)
-        uint tIdx     = indexOffset + sideIndexCount + id * 6u;
+        uint tIdx = (ring == 0u)
+            ? indexOffset + sideIndexCount + col * 3u
+            : indexOffset + sideIndexCount + sides * 3u + (ring - 1u) * sides * 6u + col * 6u;
 
         if (ring == 0u)
         {
@@ -174,10 +186,6 @@ void main()
             indices[tIdx + 0u] = vertexOffset + center;
             indices[tIdx + 1u] = vertexOffset + r0;
             indices[tIdx + 2u] = vertexOffset + r1;
-            // Pad last triangle as degenerate
-            indices[tIdx + 3u] = vertexOffset + center;
-            indices[tIdx + 4u] = vertexOffset + center;
-            indices[tIdx + 5u] = vertexOffset + center;
         }
         else
         {
@@ -200,7 +208,8 @@ void main()
     }
 
     // --- Top cap indices ---
-    uint botCapIndexCount = capSegments * sides * 6u;
+    // Matches the bottom cap's own fan-vs-quad distinction above exactly.
+    uint capBotIndexCount = sides * 3u + (capSegments - 1u) * sides * 6u;
     uint topBase = sideVertCount + capVertCount; // first top cap vertex (= center)
 
     if (id < capSegments * sides)
@@ -208,7 +217,9 @@ void main()
         uint ring = id / sides;
         uint col  = id % sides;
 
-        uint tIdx = indexOffset + sideIndexCount + botCapIndexCount + id * 6u;
+        uint tIdx = (ring == 0u)
+            ? indexOffset + sideIndexCount + capBotIndexCount + col * 3u
+            : indexOffset + sideIndexCount + capBotIndexCount + sides * 3u + (ring - 1u) * sides * 6u + col * 6u;
 
         if (ring == 0u)
         {
@@ -220,9 +231,6 @@ void main()
             indices[tIdx + 0u] = vertexOffset + center;
             indices[tIdx + 1u] = vertexOffset + r1;
             indices[tIdx + 2u] = vertexOffset + r0;
-            indices[tIdx + 3u] = vertexOffset + center;
-            indices[tIdx + 4u] = vertexOffset + center;
-            indices[tIdx + 5u] = vertexOffset + center;
         }
         else
         {

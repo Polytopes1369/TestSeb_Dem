@@ -129,25 +129,45 @@ void main()
     uint hemiQuads = nbCapSegs * sides;
     uint bodyQuads = heightSegs * sides;
 
-    // --- Bottom hemisphere quads ---
+    // Both hemispheres' pole ring is built from sideColumns DUPLICATE vertices (every column at
+    // the pole row collapses to the exact same 3D position -- see the vertex generation above:
+    // sinPhi == 0 at row 0 for the bottom hemisphere / at row nbCapSegs for the top one,
+    // regardless of col). Treating that ring as a genuine quad strip like every other ring
+    // therefore produces one legitimate triangle and one degenerate (zero-area) triangle per
+    // column -- the degenerate one has two of its three corners at the exact same duplicated-
+    // pole position. Fixed below by emitting only the single valid triangle at the pole-adjacent
+    // ring (3 indices) instead of a full quad (6 indices); see project memory on this
+    // investigation and VulkanContext::GenerateCapsule's matching index-count formula.
+    uint bottomHemiIndexCount = sides * 3u + (nbCapSegs - 1u) * sides * 6u;
+
+    // --- Bottom hemisphere quads --- (pole ring is ring 0, the FIRST ring)
     if (id < hemiQuads)
     {
         uint ring = id / sides; // 0 = innermost (pole→first ring)
         uint col  = id % sides;
 
-        uint tIdx = indexOffset + id * 6u;
+        uint tIdx = (ring == 0u)
+            ? indexOffset + col * 3u
+            : indexOffset + sides * 3u + (ring - 1u) * sides * 6u + col * 6u;
 
         uint r0  = ring       * sideColumns + col;
-        uint r0n = ring       * sideColumns + col + 1u;
         uint r1  = (ring + 1u) * sideColumns + col;
         uint r1n = (ring + 1u) * sideColumns + col + 1u;
 
+        // Triangle (r0, r1, r1n) is always valid (r1/r1n are distinct real ring-1 points even
+        // when ring==0, where r0 sits on the duplicated pole). Only emit the second triangle
+        // (r0, r1n, r0n) -- which degenerates to zero area when ring==0, since r0 and r0n are
+        // both the same duplicated pole vertex position -- for rings above the pole.
         indices[tIdx + 0u] = vertexOffset + r0;
         indices[tIdx + 1u] = vertexOffset + r1;
         indices[tIdx + 2u] = vertexOffset + r1n;
-        indices[tIdx + 3u] = vertexOffset + r0;
-        indices[tIdx + 4u] = vertexOffset + r1n;
-        indices[tIdx + 5u] = vertexOffset + r0n;
+        if (ring != 0u)
+        {
+            uint r0n = ring * sideColumns + col + 1u;
+            indices[tIdx + 3u] = vertexOffset + r0;
+            indices[tIdx + 4u] = vertexOffset + r1n;
+            indices[tIdx + 5u] = vertexOffset + r0n;
+        }
     }
 
     // --- Body quads ---
@@ -161,7 +181,7 @@ void main()
         uint t0 = bodyBase + (row + 1u) * sideColumns + col;
         uint t1 = bodyBase + (row + 1u) * sideColumns + col + 1u;
 
-        uint tIdx = indexOffset + hemiQuads * 6u + id * 6u;
+        uint tIdx = indexOffset + bottomHemiIndexCount + id * 6u;
         indices[tIdx + 0u] = vertexOffset + b0;
         indices[tIdx + 1u] = vertexOffset + t0;
         indices[tIdx + 2u] = vertexOffset + t1;
@@ -170,23 +190,34 @@ void main()
         indices[tIdx + 5u] = vertexOffset + b1;
     }
 
-    // --- Top hemisphere quads ---
+    // --- Top hemisphere quads --- (pole ring is ring nbCapSegs-1, the LAST ring)
     if (id < hemiQuads)
     {
         uint ring = id / sides;
         uint col  = id % sides;
+        bool poleRing = (ring == nbCapSegs - 1u);
+
+        uint tIdx = indexOffset + bottomHemiIndexCount + bodyQuads * 6u +
+                    ring * sides * 6u + col * (poleRing ? 3u : 6u);
 
         uint r0  = topHemiBase + ring       * sideColumns + col;
         uint r0n = topHemiBase + ring       * sideColumns + col + 1u;
-        uint r1  = topHemiBase + (ring + 1u) * sideColumns + col;
         uint r1n = topHemiBase + (ring + 1u) * sideColumns + col + 1u;
 
-        uint tIdx = indexOffset + (hemiQuads + bodyQuads) * 6u + id * 6u;
+        // Triangle (r0, r1n, r0n) is always valid (r0/r0n are distinct real ring points even
+        // when this is the pole-adjacent ring, where r1n sits on the duplicated pole). Only
+        // emit the second triangle (r0, r1, r1n) -- which degenerates to zero area on the pole
+        // ring, since r1 and r1n are both the same duplicated pole vertex position -- for rings
+        // below the pole.
         indices[tIdx + 0u] = vertexOffset + r0;
         indices[tIdx + 1u] = vertexOffset + r1n;
         indices[tIdx + 2u] = vertexOffset + r0n;
-        indices[tIdx + 3u] = vertexOffset + r0;
-        indices[tIdx + 4u] = vertexOffset + r1;
-        indices[tIdx + 5u] = vertexOffset + r1n;
+        if (!poleRing)
+        {
+            uint r1 = topHemiBase + (ring + 1u) * sideColumns + col;
+            indices[tIdx + 3u] = vertexOffset + r0;
+            indices[tIdx + 4u] = vertexOffset + r1;
+            indices[tIdx + 5u] = vertexOffset + r1n;
+        }
     }
 }
