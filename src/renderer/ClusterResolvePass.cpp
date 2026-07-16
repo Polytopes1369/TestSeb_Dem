@@ -563,8 +563,7 @@ namespace renderer {
         pipelineLayoutInfo.pPushConstantRanges = &pushRange;
         VK_CHECK(vkCreatePipelineLayout(device, &pipelineLayoutInfo, nullptr, &m_ResolveBinnedPipelineLayout));
 
-        std::vector<char> shaderCode = ReadShaderFile("shaders/ClusterResolveBinned.comp.spv");
-        VkShaderModule shaderModule = VulkanPipeline::CreateShaderModule(device, shaderCode);
+        VkShaderModule shaderModule = VulkanPipeline::LoadShaderModule(device, "shaders/ClusterResolveBinned.comp.spv");
         m_ResolveBinnedPipeline = VulkanPipeline::CreateComputePipeline(device, m_ResolveBinnedPipelineLayout, shaderModule);
         vkDestroyShaderModule(device, shaderModule, nullptr);
 
