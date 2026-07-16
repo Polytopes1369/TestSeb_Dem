@@ -281,7 +281,8 @@ int main() {
         vkBeginCommandBuffer(vkContext.GetCommandBuffer(), &beginInfo);
 
         clusterPipeline.RecordFrame(vkContext.GetCommandBuffer(), camera.GetPushConstants(),
-            camera.GetPosition(), static_cast<float>(glfwGetTime()), vkContext.GetSwapchainImages()[imageIndex]);
+            camera.GetPosition(), camera.GetFrameInfo(aspect), static_cast<float>(glfwGetTime()),
+            vkContext.GetSwapchainImages()[imageIndex]);
 
         vkEndCommandBuffer(vkContext.GetCommandBuffer());
 

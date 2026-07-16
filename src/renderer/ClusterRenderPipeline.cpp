@@ -282,6 +282,52 @@ bool ClusterRenderPipeline::Init(
       m_SoftwareRaster.GetVisBufferAtomicView(),
       m_MaskGenerator.GetMaskImageInfos());
 
+  // =========================================================================================
+  // STEP 7 -- Lumen-style GI infrastructure: sun shadow map, Surface Cache, Global SDF clipmap
+  // (see ClusterRenderPipeline.h's own class-comment addendum on why these are unconditional,
+  // not Debug-only, unlike the stats/overlay block and m_SDFRayMarch below). Each pass re-reads
+  // the same consolidated .cache file independently (this codebase's established "self-contained
+  // pass" convention -- see e.g. renderer::ShadowMapPass's own class comment).
+  // =========================================================================================
+  if (!m_ShadowMap.Init(createInfo.device, createInfo.allocator,
+                        createInfo.commandPool, createInfo.queue,
+                        createInfo.cacheFilePath)) {
+    LOG_ERROR("[ClusterRenderPipeline] Failed to initialize ShadowMapPass.");
+    return false;
+  }
+  if (!m_SurfaceCache.Init(createInfo.device, createInfo.allocator,
+                           createInfo.commandPool, createInfo.queue,
+                           createInfo.cacheFilePath)) {
+    LOG_ERROR("[ClusterRenderPipeline] Failed to initialize SurfaceCachePass.");
+    return false;
+  }
+  // One-time wiring (see SurfaceCachePass::SetShadowMap's own comment): the shadow map's view/
+  // sampler never change again after ShadowMapPass::Init(), so this binding is never refreshed.
+  m_SurfaceCache.SetShadowMap(m_ShadowMap.GetShadowMapView(), m_ShadowMap.GetShadowMapSampler());
+
+  if (!m_GlobalSDF.Init(createInfo.device, createInfo.allocator,
+                        createInfo.commandPool, createInfo.queue,
+                        createInfo.cacheFilePath)) {
+    LOG_ERROR("[ClusterRenderPipeline] Failed to initialize GlobalSDFPass.");
+    return false;
+  }
+
+#ifndef NDEBUG
+  // Two-tier SDF ray march DEBUG VISUALIZATION (see ClusterRenderPipeline.h's own comment on
+  // m_SDFRayMarch) -- output sized to match the render extent so its debug image is a 1:1
+  // resolution match for whatever m_Resolve would otherwise have produced.
+  if (!m_SDFRayMarch.Init(createInfo.device, createInfo.allocator,
+                          createInfo.commandPool, createInfo.queue,
+                          createInfo.cacheFilePath, createInfo.renderExtent.width,
+                          createInfo.renderExtent.height)) {
+    LOG_ERROR("[ClusterRenderPipeline] Failed to initialize SDFRayMarchPass.");
+    return false;
+  }
+  // One-time wiring (see SDFRayMarchPass::SetGlobalSDFViews's own comment): the 4 clipmap level
+  // views never change again after GlobalSDFPass::Init().
+  m_SDFRayMarch.SetGlobalSDFViews(m_GlobalSDF);
+#endif
+
 #ifndef NDEBUG
   // Debug-only stat overlay: triangle-count compute pass (reads ONLY m_OcclusionCulling's already-
   // public, stable accessors -- both the masked and opaque list variants, see
@@ -322,7 +368,11 @@ void ClusterRenderPipeline::Shutdown() {
   m_Allocator = VK_NULL_HANDLE;
   m_LastStatsSampleTime = 0.0f;
   m_LastStatsSampleBytes = 0;
+  m_SDFRayMarch.Shutdown();
 #endif
+  m_GlobalSDF.Shutdown();
+  m_SurfaceCache.Shutdown();
+  m_ShadowMap.Shutdown();
   m_Resolve.Shutdown();
   m_SoftwareRaster.Shutdown();
   m_HardwareRaster.Shutdown();
@@ -389,6 +439,7 @@ void ClusterRenderPipeline::BeginVisBufferRendering(
 void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
                                         const CameraPushConstants &camera,
                                         const maths::vec3 &cameraPositionWorld,
+                                        const CameraFrameInfo &cameraFrameInfo,
                                         float globalTimeSeconds,
                                         VkImage swapchainImage) {
   assert(m_ClusterCount > 0 && "RecordFrame called before a successful Init");
@@ -414,6 +465,62 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
   m_OcclusionCulling.RecordClearFrame(cmd);
   m_SoftwareRaster.RecordClear(cmd);
   m_LODSelection.RecordClear(cmd);
+
+  // =========================================================================================
+  // [1z] Lumen-style GI infrastructure: sun shadow map -> Surface Cache capture -> Global SDF
+  // clipmap streaming -> (Debug-only) SDF ray march debug visualization. Independent of the
+  // Nanite VisBuffer/HZB machinery above and below (no shared images, no fence contention -- see
+  // ClusterRenderPipeline.h's own class-comment addendum), so it can run anywhere in the frame;
+  // placed early, right after the worklist clears, so it overlaps with the GPU's own internal
+  // scheduling of the culling/streaming work that follows rather than sitting at the tail end.
+  // =========================================================================================
+  {
+    // Sun direction is fixed for now (m_SceneLights' own default, see LightingTypes.h) -- a
+    // future day/night system would rotate it per frame instead.
+    const maths::vec3 sunDirection = m_SceneLights.sun.direction;
+
+    // 1. Shadow map first: SurfaceCachePass's shadow lookup (below) needs THIS frame's light
+    // view-projection, and ShadowMapPass::RecordCapture's own trailing barrier already makes its
+    // depth writes visible to a fragment-shader sampled read (see that method's own comment).
+    m_ShadowMap.RecordCapture(cmd, sunDirection);
+
+    // 2. Surface Cache: feed this frame's light data (the light view-proj THIS frame's shadow map
+    // was just rendered with, not a stale one) before the visibility-driven capture draws.
+    m_SurfaceCache.UpdateLighting(m_SceneLights, m_ShadowMap.GetLightViewProj());
+    m_SurfaceCache.UpdateVisibility(cameraFrameInfo.position, cameraFrameInfo.forward,
+                                    maths::vec3{0.0f, 1.0f, 0.0f}, cameraFrameInfo.fovYRadians,
+                                    cameraFrameInfo.aspectRatio, cameraFrameInfo.nearZ,
+                                    cameraFrameInfo.farZ);
+    m_SurfaceCache.RecordCapture(cmd);
+
+    // 3. Global SDF clipmap streaming, from this frame's camera position.
+    m_GlobalSDF.RecordUpdate(cmd, cameraFrameInfo.position);
+
+#ifndef NDEBUG
+    // GlobalSDFPass::RecordUpdate's own trailing barrier only extends visibility to
+    // SHADER_STORAGE_READ/WRITE (its own compositing dispatches read/write the clipmap via
+    // imageLoad/imageStore) -- SDFRayMarchPass instead samples it through a COMBINED IMAGE
+    // SAMPLER (SetGlobalSDFViews), which needs SHADER_SAMPLED_READ, a distinct access flag the
+    // barrier above does not cover. Same "STORAGE_WRITE -> SAMPLED_READ" extension this class's
+    // own HZB rebuilds already need (see the barriers around m_HZB.Generate() below).
+    VkMemoryBarrier2 globalSDFToSampledBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    globalSDFToSampledBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    globalSDFToSampledBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+    globalSDFToSampledBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    globalSDFToSampledBarrier.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+    VkDependencyInfo globalSDFToSampledDep{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    globalSDFToSampledDep.memoryBarrierCount = 1;
+    globalSDFToSampledDep.pMemoryBarriers = &globalSDFToSampledBarrier;
+    vkCmdPipelineBarrier2(cmd, &globalSDFToSampledDep);
+
+    // 4. Two-tier SDF ray march DEBUG VISUALIZATION -- only its OUTPUT IMAGE is ever displayed
+    // (via the DEBUG_VIEW_LUMEN blit-swap below), but it is always recorded so the debug view
+    // shows this frame's state the instant it's selected, with no one-frame lag.
+    m_SDFRayMarch.RecordRayMarch(cmd, m_GlobalSDF, cameraFrameInfo.position, cameraFrameInfo.forward,
+                                 maths::vec3{0.0f, 1.0f, 0.0f}, cameraFrameInfo.fovYRadians,
+                                 cameraFrameInfo.aspectRatio, cameraFrameInfo.nearZ, cameraFrameInfo.farZ);
+#endif
+  }
 
   // =========================================================================================
   // [1a] Async streaming triage: read back LAST frame's residency misses (captured by this
@@ -858,6 +965,19 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
   // trailing barrier targeted the COPY stage, but vkCmdBlitImage executes in
   // the BLIT stage, so visibility is re-extended here explicitly.
   // =========================================================================================
+  // DEBUG_VIEW_LUMEN swaps the blit SOURCE to m_SDFRayMarch's own debug-visualization image
+  // instead of m_Resolve's normal lit output -- see ClusterRenderPipeline.h's own comment on why
+  // this (not sampling it from within ClusterResolve.comp) is the chosen mechanism. Both images
+  // share the exact same format (VK_FORMAT_R8G8B8A8_UNORM) and permanent layout (GENERAL), and
+  // both are last written by a compute shader's imageStore, so the SAME barrier below (targeting
+  // COMPUTE_SHADER_BIT/SHADER_STORAGE_WRITE_BIT -> BLIT_BIT/TRANSFER_READ_BIT) covers either
+  // choice with no changes needed -- only which VkImage is actually blitted differs.
+  VkImage blitSourceImage = m_Resolve.GetOutputColorImage();
+#ifndef NDEBUG
+  if (camera.debugViewMode == DEBUG_VIEW_LUMEN) {
+    blitSourceImage = m_SDFRayMarch.GetOutputImage();
+  }
+#endif
   {
     VkMemoryBarrier2 resolveToBlitBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
     resolveToBlitBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
@@ -896,7 +1016,7 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
                               static_cast<int32_t>(m_RenderExtent.height), 1};
   // Same extent both sides -- the "blit" is a 1:1 copy that also performs the
   // RGBA8 -> B8G8R8A8 component reordering the swapchain format requires.
-  vkCmdBlitImage(cmd, m_Resolve.GetOutputColorImage(), VK_IMAGE_LAYOUT_GENERAL,
+  vkCmdBlitImage(cmd, blitSourceImage, VK_IMAGE_LAYOUT_GENERAL,
                  swapchainImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
                  &blitRegion, VK_FILTER_NEAREST);
 

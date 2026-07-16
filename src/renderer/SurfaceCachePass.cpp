@@ -615,7 +615,11 @@ namespace renderer {
         VkDescriptorImageInfo shadowImageInfo{};
         shadowImageInfo.sampler = shadowMapSampler;
         shadowImageInfo.imageView = shadowMapView;
-        shadowImageInfo.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL; // Still a valid sampled layout, matching renderer::ShadowMapPass's own permanent-layout convention.
+        // renderer::ShadowMapPass keeps its depth image in GENERAL for its entire lifetime (valid
+        // for both the depth-attachment write AND this sampled read, with no ping-ponging -- see
+        // that class's own Init() comment on why GENERAL, not DEPTH_ATTACHMENT_OPTIMAL, which is
+        // NOT a legal sampled-image descriptor layout).
+        shadowImageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
         VkWriteDescriptorSet shadowWrite{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
         shadowWrite.dstSet = m_LightingDescriptorSet;
