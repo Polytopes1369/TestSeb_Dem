@@ -15,6 +15,12 @@
 #include <format>
 #include <cassert>
 
+// Validation layers, the debug messenger and the code that wires them up are debug-only tooling
+// (project rule: nothing debug-related is compiled into a Release binary). Everything gated by
+// NDEBUG below -- the array, DebugCallback, and the extension/messenger setup in CreateInstance /
+// SetupDebugMessenger / the shutdown path -- compiles to nothing in Release.
+#ifndef NDEBUG
+
 // For IsDebuggerPresent() in DebugCallback -- lean include, and NOMINMAX so windows.h's min/max
 // macros never shadow the std:: ones used throughout this file.
 #define WIN32_LEAN_AND_MEAN
@@ -25,6 +31,8 @@
 const std::vector<const char*> validationLayers = {
     "VK_LAYER_KHRONOS_validation"
 };
+
+#endif // NDEBUG
 
 namespace {
     // Procedural geometry SSBO capacities. Sized with real headroom above the current 12-primitive
@@ -266,6 +274,7 @@ namespace {
     constexpr float kBoxFaceLengthOffsetSign[6] = { 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f };
 }
 
+#ifndef NDEBUG
 static VKAPI_ATTR VkBool32 VKAPI_CALL DebugCallback(
     VkDebugUtilsMessageSeverityFlagBitsEXT messageSeverity,
     VkDebugUtilsMessageTypeFlagsEXT messageType,
@@ -285,13 +294,14 @@ static VKAPI_ATTR VkBool32 VKAPI_CALL DebugCallback(
     // whatever the last successful log line happened to be. Breaking is also gated on an actual
     // debugger being attached, so a plain console launch now logs the error and keeps going
     // instead of dying on an int3 the user can never see.
-    Logger::Log(level, pCallbackData->pMessage);
+    LOG(level, pCallbackData->pMessage);
 
     if (messageSeverity >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT && IsDebuggerPresent()) {
         __debugbreak();
     }
     return VK_FALSE;
 }
+#endif // NDEBUG
 
 void VulkanContext::Init(std::string_view appName, GLFWwindow* window) {
     CreateInstance(appName);
@@ -482,11 +492,13 @@ void VulkanContext::CreateInstance(std::string_view appName) {
     const char** glfwExtensions = glfwGetRequiredInstanceExtensions(&glfwExtensionCount);
     std::vector<const char*> extensions(glfwExtensions, glfwExtensions + glfwExtensionCount);
 
+#ifndef NDEBUG
     if (m_EnableValidationLayers) {
         extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
         createInfo.enabledLayerCount = static_cast<uint32_t>(validationLayers.size());
         createInfo.ppEnabledLayerNames = validationLayers.data();
     }
+#endif
 
     createInfo.enabledExtensionCount = static_cast<uint32_t>(extensions.size());
     createInfo.ppEnabledExtensionNames = extensions.data();
@@ -497,6 +509,7 @@ void VulkanContext::CreateInstance(std::string_view appName) {
 }
 
 void VulkanContext::SetupDebugMessenger() {
+#ifndef NDEBUG
     if (!m_EnableValidationLayers) return;
 
     VkDebugUtilsMessengerCreateInfoEXT createInfo{ VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT };
@@ -509,6 +522,7 @@ void VulkanContext::SetupDebugMessenger() {
     if (func == nullptr || func(m_Instance, &createInfo, nullptr, &m_DebugMessenger) != VK_SUCCESS) {
         throw std::runtime_error("Failed to set up debug messenger!");
     }
+#endif // NDEBUG
 }
 
 void VulkanContext::CreateSurface(GLFWwindow* window) {
@@ -1114,7 +1128,7 @@ void VulkanContext::GenerateGeometry() {
     uint32_t runningVertexOffset = 0;
     uint32_t runningIndexOffset = 0;
 
-    Logger::Log(LogLevel::Info, "[GenerateGeometry] Generating 12 procedural primitives on a 3-wide grid...");
+    LOG_INFO("[GenerateGeometry] Generating 12 procedural primitives on a 3-wide grid...");
 
     // -------------------------------------------------------------------------
     // ICOSPHERE (slot 2 visually) — generated first so it occupies buffer offset 0.
@@ -1688,7 +1702,7 @@ void VulkanContext::GenerateGeometry() {
     const VkDeviceSize vertexBytesUsed = static_cast<VkDeviceSize>(m_TotalVertexCount) * sizeof(renderer::Vertex);
     const VkDeviceSize indexBytesUsed = static_cast<VkDeviceSize>(m_TotalIndexCount) * sizeof(uint32_t);
     if (vertexBytesUsed > kVertexBufferBytes || indexBytesUsed > kIndexBufferBytes) {
-        Logger::Log(LogLevel::Critical, std::format(
+        LOG_CRITICAL(std::format(
             "[GenerateGeometry] Procedural geometry OVERFLOWED its fixed-size SSBOs: "
             "vertices used {}/{} bytes, indices used {}/{} bytes. GPU writes past this point are "
             "undefined behavior (silent corruption of adjacent buffers). Increase kVertexBufferBytes/"
@@ -1697,7 +1711,7 @@ void VulkanContext::GenerateGeometry() {
         throw std::runtime_error("Procedural geometry buffers overflowed -- see log for exact sizes.");
     }
 
-    Logger::Log(LogLevel::Info, std::format(
+    LOG_INFO(std::format(
         "[GenerateGeometry] All 12 primitives generated: totalVertexCount={} totalIndexCount={} "
         "(buffers hold {} verts / {} indices max)",
         runningVertexOffset, runningIndexOffset,
@@ -1763,7 +1777,7 @@ void VulkanContext::DebugReadbackGeometrySample(uint32_t vertsPerFace, uint32_t 
     stagingVertexInfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     VmaAllocationCreateInfo stagingAllocInfo{ .usage = VMA_MEMORY_USAGE_GPU_TO_CPU };
     if (vmaCreateBuffer(m_Allocator, &stagingVertexInfo, &stagingAllocInfo, &stagingVertexBuffer, &stagingVertexAlloc, nullptr) != VK_SUCCESS) {
-        Logger::Log(LogLevel::Error, "[DebugReadback] Failed to allocate vertex staging buffer!");
+        LOG_ERROR("[DebugReadback] Failed to allocate vertex staging buffer!");
         return;
     }
 
@@ -1773,7 +1787,7 @@ void VulkanContext::DebugReadbackGeometrySample(uint32_t vertsPerFace, uint32_t 
     stagingIndexInfo.size = indexSampleBytes;
     stagingIndexInfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     if (vmaCreateBuffer(m_Allocator, &stagingIndexInfo, &stagingAllocInfo, &stagingIndexBuffer, &stagingIndexAlloc, nullptr) != VK_SUCCESS) {
-        Logger::Log(LogLevel::Error, "[DebugReadback] Failed to allocate index staging buffer!");
+        LOG_ERROR("[DebugReadback] Failed to allocate index staging buffer!");
         vmaDestroyBuffer(m_Allocator, stagingVertexBuffer, stagingVertexAlloc);
         return;
     }
@@ -1785,7 +1799,7 @@ void VulkanContext::DebugReadbackGeometrySample(uint32_t vertsPerFace, uint32_t 
 
     VkCommandBuffer cmd;
     if (vkAllocateCommandBuffers(m_Device, &cmdAllocInfo, &cmd) != VK_SUCCESS) {
-        Logger::Log(LogLevel::Error, "[DebugReadback] Failed allocating readback command buffer!");
+        LOG_ERROR("[DebugReadback] Failed allocating readback command buffer!");
         vmaDestroyBuffer(m_Allocator, stagingVertexBuffer, stagingVertexAlloc);
         vmaDestroyBuffer(m_Allocator, stagingIndexBuffer, stagingIndexAlloc);
         return;
@@ -1820,7 +1834,7 @@ void VulkanContext::DebugReadbackGeometrySample(uint32_t vertsPerFace, uint32_t 
 
         auto logVertex = [](const char* label, const renderer::Vertex& v) {
             float len = std::sqrt(v.position.x * v.position.x + v.position.y * v.position.y + v.position.z * v.position.z);
-            Logger::Log(LogLevel::Info, std::format(
+            LOG_INFO(std::format(
                 "[DebugReadback] {} pos=({:.4f}, {:.4f}, {:.4f}) |pos|={:.4f} meshID={} materialID={}",
                 label, v.position.x, v.position.y, v.position.z, len, v.meshID, v.materialID));
             };
@@ -1840,7 +1854,7 @@ void VulkanContext::DebugReadbackGeometrySample(uint32_t vertsPerFace, uint32_t 
         vmaUnmapMemory(m_Allocator, stagingVertexAlloc);
     }
     else {
-        Logger::Log(LogLevel::Error, "[DebugReadback] Failed to map vertex staging buffer for readback!");
+        LOG_ERROR("[DebugReadback] Failed to map vertex staging buffer for readback!");
     }
 
     void* mappedIndices = nullptr;
@@ -1850,11 +1864,11 @@ void VulkanContext::DebugReadbackGeometrySample(uint32_t vertsPerFace, uint32_t 
         for (uint32_t i = 0; i < sampleIndexCount; ++i) {
             idxDump += std::format("{} ", idx[i]);
         }
-        Logger::Log(LogLevel::Info, std::format("[DebugReadback] First {} indices: {}", sampleIndexCount, idxDump));
+        LOG_INFO(std::format("[DebugReadback] First {} indices: {}", sampleIndexCount, idxDump));
         vmaUnmapMemory(m_Allocator, stagingIndexAlloc);
     }
     else {
-        Logger::Log(LogLevel::Error, "[DebugReadback] Failed to map index staging buffer for readback!");
+        LOG_ERROR("[DebugReadback] Failed to map index staging buffer for readback!");
     }
 
     vmaDestroyBuffer(m_Allocator, stagingVertexBuffer, stagingVertexAlloc);
@@ -2001,12 +2015,14 @@ void VulkanContext::Shutdown() {
         vkDestroySurfaceKHR(m_Instance, m_Surface, nullptr);
     }
 
+#ifndef NDEBUG
     if (m_EnableValidationLayers && m_DebugMessenger != VK_NULL_HANDLE) {
         auto func = (PFN_vkDestroyDebugUtilsMessengerEXT)vkGetInstanceProcAddr(m_Instance, "vkDestroyDebugUtilsMessengerEXT");
         if (func != nullptr) {
             func(m_Instance, m_DebugMessenger, nullptr);
         }
     }
+#endif // NDEBUG
 
     if (m_Instance != VK_NULL_HANDLE) {
         vkDestroyInstance(m_Instance, nullptr);

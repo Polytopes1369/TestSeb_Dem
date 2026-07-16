@@ -1,4 +1,9 @@
 #include "Logger.h"
+
+// Entire translation unit is debug-only: in Release (NDEBUG) Logger.h declares no Logger class at
+// all, so this file compiles to nothing and contributes zero bytes to the final executable.
+#ifndef NDEBUG
+
 #include <iostream>
 #include <fstream>
 #include <format>
@@ -68,3 +73,5 @@ void Logger::LogVulkanError(VkResult result, std::string_view operation, const s
 
     Log(LogLevel::Critical, errorMsg, loc);
 }
+
+#endif // NDEBUG

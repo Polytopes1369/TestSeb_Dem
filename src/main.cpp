@@ -12,11 +12,11 @@
 #include <format>
 
 int main() {
-    Logger::Init("demo_log.txt");
-    Logger::Log(LogLevel::Info, "Starting DemoScene Engine...");
+    LOG_INIT("demo_log.txt");
+    LOG_INFO("Starting DemoScene Engine...");
 
     if (!glfwInit()) {
-        Logger::Log(LogLevel::Critical, "Failed to initialize GLFW!");
+        LOG_CRITICAL("Failed to initialize GLFW!");
         return -1;
     }
 
@@ -25,7 +25,7 @@ int main() {
 
     GLFWwindow* window = glfwCreateWindow(config::WINDOW_WIDTH, config::WINDOW_HEIGHT, "Vulkan 1.3 Bindless Demoscene", nullptr, nullptr);
     if (!window) {
-        Logger::Log(LogLevel::Critical, "Failed to create GLFW window!");
+        LOG_CRITICAL("Failed to create GLFW window!");
         glfwTerminate();
         return -1;
     }
@@ -45,11 +45,11 @@ int main() {
         vkContext.GetTotalVertexCount(), vkContext.GetTotalIndexCount(),
         vkContext.GetEntityData(), vkContext.GetEntityCount());
     if (!geometryCacheTestPassed) {
-        Logger::Log(LogLevel::Critical, "[Main] Virtual geometry cache build FAILED — the clustered pipeline cannot run without scene.cache.");
+        LOG_CRITICAL("[Main] Virtual geometry cache build FAILED — the clustered pipeline cannot run without scene.cache.");
         vkContext.Shutdown();
         glfwDestroyWindow(window);
         glfwTerminate();
-        Logger::Shutdown();
+        LOG_SHUTDOWN();
         return -1;
     }
 
@@ -81,15 +81,15 @@ int main() {
         pipelineInitOk = clusterPipeline.Init(pipelineInfo);
     }
     catch (const std::exception& e) {
-        Logger::Log(LogLevel::Critical, std::format("[Main] ClusterRenderPipeline::Init threw: {}", e.what()));
+        LOG_CRITICAL(std::format("[Main] ClusterRenderPipeline::Init threw: {}", e.what()));
     }
     if (!pipelineInitOk) {
-        Logger::Log(LogLevel::Critical, "[Main] ClusterRenderPipeline initialization FAILED.");
+        LOG_CRITICAL("[Main] ClusterRenderPipeline initialization FAILED.");
         clusterPipeline.Shutdown();
         vkContext.Shutdown();
         glfwDestroyWindow(window);
         glfwTerminate();
-        Logger::Shutdown();
+        LOG_SHUTDOWN();
         return -1;
     }
 
@@ -102,7 +102,7 @@ int main() {
     fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
     VK_CHECK(vkCreateFence(vkContext.GetDevice(), &fenceInfo, nullptr, &frameFence));
 
-    Logger::Log(LogLevel::Info, "Entering main loop.");
+    LOG_INFO("Entering main loop.");
 
     // Instantiate the camera looking at the origin; CameraOrbit() below repositions it every
     // frame, so the initial position/target here only seed the pitch/yaw derivation.
@@ -143,18 +143,18 @@ int main() {
             const maths::mat4& view = camera.GetPushConstants().view;
             const maths::mat4& proj = camera.GetPushConstants().proj;
 
-            Logger::Log(LogLevel::Info, std::format(
+            LOG_INFO(std::format(
                 "[Frame0] aspect={:.4f} cameraPos=({:.3f}, {:.3f}, {:.3f}) pitch={:.2f} yaw={:.2f}",
                 aspect, pos.x, pos.y, pos.z, camera.GetPitch(), camera.GetYaw()));
 
-            Logger::Log(LogLevel::Info, std::format(
+            LOG_INFO(std::format(
                 "[Frame0] view = [{:.3f} {:.3f} {:.3f} {:.3f}] [{:.3f} {:.3f} {:.3f} {:.3f}] [{:.3f} {:.3f} {:.3f} {:.3f}] [{:.3f} {:.3f} {:.3f} {:.3f}]",
                 view.m[0], view.m[4], view.m[8], view.m[12],
                 view.m[1], view.m[5], view.m[9], view.m[13],
                 view.m[2], view.m[6], view.m[10], view.m[14],
                 view.m[3], view.m[7], view.m[11], view.m[15]));
 
-            Logger::Log(LogLevel::Info, std::format(
+            LOG_INFO(std::format(
                 "[Frame0] proj = [{:.3f} {:.3f} {:.3f} {:.3f}] [{:.3f} {:.3f} {:.3f} {:.3f}] [{:.3f} {:.3f} {:.3f} {:.3f}] [{:.3f} {:.3f} {:.3f} {:.3f}]",
                 proj.m[0], proj.m[4], proj.m[8], proj.m[12],
                 proj.m[1], proj.m[5], proj.m[9], proj.m[13],
@@ -169,7 +169,7 @@ int main() {
                 float y = vp.m[1] * worldPos.x + vp.m[5] * worldPos.y + vp.m[9] * worldPos.z + vp.m[13];
                 float z = vp.m[2] * worldPos.x + vp.m[6] * worldPos.y + vp.m[10] * worldPos.z + vp.m[14];
                 float w = vp.m[3] * worldPos.x + vp.m[7] * worldPos.y + vp.m[11] * worldPos.z + vp.m[15];
-                Logger::Log(LogLevel::Info, std::format(
+                LOG_INFO(std::format(
                     "[Frame0] project({:.2f},{:.2f},{:.2f}) -> clip=({:.3f}, {:.3f}, {:.3f}, {:.3f}) ndc=({:.3f}, {:.3f}, {:.3f}) {}",
                     worldPos.x, worldPos.y, worldPos.z, x, y, z, w,
                     (w != 0.0f) ? x / w : 0.0f, (w != 0.0f) ? y / w : 0.0f, (w != 0.0f) ? z / w : 0.0f,
@@ -240,7 +240,7 @@ int main() {
         vkQueuePresentKHR(vkContext.GetGraphicsQueue(), &presentInfo);
     }
 
-    Logger::Log(LogLevel::Info, "Shutting down engine...");
+    LOG_INFO("Shutting down engine...");
 
     // Drain the GPU before destroying anything the last in-flight frame may still be using --
     // the per-frame loop deliberately never device-idles, so this is the one place that does.
@@ -254,7 +254,7 @@ int main() {
 
     glfwDestroyWindow(window);
     glfwTerminate();
-    Logger::Shutdown();
+    LOG_SHUTDOWN();
 
     return 0;
 }

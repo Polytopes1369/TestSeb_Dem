@@ -20,9 +20,11 @@ namespace renderer {
 
         m_Device = createInfo.device;
         m_RenderExtent = createInfo.renderExtent;
+#ifndef NDEBUG
         m_Allocator = createInfo.allocator;
         m_CommandPool = createInfo.commandPool;
         m_Queue = createInfo.queue;
+#endif
         m_VisBufferClusterIDImage = createInfo.visBufferClusterIDImage;
         m_VisBufferClusterIDView = createInfo.visBufferClusterIDView;
         m_VisBufferTriangleIDImage = createInfo.visBufferTriangleIDImage;
@@ -37,7 +39,7 @@ namespace renderer {
 
         geometry::CacheFileHeader header{};
         if (!cacheManager.ReadHeader(createInfo.cacheFilePath, header)) {
-            Logger::Log(LogLevel::Error, std::format("[ClusterRenderPipeline] Failed to read cache header '{}'.", createInfo.cacheFilePath.string()));
+            LOG_ERROR(std::format("[ClusterRenderPipeline] Failed to read cache header '{}'.", createInfo.cacheFilePath.string()));
             return false;
         }
 
@@ -46,12 +48,12 @@ namespace renderer {
         if (!cacheManager.ReadClusterIndexTable(createInfo.cacheFilePath, header, indexEntries)
             || !cacheManager.ReadDAGTable(createInfo.cacheFilePath, header, dagEntries)
             || indexEntries.empty() || indexEntries.size() != dagEntries.size()) {
-            Logger::Log(LogLevel::Error, "[ClusterRenderPipeline] Failed to read cache cluster/DAG tables.");
+            LOG_ERROR("[ClusterRenderPipeline] Failed to read cache cluster/DAG tables.");
             return false;
         }
 
         uint32_t totalClusterCount = static_cast<uint32_t>(indexEntries.size());
-        Logger::Log(LogLevel::Info, std::format("[ClusterRenderPipeline] Cache tables read: {} clusters.", totalClusterCount));
+        LOG_INFO(std::format("[ClusterRenderPipeline] Cache tables read: {} clusters.", totalClusterCount));
 
         // =========================================================================================
         // STEP 2 -- Streaming: read the whole geometry section into one host-visible staging
@@ -68,13 +70,13 @@ namespace renderer {
         {
             std::ifstream file(createInfo.cacheFilePath, std::ios::binary);
             if (!file.is_open()) {
-                Logger::Log(LogLevel::Error, "[ClusterRenderPipeline] Failed to open cache file for the geometry section read.");
+                LOG_ERROR("[ClusterRenderPipeline] Failed to open cache file for the geometry section read.");
                 return false;
             }
             file.seekg(static_cast<std::streamoff>(header.geometryDataBaseOffset));
             file.read(static_cast<char*>(stagingBuffer.MappedData()), static_cast<std::streamsize>(geometrySectionSize));
             if (!file) {
-                Logger::Log(LogLevel::Error, "[ClusterRenderPipeline] Short read on the cache geometry section.");
+                LOG_ERROR("[ClusterRenderPipeline] Short read on the cache geometry section.");
                 return false;
             }
         }
@@ -100,7 +102,7 @@ namespace renderer {
             }
         }
         if (leafCount == 0) {
-            Logger::Log(LogLevel::Error, "[ClusterRenderPipeline] Cache contains no leaf clusters.");
+            LOG_ERROR("[ClusterRenderPipeline] Cache contains no leaf clusters.");
             return false;
         }
 
@@ -133,7 +135,7 @@ namespace renderer {
                 bool bound = m_PagePool.BindPage(cmd, entry.virtualAddress, stagingBuffer.Handle(),
                     entry.virtualAddress - header.geometryDataBaseOffset, geometry::kPageSizeBytes);
                 if (!bound) {
-                    Logger::Log(LogLevel::Error, std::format("[ClusterRenderPipeline] BindPage failed for cluster {}.", entry.clusterID));
+                    LOG_ERROR(std::format("[ClusterRenderPipeline] BindPage failed for cluster {}.", entry.clusterID));
                     vkEndCommandBuffer(cmd);
                     vkFreeCommandBuffers(m_Device, createInfo.commandPool, 1, &cmd);
                     return false;
@@ -161,7 +163,7 @@ namespace renderer {
         }
 
         stagingBuffer.Destroy();
-        Logger::Log(LogLevel::Info, "[ClusterRenderPipeline] All cluster pages streamed + decompressed.");
+        LOG_INFO("[ClusterRenderPipeline] All cluster pages streamed + decompressed.");
 
         // =========================================================================================
         // STEP 5 -- Build and upload the leaf clusters' culling metadata. firstIndex/vertexOffset
@@ -175,7 +177,9 @@ namespace renderer {
         // with `metadata`/the GPU cluster-slot indices -- is how the debug outcome histogram
         // (see RecordFrame's periodic dump) maps a cluster slot back to which primitive it came
         // from, using the same ClusterIndexEntry::entityID already read from disk.
+#ifndef NDEBUG
         m_ClusterSlotToEntityID.reserve(leafCount);
+#endif
         for (size_t i = 0; i < indexEntries.size(); ++i) {
             if (dagEntries[i].level != 0) {
                 continue;
@@ -198,12 +202,14 @@ namespace renderer {
             meta.vertexOffset = physicalPage * geometry::kMaxClusterVertices;
             meta.clusterID = entry.clusterID;
             metadata.push_back(meta);
+#ifndef NDEBUG
             m_ClusterSlotToEntityID.push_back(entry.entityID);
+#endif
         }
         m_ClusterCount = static_cast<uint32_t>(metadata.size());
 
         m_OcclusionCulling.UploadClusterMetadata(createInfo.commandPool, createInfo.queue, metadata);
-        Logger::Log(LogLevel::Info, "[ClusterRenderPipeline] Culling metadata uploaded; initializing raster/resolve passes...");
+        LOG_INFO("[ClusterRenderPipeline] Culling metadata uploaded; initializing raster/resolve passes...");
 
         // =========================================================================================
         // STEP 6 -- Initialize the hybrid rasterization + resolve stages against the buffers the
@@ -223,7 +229,7 @@ namespace renderer {
             createInfo.visBufferTriangleIDView, createInfo.depthImageView,
             m_SoftwareRaster.GetVisBufferAtomicView());
 
-        Logger::Log(LogLevel::Info, std::format(
+        LOG_INFO(std::format(
             "[ClusterRenderPipeline] Initialized: {} clusters streamed from cache ({} leaf candidates, {} logical pages).",
             totalClusterCount, m_ClusterCount, maxLogicalPages));
         return true;
@@ -240,12 +246,14 @@ namespace renderer {
         m_PagePool.Shutdown();
 
         m_ClusterCount = 0;
+#ifndef NDEBUG
         m_ClusterSlotToEntityID.clear();
         m_FrameCounter = 0;
         m_DebugOutcomeDumped = false;
         m_Allocator = VK_NULL_HANDLE;
         m_CommandPool = VK_NULL_HANDLE;
         m_Queue = VK_NULL_HANDLE;
+#endif
         m_VisBufferClusterIDImage = VK_NULL_HANDLE;
         m_VisBufferClusterIDView = VK_NULL_HANDLE;
         m_VisBufferTriangleIDImage = VK_NULL_HANDLE;
@@ -291,7 +299,10 @@ namespace renderer {
         vkCmdBeginRendering(cmd, &renderingInfo);
     }
 
-    // DEBUG (temporary): see the class comment above RecordFrame()'s trigger site.
+    // DEBUG (temporary): see the class comment above RecordFrame()'s trigger site. Entirely
+    // debug-only tooling (GPU debug-buffer readback + histogram dump) -- must not be compiled or
+    // executed in Release (project rule: no debug hooks/tools in the Release binary).
+#ifndef NDEBUG
     void ClusterRenderPipeline::DumpDebugOutcomeHistogram(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue) const {
         VkDeviceSize readbackSize = static_cast<VkDeviceSize>(sizeof(uint32_t)) * m_ClusterCount;
 
@@ -356,7 +367,7 @@ namespace renderer {
             }
         }
 
-        Logger::Log(LogLevel::Info, std::format("[ClusterRenderPipeline] DEBUG per-entity culling outcome histogram (frame {}):", m_FrameCounter));
+        LOG_INFO(std::format("[ClusterRenderPipeline] DEBUG per-entity culling outcome histogram (frame {}):", m_FrameCounter));
         for (uint32_t entityID = 0; entityID < 12; ++entityID) {
             std::string line = std::format("[ClusterRenderPipeline]   meshID={}: ", entityID);
             for (uint32_t outcome = 0; outcome < 8; ++outcome) {
@@ -365,14 +376,16 @@ namespace renderer {
                     line += std::format("{}={} ", kOutcomeNames[outcome], count);
                 }
             }
-            Logger::Log(LogLevel::Info, line);
+            LOG_INFO(line);
         }
     }
+#endif // NDEBUG
 
     void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd, const CameraPushConstants& camera,
         const maths::vec3& cameraPositionWorld, VkImage swapchainImage) {
         assert(m_ClusterCount > 0 && "RecordFrame called before a successful Init");
 
+#ifndef NDEBUG
         // DEBUG (temporary): dump a per-entity culling-outcome histogram once, after the scene has
         // reached steady state (frame 60). Safe to do here, before this frame's own `cmd` is
         // recorded/submitted: main.cpp's single-frame-in-flight loop already waited on the previous
@@ -382,6 +395,7 @@ namespace renderer {
         if (m_FrameCounter >= 55 && m_FrameCounter <= 65) {
             DumpDebugOutcomeHistogram(m_Device, m_Allocator, m_CommandPool, m_Queue);
         }
+#endif
 
         // Every stage of this frame consumes the SAME combined matrix -- this is what makes the
         // resolve pass's screen-space triangle re-projection bit-identical to the rasterizers'.

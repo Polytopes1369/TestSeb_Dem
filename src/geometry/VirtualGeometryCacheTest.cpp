@@ -44,7 +44,7 @@ namespace geometry {
             vInfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
             VmaAllocationCreateInfo stagingAllocInfo{ .usage = VMA_MEMORY_USAGE_GPU_TO_CPU };
             if (vmaCreateBuffer(allocator, &vInfo, &stagingAllocInfo, &stagingVertex, &stagingVertexAlloc, nullptr) != VK_SUCCESS) {
-                Logger::Log(LogLevel::Error, "[GeometryCacheTest] Failed to allocate vertex staging buffer for full readback!");
+                LOG_ERROR("[GeometryCacheTest] Failed to allocate vertex staging buffer for full readback!");
                 return false;
             }
 
@@ -54,7 +54,7 @@ namespace geometry {
             iInfo.size = indexBytes;
             iInfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
             if (vmaCreateBuffer(allocator, &iInfo, &stagingAllocInfo, &stagingIndex, &stagingIndexAlloc, nullptr) != VK_SUCCESS) {
-                Logger::Log(LogLevel::Error, "[GeometryCacheTest] Failed to allocate index staging buffer for full readback!");
+                LOG_ERROR("[GeometryCacheTest] Failed to allocate index staging buffer for full readback!");
                 vmaDestroyBuffer(allocator, stagingVertex, stagingVertexAlloc);
                 return false;
             }
@@ -66,7 +66,7 @@ namespace geometry {
 
             VkCommandBuffer cmd = VK_NULL_HANDLE;
             if (vkAllocateCommandBuffers(device, &cmdAllocInfo, &cmd) != VK_SUCCESS) {
-                Logger::Log(LogLevel::Error, "[GeometryCacheTest] Failed to allocate the full-readback command buffer!");
+                LOG_ERROR("[GeometryCacheTest] Failed to allocate the full-readback command buffer!");
                 vmaDestroyBuffer(allocator, stagingVertex, stagingVertexAlloc);
                 vmaDestroyBuffer(allocator, stagingIndex, stagingIndexAlloc);
                 return false;
@@ -101,7 +101,7 @@ namespace geometry {
                 vmaUnmapMemory(allocator, stagingVertexAlloc);
             }
             else {
-                Logger::Log(LogLevel::Error, "[GeometryCacheTest] Failed to map vertex staging buffer!");
+                LOG_ERROR("[GeometryCacheTest] Failed to map vertex staging buffer!");
                 ok = false;
             }
 
@@ -111,7 +111,7 @@ namespace geometry {
                 vmaUnmapMemory(allocator, stagingIndexAlloc);
             }
             else if (ok) {
-                Logger::Log(LogLevel::Error, "[GeometryCacheTest] Failed to map index staging buffer!");
+                LOG_ERROR("[GeometryCacheTest] Failed to map index staging buffer!");
                 ok = false;
             }
 
@@ -159,7 +159,7 @@ namespace geometry {
             uint32_t vertexCount = static_cast<uint32_t>(node.mesh.positions.size());
             uint32_t indexCount = static_cast<uint32_t>(node.mesh.triangles.size());
             if (vertexCount > kMaxClusterVertices || indexCount > kMaxClusterIndices) {
-                Logger::Log(LogLevel::Error, std::format(
+                LOG_ERROR(std::format(
                     "[GeometryCacheTest] DAG node (level {}) exceeds the fixed cluster capacity: "
                     "{} vertices (max {}), {} indices (max {}).",
                     node.level, vertexCount, kMaxClusterVertices, indexCount, kMaxClusterIndices));
@@ -273,13 +273,13 @@ namespace geometry {
         uint32_t totalVertexCount, uint32_t totalIndexCount,
         const core::EntityData* entityData, uint32_t entityCount) {
 
-        Logger::Log(LogLevel::Info, "[GeometryCacheTest] Starting virtual geometry cache round-trip test...");
+        LOG_INFO("[GeometryCacheTest] Starting virtual geometry cache round-trip test...");
 
         std::vector<renderer::Vertex> allVertices;
         std::vector<uint32_t> allIndices;
         if (!ReadbackFullGeometry(device, allocator, graphicsQueue, commandPool, vertexBuffer, indexBuffer,
             totalVertexCount, totalIndexCount, allVertices, allIndices)) {
-            Logger::Log(LogLevel::Error, "[GeometryCacheTest] Aborting: full geometry readback failed.");
+            LOG_ERROR("[GeometryCacheTest] Aborting: full geometry readback failed.");
             return false;
         }
 
@@ -300,16 +300,16 @@ namespace geometry {
                 uint32_t i0 = allIndices[t + 0];
                 ++trisByMeshID[allVertices[i0].meshID];
             }
-            Logger::Log(LogLevel::Info, "[GeometryCacheTest] Per-meshID diagnostic histogram:");
+            LOG_INFO("[GeometryCacheTest] Per-meshID diagnostic histogram:");
             for (uint32_t id = 0; id < entityCount; ++id) {
                 uint32_t vc = vertsByMeshID.count(id) ? vertsByMeshID[id] : 0u;
                 uint32_t tc = trisByMeshID.count(id) ? trisByMeshID[id] : 0u;
-                Logger::Log(LogLevel::Info, std::format(
+                LOG_INFO(std::format(
                     "[GeometryCacheTest]   meshID={}: vertices={} triangles={}", id, vc, tc));
             }
             for (const auto& [id, vc] : vertsByMeshID) {
                 if (id >= entityCount) {
-                    Logger::Log(LogLevel::Warning, std::format(
+                    LOG_WARNING(std::format(
                         "[GeometryCacheTest]   OUT-OF-RANGE meshID={} found on {} vertices (expected range [0,{}))! "
                         "This indicates memory corruption (likely a buffer capacity overflow).", id, vc, entityCount));
                 }
@@ -332,7 +332,7 @@ namespace geometry {
 
             ClusterDAG dag = BuildClusterDAG(meshID, allVertices, allIndices);
             if (dag.nodes.empty()) {
-                Logger::Log(LogLevel::Warning, std::format(
+                LOG_WARNING(std::format(
                     "[GeometryCacheTest] Entity meshID={} produced zero clusters (no matching triangles); skipping.", meshID));
                 continue;
             }
@@ -343,7 +343,7 @@ namespace geometry {
             std::vector<std::string> dagErrors;
             if (!ValidateClusterDAG(dag, dagErrors)) {
                 for (const std::string& err : dagErrors) {
-                    Logger::Log(LogLevel::Error, std::format("[GeometryCacheTest] entity meshID={} DAG: {}", meshID, err));
+                    LOG_ERROR(std::format("[GeometryCacheTest] entity meshID={} DAG: {}", meshID, err));
                 }
                 allEntitiesOk = false;
                 continue;
@@ -396,28 +396,28 @@ namespace geometry {
                 if (itMax == maxCutoffByEntity.end() || cutoff > itMax->second) maxCutoffByEntity[e.entityID] = cutoff;
                 ++countByEntity[e.entityID];
             }
-            Logger::Log(LogLevel::Info, "[GeometryCacheTest] Per-entity coneCutoff range (all DAG levels, not just leaves):");
+            LOG_INFO("[GeometryCacheTest] Per-entity coneCutoff range (all DAG levels, not just leaves):");
             for (const auto& [id, count] : countByEntity) {
-                Logger::Log(LogLevel::Info, std::format(
+                LOG_INFO(std::format(
                     "[GeometryCacheTest]   meshID={}: clusters={} coneCutoff min={:.3f} max={:.3f}",
                     id, count, minCutoffByEntity[id], maxCutoffByEntity[id]));
             }
         }
 
         if (!allEntitiesOk) {
-            Logger::Log(LogLevel::Error,
+            LOG_ERROR(
                 "[GeometryCacheTest] Aborting before write: one or more entities failed DAG validation or cluster encoding (see errors above).");
             return false;
         }
         if (indexEntries.empty()) {
-            Logger::Log(LogLevel::Error, "[GeometryCacheTest] Aborting: no entity produced any cluster.");
+            LOG_ERROR("[GeometryCacheTest] Aborting: no entity produced any cluster.");
             return false;
         }
 
         // --- Write the whole scene's clusters into ONE consolidated .cache file -----------------
         std::filesystem::path filePath = std::filesystem::path(".") / "scene.cache";
         if (!cacheManager.WriteCacheFile(filePath, indexEntries, dagEntries, clusterData, entitiesWithGeometry)) {
-            Logger::Log(LogLevel::Error, std::format("[GeometryCacheTest] WriteCacheFile failed for '{}'.", filePath.string()));
+            LOG_ERROR(std::format("[GeometryCacheTest] WriteCacheFile failed for '{}'.", filePath.string()));
             return false;
         }
 
@@ -426,12 +426,12 @@ namespace geometry {
 
         CacheFileHeader readHeader{};
         if (!cacheManager.ReadHeader(filePath, readHeader)) {
-            Logger::Log(LogLevel::Error, "[GeometryCacheTest] Failed to read back the CacheFileHeader.");
+            LOG_ERROR("[GeometryCacheTest] Failed to read back the CacheFileHeader.");
             return false;
         }
         bool headerOk = readHeader.clusterCount == indexEntries.size() && readHeader.entityCount == entitiesWithGeometry;
         allPassed = allPassed && headerOk;
-        Logger::Log(headerOk ? LogLevel::Info : LogLevel::Error, std::format(
+        LOG(headerOk ? LogLevel::Info : LogLevel::Error, std::format(
             "[GeometryCacheTest] Header round-trip: {} (clusterCount={}, entityCount={}).",
             headerOk ? "OK" : "FAIL", readHeader.clusterCount, readHeader.entityCount));
 
@@ -440,7 +440,7 @@ namespace geometry {
             && readIndexEntries.size() == indexEntries.size()
             && std::memcmp(readIndexEntries.data(), indexEntries.data(), indexEntries.size() * sizeof(ClusterIndexEntry)) == 0;
         allPassed = allPassed && indexTableOk;
-        Logger::Log(indexTableOk ? LogLevel::Info : LogLevel::Error, std::format(
+        LOG(indexTableOk ? LogLevel::Info : LogLevel::Error, std::format(
             "[GeometryCacheTest] Cluster index table round-trip: {}.", indexTableOk ? "OK" : "FAIL"));
 
         std::vector<DAGNodeEntry> readDagEntries;
@@ -448,7 +448,7 @@ namespace geometry {
             && readDagEntries.size() == dagEntries.size()
             && std::memcmp(readDagEntries.data(), dagEntries.data(), dagEntries.size() * sizeof(DAGNodeEntry)) == 0;
         allPassed = allPassed && dagTableOk;
-        Logger::Log(dagTableOk ? LogLevel::Info : LogLevel::Error, std::format(
+        LOG(dagTableOk ? LogLevel::Info : LogLevel::Error, std::format(
             "[GeometryCacheTest] DAG table round-trip: {}.", dagTableOk ? "OK" : "FAIL"));
 
         // Re-validate the DAG *as reconstructed from the on-disk table*, proving the persisted
@@ -460,11 +460,11 @@ namespace geometry {
             std::vector<std::string> reconstructedErrors;
             onDiskDagValid = ValidateClusterDAG(reconstructed, reconstructedErrors);
             for (const std::string& err : reconstructedErrors) {
-                Logger::Log(LogLevel::Error, std::format("[GeometryCacheTest] on-disk DAG: {}", err));
+                LOG_ERROR(std::format("[GeometryCacheTest] on-disk DAG: {}", err));
             }
         }
         allPassed = allPassed && onDiskDagValid;
-        Logger::Log(onDiskDagValid ? LogLevel::Info : LogLevel::Error, std::format(
+        LOG(onDiskDagValid ? LogLevel::Info : LogLevel::Error, std::format(
             "[GeometryCacheTest] On-disk DAG re-validation: {}.", onDiskDagValid ? "OK" : "FAIL"));
 
         // Sample one arbitrary (not just the first) cluster's geometry block and verify it
@@ -480,10 +480,10 @@ namespace geometry {
                 && std::memcmp(&readClusterData, &clusterData[sampleClusterIndex], sizeof(ClusterData)) == 0;
         }
         allPassed = allPassed && clusterReadOk;
-        Logger::Log(clusterReadOk ? LogLevel::Info : LogLevel::Error, std::format(
+        LOG(clusterReadOk ? LogLevel::Info : LogLevel::Error, std::format(
             "[GeometryCacheTest] Sample cluster [{}] geometry block round-trip: {}.", sampleClusterIndex, clusterReadOk ? "OK" : "FAIL"));
 
-        Logger::Log(allPassed ? LogLevel::Info : LogLevel::Error, std::format(
+        LOG(allPassed ? LogLevel::Info : LogLevel::Error, std::format(
             "[GeometryCacheTest] Virtual geometry cache round-trip test {} -- '{}': {} cluster(s) across {} entit(y/ies).",
             allPassed ? "PASSED" : "FAILED", filePath.string(), indexEntries.size(), entitiesWithGeometry));
 

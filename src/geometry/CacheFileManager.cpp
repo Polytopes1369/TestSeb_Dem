@@ -60,7 +60,7 @@ namespace geometry {
         bool WriteZeroPaddedSection(HANDLE fileHandle, const void* data, size_t dataSizeBytes, size_t paddedSizeBytes) {
             AlignedPageBuffer scratch(paddedSizeBytes);
             if (!scratch.IsValid()) {
-                Logger::Log(LogLevel::Error, std::format(
+                LOG_ERROR(std::format(
                     "[CacheFileManager] VirtualAlloc failed for a {}-byte zero-padded write scratch buffer!", paddedSizeBytes));
                 return false;
             }
@@ -95,14 +95,14 @@ namespace geometry {
                     ++deletedCount;
                 }
                 else {
-                    Logger::Log(LogLevel::Warning, std::format(
+                    LOG_WARNING(std::format(
                         "[CacheFileManager] Failed to delete stale cache file '{}': {}",
                         entry.path().string(), removeEc.message()));
                 }
             }
         }
 
-        Logger::Log(LogLevel::Info, std::format(
+        LOG_INFO(std::format(
             "[CacheFileManager] Purged {} stale .cache file(s) from '{}'.",
             deletedCount, directory.string()));
     }
@@ -116,7 +116,7 @@ namespace geometry {
 
         const uint32_t clusterCount = static_cast<uint32_t>(indexEntries.size());
         if (dagEntries.size() != clusterCount || clusterData.size() != clusterCount) {
-            Logger::Log(LogLevel::Error, std::format(
+            LOG_ERROR(std::format(
                 "[CacheFileManager] WriteCacheFile: mismatched section sizes (index={}, dag={}, data={})",
                 indexEntries.size(), dagEntries.size(), clusterData.size()));
             return false;
@@ -164,7 +164,7 @@ namespace geometry {
             nullptr);
 
         if (fileHandle == INVALID_HANDLE_VALUE) {
-            Logger::Log(LogLevel::Error, std::format(
+            LOG_ERROR(std::format(
                 "[CacheFileManager] CreateFileW failed for '{}' (GetLastError={})",
                 filePath.string(), GetLastError()));
             return false;
@@ -172,21 +172,21 @@ namespace geometry {
 
         // --- Section 1: header, zero-padded to kCacheFileHeaderPaddedSizeBytes -----------------
         if (!WriteZeroPaddedSection(fileHandle, &header, sizeof(CacheFileHeader), kCacheFileHeaderPaddedSizeBytes)) {
-            Logger::Log(LogLevel::Error, std::format("[CacheFileManager] Failed writing the header to '{}' (GetLastError={})", filePath.string(), GetLastError()));
+            LOG_ERROR(std::format("[CacheFileManager] Failed writing the header to '{}' (GetLastError={})", filePath.string(), GetLastError()));
             CloseHandle(fileHandle);
             return false;
         }
 
         // --- Section 2: cluster index table, zero-padded to the next page boundary -------------
         if (!WriteZeroPaddedSection(fileHandle, indexEntries.data(), static_cast<size_t>(clusterIndexTableSizeBytes), static_cast<size_t>(clusterIndexTablePaddedSizeBytes))) {
-            Logger::Log(LogLevel::Error, std::format("[CacheFileManager] Failed writing the cluster index table to '{}' (GetLastError={})", filePath.string(), GetLastError()));
+            LOG_ERROR(std::format("[CacheFileManager] Failed writing the cluster index table to '{}' (GetLastError={})", filePath.string(), GetLastError()));
             CloseHandle(fileHandle);
             return false;
         }
 
         // --- Section 3: DAG table, zero-padded to the next page boundary -----------------------
         if (!WriteZeroPaddedSection(fileHandle, dagEntries.data(), static_cast<size_t>(dagTableSizeBytes), static_cast<size_t>(dagTablePaddedSizeBytes))) {
-            Logger::Log(LogLevel::Error, std::format("[CacheFileManager] Failed writing the DAG table to '{}' (GetLastError={})", filePath.string(), GetLastError()));
+            LOG_ERROR(std::format("[CacheFileManager] Failed writing the DAG table to '{}' (GetLastError={})", filePath.string(), GetLastError()));
             CloseHandle(fileHandle);
             return false;
         }
@@ -194,7 +194,7 @@ namespace geometry {
         // --- Section 4: one page-aligned, zero-padded ClusterData block per cluster ------------
         for (uint32_t i = 0; i < clusterCount; ++i) {
             if (!WriteZeroPaddedSection(fileHandle, &clusterData[i], sizeof(ClusterData), kPageSizeBytes)) {
-                Logger::Log(LogLevel::Error, std::format(
+                LOG_ERROR(std::format(
                     "[CacheFileManager] Failed writing cluster {}'s geometry block to '{}' (GetLastError={})",
                     i, filePath.string(), GetLastError()));
                 CloseHandle(fileHandle);
@@ -204,7 +204,7 @@ namespace geometry {
 
         CloseHandle(fileHandle);
 
-        Logger::Log(LogLevel::Info, std::format(
+        LOG_INFO(std::format(
             "[CacheFileManager] Wrote '{}': {} cluster(s) across {} entit(y/ies), {} bytes total "
             "(index table {} B, DAG table {} B, geometry {} B).",
             filePath.string(), clusterCount, entityCount, totalFileSizeBytes,
@@ -216,7 +216,7 @@ namespace geometry {
         HANDLE fileHandle = CreateFileW(
             filePath.wstring().c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (fileHandle == INVALID_HANDLE_VALUE) {
-            Logger::Log(LogLevel::Error, std::format(
+            LOG_ERROR(std::format(
                 "[CacheFileManager] CreateFileW (read header) failed for '{}' (GetLastError={})", filePath.string(), GetLastError()));
             return false;
         }
@@ -226,11 +226,11 @@ namespace geometry {
         CloseHandle(fileHandle);
 
         if (ok == FALSE || bytesRead != sizeof(CacheFileHeader)) {
-            Logger::Log(LogLevel::Error, std::format("[CacheFileManager] Failed reading the header from '{}'", filePath.string()));
+            LOG_ERROR(std::format("[CacheFileManager] Failed reading the header from '{}'", filePath.string()));
             return false;
         }
         if (outHeader.magic != CacheFileHeader::kMagic || outHeader.version != CacheFileHeader::kVersion) {
-            Logger::Log(LogLevel::Error, std::format(
+            LOG_ERROR(std::format(
                 "[CacheFileManager] '{}' has an unrecognized magic/version (magic=0x{:08X}, version={})",
                 filePath.string(), outHeader.magic, outHeader.version));
             return false;
@@ -251,7 +251,7 @@ namespace geometry {
             HANDLE fileHandle = CreateFileW(
                 filePath.wstring().c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
             if (fileHandle == INVALID_HANDLE_VALUE) {
-                Logger::Log(LogLevel::Error, std::format(
+                LOG_ERROR(std::format(
                     "[CacheFileManager] CreateFileW (read table) failed for '{}' (GetLastError={})", filePath.string(), GetLastError()));
                 return false;
             }
@@ -259,7 +259,7 @@ namespace geometry {
             LARGE_INTEGER seekOffset{};
             seekOffset.QuadPart = static_cast<LONGLONG>(tableOffset);
             if (!SetFilePointerEx(fileHandle, seekOffset, nullptr, FILE_BEGIN)) {
-                Logger::Log(LogLevel::Error, std::format("[CacheFileManager] SetFilePointerEx failed for '{}'", filePath.string()));
+                LOG_ERROR(std::format("[CacheFileManager] SetFilePointerEx failed for '{}'", filePath.string()));
                 CloseHandle(fileHandle);
                 return false;
             }
@@ -270,7 +270,7 @@ namespace geometry {
             CloseHandle(fileHandle);
 
             if (ok == FALSE || bytesRead != bytesToRead) {
-                Logger::Log(LogLevel::Error, std::format("[CacheFileManager] Failed reading a table from '{}'", filePath.string()));
+                LOG_ERROR(std::format("[CacheFileManager] Failed reading a table from '{}'", filePath.string()));
                 return false;
             }
             return true;
@@ -300,7 +300,7 @@ namespace geometry {
             nullptr);
 
         if (fileHandle == INVALID_HANDLE_VALUE) {
-            Logger::Log(LogLevel::Error, std::format(
+            LOG_ERROR(std::format(
                 "[CacheFileManager] CreateFileW (read cluster) failed for '{}' (GetLastError={})",
                 filePath.string(), GetLastError()));
             std::promise<bool> failedPromise;
@@ -310,7 +310,7 @@ namespace geometry {
 
         HANDLE completionEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
         if (completionEvent == nullptr) {
-            Logger::Log(LogLevel::Error, "[CacheFileManager] CreateEventW failed for overlapped cluster read!");
+            LOG_ERROR("[CacheFileManager] CreateEventW failed for overlapped cluster read!");
             CloseHandle(fileHandle);
             std::promise<bool> failedPromise;
             failedPromise.set_value(false);
@@ -328,7 +328,7 @@ namespace geometry {
         DWORD lastError = GetLastError();
 
         if (immediateResult == FALSE && lastError != ERROR_IO_PENDING) {
-            Logger::Log(LogLevel::Error, std::format(
+            LOG_ERROR(std::format(
                 "[CacheFileManager] ReadFile failed for '{}' at offset {} (GetLastError={})",
                 filePath.string(), virtualAddress, lastError));
             CloseHandle(completionEvent);
@@ -351,7 +351,7 @@ namespace geometry {
             CloseHandle(fileHandle);
 
             if (ok == FALSE || bytesTransferred != kPageSizeBytes) {
-                Logger::Log(LogLevel::Error, std::format(
+                LOG_ERROR(std::format(
                     "[CacheFileManager] Overlapped cluster read did not complete cleanly "
                     "(GetLastError={}, bytesTransferred={}).",
                     waitError, bytesTransferred));

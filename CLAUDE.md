@@ -30,7 +30,8 @@ Tout est 100% procedural GPU driven.
 5. **Modification d'une fonction :** Donne explicitement le code "Avant correction" et "Après correction" pour chaque modification.
 6. **Journalisation & Rigueur :** Utilise notre système de log unifié pour rapporter chaque étape critique (initialisation, allocations VMA, chargements, modifications de pipelines).
 7. **Modifications Incrémentales :** Fais des modifications étape par étape et assure la logique de compilation à chaque fichier traité.
-8. **Outils de Débogage & Séparation Build (Debug/Release) :**
-   * Crée des outils de debug spécifiques si nécessaire (ex: Debug Buffers pour GPU, visualisations de clusters, dumps de textures) afin de valider l'implémentation exacte des fonctionnalités.
-   * Utilise impérativement le logger unifié pour suivre et valider les informations importantes d'exécution.
-   * **Règle d'or de la taille de l'exécutable :** Tous les outils de débogage, les hooks de validation, les chaînes de texte verbeuses de debug et le code du logger doivent être conditionnés par des macros de précompilation (ex: `#ifndef NDEBUG` ou `#ifdef _DEBUG`). **Rien** de tout cela ne doit être compilé en configuration **Release**, afin de maintenir un exécutable final ultra-léger et optimisé pour la performance brute.
+8. Outils de Débogage & Séparation Build (Debug/Release Strict) :
+   * **Règle d'or d'exclusion binaire (Release) :** Tout le code lié aux tests, à la validation GPU, aux overlays statistiques, au système de routage d'inputs Numpad, aux modes de visualisation (Lumen/Nanite) et au logger unifié **ne doit pas être compilé** en mode Release.
+   * **Isolation par fichiers & CMake :** Les fichiers sources dédiés au debug (ex: `DebugInputRouter.cpp`, `Logger.cpp`, `GpuDebugBuffer.cpp`) doivent être exclus de la compilation via des conditions de build CMake (`if(CMAKE_BUILD_TYPE STREQUAL "Debug")`) ou encapsulés par une garde de précompilation englobant l'intégralité du fichier (`#ifdef _DEBUG ... #endif`). En mode Release, le compilateur ne doit générer *aucun* code objet pour ces fonctionnalités.
+   * **Zéro overhead de chaînes de caractères :** Aucune chaîne de texte verbeuse, aucun formatage de diagnostic, et aucun symbole lié aux outils de debug ne doit persister dans l'exécutable final de production afin de garantir un poids minimal et une optimisation maximale.
+   

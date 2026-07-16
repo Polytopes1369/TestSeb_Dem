@@ -61,7 +61,7 @@ namespace geometry {
             nullptr);
 
         if (m_FileHandle == INVALID_HANDLE_VALUE) {
-            Logger::Log(LogLevel::Error, std::format(
+            LOG_ERROR(std::format(
                 "[AsyncFileStreamer] CreateFileW failed for '{}' (GetLastError={})", filePath.string(), GetLastError()));
             return false;
         }
@@ -72,7 +72,7 @@ namespace geometry {
         // apart from the synthetic shutdown packets Close() posts with kShutdownCompletionKey.
         m_CompletionPort = CreateIoCompletionPort(m_FileHandle, nullptr, 0, m_WorkerThreadCount);
         if (m_CompletionPort == nullptr) {
-            Logger::Log(LogLevel::Error, std::format(
+            LOG_ERROR(std::format(
                 "[AsyncFileStreamer] CreateIoCompletionPort failed for '{}' (GetLastError={})", filePath.string(), GetLastError()));
             CloseHandle(m_FileHandle);
             m_FileHandle = INVALID_HANDLE_VALUE;
@@ -114,14 +114,14 @@ namespace geometry {
 
     bool AsyncFileStreamer::SubmitRead(uint64_t fileOffset, void* destinationBuffer, uint32_t sizeBytes, ReadCallback onComplete) {
         if (!IsOpen()) {
-            Logger::Log(LogLevel::Error, "[AsyncFileStreamer] SubmitRead called on a closed streamer!");
+            LOG_ERROR("[AsyncFileStreamer] SubmitRead called on a closed streamer!");
             return false;
         }
         bool aligned = (fileOffset % kStreamerBlockSizeBytes == 0)
             && (sizeBytes % kStreamerBlockSizeBytes == 0)
             && (reinterpret_cast<uintptr_t>(destinationBuffer) % kStreamerBlockSizeBytes == 0);
         if (!aligned) {
-            Logger::Log(LogLevel::Error, std::format(
+            LOG_ERROR(std::format(
                 "[AsyncFileStreamer] SubmitRead: offset={}, size={}, buffer={:#x} must all be multiples of {} bytes (FILE_FLAG_NO_BUFFERING requirement).",
                 fileOffset, sizeBytes, reinterpret_cast<uintptr_t>(destinationBuffer), kStreamerBlockSizeBytes));
             return false;
@@ -142,7 +142,7 @@ namespace geometry {
             // Genuine launch failure: no real completion packet will ever be queued by the OS for
             // this request, so post a synthetic one ourselves -- see StreamingRequest::
             // launchFailed for why onComplete must never be invoked directly here.
-            Logger::Log(LogLevel::Error, std::format(
+            LOG_ERROR(std::format(
                 "[AsyncFileStreamer] ReadFile failed at offset {} (GetLastError={})", fileOffset, lastError));
             request->launchFailed = true;
             if (!PostQueuedCompletionStatus(m_CompletionPort, 0, 0, &request->overlapped)) {
@@ -151,7 +151,7 @@ namespace geometry {
                 // Finalizing it here is still safe -- PostQueuedCompletionStatus failing is not
                 // something a caller's callback can trigger repeatedly by re-submitting, so this
                 // path cannot recurse the way a direct onComplete-on-every-failure call could.
-                Logger::Log(LogLevel::Error, "[AsyncFileStreamer] PostQueuedCompletionStatus failed for a synthetic failure packet!");
+                LOG_ERROR("[AsyncFileStreamer] PostQueuedCompletionStatus failed for a synthetic failure packet!");
                 ReadCallback failedCallback = std::move(request->onComplete);
                 delete request;
                 OnRequestFinished();
@@ -209,7 +209,7 @@ namespace geometry {
                 // returning FALSE with overlapped == nullptr here happens only for port-level
                 // failures, which should not occur while Close() still owns a valid handle, so
                 // treat it as fatal to this thread rather than looping forever.
-                Logger::Log(LogLevel::Error, std::format(
+                LOG_ERROR(std::format(
                     "[AsyncFileStreamer] GetQueuedCompletionStatus returned no packet (GetLastError={}); worker exiting.", ioError));
                 break;
             }

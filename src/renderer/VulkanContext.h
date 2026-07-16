@@ -77,7 +77,9 @@ public:
 
 private:
     VkInstance m_Instance = VK_NULL_HANDLE;
+#ifndef NDEBUG
     VkDebugUtilsMessengerEXT m_DebugMessenger = VK_NULL_HANDLE;
+#endif
     VkSurfaceKHR m_Surface = VK_NULL_HANDLE;
     VkPhysicalDevice m_PhysicalDevice = VK_NULL_HANDLE;
     VkDevice m_Device = VK_NULL_HANDLE;
@@ -177,7 +179,9 @@ private:
     // UploadEntityData(). One entry per primitive (box=0 .. chamferBox=11), see struct_custo.glsl.
     std::array<core::EntityData, kEntityCount> m_EntityData{};
 
+#ifndef NDEBUG
     const bool m_EnableValidationLayers = true;
+#endif
 
     void CreateInstance(std::string_view appName);
     void SetupDebugMessenger();
