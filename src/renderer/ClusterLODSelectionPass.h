@@ -45,8 +45,8 @@ namespace renderer {
 
     // GLSL-friendly, std430-compatible mirror of DAGNodePayload in ClusterDAGScreenError.comp.
     // Field order matches that struct exactly (sphereCenter first so every following scalar packs
-    // tightly with zero implicit padding -- see that shader's own comment) -- 48 bytes, already a
-    // multiple of its own 16-byte array stride, so no manual trailing pad is needed here either.
+    // tightly with zero implicit padding -- see that shader's own comment). entityID's trailing
+    // 3x uint32 pad rounds the struct up to 64 bytes, its actual std430 array stride.
     struct DAGNodePayload {
         maths::vec3 sphereCenter;
         float sphereRadius = 0.0f;
@@ -60,8 +60,16 @@ namespace renderer {
         float clusterError = 0.0f;
         float parentError = 0.0f;
         float maxWPOAmplitude = 0.0f;
+
+        // geometry::ClusterIndexEntry::entityID -- the owning entity's meshID, used by
+        // ClusterDAGScreenError.comp to rotate sphereCenter into its current (not rest-pose) world
+        // position before projecting error to pixels. See cluster_entity_transform.glsl.
+        uint32_t entityID = 0;
+        uint32_t _pad0 = 0;
+        uint32_t _pad1 = 0;
+        uint32_t _pad2 = 0;
     };
-    static_assert(sizeof(DAGNodePayload) == 48,
+    static_assert(sizeof(DAGNodePayload) == 64,
         "DAGNodePayload must match DAGNodePayload in ClusterDAGScreenError.comp exactly (std430 layout)");
 
     // GLSL-friendly, std430-compatible mirror of LODNodeMetadata in cluster_lod_node_metadata.glsl.
@@ -101,9 +109,13 @@ namespace renderer {
         // geometry::GpuPageTable::LogicalAddressToPageID() for each entry's logicalPageID).
         // `leafCount` sizes the candidate output buffer (a valid cut's simultaneous draw count
         // never exceeds the total leaf count). `pageTableBuffer` is
-        // renderer::GpuGeometryPagePool::GetPageTableBuffer().
+        // renderer::GpuGeometryPagePool::GetPageTableBuffer(). `entityTransformBuffer` is the same
+        // per-entity rotation buffer VulkanContext::UpdateEntityRotations() re-uploads every frame
+        // (VulkanContext::GetEntityTransformBuffer()) -- bound into the ScreenError and Compact
+        // passes so their cluster-bounds tests stay in sync with each entity's current rotation
+        // instead of its rest pose (see cluster_entity_transform.glsl).
         void Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
-            VkBuffer pageTableBuffer, uint32_t leafCount,
+            VkBuffer pageTableBuffer, VkBuffer entityTransformBuffer, uint32_t leafCount,
             const std::vector<geometry::ClusterIndexEntry>& indexEntries,
             const std::vector<geometry::DAGNodeEntry>& dagEntries);
 

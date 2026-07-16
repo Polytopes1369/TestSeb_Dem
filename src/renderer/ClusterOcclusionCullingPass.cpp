@@ -10,7 +10,7 @@ namespace renderer {
 
 
     void ClusterOcclusionCullingPass::Init(VkDevice device, VmaAllocator allocator, uint32_t maxClusters, uint32_t totalClusterCount,
-        VkBuffer candidateMetadataBuffer, VkBuffer candidateCountBuffer,
+        VkBuffer candidateMetadataBuffer, VkBuffer candidateCountBuffer, VkBuffer entityTransformBuffer,
         VkImageView hzbFullView, VkExtent2D hzbMip0Extent, uint32_t hzbMipLevelCount) {
         Shutdown();
 
@@ -18,6 +18,7 @@ namespace renderer {
         m_MaxClusters = maxClusters;
         m_CandidateMetadataBuffer = candidateMetadataBuffer;
         m_CandidateCountBuffer = candidateCountBuffer;
+        m_EntityTransformBuffer = entityTransformBuffer;
         m_HZBView = hzbFullView;
         m_HZBMip0Width = static_cast<float>(hzbMip0Extent.width);
         m_HZBMip0Height = static_cast<float>(hzbMip0Extent.height);
@@ -151,7 +152,7 @@ namespace renderer {
         // ClusterHZBOcclusionCull.comp's set = 0 bindings 0..16 exactly (0..11 the original set,
         // 12..16 the opaque-list counterparts -- see that shader's "Opaque / masked classification"
         // class comment). Shared by both the early and late pipelines. ---
-        VkDescriptorSetLayoutBinding bindings[17]{};
+        VkDescriptorSetLayoutBinding bindings[18]{};
         bindings[0] = { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };          // ClusterCullMetadataSSBO
         bindings[1] = { 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };          // CullingViewParamsUBO
         bindings[2] = { 2, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };          // HZBOcclusionViewParamsUBO
@@ -169,9 +170,10 @@ namespace renderer {
         bindings[14] = { 14, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };       // LateIndirectCommandsOpaqueSSBO
         bindings[15] = { 15, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };       // LateDrawCountOpaqueSSBO
         bindings[16] = { 16, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };       // SoftwareClusterListOpaqueSSBO
+        bindings[17] = { 17, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };       // EntityTransformBuffer (borrowed)
 
         VkDescriptorSetLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-        layoutInfo.bindingCount = 17;
+        layoutInfo.bindingCount = 18;
         layoutInfo.pBindings = bindings;
         VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &layoutInfo, nullptr, &m_SetLayout));
 
@@ -187,7 +189,7 @@ namespace renderer {
 
         // --- One shared descriptor pool for both sets ---
         VkDescriptorPoolSize poolSizes[3]{};
-        poolSizes[0] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 14 + 2 };      // Main set's 14 SSBOs (incl. the 2 borrowed ones) + BuildArgs set's 2 SSBOs.
+        poolSizes[0] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 15 + 2 };      // Main set's 15 SSBOs (incl. the 3 borrowed ones) + BuildArgs set's 2 SSBOs.
         poolSizes[1] = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2 };
         poolSizes[2] = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1 };
 
@@ -226,6 +228,7 @@ namespace renderer {
         VkDescriptorBufferInfo lateIndirectOpaqueInfo{ m_LateIndirectCommandOpaqueBuffer.Handle(), 0, m_LateIndirectCommandOpaqueBuffer.Size() };
         VkDescriptorBufferInfo lateDrawCountOpaqueInfo{ m_LateDrawCountOpaqueBuffer.Handle(), 0, m_LateDrawCountOpaqueBuffer.Size() };
         VkDescriptorBufferInfo softwareClusterListOpaqueInfo{ m_SoftwareClusterListOpaqueBuffer.Handle(), 0, m_SoftwareClusterListOpaqueBuffer.Size() };
+        VkDescriptorBufferInfo entityTransformInfo{ m_EntityTransformBuffer, 0, VK_WHOLE_SIZE };
 
         VkDescriptorImageInfo hzbImageInfo{};
         hzbImageInfo.sampler = m_HZBSampler;
@@ -234,7 +237,7 @@ namespace renderer {
         // an attachment or a sampled-only resource) -- see HZBPass.h's class comment.
         hzbImageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
-        VkWriteDescriptorSet writes[17]{};
+        VkWriteDescriptorSet writes[18]{};
         writes[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_DescriptorSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &clusterInfo, nullptr };
         writes[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_DescriptorSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &viewParamsInfo, nullptr };
         writes[2] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_DescriptorSet, 2, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &hzbParamsInfo, nullptr };
@@ -252,7 +255,8 @@ namespace renderer {
         writes[14] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_DescriptorSet, 14, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &lateIndirectOpaqueInfo, nullptr };
         writes[15] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_DescriptorSet, 15, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &lateDrawCountOpaqueInfo, nullptr };
         writes[16] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_DescriptorSet, 16, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &softwareClusterListOpaqueInfo, nullptr };
-        vkUpdateDescriptorSets(m_Device, 17, writes, 0, nullptr);
+        writes[17] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_DescriptorSet, 17, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &entityTransformInfo, nullptr };
+        vkUpdateDescriptorSets(m_Device, 18, writes, 0, nullptr);
 
         // --- BuildDispatchIndirectArgs set descriptor writes -- binding 0 aliases the pending
         // list buffer, reading only its leading count word (see BuildDispatchIndirectArgs.comp's

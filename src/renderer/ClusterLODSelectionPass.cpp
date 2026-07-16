@@ -31,7 +31,7 @@ namespace renderer {
     } // namespace
 
     void ClusterLODSelectionPass::Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
-        VkBuffer pageTableBuffer, uint32_t leafCount,
+        VkBuffer pageTableBuffer, VkBuffer entityTransformBuffer, uint32_t leafCount,
         const std::vector<geometry::ClusterIndexEntry>& indexEntries,
         const std::vector<geometry::DAGNodeEntry>& dagEntries) {
         Shutdown();
@@ -74,6 +74,7 @@ namespace renderer {
             node.clusterError = dagNode.clusterError;
             node.parentError = dagNode.parentError;
             node.maxWPOAmplitude = entry.maxWPOAmplitude;
+            node.entityID = entry.entityID;
 
             LODNodeMetadata& lodNode = lodNodes[i];
             lodNode.boundsMin = boundsMin;
@@ -166,7 +167,7 @@ namespace renderer {
         // Descriptor pool, shared by all 4 sets.
         // =====================================================================================
         VkDescriptorPoolSize poolSizes[2]{};
-        poolSizes[0] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4 + 5 + 6 + 2 }; // ScreenError + Fallback + Compact + BuildArgs SSBOs.
+        poolSizes[0] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 5 + 5 + 6 + 2 }; // ScreenError + Fallback + Compact + BuildArgs SSBOs (ScreenError gained an EntityTransformBuffer binding for its rotated-sphereCenter LOD estimate).
         poolSizes[1] = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 };            // DAGViewParamsUBO.
 
         VkDescriptorPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
@@ -179,15 +180,16 @@ namespace renderer {
         // Set 1 / Pipeline 1: ClusterDAGScreenError.comp -- bindings 0..4.
         // =====================================================================================
         {
-            VkDescriptorSetLayoutBinding bindings[5]{};
+            VkDescriptorSetLayoutBinding bindings[6]{};
             bindings[0] = { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // DAGNodesSSBO
             bindings[1] = { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // DAGDecisionSSBO
             bindings[2] = { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // DAGLocalErrorSSBO
             bindings[3] = { 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // DAGParentErrorSSBO
             bindings[4] = { 4, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // DAGViewParamsUBO
+            bindings[5] = { 5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // EntityTransformBuffer
 
             VkDescriptorSetLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-            layoutInfo.bindingCount = 5;
+            layoutInfo.bindingCount = 6;
             layoutInfo.pBindings = bindings;
             VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &layoutInfo, nullptr, &m_ScreenErrorSetLayout));
 
@@ -202,14 +204,16 @@ namespace renderer {
             VkDescriptorBufferInfo localErrorInfo{ m_DAGLocalErrorBuffer.Handle(), 0, m_DAGLocalErrorBuffer.Size() };
             VkDescriptorBufferInfo parentErrorInfo{ m_DAGParentErrorBuffer.Handle(), 0, m_DAGParentErrorBuffer.Size() };
             VkDescriptorBufferInfo viewParamsInfo{ m_ViewParamsBuffer.Handle(), 0, m_ViewParamsBuffer.Size() };
+            VkDescriptorBufferInfo entityTransformInfo{ entityTransformBuffer, 0, VK_WHOLE_SIZE };
 
-            VkWriteDescriptorSet writes[5]{};
+            VkWriteDescriptorSet writes[6]{};
             writes[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ScreenErrorDescriptorSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &dagNodesInfo, nullptr };
             writes[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ScreenErrorDescriptorSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &decisionInfo, nullptr };
             writes[2] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ScreenErrorDescriptorSet, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &localErrorInfo, nullptr };
             writes[3] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ScreenErrorDescriptorSet, 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &parentErrorInfo, nullptr };
             writes[4] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ScreenErrorDescriptorSet, 4, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &viewParamsInfo, nullptr };
-            vkUpdateDescriptorSets(m_Device, 5, writes, 0, nullptr);
+            writes[5] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ScreenErrorDescriptorSet, 5, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &entityTransformInfo, nullptr };
+            vkUpdateDescriptorSets(m_Device, 6, writes, 0, nullptr);
 
             VkPipelineLayoutCreateInfo pipelineLayoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
             pipelineLayoutInfo.setLayoutCount = 1;
