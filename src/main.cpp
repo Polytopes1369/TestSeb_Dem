@@ -29,6 +29,11 @@ struct DebugState {
     // renderer::ClusterRenderPipeline::SetDebugSSRTEnabled -- gates the Screen Space Probe GI
     // trace/temporal/gather trio ([12b] in RecordFrame) so its cost/contribution can be A/B'd.
     bool ssrtEnabled = true;
+    // renderer::ClusterRenderPipeline::SetDebugWorldProbesEnabled -- gates the World Probe grid
+    // update ([12c] in RecordFrame). Unlike radiosityEnabled/ssrtEnabled above, this system has no
+    // live consumer yet (see that setter's own comment), so it defaults to true here only to keep
+    // it exercisable in Debug -- Release hardcodes it off regardless of this default.
+    bool worldProbesEnabled = true;
 };
 static DebugState g_DebugState;
 
@@ -104,6 +109,14 @@ static void KeyCallback(GLFWwindow* window, int key, int scancode, int action, i
     case GLFW_KEY_F:
         g_DebugState.ssrtEnabled = !g_DebugState.ssrtEnabled;
         LOG_INFO(std::format("[Debug] Screen Space Probe GI (SSRT): {}", g_DebugState.ssrtEnabled ? "ON" : "OFF"));
+        break;
+    case GLFW_KEY_H:
+        // Toggles WorldProbeGridPass::RecordUpdate -- see ClusterRenderPipeline::
+        // SetDebugWorldProbesEnabled's own comment: unlike 'G'/'F' above, this pass has no live
+        // consumer in the render path yet (computed for inspection only), so this key exists to
+        // A/B its GPU cost while it's being built out, not to compare a real visual contribution.
+        g_DebugState.worldProbesEnabled = !g_DebugState.worldProbesEnabled;
+        LOG_INFO(std::format("[Debug] World Probe Grid (not yet sampled by shading): {}", g_DebugState.worldProbesEnabled ? "ON" : "OFF"));
         break;
     default:
         break;
@@ -243,6 +256,7 @@ int main() {
         clusterPipeline.SetDebugTraceMode(g_DebugState.traceMode);
         clusterPipeline.SetDebugRadiosityEnabled(g_DebugState.radiosityEnabled);
         clusterPipeline.SetDebugSSRTEnabled(g_DebugState.ssrtEnabled);
+        clusterPipeline.SetDebugWorldProbesEnabled(g_DebugState.worldProbesEnabled);
 #endif
 
         // --- DEBUG: dump the camera position and the resulting view/proj matrices on the

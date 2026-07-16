@@ -194,6 +194,19 @@ namespace renderer {
         // this frame, so its cost/contribution is directly A/B-able the same way -- see main.cpp's
         // 'F' key. Defaults to true (Release has no toggle and always runs the trio).
         void SetDebugSSRTEnabled(bool enabled) { m_DebugSSRTEnabled = enabled; }
+
+        // Gates RecordFrame()'s [12c] m_WorldProbes.RecordUpdate() dispatch -- see main.cpp's 'H'
+        // key. UNLIKE SetDebugRadiosityEnabled/SetDebugSSRTEnabled above, this is NOT a real
+        // production GI term yet: world_probe_sampling.glsl's SampleWorldProbeGrid() is referenced
+        // only by the dead ScreenTracePass/GICompositePass (never instantiated by this class, see
+        // m_WorldProbes' own member comment) -- so the grid is fully computed every frame but
+        // sampled by nothing in the live pipeline. Release therefore hardcodes this OFF
+        // (RecordFrame() skips the dispatch entirely, unlike radiosity/SSRT's Release-always-on),
+        // so a real GPU cost is not paid for zero visual effect. Debug defaults to true so the pass
+        // stays exercised/inspectable while a real consumer is built. Flip Release's hardcoded
+        // default to true once a live consumer samples this grid (e.g. dynamic or off-screen
+        // objects with no Surface Cache Card of their own).
+        void SetDebugWorldProbesEnabled(bool enabled) { m_DebugWorldProbesEnabled = enabled; }
 #endif
 
     private:
@@ -282,11 +295,19 @@ namespace renderer {
 
         // World Probe grid (Lumen "Translucency Volume" / global illumination volume): a low-
         // resolution, camera-centered 3D grid of ambient irradiance probes, fully rebuilt every
-        // frame from m_SurfaceCache's radiance atlas -- what dynamic/off-screen objects (particle
-        // systems, animated characters, anything m_ScreenProbeGI's screen-space probes cannot cover
-        // because they have no on-screen presence of their own) sample for indirect light, via
-        // world_probe_sampling.glsl's SampleWorldProbeGrid(). See WorldProbeGridPass's own class
-        // comment for why this is a SEPARATE system from m_ScreenProbeGI, not a duplicate of it.
+        // frame from m_SurfaceCache's radiance atlas -- INTENDED as what dynamic/off-screen objects
+        // (particle systems, animated characters, anything m_ScreenProbeGI's screen-space probes
+        // cannot cover because they have no on-screen presence of their own) would sample for
+        // indirect light, via world_probe_sampling.glsl's SampleWorldProbeGrid(). See
+        // WorldProbeGridPass's own class comment for why this is a SEPARATE system from
+        // m_ScreenProbeGI, not a duplicate of it.
+        //
+        // CURRENT STATUS (as of the 2026-07-16 UE5.8-parity audit): SampleWorldProbeGrid() has no
+        // live caller -- it is referenced only by the dead ScreenTracePass/GICompositePass, neither
+        // ever instantiated by this class. The grid is computed correctly every frame but consumed
+        // by nothing yet. See SetDebugWorldProbesEnabled()'s own comment: Release does not pay for
+        // this dispatch until a real consumer exists (planned once entity movement/dynamic objects
+        // are supported).
         WorldProbeGridPass m_WorldProbes;
 
         // Final spatial denoiser (À-Trous wavelet, edge-guided by m_Resolve's own G-buffer normal/
@@ -311,6 +332,9 @@ namespace renderer {
         uint32_t m_DebugTraceMode = 0;
         bool m_DebugRadiosityEnabled = true;
         bool m_DebugSSRTEnabled = true;
+        // See SetDebugWorldProbesEnabled()'s own comment for why this defaults to true in Debug
+        // while Release hardcodes the equivalent local to false (opposite of the two toggles above).
+        bool m_DebugWorldProbesEnabled = true;
 #endif
 
 #ifndef NDEBUG

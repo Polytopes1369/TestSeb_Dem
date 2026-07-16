@@ -4,9 +4,18 @@
 // from the Surface Cache (renderer::SurfaceCachePass's radiance atlas, sampled via the same
 // mesh_sdf_trace.glsl + surface_cache_sampling.glsl trace-and-sample primitive
 // renderer::SurfaceCacheGIInjectPass already uses -- see WorldProbeInject.comp's own class
-// comment). This is what dynamic or unmapped objects -- particle systems, animated characters,
-// anything without a Surface Cache Card of its own -- sample for indirect light, via
-// world_probe_sampling.glsl's SampleWorldProbeGrid(), instead of tracing their own rays.
+// comment). This is INTENDED as what dynamic or unmapped objects -- particle systems, animated
+// characters, anything without a Surface Cache Card of its own -- would sample for indirect
+// light, via world_probe_sampling.glsl's SampleWorldProbeGrid(), instead of tracing their own rays.
+//
+// --- Current status (2026-07-16 UE5.8-parity audit) ---
+// SampleWorldProbeGrid() has no live caller today -- it is referenced only by the dead
+// ScreenTracePass/GICompositePass (both exist as compilable files but neither is instantiated by
+// renderer::ClusterRenderPipeline). This pass's own RecordUpdate() runs correctly and writes real
+// data into GetGridView() every frame it's called, but nothing downstream reads that view yet.
+// renderer::ClusterRenderPipeline::SetDebugWorldProbesEnabled() gates the RecordUpdate() call
+// itself for exactly this reason (Release skips it rather than paying for an unconsumed result) --
+// see that method's own comment for the plan to re-enable it once a real consumer is wired in.
 //
 // --- Why a full rebuild every frame, not incremental/toroidal streaming ---
 // renderer::GlobalSDFPass's clipmap levels stream incrementally (only newly-revealed slabs are

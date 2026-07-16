@@ -60,11 +60,11 @@ namespace renderer::debug {
         // top-right FPS counter into this frame's glyph instance list (CPU-side only -- no GPU
         // work happens here). `bytesPerSecond` is displayed in KB/s. `fps` and `viewportWidthPixels`
         // (the render extent's width, needed to right-align the FPS text) drive the top-right
-        // counter; `radiosityEnabled`/`ssrtEnabled`/`traceMode` (0 = SWRT, 1 = HWRT) mirror
-        // ClusterRenderPipeline's own current debug-toggle state exactly.
+        // counter; `radiosityEnabled`/`ssrtEnabled`/`traceMode` (0 = SWRT, 1 = HWRT)/
+        // `worldProbesEnabled` mirror ClusterRenderPipeline's own current debug-toggle state exactly.
         void BuildFrameText(float gpuMemUsedMB, uint32_t pendingPageLoads, float bytesPerSecond,
             uint32_t hwTriangleCount, uint32_t swTriangleCount, float fps, float viewportWidthPixels,
-            bool radiosityEnabled, bool ssrtEnabled, uint32_t traceMode);
+            bool radiosityEnabled, bool ssrtEnabled, uint32_t traceMode, bool worldProbesEnabled);
 
         void RecordDraw(VkCommandBuffer cmd, VkImage outputColorImage, VkImageView outputColorView, VkExtent2D extent);
 
