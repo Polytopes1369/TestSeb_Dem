@@ -142,6 +142,25 @@ namespace maths {
             result.m[14] = -(zFar * zNear) / (zFar - zNear);
             return result;
         }
+
+        // Symmetric orthographic projection matching PerspectiveVulkan's own convention: Y flipped
+        // (m[5] negated) to account for Vulkan's Y-down NDC, and depth mapped to Vulkan's [0,1]
+        // range (viewZ = -zNear -> ndc.z = 0, viewZ = -zFar -> ndc.z = 1), for a right-handed view
+        // space whose forward is -Z (i.e. intended to be composed with mat4::LookAt exactly like
+        // PerspectiveVulkan is). Used by the surface-cache capture pass (renderer::SurfaceCachePass)
+        // to project a Card's orthographic box-face view -- see that class for the eye/up/extent
+        // convention this is composed with.
+        static constexpr mat4 OrthoVulkan(float halfWidth, float halfHeight, float zNear, float zFar) {
+            mat4 result;
+            for (int i = 0; i < 16; ++i) result.m[i] = 0.0f;
+
+            result.m[0] = 1.0f / halfWidth;
+            result.m[5] = -1.0f / halfHeight;
+            result.m[10] = -1.0f / (zFar - zNear);
+            result.m[14] = -zNear / (zFar - zNear);
+            result.m[15] = 1.0f;
+            return result;
+        }
     };
 
     struct quat {

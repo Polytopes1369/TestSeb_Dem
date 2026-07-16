@@ -1,0 +1,74 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+
+// Global SDF clipmap compositing (see renderer::GlobalSDFPass): one invocation per destination
+// clipmap texel within the dispatched region. renderer::GlobalSDFPass::RecordSlab issues one
+// dispatch per (wrap-contiguous piece, mode) pair:
+//   mode == 0 (clear): writes farValue to every dispatched texel -- run once per newly-revealed
+//     region before any object is composited into it, since toroidal wraparound means those
+//     texels currently hold STALE distance data from whatever world region used to occupy that
+//     memory (see GlobalSDFPass.h's class comment).
+//   mode == 1 (composite): for each dispatched texel, reconstructs its WORLD position (from
+//     dispatchWorldMin + the invocation's offset -- CPU-resolved, no wrap arithmetic needed here
+//     at all, see GlobalSDFPass.cpp's SplitWrappedRange), skips it entirely if that world position
+//     falls outside the currently-bound object's own Mesh SDF volume (never fabricate a distance
+//     for a region the object's SDF was never sampled over), otherwise trilinearly samples the
+//     object's SDF (g_ObjectSDF, a plain R32_SFLOAT 3D texture decoded CPU-side from that object's
+//     compressed geometry::MeshSDF -- see GlobalSDFPass.cpp's Init()) and MIN-composites it against
+//     whatever is already in the clipmap texel -- the standard SDF union operator. Dispatched once
+//     per (piece, entity) pair with a full memory barrier between every dispatch, so no two
+//     invocations ever race on the same texel regardless of how many objects overlap one region.
+
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+
+layout(r32f, set = 0, binding = 0) uniform image3D g_ClipmapLevel;
+layout(set = 1, binding = 0) uniform sampler3D g_ObjectSDF;
+
+layout(push_constant) uniform GlobalSDFCompositePC {
+    int dispatchMinTexelX; int dispatchMinTexelY; int dispatchMinTexelZ; int mode;
+    float dispatchWorldMinX; float dispatchWorldMinY; float dispatchWorldMinZ; float clipmapVoxelSize;
+    float objectVolumeMinX; float objectVolumeMinY; float objectVolumeMinZ; float objectVoxelSize;
+    int objectResolution; float farValue; int clipmapResolution; int _pad0;
+} pc;
+
+void main() {
+    ivec3 dispatchMinTexel = ivec3(pc.dispatchMinTexelX, pc.dispatchMinTexelY, pc.dispatchMinTexelZ);
+    ivec3 destTexel = dispatchMinTexel + ivec3(gl_GlobalInvocationID);
+
+    // Defensive bounds check: a piece's texel count need not be a multiple of the 4x4x4
+    // workgroup size, so the last workgroup along an axis can dispatch a few invocations past the
+    // piece's actual extent. Vulkan already defines an out-of-range imageStore/imageLoad as a
+    // safe no-op/undefined-but-harmless read for a storage image, but this check keeps the
+    // behavior explicit rather than relying on that fallback.
+    if (any(greaterThanEqual(destTexel, ivec3(pc.clipmapResolution))) || any(lessThan(destTexel, ivec3(0)))) {
+        return;
+    }
+
+    if (pc.mode == 0) {
+        imageStore(g_ClipmapLevel, destTexel, vec4(pc.farValue, 0.0, 0.0, 0.0));
+        return;
+    }
+
+    vec3 dispatchWorldMin = vec3(pc.dispatchWorldMinX, pc.dispatchWorldMinY, pc.dispatchWorldMinZ);
+    vec3 worldPos = dispatchWorldMin + vec3(gl_GlobalInvocationID) * pc.clipmapVoxelSize;
+
+    vec3 objectVolumeMin = vec3(pc.objectVolumeMinX, pc.objectVolumeMinY, pc.objectVolumeMinZ);
+    vec3 objectExtent = vec3(float(pc.objectResolution) * pc.objectVoxelSize);
+    vec3 localPos = worldPos - objectVolumeMin;
+
+    // Outside this object's own SDF volume: leave the texel exactly as the clear pass (or an
+    // earlier object's composite dispatch, this same slab update) already left it.
+    if (any(lessThan(localPos, vec3(0.0))) || any(greaterThanEqual(localPos, objectExtent))) {
+        return;
+    }
+
+    // Matches geometry::SampleMeshSDF's voxel-center convention exactly: voxel index i's data
+    // sample sits at continuous local position (i + 0.5) * voxelSize, which normalized-coordinate
+    // hardware trilinear filtering reproduces at uvw = localPos / (voxelSize * resolution) -- see
+    // GlobalSDFPass.cpp's own derivation notes for why no extra +/-0.5 term belongs here.
+    vec3 uvw = localPos / (pc.objectVoxelSize * float(pc.objectResolution));
+    float objectDistance = texture(g_ObjectSDF, uvw).r;
+
+    float existing = imageLoad(g_ClipmapLevel, destTexel).r;
+    imageStore(g_ClipmapLevel, destTexel, vec4(min(existing, objectDistance), 0.0, 0.0, 0.0));
+}
