@@ -13,6 +13,7 @@
 // world_probe_sampling.glsl's SampleWorldProbeGrid at this pixel's own world position.
 
 #include "include/math_utils.glsl"
+#include "include/octahedral.glsl"
 
 #define WORLD_PROBE_GRID_SET 0
 #define WORLD_PROBE_GRID_BINDING 5
@@ -41,31 +42,6 @@ layout(std140, set = 0, binding = 4) uniform ScreenTraceViewParamsUBO {
 const uint kScreenTraceSteps = 24u;
 const float kScreenTraceMaxDistance = 3.0;
 const float kDepthThicknessNDC = 0.01;
-
-// Inverse of ClusterResolve.comp's own OctEncode.
-vec3 OctDecode(vec2 e) {
-    e = e * 2.0 - 1.0;
-    vec3 n = vec3(e.xy, 1.0 - abs(e.x) - abs(e.y));
-    float t = clamp(-n.z, 0.0, 1.0);
-    n.xy += mix(vec2(t, t), vec2(-t, -t), greaterThanEqual(n.xy, vec2(0.0)));
-    return normalize(n);
-}
-
-float RadicalInverse(uint index, uint base) {
-    float result = 0.0;
-    float f = 1.0 / float(base);
-    uint i = index;
-    while (i > 0u) {
-        result += f * float(i % base);
-        i /= base;
-        f /= float(base);
-    }
-    return result;
-}
-
-vec2 Halton23(uint index) {
-    return vec2(RadicalInverse(index, 2u), RadicalInverse(index, 3u));
-}
 
 // Malley's method cosine-weighted hemisphere sample -- identical shape to
 // SurfaceCacheGIInject.comp's own CosineWeightedHemisphereSample (see that shader's own comment

@@ -126,4 +126,24 @@ vec4 Hash4(vec2 p)
     p4 += dot(p4, p4.wzxy + 33.33);
     return fract((p4.xxyz + p4.yzzw) * p4.zywx);
 }
+
+// Van der Corput radical inverse in the given prime base -- the low-discrepancy sequence
+// building block for Halton23 below.
+float RadicalInverse(uint index, uint base) {
+    float result = 0.0;
+    float f = 1.0 / float(base);
+    uint i = index;
+    while (i > 0u) {
+        result += f * float(i % base);
+        i /= base;
+        f /= float(base);
+    }
+    return result;
+}
+
+// 2D Halton sequence (bases 2, 3) -- a low-discrepancy alternative to per-pixel random jitter,
+// used to decorrelate successive frames' ray/sample directions without clustering.
+vec2 Halton23(uint index) {
+    return vec2(RadicalInverse(index, 2u), RadicalInverse(index, 3u));
+}
 #endif

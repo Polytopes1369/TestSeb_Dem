@@ -28,6 +28,7 @@
 // same-frame injection behavior production Lumen-style radiosity passes rely on, not a bug.
 
 #include "include/math_utils.glsl"
+#include "include/octahedral.glsl"
 #include "include/mesh_sdf_trace.glsl"        // set 1
 #include "include/surface_cache_sampling.glsl" // set 2
 
@@ -45,11 +46,9 @@ layout(set = 0, binding = 5) uniform accelerationStructureEXT g_TLAS;
 // GetIndexBuffer(), renderer::SurfaceCacheRayTracingPass's own draw-range SSBO) so the HWRT trace
 // path below (TraceHWRT) computes a geometric hit normal exactly the same way the full ray
 // tracing pipeline's closest-hit shader does.
-struct FallbackVertexGpu { float posX, posY, posZ; float normX, normY, normZ; float u, v; };
-layout(std430, set = 0, binding = 6) readonly buffer FallbackVertexBuffer { FallbackVertexGpu g_Vertices[]; };
-layout(std430, set = 0, binding = 7) readonly buffer FallbackIndexBuffer { uint g_Indices[]; };
-struct EntityDrawRangeGpu { int vertexOffset; uint firstIndex; uint indexCount; uint _pad; };
-layout(std430, set = 0, binding = 8) readonly buffer EntityDrawRangeBuffer { EntityDrawRangeGpu g_DrawRanges[]; };
+#define FALLBACK_GEOMETRY_SET 0
+#define FALLBACK_GEOMETRY_BASE_BINDING 6
+#include "include/fallback_geometry.glsl"
 
 layout(push_constant) uniform GIInjectPushConstants {
     uvec2 atlasOffset; // This dispatch's card's atlasOffset (renderer::SurfaceCacheGIInjectPass::RecordInject()).
@@ -59,31 +58,6 @@ layout(push_constant) uniform GIInjectPushConstants {
     uint frameIndex;   // Halton sequence temporal offset, advanced by the caller across calls for temporal variety.
     uint traceMode;    // 0 = SWRT (TraceMeshSDFScene), 1 = HWRT (TraceHWRT, inline ray query).
 } pc;
-
-// Inverse of SurfaceCacheCapture.frag's OctEncode -- the standard octahedral decode.
-vec3 OctDecode(vec2 e) {
-    e = e * 2.0 - 1.0;
-    vec3 n = vec3(e.xy, 1.0 - abs(e.x) - abs(e.y));
-    float t = clamp(-n.z, 0.0, 1.0);
-    n.xy += mix(vec2(t, t), vec2(-t, -t), greaterThanEqual(n.xy, vec2(0.0)));
-    return normalize(n);
-}
-
-float RadicalInverse(uint index, uint base) {
-    float result = 0.0;
-    float f = 1.0 / float(base);
-    uint i = index;
-    while (i > 0u) {
-        result += f * float(i % base);
-        i /= base;
-        f /= float(base);
-    }
-    return result;
-}
-
-vec2 Halton23(uint index) {
-    return vec2(RadicalInverse(index, 2u), RadicalInverse(index, 3u));
-}
 
 // Malley's method: a uniform sample on the unit disk, lifted onto the hemisphere by
 // sqrt(1 - r^2), IS a cosine-weighted hemisphere sample -- oriented here by the tangent frame

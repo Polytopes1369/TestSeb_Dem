@@ -15,11 +15,9 @@
 #define PAGE_TABLE_BINDING 0
 #include "include/geometry_page_table.glsl"
 
-// Matches geometry::kMaxClusterVertices/kMaxClusterTriangles (ClusterFormat.h) -- duplicated here
-// rather than #included via cluster_vertex_decode.glsl, same reasoning as ClusterLODCompact.comp's
-// own identical duplication (this shader does not decode any vertex data itself).
-#define CLUSTER_MAX_VERTICES 64u
-#define CLUSTER_MAX_INDICES 384u
+// Limits only (not the full cluster_vertex_decode.glsl, which also pulls in a compressed-pool
+// SSBO binding this shader does not decode any vertex data from).
+#include "include/cluster_limits.glsl"
 
 // Mirrors renderer::TransparentClusterEntry (TransparentForwardPass.h) field-for-field.
 struct TransparentClusterEntry {

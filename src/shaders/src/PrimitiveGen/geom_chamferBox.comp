@@ -24,6 +24,8 @@ layout(local_size_x = 64) in;
 layout(std430, binding = 0) writeonly buffer VertexBuffer { Vertex vertices[]; };
 layout(std430, binding = 1) writeonly buffer IndexBuffer  { uint indices[]; };
 
+#include "include/uv_sphere_topology.glsl"
+
 layout(std140, binding = 2) uniform Params
 {
     float width;
@@ -96,39 +98,7 @@ void main()
     v.position += vec3(worldOffsetX, worldOffsetY, worldOffsetZ);
     vertices[vertexOffset + id] = v;
 
-    // --- Indices: identical topology to geom_sphere.comp (top cap fan, middle quads, bottom
-    // cap fan), since reshaping d into a box only changes vertex positions, not the grid. ---
-    if (id < sideSegs) // top cap fan
-    {
-        uint lon = id;
-        uint tIdx = indexOffset + lon * 3u;
-        indices[tIdx + 0u] = vertexOffset + lon + 2u;
-        indices[tIdx + 1u] = vertexOffset + lon + 1u;
-        indices[tIdx + 2u] = vertexOffset;
-    }
-
-    if (ringCount > 1u && id < (ringCount - 1u) * sideSegs) // middle quads
-    {
-        uint lat = id / sideSegs;
-        uint lon = id % sideSegs;
-        uint current = lon + lat * ringStride + 1u;
-        uint next    = current + ringStride;
-
-        uint tIdx = indexOffset + sideSegs * 3u + (lat * sideSegs + lon) * 6u;
-        indices[tIdx + 0u] = vertexOffset + current;
-        indices[tIdx + 1u] = vertexOffset + current + 1u;
-        indices[tIdx + 2u] = vertexOffset + next + 1u;
-        indices[tIdx + 3u] = vertexOffset + current;
-        indices[tIdx + 4u] = vertexOffset + next + 1u;
-        indices[tIdx + 5u] = vertexOffset + next;
-    }
-
-    if (id < sideSegs) // bottom cap fan
-    {
-        uint lon = id;
-        uint tIdx = indexOffset + sideSegs * 3u + (ringCount - 1u) * sideSegs * 6u + lon * 3u;
-        indices[tIdx + 0u] = vertexOffset + vertCount - 1u;
-        indices[tIdx + 1u] = vertexOffset + vertCount - (lon + 2u) - 1u;
-        indices[tIdx + 2u] = vertexOffset + vertCount - (lon + 1u) - 1u;
-    }
+    // --- Indices: shared UV-sphere grid topology (identical to geom_sphere.comp), since
+    // reshaping d into a box only changes vertex positions, not the grid. ---
+    WriteUVSphereTopologyIndices(indexOffset, vertexOffset, id, sideSegs, ringCount, vertCount);
 }

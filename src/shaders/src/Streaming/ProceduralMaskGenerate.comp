@@ -13,7 +13,7 @@
 // cluster style), without any RNG state or external asset.
 
 #define K_MASK_TEXTURE_SIZE 128u
-#define K_MAX_MASK_TEXTURES 64u
+#include "include/mask_texture_limits.glsl"
 
 layout(r8, set = 0, binding = 0) uniform writeonly image2D g_MaskOutputs[K_MAX_MASK_TEXTURES];
 

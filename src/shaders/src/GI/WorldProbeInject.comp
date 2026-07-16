@@ -32,11 +32,9 @@ layout(set = 0, binding = 1) uniform accelerationStructureEXT g_TLAS;
 // Mirrors SurfaceCacheGIInject.comp's own vertex/index/draw-range bindings exactly (same struct
 // layouts, same underlying buffers) so the HWRT trace path below computes a geometric hit normal
 // exactly the same way that shader's own TraceHWRT does.
-struct FallbackVertexGpu { float posX, posY, posZ; float normX, normY, normZ; float u, v; };
-layout(std430, set = 0, binding = 2) readonly buffer FallbackVertexBuffer { FallbackVertexGpu g_Vertices[]; };
-layout(std430, set = 0, binding = 3) readonly buffer FallbackIndexBuffer { uint g_Indices[]; };
-struct EntityDrawRangeGpu { int vertexOffset; uint firstIndex; uint indexCount; uint _pad; };
-layout(std430, set = 0, binding = 4) readonly buffer EntityDrawRangeBuffer { EntityDrawRangeGpu g_DrawRanges[]; };
+#define FALLBACK_GEOMETRY_SET 0
+#define FALLBACK_GEOMETRY_BASE_BINDING 2
+#include "include/fallback_geometry.glsl"
 
 layout(push_constant) uniform WorldProbeInjectPushConstants {
     vec3 gridOrigin;   // World-space position of this grid's texel (0,0,0) corner (renderer::WorldProbeGridPass::GetGridOriginWorld()).

@@ -35,21 +35,13 @@ layout(rg8, set = 0, binding = 3) uniform readonly image2D g_GBufferRoughnessMet
 
 layout(set = 0, binding = 4) uniform accelerationStructureEXT g_TLAS;
 
-struct FallbackVertexGpu { float posX, posY, posZ; float normX, normY, normZ; float u, v; };
-layout(std430, set = 0, binding = 5) readonly buffer FallbackVertexBuffer { FallbackVertexGpu g_Vertices[]; };
-layout(std430, set = 0, binding = 6) readonly buffer FallbackIndexBuffer { uint g_Indices[]; };
-struct EntityDrawRangeGpu { int vertexOffset; uint firstIndex; uint indexCount; uint _pad; };
-layout(std430, set = 0, binding = 7) readonly buffer EntityDrawRangeBuffer { EntityDrawRangeGpu g_DrawRanges[]; };
+#define FALLBACK_GEOMETRY_SET 0
+#define FALLBACK_GEOMETRY_BASE_BINDING 5
+#include "include/fallback_geometry.glsl"
 
-layout(std140, set = 0, binding = 8) uniform ReflectionViewParamsUBO {
-    mat4 invViewProj;
-    mat4 prevViewProj; // Unused here -- renderer::ReflectionPass::RecordTemporal's own concern.
-    vec3 cameraPositionWorld;
-    float _pad0;
-    vec2 viewportSize;
-    float _pad1;
-    float _pad2;
-} g_ViewParams;
+#define REFLECTION_VIEW_PARAMS_SET 0
+#define REFLECTION_VIEW_PARAMS_BINDING 8
+#include "include/reflection_view_params.glsl"
 
 // rgb = this pixel's own world position, a = validity (1.0 = geometry, 0.0 = background) -- same
 // {xyz, validity} convention as renderer::ScreenProbeGIPass::kWorldPosFormat.

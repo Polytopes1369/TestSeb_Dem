@@ -38,12 +38,9 @@ layout(set = 0, binding = 7) uniform sampler2D g_HistorySHB;
 layout(set = 0, binding = 8) uniform sampler2D g_HistoryWorldPos;
 layout(set = 0, binding = 9) uniform sampler2D g_HistoryNormal;
 
-layout(std140, set = 0, binding = 10) uniform ScreenProbeViewParamsUBO {
-    mat4 invViewProj; // Unused here.
-    mat4 prevViewProj;
-    vec2 viewportSize;
-    vec2 probeGridSize;
-} g_ViewParams;
+#define SCREEN_PROBE_VIEW_PARAMS_SET 0
+#define SCREEN_PROBE_VIEW_PARAMS_BINDING 10
+#include "include/screen_probe_view_params.glsl"
 
 layout(push_constant) uniform TemporalPushConstants {
     uint probeCountX;

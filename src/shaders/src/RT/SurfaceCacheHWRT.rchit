@@ -11,42 +11,15 @@
 #include "include/mesh_sdf_trace.glsl"        // set 1: EntityInfo (firstCardIndex/cardCount) -- only its card-range fields are used here, its SDF sampler array is not.
 #include "include/surface_cache_sampling.glsl" // set 2: card table + radiance atlas.
 
+#define FALLBACK_GEOMETRY_SET 3
+#define FALLBACK_GEOMETRY_BASE_BINDING 0
+#include "include/fallback_geometry.glsl"
+
 struct RayResult {
     vec3 color;
     float hit;
 };
 layout(location = 0) rayPayloadInEXT RayResult g_Payload;
-
-// Combined Fallback Mesh vertex/index buffers -- the SAME buffers every BLAS in this TLAS was
-// built directly against (renderer::SurfaceCachePass::GetVertexBuffer()/GetIndexBuffer(), see
-// renderer::AccelerationStructure::BuildBLAS's own comment on why no separate geometry upload
-// exists for ray tracing). std430-exact mirror of geometry::FallbackVertex (32 bytes: 3+3+2
-// floats, no padding -- see ClusterFormat.h's own static_assert) using flat scalars for the same
-// reason surface_cache_sampling.glsl's card struct does (avoid std430's vec3-alignment padding
-// diverging from the tightly-packed C++ layout).
-struct FallbackVertexGpu {
-    float posX, posY, posZ;
-    float normX, normY, normZ;
-    float u, v;
-};
-layout(std430, set = 3, binding = 0) readonly buffer FallbackVertexBuffer {
-    FallbackVertexGpu g_Vertices[];
-};
-layout(std430, set = 3, binding = 1) readonly buffer FallbackIndexBuffer {
-    uint g_Indices[];
-};
-// std430-exact mirror of renderer::SurfaceCachePass::EntityDrawRange (vertexOffset/firstIndex/
-// indexCount, 12 bytes in C++ but padded to 16 here for std430's own array-stride rounding --
-// the C++-side upload zero-fills the pad field, see SurfaceCacheRayTracingPass::Init()).
-struct EntityDrawRangeGpu {
-    int vertexOffset;
-    uint firstIndex;
-    uint indexCount;
-    uint _pad;
-};
-layout(std430, set = 3, binding = 2) readonly buffer EntityDrawRangeBuffer {
-    EntityDrawRangeGpu g_DrawRanges[];
-};
 
 vec3 FetchPosition(uint globalVertexIndex) {
     FallbackVertexGpu v = g_Vertices[globalVertexIndex];

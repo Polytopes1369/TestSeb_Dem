@@ -16,11 +16,9 @@
 #define PAGE_TABLE_BINDING 2
 #include "include/geometry_page_table.glsl"
 
-// Matches geometry::kMaxClusterVertices / kMaxClusterTriangles (ClusterFormat.h) -- duplicated
-// here (rather than #included via cluster_vertex_decode.glsl) so this shader does not need to
+// Limits only (rather than the full cluster_vertex_decode.glsl) so this shader does not need to
 // declare and bind an unused CompressedClusterPoolSSBO purely to reach these two constants.
-#define CLUSTER_MAX_VERTICES 64u
-#define CLUSTER_MAX_INDICES 384u
+#include "include/cluster_limits.glsl"
 
 #define DAG_DECISION_DRAW      0u
 #define DAG_DECISION_SUBDIVIDE 1u

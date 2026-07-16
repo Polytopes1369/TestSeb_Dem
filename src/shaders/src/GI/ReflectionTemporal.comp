@@ -39,15 +39,9 @@ layout(set = 0, binding = 4) uniform sampler2D g_HistoryWorldPos;
 layout(set = 0, binding = 5) uniform sampler2D g_HistoryNormal;
 layout(rg8, set = 0, binding = 6) uniform readonly image2D g_GBufferRoughnessMetallic; // .r = roughness.
 
-layout(std140, set = 0, binding = 7) uniform ReflectionViewParamsUBO {
-    mat4 invViewProj; // Unused here.
-    mat4 prevViewProj;
-    vec3 cameraPositionWorld; // Unused here.
-    float _pad0;
-    vec2 viewportSize;
-    float _pad1;
-    float _pad2;
-} g_ViewParams;
+#define REFLECTION_VIEW_PARAMS_SET 0
+#define REFLECTION_VIEW_PARAMS_BINDING 7
+#include "include/reflection_view_params.glsl"
 
 void main() {
     ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);

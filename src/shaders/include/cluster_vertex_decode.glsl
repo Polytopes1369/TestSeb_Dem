@@ -14,8 +14,9 @@
 // express directly -- every field is instead reconstructed with explicit byte-offset loads, which
 // is correct regardless of the field's alignment relative to a 4-byte SSBO word.
 
-// Matches geometry::kMaxClusterVertices (ClusterFormat.h) and geometry::kPageSizeBytes.
-#define CLUSTER_MAX_VERTICES 64u
+#include "include/cluster_limits.glsl"
+
+// Matches geometry::kPageSizeBytes.
 #define CLUSTER_PAGE_SIZE_BYTES 4096u
 
 // Byte layout of geometry::ClusterData, in field declaration order (positions, then normals,
@@ -35,8 +36,6 @@
 #define CLUSTER_POSITION_BASE_BYTES  0u
 #define CLUSTER_NORMAL_BASE_BYTES    (CLUSTER_POSITION_BASE_BYTES + CLUSTER_POSITION_BLOCK_BYTES)
 #define CLUSTER_UV_BASE_BYTES        (CLUSTER_NORMAL_BASE_BYTES + CLUSTER_NORMAL_BLOCK_BYTES)
-#define CLUSTER_MAX_TRIANGLES 128u
-#define CLUSTER_MAX_INDICES (CLUSTER_MAX_TRIANGLES * 3u)
 #define CLUSTER_INDICES_BASE_BYTES (CLUSTER_UV_BASE_BYTES + CLUSTER_MAX_VERTICES * 4u)
 
 layout(std430, set = COMPRESSED_POOL_SET, binding = COMPRESSED_POOL_BINDING) readonly buffer CompressedClusterPoolSSBO {

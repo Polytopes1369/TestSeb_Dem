@@ -33,6 +33,7 @@
 
 #include "include/procedural_material.glsl"
 #include "include/math_utils.glsl"
+#include "include/octahedral.glsl"
 
 #define SHADOW_ATLAS_SET 0
 #define SHADOW_ATLAS_BINDING 1
@@ -82,18 +83,6 @@ layout(location = 2) out vec4 outEmissive;
 layout(location = 3) out vec4 outDirectLighting;
 layout(location = 4) out vec4 outRadiance;
 layout(location = 5) out vec4 outWorldPos;
-
-// Octahedral encoding of a unit vector into [0,1]^2 -- the same compact normal encoding this
-// codebase already uses for cluster vertex normals (geometry::ClusterVertexNormal /
-// GeometryEncoding.h), applied here to the captured world-space surface normal.
-vec2 OctEncode(vec3 n) {
-    vec2 p = n.xy * (1.0 / (abs(n.x) + abs(n.y) + abs(n.z)));
-    if (n.z < 0.0) {
-        vec2 signP = vec2(p.x >= 0.0 ? 1.0 : -1.0, p.y >= 0.0 ? 1.0 : -1.0);
-        p = (1.0 - abs(p.yx)) * signP;
-    }
-    return p * 0.5 + 0.5;
-}
 
 // Direct lighting for one captured texel: the sun (shadowed via SampleSunShadowVSM,
 // shadow_sun_sampling.glsl) plus every active point light (Phase 3 onward: ALSO shadowed, via

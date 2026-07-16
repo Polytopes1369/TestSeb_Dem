@@ -8,7 +8,7 @@
 // edge-feathering blend). The includer must #define MASK_ARRAY_SET / MASK_ARRAY_BINDING before
 // including this header, matching whichever binding slot that shader's own descriptor set
 // reserves for it (matches renderer::ProceduralMaskGenerator::kMaxMaskTextures).
-#define K_MAX_MASK_TEXTURES 64u
+#include "include/mask_texture_limits.glsl"
 
 layout(set = MASK_ARRAY_SET, binding = MASK_ARRAY_BINDING) uniform sampler2D g_MaskTextures[K_MAX_MASK_TEXTURES];
 
