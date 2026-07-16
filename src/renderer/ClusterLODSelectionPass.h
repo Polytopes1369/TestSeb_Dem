@@ -107,10 +107,15 @@ namespace renderer {
         // `leafCount` sizes the candidate output buffer (a valid cut's simultaneous draw count
         // never exceeds the total leaf count). `pageTableBuffer` is
         // renderer::GpuGeometryPagePool::GetPageTableBuffer().
+        // `entityDataBuffer` (renderer::VulkanContext's own, same handle ClusterResolvePass::Init
+        // receives) is bound read-only into ClusterLODCompact.comp's descriptor set (binding 6) so
+        // it can exclude core::EntityFlags::IsTransparent entities from this candidate list --
+        // see that shader's own comment.
         void Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
             VkBuffer pageTableBuffer, uint32_t leafCount,
             const std::vector<geometry::ClusterIndexEntry>& indexEntries,
-            const std::vector<geometry::DAGNodeEntry>& dagEntries);
+            const std::vector<geometry::DAGNodeEntry>& dagEntries,
+            VkBuffer entityDataBuffer);
 
         void Shutdown();
 

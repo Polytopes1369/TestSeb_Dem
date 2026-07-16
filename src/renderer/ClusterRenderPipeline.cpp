@@ -151,7 +151,7 @@ bool ClusterRenderPipeline::Init(
   m_LODSelection.Init(createInfo.device, createInfo.allocator,
                       createInfo.commandPool, createInfo.queue,
                       m_PagePool.GetPageTableBuffer(), leafCount, indexEntries,
-                      dagEntries);
+                      dagEntries, createInfo.entityDataBuffer);
 
   // Wires the async streaming stack for real -- see GeometryStreamingCoordinator's own class
   // comment. Needs only the cache file path (re-opened for unbuffered/overlapped reads,
