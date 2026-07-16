@@ -1,6 +1,7 @@
 #pragma once
 
 #include <vulkan/vulkan.h>
+#include <vk_mem_alloc.h>
 #include <functional>
 
 namespace renderer {
@@ -102,6 +103,32 @@ namespace renderer {
             VkBuffer vertexBuffer,
             VkBuffer indexBuffer,
             VkBuffer drawRangeBuffer
+        );
+
+        // Allocates a single-mip, single-layer, 2D GPU-only image (STORAGE_BIT for compute
+        // imageLoad/imageStore | SAMPLED_BIT for a later sampled read, e.g. history reprojection |
+        // TRANSFER_DST_BIT for a one-time neutral-default clear) plus its matching 2D view -- the
+        // "ping-pong GI field" convention shared by ScreenProbeGIPass's probe images and
+        // ReflectionPass's reflection images.
+        static void CreateStorageSampledImage2D(
+            VmaAllocator allocator,
+            VkDevice device,
+            VkFormat format,
+            VkExtent2D extent,
+            VkImage& outImage,
+            VmaAllocation& outAllocation,
+            VkImageView& outView
+        );
+
+        // Records UNDEFINED -> TRANSFER_DST_OPTIMAL, vkCmdClearColorImage, then
+        // TRANSFER_DST_OPTIMAL -> GENERAL (leaving the image ready for a compute shader to both
+        // imageLoad and sample it) for a single mip/layer color image. The one-time
+        // "give this ping-pong GI field image a defined neutral starting value" idiom shared by
+        // ScreenProbeGIPass and ReflectionPass's own Init()-time clear loops.
+        static void ClearComputeImageToGeneral(
+            VkCommandBuffer cmd,
+            VkImage image,
+            const VkClearColorValue& clearColor
         );
     };
 
