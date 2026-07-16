@@ -180,87 +180,132 @@ void main()
         indices[tIdx + 5u] = vertexOffset + t1;
     }
 
+    // Every side face's topmost quad row (row == heightSegments-1) borders the apex: `factor =
+    // 1.0 - ty` pinches X/Z to 0 as ty->1, so ALL columns of the row above (row+1 ==
+    // heightSegments, ty == 1) collapse to the exact same apex position (0, height, 0). Treating
+    // that row as a genuine quad like every row below it therefore produces one legitimate
+    // triangle and one degenerate (zero-area) triangle per column -- the degenerate one has two
+    // of its three corners at the same duplicated-apex position. Fixed below by emitting only
+    // the single valid triangle at the apex-adjacent row (3 indices) instead of a full quad (6
+    // indices); see project memory on this investigation and VulkanContext::GeneratePyramid's
+    // matching index-count formula. Per-face index count is therefore
+    // cols*3u + (rows-1u)*cols*6u instead of a uniform rows*cols*6u.
+
     // Indices +Z Face
     uint sideZ1_IndexOffset = baseQuads * 6u;
     if (id < sideZQuads)
     {
         uint col = id % widthSegments;
         uint row = id / widthSegments;
+        bool apexRow = (row == heightSegments - 1u);
         uint baseOffset = baseVertCount;
         uint b0 = baseOffset + row * sideZCols + col;
         uint b1 = b0 + 1u;
         uint t0 = baseOffset + (row + 1u) * sideZCols + col;
         uint t1 = t0 + 1u;
-        
-        uint tIdx = indexOffset + sideZ1_IndexOffset + id * 6u;
-        indices[tIdx + 0u] = vertexOffset + b0;
-        indices[tIdx + 1u] = vertexOffset + t1;
-        indices[tIdx + 2u] = vertexOffset + t0;
-        indices[tIdx + 3u] = vertexOffset + b0;
-        indices[tIdx + 4u] = vertexOffset + b1;
-        indices[tIdx + 5u] = vertexOffset + t1;
+
+        uint tIdx = indexOffset + sideZ1_IndexOffset + row * widthSegments * 6u + col * (apexRow ? 3u : 6u);
+        // (b0, t1, t0) degenerates to zero area on the apex row (t0 == t1 there) -- only emit it below it.
+        if (!apexRow)
+        {
+            indices[tIdx + 0u] = vertexOffset + b0;
+            indices[tIdx + 1u] = vertexOffset + t1;
+            indices[tIdx + 2u] = vertexOffset + t0;
+            indices[tIdx + 3u] = vertexOffset + b0;
+            indices[tIdx + 4u] = vertexOffset + b1;
+            indices[tIdx + 5u] = vertexOffset + t1;
+        }
+        else
+        {
+            indices[tIdx + 0u] = vertexOffset + b0;
+            indices[tIdx + 1u] = vertexOffset + b1;
+            indices[tIdx + 2u] = vertexOffset + t1;
+        }
     }
+    uint sideZQuadIndexCount = widthSegments * 3u + (heightSegments - 1u) * widthSegments * 6u;
 
     // Indices -Z Face
-    uint sideZ2_IndexOffset = sideZ1_IndexOffset + sideZQuads * 6u;
+    uint sideZ2_IndexOffset = sideZ1_IndexOffset + sideZQuadIndexCount;
     if (id < sideZQuads)
     {
         uint col = id % widthSegments;
         uint row = id / widthSegments;
+        bool apexRow = (row == heightSegments - 1u);
         uint baseOffset = baseVertCount + sideZVerts;
         uint b0 = baseOffset + row * sideZCols + col;
         uint b1 = b0 + 1u;
         uint t0 = baseOffset + (row + 1u) * sideZCols + col;
         uint t1 = t0 + 1u;
-        
-        uint tIdx = indexOffset + sideZ2_IndexOffset + id * 6u;
+
+        uint tIdx = indexOffset + sideZ2_IndexOffset + row * widthSegments * 6u + col * (apexRow ? 3u : 6u);
         indices[tIdx + 0u] = vertexOffset + b0;
         indices[tIdx + 1u] = vertexOffset + b1;
         indices[tIdx + 2u] = vertexOffset + t1;
-        indices[tIdx + 3u] = vertexOffset + b0;
-        indices[tIdx + 4u] = vertexOffset + t1;
-        indices[tIdx + 5u] = vertexOffset + t0;
+        // (b0, t1, t0) degenerates to zero area on the apex row (t0 == t1 there) -- only emit it below it.
+        if (!apexRow)
+        {
+            indices[tIdx + 3u] = vertexOffset + b0;
+            indices[tIdx + 4u] = vertexOffset + t1;
+            indices[tIdx + 5u] = vertexOffset + t0;
+        }
     }
 
     // Indices +X Face
-    uint sideX1_IndexOffset = sideZ2_IndexOffset + sideZQuads * 6u;
+    uint sideX1_IndexOffset = sideZ2_IndexOffset + sideZQuadIndexCount;
     if (id < sideXQuads)
     {
         uint col = id % depthSegments;
         uint row = id / depthSegments;
+        bool apexRow = (row == heightSegments - 1u);
         uint baseOffset = baseVertCount + 2u * sideZVerts;
         uint b0 = baseOffset + row * sideXCols + col;
         uint b1 = b0 + 1u;
         uint t0 = baseOffset + (row + 1u) * sideXCols + col;
         uint t1 = t0 + 1u;
-        
-        uint tIdx = indexOffset + sideX1_IndexOffset + id * 6u;
-        indices[tIdx + 0u] = vertexOffset + b0;
-        indices[tIdx + 1u] = vertexOffset + t1;
-        indices[tIdx + 2u] = vertexOffset + t0;
-        indices[tIdx + 3u] = vertexOffset + b0;
-        indices[tIdx + 4u] = vertexOffset + b1;
-        indices[tIdx + 5u] = vertexOffset + t1;
+
+        uint tIdx = indexOffset + sideX1_IndexOffset + row * depthSegments * 6u + col * (apexRow ? 3u : 6u);
+        // (b0, t1, t0) degenerates to zero area on the apex row (t0 == t1 there) -- only emit it below it.
+        if (!apexRow)
+        {
+            indices[tIdx + 0u] = vertexOffset + b0;
+            indices[tIdx + 1u] = vertexOffset + t1;
+            indices[tIdx + 2u] = vertexOffset + t0;
+            indices[tIdx + 3u] = vertexOffset + b0;
+            indices[tIdx + 4u] = vertexOffset + b1;
+            indices[tIdx + 5u] = vertexOffset + t1;
+        }
+        else
+        {
+            indices[tIdx + 0u] = vertexOffset + b0;
+            indices[tIdx + 1u] = vertexOffset + b1;
+            indices[tIdx + 2u] = vertexOffset + t1;
+        }
     }
+    uint sideXQuadIndexCount = depthSegments * 3u + (heightSegments - 1u) * depthSegments * 6u;
 
     // Indices -X Face
-    uint sideX2_IndexOffset = sideX1_IndexOffset + sideXQuads * 6u;
+    uint sideX2_IndexOffset = sideX1_IndexOffset + sideXQuadIndexCount;
     if (id < sideXQuads)
     {
         uint col = id % depthSegments;
         uint row = id / depthSegments;
+        bool apexRow = (row == heightSegments - 1u);
         uint baseOffset = baseVertCount + 2u * sideZVerts + sideXVerts;
         uint b0 = baseOffset + row * sideXCols + col;
         uint b1 = b0 + 1u;
         uint t0 = baseOffset + (row + 1u) * sideXCols + col;
         uint t1 = t0 + 1u;
-        
-        uint tIdx = indexOffset + sideX2_IndexOffset + id * 6u;
+
+        uint tIdx = indexOffset + sideX2_IndexOffset + row * depthSegments * 6u + col * (apexRow ? 3u : 6u);
         indices[tIdx + 0u] = vertexOffset + b0;
         indices[tIdx + 1u] = vertexOffset + b1;
         indices[tIdx + 2u] = vertexOffset + t1;
-        indices[tIdx + 3u] = vertexOffset + b0;
-        indices[tIdx + 4u] = vertexOffset + t1;
-        indices[tIdx + 5u] = vertexOffset + t0;
+        // (b0, t1, t0) degenerates to zero area on the apex row (t0 == t1 there) -- only emit it below it.
+        if (!apexRow)
+        {
+            indices[tIdx + 3u] = vertexOffset + b0;
+            indices[tIdx + 4u] = vertexOffset + t1;
+            indices[tIdx + 5u] = vertexOffset + t0;
+        }
     }
 }

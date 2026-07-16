@@ -1413,8 +1413,11 @@ void VulkanContext::GenerateCone(
                           sizeof(params), nullptr, 0, groupCount, 1, 1);
 
   runningVertexOffset += totalVerts;
-  runningIndexOffset += params.sides * params.heightSegments * 6u +
-                        2u * params.capSegments * params.sides * 6u;
+  // Each cap's innermost ring is a fan from the center vertex (1 triangle/column, 3 indices),
+  // every ring above it a genuine quad strip (2 triangles/column, 6 indices) -- see
+  // geom_cone.comp's own comment on why this differs from a uniform 6-indices-per-ring stride.
+  uint32_t capIndexCount = params.sides * 3u + (params.capSegments - 1u) * params.sides * 6u;
+  runningIndexOffset += params.sides * params.heightSegments * 6u + 2u * capIndexCount;
 }
 
 void VulkanContext::GenerateSphere(
@@ -1536,7 +1539,11 @@ void VulkanContext::GenerateCylinder(
                           &params, sizeof(params), nullptr, 0, groupCount, 1, 1);
 
   runningVertexOffset += totalVerts;
-  runningIndexOffset += 6u * params.sides * (params.heightSegments + 2u * params.capSegments);
+  // Each cap's innermost ring is a fan from the center vertex (1 triangle/column, 3 indices),
+  // every ring above it a genuine quad strip (2 triangles/column, 6 indices) -- see
+  // geom_cylinder.comp's own comment on why this differs from a uniform 6-indices-per-ring stride.
+  uint32_t capIndexCount = params.sides * 3u + (params.capSegments - 1u) * params.sides * 6u;
+  runningIndexOffset += 6u * params.sides * params.heightSegments + 2u * capIndexCount;
 }
 
 void VulkanContext::GenerateTube(
@@ -1677,9 +1684,13 @@ void VulkanContext::GeneratePyramid(
   runningVertexOffset += totalVerts;
 
   uint32_t baseQuads = params.widthSegments * params.depthSegments;
-  uint32_t sideZQuads = params.widthSegments * params.heightSegments;
-  uint32_t sideXQuads = params.depthSegments * params.heightSegments;
-  runningIndexOffset += 6u * (baseQuads + 2u * sideZQuads + 2u * sideXQuads);
+  // Each side face's topmost quad row borders the apex, where every column collapses to the
+  // same duplicated vertex position (1 triangle/column there, 3 indices) instead of a genuine
+  // quad (2 triangles/column, 6 indices) -- see geom_pyramide.comp's own comment on why this
+  // differs from a uniform 6-indices-per-row stride.
+  uint32_t sideZQuadIndexCount = params.widthSegments * 3u + (params.heightSegments - 1u) * params.widthSegments * 6u;
+  uint32_t sideXQuadIndexCount = params.depthSegments * 3u + (params.heightSegments - 1u) * params.depthSegments * 6u;
+  runningIndexOffset += 6u * baseQuads + 2u * sideZQuadIndexCount + 2u * sideXQuadIndexCount;
 }
 
 void VulkanContext::GeneratePlane(
@@ -1756,7 +1767,13 @@ void VulkanContext::GenerateCapsule(
                           sizeof(params), nullptr, 0, groupCount, 1, 1);
 
   runningVertexOffset += totalVerts;
-  runningIndexOffset += 6u * params.sides * (3u * params.heightSegs);
+  // Each hemisphere's pole-adjacent ring is a fan over sideColumns duplicate pole vertices (1
+  // triangle/column, 3 indices), every other ring a genuine quad strip (2 triangles/column, 6
+  // indices) -- see geom_capsule.comp's own comment on why this differs from a uniform
+  // 6-indices-per-ring stride. nbCapSegs == heightSegs in the shader (see its own comment).
+  uint32_t hemiIndexCount = params.sides * 3u + (params.heightSegs - 1u) * params.sides * 6u;
+  uint32_t bodyIndexCount = 6u * params.sides * params.heightSegs;
+  runningIndexOffset += 2u * hemiIndexCount + bodyIndexCount;
 }
 
 void VulkanContext::GenerateGeometry() {
