@@ -278,6 +278,124 @@ namespace geometry {
             return false;
         }
 
+        // Finds and welds away any residual degenerate (near-zero-area) triangle left in `mesh`
+        // after the main greedy collapse loop, by merging its shortest edge's UNLOCKED endpoint
+        // onto the other endpoint. See this function's call site for why such a triangle can
+        // survive the collapse loop completely untouched: the loop only re-evaluates candidate
+        // collapses for edges incident to a vertex that was JUST collapsed, so a triangle whose
+        // shape degrades only as a side effect of OTHER, unrelated collapses moving its
+        // neighbors is never itself proposed (and therefore never rejected by
+        // CollapseWouldFoldOver) -- e.g. two boundary (locked) vertices from two independently
+        // authored "same" edges (see geometry::ClusterDAG.cpp's MergeLevelMeshes) that sit at
+        // slightly different positions, with a nearby unlocked vertex freely minimizing its own
+        // quadric error until it lands almost exactly between them. Bounded fixed-point
+        // iteration: welding one sliver can occasionally reveal another (e.g. if the vertex it
+        // was welded onto is itself part of one), but each successful weld strictly reduces the
+        // triangle count, so this always terminates well within the iteration cap.
+        void WeldResidualSliverTriangles(SimplifiableMesh& mesh) {
+            constexpr float kSliverAreaSq = 1e-14f; // Matches CollapseWouldFoldOver's own threshold.
+            constexpr uint32_t kMaxWeldPasses = 64;
+
+            for (uint32_t pass = 0; pass < kMaxWeldPasses; ++pass) {
+                uint32_t weldFrom = kDeadSentinel;
+                uint32_t weldTo = kDeadSentinel;
+                float bestCandidateEdgeLenSq = std::numeric_limits<float>::max();
+
+                // Fallback candidate, used only if the whole mesh has no unlocked-vertex fix
+                // available anywhere: two LOCKED vertices whose triangle is degenerate are, by
+                // definition, already within kSliverAreaSq of being the same point -- exactly the
+                // "two independently-authored copies of the same boundary point" case the whole
+                // locked-position-aliasing system (ClusterDAG.cpp's MergeLevelMeshes) exists to
+                // collapse into one, it just failed to recognize them as equal because they
+                // aren't bit-exact. Merging them here doesn't move a locked vertex to any new,
+                // otherwise-unrelated position -- it recognizes two near-coincident locked
+                // vertices as the single point they were always meant to represent.
+                uint32_t fallbackFrom = kDeadSentinel;
+                uint32_t fallbackTo = kDeadSentinel;
+                float bestFallbackEdgeLenSq = std::numeric_limits<float>::max();
+
+                for (size_t t = 0; t + 2 < mesh.triangles.size(); t += 3) {
+                    uint32_t idx[3] = { mesh.triangles[t + 0], mesh.triangles[t + 1], mesh.triangles[t + 2] };
+                    if (idx[0] == idx[1] || idx[1] == idx[2] || idx[2] == idx[0]) {
+                        continue; // Already-degenerate by duplicate index; the compaction below drops it.
+                    }
+                    const maths::vec3& p0 = mesh.positions[idx[0]];
+                    const maths::vec3& p1 = mesh.positions[idx[1]];
+                    const maths::vec3& p2 = mesh.positions[idx[2]];
+                    maths::vec3 cross = (p1 - p0).Cross(p2 - p0);
+                    if (cross.Dot(cross) * 0.25f >= kSliverAreaSq) {
+                        continue; // Not degenerate.
+                    }
+
+                    const maths::vec3 pos[3] = { p0, p1, p2 };
+                    // For each of this triangle's 3 vertices, its two incident-edge lengths within
+                    // the triangle; an unlocked vertex is a candidate to weld onto its nearer
+                    // neighbor (minimizes the geometric displacement this correction introduces).
+                    for (int slot = 0; slot < 3; ++slot) {
+                        int prevSlot = (slot + 2) % 3;
+                        int nextSlot = (slot + 1) % 3;
+                        maths::vec3 toPrev = pos[prevSlot] - pos[slot];
+                        maths::vec3 toNext = pos[nextSlot] - pos[slot];
+                        float prevLenSq = toPrev.Dot(toPrev);
+                        float nextLenSq = toNext.Dot(toNext);
+                        bool prevCloser = prevLenSq <= nextLenSq;
+                        float candidateLenSq = prevCloser ? prevLenSq : nextLenSq;
+                        uint32_t candidateTarget = idx[prevCloser ? prevSlot : nextSlot];
+
+                        if (mesh.locked[idx[slot]]) {
+                            // Only usable as the last-resort fallback, and only onto another
+                            // locked vertex (welding a locked vertex onto an unlocked one would
+                            // still mean "moving" the locked point, which the fallback's own
+                            // rationale above does not justify).
+                            if (mesh.locked[candidateTarget] && candidateLenSq < bestFallbackEdgeLenSq) {
+                                bestFallbackEdgeLenSq = candidateLenSq;
+                                fallbackFrom = idx[slot];
+                                fallbackTo = candidateTarget;
+                            }
+                            continue;
+                        }
+                        if (candidateLenSq < bestCandidateEdgeLenSq) {
+                            bestCandidateEdgeLenSq = candidateLenSq;
+                            weldFrom = idx[slot];
+                            weldTo = candidateTarget;
+                        }
+                    }
+                }
+
+                if (weldFrom == kDeadSentinel) {
+                    if (fallbackFrom == kDeadSentinel) {
+                        break; // No degenerate triangle left at all.
+                    }
+                    weldFrom = fallbackFrom;
+                    weldTo = fallbackTo;
+                }
+
+                for (uint32_t& idx : mesh.triangles) {
+                    if (idx == weldFrom) {
+                        idx = weldTo;
+                    }
+                }
+            }
+
+            // Drop any triangle that welding left with a duplicate index (degenerate-by-construction,
+            // zero area by definition) -- vertices themselves are left in place (a handful of now-
+            // unreferenced entries cost a negligible amount of memory and are harmless).
+            std::vector<uint32_t> cleaned;
+            cleaned.reserve(mesh.triangles.size());
+            for (size_t t = 0; t + 2 < mesh.triangles.size(); t += 3) {
+                uint32_t i0 = mesh.triangles[t + 0];
+                uint32_t i1 = mesh.triangles[t + 1];
+                uint32_t i2 = mesh.triangles[t + 2];
+                if (i0 == i1 || i1 == i2 || i2 == i0) {
+                    continue;
+                }
+                cleaned.push_back(i0);
+                cleaned.push_back(i1);
+                cleaned.push_back(i2);
+            }
+            mesh.triangles = std::move(cleaned);
+        }
+
     } // namespace
 
     uint32_t SimplifyMeshQEM(
@@ -286,10 +404,14 @@ namespace geometry {
         const uint32_t initialTriangleCount = static_cast<uint32_t>(mesh.triangles.size() / 3);
 
         if (vertexCount == 0 || (initialTriangleCount <= targetTriangleCount && vertexCount <= targetVertexCount)) {
+            // Even when no collapse is needed, weld away any sliver already present in the input
+            // (e.g. inherited from an earlier level's own weld-worthy merge) -- cheap no-op when
+            // the mesh is already clean, which is the common case.
+            WeldResidualSliverTriangles(mesh);
             if (outMaxError) {
                 *outMaxError = 0.0f; // No collapse applied: geometry is unchanged, zero error introduced.
             }
-            return initialTriangleCount;
+            return static_cast<uint32_t>(mesh.triangles.size() / 3);
         }
 
         double maxAppliedCollapseCostSq = 0.0;
@@ -459,16 +581,19 @@ namespace geometry {
         mesh.uvs = std::move(newUVs);
         mesh.triangles = std::move(newTriangles);
 
+        // CollapseWouldFoldOver (above) rejects any COLLAPSE that would CREATE a degenerate/
+        // near-zero-area triangle, but a triangle that only degrades as a side effect of OTHER,
+        // unrelated collapses moving its neighbors (or one already degenerate in the input mesh)
+        // is never itself proposed, so it can survive untouched into this point. Weld those away
+        // -- see WeldResidualSliverTriangles's own comment for the full mechanism.
+        WeldResidualSliverTriangles(mesh);
+
 #ifndef NDEBUG
         // Sanity check for the 2026-07-16 "clusters mis-generated during triangulation -> cluster
-        // conversion" investigation: CollapseWouldFoldOver (above) rejects any COLLAPSE that would
-        // CREATE a degenerate/near-zero-area triangle, but a triangle that was ALREADY degenerate in
-        // the input mesh (e.g. cone/cylinder cap-ring index padding -- see
-        // VirtualGeometryCacheTest.cpp's own comment on this) contributes a zero quadric
-        // (PlaneQuadric's kMinTriangleAreaSq-equivalent early-out above) and is simply never touched
-        // by a collapse, so it survives unflagged into the output mesh. This walks the FINAL
-        // triangle list once to report how many (still) are degenerate, so it's possible to tell
-        // whether bad input geometry or the simplifier itself is the source.
+        // conversion" investigation: reports anything WeldResidualSliverTriangles could not fix --
+        // i.e. a degenerate triangle whose all 3 vertices are locked, which would mean the
+        // boundary itself (not just interior simplification) is geometrically broken. Should never
+        // fire in practice; a real occurrence is worth investigating on its own.
         {
             uint32_t degenerateCount = 0;
             uint32_t firstDegenerateTriangle = 0xFFFFFFFFu;
@@ -485,10 +610,10 @@ namespace geometry {
             }
             if (degenerateCount > 0) {
                 LOG_WARNING(std::format(
-                    "[MeshSimplifier] output mesh has {} degenerate (near-zero-area) triangle(s) out of {} "
-                    "(first at triangle index {}) -- these were never collapsed away because a zero-area "
-                    "triangle contributes nothing to any vertex's quadric. Likely inherited from the input "
-                    "mesh (e.g. primitive cap-ring padding) rather than introduced by simplification itself.",
+                    "[MeshSimplifier] output mesh STILL has {} degenerate (near-zero-area) triangle(s) out of {} "
+                    "(first at triangle index {}) after WeldResidualSliverTriangles -- every vertex of these "
+                    "triangles must be locked (boundary), meaning the boundary geometry itself is degenerate, "
+                    "not just an interior simplification artifact.",
                     degenerateCount, mesh.triangles.size() / 3, firstDegenerateTriangle));
             }
         }
