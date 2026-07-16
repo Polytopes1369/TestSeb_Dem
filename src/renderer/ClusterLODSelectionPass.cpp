@@ -1,5 +1,6 @@
 #include "renderer/ClusterLODSelectionPass.h"
 
+#include <cmath>
 #include <cstring>
 #include <format>
 #include <stdexcept>
@@ -732,6 +733,95 @@ namespace renderer {
             "[ClusterLODSelectionPass][DebugDAGCutGaps] Analyzed {} entities, {} total leaves, {} total gap leaves ({:.2f}%).",
             statsByEntity.size(), totalLeaves, totalGaps,
             totalLeaves > 0 ? (100.0 * static_cast<double>(totalGaps) / static_cast<double>(totalLeaves)) : 0.0));
+
+        // ---------------------------------------------------------------------------------------
+        // Floor position-sanity scan (2026-07-16 "floating disconnected fragments" investigation):
+        // the floor (entityID 12) is a perfectly flat, non-rotating plane at Y=-0.8 -- EVERY node's
+        // sphereCenter, at every DAG level, must sit at that exact height and within the floor's
+        // 300x300m footprint ([-150, 150] on X/Z). GI (radiosity/SSRT/world probes) was already
+        // ruled out as the source of the floating fragments seen in screenshots (identical with all
+        // three off) -- this checks whether the DAG DATA ITSELF already contains out-of-place
+        // positions for the floor, which would point at cache-build/simplification corruption
+        // rather than a runtime rendering/streaming bug.
+        constexpr uint32_t kFloorEntityID = 12;
+        constexpr float kFloorY = -0.8f;
+        constexpr float kFloorHalfExtent = 150.0f;
+        constexpr float kYTolerance = 0.05f;
+        constexpr float kXZTolerance = 1.0f; // A cluster's own sphereRadius can push its center slightly past the exact edge.
+
+        uint32_t floorNodesChecked = 0;
+        uint32_t floorOutliers = 0;
+        std::string outlierExamples;
+        for (uint32_t i = 0; i < m_TotalNodeCount; ++i) {
+            const DAGNodePayload& node = m_DebugDagNodesCopy[i];
+            if (node.entityID != kFloorEntityID) {
+                continue;
+            }
+            ++floorNodesChecked;
+
+            bool yBad = std::abs(node.sphereCenter.y - kFloorY) > kYTolerance;
+            bool xBad = std::abs(node.sphereCenter.x) > (kFloorHalfExtent + kXZTolerance);
+            bool zBad = std::abs(node.sphereCenter.z) > (kFloorHalfExtent + kXZTolerance);
+            if (yBad || xBad || zBad) {
+                ++floorOutliers;
+                if (floorOutliers <= 10) {
+                    outlierExamples += std::format("  clusterID={} level={} sphereCenter=({:.3f},{:.3f},{:.3f}) sphereRadius={:.3f} parentClusterID={}\n",
+                        i, node.level, node.sphereCenter.x, node.sphereCenter.y, node.sphereCenter.z, node.sphereRadius,
+                        node.parentClusterID == geometry::kInvalidClusterID ? -1 : static_cast<int32_t>(node.parentClusterID));
+                }
+            }
+        }
+
+        if (floorOutliers > 0) {
+            LOG_WARNING(std::format(
+                "[ClusterLODSelectionPass][DebugFloorPositionScan] {}/{} floor DAG nodes have a sphereCenter outside the expected flat Y={:.1f} / [-{:.0f},{:.0f}] XZ footprint -- the cache-build data itself is corrupt for these, not just a runtime culling/streaming symptom. Examples:\n{}",
+                floorOutliers, floorNodesChecked, kFloorY, kFloorHalfExtent, kFloorHalfExtent, outlierExamples));
+        } else {
+            LOG_INFO(std::format(
+                "[ClusterLODSelectionPass][DebugFloorPositionScan] Checked {} floor DAG nodes: all sphereCenters are within the expected flat Y={:.1f} / [-{:.0f},{:.0f}] XZ footprint. Floor cache data is NOT corrupt -- the floating fragments must come from elsewhere (rendering/decode/vis-buffer, not the DAG itself).",
+                floorNodesChecked, kFloorY, kFloorHalfExtent, kFloorHalfExtent));
+        }
+
+        // ---------------------------------------------------------------------------------------
+        // Same sanity idea for the 12 non-floor (sculpted, grid-arranged) primitives: each entity's
+        // whole grid slot + own half-extent puts every one of its clusters, at every DAG level,
+        // well within a generous +/-10m box on X/Z and +/-3m on Y (see VulkanContext::GridSlot's
+        // 3m spacing / 3-wide grid and each primitive's own ~1-2m size). A node outside that would
+        // mean THAT entity's own cache data is corrupt -- independent of the floor investigation
+        // above, e.g. relevant to the box primitive's own persistent crack.
+        // ---------------------------------------------------------------------------------------
+        constexpr float kPrimitiveXZBound = 10.0f;
+        constexpr float kPrimitiveYBound = 3.0f;
+        std::unordered_map<uint32_t, uint32_t> primitiveOutlierCountByEntity;
+        std::unordered_map<uint32_t, std::string> primitiveOutlierExamplesByEntity;
+        for (uint32_t i = 0; i < m_TotalNodeCount; ++i) {
+            const DAGNodePayload& node = m_DebugDagNodesCopy[i];
+            if (node.entityID == kFloorEntityID) {
+                continue;
+            }
+            bool outOfBounds = std::abs(node.sphereCenter.x) > kPrimitiveXZBound
+                || std::abs(node.sphereCenter.z) > kPrimitiveXZBound
+                || std::abs(node.sphereCenter.y) > kPrimitiveYBound;
+            if (outOfBounds) {
+                uint32_t& count = primitiveOutlierCountByEntity[node.entityID];
+                ++count;
+                std::string& examples = primitiveOutlierExamplesByEntity[node.entityID];
+                if (count <= 5) {
+                    examples += std::format("  clusterID={} level={} sphereCenter=({:.3f},{:.3f},{:.3f}) sphereRadius={:.3f}\n",
+                        i, node.level, node.sphereCenter.x, node.sphereCenter.y, node.sphereCenter.z, node.sphereRadius);
+                }
+            }
+        }
+
+        if (primitiveOutlierCountByEntity.empty()) {
+            LOG_INFO("[ClusterLODSelectionPass][DebugPrimitivePositionScan] All 12 non-floor entities' DAG nodes are within the expected grid-local bounds. No corrupt cache data found there either.");
+        } else {
+            for (const auto& [entityID, count] : primitiveOutlierCountByEntity) {
+                LOG_WARNING(std::format(
+                    "[ClusterLODSelectionPass][DebugPrimitivePositionScan] entityID={}: {} DAG node(s) have a sphereCenter outside the expected +/-{:.0f}m XZ / +/-{:.0f}m Y grid-local bounds -- this entity's own cache data is corrupt. Examples:\n{}",
+                    entityID, count, kPrimitiveXZBound, kPrimitiveYBound, primitiveOutlierExamplesByEntity[entityID]));
+            }
+        }
     }
 #endif
 
