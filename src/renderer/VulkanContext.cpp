@@ -44,8 +44,8 @@ namespace {
 // writing) since GenerateGeometry() asserts against these below -- growing a
 // primitive's segment counts past this ceiling now fails loudly at startup
 // instead of silently overflowing into adjacent GPU memory.
-constexpr VkDeviceSize kVertexBufferBytes = 1024 * 1024;
-constexpr VkDeviceSize kIndexBufferBytes = 256 * 1024;
+constexpr VkDeviceSize kVertexBufferBytes = 128 * 1024 * 1024;
+constexpr VkDeviceSize kIndexBufferBytes = 64 * 1024 * 1024;
 
 // --- Per-shader Params blocks, mirrored 1:1 from their geom_*.comp
 // UBO/push-constant declarations (all fields are 4-byte scalars, so std140
@@ -1285,16 +1285,16 @@ void VulkanContext::UploadEntityData() {
 
 void VulkanContext::GenerateBox(
     float Width, float Length, float Height,
-    uint32_t WidthSegments, uint32_t LengthSegments, uint32_t HeightSegments,
     uint32_t meshID, maths::vec2 slot,
     uint32_t& runningVertexOffset, uint32_t& runningIndexOffset) {
-  // Validate dimensions and segments are positive and non-zero
+  // Validate dimensions are positive and non-zero
   assert(Width > 0.0f);
   assert(Length > 0.0f);
   assert(Height > 0.0f);
-  assert(WidthSegments > 0u);
-  assert(LengthSegments > 0u);
-  assert(HeightSegments > 0u);
+
+  uint32_t WidthSegments = std::max(1u, static_cast<uint32_t>(std::round(Width / 0.01f)));
+  uint32_t LengthSegments = std::max(1u, static_cast<uint32_t>(std::round(Length / 0.01f)));
+  uint32_t HeightSegments = std::max(1u, static_cast<uint32_t>(std::round(Height / 0.01f)));
 
   for (uint32_t face = 0; face < 6u; ++face) {
     BoxPushConstants params{};
@@ -1342,17 +1342,18 @@ void VulkanContext::GenerateBox(
 
 void VulkanContext::GenerateCone(
     float Radius1, float Radius2, float Height,
-    uint32_t HeightSegments, uint32_t CapSegments, uint32_t Sides,
     uint32_t meshID, maths::vec2 slot,
     uint32_t& runningVertexOffset, uint32_t& runningIndexOffset) {
-  // Validate dimensions and segments are positive and non-zero
+  // Validate dimensions are positive and non-zero
   assert(Radius1 > 0.0f);
   assert(Radius2 > 0.0f);
   assert(Height > 0.0f);
-  assert(HeightSegments > 0u);
-  assert(CapSegments > 0u);
-  assert(Sides > 0u);
-  assert(Sides >= 3u);
+
+  constexpr float PI = 3.1415926535f;
+  float maxRadius = std::max(Radius1, Radius2);
+  uint32_t HeightSegments = std::max(1u, static_cast<uint32_t>(std::round(Height / 0.01f)));
+  uint32_t CapSegments = std::max(1u, static_cast<uint32_t>(std::round(maxRadius / 0.01f)));
+  uint32_t Sides = std::max(3u, static_cast<uint32_t>(std::round(2.0f * PI * maxRadius / 0.01f)));
 
   ConeParams params{};
   params.radius1 = Radius1;
@@ -1385,13 +1386,14 @@ void VulkanContext::GenerateCone(
 }
 
 void VulkanContext::GenerateSphere(
-    float Radius, uint32_t Segments,
+    float Radius,
     uint32_t meshID, maths::vec2 slot,
     uint32_t& runningVertexOffset, uint32_t& runningIndexOffset) {
-  // Validate dimensions and segments are positive and non-zero
+  // Validate dimensions are positive and non-zero
   assert(Radius > 0.0f);
-  assert(Segments > 0u);
-  assert(Segments >= 3u);
+
+  constexpr float PI = 3.1415926535f;
+  uint32_t Segments = std::max(3u, static_cast<uint32_t>(std::round(2.0f * PI * Radius / 0.01f)));
 
   SphereParams params{};
   params.radius = Radius;
@@ -1418,14 +1420,16 @@ void VulkanContext::GenerateSphere(
 }
 
 void VulkanContext::GenerateIcosphere(
-    float Radius, uint32_t Segments, bool Tetra, bool Octa, bool Icosa,
+    float Radius, bool Tetra, bool Octa, bool Icosa,
     uint32_t meshID, maths::vec2 slot,
     uint32_t& runningVertexOffset, uint32_t& runningIndexOffset,
     uint32_t& outBaseFaceCount, uint32_t& outVertsPerFace) {
   // Validate dimensions and segments are positive and non-zero
   assert(Radius > 0.0f);
-  assert(Segments > 0u);
   assert((Tetra ? 1 : 0) + (Octa ? 1 : 0) + (Icosa ? 1 : 0) == 1);
+
+  float edgeLength = (Icosa ? 1.05f : (Octa ? 1.41f : 1.63f)) * Radius;
+  uint32_t Segments = std::max(1u, static_cast<uint32_t>(std::round(edgeLength / 0.01f)));
 
   IcosphereParams params{};
   params.radius = Radius;
@@ -1463,16 +1467,17 @@ void VulkanContext::GenerateIcosphere(
 }
 
 void VulkanContext::GenerateCylinder(
-    float Radius, float Height, uint32_t HeightSegments, uint32_t CapSegments, uint32_t Sides,
+    float Radius, float Height,
     uint32_t meshID, maths::vec2 slot,
     uint32_t& runningVertexOffset, uint32_t& runningIndexOffset) {
-  // Validate dimensions and segments are positive and non-zero
+  // Validate dimensions are positive and non-zero
   assert(Radius > 0.0f);
   assert(Height > 0.0f);
-  assert(HeightSegments > 0u);
-  assert(CapSegments > 0u);
-  assert(Sides > 0u);
-  assert(Sides >= 3u);
+
+  constexpr float PI = 3.1415926535f;
+  uint32_t HeightSegments = std::max(1u, static_cast<uint32_t>(std::round(Height / 0.01f)));
+  uint32_t CapSegments = std::max(1u, static_cast<uint32_t>(std::round(Radius / 0.01f)));
+  uint32_t Sides = std::max(3u, static_cast<uint32_t>(std::round(2.0f * PI * Radius / 0.01f)));
 
   CylinderParams params{};
   params.radius = Radius;
@@ -1503,18 +1508,19 @@ void VulkanContext::GenerateCylinder(
 }
 
 void VulkanContext::GenerateTube(
-    float Radius1, float Radius2, float Height, uint32_t HeightSegments, uint32_t CapSegments, uint32_t Sides,
+    float Radius1, float Radius2, float Height,
     uint32_t meshID, maths::vec2 slot,
     uint32_t& runningVertexOffset, uint32_t& runningIndexOffset) {
-  // Validate dimensions and segments are positive and non-zero
+  // Validate dimensions are positive and non-zero
   assert(Radius1 > 0.0f);
   assert(Radius2 > 0.0f);
   assert(Radius1 > Radius2);
   assert(Height > 0.0f);
-  assert(HeightSegments > 0u);
-  assert(CapSegments > 0u);
-  assert(Sides > 0u);
-  assert(Sides >= 3u);
+
+  constexpr float PI = 3.1415926535f;
+  uint32_t HeightSegments = std::max(1u, static_cast<uint32_t>(std::round(Height / 0.01f)));
+  uint32_t CapSegments = std::max(1u, static_cast<uint32_t>(std::round((Radius1 - Radius2) / 0.01f)));
+  uint32_t Sides = std::max(3u, static_cast<uint32_t>(std::round(2.0f * PI * Radius1 / 0.01f)));
 
   TubeParams params{};
   params.radius1 = Radius1;
@@ -1551,14 +1557,16 @@ void VulkanContext::GenerateTube(
 }
 
 void VulkanContext::GenerateTorus(
-    float Radius1, float Radius2, float Rotation, float Twist, uint32_t Segments, uint32_t Sides,
+    float Radius1, float Radius2, float Rotation, float Twist,
     uint32_t meshID, maths::vec2 slot,
     uint32_t& runningVertexOffset, uint32_t& runningIndexOffset) {
-  // Validate dimensions and segments are positive and non-zero
+  // Validate dimensions are positive and non-zero
   assert(Radius1 > 0.0f);
   assert(Radius2 > 0.0f);
-  assert(Segments > 0u);
-  assert(Sides > 0u);
+
+  constexpr float PI = 3.1415926535f;
+  uint32_t Segments = std::max(3u, static_cast<uint32_t>(std::round(2.0f * PI * Radius1 / 0.01f)));
+  uint32_t Sides = std::max(3u, static_cast<uint32_t>(std::round(2.0f * PI * Radius2 / 0.01f)));
 
   TorusParams params{};
   params.radius1 = Radius1;
@@ -1588,16 +1596,17 @@ void VulkanContext::GenerateTorus(
 }
 
 void VulkanContext::GeneratePyramid(
-    float Width, float Depth, float Height, uint32_t WidthSegments, uint32_t DepthSegments, uint32_t HeightSegments,
+    float Width, float Depth, float Height,
     uint32_t meshID, maths::vec2 slot,
     uint32_t& runningVertexOffset, uint32_t& runningIndexOffset) {
-  // Validate dimensions and segments are positive and non-zero
+  // Validate dimensions are positive and non-zero
   assert(Width > 0.0f);
   assert(Depth > 0.0f);
   assert(Height > 0.0f);
-  assert(WidthSegments > 0u);
-  assert(DepthSegments > 0u);
-  assert(HeightSegments > 0u);
+
+  uint32_t WidthSegments = std::max(1u, static_cast<uint32_t>(std::round(Width / 0.01f)));
+  uint32_t DepthSegments = std::max(1u, static_cast<uint32_t>(std::round(Depth / 0.01f)));
+  uint32_t HeightSegments = std::max(1u, static_cast<uint32_t>(std::round(Height / 0.01f)));
 
   PyramidParams params{};
   params.width = Width;
@@ -1642,14 +1651,15 @@ void VulkanContext::GeneratePyramid(
 }
 
 void VulkanContext::GeneratePlane(
-    float Length, float Width, uint32_t LengthSegments, uint32_t WidthSegments,
+    float Length, float Width,
     uint32_t meshID, maths::vec2 slot,
     uint32_t& runningVertexOffset, uint32_t& runningIndexOffset) {
-  // Validate dimensions and segments are positive and non-zero
+  // Validate dimensions are positive and non-zero
   assert(Length > 0.0f);
   assert(Width > 0.0f);
-  assert(LengthSegments > 0u);
-  assert(WidthSegments > 0u);
+
+  uint32_t LengthSegments = std::max(2u, static_cast<uint32_t>(std::round(Length / 0.01f)));
+  uint32_t WidthSegments = std::max(2u, static_cast<uint32_t>(std::round(Width / 0.01f)));
 
   PlaneParams params{};
   params.width = Width;
@@ -1677,15 +1687,16 @@ void VulkanContext::GeneratePlane(
 }
 
 void VulkanContext::GenerateCapsule(
-    float Radius, float Height, uint32_t Sides, uint32_t HeightSegs,
+    float Radius, float Height,
     uint32_t meshID, maths::vec2 slot,
     uint32_t& runningVertexOffset, uint32_t& runningIndexOffset) {
-  // Validate dimensions and segments are positive and non-zero
+  // Validate dimensions are positive and non-zero
   assert(Radius > 0.0f);
   assert(Height > 0.0f);
-  assert(Sides > 0u);
-  assert(Sides >= 3u);
-  assert(HeightSegs > 0u);
+
+  constexpr float PI = 3.1415926535f;
+  uint32_t HeightSegs = std::max(1u, static_cast<uint32_t>(std::round(Height / 0.01f)));
+  uint32_t Sides = std::max(3u, static_cast<uint32_t>(std::round(2.0f * PI * Radius / 0.01f)));
 
   CapsuleParams params{};
   params.radius = Radius;
@@ -1745,16 +1756,17 @@ void VulkanContext::GenerateGeometry() {
     // Target parameters to accept and strictly validate:
     // IcoSphere: Radius, Segments, Tetra, Octa, Icosa
     float Radius = 0.8f;
-    uint32_t Segments = 8u;
     bool Tetra = false;
     bool Octa = false;
     bool Icosa = true;
 
-    GenerateIcosphere(Radius, Segments, Tetra, Octa, Icosa,
+    GenerateIcosphere(Radius, Tetra, Octa, Icosa,
                       m_EntityData[2].meshID, slot,
                       runningVertexOffset, runningIndexOffset,
                       icosphereBaseFaceCount, icosphereVertsPerFace);
 
+    float edgeLength = (Icosa ? 1.05f : (Octa ? 1.41f : 1.63f)) * Radius;
+    uint32_t Segments = std::max(1u, static_cast<uint32_t>(std::round(edgeLength / 0.01f)));
     icosphereIndexCount = icosphereBaseFaceCount * Segments * Segments * 3u;
   }
   // DEBUG: sample-readback the icosphere geometry, exactly as before this
@@ -1768,7 +1780,7 @@ void VulkanContext::GenerateGeometry() {
   // -------------------------------------------------------------------------
   {
     maths::vec2 slot = gridSlot(0);
-    GenerateBox(1.4f, 1.4f, 1.4f, 2u, 2u, 2u, m_EntityData[0].meshID, slot, runningVertexOffset, runningIndexOffset);
+    GenerateBox(1.4f, 1.4f, 1.4f, m_EntityData[0].meshID, slot, runningVertexOffset, runningIndexOffset);
   }
 
   // -------------------------------------------------------------------------
@@ -1776,7 +1788,7 @@ void VulkanContext::GenerateGeometry() {
   // -------------------------------------------------------------------------
   {
     maths::vec2 slot = gridSlot(1);
-    GenerateCone(0.7f, 0.35f, 1.4f, 4u, 4u, 32u, m_EntityData[1].meshID, slot, runningVertexOffset, runningIndexOffset);
+    GenerateCone(0.7f, 0.35f, 1.4f, m_EntityData[1].meshID, slot, runningVertexOffset, runningIndexOffset);
   }
 
   // -------------------------------------------------------------------------
@@ -1789,10 +1801,8 @@ void VulkanContext::GenerateGeometry() {
     // Plane: Length, Width, LengthSegments, WidthSegments
     float Length = 1.4f;
     float Width = 1.4f;
-    uint32_t LengthSegments = 2u;
-    uint32_t WidthSegments = 2u;
 
-    GeneratePlane(Length, Width, LengthSegments, WidthSegments,
+    GeneratePlane(Length, Width,
                   m_EntityData[3].meshID, slot,
                   runningVertexOffset, runningIndexOffset);
   }
@@ -1802,7 +1812,7 @@ void VulkanContext::GenerateGeometry() {
   // -------------------------------------------------------------------------
   {
     maths::vec2 slot = gridSlot(4);
-    GenerateSphere(0.8f, 24u, m_EntityData[4].meshID, slot, runningVertexOffset, runningIndexOffset);
+    GenerateSphere(0.8f, m_EntityData[4].meshID, slot, runningVertexOffset, runningIndexOffset);
   }
 
   // -------------------------------------------------------------------------
@@ -1817,10 +1827,8 @@ void VulkanContext::GenerateGeometry() {
     float Radius2 = 0.22f;
     float Rotation = 0.0f;
     float Twist = 0.0f;
-    uint32_t Segments = 32u;
-    uint32_t Sides = 16u;
 
-    GenerateTorus(Radius1, Radius2, Rotation, Twist, Segments, Sides,
+    GenerateTorus(Radius1, Radius2, Rotation, Twist,
                   m_EntityData[5].meshID, slot,
                   runningVertexOffset, runningIndexOffset);
   }
@@ -1837,11 +1845,8 @@ void VulkanContext::GenerateGeometry() {
     float Radius1 = 0.7f; // outer
     float Radius2 = 0.5f; // inner
     float Height = 1.4f;
-    uint32_t HeightSegments = 4u;
-    uint32_t CapSegments = 4u;
-    uint32_t Sides = 24u;
 
-    GenerateTube(Radius1, Radius2, Height, HeightSegments, CapSegments, Sides,
+    GenerateTube(Radius1, Radius2, Height,
                  m_EntityData[6].meshID, slot,
                  runningVertexOffset, runningIndexOffset);
   }
@@ -1856,10 +1861,8 @@ void VulkanContext::GenerateGeometry() {
     // Capsule: Radius, Height, Sides, HeightSegs
     float Radius = 0.5f;
     float Height = 0.8f; // cylindrical body length
-    uint32_t Sides = 24u;
-    uint32_t HeightSegs = 4u;
 
-    GenerateCapsule(Radius, Height, Sides, HeightSegs,
+    GenerateCapsule(Radius, Height,
                     m_EntityData[7].meshID, slot,
                     runningVertexOffset, runningIndexOffset);
   }
@@ -1874,11 +1877,8 @@ void VulkanContext::GenerateGeometry() {
     // Cylinder: Radius, Height, HeightSegments, CapSegments, Sides
     float Radius = 0.7f;
     float Height = 1.4f;
-    uint32_t HeightSegments = 4u;
-    uint32_t CapSegments = 4u;
-    uint32_t Sides = 24u;
 
-    GenerateCylinder(Radius, Height, HeightSegments, CapSegments, Sides,
+    GenerateCylinder(Radius, Height,
                      m_EntityData[8].meshID, slot,
                      runningVertexOffset, runningIndexOffset);
   }
@@ -1895,11 +1895,8 @@ void VulkanContext::GenerateGeometry() {
     float Width = 1.4f;
     float Depth = 1.4f;
     float Height = 1.2f;
-    uint32_t WidthSegments = 4u;
-    uint32_t DepthSegments = 4u;
-    uint32_t HeightSegments = 4u;
 
-    GeneratePyramid(Width, Depth, Height, WidthSegments, DepthSegments, HeightSegments,
+    GeneratePyramid(Width, Depth, Height,
                     m_EntityData[9].meshID, slot,
                     runningVertexOffset, runningIndexOffset);
   }
@@ -1914,8 +1911,13 @@ void VulkanContext::GenerateGeometry() {
     params.tube = 0.15f;
     params.p = 2u;
     params.q = 3u;
-    params.nbRadSeg = 128u;
-    params.nbSides = 12u;
+    
+    // Calculate segments based on density: 1 vertex per 0.01m
+    constexpr float PI = 3.1415926535f;
+    float curveLength = 2.0f * PI * params.radius * std::max(params.p, params.q);
+    params.nbRadSeg = std::max(3u, static_cast<uint32_t>(std::round(curveLength / 0.01f)));
+    params.nbSides = std::max(3u, static_cast<uint32_t>(std::round(2.0f * PI * params.tube / 0.01f)));
+
     params.meshID = m_EntityData[10].meshID;
     params.materialID = 0.0f;
     params.vertexOffset = runningVertexOffset;
@@ -1947,8 +1949,11 @@ void VulkanContext::GenerateGeometry() {
     params.width = 1.4f;
     params.height = 1.4f;
     params.depth = 1.4f;
-    params.sideSegs = 24u;
-    params.heightSegs = 16u;
+    
+    // Calculate segments based on density: 1 vertex per 0.01m
+    params.heightSegs = std::max(3u, static_cast<uint32_t>(std::round(params.height / 0.01f)));
+    params.sideSegs = std::max(3u, static_cast<uint32_t>(std::round(2.0f * (params.width + params.depth) / 0.01f)));
+
     params.chamferPower =
         6.0f; // > 2 required (see geom_chamferBox.comp); higher = sharper edges
     params.meshID = m_EntityData[11].meshID;
