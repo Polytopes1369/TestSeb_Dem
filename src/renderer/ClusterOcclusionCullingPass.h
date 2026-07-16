@@ -146,8 +146,14 @@ namespace renderer {
         // separately, before the first frame's RecordEarlyPass() (mirroring
         // renderer::GpuGeometryPagePool::Init()/ClearPageTable()'s split for the same reason: the
         // clear needs a command buffer the caller records and submits on their own schedule).
+        // `entityTransformBuffer` is the same per-entity rotation buffer VulkanContext::
+        // UpdateEntityRotations() re-uploads every frame (VulkanContext::GetEntityTransformBuffer())
+        // -- ClusterHZBOcclusionCull.comp uses it to rotate each candidate's bounds/sphere/cone into
+        // the entity's CURRENT orientation before testing them, entirely on a local copy (never
+        // written back to candidateMetadataBuffer, which ClusterRaster.vert's vertex decode still
+        // needs in its original rest-pose form) -- see cluster_entity_transform.glsl.
         void Init(VkDevice device, VmaAllocator allocator, uint32_t maxClusters, uint32_t totalClusterCount,
-            VkBuffer candidateMetadataBuffer, VkBuffer candidateCountBuffer,
+            VkBuffer candidateMetadataBuffer, VkBuffer candidateCountBuffer, VkBuffer entityTransformBuffer,
             VkImageView hzbFullView, VkExtent2D hzbMip0Extent, uint32_t hzbMipLevelCount);
 
         void Shutdown();
@@ -273,6 +279,9 @@ namespace renderer {
         // specialization's bound check reads it instead of a push-constant clusterCount, now that
         // the candidate count is only ever known on the GPU).
         VkBuffer m_CandidateCountBuffer = VK_NULL_HANDLE;
+        // binding 17: EntityTransform[entityCount] -- BORROWED from VulkanContext::
+        // GetEntityTransformBuffer(); read-only here.
+        VkBuffer m_EntityTransformBuffer = VK_NULL_HANDLE;
         GpuBuffer m_ViewParamsBuffer;        // binding 1: CullingViewParams, std140 UBO, GPU_ONLY.
         GpuBuffer m_HZBParamsBuffer;         // binding 2: HZBOcclusionViewParams, std140 UBO, GPU_ONLY.
         // binding 3: HZB texture -- m_HZBView / m_HZBSampler below, not owned as a GpuBuffer.

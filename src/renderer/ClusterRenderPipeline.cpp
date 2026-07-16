@@ -150,8 +150,9 @@ bool ClusterRenderPipeline::Init(
   // index/DAG tables read in STEP 1.
   m_LODSelection.Init(createInfo.device, createInfo.allocator,
                       createInfo.commandPool, createInfo.queue,
-                      m_PagePool.GetPageTableBuffer(), leafCount, indexEntries,
-                      dagEntries, createInfo.entityDataBuffer);
+                      m_PagePool.GetPageTableBuffer(),
+                      createInfo.entityTransformBuffer, leafCount,
+                      indexEntries, dagEntries, createInfo.entityDataBuffer);
 
   // Wires the async streaming stack for real -- see GeometryStreamingCoordinator's own class
   // comment. Needs only the cache file path (re-opened for unbuffered/overlapped reads,
@@ -164,6 +165,7 @@ bool ClusterRenderPipeline::Init(
                           totalClusterCount,
                           m_LODSelection.GetCandidateMetadataBuffer(),
                           m_LODSelection.GetCandidateCountBuffer(),
+                          createInfo.entityTransformBuffer,
                           m_HZB.GetFullView(), m_HZB.GetMipExtent(0),
                           m_HZB.GetMipLevelCount());
 
@@ -733,6 +735,17 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
     lodViewParams.aspectRatio = static_cast<float>(m_RenderExtent.width) / static_cast<float>(m_RenderExtent.height);
 
     m_LODSelection.RecordEvaluateAndCompact(cmd, lodViewParams);
+
+#ifndef NDEBUG
+    // See RequestDebugDAGCutGapsDump()'s own comment: state 1 means main.cpp's 'K' key armed a
+    // dump this frame -- record the DAGDecisionSSBO readback now (right after the dispatch that
+    // just wrote this frame's decisions) and advance to state 2 so PumpDebugDAGCutGapsDump() logs
+    // it once this frame's fence confirms the copy has landed.
+    if (m_DebugDAGCutGapsDumpState == 1) {
+        m_LODSelection.RecordDebugReadback(cmd);
+        m_DebugDAGCutGapsDumpState = 2;
+    }
+#endif
 
     // Captures THIS frame's residency-miss reports (ClusterLODResidencyFallback.comp, just
     // dispatched above) into the feedback buffer's host-visible readback half, for [1a]'s

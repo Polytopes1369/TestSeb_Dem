@@ -1,4 +1,3 @@
-// geom_pyramide.comp
 #version 460
 #extension GL_GOOGLE_include_directive : enable
 
@@ -29,7 +28,7 @@ layout(std140, binding = 2) uniform Params
 
 void main()
 {
-    // Strict validation assertions: interdict negative or null values
+    // Validation stricte des paramètres d'entrée
     if (width <= 0.0 || depth <= 0.0 || height <= 0.0 ||
         widthSegments == 0 || depthSegments == 0 || heightSegments == 0)
     {
@@ -38,137 +37,150 @@ void main()
 
     uint id = gl_GlobalInvocationID.x;
 
+    // Définition de la topologie des sommets
     uint baseColumns = widthSegments + 1u;
     uint baseRows    = depthSegments + 1u;
     uint baseVertCount = baseColumns * baseRows;
 
     uint sideZCols = widthSegments + 1u;
     uint sideZRows = heightSegments + 1u;
-    uint sideZVerts = sideZCols * sideZRows; // vertices for one Z-aligned side
+    uint sideZVerts = sideZCols * sideZRows;
 
     uint sideXCols = depthSegments + 1u;
     uint sideXRows = heightSegments + 1u;
-    uint sideXVerts = sideXCols * sideXRows; // vertices for one X-aligned side
+    uint sideXVerts = sideXCols * sideXRows;
 
     uint totalVerts = baseVertCount + 2u * sideZVerts + 2u * sideXVerts;
-    if (id >= totalVerts) return;
 
-    Vertex v;
-    v.meshID = meshID;
-    v.materialID = materialID;
+    // Étape 1 : Génération des Sommets (uniquement si le thread correspond à un vertex valide)
+    if (id < totalVerts)
+    {
+        Vertex v;
+        v.meshID = meshID;
+        v.materialID = materialID;
 
-    // -------------------------------------------------------------------------
-    // VERTEX GENERATION
-    // -------------------------------------------------------------------------
-    if (id < baseVertCount)
-    {
-        // Base Face
-        uint col = id % baseColumns;
-        uint row = id / baseColumns;
-        float tx = float(col) / float(widthSegments);
-        float tz = float(row) / float(depthSegments);
-        v.position = vec3(mix(-width * 0.5, width * 0.5, tx), 0.0, mix(-depth * 0.5, depth * 0.5, tz));
-        v.normal   = vec3(0.0, -1.0, 0.0);
-        v.uv       = vec2(tx, tz);
-    }
-    else if (id < baseVertCount + sideZVerts)
-    {
-        // +Z Side Face (facing positive Z direction)
-        uint local = id - baseVertCount;
-        uint col = local % sideZCols;
-        uint row = local / sideZCols;
-        float tx = float(col) / float(widthSegments);
-        float ty = float(row) / float(heightSegments);
-        
-        v.position = vec3(
-            mix(-width * 0.5, width * 0.5, tx) * (1.0 - ty),
-            ty * height,
-            depth * 0.5 * (1.0 - ty)
-        );
-        v.normal   = normalize(vec3(0.0, depth * 0.5, height));
-        v.uv       = vec2(tx, ty);
-    }
-    else if (id < baseVertCount + 2u * sideZVerts)
-    {
-        // -Z Side Face (facing negative Z direction)
-        uint local = id - (baseVertCount + sideZVerts);
-        uint col = local % sideZCols;
-        uint row = local / sideZCols;
-        float tx = float(col) / float(widthSegments);
-        float ty = float(row) / float(heightSegments);
-        
-        v.position = vec3(
-            mix(width * 0.5, -width * 0.5, tx) * (1.0 - ty),
-            ty * height,
-            -depth * 0.5 * (1.0 - ty)
-        );
-        v.normal   = normalize(vec3(0.0, depth * 0.5, -height));
-        v.uv       = vec2(tx, ty);
-    }
-    else if (id < baseVertCount + 2u * sideZVerts + sideXVerts)
-    {
-        // +X Side Face
-        uint local = id - (baseVertCount + 2u * sideZVerts);
-        uint col = local % sideXCols;
-        uint row = local / sideXCols;
-        float tx = float(col) / float(depthSegments);
-        float ty = float(row) / float(heightSegments);
-        
-        v.position = vec3(
-            width * 0.5 * (1.0 - ty),
-            ty * height,
-            mix(depth * 0.5, -depth * 0.5, tx) * (1.0 - ty)
-        );
-        v.normal   = normalize(vec3(height, width * 0.5, 0.0));
-        v.uv       = vec2(tx, ty);
-    }
-    else
-    {
-        // -X Side Face
-        uint local = id - (baseVertCount + 2u * sideZVerts + sideXVerts);
-        uint col = local % sideXCols;
-        uint row = local / sideXCols;
-        float tx = float(col) / float(depthSegments);
-        float ty = float(row) / float(heightSegments);
-        
-        v.position = vec3(
-            -width * 0.5 * (1.0 - ty),
-            ty * height,
-            mix(-depth * 0.5, depth * 0.5, tx) * (1.0 - ty)
-        );
-        v.normal   = normalize(vec3(-height, width * 0.5, 0.0));
-        v.uv       = vec2(tx, ty);
+        if (id < baseVertCount)
+        {
+            // --- BASE (Y = 0, orientée vers le bas) ---
+            uint col = id % baseColumns;
+            uint row = id / baseColumns;
+            float tx = float(col) / float(widthSegments);
+            float tz = float(row) / float(depthSegments);
+            
+            v.position = vec3(mix(-width * 0.5, width * 0.5, tx), 0.0, mix(-depth * 0.5, depth * 0.5, tz));
+            v.normal   = vec3(0.0, -1.0, 0.0);
+            v.uv       = vec2(tx, tz);
+        }
+        else if (id < baseVertCount + sideZVerts)
+        {
+            // --- FACE +Z (Pente vers le haut) ---
+            uint local = id - baseVertCount;
+            uint col = local % sideZCols;
+            uint row = local / sideZCols;
+            float tx = float(col) / float(widthSegments);
+            float ty = float(row) / float(heightSegments);
+            
+            // Pincement linéaire des coordonnées X et Z vers l'apex
+            float factor = 1.0 - ty;
+            v.position = vec3(
+                mix(-width * 0.5, width * 0.5, tx) * factor,
+                ty * height,
+                (depth * 0.5) * factor
+            );
+            // Calcul mathématique exact de la normale de la pente
+            float slopeAngleX = atan(height, depth * 0.5);
+            v.normal = normalize(vec3(0.0, cos(slopeAngleX), sin(slopeAngleX)));
+            v.uv = vec2(tx, ty);
+        }
+        else if (id < baseVertCount + 2u * sideZVerts)
+        {
+            // --- FACE -Z (Pente vers le haut) ---
+            uint local = id - (baseVertCount + sideZVerts);
+            uint col = local % sideZCols;
+            uint row = local / sideZCols;
+            float tx = float(col) / float(widthSegments);
+            float ty = float(row) / float(heightSegments);
+            
+            float factor = 1.0 - ty;
+            v.position = vec3(
+                mix(width * 0.5, -width * 0.5, tx) * factor,
+                ty * height,
+                (-depth * 0.5) * factor
+            );
+            float slopeAngleX = atan(height, depth * 0.5);
+            v.normal = normalize(vec3(0.0, cos(slopeAngleX), -sin(slopeAngleX)));
+            v.uv = vec2(tx, ty);
+        }
+        else if (id < baseVertCount + 2u * sideZVerts + sideXVerts)
+        {
+            // --- FACE +X (Pente vers le haut) ---
+            uint local = id - (baseVertCount + 2u * sideZVerts);
+            uint col = local % sideXCols;
+            uint row = local / sideXCols;
+            float tx = float(col) / float(depthSegments);
+            float ty = float(row) / float(heightSegments);
+            
+            float factor = 1.0 - ty;
+            v.position = vec3(
+                (width * 0.5) * factor,
+                ty * height,
+                mix(depth * 0.5, -depth * 0.5, tx) * factor
+            );
+            float slopeAngleZ = atan(height, width * 0.5);
+            v.normal = normalize(vec3(sin(slopeAngleZ), cos(slopeAngleZ), 0.0));
+            v.uv = vec2(tx, ty);
+        }
+        else
+        {
+            // --- FACE -X (Pente vers le haut) ---
+            uint local = id - (baseVertCount + 2u * sideZVerts + sideXVerts);
+            uint col = local % sideXCols;
+            uint row = local / sideXCols;
+            float tx = float(col) / float(depthSegments);
+            float ty = float(row) / float(heightSegments);
+            
+            float factor = 1.0 - ty;
+            v.position = vec3(
+                (-width * 0.5) * factor,
+                ty * height,
+                mix(-depth * 0.5, depth * 0.5, tx) * factor
+            );
+            float slopeAngleZ = atan(height, width * 0.5);
+            v.normal = normalize(vec3(-sin(slopeAngleZ), cos(slopeAngleZ), 0.0));
+            v.uv = vec2(tx, ty);
+        }
+
+        v.uv2 = v.uv;
+        v.position += vec3(worldOffsetX, worldOffsetY, worldOffsetZ);
+        vertices[vertexOffset + id] = v;
     }
 
-    v.uv2 = v.uv;
-    v.position += vec3(worldOffsetX, worldOffsetY, worldOffsetZ);
-    vertices[vertexOffset + id] = v;
-
-    // -------------------------------------------------------------------------
-    // INDEX GENERATION (One thread per quad)
-    // -------------------------------------------------------------------------
+    // Étape 2 : Génération des Indices (sécurisée par face pour éviter l'écriture hors-limites)
     uint baseQuads = widthSegments * depthSegments;
     uint sideZQuads = widthSegments * heightSegments;
     uint sideXQuads = depthSegments * heightSegments;
 
+    // Indices Base (Uniquement si le thread gère un quad de la base)
     if (id < baseQuads)
     {
-        // Base Face Indices (pointing downwards, so Y-normal is negative)
         uint col = id % widthSegments;
         uint row = id / widthSegments;
         uint b0 = row * baseColumns + col;
         uint b1 = b0 + 1u;
         uint t0 = (row + 1u) * baseColumns + col;
         uint t1 = t0 + 1u;
+        
         uint tIdx = indexOffset + id * 6u;
+        // Inversion de l'enroulement (CCW vu du dessous) pour éviter le culling
         indices[tIdx + 0u] = vertexOffset + b0;
-        indices[tIdx + 1u] = vertexOffset + b1;
-        indices[tIdx + 2u] = vertexOffset + t1;
+        indices[tIdx + 1u] = vertexOffset + t1;
+        indices[tIdx + 2u] = vertexOffset + b1;
         indices[tIdx + 3u] = vertexOffset + b0;
-        indices[tIdx + 4u] = vertexOffset + t1;
-        indices[tIdx + 5u] = vertexOffset + t0;
+        indices[tIdx + 4u] = vertexOffset + t0;
+        indices[tIdx + 5u] = vertexOffset + t1;
     }
 
+    // Indices +Z Face
     uint sideZ1_IndexOffset = baseQuads * 6u;
     if (id < sideZQuads)
     {
@@ -179,6 +191,7 @@ void main()
         uint b1 = b0 + 1u;
         uint t0 = baseOffset + (row + 1u) * sideZCols + col;
         uint t1 = t0 + 1u;
+        
         uint tIdx = indexOffset + sideZ1_IndexOffset + id * 6u;
         indices[tIdx + 0u] = vertexOffset + b0;
         indices[tIdx + 1u] = vertexOffset + t1;
@@ -188,6 +201,7 @@ void main()
         indices[tIdx + 5u] = vertexOffset + t1;
     }
 
+    // Indices -Z Face
     uint sideZ2_IndexOffset = sideZ1_IndexOffset + sideZQuads * 6u;
     if (id < sideZQuads)
     {
@@ -198,6 +212,7 @@ void main()
         uint b1 = b0 + 1u;
         uint t0 = baseOffset + (row + 1u) * sideZCols + col;
         uint t1 = t0 + 1u;
+        
         uint tIdx = indexOffset + sideZ2_IndexOffset + id * 6u;
         indices[tIdx + 0u] = vertexOffset + b0;
         indices[tIdx + 1u] = vertexOffset + b1;
@@ -207,6 +222,7 @@ void main()
         indices[tIdx + 5u] = vertexOffset + t0;
     }
 
+    // Indices +X Face
     uint sideX1_IndexOffset = sideZ2_IndexOffset + sideZQuads * 6u;
     if (id < sideXQuads)
     {
@@ -217,6 +233,7 @@ void main()
         uint b1 = b0 + 1u;
         uint t0 = baseOffset + (row + 1u) * sideXCols + col;
         uint t1 = t0 + 1u;
+        
         uint tIdx = indexOffset + sideX1_IndexOffset + id * 6u;
         indices[tIdx + 0u] = vertexOffset + b0;
         indices[tIdx + 1u] = vertexOffset + t1;
@@ -226,6 +243,7 @@ void main()
         indices[tIdx + 5u] = vertexOffset + t1;
     }
 
+    // Indices -X Face
     uint sideX2_IndexOffset = sideX1_IndexOffset + sideXQuads * 6u;
     if (id < sideXQuads)
     {
@@ -236,6 +254,7 @@ void main()
         uint b1 = b0 + 1u;
         uint t0 = baseOffset + (row + 1u) * sideXCols + col;
         uint t1 = t0 + 1u;
+        
         uint tIdx = indexOffset + sideX2_IndexOffset + id * 6u;
         indices[tIdx + 0u] = vertexOffset + b0;
         indices[tIdx + 1u] = vertexOffset + b1;

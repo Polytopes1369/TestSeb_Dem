@@ -1,25 +1,12 @@
 {
   "permissions": {
-    "allow": [
-      "Read(//d/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026-ssrt-atrous-worldprobes-worktree/**)",
-      "Skill(run)",
-      "Skill(run:*)"
-    ],
     "deny": [
-      "Bash(rm *)",
+      "Bash(git push * --delete)",
+      "Bash(git push * -d)",
       "Bash(git rm *)",
-      "Bash(rmdir *)"
+      "Bash(git branch -D *)",
+      "Bash(git branch -d *)"
     ],
-    "additionalDirectories": [
-      "d:\\DemoScene\\DemoScene_Vulkan2026_BaseArchi\\DemoScene_2026-lumen-integration-worktree\\src\\core",
-      "d:\\DemoScene\\DemoScene_Vulkan2026_BaseArchi\\DemoScene_2026-lumen-integration-worktree\\src\\renderer",
-      "d:\\DemoScene\\DemoScene_Vulkan2026_BaseArchi\\DemoScene_2026-lumen-integration-worktree\\src",
-      "d:\\DemoScene\\DemoScene_Vulkan2026_BaseArchi\\DemoScene_2026-ssrt-atrous-worldprobes-worktree\\src\\renderer",
-      "d:\\DemoScene\\DemoScene_Vulkan2026_BaseArchi\\DemoScene_2026-ssrt-atrous-worldprobes-worktree\\src\\shaders\\src\\Renderer",
-      "d:\\DemoScene\\DemoScene_Vulkan2026_BaseArchi\\DemoScene_2026-ssrt-atrous-worldprobes-worktree\\src\\shaders\\include",
-      "d:\\DemoScene\\DemoScene_Vulkan2026_BaseArchi\\DemoScene_2026-ssrt-atrous-worldprobes-worktree\\src\\shaders\\src\\GI",
-      "d:\\DemoScene\\DemoScene_Vulkan2026_BaseArchi\\DemoScene_2026-ssrt-atrous-worldprobes-worktree\\src\\core\\maths",
-      "d:\\DemoScene\\DemoScene_Vulkan2026_BaseArchi\\DemoScene_2026-ssrt-atrous-worldprobes-worktree"
-    ]
+    "defaultMode": "auto"
   }
 }

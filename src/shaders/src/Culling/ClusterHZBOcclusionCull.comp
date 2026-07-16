@@ -75,6 +75,7 @@
 
 #include "include/cluster_culling_common.glsl"
 #include "include/cluster_culling_tests.glsl"
+#include "include/cluster_entity_transform.glsl"
 
 #define HZB_TEXTURE_SET 0
 #define HZB_TEXTURE_BINDING 3
@@ -182,6 +183,10 @@ layout(std430, set = 0, binding = 16) buffer SoftwareClusterListOpaqueSSBO {
     uint clusterIndex[];
 } g_SoftwareClusterListOpaque;
 
+layout(std430, set = 0, binding = 17) readonly buffer EntityTransformBuffer {
+    EntityTransform entityTransforms[];
+};
+
 layout(push_constant) uniform ClusterOcclusionPushConstants {
     // Average estimated triangle screen size (pixels) below which a cluster is routed to the
     // software rasterizer instead of a hardware indirect draw -- see ShouldUseSoftwareRaster().
@@ -227,6 +232,21 @@ void EmitSoftwareCluster(ClusterCullMetadata cluster, uint clusterSlotIndex) {
 }
 
 layout(local_size_x = 64) in;
+
+// Rotates a LOCAL copy's culling-relevant fields (boundsMin/boundsMax/sphereCenter/coneAxis) into
+// the owning entity's CURRENT orientation, in place. Deliberately never writes back to
+// g_Clusters (the SSBO) -- ClusterRaster.vert re-reads that same buffer independently to
+// dequantize this cluster's vertex positions using boundsMin/boundsMax as the ORIGINAL, rest-pose
+// range those positions were encoded against; rotating the persisted copy would desync the decode
+// range from the encoded data and scramble every vertex in the cluster. Every caller here only
+// ever culls with the returned local copy, never the SSBO original. See
+// cluster_entity_transform.glsl for the transform formulas themselves.
+void RotateClusterToCurrentPose(inout ClusterCullMetadata cluster) {
+    EntityTransform xform = entityTransforms[cluster.entityID];
+    TransformClusterBoundsByEntity(cluster.boundsMin, cluster.boundsMax, xform);
+    cluster.sphereCenter = TransformClusterCenterByEntity(cluster.sphereCenter, xform);
+    cluster.coneAxis = TransformClusterDirectionByEntity(cluster.coneAxis, xform);
+}
 
 // Compacts one surviving cluster's draw into the early or late indirect command buffer via that
 // buffer's own atomic counter -- exactly ClusterFrustumCull.comp's compaction pattern, duplicated
@@ -290,6 +310,7 @@ void main() {
 
         uint clusterIndex = g_PendingList.clusterIndex[pendingSlot];
         ClusterCullMetadata cluster = g_Clusters.clusters[clusterIndex];
+        RotateClusterToCurrentPose(cluster);
         InflateBoundsForWPO(cluster.boundsMin, cluster.boundsMax, cluster.sphereRadius, cluster.maxWPOAmplitude);
 
         bool occluded = IsClusterOccluded(cluster.boundsMin, cluster.boundsMax,
@@ -320,6 +341,7 @@ void main() {
         }
 
         ClusterCullMetadata cluster = g_Clusters.clusters[clusterIndex];
+        RotateClusterToCurrentPose(cluster);
         InflateBoundsForWPO(cluster.boundsMin, cluster.boundsMax, cluster.sphereRadius, cluster.maxWPOAmplitude);
 
         // Frustum + backface: a rejection here holds for the whole frame (both passes), so the

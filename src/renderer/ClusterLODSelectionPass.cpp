@@ -3,6 +3,9 @@
 #include <cstring>
 #include <format>
 #include <stdexcept>
+#ifndef NDEBUG
+#include <unordered_map>
+#endif
 
 #include "core/Logger.h"
 #include "geometry/ClusterDAG.h" // geometry::kInvalidClusterID
@@ -31,7 +34,7 @@ namespace renderer {
     } // namespace
 
     void ClusterLODSelectionPass::Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
-        VkBuffer pageTableBuffer, uint32_t leafCount,
+        VkBuffer pageTableBuffer, VkBuffer entityTransformBuffer, uint32_t leafCount,
         const std::vector<geometry::ClusterIndexEntry>& indexEntries,
         const std::vector<geometry::DAGNodeEntry>& dagEntries,
         VkBuffer entityDataBuffer) {
@@ -75,6 +78,18 @@ namespace renderer {
             node.clusterError = dagNode.clusterError;
             node.parentError = dagNode.parentError;
             node.maxWPOAmplitude = entry.maxWPOAmplitude;
+            node.entityID = entry.entityID;
+            // Read directly from the fully-populated INPUT indexEntries vector (not the `dagNodes`
+            // vector this same loop is still building) -- parentClusterID commonly points forward
+            // (a leaf's parent sits at a higher, not-yet-processed index in this loop, since level-0
+            // leaves are assigned the lowest clusterIDs), so `dagNodes[parentClusterID]` would not
+            // yet be initialized if read here instead. See ClusterDAGScreenError.comp's
+            // DAGNodePayload::parentSphereCenter comment for why this field exists.
+            node.parentSphereCenter = (dagNode.parentClusterID != geometry::kInvalidClusterID)
+                ? maths::vec3{ indexEntries[dagNode.parentClusterID].sphereCenter[0],
+                               indexEntries[dagNode.parentClusterID].sphereCenter[1],
+                               indexEntries[dagNode.parentClusterID].sphereCenter[2] }
+                : maths::vec3{};
 
             LODNodeMetadata& lodNode = lodNodes[i];
             lodNode.boundsMin = boundsMin;
@@ -93,6 +108,12 @@ namespace renderer {
             lodNode.materialID = entry.materialID;
         }
 
+#ifndef NDEBUG
+        // Retain a CPU-side copy purely for DebugLogDAGCutGaps()'s ancestor walk -- see this
+        // class's own header comment. Never referenced by any GPU-facing code path.
+        m_DebugDagNodesCopy = dagNodes;
+#endif
+
         // =====================================================================================
         // Buffers.
         // =====================================================================================
@@ -100,8 +121,16 @@ namespace renderer {
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
         m_LODNodeMetadataBuffer.Create(allocator, static_cast<VkDeviceSize>(sizeof(LODNodeMetadata)) * m_TotalNodeCount,
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
+        // TRANSFER_SRC_BIT is only ever needed by RecordDebugReadback() (Debug-only, see this
+        // class's own comment) -- adding it unconditionally in Release would cost nothing
+        // functionally, but keeping it Debug-gated matches this codebase's "zero debug footprint
+        // in Release" rule at the bit-flag level too.
+        VkBufferUsageFlags decisionBufferUsage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+#ifndef NDEBUG
+        decisionBufferUsage |= VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+#endif
         m_DAGDecisionBuffer.Create(allocator, static_cast<VkDeviceSize>(sizeof(uint32_t)) * m_TotalNodeCount,
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
+            decisionBufferUsage, VMA_MEMORY_USAGE_GPU_ONLY);
         m_DAGLocalErrorBuffer.Create(allocator, static_cast<VkDeviceSize>(sizeof(float)) * m_TotalNodeCount,
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
         m_DAGParentErrorBuffer.Create(allocator, static_cast<VkDeviceSize>(sizeof(float)) * m_TotalNodeCount,
@@ -116,6 +145,11 @@ namespace renderer {
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
         m_EarlyDispatchArgsBuffer.Create(allocator, sizeof(VkDispatchIndirectCommand),
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
+
+#ifndef NDEBUG
+        m_DebugDecisionReadbackBuffer.Create(allocator, static_cast<VkDeviceSize>(sizeof(uint32_t)) * m_TotalNodeCount,
+            VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_CPU_ONLY, /*mapped=*/true);
+#endif
 
         m_FeedbackBuffer.Init(allocator, m_TotalNodeCount);
 
@@ -168,7 +202,7 @@ namespace renderer {
         // Descriptor pool, shared by all 4 sets.
         // =====================================================================================
         VkDescriptorPoolSize poolSizes[2]{};
-        poolSizes[0] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4 + 5 + 7 + 2 }; // ScreenError + Fallback + Compact + BuildArgs SSBOs.
+        poolSizes[0] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 5 + 5 + 7 + 2 }; // ScreenError + Fallback + Compact + BuildArgs SSBOs (ScreenError gained an EntityTransformBuffer binding for its rotated-sphereCenter LOD estimate; Compact gained an EntityDataBuffer binding for transparent-entity exclusion).
         poolSizes[1] = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 };            // DAGViewParamsUBO.
 
         VkDescriptorPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
@@ -181,15 +215,16 @@ namespace renderer {
         // Set 1 / Pipeline 1: ClusterDAGScreenError.comp -- bindings 0..4.
         // =====================================================================================
         {
-            VkDescriptorSetLayoutBinding bindings[5]{};
+            VkDescriptorSetLayoutBinding bindings[6]{};
             bindings[0] = { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // DAGNodesSSBO
             bindings[1] = { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // DAGDecisionSSBO
             bindings[2] = { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // DAGLocalErrorSSBO
             bindings[3] = { 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // DAGParentErrorSSBO
             bindings[4] = { 4, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // DAGViewParamsUBO
+            bindings[5] = { 5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // EntityTransformBuffer
 
             VkDescriptorSetLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-            layoutInfo.bindingCount = 5;
+            layoutInfo.bindingCount = 6;
             layoutInfo.pBindings = bindings;
             VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &layoutInfo, nullptr, &m_ScreenErrorSetLayout));
 
@@ -204,14 +239,16 @@ namespace renderer {
             VkDescriptorBufferInfo localErrorInfo{ m_DAGLocalErrorBuffer.Handle(), 0, m_DAGLocalErrorBuffer.Size() };
             VkDescriptorBufferInfo parentErrorInfo{ m_DAGParentErrorBuffer.Handle(), 0, m_DAGParentErrorBuffer.Size() };
             VkDescriptorBufferInfo viewParamsInfo{ m_ViewParamsBuffer.Handle(), 0, m_ViewParamsBuffer.Size() };
+            VkDescriptorBufferInfo entityTransformInfo{ entityTransformBuffer, 0, VK_WHOLE_SIZE };
 
-            VkWriteDescriptorSet writes[5]{};
+            VkWriteDescriptorSet writes[6]{};
             writes[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ScreenErrorDescriptorSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &dagNodesInfo, nullptr };
             writes[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ScreenErrorDescriptorSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &decisionInfo, nullptr };
             writes[2] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ScreenErrorDescriptorSet, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &localErrorInfo, nullptr };
             writes[3] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ScreenErrorDescriptorSet, 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &parentErrorInfo, nullptr };
             writes[4] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ScreenErrorDescriptorSet, 4, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &viewParamsInfo, nullptr };
-            vkUpdateDescriptorSets(m_Device, 5, writes, 0, nullptr);
+            writes[5] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ScreenErrorDescriptorSet, 5, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &entityTransformInfo, nullptr };
+            vkUpdateDescriptorSets(m_Device, 6, writes, 0, nullptr);
 
             VkPipelineLayoutCreateInfo pipelineLayoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
             pipelineLayoutInfo.setLayoutCount = 1;
@@ -426,6 +463,11 @@ namespace renderer {
         m_CandidateCountBuffer.Destroy();
         m_EarlyDispatchArgsBuffer.Destroy();
 
+#ifndef NDEBUG
+        m_DebugDecisionReadbackBuffer.Destroy();
+        m_DebugDagNodesCopy.clear();
+#endif
+
         m_TotalNodeCount = 0;
         m_LeafCount = 0;
         m_Allocator = VK_NULL_HANDLE;
@@ -557,5 +599,140 @@ namespace renderer {
         depInfo.pMemoryBarriers = &barrier;
         vkCmdPipelineBarrier2(cmd, &depInfo);
     }
+
+#ifndef NDEBUG
+    void ClusterLODSelectionPass::RecordDebugReadback(VkCommandBuffer cmd) {
+        // Barrier #1: this frame's ClusterDAGScreenError.comp writes into m_DAGDecisionBuffer must
+        // complete and be visible before the copy reads it.
+        VkMemoryBarrier2 preCopyBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+        preCopyBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        preCopyBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+        preCopyBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+        preCopyBarrier.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+
+        VkDependencyInfo preCopyDependency{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+        preCopyDependency.memoryBarrierCount = 1;
+        preCopyDependency.pMemoryBarriers = &preCopyBarrier;
+        vkCmdPipelineBarrier2(cmd, &preCopyDependency);
+
+        VkBufferCopy copyRegion{ 0, 0, m_DAGDecisionBuffer.Size() };
+        vkCmdCopyBuffer(cmd, m_DAGDecisionBuffer.Handle(), m_DebugDecisionReadbackBuffer.Handle(), 1, &copyRegion);
+
+        // Barrier #2: exactly renderer::FeedbackBuffer::RecordReadback()'s own host-visibility
+        // barrier -- HOST_COHERENT memory still requires this execution/visibility dependency
+        // before a host read, per the Vulkan spec.
+        VkMemoryBarrier2 postCopyBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+        postCopyBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+        postCopyBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        postCopyBarrier.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT;
+        postCopyBarrier.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT;
+
+        VkDependencyInfo postCopyDependency{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+        postCopyDependency.memoryBarrierCount = 1;
+        postCopyDependency.pMemoryBarriers = &postCopyBarrier;
+        vkCmdPipelineBarrier2(cmd, &postCopyDependency);
+    }
+
+    void ClusterLODSelectionPass::DebugLogDAGCutGaps() const {
+        constexpr uint32_t kDagDecisionDraw = 0u; // Matches DAG_DECISION_DRAW in ClusterDAGScreenError.comp.
+
+        const uint32_t* decisions = static_cast<const uint32_t*>(m_DebugDecisionReadbackBuffer.MappedData());
+        if (decisions == nullptr || m_DebugDagNodesCopy.size() != m_TotalNodeCount) {
+            LOG_WARNING("[ClusterLODSelectionPass][DebugDAGCutGaps] No data to analyze yet (readback not recorded, or Init() not called).");
+            return;
+        }
+
+        struct EntityGapStats {
+            uint32_t leafCount = 0;
+            uint32_t gapCount = 0; // Leaves whose entire ancestor chain has zero DRAW decisions.
+            std::vector<uint32_t> exampleGapClusterIDs; // First few, for logging.
+        };
+        std::unordered_map<uint32_t, EntityGapStats> statsByEntity;
+
+        for (uint32_t i = 0; i < m_TotalNodeCount; ++i) {
+            const DAGNodePayload& node = m_DebugDagNodesCopy[i];
+            bool isLeaf = node.childClusterID0 == geometry::kInvalidClusterID && node.childClusterID1 == geometry::kInvalidClusterID;
+            if (!isLeaf) {
+                continue;
+            }
+
+            EntityGapStats& stats = statsByEntity[node.entityID];
+            ++stats.leafCount;
+
+            // Walk this leaf's own node and every ancestor up to the root, looking for a single
+            // DRAW decision anywhere on the path. Bounded by m_TotalNodeCount as a hard safety cap
+            // (the DAG is acyclic by construction/ValidateClusterDAG, so this should never actually
+            // be reached) rather than trusting an unbounded while(true) on data this debug tool
+            // itself must remain robust against if the DAG were ever corrupt.
+            bool foundDraw = false;
+            uint32_t currentIndex = i;
+            for (uint32_t step = 0; step < m_TotalNodeCount; ++step) {
+                if (decisions[currentIndex] == kDagDecisionDraw) {
+                    foundDraw = true;
+                    break;
+                }
+                uint32_t parentClusterID = m_DebugDagNodesCopy[currentIndex].parentClusterID;
+                if (parentClusterID == geometry::kInvalidClusterID) {
+                    break; // Reached the root without finding a DRAW decision.
+                }
+                currentIndex = parentClusterID;
+            }
+
+            if (!foundDraw) {
+                ++stats.gapCount;
+                if (stats.exampleGapClusterIDs.size() < 5) {
+                    stats.exampleGapClusterIDs.push_back(node.clusterID);
+                }
+            }
+        }
+
+        uint32_t totalLeaves = 0;
+        uint32_t totalGaps = 0;
+        for (const auto& [entityID, stats] : statsByEntity) {
+            totalLeaves += stats.leafCount;
+            totalGaps += stats.gapCount;
+            if (stats.gapCount == 0) {
+                continue;
+            }
+
+            std::string exampleList;
+            for (uint32_t clusterID : stats.exampleGapClusterIDs) {
+                const DAGNodePayload& node = m_DebugDagNodesCopy[clusterID];
+                exampleList += std::format("  clusterID={} level={} sphereCenter=({:.3f},{:.3f},{:.3f}) sphereRadius={:.3f} clusterError={:.6f} parentError={:.6f}\n",
+                    clusterID, node.level, node.sphereCenter.x, node.sphereCenter.y, node.sphereCenter.z, node.sphereRadius,
+                    node.clusterError, node.parentError);
+            }
+
+            // Full leaf-to-root decision chain for the FIRST example only (kept to one to bound
+            // log size) -- decision values: 0=DRAW, 1=SUBDIVIDE, 2=SKIP (DAG_DECISION_* in
+            // ClusterDAGScreenError.comp). Directly shows WHY no node on the path ever satisfies
+            // the DRAW condition (e.g. every node stuck at SUBDIVIDE, or a monotonicity break).
+            std::string chainDump;
+            if (!stats.exampleGapClusterIDs.empty()) {
+                uint32_t chainIndex = stats.exampleGapClusterIDs[0];
+                for (uint32_t step = 0; step < m_TotalNodeCount; ++step) {
+                    const DAGNodePayload& chainNode = m_DebugDagNodesCopy[chainIndex];
+                    chainDump += std::format("    [{}] clusterID={} level={} decision={} clusterError={:.6f} parentError={:.6f} parentClusterID={}\n",
+                        step, chainIndex, chainNode.level, decisions[chainIndex],
+                        chainNode.clusterError, chainNode.parentError,
+                        chainNode.parentClusterID == geometry::kInvalidClusterID ? -1 : static_cast<int32_t>(chainNode.parentClusterID));
+                    if (chainNode.parentClusterID == geometry::kInvalidClusterID) {
+                        break;
+                    }
+                    chainIndex = chainNode.parentClusterID;
+                }
+            }
+
+            LOG_WARNING(std::format(
+                "[ClusterLODSelectionPass][DebugDAGCutGaps] entityID={}: {}/{} leaves have NO DRAW decision anywhere on their leaf-to-root path (a genuine DAG-cut gap -- RequestClusterResidency() is never called for these, so they never even enter the streaming queue). Examples:\n{}\nFull chain for first example:\n{}",
+                entityID, stats.gapCount, stats.leafCount, exampleList, chainDump));
+        }
+
+        LOG_INFO(std::format(
+            "[ClusterLODSelectionPass][DebugDAGCutGaps] Analyzed {} entities, {} total leaves, {} total gap leaves ({:.2f}%).",
+            statsByEntity.size(), totalLeaves, totalGaps,
+            totalLeaves > 0 ? (100.0 * static_cast<double>(totalGaps) / static_cast<double>(totalLeaves)) : 0.0));
+    }
+#endif
 
 }

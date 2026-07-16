@@ -229,6 +229,25 @@ namespace renderer {
         // SetDebugSSRTEnabled/SetDebugRadiosityEnabled's own Release-always-on convention, not
         // SetDebugWorldProbesEnabled's Release-always-off one).
         void SetDebugReflectionsEnabled(bool enabled) { m_DebugReflectionsEnabled = enabled; }
+
+        // Investigating the 2026-07-16 "persistent holes" bug (see project memory
+        // project_persistent_cluster_holes_open_bug.md / ClusterLODSelectionPass::
+        // DebugLogDAGCutGaps()'s own doc comment for the full analysis this triggers). Call once
+        // from main.cpp's 'K' key handler: arms a one-shot dump that RecordFrame() records THIS
+        // frame (m_LODSelection.RecordDebugReadback()), then main.cpp calls
+        // PumpDebugDAGCutGapsDump() at the top of the NEXT frame (after that frame's fence has
+        // been waited on, guaranteeing the readback landed) to actually log it.
+        void RequestDebugDAGCutGapsDump() { m_DebugDAGCutGapsDumpState = 1; }
+
+        // See RequestDebugDAGCutGapsDump()'s doc comment -- must be called once per frame, after
+        // this frame's own frameFence wait, before RecordFrame(). A no-op unless a dump is
+        // actually pending.
+        void PumpDebugDAGCutGapsDump() {
+            if (m_DebugDAGCutGapsDumpState == 2) {
+                m_LODSelection.DebugLogDAGCutGaps();
+                m_DebugDAGCutGapsDumpState = 0;
+            }
+        }
 #endif
 
     private:
@@ -393,6 +412,11 @@ namespace renderer {
         // Release hardcodes the equivalent local to true (matching m_DebugSSRTEnabled's own
         // Release-always-on convention), since this pass has a real live consumer already.
         bool m_DebugReflectionsEnabled = true;
+
+        // See RequestDebugDAGCutGapsDump()'s own comment: 0 = idle, 1 = "record the readback this
+        // frame" (set by main.cpp's 'K' key), 2 = "readback landed, safe to log now" (set by
+        // RecordFrame() right after it records the copy, consumed by PumpDebugDAGCutGapsDump()).
+        uint32_t m_DebugDAGCutGapsDumpState = 0;
 #endif
 
 #ifndef NDEBUG

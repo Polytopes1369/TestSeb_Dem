@@ -39,6 +39,10 @@ struct DebugState {
     // its cost/contribution can be A/B'd, same as ssrtEnabled above (this pass has a real live
     // consumer from its first frame, unlike worldProbesEnabled).
     bool reflectionsEnabled = true;
+    // Set by the 'K' key, consumed (and reset) once per frame by the main loop, which calls
+    // renderer::ClusterRenderPipeline::RequestDebugDAGCutGapsDump() -- see that method's own
+    // comment for the investigation this is part of.
+    bool dumpDAGCutGapsRequested = false;
 };
 static DebugState g_DebugState;
 
@@ -133,6 +137,13 @@ static void KeyCallback(GLFWwindow* window, int key, int scancode, int action, i
         // instead -- 'M' for shadow "Map" cascades.
         g_DebugState.viewMode = DEBUG_VIEW_SHADOW_CASCADES;
         LOG_INFO("[Debug] View Mode: SHADOW CASCADES");
+        break;
+    case GLFW_KEY_K:
+        // See renderer::ClusterRenderPipeline::RequestDebugDAGCutGapsDump()'s own comment: this
+        // one-shot dump walks every leaf's ancestor chain looking for DAG-cut regions with zero
+        // DRAW decisions anywhere -- the 2026-07-16 "persistent holes" investigation.
+        g_DebugState.dumpDAGCutGapsRequested = true;
+        LOG_INFO("[Debug] Requested DAG-cut gap dump (logged via LOG_WARNING/LOG_INFO in ~2 frames).");
         break;
     default:
         break;
@@ -275,6 +286,10 @@ int main() {
         clusterPipeline.SetDebugSSRTEnabled(g_DebugState.ssrtEnabled);
         clusterPipeline.SetDebugWorldProbesEnabled(g_DebugState.worldProbesEnabled);
         clusterPipeline.SetDebugReflectionsEnabled(g_DebugState.reflectionsEnabled);
+        if (g_DebugState.dumpDAGCutGapsRequested) {
+            clusterPipeline.RequestDebugDAGCutGapsDump();
+            g_DebugState.dumpDAGCutGapsRequested = false;
+        }
 #endif
 
         // --- DEBUG: dump the camera position and the resulting view/proj matrices on the
@@ -330,6 +345,12 @@ int main() {
         // straight through.
         VK_CHECK(vkWaitForFences(vkContext.GetDevice(), 1, &frameFence, VK_TRUE, UINT64_MAX));
         VK_CHECK(vkResetFences(vkContext.GetDevice(), 1, &frameFence));
+
+#ifndef NDEBUG
+        // Must run right after the fence wait above: guarantees the previous frame's
+        // RecordDebugReadback() copy (if any) has actually completed before we read it.
+        clusterPipeline.PumpDebugDAGCutGapsDump();
+#endif
 
         uint32_t imageIndex;
         vkAcquireNextImageKHR(vkContext.GetDevice(), vkContext.GetSwapchain(),

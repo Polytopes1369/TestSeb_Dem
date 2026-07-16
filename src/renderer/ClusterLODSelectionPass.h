@@ -45,8 +45,8 @@ namespace renderer {
 
     // GLSL-friendly, std430-compatible mirror of DAGNodePayload in ClusterDAGScreenError.comp.
     // Field order matches that struct exactly (sphereCenter first so every following scalar packs
-    // tightly with zero implicit padding -- see that shader's own comment) -- 48 bytes, already a
-    // multiple of its own 16-byte array stride, so no manual trailing pad is needed here either.
+    // tightly with zero implicit padding -- see that shader's own comment). entityID's trailing
+    // 3x uint32 pad rounds the struct up to 64 bytes, its actual std430 array stride.
     struct DAGNodePayload {
         maths::vec3 sphereCenter;
         float sphereRadius = 0.0f;
@@ -60,8 +60,25 @@ namespace renderer {
         float clusterError = 0.0f;
         float parentError = 0.0f;
         float maxWPOAmplitude = 0.0f;
+
+        // geometry::ClusterIndexEntry::entityID -- the owning entity's meshID, used by
+        // ClusterDAGScreenError.comp to rotate sphereCenter/parentSphereCenter into their current
+        // (not rest-pose) world positions before projecting error to pixels. See
+        // cluster_entity_transform.glsl.
+        uint32_t entityID = 0;
+        uint32_t _pad0 = 0;
+        uint32_t _pad1 = 0;
+        uint32_t _pad2 = 0;
+
+        // The DIRECT PARENT's own sphereCenter -- see ClusterDAGScreenError.comp's own comment on
+        // this field for why parentError must be projected from the parent's actual position
+        // rather than this node's (the bug behind the 2026-07-16 "persistent holes" investigation,
+        // project_persistent_cluster_holes_open_bug.md). {0,0,0} for a root node (parentError is
+        // +infinity there, so the position multiplying it is irrelevant).
+        maths::vec3 parentSphereCenter{};
+        float _pad3 = 0.0f;
     };
-    static_assert(sizeof(DAGNodePayload) == 48,
+    static_assert(sizeof(DAGNodePayload) == 80,
         "DAGNodePayload must match DAGNodePayload in ClusterDAGScreenError.comp exactly (std430 layout)");
 
     // GLSL-friendly, std430-compatible mirror of LODNodeMetadata in cluster_lod_node_metadata.glsl.
@@ -106,13 +123,17 @@ namespace renderer {
         // geometry::GpuPageTable::LogicalAddressToPageID() for each entry's logicalPageID).
         // `leafCount` sizes the candidate output buffer (a valid cut's simultaneous draw count
         // never exceeds the total leaf count). `pageTableBuffer` is
-        // renderer::GpuGeometryPagePool::GetPageTableBuffer().
-        // `entityDataBuffer` (renderer::VulkanContext's own, same handle ClusterResolvePass::Init
-        // receives) is bound read-only into ClusterLODCompact.comp's descriptor set (binding 6) so
-        // it can exclude core::EntityFlags::IsTransparent entities from this candidate list --
-        // see that shader's own comment.
+        // renderer::GpuGeometryPagePool::GetPageTableBuffer(). `entityTransformBuffer` is the same
+        // per-entity rotation buffer VulkanContext::UpdateEntityRotations() re-uploads every frame
+        // (VulkanContext::GetEntityTransformBuffer()) -- bound into the ScreenError and Compact
+        // passes so their cluster-bounds tests stay in sync with each entity's current rotation
+        // instead of its rest pose (see cluster_entity_transform.glsl). `entityDataBuffer`
+        // (renderer::VulkanContext's own, same handle ClusterResolvePass::Init receives) is bound
+        // read-only into ClusterLODCompact.comp's descriptor set (binding 6) so it can exclude
+        // core::EntityFlags::IsTransparent entities from this candidate list -- see that shader's
+        // own comment.
         void Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
-            VkBuffer pageTableBuffer, uint32_t leafCount,
+            VkBuffer pageTableBuffer, VkBuffer entityTransformBuffer, uint32_t leafCount,
             const std::vector<geometry::ClusterIndexEntry>& indexEntries,
             const std::vector<geometry::DAGNodeEntry>& dagEntries,
             VkBuffer entityDataBuffer);
@@ -153,6 +174,28 @@ namespace renderer {
         // this class only owns and clears it, it does not itself read it back.
         FeedbackBuffer& GetFeedbackBuffer() { return m_FeedbackBuffer; }
 
+#ifndef NDEBUG
+        // Investigating the 2026-07-16 "persistent holes" bug (see project memory
+        // project_persistent_cluster_holes_open_bug.md): copies this frame's DAGDecisionSSBO/
+        // ForceDrawSSBO into host-readable staging buffers. Call once per frame, after
+        // RecordEvaluateAndCompact() -- mirrors FeedbackBuffer::RecordReadback()'s one-frame-lag
+        // contract (main.cpp's single-frame-in-flight fence wait makes reading THIS copy safe at
+        // the start of the NEXT frame). Debug-only: entirely compiled out in Release (rule 8,
+        // CLAUDE.md) -- costs one extra readback + barrier pair per frame, never shipped.
+        void RecordDebugReadback(VkCommandBuffer cmd);
+
+        // Walks every leaf node (childClusterID0 == childClusterID1 == kInvalidClusterID) up its
+        // own parentClusterID chain to the DAG root, checking whether ANY node along that path
+        // has DAG_DECISION_DRAW this frame. A leaf whose entire ancestor chain has zero DRAW
+        // decisions represents a screen region with NO representative cluster at any LOD level --
+        // a genuine DAG-cut gap, independent of residency/streaming (RequestClusterResidency() is
+        // only ever called for DRAW-decided nodes, so a gap here means nothing was ever even
+        // requested for that region). Logs a per-entity gap count plus a handful of example
+        // clusterIDs/world positions for the worst-offending entity via the unified logger. Safe
+        // to call any time after RecordDebugReadback()'s data has landed (see that method's doc).
+        void DebugLogDAGCutGaps() const;
+#endif
+
     private:
         static constexpr uint32_t kWorkgroupSize = 64; // Matches every LOD shader's local_size_x.
 
@@ -173,6 +216,15 @@ namespace renderer {
         GpuBuffer m_CandidateMetadataBuffer; // ClusterCullMetadata[leafCount], std430, GPU_ONLY.
         GpuBuffer m_CandidateCountBuffer;    // single uint32 atomic counter, GPU_ONLY.
         GpuBuffer m_EarlyDispatchArgsBuffer; // VkDispatchIndirectCommand (3x uint32), GPU_ONLY.
+
+#ifndef NDEBUG
+        // DAG-cut gap investigation (see RecordDebugReadback()/DebugLogDAGCutGaps() above).
+        // m_DebugDagNodesCopy retains Init()'s local `dagNodes` vector (normally discarded once
+        // uploaded) purely so the CPU-side ancestor walk has parentClusterID/childClusterID0-1/
+        // entityID/sphereCenter to work with -- never touched by any GPU-facing code.
+        std::vector<DAGNodePayload> m_DebugDagNodesCopy;
+        GpuBuffer m_DebugDecisionReadbackBuffer; // uint[totalNodeCount], CPU_ONLY mapped -- mirrors m_DAGDecisionBuffer.
+#endif
 
         // Dispatch 1: ClusterDAGScreenError.comp.
         VkDescriptorSetLayout m_ScreenErrorSetLayout = VK_NULL_HANDLE;

@@ -1,0 +1,18 @@
+# Tout exclure par défaut
+*
+*/
+
+# Réautoriser explicitement les dossiers requis et leur contenu
+!src/
+!src/**
+!tests/
+!tests/**
+
+# Exclure les fichiers de build, temporaires ou volumineux générés dans ces dossiers (ajuste selon tes besoins)
+.git/
+.vs/
+bin/
+obj/
+*.exe
+*.pdb
+*.ilk

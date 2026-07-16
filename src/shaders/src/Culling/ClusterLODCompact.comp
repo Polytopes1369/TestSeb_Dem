@@ -83,6 +83,14 @@ void main() {
 
     uint physicalPageIndex = g_GeometryPageTable.physicalPageIndex[node.logicalPageID];
 
+    // NOTE: boundsMin/boundsMax are copied through UNCHANGED, in the entity's rest pose --
+    // ClusterRaster.vert's DecodeClusterPosition() uses these exact same two fields as the
+    // dequantization range for this cluster's compressed vertex positions (encoded at cache-build
+    // time against this same rest-pose box), so they must never be rotated/refit here or every
+    // vertex in the cluster decodes to a scrambled position. Cluster-bounds rotation for the
+    // downstream frustum/backface/occlusion tests happens locally inside ClusterFrustumCull.comp
+    // and ClusterHZBOcclusionCull.comp instead, on their own transient copies -- see
+    // cluster_entity_transform.glsl's own comment.
     ClusterCullMetadata meta;
     meta.boundsMin = node.boundsMin;
     meta.boundsMax = node.boundsMax;
