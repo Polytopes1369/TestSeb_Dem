@@ -1,5 +1,6 @@
 #include "renderer/ClusterRenderPipeline.h"
 
+#include <array>
 #include <cassert>
 #include <cmath>
 #include <cstring>
@@ -15,17 +16,31 @@
 
 namespace renderer {
 
+    namespace {
+
+        // Byte-for-byte mirror of the WPOGlobalsUBO block declared identically in ClusterRaster.vert
+        // and ClusterSoftwareRaster.comp (std140): a single float naturally needs no padding to reach
+        // a 16-byte size, but the trailing pad floats are declared explicitly anyway (matching this
+        // codebase's own convention, e.g. ClusterSoftwareRasterPass.cpp's SoftwareRasterViewParams)
+        // so the CPU-side struct's sizeof() stays an honest, self-documenting match for the UBO's
+        // actual GPU size.
+        struct WPOGlobalsUBO {
+            float globalTime = 0.0f;
+            float _pad0 = 0.0f;
+            float _pad1 = 0.0f;
+            float _pad2 = 0.0f;
+        };
+        static_assert(sizeof(WPOGlobalsUBO) == 16,
+            "WPOGlobalsUBO must match the WPOGlobalsUBO block in ClusterRaster.vert / ClusterSoftwareRaster.comp exactly (std140 layout)");
+
+    } // namespace
+
 bool ClusterRenderPipeline::Init(
     const ClusterRenderPipelineCreateInfo &createInfo) {
   Shutdown();
 
   m_Device = createInfo.device;
   m_RenderExtent = createInfo.renderExtent;
-#ifndef NDEBUG
-  m_Allocator = createInfo.allocator;
-  m_CommandPool = createInfo.commandPool;
-  m_Queue = createInfo.queue;
-#endif
   m_VisBufferClusterIDImage = createInfo.visBufferClusterIDImage;
   m_VisBufferClusterIDView = createInfo.visBufferClusterIDView;
   m_VisBufferTriangleIDImage = createInfo.visBufferTriangleIDImage;
@@ -127,7 +142,27 @@ bool ClusterRenderPipeline::Init(
     return false;
   }
 
+  // Per-frame GPU-driven LOD DAG cut, replacing the old CPU-baked "always DAG
+  // level 0" candidate list -- see ClusterLODSelectionPass's own class
+  // comment. Needs only the page table's buffer HANDLE (not yet-populated
+  // content -- STEP 4 below binds every page after this call) and the full
+  // index/DAG tables read in STEP 1.
+  m_LODSelection.Init(createInfo.device, createInfo.allocator,
+                      createInfo.commandPool, createInfo.queue,
+                      m_PagePool.GetPageTableBuffer(), leafCount, indexEntries,
+                      dagEntries);
+
+  // Wires the async streaming stack for real -- see GeometryStreamingCoordinator's own class
+  // comment. Needs only the cache file path (re-opened for unbuffered/overlapped reads,
+  // independent of the STEP 2/4 bulk-load path above, which already closed its own plain
+  // std::ifstream by this point) and its own copy of indexEntries (clusterID -> virtualAddress).
+  m_Streaming.Init(createInfo.device, createInfo.allocator,
+                   createInfo.cacheFilePath, indexEntries);
+
   m_OcclusionCulling.Init(createInfo.device, createInfo.allocator, leafCount,
+                          totalClusterCount,
+                          m_LODSelection.GetCandidateMetadataBuffer(),
+                          m_LODSelection.GetCandidateCountBuffer(),
                           m_HZB.GetFullView(), m_HZB.GetMipExtent(0),
                           m_HZB.GetMipLevelCount());
 
@@ -199,71 +234,33 @@ bool ClusterRenderPipeline::Init(
   LOG_INFO(
       "[ClusterRenderPipeline] All cluster pages streamed + decompressed.");
 
-  // =========================================================================================
-  // STEP 5 -- Build and upload the leaf clusters' culling metadata.
-  // firstIndex/vertexOffset follow GeometryDecompressionPass's documented
-  // physical-page-slot layout contract, which is exactly what
-  // ClusterRaster.vert / ClusterSoftwareRaster.comp decode back.
-  // =========================================================================================
-  std::vector<ClusterCullMetadata> metadata;
-  metadata.reserve(leafCount);
-  // DEBUG (temporary): ClusterCullMetadata deliberately has no entity ID field
-  // (the GPU culling/routing code never needs one), so this CPU-side shadow
-  // array -- index-aligned with `metadata`/the GPU cluster-slot indices -- is
-  // how the debug outcome histogram (see RecordFrame's periodic dump) maps a
-  // cluster slot back to which primitive it came from, using the same
-  // ClusterIndexEntry::entityID already read from disk.
-#ifndef NDEBUG
-  m_ClusterSlotToEntityID.reserve(leafCount);
-#endif
-  for (size_t i = 0; i < indexEntries.size(); ++i) {
-    if (dagEntries[i].level != 0) {
-      continue;
-    }
-    const geometry::ClusterIndexEntry &entry = indexEntries[i];
-    uint32_t physicalPage =
-        m_PagePool.GetPhysicalPageIndex(entry.virtualAddress);
-
-    ClusterCullMetadata meta{};
-    meta.boundsMin = {entry.boundsMin[0], entry.boundsMin[1],
-                      entry.boundsMin[2]};
-    meta.boundsMax = {entry.boundsMax[0], entry.boundsMax[1],
-                      entry.boundsMax[2]};
-    meta.sphereCenter = {entry.sphereCenter[0], entry.sphereCenter[1],
-                         entry.sphereCenter[2]};
-    meta.sphereRadius = entry.sphereRadius;
-    // Inverse of BuildIndexEntry's int8 quantization
-    // (VirtualGeometryCacheTest.cpp): the axis is re-normalized after
-    // dequantization since per-component rounding denormalizes it.
-    maths::vec3 coneAxis{entry.coneAxisX / 127.0f, entry.coneAxisY / 127.0f,
-                         entry.coneAxisZ / 127.0f};
-    meta.coneAxis = coneAxis.Normalize();
-    meta.coneCutoff = entry.coneCutoff / 127.0f;
-    meta.indexCount = entry.indexCount;
-    meta.firstIndex = physicalPage * geometry::kMaxClusterIndices;
-    meta.vertexOffset = physicalPage * geometry::kMaxClusterVertices;
-    meta.clusterID = entry.clusterID;
-    metadata.push_back(meta);
-#ifndef NDEBUG
-    m_ClusterSlotToEntityID.push_back(entry.entityID);
-#endif
-  }
-  m_ClusterCount = static_cast<uint32_t>(metadata.size());
-
-  m_OcclusionCulling.UploadClusterMetadata(createInfo.commandPool,
-                                           createInfo.queue, metadata);
-  LOG_INFO("[ClusterRenderPipeline] Culling metadata uploaded; initializing "
-           "raster/resolve passes...");
+  // Candidate metadata is now a per-frame GPU-computed LOD cut (m_LODSelection,
+  // wired above) instead of a CPU-baked upload -- m_ClusterCount is repurposed
+  // as an upper bound (the DAG's total leaf count), see GetClusterCount()'s doc.
+  m_ClusterCount = leafCount;
 
   // =========================================================================================
   // STEP 6 -- Initialize the hybrid rasterization + resolve stages against the
   // buffers the culling pass owns.
   // =========================================================================================
+  // WPOGlobalsUBO: 16 bytes, std140 (float globalTime + 3 pad floats) -- uploaded once per frame
+  // in RecordFrame(), read by both raster passes' vertex/compute shaders (wpo_deformation.glsl).
+  m_WPOGlobalsBuffer.Create(createInfo.allocator, sizeof(WPOGlobalsUBO),
+      VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+      VMA_MEMORY_USAGE_GPU_ONLY);
+
+  // Procedurally generates the bindless cutout mask array once, before any consumer pass below
+  // is initialized (each one binds GetMaskImageInfos() into its own descriptor set).
+  m_MaskGenerator.Init(createInfo.device, createInfo.allocator,
+                       createInfo.commandPool, createInfo.queue);
+
   std::array<VkFormat, 2> visBufferFormats{createInfo.visBufferFormat,
                                            createInfo.visBufferFormat};
   m_HardwareRaster.Init(createInfo.device,
                         m_OcclusionCulling.GetClusterMetadataBuffer(),
-                        m_PagePool.GetPhysicalPoolBuffer(), visBufferFormats,
+                        m_PagePool.GetPhysicalPoolBuffer(),
+                        m_WPOGlobalsBuffer.Handle(),
+                        m_MaskGenerator.GetMaskImageInfos(), visBufferFormats,
                         createInfo.depthFormat);
 
   m_SoftwareRaster.Init(createInfo.device, createInfo.allocator,
@@ -271,7 +268,10 @@ bool ClusterRenderPipeline::Init(
                         createInfo.renderExtent,
                         m_OcclusionCulling.GetClusterMetadataBuffer(),
                         m_PagePool.GetPhysicalPoolBuffer(),
-                        m_OcclusionCulling.GetSoftwareClusterListBuffer());
+                        m_OcclusionCulling.GetSoftwareClusterListBuffer(),
+                        m_OcclusionCulling.GetSoftwareClusterListOpaqueBuffer(),
+                        m_WPOGlobalsBuffer.Handle(),
+                        m_MaskGenerator.GetMaskImageInfos());
 
   m_Resolve.Init(
       createInfo.device, createInfo.allocator, createInfo.commandPool,
@@ -279,7 +279,32 @@ bool ClusterRenderPipeline::Init(
       m_OcclusionCulling.GetClusterMetadataBuffer(),
       m_PagePool.GetPhysicalPoolBuffer(), createInfo.visBufferClusterIDView,
       createInfo.visBufferTriangleIDView, createInfo.depthImageView,
-      m_SoftwareRaster.GetVisBufferAtomicView());
+      m_SoftwareRaster.GetVisBufferAtomicView(),
+      m_MaskGenerator.GetMaskImageInfos());
+
+#ifndef NDEBUG
+  // Debug-only stat overlay: triangle-count compute pass (reads ONLY m_OcclusionCulling's already-
+  // public, stable accessors -- both the masked and opaque list variants, see
+  // ClusterTriangleStatsPass's own class comment) + the bitmap-font text renderer drawing directly
+  // onto m_Resolve's own output color image.
+  m_Allocator = createInfo.allocator;
+  m_TriangleStats.Init(createInfo.device, createInfo.allocator,
+                       m_OcclusionCulling.GetMaxClusters(),
+                       m_OcclusionCulling.GetClusterMetadataBuffer(),
+                       m_OcclusionCulling.GetEarlyIndirectCommandBuffer(),
+                       m_OcclusionCulling.GetEarlyDrawCountBuffer(),
+                       m_OcclusionCulling.GetLateIndirectCommandBuffer(),
+                       m_OcclusionCulling.GetLateDrawCountBuffer(),
+                       m_OcclusionCulling.GetSoftwareClusterListBuffer(),
+                       m_OcclusionCulling.GetEarlyIndirectCommandOpaqueBuffer(),
+                       m_OcclusionCulling.GetEarlyDrawCountOpaqueBuffer(),
+                       m_OcclusionCulling.GetLateIndirectCommandOpaqueBuffer(),
+                       m_OcclusionCulling.GetLateDrawCountOpaqueBuffer(),
+                       m_OcclusionCulling.GetSoftwareClusterListOpaqueBuffer());
+  m_DebugOverlay.Init(createInfo.device, createInfo.allocator,
+                      createInfo.commandPool, createInfo.queue,
+                      ClusterResolvePass::kOutputColorFormat);
+#endif
 
   LOG_INFO(
       std::format("[ClusterRenderPipeline] Initialized: {} clusters streamed "
@@ -291,23 +316,26 @@ bool ClusterRenderPipeline::Init(
 void ClusterRenderPipeline::Shutdown() {
   // Reverse initialization order; each Shutdown() is null-safe on a
   // never-initialized pass.
+#ifndef NDEBUG
+  m_DebugOverlay.Shutdown();
+  m_TriangleStats.Shutdown();
+  m_Allocator = VK_NULL_HANDLE;
+  m_LastStatsSampleTime = 0.0f;
+  m_LastStatsSampleBytes = 0;
+#endif
   m_Resolve.Shutdown();
   m_SoftwareRaster.Shutdown();
   m_HardwareRaster.Shutdown();
+  m_MaskGenerator.Shutdown();
   m_OcclusionCulling.Shutdown();
+  m_Streaming.Shutdown();
+  m_LODSelection.Shutdown();
   m_HZB.Shutdown();
   m_Decompression.Shutdown();
   m_PagePool.Shutdown();
+  m_WPOGlobalsBuffer.Destroy();
 
   m_ClusterCount = 0;
-#ifndef NDEBUG
-  m_ClusterSlotToEntityID.clear();
-  m_FrameCounter = 0;
-  m_DebugOutcomeDumped = false;
-  m_Allocator = VK_NULL_HANDLE;
-  m_CommandPool = VK_NULL_HANDLE;
-  m_Queue = VK_NULL_HANDLE;
-#endif
   m_VisBufferClusterIDImage = VK_NULL_HANDLE;
   m_VisBufferClusterIDView = VK_NULL_HANDLE;
   m_VisBufferTriangleIDImage = VK_NULL_HANDLE;
@@ -358,121 +386,12 @@ void ClusterRenderPipeline::BeginVisBufferRendering(
   vkCmdBeginRendering(cmd, &renderingInfo);
 }
 
-// DEBUG (temporary): see the class comment above RecordFrame()'s trigger site.
-// Entirely debug-only tooling (GPU debug-buffer readback + histogram dump) --
-// must not be compiled or executed in Release (project rule: no debug
-// hooks/tools in the Release binary).
-#ifndef NDEBUG
-void ClusterRenderPipeline::DumpDebugOutcomeHistogram(VkDevice device,
-                                                      VmaAllocator allocator,
-                                                      VkCommandPool commandPool,
-                                                      VkQueue queue) const {
-  VkDeviceSize readbackSize =
-      static_cast<VkDeviceSize>(sizeof(uint32_t)) * m_ClusterCount;
-
-  GpuBuffer stagingBuffer;
-  stagingBuffer.Create(allocator, readbackSize,
-                       VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                       VMA_MEMORY_USAGE_GPU_TO_CPU, /*mapped=*/true);
-
-  VkCommandBufferAllocateInfo cmdAllocInfo{
-      VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-  cmdAllocInfo.commandPool = commandPool;
-  cmdAllocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-  cmdAllocInfo.commandBufferCount = 1;
-
-  VkCommandBuffer cmd;
-  VK_CHECK(vkAllocateCommandBuffers(device, &cmdAllocInfo, &cmd));
-
-  VkCommandBufferBeginInfo beginInfo{
-      VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-  beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-  vkBeginCommandBuffer(cmd, &beginInfo);
-
-  // Make the previous frame's culling-shader writes to the debug outcome buffer
-  // visible to this copy -- see RecordFrame()'s trigger comment for why this is
-  // guaranteed complete.
-  VkMemoryBarrier2 preCopyBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
-  preCopyBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-  preCopyBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-  preCopyBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
-  preCopyBarrier.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
-
-  VkDependencyInfo preCopyDependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
-  preCopyDependency.memoryBarrierCount = 1;
-  preCopyDependency.pMemoryBarriers = &preCopyBarrier;
-  vkCmdPipelineBarrier2(cmd, &preCopyDependency);
-
-  VkBufferCopy copyRegion{};
-  copyRegion.srcOffset = 0;
-  copyRegion.dstOffset = 0;
-  copyRegion.size = readbackSize;
-  vkCmdCopyBuffer(cmd, m_OcclusionCulling.GetDebugOutcomeBuffer(),
-                  stagingBuffer.Handle(), 1, &copyRegion);
-
-  vkEndCommandBuffer(cmd);
-
-  VkSubmitInfo submitInfo{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-  submitInfo.commandBufferCount = 1;
-  submitInfo.pCommandBuffers = &cmd;
-  VK_CHECK(vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE));
-  VK_CHECK(vkQueueWaitIdle(queue));
-  vkFreeCommandBuffers(device, commandPool, 1, &cmd);
-
-  const uint32_t *outcomes =
-      static_cast<const uint32_t *>(stagingBuffer.MappedData());
-
-  static constexpr const char *kOutcomeNames[8] = {
-      "frustum-rejected",     "backface-rejected", "occluded-early(pending)",
-      "occluded-late(final)", "drawn-hw-early",    "drawn-hw-late",
-      "drawn-sw-early",       "drawn-sw-late"};
-
-  // Fixed 12 entities x 8 outcome codes -- see ClusterHZBOcclusionCull.comp's
-  // DebugOutcomeSSBO encoding comment for the code list.
-  uint32_t countsByEntityAndOutcome[12][8] = {};
-  for (uint32_t slot = 0; slot < m_ClusterCount; ++slot) {
-    uint32_t entityID = m_ClusterSlotToEntityID[slot];
-    uint32_t outcome = outcomes[slot];
-    if (entityID < 12 && outcome < 8) {
-      ++countsByEntityAndOutcome[entityID][outcome];
-    }
-  }
-
-  LOG_INFO(std::format("[ClusterRenderPipeline] DEBUG per-entity culling "
-                       "outcome histogram (frame {}):",
-                       m_FrameCounter));
-  for (uint32_t entityID = 0; entityID < 12; ++entityID) {
-    std::string line =
-        std::format("[ClusterRenderPipeline]   meshID={}: ", entityID);
-    for (uint32_t outcome = 0; outcome < 8; ++outcome) {
-      uint32_t count = countsByEntityAndOutcome[entityID][outcome];
-      if (count > 0) {
-        line += std::format("{}={} ", kOutcomeNames[outcome], count);
-      }
-    }
-    LOG_INFO(line);
-  }
-}
-#endif // NDEBUG
-
 void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
                                         const CameraPushConstants &camera,
                                         const maths::vec3 &cameraPositionWorld,
+                                        float globalTimeSeconds,
                                         VkImage swapchainImage) {
   assert(m_ClusterCount > 0 && "RecordFrame called before a successful Init");
-
-#ifndef NDEBUG
-  // DEBUG (temporary): dump a per-entity culling-outcome histogram once, after
-  // the scene has reached steady state (frame 60). Safe to do here, before this
-  // frame's own `cmd` is recorded/submitted: main.cpp's single-frame-in-flight
-  // loop already waited on the previous frame's fence before calling
-  // RecordFrame(), so the previous frame's debugOutcome writes are guaranteed
-  // complete and this blocking readback cannot race anything.
-  ++m_FrameCounter;
-  if (m_FrameCounter >= 55 && m_FrameCounter <= 65) {
-    DumpDebugOutcomeHistogram(m_Device, m_Allocator, m_CommandPool, m_Queue);
-  }
-#endif
 
   // Every stage of this frame consumes the SAME combined matrix -- this is what
   // makes the resolve pass's screen-space triangle re-projection bit-identical
@@ -494,6 +413,72 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
   // =========================================================================================
   m_OcclusionCulling.RecordClearFrame(cmd);
   m_SoftwareRaster.RecordClear(cmd);
+  m_LODSelection.RecordClear(cmd);
+
+  // =========================================================================================
+  // [1a] Async streaming triage: read back LAST frame's residency misses (captured by this
+  // frame's own [1b] readback below, one frame ago), submit new disk reads, and bind/decompress
+  // whatever completed since last frame -- see GeometryStreamingCoordinator's own class comment.
+  // Recorded before the LOD cut below so any page bound this frame is already resident by the
+  // time this frame's own residency checks (ClusterLODResidencyFallback.comp/ClusterLODCompact
+  // .comp) run.
+  // =========================================================================================
+  m_Streaming.ProcessFeedbackAndDrainCompletions(cmd, m_LODSelection.GetFeedbackBuffer(),
+                                                 m_PagePool, m_Decompression);
+
+  // =========================================================================================
+  // [1b] Per-frame GPU-driven LOD DAG cut: evaluate every DAG node's screen-space error against
+  // the current view, apply the parent-fallback residency policy, and stream-compact the result
+  // into this frame's candidate ClusterCullMetadata list -- see ClusterLODSelectionPass's own
+  // class comment. Must run before m_OcclusionCulling's early pass, which now consumes its
+  // GPU-only candidate count/buffer instead of a CPU-known cluster list.
+  // =========================================================================================
+  {
+    ClusterLODSelectionPass::ViewParams lodViewParams{};
+    lodViewParams.view = camera.view;
+    lodViewParams.proj = camera.proj;
+    lodViewParams.pixelErrorThreshold = kLODPixelErrorThreshold;
+    // 2*atan(1/projScaleY) recovers fovYRadians from the projection matrix's own Y-scale term
+    // (see projScaleY's own comment below) -- computed here, ahead of projScaleY's declaration,
+    // since ExtractFrustumPlanes/viewProj aren't needed for this derivation.
+    float earlyProjScaleY = std::abs(camera.proj.m[5]);
+    lodViewParams.fovYRadians = 2.0f * std::atan(1.0f / earlyProjScaleY);
+    lodViewParams.viewportHeight = static_cast<float>(m_RenderExtent.height);
+    lodViewParams.aspectRatio = static_cast<float>(m_RenderExtent.width) / static_cast<float>(m_RenderExtent.height);
+
+    m_LODSelection.RecordEvaluateAndCompact(cmd, lodViewParams);
+
+    // Captures THIS frame's residency-miss reports (ClusterLODResidencyFallback.comp, just
+    // dispatched above) into the feedback buffer's host-visible readback half, for [1a]'s
+    // ProcessFeedbackAndDrainCompletions() to consume next frame -- see FeedbackBuffer::
+    // RecordReadback()'s own doc comment for why "next frame" (not this one) is the earliest safe
+    // point to read it back on the CPU.
+    m_LODSelection.GetFeedbackBuffer().RecordReadback(cmd);
+
+    m_LODSelection.RecordBuildEarlyDispatchArgs(cmd);
+  }
+
+  // =========================================================================================
+  // [1b] Upload this frame's WPOGlobalsUBO (globalTime + padding) -- read by both raster passes'
+  // WPO sway function (wpo_deformation.glsl). Uploaded once here, well before either raster pass
+  // records its draw/dispatch, so a single barrier below covers both consumers.
+  // =========================================================================================
+  {
+    WPOGlobalsUBO wpoGlobals{};
+    wpoGlobals.globalTime = globalTimeSeconds;
+    vkCmdUpdateBuffer(cmd, m_WPOGlobalsBuffer.Handle(), 0, sizeof(WPOGlobalsUBO), &wpoGlobals);
+
+    VkMemoryBarrier2 wpoBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    wpoBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+    wpoBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    wpoBarrier.dstStageMask = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    wpoBarrier.dstAccessMask = VK_ACCESS_2_UNIFORM_READ_BIT;
+
+    VkDependencyInfo wpoDepInfo{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    wpoDepInfo.memoryBarrierCount = 1;
+    wpoDepInfo.pMemoryBarriers = &wpoBarrier;
+    vkCmdPipelineBarrier2(cmd, &wpoDepInfo);
+  }
 
   // =========================================================================================
   // [2] EARLY cull: every leaf candidate vs frustum/backface + LAST frame's HZB
@@ -502,7 +487,7 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
   // DRAW_INDIRECT and the pending + software lists visible to later COMPUTE.
   // =========================================================================================
   m_OcclusionCulling.RecordEarlyPass(cmd, viewParams, viewProj, projScaleY,
-                                     m_ClusterCount,
+                                     m_LODSelection.GetEarlyDispatchArgsBuffer(),
                                      kSoftwareRasterThresholdPixels);
 
   // =========================================================================================
@@ -560,14 +545,22 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
 
   // =========================================================================================
   // [4] EARLY hardware raster: draws exactly the early cull's survivors via
-  // vkCmdDrawIndexedIndirectCount into the VisBuffer + depth (CLEAR load ops).
+  // vkCmdDrawIndexedIndirectCount into the VisBuffer + depth (CLEAR load ops). Opaque first (no
+  // discard, real hardware early-Z eligible), then masked (mask-sampling discard) -- opaque-first
+  // is a perf-only ordering choice (lets the masked pipeline's depth test reject more fragments
+  // before running its non-early-Z frag shader); final depth/VisBuffer content is order-independent.
   // =========================================================================================
   BeginVisBufferRendering(cmd, /*clearAttachments=*/true);
   m_HardwareRaster.RecordDraw(
       cmd, camera, m_RenderExtent,
       m_Decompression.GetDecompressedIndexPoolBuffer(),
+      m_OcclusionCulling.GetEarlyIndirectCommandOpaqueBuffer(),
+      m_OcclusionCulling.GetEarlyDrawCountOpaqueBuffer(), m_ClusterCount, /*opaque=*/true);
+  m_HardwareRaster.RecordDraw(
+      cmd, camera, m_RenderExtent,
+      m_Decompression.GetDecompressedIndexPoolBuffer(),
       m_OcclusionCulling.GetEarlyIndirectCommandBuffer(),
-      m_OcclusionCulling.GetEarlyDrawCountBuffer(), m_ClusterCount);
+      m_OcclusionCulling.GetEarlyDrawCountBuffer(), m_ClusterCount, /*opaque=*/false);
   vkCmdEndRendering(cmd);
 
   // =========================================================================================
@@ -695,14 +688,20 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
 
   // =========================================================================================
   // [9] LATE hardware raster (loadOp = LOAD) -- draws the disocclusions the
-  // early pass could not confirm, on top of the early output.
+  // early pass could not confirm, on top of the early output. Opaque first, same rationale as
+  // the early pass above.
   // =========================================================================================
   BeginVisBufferRendering(cmd, /*clearAttachments=*/false);
   m_HardwareRaster.RecordDraw(cmd, camera, m_RenderExtent,
                               m_Decompression.GetDecompressedIndexPoolBuffer(),
+                              m_OcclusionCulling.GetLateIndirectCommandOpaqueBuffer(),
+                              m_OcclusionCulling.GetLateDrawCountOpaqueBuffer(),
+                              m_ClusterCount, /*opaque=*/true);
+  m_HardwareRaster.RecordDraw(cmd, camera, m_RenderExtent,
+                              m_Decompression.GetDecompressedIndexPoolBuffer(),
                               m_OcclusionCulling.GetLateIndirectCommandBuffer(),
                               m_OcclusionCulling.GetLateDrawCountBuffer(),
-                              m_ClusterCount);
+                              m_ClusterCount, /*opaque=*/false);
   vkCmdEndRendering(cmd);
 
   // =========================================================================================
@@ -762,7 +761,11 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
   // output image. The software rasterizer's atomic writes are already visible
   // (RecordRaster's trailing COMPUTE -> COMPUTE barrier).
   // =========================================================================================
-  m_Resolve.RecordResolve(cmd, viewProj);
+  m_Resolve.RecordResolve(cmd, viewProj
+#ifndef NDEBUG
+    , camera.debugViewMode
+#endif
+  );
 
   // =========================================================================================
   // [13] Second HZB rebuild, from the now-complete (early + late) depth: this
@@ -803,6 +806,51 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
     depInfo.pMemoryBarriers = &barrier;
     vkCmdPipelineBarrier2(cmd, &depInfo);
   }
+
+#ifndef NDEBUG
+  // =========================================================================================
+  // [13b] Debug-only stat overlay (whole block compiled out in Release). Timing contract: read
+  // back the PREVIOUS frame's triangle-count result first (safe because main.cpp's frame fence
+  // already guarantees that frame's GPU work is complete before this RecordFrame() call started
+  // recording), THEN clear/dispatch/readback THIS frame's counters for next frame's read -- the
+  // same "always one frame behind" contract renderer::FeedbackBuffer already uses.
+  // =========================================================================================
+  {
+    uint32_t hwTriangleCount = 0;
+    uint32_t swTriangleCount = 0;
+    m_TriangleStats.ReadStats(hwTriangleCount, swTriangleCount);
+
+    m_TriangleStats.RecordClear(cmd);
+    m_TriangleStats.RecordCompute(cmd);
+    m_TriangleStats.RecordReadback(cmd);
+
+    const VkPhysicalDeviceMemoryProperties* memProps = nullptr;
+    vmaGetMemoryProperties(m_Allocator, &memProps);
+    std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> heapBudgets{};
+    vmaGetHeapBudgets(m_Allocator, heapBudgets.data());
+    VkDeviceSize gpuMemUsedBytes = 0;
+    for (uint32_t heap = 0; heap < memProps->memoryHeapCount; ++heap) {
+      gpuMemUsedBytes += heapBudgets[heap].usage;
+    }
+    float gpuMemUsedMB = static_cast<float>(gpuMemUsedBytes) / (1024.0f * 1024.0f);
+
+    uint32_t pendingPageLoads = m_Streaming.GetPendingRequestCount() + m_Streaming.GetInFlightReadCount();
+
+    // Bytes/sec: a wall-clock delta against the streamer's running total, not an instantaneous GPU
+    // counter -- globalTimeSeconds is main.cpp's glfwGetTime(), monotonically increasing, already
+    // threaded through this function for WPO.
+    uint64_t totalBytesCompleted = m_Streaming.GetTotalBytesCompleted();
+    float deltaTime = globalTimeSeconds - m_LastStatsSampleTime;
+    float bytesPerSecond = (deltaTime > 0.0f)
+        ? static_cast<float>(totalBytesCompleted - m_LastStatsSampleBytes) / deltaTime
+        : 0.0f;
+    m_LastStatsSampleTime = globalTimeSeconds;
+    m_LastStatsSampleBytes = totalBytesCompleted;
+
+    m_DebugOverlay.BuildFrameText(gpuMemUsedMB, pendingPageLoads, bytesPerSecond, hwTriangleCount, swTriangleCount);
+    m_DebugOverlay.RecordDraw(cmd, m_Resolve.GetOutputColorImage(), m_Resolve.GetOutputColorView(), m_RenderExtent);
+  }
+#endif
 
   // =========================================================================================
   // [14] Blit the resolved image to the swapchain image and hand it to present.

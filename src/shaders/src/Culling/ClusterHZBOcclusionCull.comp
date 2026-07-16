@@ -21,7 +21,9 @@
 // A cluster passing both is then tested against the HZB as it stood at the *start* of this frame
 // -- i.e. built from the *previous* frame's final depth buffer, since this frame has not
 // rasterized anything yet. Two pieces of information decide its fate:
-//   - g_VisibleLastFrame[i]: was this exact cluster index confirmed visible at the end of last
+//   - g_VisibleLastFrame[cluster.clusterID]: was this exact cluster (by its persistent, stable
+//     clusterID -- NOT its transient per-frame candidate slot, which a dynamic LOD cut reassigns
+//     every frame, see renderer::ClusterLODSelectionPass) confirmed visible at the end of last
 //     frame (persisted across frames, see renderer::ClusterOcclusionCullingPass)?
 //   - The result of testing it against that (stale) HZB right now.
 // If it was visible last frame AND still passes the stale-HZB test, it is drawn immediately (the
@@ -56,6 +58,20 @@
 //     renderer::ClusterSoftwareRasterPass) -- no indirect draw command is ever produced for it.
 // A cluster can only end up on one list or the other, never both, so the two rasterization paths'
 // outputs never race on the same cluster.
+//
+// --- Opaque / masked classification (orthogonal to the above) ---
+// A SECOND, independent routing decision picks which of two SETS of lists (opaque or masked) a
+// cluster's draw/software-list entry lands in, based purely on cluster.maskTextureIndex ==
+// 0xFFFFFFFFu (geometry::kInvalidMaskTextureIndex -- see ClusterFormat.h): this is a STATIC,
+// per-cluster property baked in at cluster-build time (geometry::ClusterPartitioner's opacity
+// classification/split), unlike the dynamic screen-size test above, so it composes cheaply as one
+// extra branch at each emission site rather than a second dispatch. The result is SIX output lists
+// instead of three (early-hw x{opaque,masked}, late-hw x{opaque,masked}, software x{opaque,masked}):
+// renderer::ClusterHardwareRasterPass consumes the opaque lists with a pipeline that has zero mask-
+// sampling instructions and no `discard` (real hardware early-Z), and the masked lists with its
+// existing mask-sampling pipeline; renderer::ClusterSoftwareRasterPass does the same split for its
+// two compute pipelines. A cluster is written to exactly one of the two same-purpose lists, never
+// both, so the four resulting rasterization paths' outputs never race on the same cluster.
 
 #include "include/cluster_culling_common.glsl"
 #include "include/cluster_culling_tests.glsl"
@@ -131,30 +147,49 @@ layout(std430, set = 0, binding = 10) buffer SoftwareClusterListSSBO {
     uint clusterIndex[];
 } g_SoftwareClusterList;
 
-// DEBUG (temporary): one outcome code per cluster slot, overwritten unconditionally at every
-// decision point below. Encoding: 0=frustum-rejected, 1=backface-rejected,
-// 2=occluded-early(pending), 3=occluded-late(final), 4=drawn-hw-early, 5=drawn-hw-late,
-// 6=drawn-sw-early, 7=drawn-sw-late. Read back once by renderer::ClusterRenderPipeline's debug
-// histogram dump -- see ClusterOcclusionCullingPass::GetDebugOutcomeBuffer().
-#define DEBUG_OUTCOME_FRUSTUM_REJECTED  0u
-#define DEBUG_OUTCOME_BACKFACE_REJECTED 1u
-#define DEBUG_OUTCOME_OCCLUDED_EARLY    2u
-#define DEBUG_OUTCOME_OCCLUDED_LATE     3u
-#define DEBUG_OUTCOME_DRAWN_HW_EARLY    4u
-#define DEBUG_OUTCOME_DRAWN_HW_LATE     5u
-#define DEBUG_OUTCOME_DRAWN_SW_EARLY    6u
-#define DEBUG_OUTCOME_DRAWN_SW_LATE     7u
+// This frame's GPU-compacted candidate count (renderer::ClusterLODSelectionPass::
+// GetCandidateCountBuffer()), replacing the old CPU-known clusterCount push constant now that the
+// candidate set is a per-frame dynamic LOD cut instead of a static, CPU-baked upload -- only the
+// EARLY specialization's bound check consults it (the LATE specialization bounds itself against
+// g_PendingList.count instead, unchanged). Read-only here: only
+// renderer::ClusterLODSelectionPass's own compaction pass ever writes it.
+layout(std430, set = 0, binding = 11) readonly buffer CandidateCountSSBO {
+    uint count;
+} g_CandidateCount;
 
-layout(std430, set = 0, binding = 11) buffer DebugOutcomeSSBO {
-    uint outcome[];
-} g_DebugOutcome;
+// --- Opaque-list counterparts of bindings 6-10 (see the "Opaque / masked classification" class
+// comment above). Bindings 6-10 above become, in effect, the MASKED lists; these five are the
+// OPAQUE lists, same shapes, same zero-per-frame-reset contract via
+// renderer::ClusterOcclusionCullingPass::RecordClearFrame. ---
+layout(std430, set = 0, binding = 12) writeonly buffer EarlyIndirectCommandsOpaqueSSBO {
+    DrawIndexedIndirectCommand commands[];
+} g_EarlyIndirectCommandsOpaque;
+
+layout(std430, set = 0, binding = 13) buffer EarlyDrawCountOpaqueSSBO {
+    uint count;
+} g_EarlyDrawCountOpaque;
+
+layout(std430, set = 0, binding = 14) writeonly buffer LateIndirectCommandsOpaqueSSBO {
+    DrawIndexedIndirectCommand commands[];
+} g_LateIndirectCommandsOpaque;
+
+layout(std430, set = 0, binding = 15) buffer LateDrawCountOpaqueSSBO {
+    uint count;
+} g_LateDrawCountOpaque;
+
+layout(std430, set = 0, binding = 16) buffer SoftwareClusterListOpaqueSSBO {
+    uint count;
+    uint clusterIndex[];
+} g_SoftwareClusterListOpaque;
 
 layout(push_constant) uniform ClusterOcclusionPushConstants {
-    uint clusterCount; // Total candidate count in g_Clusters -- only consulted by the EARLY specialization.
     // Average estimated triangle screen size (pixels) below which a cluster is routed to the
     // software rasterizer instead of a hardware indirect draw -- see ShouldUseSoftwareRaster().
     // Nanite-style engines typically use a value in the 4-8 pixel range.
     float softwareRasterThresholdPixels;
+#ifdef _DEBUG
+    uint disableOcclusionCulling;
+#endif
 } pc;
 
 // Cheap, cluster-level hardware/software rasterization classification: see the class comment.
@@ -175,11 +210,19 @@ bool ShouldUseSoftwareRaster(ClusterCullMetadata cluster) {
 }
 
 // Appends `clusterSlotIndex` to the software rasterizer's worklist via the same atomic-compaction
-// pattern as g_PendingList / the indirect draw lists.
-void EmitSoftwareCluster(uint clusterSlotIndex) {
-    uint slot = atomicAdd(g_SoftwareClusterList.count, 1u);
-    if (slot < g_SoftwareClusterList.clusterIndex.length()) {
-        g_SoftwareClusterList.clusterIndex[slot] = clusterSlotIndex;
+// pattern as g_PendingList / the indirect draw lists -- opaque or masked list per
+// cluster.maskTextureIndex (see the "Opaque / masked classification" class comment above).
+void EmitSoftwareCluster(ClusterCullMetadata cluster, uint clusterSlotIndex) {
+    if (cluster.maskTextureIndex == 0xFFFFFFFFu) {
+        uint slot = atomicAdd(g_SoftwareClusterListOpaque.count, 1u);
+        if (slot < g_SoftwareClusterListOpaque.clusterIndex.length()) {
+            g_SoftwareClusterListOpaque.clusterIndex[slot] = clusterSlotIndex;
+        }
+    } else {
+        uint slot = atomicAdd(g_SoftwareClusterList.count, 1u);
+        if (slot < g_SoftwareClusterList.clusterIndex.length()) {
+            g_SoftwareClusterList.clusterIndex[slot] = clusterSlotIndex;
+        }
     }
 }
 
@@ -201,9 +244,16 @@ void EmitEarlyDraw(ClusterCullMetadata cluster, uint clusterSlotIndex) {
     cmd.vertexOffset = cluster.vertexOffset;
     cmd.firstInstance = clusterSlotIndex;
 
-    uint slot = atomicAdd(g_EarlyDrawCount.count, 1u);
-    if (slot < g_EarlyIndirectCommands.commands.length()) {
-        g_EarlyIndirectCommands.commands[slot] = cmd;
+    if (cluster.maskTextureIndex == 0xFFFFFFFFu) {
+        uint slot = atomicAdd(g_EarlyDrawCountOpaque.count, 1u);
+        if (slot < g_EarlyIndirectCommandsOpaque.commands.length()) {
+            g_EarlyIndirectCommandsOpaque.commands[slot] = cmd;
+        }
+    } else {
+        uint slot = atomicAdd(g_EarlyDrawCount.count, 1u);
+        if (slot < g_EarlyIndirectCommands.commands.length()) {
+            g_EarlyIndirectCommands.commands[slot] = cmd;
+        }
     }
 }
 
@@ -215,9 +265,16 @@ void EmitLateDraw(ClusterCullMetadata cluster, uint clusterSlotIndex) {
     cmd.vertexOffset = cluster.vertexOffset;
     cmd.firstInstance = clusterSlotIndex;
 
-    uint slot = atomicAdd(g_LateDrawCount.count, 1u);
-    if (slot < g_LateIndirectCommands.commands.length()) {
-        g_LateIndirectCommands.commands[slot] = cmd;
+    if (cluster.maskTextureIndex == 0xFFFFFFFFu) {
+        uint slot = atomicAdd(g_LateDrawCountOpaque.count, 1u);
+        if (slot < g_LateIndirectCommandsOpaque.commands.length()) {
+            g_LateIndirectCommandsOpaque.commands[slot] = cmd;
+        }
+    } else {
+        uint slot = atomicAdd(g_LateDrawCount.count, 1u);
+        if (slot < g_LateIndirectCommands.commands.length()) {
+            g_LateIndirectCommands.commands[slot] = cmd;
+        }
     }
 }
 
@@ -233,66 +290,71 @@ void main() {
 
         uint clusterIndex = g_PendingList.clusterIndex[pendingSlot];
         ClusterCullMetadata cluster = g_Clusters.clusters[clusterIndex];
+        InflateBoundsForWPO(cluster.boundsMin, cluster.boundsMax, cluster.sphereRadius, cluster.maxWPOAmplitude);
 
         bool occluded = IsClusterOccluded(cluster.boundsMin, cluster.boundsMax,
             g_HZBParams.data.viewProj, g_HZBParams.data.hzbMip0Size, g_HZBParams.data.hzbMipCount);
+#ifdef _DEBUG
+        if (pc.disableOcclusionCulling != 0) {
+            occluded = false;
+        }
+#endif
 
         if (!occluded) {
             if (ShouldUseSoftwareRaster(cluster)) {
-                EmitSoftwareCluster(clusterIndex);
-                g_DebugOutcome.outcome[clusterIndex] = DEBUG_OUTCOME_DRAWN_SW_LATE;
+                EmitSoftwareCluster(cluster, clusterIndex);
             } else {
                 EmitLateDraw(cluster, clusterIndex);
-                g_DebugOutcome.outcome[clusterIndex] = DEBUG_OUTCOME_DRAWN_HW_LATE;
             }
-        } else {
-            g_DebugOutcome.outcome[clusterIndex] = DEBUG_OUTCOME_OCCLUDED_LATE;
         }
 
         // Final word on this cluster's visibility for this frame -- next frame's early pass reads
-        // this value.
-        g_VisibleLastFrame.visible[clusterIndex] = occluded ? 0u : 1u;
+        // this value. Indexed by the cluster's persistent, stable clusterID (NOT clusterIndex, its
+        // transient per-frame candidate slot -- see this file's class comment).
+        g_VisibleLastFrame.visible[cluster.clusterID] = occluded ? 0u : 1u;
     } else {
-        // --- EARLY: one invocation per candidate cluster ---
+        // --- EARLY: one invocation per this frame's GPU-compacted candidate ---
         uint clusterIndex = gl_GlobalInvocationID.x;
-        if (clusterIndex >= pc.clusterCount) {
+        if (clusterIndex >= g_CandidateCount.count) {
             return;
         }
 
         ClusterCullMetadata cluster = g_Clusters.clusters[clusterIndex];
+        InflateBoundsForWPO(cluster.boundsMin, cluster.boundsMax, cluster.sphereRadius, cluster.maxWPOAmplitude);
 
         // Frustum + backface: a rejection here holds for the whole frame (both passes), so the
         // cluster is dropped entirely -- it never reaches either work list.
         bool inFrustum = IsBoxInsideFrustum(cluster.boundsMin, cluster.boundsMax, g_ViewParams.data.frustumPlanes);
         bool backFacing = IsClusterBackFacing(cluster.sphereCenter, cluster.sphereRadius, cluster.coneAxis, cluster.coneCutoff, g_ViewParams.data.cameraPositionWorld);
         if (!inFrustum || backFacing) {
-            g_VisibleLastFrame.visible[clusterIndex] = 0u;
-            g_DebugOutcome.outcome[clusterIndex] = inFrustum ? DEBUG_OUTCOME_BACKFACE_REJECTED : DEBUG_OUTCOME_FRUSTUM_REJECTED;
+            g_VisibleLastFrame.visible[cluster.clusterID] = 0u;
             return;
         }
 
-        bool wasVisibleLastFrame = g_VisibleLastFrame.visible[clusterIndex] != 0u;
+        bool wasVisibleLastFrame = g_VisibleLastFrame.visible[cluster.clusterID] != 0u;
         bool occludedByStaleHZB = IsClusterOccluded(cluster.boundsMin, cluster.boundsMax,
             g_HZBParams.data.viewProj, g_HZBParams.data.hzbMip0Size, g_HZBParams.data.hzbMipCount);
+#ifdef _DEBUG
+        if (pc.disableOcclusionCulling != 0) {
+            occludedByStaleHZB = false;
+        }
+#endif
 
         if (wasVisibleLastFrame && !occludedByStaleHZB) {
             // Confirmed still visible against last frame's geometry: draw immediately, no need to
             // spend a late-pass re-test on it.
             if (ShouldUseSoftwareRaster(cluster)) {
-                EmitSoftwareCluster(clusterIndex);
-                g_DebugOutcome.outcome[clusterIndex] = DEBUG_OUTCOME_DRAWN_SW_EARLY;
+                EmitSoftwareCluster(cluster, clusterIndex);
             } else {
                 EmitEarlyDraw(cluster, clusterIndex);
-                g_DebugOutcome.outcome[clusterIndex] = DEBUG_OUTCOME_DRAWN_HW_EARLY;
             }
-            g_VisibleLastFrame.visible[clusterIndex] = 1u;
+            g_VisibleLastFrame.visible[cluster.clusterID] = 1u;
         } else {
             // Uncertain: either this cluster was not part of last frame's visible set (its
             // visibility against anything is unknown), or the stale HZB claims occlusion by
             // geometry that itself might be about to get overdrawn this frame. Defer to the late
             // pass rather than guessing -- g_VisibleLastFrame is deliberately left untouched here;
             // the late pass writes its final value once the fresh HZB is available.
-            g_DebugOutcome.outcome[clusterIndex] = DEBUG_OUTCOME_OCCLUDED_EARLY;
             uint slot = atomicAdd(g_PendingList.count, 1u);
             if (slot < g_PendingList.clusterIndex.length()) {
                 g_PendingList.clusterIndex[slot] = clusterIndex;

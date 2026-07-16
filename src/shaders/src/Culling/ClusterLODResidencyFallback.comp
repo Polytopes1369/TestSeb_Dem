@@ -1,0 +1,90 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+
+// Second dispatch of renderer::ClusterLODSelectionPass's per-frame LOD-cut evaluation (see that
+// class's comment for the full 3-dispatch sequence). Consumes ClusterDAGScreenError.comp's
+// per-node DRAW/SUBDIVIDE/SKIP decision (left untouched by this shader) and applies this engine's
+// chosen parent-fallback residency policy: a node whose fine geometry isn't resident yet must not
+// simply vanish from the rendered frame -- its nearest already-resident ancestor is marked to draw
+// in its place instead, via a bounded upward walk of parentClusterID. DAG depth is small (a
+// handful of levels for any realistically sized cluster hierarchy, since each level roughly halves
+// the cluster count), so this bounded per-node walk is not the unbounded tree traversal the
+// single-pass screen-error test elsewhere in this pipeline deliberately avoids.
+//
+// A node with a DRAW decision that IS already resident needs no action here at all --
+// ClusterLODCompact.comp picks it up directly via its own decision==DRAW check. This shader only
+// ever touches non-resident DRAW-decided nodes and whichever resident ancestor each one finds.
+
+#include "include/cluster_lod_node_metadata.glsl"
+
+#define PAGE_TABLE_SET 0
+#define PAGE_TABLE_BINDING 2
+#include "include/geometry_page_table.glsl"
+
+#define FEEDBACK_BUFFER_SET 0
+#define FEEDBACK_BUFFER_BINDING 4
+#include "include/feedback_buffer.glsl"
+
+#define DAG_DECISION_DRAW      0u
+#define DAG_DECISION_SUBDIVIDE 1u
+#define DAG_DECISION_SKIP      2u
+
+layout(std430, set = 0, binding = 0) readonly buffer DAGDecisionSSBO {
+    uint decisions[];
+} g_DAGDecisions;
+
+layout(std430, set = 0, binding = 1) readonly buffer LODNodeMetadataSSBO {
+    LODNodeMetadata nodes[];
+} g_LODNodes;
+
+// binding 2 == g_GeometryPageTable, declared by geometry_page_table.glsl.
+
+layout(std430, set = 0, binding = 3) buffer ForceDrawSSBO {
+    uint forceDraw[];
+} g_ForceDraw;
+
+// binding 4 == g_FeedbackBuffer, declared by feedback_buffer.glsl.
+
+// Bounds the ancestor walk below: comfortably above any realistic DAG depth (this engine's own
+// grouping roughly halves the cluster count per level).
+#define MAX_ANCESTOR_WALK 24u
+
+layout(local_size_x = 64) in;
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    if (index >= g_LODNodes.nodes.length()) {
+        return;
+    }
+
+    if (g_DAGDecisions.decisions[index] != DAG_DECISION_DRAW) {
+        return;
+    }
+
+    LODNodeMetadata node = g_LODNodes.nodes[index];
+    if (IsClusterResident(node.logicalPageID)) {
+        return; // ClusterLODCompact.comp picks this node up directly -- nothing to do here.
+    }
+
+    // This DRAW-decided node's own fine geometry isn't resident yet: request it for a future
+    // frame, and substitute the nearest already-resident ancestor for THIS frame so the region it
+    // covers is never simply missing.
+    RequestClusterResidency(node.clusterID);
+
+    uint ancestor = node.parentClusterID;
+    for (uint step = 0u; step < MAX_ANCESTOR_WALK && ancestor != 0xFFFFFFFFu; ++step) {
+        LODNodeMetadata ancestorNode = g_LODNodes.nodes[ancestor];
+        if (IsClusterResident(ancestorNode.logicalPageID)) {
+            // Idempotent under races: every child of this ancestor that independently reaches this
+            // same point writes the same value 1, so a plain atomicOr (no mutual exclusion needed)
+            // is sufficient.
+            atomicOr(g_ForceDraw.forceDraw[ancestor], 1u);
+            return;
+        }
+        ancestor = ancestorNode.parentClusterID;
+    }
+    // Walked off the root (or exceeded MAX_ANCESTOR_WALK) without finding a resident ancestor --
+    // exceptionally rare (would require the DAG's own root to be non-resident) -- this node's
+    // region is simply absent for this one frame; already requested above, so it resolves once
+    // streaming catches up.
+}

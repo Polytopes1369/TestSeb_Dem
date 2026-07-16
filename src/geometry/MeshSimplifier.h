@@ -36,6 +36,15 @@ namespace geometry {
         // change and it must never be removed by an edge collapse. Set by the caller before
         // simplification (typically: vertices on the mesh's/group's outer boundary).
         std::vector<bool> locked;
+
+        // Per-vertex (parallel to positions): texture coordinates, carried through unchanged for
+        // a locked/surviving vertex and averaged (midpoint) across the collapsed edge for a
+        // non-locked one (see SimplifyMeshQEM's collapse-application step) -- QEM itself has no
+        // attribute-aware error term for UV, so this is a simple, reviewable approximation, not a
+        // placeholder. Populated from the source geometry (renderer::Vertex::uv) at every site
+        // that builds a SimplifiableMesh (ClusterGrouping::GroupAdjacentClusters,
+        // ClusterDAG.cpp's leaf-node construction and coarser-level merge).
+        std::vector<maths::vec2> uvs;
     };
 
     // Simplifies `mesh` in place via iterative QEM edge collapses until BOTH the triangle count

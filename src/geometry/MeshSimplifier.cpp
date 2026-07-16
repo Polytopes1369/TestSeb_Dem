@@ -136,6 +136,7 @@ namespace geometry {
         struct MeshState {
             std::vector<maths::vec3> positions;
             std::vector<bool> locked;
+            std::vector<maths::vec2> uvs;
             std::vector<bool> aliveVertex;
             std::vector<uint32_t> version;
 
@@ -303,6 +304,8 @@ namespace geometry {
         state.positions = mesh.positions;
         state.locked = mesh.locked;
         state.locked.resize(vertexCount, false); // Defensive: tolerate a shorter locked array.
+        state.uvs = mesh.uvs;
+        state.uvs.resize(vertexCount, maths::vec2{ 0.0f, 0.0f }); // Defensive: tolerate a shorter/absent uvs array.
         state.aliveVertex.assign(vertexCount, true);
         state.version.assign(vertexCount, 0u);
         state.quadric.assign(vertexCount, Quadric{});
@@ -379,6 +382,9 @@ namespace geometry {
             // --- Apply the collapse -------------------------------------------------------
             if (!state.locked[keep]) {
                 state.positions[keep] = candidate.target;
+                // UV midpoint blend: QEM has no attribute-aware error term for UV, so this is a
+                // simple, reviewable approximation (not a placeholder) -- see SimplifiableMesh::uvs.
+                state.uvs[keep] = (state.uvs[keep] + state.uvs[remove]) * 0.5f;
             }
 
             // Remap every triangle touching `remove`: either it also touches `keep` (degenerate,
@@ -433,6 +439,7 @@ namespace geometry {
         std::vector<uint32_t> remap(vertexCount, kDeadSentinel);
         std::vector<maths::vec3> newPositions;
         std::vector<bool> newLocked;
+        std::vector<maths::vec2> newUVs;
         std::vector<uint32_t> newTriangles;
         newPositions.reserve(vertexCount);
         newTriangles.reserve(static_cast<size_t>(state.triangleCount) * 3);
@@ -447,6 +454,7 @@ namespace geometry {
                     remap[v] = static_cast<uint32_t>(newPositions.size());
                     newPositions.push_back(state.positions[v]);
                     newLocked.push_back(state.locked[v]);
+                    newUVs.push_back(state.uvs[v]);
                 }
                 newTriangles.push_back(remap[v]);
             }
@@ -454,6 +462,7 @@ namespace geometry {
 
         mesh.positions = std::move(newPositions);
         mesh.locked = std::move(newLocked);
+        mesh.uvs = std::move(newUVs);
         mesh.triangles = std::move(newTriangles);
 
         if (outMaxError) {

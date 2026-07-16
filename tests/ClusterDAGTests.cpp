@@ -150,10 +150,10 @@ namespace {
         std::vector<uint32_t> indices;
         GenerateUVSphere(0u, 40u, 40u, 3.0f, maths::vec3{ 0.0f, 0.0f, 0.0f }, vertices, indices); // 3200 triangles
 
-        std::vector<geometry::MeshCluster> expectedLeaves = geometry::PartitionMeshIntoClusters(0u, vertices, indices);
+        std::vector<geometry::MeshCluster> expectedLeaves = geometry::PartitionMeshIntoClusters(0u, vertices, indices, geometry::kInvalidMaskTextureIndex);
         Check(!expectedLeaves.empty(), "expected at least one leaf cluster from the synthetic sphere");
 
-        geometry::ClusterDAG dag = geometry::BuildClusterDAG(0u, vertices, indices);
+        geometry::ClusterDAG dag = geometry::BuildClusterDAG(0u, vertices, indices, geometry::kInvalidMaskTextureIndex);
         Check(!dag.nodes.empty(), "expected a non-empty DAG");
         Check(!dag.rootIndices.empty(), "expected at least one root");
 

@@ -83,4 +83,23 @@ bool IsClusterBackFacing(vec3 sphereCenter, float sphereRadius, vec3 coneAxis, f
     return dot(cameraToCenter, coneAxis) >= coneCutoff * dist + sphereRadius;
 }
 
+// Conservatively inflates a cluster's bounding volumes (AABB + bounding sphere) by its authored
+// maximum World Position Offset sway displacement (see wpo_deformation.glsl's
+// ApplyWPODeformation and geometry::ClusterIndexEntry::maxWPOAmplitude), so every downstream test
+// that consumes these volumes -- frustum (IsBoxInsideFrustum), backface cone
+// (IsClusterBackFacing, whose rejection condition only gets HARDER to satisfy as sphereRadius
+// grows, correctly making it more lenient rather than needing a separate directional adjustment),
+// HZB occlusion (IsClusterOccluded), and the hardware/software routing screen-size estimate
+// (ShouldUseSoftwareRaster) -- all see a volume that still safely contains every vertex's true,
+// possibly-displaced position. Isotropic (grows every axis/direction equally) rather than biased
+// toward the sway function's actual instantaneous direction: the sway's phase is per-cluster-
+// hashed and time-varying, so no single fixed bias direction would stay conservative across every
+// frame. A no-op (bit-identical inputs/outputs) when maxWPOAmplitude is 0, the common case for
+// non-swaying clusters.
+void InflateBoundsForWPO(inout vec3 boundsMin, inout vec3 boundsMax, inout float sphereRadius, float maxWPOAmplitude) {
+    boundsMin -= vec3(maxWPOAmplitude);
+    boundsMax += vec3(maxWPOAmplitude);
+    sphereRadius += maxWPOAmplitude;
+}
+
 #endif // CLUSTER_CULLING_TESTS_GLSL

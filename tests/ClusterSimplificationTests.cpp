@@ -68,7 +68,7 @@ int main() {
     std::vector<uint32_t> indices;
     GenerateUVSphere(0u, 40u, 40u, 3.0f, maths::vec3{ 0.0f, 0.0f, 0.0f }, vertices, indices); // 3200 triangles
 
-    std::vector<geometry::MeshCluster> clusters = geometry::PartitionMeshIntoClusters(0u, vertices, indices);
+    std::vector<geometry::MeshCluster> clusters = geometry::PartitionMeshIntoClusters(0u, vertices, indices, geometry::kInvalidMaskTextureIndex);
     check(!clusters.empty(), "expected at least one cluster from the synthetic sphere");
 
     uint32_t totalClusterTriangles = 0;

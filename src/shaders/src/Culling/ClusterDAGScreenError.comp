@@ -17,14 +17,25 @@
 //   decision = 2 -> skip this cluster (the parent is already accurate enough; let the coarser
 //                   ancestor represent the region)
 //
-// The shader is intentionally format-stable and can be bound by a future GPU-driven LOD pass
-// that fills the input SSBOs from CPU-side DAG data.
+// Driven by renderer::ClusterLODSelectionPass (see that class for the full per-frame 3-dispatch
+// sequence this is the first of), which fills DAGNodesSSBO from geometry::ClusterIndexEntry /
+// DAGNodeEntry once at Init() and re-dispatches this shader every frame against the current view.
 
 #define DAG_DECISION_DRAW      0u
 #define DAG_DECISION_SUBDIVIDE 1u
 #define DAG_DECISION_SKIP      2u
 
+// Field order is deliberate: sphereCenter (the only vec3) comes first so it naturally lands at
+// offset 0 (already a multiple of its own 16-byte std430 base alignment) -- every field after it
+// is a plain 4-byte scalar with no alignment needs of its own, so the whole struct packs to
+// exactly 48 bytes (already a multiple of 16) with zero implicit padding anywhere, letting the
+// C++ mirror (renderer::DAGNodePayload, ClusterLODSelectionPass.h) match it field-for-field with
+// no manual padding either. See renderer::ClusterLODSelectionPass for the driver that populates
+// this SSBO from geometry::ClusterIndexEntry / DAGNodeEntry.
 struct DAGNodePayload {
+    vec3 sphereCenter;
+    float sphereRadius;
+
     uint clusterID;
     uint parentClusterID;
     uint childClusterID0;
@@ -34,8 +45,12 @@ struct DAGNodePayload {
     float clusterError;
     float parentError;
 
-    vec3 sphereCenter;
-    float sphereRadius;
+    // Worst-case world-space displacement this node's own vertices' WPO sway can apply (see
+    // wpo_deformation.glsl / geometry::ClusterIndexEntry::maxWPOAmplitude) -- inflates both error
+    // terms below before projection so a swaying cluster's LOD cut never selects a coarser level
+    // than its true (displaced) on-screen error would allow. 0 for any non-swaying cluster, making
+    // the inflation below an exact no-op for them.
+    float maxWPOAmplitude;
 };
 
 struct DAGScreenErrorViewParams {
@@ -89,8 +104,16 @@ void main() {
 
     DAGNodePayload node = g_DAGNodes.nodes[index];
 
-    float localPixelError = ProjectedErrorToPixels(node.clusterError, node.sphereCenter);
-    float parentPixelError = ProjectedErrorToPixels(node.parentError, node.sphereCenter);
+    // Inflate both error terms by the same amount before projection: this preserves the required
+    // strict parentError > clusterError ordering (ClusterDAG.cpp's ValidateClusterDAG invariant --
+    // adding the same constant to both sides of a strict inequality cannot flip it) while
+    // conservatively biasing the cut toward finer detail for a swaying cluster, exactly mirroring
+    // cluster_culling_tests.glsl's InflateBoundsForWPO used by the occlusion/frustum culling pass.
+    float clusterError = node.clusterError + node.maxWPOAmplitude;
+    float parentError = node.parentError + node.maxWPOAmplitude;
+
+    float localPixelError = ProjectedErrorToPixels(clusterError, node.sphereCenter);
+    float parentPixelError = ProjectedErrorToPixels(parentError, node.sphereCenter);
 
     uint decision = DAG_DECISION_SKIP;
     if (localPixelError < g_ViewParams.data.pixelThreshold && parentPixelError >= g_ViewParams.data.pixelThreshold) {

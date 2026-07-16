@@ -48,6 +48,10 @@
 #include "include/half_space_raster.glsl"
 #include "include/procedural_material.glsl"
 
+#define MASK_ARRAY_SET 0
+#define MASK_ARRAY_BINDING 8
+#include "include/mask_sampling.glsl"
+
 layout(std430, set = 0, binding = 0) readonly buffer ClusterCullMetadataSSBO {
     ClusterCullMetadata clusters[];
 } g_Clusters;
@@ -66,6 +70,55 @@ layout(std140, set = 0, binding = 7) uniform ResolveViewParamsUBO {
     float _pad0;
     float _pad1;
 } g_ViewParams;
+
+#ifdef _DEBUG
+layout(push_constant) uniform DebugPC {
+    uint viewMode;
+} pc;
+
+uint GetFontChar(int c) {
+    if (c == 65) return 15269425u;
+    if (c == 66) return 32045630u;
+    if (c == 67) return 15254062u;
+    if (c == 68) return 32032318u;
+    if (c == 69) return 33061407u;
+    if (c == 70) return 33061392u;
+    if (c == 71) return 15224366u;
+    if (c == 72) return 18415153u;
+    if (c == 73) return 14815374u;
+    if (c == 74) return 3179566u;
+    if (c == 75) return 19554962u;
+    if (c == 76) return 17318431u;
+    if (c == 77) return 18732593u;
+    if (c == 78) return 18667121u;
+    if (c == 79) return 15255086u;
+    if (c == 80) return 32045584u;
+    if (c == 81) return 15259213u;
+    if (c == 82) return 32045714u;
+    if (c == 83) return 15218734u;
+    if (c == 84) return 32641156u;
+    if (c == 85) return 18400814u;
+    if (c == 86) return 18400580u;
+    if (c == 87) return 18405233u;
+    if (c == 88) return 18157905u;
+    if (c == 89) return 18157700u;
+    if (c == 90) return 32575775u;
+    if (c == 32) return 0u;
+    return 0u;
+}
+
+bool DrawString(ivec2 pixel, ivec2 startPos, int chars[32], int len) {
+    ivec2 local = pixel - startPos;
+    if (local.x < 0 || local.y < 0 || local.y >= 5) return false;
+    int charIdx = local.x / 6;
+    if (charIdx >= len) return false;
+    int localX = local.x % 6;
+    if (localX == 5) return false;
+    uint glyph = GetFontChar(chars[charIdx]);
+    uint bitIdx = (local.y * 5) + localX;
+    return ((glyph >> (24u - bitIdx)) & 1u) != 0u;
+}
+#endif
 
 layout(local_size_x = 8, local_size_y = 8) in;
 
@@ -101,76 +154,158 @@ void main() {
         triangleOrdinal = swVisibilityID & 0x7Fu;
     }
 
-    if (!hasAnyData) {
-        // Background: matches main.cpp's dark-blue swapchain clear color from before the
-        // Visibility Buffer conversion, so a pixel with nothing rasterized reads the same either
-        // way.
-        imageStore(g_OutputColor, pixel, vec4(0.05, 0.05, 0.1, 1.0));
-        return;
+    vec3 finalColor = vec3(0.05, 0.05, 0.1);
+
+    if (hasAnyData) {
+        // --- Step 2: re-fetch the winning triangle's 3 vertices and reconstruct barycentrics ---
+        ClusterCullMetadata cluster = g_Clusters.clusters[clusterSlotIndex];
+        uint physicalPageIndex = cluster.vertexOffset / CLUSTER_MAX_VERTICES;
+        uint pageByteBase = physicalPageIndex * CLUSTER_PAGE_SIZE_BYTES;
+
+        uint i0 = ClusterLoadByte(pageByteBase + CLUSTER_INDICES_BASE_BYTES + triangleOrdinal * 3u + 0u);
+        uint i1 = ClusterLoadByte(pageByteBase + CLUSTER_INDICES_BASE_BYTES + triangleOrdinal * 3u + 1u);
+        uint i2 = ClusterLoadByte(pageByteBase + CLUSTER_INDICES_BASE_BYTES + triangleOrdinal * 3u + 2u);
+
+        vec3 p0 = DecodeClusterPosition(pageByteBase, i0, cluster.boundsMin, cluster.boundsMax);
+        vec3 p1 = DecodeClusterPosition(pageByteBase, i1, cluster.boundsMin, cluster.boundsMax);
+        vec3 p2 = DecodeClusterPosition(pageByteBase, i2, cluster.boundsMin, cluster.boundsMax);
+        vec3 n0 = DecodeClusterNormal(pageByteBase, i0);
+        vec3 n1 = DecodeClusterNormal(pageByteBase, i1);
+        vec3 n2 = DecodeClusterNormal(pageByteBase, i2);
+        vec2 uv0 = DecodeClusterUV(pageByteBase, i0);
+        vec2 uv1 = DecodeClusterUV(pageByteBase, i1);
+        vec2 uv2 = DecodeClusterUV(pageByteBase, i2);
+
+        vec4 clip0 = g_ViewParams.viewProj * vec4(p0, 1.0);
+        vec4 clip1 = g_ViewParams.viewProj * vec4(p1, 1.0);
+        vec4 clip2 = g_ViewParams.viewProj * vec4(p2, 1.0);
+
+        vec2 screen0 = (clip0.xy / clip0.w * 0.5 + 0.5) * g_ViewParams.viewportSize;
+        vec2 screen1 = (clip1.xy / clip1.w * 0.5 + 0.5) * g_ViewParams.viewportSize;
+        vec2 screen2 = (clip2.xy / clip2.w * 0.5 + 0.5) * g_ViewParams.viewportSize;
+
+        vec2 pixelCenter = vec2(pixel) + 0.5;
+
+        float area2 = EdgeFunction(screen0, screen1, screen2);
+        float invArea2 = (abs(area2) > 1.0e-8) ? (1.0 / area2) : 0.0;
+
+        // Screen-space-linear barycentric weights (not yet perspective-correct).
+        float w0 = EdgeFunction(screen1, screen2, pixelCenter) * invArea2;
+        float w1 = EdgeFunction(screen2, screen0, pixelCenter) * invArea2;
+        float w2 = EdgeFunction(screen0, screen1, pixelCenter) * invArea2;
+
+        // Perspective correction: screen-space-linear weights interpolate attributes incorrectly under
+        // perspective projection (unlike NDC depth itself, which the rasterizer already relies on
+        // being screen-linear) -- dividing each weight by its vertex's clip.w and renormalizing
+        // recovers the perspective-correct weights standard rasterizers apply to varyings.
+        float invW0 = 1.0 / clip0.w;
+        float invW1 = 1.0 / clip1.w;
+        float invW2 = 1.0 / clip2.w;
+        float interpInvW = w0 * invW0 + w1 * invW1 + w2 * invW2;
+        float perspNorm = (abs(interpInvW) > 1.0e-8) ? (1.0 / interpInvW) : 0.0;
+        float pw0 = w0 * invW0 * perspNorm;
+        float pw1 = w1 * invW1 * perspNorm;
+        float pw2 = w2 * invW2 * perspNorm;
+
+        vec3 normal = normalize(pw0 * n0 + pw1 * n1 + pw2 * n2);
+        vec2 uv = pw0 * uv0 + pw1 * uv1 + pw2 * uv2;
+
+        // --- Step 3: procedural material evaluation (see the class comment for why no texture
+        // sampling happens here yet) ---
+        vec3 lightDir = normalize(vec3(0.5, 1.0, 0.5));
+        float diff = max(dot(normal, lightDir), 0.0);
+
+        uint hashed = HashID(clusterSlotIndex);
+        float hue = float(hashed) / 4294967295.0;
+        vec3 albedo = HsvToRgb(vec3(hue, 0.65, 0.85));
+        finalColor = albedo * 0.15 + albedo * diff;
+
+        // Opacity-mask soft edge feathering: the hard cutout already happened upstream
+        // (ClusterRaster.frag's discard / ClusterSoftwareRaster.comp's skipped atomic write), so
+        // only pixels whose alpha already cleared that cutoff ever reach this point -- blending
+        // toward the background color based on how far above the cutoff this pixel's alpha sits
+        // softens what would otherwise be a hard-edged foliage silhouette. A no-op for any
+        // non-masked cluster (SampleMaskAlpha returns 1.0 for the sentinel, past both smoothstep
+        // edges).
+        if (cluster.maskTextureIndex != 0xFFFFFFFFu) {
+            float maskAlpha = SampleMaskAlpha(cluster.maskTextureIndex, uv);
+            float edgeBlend = smoothstep(0.5, 0.75, maskAlpha);
+            finalColor = mix(vec3(0.05, 0.05, 0.1), finalColor, edgeBlend);
+        }
+
+#ifdef _DEBUG
+        if (pc.viewMode == 1) { // DEBUG_VIEW_NANITE_TRIANGLES
+            uint hashedTri = HashID(clusterSlotIndex * 1337 + triangleOrdinal);
+            finalColor = HsvToRgb(vec3(float(hashedTri) / 4294967295.0, 0.8, 0.8));
+        } else if (pc.viewMode == 2) { // DEBUG_VIEW_NANITE_CLUSTERS
+            finalColor = HsvToRgb(vec3(hue, 0.8, 0.8));
+        } else if (pc.viewMode == 8) { // DEBUG_VIEW_OVERDRAWS
+            if (hwHasData && (!swHasData || hwDepth <= swDepth)) finalColor = vec3(0.0, 1.0, 0.0);
+            else finalColor = vec3(0.0, 0.0, 1.0);
+        } else if (pc.viewMode == 10) { // DEBUG_VIEW_DEPTH
+            float d = hwHasData && (!swHasData || hwDepth <= swDepth) ? hwDepth : swDepth;
+            finalColor = vec3(pow(d, 0.2));
+        } else if (pc.viewMode == 11) { // DEBUG_VIEW_NORMALS
+            finalColor = normal * 0.5 + 0.5;
+        } else if (pc.viewMode != 0) {
+            // Placeholders
+            finalColor = vec3(1.0, 0.0, 1.0);
+        }
+#endif
+    } else {
+#ifdef _DEBUG
+        if (pc.viewMode == 10) { // DEBUG_VIEW_DEPTH
+            // For depth view, empty background should render as white/1.0
+            finalColor = vec3(1.0);
+        } else if (pc.viewMode != 0 && pc.viewMode != 1 && pc.viewMode != 2 && pc.viewMode != 8 && pc.viewMode != 11) {
+            // For Lumen / SDF placeholders, render the placeholder color even on background
+            finalColor = vec3(1.0, 0.0, 1.0);
+        }
+#endif
     }
 
-    // --- Step 2: re-fetch the winning triangle's 3 vertices and reconstruct barycentrics ---
-    ClusterCullMetadata cluster = g_Clusters.clusters[clusterSlotIndex];
-    uint physicalPageIndex = cluster.vertexOffset / CLUSTER_MAX_VERTICES;
-    uint pageByteBase = physicalPageIndex * CLUSTER_PAGE_SIZE_BYTES;
+#ifdef _DEBUG
+    ivec2 uiPixel = pixel / 2;
+    ivec2 uiRes = ivec2(g_ViewParams.viewportSize) / 2;
+    int chars[32];
+    int len = 0;
+    
+    if (pc.viewMode == 0) {
+        chars[0]=78; chars[1]=79; chars[2]=82; chars[3]=77; chars[4]=65; chars[5]=76; len=6;
+    } else if (pc.viewMode == 1) {
+        chars[0]=78; chars[1]=65; chars[2]=78; chars[3]=73; chars[4]=84; chars[5]=69; chars[6]=32; chars[7]=84; chars[8]=82; chars[9]=73; chars[10]=65; chars[11]=78; chars[12]=71; chars[13]=76; chars[14]=69; chars[15]=83; len=16;
+    } else if (pc.viewMode == 2) {
+        chars[0]=78; chars[1]=65; chars[2]=78; chars[3]=73; chars[4]=84; chars[5]=69; chars[6]=32; chars[7]=67; chars[8]=76; chars[9]=85; chars[10]=83; chars[11]=84; chars[12]=69; chars[13]=82; chars[14]=83; len=15;
+    } else if (pc.viewMode == 8) {
+        chars[0]=79; chars[1]=86; chars[2]=69; chars[3]=82; chars[4]=68; chars[5]=82; chars[6]=65; chars[7]=87; chars[8]=83; len=9;
+    } else if (pc.viewMode == 10) {
+        chars[0]=68; chars[1]=69; chars[2]=80; chars[3]=84; chars[4]=72; len=5;
+    } else if (pc.viewMode == 11) {
+        chars[0]=78; chars[1]=79; chars[2]=82; chars[3]=77; chars[4]=65; chars[5]=76; chars[6]=83; len=7;
+    } else if (pc.viewMode == 13) {
+        chars[0]=76; chars[1]=85; chars[2]=77; chars[3]=69; chars[4]=78; len=5;
+    } else if (pc.viewMode == 12) {
+        chars[0]=77; chars[1]=79; chars[2]=84; chars[3]=73; chars[4]=79; chars[5]=78; chars[6]=32; chars[7]=86; chars[8]=69; chars[9]=67; chars[10]=84; chars[11]=79; chars[12]=82; chars[13]=83; len=14;
+    } else if (pc.viewMode == 9) {
+        chars[0]=71; chars[1]=76; chars[2]=79; chars[3]=66; chars[4]=65; chars[5]=76; chars[6]=32; chars[7]=83; chars[8]=68; chars[9]=70; len=10;
+    } else if (pc.viewMode == 14) {
+        chars[0]=83; chars[1]=80; chars[2]=65; chars[3]=84; chars[4]=73; chars[5]=65; chars[6]=76; chars[7]=32; chars[8]=80; chars[9]=82; chars[10]=79; chars[11]=66; chars[12]=69; chars[13]=83; len=14;
+    }
 
-    uint i0 = ClusterLoadByte(pageByteBase + CLUSTER_INDICES_BASE_BYTES + triangleOrdinal * 3u + 0u);
-    uint i1 = ClusterLoadByte(pageByteBase + CLUSTER_INDICES_BASE_BYTES + triangleOrdinal * 3u + 1u);
-    uint i2 = ClusterLoadByte(pageByteBase + CLUSTER_INDICES_BASE_BYTES + triangleOrdinal * 3u + 2u);
+    if (len > 0) {
+        int strWidth = len * 6;
+        ivec2 startPos = ivec2(uiRes.x - strWidth - 4, uiRes.y - 5 - 4);
+        
+        if (uiPixel.x >= startPos.x - 2 && uiPixel.x <= startPos.x + strWidth + 1 &&
+            uiPixel.y >= startPos.y - 2 && uiPixel.y <= startPos.y + 6) {
+            finalColor = vec3(0.0);
+        }
 
-    vec3 p0 = DecodeClusterPosition(pageByteBase, i0, cluster.boundsMin, cluster.boundsMax);
-    vec3 p1 = DecodeClusterPosition(pageByteBase, i1, cluster.boundsMin, cluster.boundsMax);
-    vec3 p2 = DecodeClusterPosition(pageByteBase, i2, cluster.boundsMin, cluster.boundsMax);
-    vec3 n0 = DecodeClusterNormal(pageByteBase, i0);
-    vec3 n1 = DecodeClusterNormal(pageByteBase, i1);
-    vec3 n2 = DecodeClusterNormal(pageByteBase, i2);
-    vec2 uv0 = DecodeClusterUV(pageByteBase, i0);
-    vec2 uv1 = DecodeClusterUV(pageByteBase, i1);
-    vec2 uv2 = DecodeClusterUV(pageByteBase, i2);
-
-    vec4 clip0 = g_ViewParams.viewProj * vec4(p0, 1.0);
-    vec4 clip1 = g_ViewParams.viewProj * vec4(p1, 1.0);
-    vec4 clip2 = g_ViewParams.viewProj * vec4(p2, 1.0);
-
-    vec2 screen0 = (clip0.xy / clip0.w * 0.5 + 0.5) * g_ViewParams.viewportSize;
-    vec2 screen1 = (clip1.xy / clip1.w * 0.5 + 0.5) * g_ViewParams.viewportSize;
-    vec2 screen2 = (clip2.xy / clip2.w * 0.5 + 0.5) * g_ViewParams.viewportSize;
-
-    vec2 pixelCenter = vec2(pixel) + 0.5;
-
-    float area2 = EdgeFunction(screen0, screen1, screen2);
-    float invArea2 = (abs(area2) > 1.0e-8) ? (1.0 / area2) : 0.0;
-
-    // Screen-space-linear barycentric weights (not yet perspective-correct).
-    float w0 = EdgeFunction(screen1, screen2, pixelCenter) * invArea2;
-    float w1 = EdgeFunction(screen2, screen0, pixelCenter) * invArea2;
-    float w2 = EdgeFunction(screen0, screen1, pixelCenter) * invArea2;
-
-    // Perspective correction: screen-space-linear weights interpolate attributes incorrectly under
-    // perspective projection (unlike NDC depth itself, which the rasterizer already relies on
-    // being screen-linear) -- dividing each weight by its vertex's clip.w and renormalizing
-    // recovers the perspective-correct weights standard rasterizers apply to varyings.
-    float invW0 = 1.0 / clip0.w;
-    float invW1 = 1.0 / clip1.w;
-    float invW2 = 1.0 / clip2.w;
-    float interpInvW = w0 * invW0 + w1 * invW1 + w2 * invW2;
-    float perspNorm = (abs(interpInvW) > 1.0e-8) ? (1.0 / interpInvW) : 0.0;
-    float pw0 = w0 * invW0 * perspNorm;
-    float pw1 = w1 * invW1 * perspNorm;
-    float pw2 = w2 * invW2 * perspNorm;
-
-    vec3 normal = normalize(pw0 * n0 + pw1 * n1 + pw2 * n2);
-    vec2 uv = pw0 * uv0 + pw1 * uv1 + pw2 * uv2; // Decoded and available for a future texture-sampling step.
-
-    // --- Step 3: procedural material evaluation (see the class comment for why no texture
-    // sampling happens here yet) ---
-    vec3 lightDir = normalize(vec3(0.5, 1.0, 0.5));
-    float diff = max(dot(normal, lightDir), 0.0);
-
-    uint hashed = HashID(clusterSlotIndex);
-    float hue = float(hashed) / 4294967295.0;
-    vec3 albedo = HsvToRgb(vec3(hue, 0.65, 0.85));
-    vec3 finalColor = albedo * 0.15 + albedo * diff;
+        if (DrawString(uiPixel, startPos, chars, len)) {
+            finalColor = vec3(1.0, 1.0, 0.0);
+        }
+    }
+#endif
 
     imageStore(g_OutputColor, pixel, vec4(finalColor, 1.0));
 }

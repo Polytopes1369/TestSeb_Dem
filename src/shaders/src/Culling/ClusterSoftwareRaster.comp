@@ -3,13 +3,14 @@
 #extension GL_EXT_shader_image_int64 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 
-// Ultra-fast software micro-triangle rasterizer -- the Nanite-style dual rasterization path's
-// compute half (see renderer::ClusterHardwareRasterPass for the fixed-function half). Every
-// cluster this shader processes was already routed here by
-// ClusterHZBOcclusionCull.comp's ShouldUseSoftwareRaster() because its triangles are estimated to
-// average under a few screen pixels each -- exactly the regime where the hardware rasterizer's
-// per-primitive/per-quad fixed costs dominate and a a plain parallel-per-triangle compute
-// rasterizer is faster.
+// Ultra-fast software micro-triangle rasterizer -- the MASKED-capable half of the Nanite-style dual
+// rasterization path's compute side (see renderer::ClusterHardwareRasterPass for the fixed-function
+// half, and ClusterSoftwareRasterOpaque.comp for the opaque-only, zero-mask-overhead sibling this
+// file shares its core rasterize routine with, via cluster_software_raster_core.glsl). Every cluster
+// this shader processes was already routed here by ClusterHZBOcclusionCull.comp's
+// ShouldUseSoftwareRaster() AND classified as masked (ClusterCullMetadata::maskTextureIndex !=
+// 0xFFFFFFFFu, see that shader's "Opaque / masked classification" comment) -- an opaque cluster is
+// routed to ClusterSoftwareRasterOpaque.comp's own dispatch instead.
 //
 // --- Dispatch shape ---
 // One invocation per (softwareCluster, triangleSlot) pair, flattened into a 1D dispatch: thread
@@ -25,35 +26,19 @@
 // CPU round-trip.
 //
 // --- Rasterization ---
-// Each thread projects its triangle's 3 vertices (decoded directly from the *compressed* physical
-// page pool, exactly like ClusterRaster.vert) to screen space, computes the 3 half-space (edge)
-// functions (half_space_raster.glsl) once per pixel in its screen-space bounding box, and for
-// every pixel inside the triangle atomically contends for that pixel with every other thread (from
-// any cluster, hardware or software) via a combined 64-bit (depth, visibility) word.
+// See cluster_software_raster_core.glsl's RasterizeClusterTriangle for the full algorithm (vertex
+// decode, WPO, projection, near-plane rejection, half-space test, opacity-mask cutout, depth-
+// dominant 64-bit atomic write). This file only decodes the dispatch index into
+// (cluster, triangleOrdinal, local index triple) and forwards to that shared routine.
 //
-// --- Why a 64-bit atomic image write, and what it packs ---
+// --- Why a 64-bit atomic image write ---
 // There is no hardware depth-test/ROP path here (this shader IS the depth test), so "nearest
 // triangle wins" must be implemented explicitly with a single atomic read-modify-write per
-// covered pixel: imageAtomicMax(g_VisBufferAtomic, pixel, (depthBits << 32) | visibilityID).
-// depthBits is (1 - ndcDepth) quantized to 32 bits -- Vulkan's non-reversed [0, 1] depth means
-// smaller ndcDepth is nearer, so negating before quantizing makes "nearer" map to "numerically
-// larger," matching imageAtomicMax's "largest value wins" semantics; the depth bits occupy the
-// HIGH 32 bits so the comparison is depth-dominant (visibilityID only matters as an inconsequential
-// tiebreak on an exact depth match, which imageAtomicMax handles correctly either way).
-// visibilityID (the low 32 bits) is NOT geometry::ClusterIndexEntry::clusterID -- it packs this
-// cluster's own slot index into ClusterCullMetadataSSBO (<< 7) with the local triangle ordinal
-// (0..CLUSTER_MAX_TRIANGLES-1, exactly 7 bits) in the low 7 bits, mirroring
-// ClusterHardwareRasterPass's own choice to store a re-indexable slot rather than the persistent,
-// potentially-sparse cache clusterID -- see ClusterResolve.comp, which unpacks it the same way.
-//
-// A single R64_UINT storage image is used here specifically because the atomic depth+ID
-// composite genuinely needs one 64-bit read-modify-write; this is a deliberate, narrower exception
-// to the "two R32_UINT images" choice made for the *hardware* VisBuffer (VulkanContext::
-// kVisBufferFormat), whose format only ever needs plain (non-atomic) writes -- see
-// renderer::ClusterSoftwareRasterPass's own class comment for the format/extension tradeoff this
-// requires (VK_EXT_shader_image_atomic_int64 / shaderImageInt64Atomics). ClusterResolve.comp is
-// responsible for reconciling the hardware VisBuffer's separate depth buffer against this atomic
-// buffer's own encoded depth to pick whichever rasterization path actually won each pixel.
+// covered pixel. See renderer::ClusterSoftwareRasterPass's own class comment for the full format/
+// extension tradeoff (VK_EXT_shader_image_atomic_int64 / shaderImageInt64Atomics) this requires.
+// ClusterResolve.comp is responsible for reconciling the hardware VisBuffer's separate depth buffer
+// against this atomic buffer's own encoded depth to pick whichever rasterization path actually won
+// each pixel.
 
 #include "include/cluster_culling_common.glsl"
 
@@ -62,6 +47,11 @@
 #include "include/cluster_vertex_decode.glsl"
 
 #include "include/half_space_raster.glsl"
+#include "include/wpo_deformation.glsl"
+
+#define MASK_ARRAY_SET 0
+#define MASK_ARRAY_BINDING 6
+#include "include/mask_sampling.glsl"
 
 layout(std430, set = 0, binding = 0) readonly buffer ClusterCullMetadataSSBO {
     ClusterCullMetadata clusters[];
@@ -83,18 +73,23 @@ layout(std140, set = 0, binding = 3) uniform SoftwareRasterViewParamsUBO {
 
 layout(r64ui, set = 0, binding = 4) uniform u64image2D g_VisBufferAtomic;
 
+// Uploaded once per frame by renderer::ClusterRenderPipeline -- the exact same buffer/contents
+// ClusterRaster.vert binds, so both rasterization paths apply identical WPO displacement.
+layout(std140, set = 0, binding = 5) uniform WPOGlobalsUBO {
+    float globalTime;
+    float _pad0;
+    float _pad1;
+    float _pad2;
+} g_WPOGlobals;
+
 layout(push_constant) uniform SoftwareRasterPushConstants {
     uint maxTrianglesPerCluster; // == CLUSTER_MAX_TRIANGLES, used only to decode the flattened dispatch index.
 } pc;
 
 layout(local_size_x = 64) in;
 
-// Packs (clusterSlotIndex, localTriangleOrdinal) into the atomic word's low 32 bits -- see the
-// class comment. CLUSTER_MAX_TRIANGLES (128) needs exactly 7 bits, so the shift below never loses
-// triangle-ordinal bits and never collides with the cluster-slot bits above it.
-uint PackVisibilityID(uint clusterSlotIndex, uint triangleOrdinal) {
-    return (clusterSlotIndex << 7) | (triangleOrdinal & 0x7Fu);
-}
+#define HAS_MASK_SUPPORT 1
+#include "include/cluster_software_raster_core.glsl"
 
 void main() {
     uint globalID = gl_GlobalInvocationID.x;
@@ -123,72 +118,5 @@ void main() {
     uint i1 = ClusterLoadByte(pageByteBase + CLUSTER_INDICES_BASE_BYTES + triangleOrdinal * 3u + 1u);
     uint i2 = ClusterLoadByte(pageByteBase + CLUSTER_INDICES_BASE_BYTES + triangleOrdinal * 3u + 2u);
 
-    vec3 p0World = DecodeClusterPosition(pageByteBase, i0, cluster.boundsMin, cluster.boundsMax);
-    vec3 p1World = DecodeClusterPosition(pageByteBase, i1, cluster.boundsMin, cluster.boundsMax);
-    vec3 p2World = DecodeClusterPosition(pageByteBase, i2, cluster.boundsMin, cluster.boundsMax);
-
-    vec4 clip0 = g_ViewParams.viewProj * vec4(p0World, 1.0);
-    vec4 clip1 = g_ViewParams.viewProj * vec4(p1World, 1.0);
-    vec4 clip2 = g_ViewParams.viewProj * vec4(p2World, 1.0);
-
-    // Reject any triangle with a vertex behind (or on) the camera plane. Near-plane clipping a
-    // micro-triangle correctly would require generating new clipped vertices -- disproportionate
-    // complexity for triangles this small; the hardware path (whose fixed-function clipper handles
-    // this correctly) already covers every cluster large enough for this to matter in practice,
-    // and ClusterHZBOcclusionCull.comp's own frustum test upstream already rejects clusters
-    // genuinely entirely behind the camera.
-    if (clip0.w <= 1.0e-5 || clip1.w <= 1.0e-5 || clip2.w <= 1.0e-5) {
-        return;
-    }
-
-    vec3 ndc0 = clip0.xyz / clip0.w;
-    vec3 ndc1 = clip1.xyz / clip1.w;
-    vec3 ndc2 = clip2.xyz / clip2.w;
-
-    // NDC [-1, 1] xy -> pixel screen-space coordinates. Vulkan clip space is already y-down, so no
-    // extra flip is needed (matching every other screen-space projection in this codebase, e.g.
-    // hzb_occlusion.glsl's IsClusterOccluded).
-    vec2 screen0 = (ndc0.xy * 0.5 + 0.5) * g_ViewParams.viewportSize;
-    vec2 screen1 = (ndc1.xy * 0.5 + 0.5) * g_ViewParams.viewportSize;
-    vec2 screen2 = (ndc2.xy * 0.5 + 0.5) * g_ViewParams.viewportSize;
-
-    // Screen-space bounding box, clamped to the render target.
-    vec2 bboxMin = clamp(min(screen0, min(screen1, screen2)), vec2(0.0), g_ViewParams.viewportSize - 1.0);
-    vec2 bboxMax = clamp(max(screen0, max(screen1, screen2)), vec2(0.0), g_ViewParams.viewportSize - 1.0);
-    ivec2 pixelMin = ivec2(floor(bboxMin));
-    ivec2 pixelMax = ivec2(ceil(bboxMax));
-
-    // area2 == EdgeFunction(screen0, screen1, screen2) is the triangle's own signed doubled area:
-    // zero for a degenerate (zero-area) triangle, its sign tells the winding used to normalize the
-    // per-pixel inside test below.
-    float area2 = EdgeFunction(screen0, screen1, screen2);
-    if (abs(area2) < 1.0e-8) {
-        return;
-    }
-    float invArea2 = 1.0 / area2;
-
-    for (int y = pixelMin.y; y <= pixelMax.y; ++y) {
-        for (int x = pixelMin.x; x <= pixelMax.x; ++x) {
-            vec2 pixelCenter = vec2(float(x) + 0.5, float(y) + 0.5);
-
-            float w0 = EdgeFunction(screen1, screen2, pixelCenter);
-            float w1 = EdgeFunction(screen2, screen0, pixelCenter);
-            float w2 = EdgeFunction(screen0, screen1, pixelCenter);
-
-            bool inside = (area2 > 0.0) ? (w0 >= 0.0 && w1 >= 0.0 && w2 >= 0.0)
-                                         : (w0 <= 0.0 && w1 <= 0.0 && w2 <= 0.0);
-            if (!inside) {
-                continue;
-            }
-
-            vec3 bary = vec3(w0, w1, w2) * invArea2;
-            float ndcDepth = bary.x * ndc0.z + bary.y * ndc1.z + bary.z * ndc2.z;
-
-            uint depthBits = uint(clamp(1.0 - ndcDepth, 0.0, 1.0) * 4294967295.0);
-            uint visibilityID = PackVisibilityID(clusterSlotIndex, triangleOrdinal);
-            uint64_t packed = (uint64_t(depthBits) << 32) | uint64_t(visibilityID);
-
-            imageAtomicMax(g_VisBufferAtomic, ivec2(x, y), packed);
-        }
-    }
+    RasterizeClusterTriangle(cluster, clusterSlotIndex, triangleOrdinal, pageByteBase, i0, i1, i2);
 }

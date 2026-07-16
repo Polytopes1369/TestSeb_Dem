@@ -3,6 +3,9 @@
 #include "io/CacheFileManager.h"
 #include "geometry/ClusterDAG.h"
 #include "geometry/ClusterFormat.h"
+#include "geometry/EntityMaterialTable.h"
+#include "geometry/CardGenerator.h"
+#include "geometry/FallbackMeshBuilder.h"
 #include "geometry/GeometryEncoding.h"
 #include "core/Logger.h"
 #include "renderer/RenderTypes.h"
@@ -123,13 +126,14 @@ namespace geometry {
         // -------------------------------------------------------------------------------------
         // Computes area-weighted per-vertex normals directly from a DAG node's own triangle
         // geometry. Needed because SimplifiableMesh (ClusterGrouping/MeshSimplifier/ClusterDAG's
-        // shared working type) only tracks vertex positions -- carrying real per-vertex normals
-        // and UVs through cluster grouping and QEM simplification is a separate, larger piece of
-        // work (attribute-aware quadrics, à la Hoppe) than this .cache-format pass. Recomputing a
-        // face-derived normal here is correct and complete for every DAG level (leaf or
-        // simplified); UVs have no equivalent purely-geometric fallback, so every cluster gets an
-        // explicit (0,0) placeholder instead (see EncodeClusterData below) rather than silently
-        // reusing stale, potentially wrong original-mesh UVs.
+        // shared working type) only tracks vertex positions/UVs, not normals -- carrying real
+        // per-vertex normals through cluster grouping and QEM simplification would need an
+        // attribute-aware quadric (à la Hoppe), a separate, larger piece of work than this
+        // .cache-format pass. Recomputing a face-derived normal here is correct and complete for
+        // every DAG level (leaf or simplified). UV, unlike normals, IS carried through grouping/
+        // simplification as a genuine mesh attribute (SimplifiableMesh::uvs, midpoint-blended
+        // across each QEM collapse) -- see EncodeClusterData below, which reads node.mesh.uvs
+        // directly instead of needing a geometric fallback.
         // -------------------------------------------------------------------------------------
         std::vector<maths::vec3> ComputeVertexNormals(const SimplifiableMesh& mesh) {
             std::vector<maths::vec3> normals(mesh.positions.size(), maths::vec3{ 0.0f, 0.0f, 0.0f });
@@ -172,7 +176,7 @@ namespace geometry {
             for (uint32_t v = 0; v < vertexCount; ++v) {
                 outData.positions[v] = QuantizePosition(node.mesh.positions[v], node.boundsMin, node.boundsMax);
                 outData.normals[v] = EncodeOctNormal24(normals[v]);
-                outData.uvs[v] = EncodeUV(maths::vec2{ 0.0f, 0.0f });
+                outData.uvs[v] = EncodeUV(node.mesh.uvs[v]);
             }
             for (uint32_t i = 0; i < indexCount; ++i) {
                 outData.indices[i] = static_cast<uint8_t>(node.mesh.triangles[i]);
@@ -184,7 +188,11 @@ namespace geometry {
         // coarse CPU/GPU-side culling, kept resident even while the node's own geometry block may
         // not be streamed in. virtualAddress/blockSizeBytes are left zeroed -- CacheFileManager::
         // WriteCacheFile fills them in once it has computed the file's physical layout.
-        ClusterIndexEntry BuildIndexEntry(uint32_t globalClusterID, uint32_t entityID, const ClusterDAGNode& node) {
+        // maxWPOAmplitude/maskTextureIndex come from the owning entity's GetEntityMaterialProperties
+        // lookup (see the call site below) and are stamped identically into every DAG level of a
+        // given entity, exactly like entityID itself.
+        ClusterIndexEntry BuildIndexEntry(uint32_t globalClusterID, uint32_t entityID, const ClusterDAGNode& node,
+            float maxWPOAmplitude, uint32_t maskTextureIndex) {
             // The cone must bound each triangle's flat FACE normal -- what IsClusterBackFacing
             // (cluster_culling_tests.glsl) actually tests against -- not smoothed per-vertex
             // normals. Vertex normals average together neighboring face normals, which narrows
@@ -233,7 +241,48 @@ namespace geometry {
             entry.coneAxisY = static_cast<int8_t>(std::lround(coneAxis.y * 127.0f));
             entry.coneAxisZ = static_cast<int8_t>(std::lround(coneAxis.z * 127.0f));
             entry.coneCutoff = static_cast<int8_t>(std::lround(coneCutoff * 127.0f));
+            entry.maxWPOAmplitude = maxWPOAmplitude;
+            entry.maskTextureIndex = maskTextureIndex;
             return entry;
+        }
+
+        // Converts a geometry::FallbackMesh into an on-disk-ready CacheFileManager::FallbackMeshData:
+        // full-precision FallbackVertex array, flattened triangle indices, and a freshly computed
+        // AABB. vertexDataOffset/indexDataOffset are left zeroed -- CacheFileManager::WriteCacheFile
+        // fills them in once it has computed the file's physical layout (mirrors BuildIndexEntry's
+        // own virtualAddress/blockSizeBytes convention above).
+        FallbackMeshData BuildFallbackMeshData(uint32_t entityID, const FallbackMesh& mesh) {
+            FallbackMeshData data;
+            data.indexEntry.entityID = entityID;
+            data.indexEntry.vertexCount = static_cast<uint32_t>(mesh.positions.size());
+            data.indexEntry.triangleCount = static_cast<uint32_t>(mesh.triangles.size() / 3u);
+            data.indexEntry.vertexDataOffset = 0;
+            data.indexEntry.indexDataOffset = 0;
+
+            maths::vec3 boundsMin{ std::numeric_limits<float>::max(), std::numeric_limits<float>::max(), std::numeric_limits<float>::max() };
+            maths::vec3 boundsMax{ std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest() };
+
+            data.vertices.reserve(mesh.positions.size());
+            for (size_t v = 0; v < mesh.positions.size(); ++v) {
+                const maths::vec3& p = mesh.positions[v];
+                boundsMin.x = std::min(boundsMin.x, p.x); boundsMin.y = std::min(boundsMin.y, p.y); boundsMin.z = std::min(boundsMin.z, p.z);
+                boundsMax.x = std::max(boundsMax.x, p.x); boundsMax.y = std::max(boundsMax.y, p.y); boundsMax.z = std::max(boundsMax.z, p.z);
+
+                FallbackVertex fv{};
+                fv.position[0] = p.x; fv.position[1] = p.y; fv.position[2] = p.z;
+                fv.normal[0] = mesh.normals[v].x; fv.normal[1] = mesh.normals[v].y; fv.normal[2] = mesh.normals[v].z;
+                fv.uv[0] = mesh.uvs[v].x; fv.uv[1] = mesh.uvs[v].y;
+                data.vertices.push_back(fv);
+            }
+            if (mesh.positions.empty()) {
+                boundsMin = maths::vec3{ 0.0f, 0.0f, 0.0f };
+                boundsMax = maths::vec3{ 0.0f, 0.0f, 0.0f };
+            }
+            data.indexEntry.boundsMin[0] = boundsMin.x; data.indexEntry.boundsMin[1] = boundsMin.y; data.indexEntry.boundsMin[2] = boundsMin.z;
+            data.indexEntry.boundsMax[0] = boundsMax.x; data.indexEntry.boundsMax[1] = boundsMax.y; data.indexEntry.boundsMax[2] = boundsMax.z;
+
+            data.indices = mesh.triangles;
+            return data;
         }
 
         // Reconstructs an (geometry-less) in-memory ClusterDAG purely from an on-disk DAG table,
@@ -323,14 +372,17 @@ namespace geometry {
         std::vector<ClusterIndexEntry> indexEntries;
         std::vector<DAGNodeEntry> dagEntries;
         std::vector<ClusterData> clusterData;
+        std::vector<FallbackMeshData> fallbackMeshes;
+        std::vector<SurfaceCacheCardEntry> cardEntries;
 
         bool allEntitiesOk = true;
         uint32_t entitiesWithGeometry = 0;
 
         for (uint32_t entityIdx = 0; entityIdx < entityCount; ++entityIdx) {
             uint32_t meshID = entityData[entityIdx].meshID;
+            EntityMaterialProperties materialProps = GetEntityMaterialProperties(entityData[entityIdx].materialID);
 
-            ClusterDAG dag = BuildClusterDAG(meshID, allVertices, allIndices);
+            ClusterDAG dag = BuildClusterDAG(meshID, allVertices, allIndices, materialProps.maskTextureIndex);
             if (dag.nodes.empty()) {
                 LOG_WARNING(std::format(
                     "[GeometryCacheTest] Entity meshID={} produced zero clusters (no matching triangles); skipping.", meshID));
@@ -349,6 +401,42 @@ namespace geometry {
                 continue;
             }
 
+            // Fallback Mesh: one coarse BVH proxy for this entity, built by continuing DAG-root
+            // simplification with every vertex unlocked (see FallbackMeshBuilder.h). Deliberately
+            // independent of the opaque/masked cluster split above -- it is a ray tracing
+            // acceleration-structure input, not a rasterization path.
+            FallbackMesh fallbackMesh = BuildFallbackMesh(dag);
+            if (!fallbackMesh.triangles.empty()) {
+                fallbackMeshes.push_back(BuildFallbackMeshData(meshID, fallbackMesh));
+
+                // Surface-cache cards: up to 6 orthographic box-face projections of this entity,
+                // sized from the SAME AABB the fallback mesh's index entry carries -- the capture
+                // pass rasterizes exactly that mesh through these cards, so using its bounds (not
+                // the leaf geometry's) guarantees the projection volume encloses everything the
+                // capture will ever draw. Atlas placement is deferred to the global pack below.
+                const FallbackMeshIndexEntry& fbEntry = fallbackMeshes.back().indexEntry;
+                std::vector<SurfaceCacheCardEntry> entityCards = GenerateEntityCards(meshID,
+                    maths::vec3{ fbEntry.boundsMin[0], fbEntry.boundsMin[1], fbEntry.boundsMin[2] },
+                    maths::vec3{ fbEntry.boundsMax[0], fbEntry.boundsMax[1], fbEntry.boundsMax[2] });
+                cardEntries.insert(cardEntries.end(), entityCards.begin(), entityCards.end());
+                LOG_INFO(std::format(
+                    "[GeometryCacheTest] entity meshID={}: {} surface-cache card(s) generated.",
+                    meshID, entityCards.size()));
+
+                size_t leafTriangleCount = 0;
+                for (const ClusterDAGNode& n : dag.nodes) {
+                    if (n.level == 0u) {
+                        leafTriangleCount += n.mesh.triangles.size() / 3u;
+                    }
+                }
+                size_t fallbackTriangleCount = fallbackMesh.triangles.size() / 3u;
+                LOG_INFO(std::format(
+                    "[GeometryCacheTest] entity meshID={}: fallback mesh {} triangle(s) ({:.2f}% of {} leaf triangle(s)).",
+                    meshID, fallbackTriangleCount,
+                    100.0f * static_cast<float>(fallbackTriangleCount) / static_cast<float>(std::max<size_t>(1, leafTriangleCount)),
+                    leafTriangleCount));
+            }
+
             uint32_t baseGlobalID = static_cast<uint32_t>(indexEntries.size());
             std::vector<uint32_t> localToGlobal(dag.nodes.size());
             for (size_t i = 0; i < dag.nodes.size(); ++i) {
@@ -364,7 +452,13 @@ namespace geometry {
                     allEntitiesOk = false; // Logged inside EncodeClusterData; keep bookkeeping aligned below.
                 }
                 clusterData.push_back(data);
-                indexEntries.push_back(BuildIndexEntry(globalID, meshID, node));
+                // Per-cluster, not per-entity: a cluster only carries the entity's real mask slot
+                // if BuildClusterDAG's opacity split actually classified it as masked (node.isMasked)
+                // -- an opaque cluster gets kInvalidMaskTextureIndex even if its owning entity has a
+                // cutout material, which is exactly what lets the (Part 2) opaque rasterizer path
+                // route it with zero mask-sampling overhead.
+                indexEntries.push_back(BuildIndexEntry(globalID, meshID, node, materialProps.maxWPOAmplitude,
+                    node.isMasked ? materialProps.maskTextureIndex : kInvalidMaskTextureIndex));
 
                 DAGNodeEntry dagEntry{};
                 dagEntry.clusterID = globalID;
@@ -414,9 +508,23 @@ namespace geometry {
             return false;
         }
 
+        // --- Pack every entity's cards into the global surface cache atlas ----------------------
+        // A pack failure means the scene's combined card area exceeds the atlas -- a build-time
+        // tuning error (kCardTexelsPerWorldUnit vs kSurfaceCacheAtlasSize), fatal by design since
+        // the surface cache capture pass cannot run without a complete, non-overlapping mapping.
+        if (!PackCardsIntoAtlas(cardEntries)) {
+            LOG_ERROR(std::format(
+                "[GeometryCacheTest] Aborting: {} surface-cache card(s) do not fit the {}x{} atlas.",
+                cardEntries.size(), kSurfaceCacheAtlasSize, kSurfaceCacheAtlasSize));
+            return false;
+        }
+        LOG_INFO(std::format(
+            "[GeometryCacheTest] Packed {} surface-cache card(s) into the {}x{} atlas.",
+            cardEntries.size(), kSurfaceCacheAtlasSize, kSurfaceCacheAtlasSize));
+
         // --- Write the whole scene's clusters into ONE consolidated .cache file -----------------
         std::filesystem::path filePath = std::filesystem::path(".") / "scene.cache";
-        if (!cacheManager.WriteCacheFile(filePath, indexEntries, dagEntries, clusterData, entitiesWithGeometry)) {
+        if (!cacheManager.WriteCacheFile(filePath, indexEntries, dagEntries, clusterData, fallbackMeshes, cardEntries, entitiesWithGeometry)) {
             LOG_ERROR(std::format("[GeometryCacheTest] WriteCacheFile failed for '{}'.", filePath.string()));
             return false;
         }
@@ -482,6 +590,74 @@ namespace geometry {
         allPassed = allPassed && clusterReadOk;
         LOG(clusterReadOk ? LogLevel::Info : LogLevel::Error, std::format(
             "[GeometryCacheTest] Sample cluster [{}] geometry block round-trip: {}.", sampleClusterIndex, clusterReadOk ? "OK" : "FAIL"));
+
+        // Fallback-mesh section round trip: table + one entity's full vertex/index geometry,
+        // byte-exact against the in-memory data WriteCacheFile was handed (whose indexEntry
+        // offsets it filled in place, so fallbackMeshes[i].indexEntry is already the on-disk truth).
+        std::vector<FallbackMeshIndexEntry> readFallbackTable;
+        std::vector<FallbackMeshIndexEntry> expectedFallbackTable;
+        expectedFallbackTable.reserve(fallbackMeshes.size());
+        for (const FallbackMeshData& f : fallbackMeshes) {
+            expectedFallbackTable.push_back(f.indexEntry);
+        }
+        bool fallbackTableOk = cacheManager.ReadFallbackMeshTable(filePath, readHeader, readFallbackTable)
+            && readFallbackTable.size() == expectedFallbackTable.size()
+            && (expectedFallbackTable.empty() || std::memcmp(readFallbackTable.data(), expectedFallbackTable.data(),
+                expectedFallbackTable.size() * sizeof(FallbackMeshIndexEntry)) == 0);
+        allPassed = allPassed && fallbackTableOk;
+        LOG(fallbackTableOk ? LogLevel::Info : LogLevel::Error, std::format(
+            "[GeometryCacheTest] Fallback-mesh index table round-trip: {} ({} entit(y/ies)).",
+            fallbackTableOk ? "OK" : "FAIL", expectedFallbackTable.size()));
+
+        bool fallbackGeometryOk = true;
+        if (!fallbackMeshes.empty()) {
+            uint32_t sampleFallbackIndex = static_cast<uint32_t>(fallbackMeshes.size() / 2);
+            const FallbackMeshData& expected = fallbackMeshes[sampleFallbackIndex];
+            std::vector<FallbackVertex> readVertices;
+            std::vector<uint32_t> readIndices;
+            fallbackGeometryOk = cacheManager.ReadFallbackMeshGeometry(filePath, expected.indexEntry, readVertices, readIndices)
+                && readVertices.size() == expected.vertices.size()
+                && readIndices.size() == expected.indices.size()
+                && (expected.vertices.empty() || std::memcmp(readVertices.data(), expected.vertices.data(), expected.vertices.size() * sizeof(FallbackVertex)) == 0)
+                && (expected.indices.empty() || std::memcmp(readIndices.data(), expected.indices.data(), expected.indices.size() * sizeof(uint32_t)) == 0);
+        }
+        allPassed = allPassed && fallbackGeometryOk;
+        LOG(fallbackGeometryOk ? LogLevel::Info : LogLevel::Error, std::format(
+            "[GeometryCacheTest] Sample fallback mesh geometry round-trip: {}.", fallbackGeometryOk ? "OK" : "FAIL"));
+
+        // Surface-cache card table round trip: byte-exact against the packed in-memory table,
+        // plus a re-verification that the ON-DISK rects are pairwise non-overlapping (gutter
+        // included) -- the invariant every GI sampler depends on, proven on the persisted bytes
+        // exactly like the DAG's own post-round-trip re-validation above.
+        std::vector<SurfaceCacheCardEntry> readCardTable;
+        bool cardTableOk = cacheManager.ReadSurfaceCacheCardTable(filePath, readHeader, readCardTable)
+            && readCardTable.size() == cardEntries.size()
+            && (cardEntries.empty() || std::memcmp(readCardTable.data(), cardEntries.data(),
+                cardEntries.size() * sizeof(SurfaceCacheCardEntry)) == 0);
+        if (cardTableOk) {
+            for (size_t a = 0; a < readCardTable.size() && cardTableOk; ++a) {
+                for (size_t b = a + 1; b < readCardTable.size() && cardTableOk; ++b) {
+                    const SurfaceCacheCardEntry& ca = readCardTable[a];
+                    const SurfaceCacheCardEntry& cb = readCardTable[b];
+                    // Standard AABB separation test in atlas texel space: overlap iff neither
+                    // rect is fully left of / above the other.
+                    bool overlap =
+                        ca.atlasOffset[0] < cb.atlasOffset[0] + cb.atlasSize[0] &&
+                        cb.atlasOffset[0] < ca.atlasOffset[0] + ca.atlasSize[0] &&
+                        ca.atlasOffset[1] < cb.atlasOffset[1] + cb.atlasSize[1] &&
+                        cb.atlasOffset[1] < ca.atlasOffset[1] + ca.atlasSize[1];
+                    if (overlap) {
+                        LOG_ERROR(std::format(
+                            "[GeometryCacheTest] On-disk cards {} and {} overlap in the atlas!", a, b));
+                        cardTableOk = false;
+                    }
+                }
+            }
+        }
+        allPassed = allPassed && cardTableOk;
+        LOG(cardTableOk ? LogLevel::Info : LogLevel::Error, std::format(
+            "[GeometryCacheTest] Surface-cache card table round-trip + non-overlap: {} ({} card(s)).",
+            cardTableOk ? "OK" : "FAIL", cardEntries.size()));
 
         LOG(allPassed ? LogLevel::Info : LogLevel::Error, std::format(
             "[GeometryCacheTest] Virtual geometry cache round-trip test {} -- '{}': {} cluster(s) across {} entit(y/ies).",

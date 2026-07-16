@@ -71,6 +71,14 @@ namespace geometry {
         float parentError = std::numeric_limits<float>::infinity();
 
         uint32_t level = 0; // 0 = leaf; +1 for every grouping/simplification pass above that.
+
+        // True if this node (and every leaf descendant it summarizes) should sample the entity's
+        // opacity-cutout mask at render time -- see geometry::MeshCluster::isMasked, which this is
+        // stamped from at level 0. Grouping/pairing (ClusterGrouping::BuildClusterAdjacencyWeights,
+        // this file's own BuildLevelAdjacencyWeights) never merges nodes with different isMasked
+        // values, so every non-root node's isMasked is guaranteed to equal its parent's -- checked
+        // explicitly by ValidateClusterDAG.
+        bool isMasked = false;
     };
 
     struct ClusterDAG {
@@ -82,15 +90,20 @@ namespace geometry {
     // Vertex::meshID == targetMeshID. Returns a DAG with an empty `nodes`/`rootIndices` if no
     // triangle matches targetMeshID.
     //
+    // `maskTextureIndex` is forwarded to PartitionMeshIntoClusters (see its doc comment in
+    // ClusterPartitioner.h) to classify and, if needed, split leaf clusters by opacity; pass
+    // geometry::kInvalidMaskTextureIndex for an entity with no cutout material.
+    //
     // Grouping+simplification repeats, level by level, until a single root remains or no further
-    // pairing is possible within a level (e.g. topologically disconnected mesh islands, which can
-    // never become adjacent no matter how many passes run) -- in the latter case every
-    // still-unpaired top node of its island becomes its own root, so `rootIndices` may contain
-    // more than one entry.
+    // pairing is possible within a level (e.g. topologically disconnected mesh islands, or two
+    // differently-classified (opaque vs. masked) clusters that can never merge -- see this file's
+    // BuildLevelAdjacencyWeights) -- in the latter case every still-unpaired top node becomes its
+    // own root, so `rootIndices` may contain more than one entry.
     ClusterDAG BuildClusterDAG(
         uint32_t targetMeshID,
         const std::vector<renderer::Vertex>& allVertices,
-        const std::vector<uint32_t>& allIndices);
+        const std::vector<uint32_t>& allIndices,
+        uint32_t maskTextureIndex);
 
     // Validates a whole DAG's structural and error-monotonicity invariants. Intended to run once
     // at startup, right after BuildClusterDAG, before the DAG is trusted for runtime LOD cuts.

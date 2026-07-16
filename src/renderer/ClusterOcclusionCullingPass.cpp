@@ -1,7 +1,5 @@
 #include "renderer/ClusterOcclusionCullingPass.h"
 
-#include <cassert>
-#include <cstring>
 #include <fstream>
 #include <stdexcept>
 
@@ -39,25 +37,21 @@ namespace renderer {
 
     } // namespace
 
-    void ClusterOcclusionCullingPass::Init(VkDevice device, VmaAllocator allocator, uint32_t maxClusters,
+    void ClusterOcclusionCullingPass::Init(VkDevice device, VmaAllocator allocator, uint32_t maxClusters, uint32_t totalClusterCount,
+        VkBuffer candidateMetadataBuffer, VkBuffer candidateCountBuffer,
         VkImageView hzbFullView, VkExtent2D hzbMip0Extent, uint32_t hzbMipLevelCount) {
         Shutdown();
 
         m_Device = device;
-        m_Allocator = allocator;
         m_MaxClusters = maxClusters;
+        m_CandidateMetadataBuffer = candidateMetadataBuffer;
+        m_CandidateCountBuffer = candidateCountBuffer;
         m_HZBView = hzbFullView;
         m_HZBMip0Width = static_cast<float>(hzbMip0Extent.width);
         m_HZBMip0Height = static_cast<float>(hzbMip0Extent.height);
         m_HZBMipCount = static_cast<float>(hzbMipLevelCount);
 
         // --- Buffers ---
-        m_ClusterMetadataBuffer.Create(
-            allocator,
-            static_cast<VkDeviceSize>(sizeof(ClusterCullMetadata)) * maxClusters,
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-            VMA_MEMORY_USAGE_GPU_ONLY);
-
         m_ViewParamsBuffer.Create(
             allocator,
             sizeof(ClusterCullViewParams),
@@ -71,10 +65,12 @@ namespace renderer {
             VMA_MEMORY_USAGE_GPU_ONLY);
 
         // Persisted across frames -- only ever cleared by the caller-invoked
-        // ClearPersistedVisibility(), never by RecordClearFrame().
+        // ClearPersistedVisibility(), never by RecordClearFrame(). Sized to totalClusterCount (all
+        // DAG levels), NOT maxClusters: indexed by each cluster's persistent, stable clusterID, so
+        // every possible clusterID needs a slot, not just this frame's candidate count.
         m_VisibleLastFrameBuffer.Create(
             allocator,
-            static_cast<VkDeviceSize>(sizeof(uint32_t)) * maxClusters,
+            static_cast<VkDeviceSize>(sizeof(uint32_t)) * totalClusterCount,
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
             VMA_MEMORY_USAGE_GPU_ONLY);
 
@@ -92,15 +88,6 @@ namespace renderer {
             allocator,
             static_cast<VkDeviceSize>(sizeof(uint32_t)) * (1u + maxClusters),
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-            VMA_MEMORY_USAGE_GPU_ONLY);
-
-        // DEBUG (temporary): one outcome code per cluster slot, overwritten every frame by whichever
-        // decision point in ClusterHZBOcclusionCull.comp last touched that cluster -- needs
-        // TRANSFER_SRC_BIT so ClusterRenderPipeline can read it back for the diagnostic histogram.
-        m_DebugOutcomeBuffer.Create(
-            allocator,
-            static_cast<VkDeviceSize>(sizeof(uint32_t)) * maxClusters,
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
             VMA_MEMORY_USAGE_GPU_ONLY);
 
         m_EarlyIndirectCommandBuffer.Create(
@@ -125,6 +112,39 @@ namespace renderer {
             allocator,
             sizeof(uint32_t),
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            VMA_MEMORY_USAGE_GPU_ONLY);
+
+        // --- Opaque-list counterparts (bindings 12-16), same shapes/usages as the five masked-list
+        // buffers just above -- see ClusterHZBOcclusionCull.comp's "Opaque / masked classification"
+        // class comment. ---
+        m_EarlyIndirectCommandOpaqueBuffer.Create(
+            allocator,
+            static_cast<VkDeviceSize>(sizeof(VkDrawIndexedIndirectCommand)) * maxClusters,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
+            VMA_MEMORY_USAGE_GPU_ONLY);
+
+        m_EarlyDrawCountOpaqueBuffer.Create(
+            allocator,
+            sizeof(uint32_t),
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            VMA_MEMORY_USAGE_GPU_ONLY);
+
+        m_LateIndirectCommandOpaqueBuffer.Create(
+            allocator,
+            static_cast<VkDeviceSize>(sizeof(VkDrawIndexedIndirectCommand)) * maxClusters,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
+            VMA_MEMORY_USAGE_GPU_ONLY);
+
+        m_LateDrawCountOpaqueBuffer.Create(
+            allocator,
+            sizeof(uint32_t),
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            VMA_MEMORY_USAGE_GPU_ONLY);
+
+        m_SoftwareClusterListOpaqueBuffer.Create(
+            allocator,
+            static_cast<VkDeviceSize>(sizeof(uint32_t)) * (1u + maxClusters),
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
             VMA_MEMORY_USAGE_GPU_ONLY);
 
         // VkDispatchIndirectCommand (3x uint32) -- only ever written by BuildDispatchIndirectArgs.comp.
@@ -152,10 +172,11 @@ namespace renderer {
         samplerInfo.unnormalizedCoordinates = VK_FALSE;
         VK_CHECK(vkCreateSampler(m_Device, &samplerInfo, nullptr, &m_HZBSampler));
 
-        // --- Main descriptor set layout: 12 bindings, all compute-visible, matching
-        // ClusterHZBOcclusionCull.comp's set = 0 bindings 0..11 exactly. Shared by both the early
-        // and late pipelines. ---
-        VkDescriptorSetLayoutBinding bindings[12]{};
+        // --- Main descriptor set layout: 17 bindings, all compute-visible, matching
+        // ClusterHZBOcclusionCull.comp's set = 0 bindings 0..16 exactly (0..11 the original set,
+        // 12..16 the opaque-list counterparts -- see that shader's "Opaque / masked classification"
+        // class comment). Shared by both the early and late pipelines. ---
+        VkDescriptorSetLayoutBinding bindings[17]{};
         bindings[0] = { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };          // ClusterCullMetadataSSBO
         bindings[1] = { 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };          // CullingViewParamsUBO
         bindings[2] = { 2, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };          // HZBOcclusionViewParamsUBO
@@ -167,10 +188,15 @@ namespace renderer {
         bindings[8] = { 8, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };         // LateIndirectCommandsSSBO
         bindings[9] = { 9, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };         // LateDrawCountSSBO
         bindings[10] = { 10, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };       // SoftwareClusterListSSBO
-        bindings[11] = { 11, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };       // DEBUG: DebugOutcomeSSBO
+        bindings[11] = { 11, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };       // CandidateCountSSBO (borrowed, read-only)
+        bindings[12] = { 12, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };       // EarlyIndirectCommandsOpaqueSSBO
+        bindings[13] = { 13, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };       // EarlyDrawCountOpaqueSSBO
+        bindings[14] = { 14, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };       // LateIndirectCommandsOpaqueSSBO
+        bindings[15] = { 15, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };       // LateDrawCountOpaqueSSBO
+        bindings[16] = { 16, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };       // SoftwareClusterListOpaqueSSBO
 
         VkDescriptorSetLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-        layoutInfo.bindingCount = 12;
+        layoutInfo.bindingCount = 17;
         layoutInfo.pBindings = bindings;
         VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &layoutInfo, nullptr, &m_SetLayout));
 
@@ -186,7 +212,7 @@ namespace renderer {
 
         // --- One shared descriptor pool for both sets ---
         VkDescriptorPoolSize poolSizes[3]{};
-        poolSizes[0] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 9 + 2 };       // Main set's 8 SSBOs + DEBUG DebugOutcomeSSBO + BuildArgs set's 2 SSBOs.
+        poolSizes[0] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 14 + 2 };      // Main set's 14 SSBOs (incl. the 2 borrowed ones) + BuildArgs set's 2 SSBOs.
         poolSizes[1] = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2 };
         poolSizes[2] = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1 };
 
@@ -209,7 +235,7 @@ namespace renderer {
         VK_CHECK(vkAllocateDescriptorSets(m_Device, &buildArgsSetAlloc, &m_BuildArgsDescriptorSet));
 
         // --- Main set descriptor writes ---
-        VkDescriptorBufferInfo clusterInfo{ m_ClusterMetadataBuffer.Handle(), 0, m_ClusterMetadataBuffer.Size() };
+        VkDescriptorBufferInfo clusterInfo{ m_CandidateMetadataBuffer, 0, VK_WHOLE_SIZE };
         VkDescriptorBufferInfo viewParamsInfo{ m_ViewParamsBuffer.Handle(), 0, m_ViewParamsBuffer.Size() };
         VkDescriptorBufferInfo hzbParamsInfo{ m_HZBParamsBuffer.Handle(), 0, m_HZBParamsBuffer.Size() };
         VkDescriptorBufferInfo visibleLastFrameInfo{ m_VisibleLastFrameBuffer.Handle(), 0, m_VisibleLastFrameBuffer.Size() };
@@ -219,7 +245,12 @@ namespace renderer {
         VkDescriptorBufferInfo lateIndirectInfo{ m_LateIndirectCommandBuffer.Handle(), 0, m_LateIndirectCommandBuffer.Size() };
         VkDescriptorBufferInfo lateDrawCountInfo{ m_LateDrawCountBuffer.Handle(), 0, m_LateDrawCountBuffer.Size() };
         VkDescriptorBufferInfo softwareClusterListInfo{ m_SoftwareClusterListBuffer.Handle(), 0, m_SoftwareClusterListBuffer.Size() };
-        VkDescriptorBufferInfo debugOutcomeInfo{ m_DebugOutcomeBuffer.Handle(), 0, m_DebugOutcomeBuffer.Size() };
+        VkDescriptorBufferInfo candidateCountInfo{ m_CandidateCountBuffer, 0, VK_WHOLE_SIZE };
+        VkDescriptorBufferInfo earlyIndirectOpaqueInfo{ m_EarlyIndirectCommandOpaqueBuffer.Handle(), 0, m_EarlyIndirectCommandOpaqueBuffer.Size() };
+        VkDescriptorBufferInfo earlyDrawCountOpaqueInfo{ m_EarlyDrawCountOpaqueBuffer.Handle(), 0, m_EarlyDrawCountOpaqueBuffer.Size() };
+        VkDescriptorBufferInfo lateIndirectOpaqueInfo{ m_LateIndirectCommandOpaqueBuffer.Handle(), 0, m_LateIndirectCommandOpaqueBuffer.Size() };
+        VkDescriptorBufferInfo lateDrawCountOpaqueInfo{ m_LateDrawCountOpaqueBuffer.Handle(), 0, m_LateDrawCountOpaqueBuffer.Size() };
+        VkDescriptorBufferInfo softwareClusterListOpaqueInfo{ m_SoftwareClusterListOpaqueBuffer.Handle(), 0, m_SoftwareClusterListOpaqueBuffer.Size() };
 
         VkDescriptorImageInfo hzbImageInfo{};
         hzbImageInfo.sampler = m_HZBSampler;
@@ -228,7 +259,7 @@ namespace renderer {
         // an attachment or a sampled-only resource) -- see HZBPass.h's class comment.
         hzbImageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
-        VkWriteDescriptorSet writes[12]{};
+        VkWriteDescriptorSet writes[17]{};
         writes[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_DescriptorSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &clusterInfo, nullptr };
         writes[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_DescriptorSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &viewParamsInfo, nullptr };
         writes[2] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_DescriptorSet, 2, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &hzbParamsInfo, nullptr };
@@ -240,8 +271,13 @@ namespace renderer {
         writes[8] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_DescriptorSet, 8, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &lateIndirectInfo, nullptr };
         writes[9] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_DescriptorSet, 9, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &lateDrawCountInfo, nullptr };
         writes[10] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_DescriptorSet, 10, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &softwareClusterListInfo, nullptr };
-        writes[11] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_DescriptorSet, 11, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &debugOutcomeInfo, nullptr };
-        vkUpdateDescriptorSets(m_Device, 12, writes, 0, nullptr);
+        writes[11] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_DescriptorSet, 11, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &candidateCountInfo, nullptr };
+        writes[12] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_DescriptorSet, 12, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &earlyIndirectOpaqueInfo, nullptr };
+        writes[13] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_DescriptorSet, 13, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &earlyDrawCountOpaqueInfo, nullptr };
+        writes[14] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_DescriptorSet, 14, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &lateIndirectOpaqueInfo, nullptr };
+        writes[15] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_DescriptorSet, 15, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &lateDrawCountOpaqueInfo, nullptr };
+        writes[16] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_DescriptorSet, 16, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &softwareClusterListOpaqueInfo, nullptr };
+        vkUpdateDescriptorSets(m_Device, 17, writes, 0, nullptr);
 
         // --- BuildDispatchIndirectArgs set descriptor writes -- binding 0 aliases the pending
         // list buffer, reading only its leading count word (see BuildDispatchIndirectArgs.comp's
@@ -258,7 +294,11 @@ namespace renderer {
         VkPushConstantRange pushConstantRange{};
         pushConstantRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
         pushConstantRange.offset = 0;
-        pushConstantRange.size = 2 * sizeof(uint32_t); // Matches ClusterOcclusionPushConstants { clusterCount; softwareRasterThresholdPixels; } (float is 4 bytes, same as uint32_t).
+#ifndef NDEBUG
+        pushConstantRange.size = 2 * sizeof(uint32_t); // Matches ClusterOcclusionPushConstants { softwareRasterThresholdPixels; disableOcclusionCulling; } -- clusterCount is now read from CandidateCountSSBO (binding 11).
+#else
+        pushConstantRange.size = 1 * sizeof(uint32_t); // Matches ClusterOcclusionPushConstants { softwareRasterThresholdPixels; }
+#endif
 
         VkPipelineLayoutCreateInfo pipelineLayoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
         pipelineLayoutInfo.setLayoutCount = 1;
@@ -383,8 +423,10 @@ namespace renderer {
         m_HZBSampler = VK_NULL_HANDLE;
         m_HZBView = VK_NULL_HANDLE; // Not owned -- just forgotten.
 
-        // GpuBuffer::Destroy() is null-safe (no-op on an already-empty instance).
-        m_ClusterMetadataBuffer.Destroy();
+        // GpuBuffer::Destroy() is null-safe (no-op on an already-empty instance). The candidate
+        // metadata/count buffers are borrowed (plain VkBuffer, not GpuBuffer) -- just forgotten.
+        m_CandidateMetadataBuffer = VK_NULL_HANDLE;
+        m_CandidateCountBuffer = VK_NULL_HANDLE;
         m_ViewParamsBuffer.Destroy();
         m_HZBParamsBuffer.Destroy();
         m_VisibleLastFrameBuffer.Destroy();
@@ -394,7 +436,11 @@ namespace renderer {
         m_LateIndirectCommandBuffer.Destroy();
         m_LateDrawCountBuffer.Destroy();
         m_SoftwareClusterListBuffer.Destroy();
-        m_DebugOutcomeBuffer.Destroy();
+        m_EarlyIndirectCommandOpaqueBuffer.Destroy();
+        m_EarlyDrawCountOpaqueBuffer.Destroy();
+        m_LateIndirectCommandOpaqueBuffer.Destroy();
+        m_LateDrawCountOpaqueBuffer.Destroy();
+        m_SoftwareClusterListOpaqueBuffer.Destroy();
         m_LateDispatchArgsBuffer.Destroy();
 
         m_MaxClusters = 0;
@@ -402,7 +448,6 @@ namespace renderer {
         m_HZBMip0Height = 0.0f;
         m_HZBMipCount = 0.0f;
         m_LastSoftwareRasterThresholdPixels = 0.0f;
-        m_Allocator = VK_NULL_HANDLE;
         m_Device = VK_NULL_HANDLE;
     }
 
@@ -421,73 +466,6 @@ namespace renderer {
         vkCmdPipelineBarrier2(cmd, &depInfo);
     }
 
-    void ClusterOcclusionCullingPass::UploadClusterMetadata(VkCommandPool commandPool, VkQueue queue, const std::vector<ClusterCullMetadata>& clusters) {
-        assert(clusters.size() <= m_MaxClusters && "ClusterOcclusionCullingPass::UploadClusterMetadata: candidate list exceeds maxClusters");
-        if (clusters.empty()) {
-            return;
-        }
-
-        // m_ClusterMetadataBuffer is VMA_MEMORY_USAGE_GPU_ONLY (not host-visible), so uploading
-        // the CPU-authored candidate list requires a temporary host-visible staging buffer plus an
-        // explicit GPU-side copy, mirroring VulkanContext::UploadEntityData's one-time-submit
-        // staging pattern (identical to renderer::ClusterCullingPass::UploadClusterMetadata).
-        VkDeviceSize uploadSize = static_cast<VkDeviceSize>(sizeof(ClusterCullMetadata)) * clusters.size();
-
-        VkBufferCreateInfo stagingInfo{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
-        stagingInfo.size = uploadSize;
-        stagingInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-
-        VmaAllocationCreateInfo stagingAllocInfo{};
-        stagingAllocInfo.usage = VMA_MEMORY_USAGE_CPU_ONLY;
-        stagingAllocInfo.flags = VMA_ALLOCATION_CREATE_MAPPED_BIT;
-
-        VkBuffer stagingBuffer = VK_NULL_HANDLE;
-        VmaAllocation stagingAllocation = VK_NULL_HANDLE;
-        VmaAllocationInfo stagingAllocResultInfo{};
-        VK_CHECK(vmaCreateBuffer(m_Allocator, &stagingInfo, &stagingAllocInfo, &stagingBuffer, &stagingAllocation, &stagingAllocResultInfo));
-        std::memcpy(stagingAllocResultInfo.pMappedData, clusters.data(), static_cast<size_t>(uploadSize));
-
-        VkCommandBufferAllocateInfo cmdAllocInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
-        cmdAllocInfo.commandPool = commandPool;
-        cmdAllocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        cmdAllocInfo.commandBufferCount = 1;
-
-        VkCommandBuffer cmd;
-        VK_CHECK(vkAllocateCommandBuffers(m_Device, &cmdAllocInfo, &cmd));
-
-        VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-        beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        vkBeginCommandBuffer(cmd, &beginInfo);
-
-        VkBufferCopy copyRegion{};
-        copyRegion.srcOffset = 0;
-        copyRegion.dstOffset = 0;
-        copyRegion.size = uploadSize;
-        vkCmdCopyBuffer(cmd, stagingBuffer, m_ClusterMetadataBuffer.Handle(), 1, &copyRegion);
-
-        VkMemoryBarrier2 memBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
-        memBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
-        memBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-        memBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-        memBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
-
-        VkDependencyInfo depInfo{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-        depInfo.memoryBarrierCount = 1;
-        depInfo.pMemoryBarriers = &memBarrier;
-        vkCmdPipelineBarrier2(cmd, &depInfo);
-
-        vkEndCommandBuffer(cmd);
-
-        VkSubmitInfo submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
-        submitInfo.commandBufferCount = 1;
-        submitInfo.pCommandBuffers = &cmd;
-        VK_CHECK(vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE));
-        VK_CHECK(vkQueueWaitIdle(queue));
-
-        vkFreeCommandBuffers(m_Device, commandPool, 1, &cmd);
-        vmaDestroyBuffer(m_Allocator, stagingBuffer, stagingAllocation);
-    }
-
     void ClusterOcclusionCullingPass::RecordClearFrame(VkCommandBuffer cmd) {
         // Only the leading count words need clearing every frame -- the shaders never read past
         // their respective counts, so stale entries beyond that from a previous, larger frame are
@@ -496,6 +474,9 @@ namespace renderer {
         vkCmdFillBuffer(cmd, m_EarlyDrawCountBuffer.Handle(), 0, sizeof(uint32_t), 0u);
         vkCmdFillBuffer(cmd, m_LateDrawCountBuffer.Handle(), 0, sizeof(uint32_t), 0u);
         vkCmdFillBuffer(cmd, m_SoftwareClusterListBuffer.Handle(), 0, sizeof(uint32_t), 0u);
+        vkCmdFillBuffer(cmd, m_EarlyDrawCountOpaqueBuffer.Handle(), 0, sizeof(uint32_t), 0u);
+        vkCmdFillBuffer(cmd, m_LateDrawCountOpaqueBuffer.Handle(), 0, sizeof(uint32_t), 0u);
+        vkCmdFillBuffer(cmd, m_SoftwareClusterListOpaqueBuffer.Handle(), 0, sizeof(uint32_t), 0u);
 
         VkMemoryBarrier2 barrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
         barrier.srcStageMask = VK_PIPELINE_STAGE_2_CLEAR_BIT;
@@ -510,8 +491,7 @@ namespace renderer {
     }
 
     void ClusterOcclusionCullingPass::RecordEarlyPass(VkCommandBuffer cmd, const ClusterCullViewParams& viewParams, const maths::mat4& viewProj,
-        float projScaleY, uint32_t clusterCount, float softwareRasterThresholdPixels) {
-        assert(clusterCount <= m_MaxClusters && "ClusterOcclusionCullingPass::RecordEarlyPass: clusterCount exceeds maxClusters");
+        float projScaleY, VkBuffer earlyDispatchArgsBuffer, float softwareRasterThresholdPixels, uint32_t disableOcclusionCulling) {
 
         m_LastSoftwareRasterThresholdPixels = softwareRasterThresholdPixels;
 
@@ -537,18 +517,19 @@ namespace renderer {
         uboDependency.pMemoryBarriers = &uboBarrier;
         vkCmdPipelineBarrier2(cmd, &uboDependency);
 
-        // --- Dispatch: one invocation per candidate cluster, early (LATE_PASS = false) specialization ---
-        // Matches ClusterOcclusionPushConstants { uint clusterCount; float softwareRasterThresholdPixels; }.
-        struct { uint32_t clusterCount; float softwareRasterThresholdPixels; } pushConstants{ clusterCount, softwareRasterThresholdPixels };
+        // --- Dispatch: one invocation per this frame's GPU-compacted candidate (count only ever
+        // known on the GPU -- see CandidateCountSSBO, binding 11 -- hence the indirect dispatch),
+        // early (LATE_PASS = false) specialization ---
+#ifndef NDEBUG
+        struct { float softwareRasterThresholdPixels; uint32_t disableOcclusionCulling; } pushConstants{ softwareRasterThresholdPixels, disableOcclusionCulling };
+#else
+        struct { float softwareRasterThresholdPixels; } pushConstants{ softwareRasterThresholdPixels };
+#endif
 
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_EarlyPipeline);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_PipelineLayout, 0, 1, &m_DescriptorSet, 0, nullptr);
         vkCmdPushConstants(cmd, m_PipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pushConstants), &pushConstants);
-
-        uint32_t groupCount = (clusterCount + kWorkgroupSize - 1) / kWorkgroupSize;
-        if (groupCount > 0) {
-            vkCmdDispatch(cmd, groupCount, 1, 1);
-        }
+        vkCmdDispatchIndirect(cmd, earlyDispatchArgsBuffer, 0);
 
         // --- Make the early indirect-draw list + its count, the software cluster list, and the
         // pending list all visible to a later vkCmdDrawIndexedIndirectCount /
@@ -592,18 +573,21 @@ namespace renderer {
         vkCmdPipelineBarrier2(cmd, &depInfo);
     }
 
-    void ClusterOcclusionCullingPass::RecordLatePass(VkCommandBuffer cmd) {
+    void ClusterOcclusionCullingPass::RecordLatePass(VkCommandBuffer cmd, uint32_t disableOcclusionCulling) {
         // --- Indirect dispatch: group count comes from GetLateDispatchArgsBuffer(), sized by
         // RecordBuildLateDispatchArgs() from the pending list's own atomic count -- no CPU
         // round-trip. The late (LATE_PASS = true) specialization reads g_PendingList, the (by now
         // freshly rebuilt, by the caller) HZB texture, and -- via ShouldUseSoftwareRaster() --
-        // pc.softwareRasterThresholdPixels; the push-constant clusterCount itself is unused by this
-        // specialization's code path (dead-code-eliminated at pipeline specialization time), but
-        // the whole push-constant block must still be re-pushed here: RecordBuildLateDispatchArgs()
-        // bound a different, incompatible pipeline layout in between, which the Vulkan spec allows
-        // to invalidate push constant values pushed under m_PipelineLayout earlier in this same
-        // command buffer (see renderer::ClusterOcclusionCullingPass.h's RecordLatePass doc). ---
-        struct { uint32_t clusterCount; float softwareRasterThresholdPixels; } pushConstants{ 0u, m_LastSoftwareRasterThresholdPixels };
+        // pc.softwareRasterThresholdPixels. The whole push-constant block must still be re-pushed
+        // here: RecordBuildLateDispatchArgs() bound a different, incompatible pipeline layout in
+        // between, which the Vulkan spec allows to invalidate push constant values pushed under
+        // m_PipelineLayout earlier in this same command buffer (see
+        // renderer::ClusterOcclusionCullingPass.h's RecordLatePass doc). ---
+#ifndef NDEBUG
+        struct { float softwareRasterThresholdPixels; uint32_t disableOcclusionCulling; } pushConstants{ m_LastSoftwareRasterThresholdPixels, disableOcclusionCulling };
+#else
+        struct { float softwareRasterThresholdPixels; } pushConstants{ m_LastSoftwareRasterThresholdPixels };
+#endif
 
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_LatePipeline);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_PipelineLayout, 0, 1, &m_DescriptorSet, 0, nullptr);

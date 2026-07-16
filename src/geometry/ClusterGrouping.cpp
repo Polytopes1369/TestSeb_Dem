@@ -71,6 +71,12 @@ namespace geometry {
         // Builds, for every unordered cluster pair sharing at least one global vertex, the count
         // of shared global vertices -- used both as the adjacency test (count > 0) and as the
         // greedy pairing's preference weight (more shared vertices => more natural merge).
+        //
+        // Cross-classification pairs (one cluster isMasked, the other not) are never recorded, even
+        // if spatially adjacent: merging an opaque and a masked cluster would produce a coarser DAG
+        // node that is no longer provably pure, defeating the entire point of the opaque/masked
+        // split one level up. A cluster left with no same-class neighbor simply becomes a singleton
+        // group below, exactly like an already-disconnected mesh island.
         std::unordered_map<uint64_t, uint32_t> BuildClusterAdjacencyWeights(const std::vector<MeshCluster>& clusters) {
             std::unordered_map<uint32_t, std::vector<uint32_t>> vertexToClusters;
             for (uint32_t ci = 0; ci < clusters.size(); ++ci) {
@@ -86,6 +92,9 @@ namespace geometry {
                 }
                 for (size_t a = 0; a < owningClusters.size(); ++a) {
                     for (size_t b = a + 1; b < owningClusters.size(); ++b) {
+                        if (clusters[owningClusters[a]].isMasked != clusters[owningClusters[b]].isMasked) {
+                            continue;
+                        }
                         uint64_t key = PackIndexPairKey(owningClusters[a], owningClusters[b]);
                         weights[key] += 1u;
                     }
@@ -141,6 +150,7 @@ namespace geometry {
             globalToLocal.reserve(globalTriangles.size());
             group.mesh.positions.reserve(globalTriangles.size());
             group.mesh.locked.reserve(globalTriangles.size());
+            group.mesh.uvs.reserve(globalTriangles.size());
             group.mesh.triangles.reserve(globalTriangles.size() * 3);
 
             auto localIndexFor = [&](uint32_t globalVertex) -> uint32_t {
@@ -152,6 +162,7 @@ namespace geometry {
                 globalToLocal.emplace(globalVertex, local);
                 group.mesh.positions.push_back(allVertices[globalVertex].position);
                 group.mesh.locked.push_back(lockedGlobal.count(globalVertex) != 0);
+                group.mesh.uvs.push_back(allVertices[globalVertex].uv);
                 return local;
                 };
 

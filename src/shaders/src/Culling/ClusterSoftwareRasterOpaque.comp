@@ -1,0 +1,101 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+#extension GL_EXT_shader_image_int64 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+// Ultra-fast software micro-triangle rasterizer -- the OPAQUE-only half of the Nanite-style dual
+// rasterization path's compute side, sibling to ClusterSoftwareRaster.comp (the masked-capable
+// variant this file shares its core rasterize routine with, via
+// cluster_software_raster_core.glsl). Every cluster this shader processes was already routed here
+// by ClusterHZBOcclusionCull.comp's ShouldUseSoftwareRaster() AND classified as fully opaque
+// (ClusterCullMetadata::maskTextureIndex == 0xFFFFFFFFu -- geometry::kInvalidMaskTextureIndex, see
+// that shader's "Opaque / masked classification" comment) -- a masked cluster is routed to
+// ClusterSoftwareRaster.comp's own dispatch instead.
+//
+// The entire point of this separate shader: NO mask array binding, NO UV decode, NO per-pixel mask
+// sample/branch -- compiled with cluster_software_raster_core.glsl's HAS_MASK_SUPPORT == 0, so
+// none of that logic exists in this variant's SPIR-V at all, matching ClusterRasterOpaque.frag's
+// "no discard, no mask sampling" contract for the hardware path. Descriptor set layout is therefore
+// genuinely smaller than the masked variant's (5 bindings vs. 6) -- unlike the hardware path, where
+// sharing one descriptor set across both pipelines costs nothing, here the dropped binding is a
+// real COMBINED_IMAGE_SAMPLER[64] array, worth actually omitting.
+//
+// See ClusterSoftwareRaster.comp's own class comment for the dispatch shape and the 64-bit atomic
+// VisBuffer write rationale -- both apply identically here.
+
+#include "include/cluster_culling_common.glsl"
+
+#define COMPRESSED_POOL_SET 0
+#define COMPRESSED_POOL_BINDING 1
+#include "include/cluster_vertex_decode.glsl"
+
+#include "include/half_space_raster.glsl"
+#include "include/wpo_deformation.glsl"
+
+layout(std430, set = 0, binding = 0) readonly buffer ClusterCullMetadataSSBO {
+    ClusterCullMetadata clusters[];
+} g_Clusters;
+
+// binding 1 == g_CompressedClusterPool, declared by cluster_vertex_decode.glsl.
+
+layout(std430, set = 0, binding = 2) readonly buffer SoftwareClusterListSSBO {
+    uint count;
+    uint clusterIndex[];
+} g_SoftwareList;
+
+layout(std140, set = 0, binding = 3) uniform SoftwareRasterViewParamsUBO {
+    mat4 viewProj;
+    vec2 viewportSize; // Render target size in pixels (width, height).
+    float _pad0;
+    float _pad1;
+} g_ViewParams;
+
+layout(r64ui, set = 0, binding = 4) uniform u64image2D g_VisBufferAtomic;
+
+// Uploaded once per frame by renderer::ClusterRenderPipeline -- the exact same buffer/contents
+// ClusterRaster.vert binds, so both rasterization paths apply identical WPO displacement.
+layout(std140, set = 0, binding = 5) uniform WPOGlobalsUBO {
+    float globalTime;
+    float _pad0;
+    float _pad1;
+    float _pad2;
+} g_WPOGlobals;
+
+layout(push_constant) uniform SoftwareRasterPushConstants {
+    uint maxTrianglesPerCluster; // == CLUSTER_MAX_TRIANGLES, used only to decode the flattened dispatch index.
+} pc;
+
+layout(local_size_x = 64) in;
+
+#define HAS_MASK_SUPPORT 0
+#include "include/cluster_software_raster_core.glsl"
+
+void main() {
+    uint globalID = gl_GlobalInvocationID.x;
+    uint listIndex = globalID / pc.maxTrianglesPerCluster;
+    uint triangleOrdinal = globalID % pc.maxTrianglesPerCluster;
+
+    if (listIndex >= g_SoftwareList.count) {
+        return;
+    }
+
+    uint clusterSlotIndex = g_SoftwareList.clusterIndex[listIndex];
+    ClusterCullMetadata cluster = g_Clusters.clusters[clusterSlotIndex];
+
+    uint triangleCount = cluster.indexCount / 3u;
+    if (triangleOrdinal >= triangleCount) {
+        return;
+    }
+
+    uint physicalPageIndex = cluster.vertexOffset / CLUSTER_MAX_VERTICES;
+    uint pageByteBase = physicalPageIndex * CLUSTER_PAGE_SIZE_BYTES;
+
+    // This cluster's local triangle-list indices, read directly from the compressed pool -- unlike
+    // ClusterRaster.vert's hardware path, there is no pre-expanded VK_INDEX_TYPE index buffer to
+    // consult here (this shader supplies its own "index fetch").
+    uint i0 = ClusterLoadByte(pageByteBase + CLUSTER_INDICES_BASE_BYTES + triangleOrdinal * 3u + 0u);
+    uint i1 = ClusterLoadByte(pageByteBase + CLUSTER_INDICES_BASE_BYTES + triangleOrdinal * 3u + 1u);
+    uint i2 = ClusterLoadByte(pageByteBase + CLUSTER_INDICES_BASE_BYTES + triangleOrdinal * 3u + 2u);
+
+    RasterizeClusterTriangle(cluster, clusterSlotIndex, triangleOrdinal, pageByteBase, i0, i1, i2);
+}

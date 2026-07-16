@@ -28,6 +28,10 @@ struct ClusterCullMetadata {
     uint firstIndex;         // Base offset into the global decompressed index buffer for this cluster.
     uint vertexOffset;       // Base vertex added to every local index before indexing the global vertex buffer.
     uint clusterID;
+    float maxWPOAmplitude;  // Worst-case world-space vertex displacement the WPO sway function can apply (see wpo_deformation.glsl).
+    uint maskTextureIndex;  // Index into the bindless cutout mask array (mask_sampling.glsl), or 0xFFFFFFFF for "fully opaque".
+    // No manual padding needed here (unlike the C++ mirror): the GLSL compiler infers the std430
+    // array stride (96 bytes, rounded up from this struct's 16-byte base alignment) on its own.
 };
 
 // GLSL-side, std140-compatible mirror of renderer::ClusterCullViewParams: the camera's 6-plane

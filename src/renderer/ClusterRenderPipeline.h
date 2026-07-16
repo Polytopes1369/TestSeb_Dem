@@ -61,12 +61,20 @@
 #include "core/Camera.h"
 #include "core/maths/Maths.h"
 #include "renderer/ClusterHardwareRasterPass.h"
+#include "renderer/ClusterLODSelectionPass.h"
 #include "renderer/ClusterOcclusionCullingPass.h"
 #include "renderer/ClusterResolvePass.h"
 #include "renderer/ClusterSoftwareRasterPass.h"
 #include "renderer/GeometryDecompressionPass.h"
+#include "renderer/GeometryStreamingCoordinator.h"
+#include "renderer/GpuBuffer.h"
 #include "renderer/GpuGeometryPagePool.h"
 #include "renderer/HZBPass.h"
+#include "renderer/ProceduralMaskGenerator.h"
+#ifndef NDEBUG
+#include "renderer/debug/ClusterTriangleStatsPass.h"
+#include "renderer/debug/DebugTextOverlay.h"
+#endif
 
 namespace renderer {
 
@@ -104,6 +112,12 @@ namespace renderer {
         // software rasterizer -- see ClusterHZBOcclusionCull.comp's ShouldUseSoftwareRaster().
         static constexpr float kSoftwareRasterThresholdPixels = 6.0f;
 
+        // Target on-screen geometric error (pixels) for the LOD DAG cut -- see
+        // ClusterDAGScreenError.comp's pixelThreshold. A node draws once its own projected error
+        // drops below this value while its parent's still exceeds it; typical Nanite-style engines
+        // target roughly 1 pixel.
+        static constexpr float kLODPixelErrorThreshold = 1.0f;
+
         // Reads the .cache file's header/tables, streams every cluster's 4 KB geometry page into
         // the physical pool (one staging buffer, one setup command buffer, one blocking submit --
         // startup-only, never repeated per frame), decompresses vertices and expands indices for
@@ -119,10 +133,17 @@ namespace renderer {
         // `camera` supplies view/proj (must be the frame's final matrices: every stage this frame
         // uses the same viewProj, which is what makes the resolve pass's barycentric
         // reconstruction exact) and `cameraPositionWorld` the eye point for the backface cone
-        // test. The caller only begins/ends/submits the command buffer and presents.
+        // test. `globalTimeSeconds` (main.cpp's glfwGetTime(), monotonically increasing) drives the
+        // World Position Offset sway function (wpo_deformation.glsl's ApplyWPODeformation, called
+        // identically from ClusterRaster.vert and ClusterSoftwareRaster.comp) -- uploaded once per
+        // frame into m_WPOGlobalsBuffer before either raster pass runs. The caller only
+        // begins/ends/submits the command buffer and presents.
         void RecordFrame(VkCommandBuffer cmd, const CameraPushConstants& camera,
-            const maths::vec3& cameraPositionWorld, VkImage swapchainImage);
+            const maths::vec3& cameraPositionWorld, float globalTimeSeconds, VkImage swapchainImage);
 
+        // Upper bound on this frame's actual candidate count (the DAG's total leaf count) -- NOT
+        // this frame's real candidate count, which only ever exists on the GPU now that
+        // m_LODSelection computes a dynamic per-frame cut (see ClusterLODSelectionPass).
         uint32_t GetClusterCount() const { return m_ClusterCount; }
 
     private:
@@ -134,15 +155,6 @@ namespace renderer {
         VkDevice m_Device = VK_NULL_HANDLE;
         VkExtent2D m_RenderExtent{ 0, 0 };
 
-        // DEBUG (temporary): borrowed handles retained only for DumpDebugOutcomeHistogram()'s
-        // one-shot readback command buffer -- not used by any other steady-state per-frame path.
-        // Debug-only tooling: compiled out entirely in Release.
-#ifndef NDEBUG
-        VmaAllocator m_Allocator = VK_NULL_HANDLE;
-        VkCommandPool m_CommandPool = VK_NULL_HANDLE;
-        VkQueue m_Queue = VK_NULL_HANDLE;
-#endif
-
         // Borrowed attachment handles (owned by VulkanContext).
         VkImage m_VisBufferClusterIDImage = VK_NULL_HANDLE;
         VkImageView m_VisBufferClusterIDView = VK_NULL_HANDLE;
@@ -151,32 +163,54 @@ namespace renderer {
         VkImage m_DepthImage = VK_NULL_HANDLE;
         VkImageView m_DepthImageView = VK_NULL_HANDLE;
 
-        // Number of leaf clusters in the culling candidate set (== metadata entries uploaded).
+        // Upper bound on this frame's actual candidate count (the DAG's total leaf count) -- see
+        // GetClusterCount()'s own comment.
         uint32_t m_ClusterCount = 0;
 
-        // DEBUG (temporary): index-aligned with the GPU cluster-slot indices -- see Init()'s comment
-        // above the loop that populates it. Used only by RecordFrame()'s periodic debug outcome dump.
-        // Debug-only tooling: compiled out entirely in Release.
-#ifndef NDEBUG
-        std::vector<uint32_t> m_ClusterSlotToEntityID;
-        uint32_t m_FrameCounter = 0;
-        bool m_DebugOutcomeDumped = false;
+        // WPOGlobalsUBO (16 bytes, std140: float globalTime + 3 pad floats) -- uploaded once per
+        // frame (vkCmdUpdateBuffer) in RecordFrame() before either raster pass runs; bound into
+        // both ClusterHardwareRasterPass and ClusterSoftwareRasterPass at Init() time. See
+        // wpo_deformation.glsl's ApplyWPODeformation for how the raster shaders consume it.
+        GpuBuffer m_WPOGlobalsBuffer;
 
-        // DEBUG (temporary): reads back ClusterOcclusionCullingPass::GetDebugOutcomeBuffer() and
-        // logs a per-entity histogram of outcome codes -- see ClusterHZBOcclusionCull.comp's
-        // DebugOutcomeSSBO encoding. Blocking (queue wait idle), so only ever called once, well
-        // after steady state (see RecordFrame()).
-        void DumpDebugOutcomeHistogram(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue) const;
-#endif
+        // Generates the bindless procedural cutout mask array (mask_sampling.glsl) once at Init()
+        // time, before any raster/resolve pass is initialized -- see ProceduralMaskGenerator's own
+        // class comment. GetMaskImageInfos() is threaded into all three passes below.
+        ProceduralMaskGenerator m_MaskGenerator;
 
         // Owned pipeline stages, in rough execution order.
         GpuGeometryPagePool m_PagePool;
         GeometryDecompressionPass m_Decompression;
         HZBPass m_HZB;
+        // Per-frame GPU-driven LOD DAG cut (ClusterDAGScreenError.comp -> ClusterLODResidencyFallback
+        // .comp -> ClusterLODCompact.comp), replacing the previous static "always DAG level 0"
+        // candidate upload -- see ClusterLODSelectionPass's own class comment. Its output
+        // (GetCandidateMetadataBuffer()/GetCandidateCountBuffer()) feeds m_OcclusionCulling below.
+        ClusterLODSelectionPass m_LODSelection;
+        // Drives the previously-dormant async streaming stack (AsyncFileStreamer/
+        // StreamingRequestQueue/FeedbackBuffer) for real, once per frame -- see
+        // GeometryStreamingCoordinator's own class comment for the exact sequencing contract with
+        // m_LODSelection's feedback buffer.
+        GeometryStreamingCoordinator m_Streaming;
         ClusterOcclusionCullingPass m_OcclusionCulling;
         ClusterHardwareRasterPass m_HardwareRaster;
         ClusterSoftwareRasterPass m_SoftwareRaster;
         ClusterResolvePass m_Resolve;
+
+#ifndef NDEBUG
+        // Real-time stat overlay (GPU memory used, pending SSD page loads, disk read throughput,
+        // HW-vs-software triangle split) -- see debug::DebugTextOverlay's own class comment. Whole
+        // block compiled out in Release (CLAUDE.md's debug/Release separation rule): zero code,
+        // zero strings, zero extra buffers survive into the production executable.
+        VmaAllocator m_Allocator = VK_NULL_HANDLE; // Borrowed, stored only for RecordFrame()'s vmaGetHeapBudgets() query.
+        debug::ClusterTriangleStatsPass m_TriangleStats;
+        debug::DebugTextOverlay m_DebugOverlay;
+        // Bytes/sec is a delta over wall-clock time, not an instantaneous GPU counter -- sampled
+        // once per frame against `globalTimeSeconds` (RecordFrame()'s own parameter, glfwGetTime()-
+        // derived) and GeometryStreamingCoordinator::GetTotalBytesCompleted()'s running total.
+        float m_LastStatsSampleTime = 0.0f;
+        uint64_t m_LastStatsSampleBytes = 0;
+#endif
     };
 
 }

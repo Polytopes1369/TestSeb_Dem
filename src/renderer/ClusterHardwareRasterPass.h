@@ -63,35 +63,55 @@ namespace renderer {
         ClusterHardwareRasterPass& operator=(const ClusterHardwareRasterPass&) = delete;
 
         // Builds the descriptor set (binding 0 = ClusterCullMetadataSSBO, binding 1 =
-        // CompressedClusterPoolSSBO, both vertex-stage-only) and the graphics pipeline (via
-        // VulkanPipeline::CreateGraphicsPipeline, reusing the exact same MRT VisBuffer color-blend
-        // / dynamic-rendering / depth-stencil setup the flat draw.vert/draw.frag pipeline already
-        // uses). `clusterMetadataBuffer` is whichever culling pass's
+        // CompressedClusterPoolSSBO, binding 2 = WPOGlobalsUBO, all vertex-stage-only) and TWO
+        // graphics pipelines sharing that one descriptor set/layout (via
+        // VulkanPipeline::CreateGraphicsPipeline, reusing the exact same MRT VisBuffer color-blend /
+        // dynamic-rendering / depth-stencil setup the flat draw.vert/draw.frag pipeline already
+        // uses): a masked pipeline (ClusterRaster.vert/ClusterRaster.frag, samples the bindless
+        // cutout mask array and discards below the alpha-test cutoff -- this `discard` statically
+        // disables hardware early-fragment-tests for the whole pipeline) and an opaque pipeline
+        // (ClusterRaster.vert/ClusterRasterOpaque.frag, no mask sampling, no discard at all, so
+        // early-Z is free to run) -- see ClusterRasterOpaque.frag's own doc comment. The opaque
+        // frag module simply never references binding 3 (the mask array), so no second descriptor
+        // set is needed. `clusterMetadataBuffer` is whichever culling pass's
         // GetClusterMetadataBuffer() the caller intends to feed RecordDraw()'s indirect buffers
         // from (renderer::ClusterCullingPass or renderer::ClusterOcclusionCullingPass) --
         // `firstInstance` in that pass's emitted VkDrawIndexedIndirectCommands indexes exactly this
         // buffer, so the two must come from the same culling pass instance/frame.
         // `compressedPhysicalPoolBuffer` is renderer::GpuGeometryPagePool::GetPhysicalPoolBuffer().
-        // `visBufferColorFormats` must match VulkanContext::kVisBufferFormat x2 (ClusterID,
-        // TriangleID) and `depthFormat` the depth image's format, so this pipeline is attachment-
-        // compatible with the render targets RecordDraw() will be called against.
+        // `wpoGlobalsBuffer` is renderer::ClusterRenderPipeline's own WPOGlobalsUBO buffer (16
+        // bytes, std140) -- see wpo_deformation.glsl's ApplyWPODeformation, called from
+        // ClusterRaster.vert. `maskImageInfos` is renderer::ProceduralMaskGenerator::
+        // GetMaskImageInfos() -- bound as binding 3 (fragment-stage-only, COMBINED_IMAGE_SAMPLER,
+        // descriptorCount == maskImageInfos.size()) for ClusterRaster.frag's opacity-mask discard
+        // (mask_sampling.glsl). `visBufferColorFormats` must match VulkanContext::kVisBufferFormat x2
+        // (ClusterID, TriangleID) and `depthFormat` the depth image's format, so this pipeline is
+        // attachment-compatible with the render targets RecordDraw() will be called against.
         void Init(VkDevice device, VkBuffer clusterMetadataBuffer, VkBuffer compressedPhysicalPoolBuffer,
+            VkBuffer wpoGlobalsBuffer, const std::vector<VkDescriptorImageInfo>& maskImageInfos,
             const std::array<VkFormat, 2>& visBufferColorFormats, VkFormat depthFormat);
 
         void Shutdown();
 
-        // Records the hardware raster draw: binds the pipeline/descriptor set, pushes `camera`
-        // (view/proj, vertex-stage only -- ClusterRaster.frag needs no push constants), binds
-        // `decompressedIndexPoolBuffer` (renderer::GeometryDecompressionPass::
-        // GetDecompressedIndexPoolBuffer(), VK_INDEX_TYPE_UINT32) as the active index buffer, sets
-        // the dynamic viewport/scissor to `renderExtent`, then issues exactly one
-        // vkCmdDrawIndexedIndirectCount over [indirectCommandBuffer, indirectCommandBuffer +
-        // maxDrawCount * sizeof(VkDrawIndexedIndirectCommand)), reading the actual sub-draw count
-        // from `drawCountBuffer` at GPU-execution time -- `maxDrawCount` only bounds the driver's
-        // worst-case iteration, it is never read back to the CPU. Must be called inside an
-        // already-open vkCmdBeginRendering scope -- see the class comment.
+        // Records one hardware raster draw: binds either the opaque or masked pipeline (per
+        // `opaque`) plus the shared descriptor set, pushes `camera` (view/proj, vertex-stage only --
+        // neither fragment shader needs push constants), binds `decompressedIndexPoolBuffer`
+        // (renderer::GeometryDecompressionPass::GetDecompressedIndexPoolBuffer(),
+        // VK_INDEX_TYPE_UINT32) as the active index buffer, sets the dynamic viewport/scissor to
+        // `renderExtent`, then issues exactly one vkCmdDrawIndexedIndirectCount over
+        // [indirectCommandBuffer, indirectCommandBuffer + maxDrawCount *
+        // sizeof(VkDrawIndexedIndirectCommand)), reading the actual sub-draw count from
+        // `drawCountBuffer` at GPU-execution time -- `maxDrawCount` only bounds the driver's
+        // worst-case iteration, it is never read back to the CPU. `indirectCommandBuffer`/
+        // `drawCountBuffer` must already be filtered to only the opaque (or only the masked)
+        // cluster list matching `opaque` -- see renderer::ClusterOcclusionCullingPass's opaque/
+        // masked list split; this call performs no filtering of its own. Must be called inside an
+        // already-open vkCmdBeginRendering scope -- see the class comment. Callers wanting both
+        // variants drawn this frame call this twice, once per `opaque` value, against each list's
+        // own indirect buffers.
         void RecordDraw(VkCommandBuffer cmd, const CameraPushConstants& camera, VkExtent2D renderExtent,
-            VkBuffer decompressedIndexPoolBuffer, VkBuffer indirectCommandBuffer, VkBuffer drawCountBuffer, uint32_t maxDrawCount);
+            VkBuffer decompressedIndexPoolBuffer, VkBuffer indirectCommandBuffer, VkBuffer drawCountBuffer,
+            uint32_t maxDrawCount, bool opaque);
 
     private:
         VkDevice m_Device = VK_NULL_HANDLE;
@@ -100,7 +120,8 @@ namespace renderer {
         VkDescriptorPool m_DescriptorPool = VK_NULL_HANDLE;
         VkDescriptorSet m_DescriptorSet = VK_NULL_HANDLE;
         VkPipelineLayout m_PipelineLayout = VK_NULL_HANDLE;
-        VkPipeline m_Pipeline = VK_NULL_HANDLE;
+        VkPipeline m_OpaquePipeline = VK_NULL_HANDLE; // ClusterRaster.vert + ClusterRasterOpaque.frag: no discard, early-Z eligible.
+        VkPipeline m_MaskedPipeline = VK_NULL_HANDLE; // ClusterRaster.vert + ClusterRaster.frag: mask-sampling discard.
     };
 
 }

@@ -118,21 +118,36 @@ namespace renderer {
         ClusterOcclusionCullingPass(const ClusterOcclusionCullingPass&) = delete;
         ClusterOcclusionCullingPass& operator=(const ClusterOcclusionCullingPass&) = delete;
 
-        // Allocates every buffer sized from `maxClusters` (cluster metadata, persisted visibility,
-        // pending list, both indirect-draw lists), the HZB sampler (nearest filtering/mipmapping --
-        // required so mip selection via textureLod never blends two mips' max-depth values
-        // together, which would silently break the occlusion test's conservativeness), and both
-        // compute pipelines (the early/late specializations of ClusterHZBOcclusionCull.comp, plus
-        // BuildDispatchIndirectArgs.comp). `hzbFullView`/`hzbMip0Extent`/`hzbMipLevelCount` must
-        // come from an already-initialized renderer::HZBPass (GetFullView() / GetMipExtent(0) /
-        // GetMipLevelCount()) -- that pyramid's image content does not need to be valid yet, only
-        // its view/dimensions, since this class only samples it per-dispatch, never at Init time.
+        // Allocates every buffer sized from `maxClusters` (persisted-visibility... no -- see
+        // `totalClusterCount` below for that one; pending list, both indirect-draw lists, software
+        // cluster list), the HZB sampler (nearest filtering/mipmapping -- required so mip selection
+        // via textureLod never blends two mips' max-depth values together, which would silently
+        // break the occlusion test's conservativeness), and both compute pipelines (the early/late
+        // specializations of ClusterHZBOcclusionCull.comp, plus BuildDispatchIndirectArgs.comp).
+        // `hzbFullView`/`hzbMip0Extent`/`hzbMipLevelCount` must come from an already-initialized
+        // renderer::HZBPass (GetFullView() / GetMipExtent(0) / GetMipLevelCount()) -- that
+        // pyramid's image content does not need to be valid yet, only its view/dimensions, since
+        // this class only samples it per-dispatch, never at Init time.
+        //
+        // `maxClusters` bounds this frame's candidate output (renderer::ClusterLODSelectionPass's
+        // own leaf-count upper bound) -- the pending/indirect-draw/software-list buffers are sized
+        // from it. `totalClusterCount` is the DAG's full node count (every level, not just
+        // leaves): unlike the old static-candidate-set design, the persisted-visibility buffer must
+        // now be indexed by each cluster's persistent, stable clusterID rather than its transient
+        // per-frame array slot (a dynamic LOD cut's "slot 5" means a different cluster every frame
+        // -- see ClusterHZBOcclusionCull.comp's g_VisibleLastFrame accesses), so it is sized to
+        // cover every possible clusterID, not just this frame's candidate count.
+        // `candidateMetadataBuffer`/`candidateCountBuffer` are borrowed from
+        // renderer::ClusterLODSelectionPass::GetCandidateMetadataBuffer()/GetCandidateCountBuffer()
+        // -- NOT owned or allocated here (unlike this class's previous, now-removed
+        // UploadClusterMetadata()-fed design).
         //
         // Does NOT clear the persisted visibility buffer -- call ClearPersistedVisibility() once,
         // separately, before the first frame's RecordEarlyPass() (mirroring
         // renderer::GpuGeometryPagePool::Init()/ClearPageTable()'s split for the same reason: the
         // clear needs a command buffer the caller records and submits on their own schedule).
-        void Init(VkDevice device, VmaAllocator allocator, uint32_t maxClusters,
+        void Init(VkDevice device, VmaAllocator allocator, uint32_t maxClusters, uint32_t totalClusterCount,
+            VkBuffer candidateMetadataBuffer, VkBuffer candidateCountBuffer,
             VkImageView hzbFullView, VkExtent2D hzbMip0Extent, uint32_t hzbMipLevelCount);
 
         void Shutdown();
@@ -144,13 +159,6 @@ namespace renderer {
         // an all-zero start is self-correcting even against an uninitialized HZB).
         void ClearPersistedVisibility(VkCommandBuffer cmd);
 
-        // Uploads this frame's candidate cluster list (clusters.size() must be <= maxClusters)
-        // into the metadata SSBO via a host-visible staging buffer + one-time command buffer copy,
-        // mirroring VulkanContext::UploadEntityData's staging pattern (identical in spirit to
-        // renderer::ClusterCullingPass::UploadClusterMetadata). A caller need not re-upload every
-        // frame if the candidate list is unchanged from the previous frame.
-        void UploadClusterMetadata(VkCommandPool commandPool, VkQueue queue, const std::vector<ClusterCullMetadata>& clusters);
-
         // Resets the pending list's count, both draw counters (early, late), and the software
         // cluster list's count to 0, with the barrier making that clear visible to
         // RecordEarlyPass()'s dispatch. Must be recorded once per frame, before RecordEarlyPass().
@@ -159,16 +167,19 @@ namespace renderer {
 
         // Records the early specialization's dispatch: uploads `viewParams` (frustum planes +
         // camera position) and the HZB projection params (built from `viewProj` plus the fixed
-        // pyramid dimensions captured at Init) into their UBOs, then dispatches one invocation per
-        // candidate cluster in [0, clusterCount). Every cluster confirmed visible against the
-        // *current* HZB (i.e. still holding last frame's data -- see the class comment) is routed,
-        // by ClusterHZBOcclusionCull.comp's ShouldUseSoftwareRaster(), to either the early
-        // indirect-draw list or GetSoftwareClusterListBuffer() based on its estimated average
-        // triangle screen size versus `softwareRasterThresholdPixels` (typically 4-8 pixels);
-        // every cluster whose visibility could not be confirmed is compacted into the pending list
-        // instead, its routing decided later by RecordLatePass(). Ends with the barrier making the
-        // early indirect-draw list, its draw count, the pending list, and the software cluster
-        // list all visible to both a later vkCmdDrawIndexedIndirectCount
+        // pyramid dimensions captured at Init) into their UBOs, then dispatches indirectly
+        // (vkCmdDispatchIndirect over `earlyDispatchArgsBuffer`,
+        // renderer::ClusterLODSelectionPass::GetEarlyDispatchArgsBuffer() -- one invocation per
+        // this frame's GPU-compacted candidate, whose count is only ever known on the GPU, hence
+        // the indirect dispatch rather than a CPU-known clusterCount). Every cluster confirmed
+        // visible against the *current* HZB (i.e. still holding last frame's data -- see the class
+        // comment) is routed, by ClusterHZBOcclusionCull.comp's ShouldUseSoftwareRaster(), to
+        // either the early indirect-draw list or GetSoftwareClusterListBuffer() based on its
+        // estimated average triangle screen size versus `softwareRasterThresholdPixels` (typically
+        // 4-8 pixels); every cluster whose visibility could not be confirmed is compacted into the
+        // pending list instead, its routing decided later by RecordLatePass(). Ends with the
+        // barrier making the early indirect-draw list, its draw count, the pending list, and the
+        // software cluster list all visible to both a later vkCmdDrawIndexedIndirectCount
         // (VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT) and RecordBuildLateDispatchArgs()/
         // RecordLatePass()/renderer::ClusterSoftwareRasterPass's compute reads
         // (VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT).
@@ -176,7 +187,7 @@ namespace renderer {
         // (non-combined) projection matrix, see HZBOcclusionViewParams::projScaleY -- passed
         // separately from `viewProj` since the combined view*proj matrix cannot itself recover it.
         void RecordEarlyPass(VkCommandBuffer cmd, const ClusterCullViewParams& viewParams, const maths::mat4& viewProj,
-            float projScaleY, uint32_t clusterCount, float softwareRasterThresholdPixels);
+            float projScaleY, VkBuffer earlyDispatchArgsBuffer, float softwareRasterThresholdPixels, uint32_t disableOcclusionCulling = 0);
 
         // Records the 1x1x1 dispatch that converts the pending list's atomic count into
         // GetLateDispatchArgsBuffer()'s VkDispatchIndirectCommand (group count = ceil(pendingCount
@@ -202,8 +213,12 @@ namespace renderer {
         // barrier making the late indirect-draw list, its draw count, and the software cluster
         // list visible to a later vkCmdDrawIndexedIndirectCount /
         // renderer::ClusterSoftwareRasterPass compute read.
-        void RecordLatePass(VkCommandBuffer cmd);
+        void RecordLatePass(VkCommandBuffer cmd, uint32_t disableOcclusionCulling = 0);
 
+        // These five getters are, in effect, the MASKED lists -- see the OPAQUE-suffixed getters
+        // below for the parallel opaque-only set (ClusterHZBOcclusionCull.comp's "Opaque / masked
+        // classification" class comment). A cluster with ClusterCullMetadata::maskTextureIndex ==
+        // 0xFFFFFFFFu (fully opaque) is routed to the opaque list; everything else lands here.
         VkBuffer GetEarlyIndirectCommandBuffer() const { return m_EarlyIndirectCommandBuffer.Handle(); }
         VkBuffer GetEarlyDrawCountBuffer() const { return m_EarlyDrawCountBuffer.Handle(); }
         VkBuffer GetLateIndirectCommandBuffer() const { return m_LateIndirectCommandBuffer.Handle(); }
@@ -214,23 +229,28 @@ namespace renderer {
         // clusterIndex[maxClusters]; }, index-aligned with GetClusterMetadataBuffer() exactly like
         // the indirect-draw lists' firstInstance values.
         VkBuffer GetSoftwareClusterListBuffer() const { return m_SoftwareClusterListBuffer.Handle(); }
+
+        // Opaque-only counterparts of the five getters above, same shapes, fed by the exact same
+        // early/late dispatches (see ClusterHZBOcclusionCull.comp's EmitEarlyDraw/EmitLateDraw/
+        // EmitSoftwareCluster) -- consumed by renderer::ClusterHardwareRasterPass's/
+        // ClusterSoftwareRasterPass's opaque pipelines (no mask sampling, hardware path has no
+        // discard so real early-Z applies).
+        VkBuffer GetEarlyIndirectCommandOpaqueBuffer() const { return m_EarlyIndirectCommandOpaqueBuffer.Handle(); }
+        VkBuffer GetEarlyDrawCountOpaqueBuffer() const { return m_EarlyDrawCountOpaqueBuffer.Handle(); }
+        VkBuffer GetLateIndirectCommandOpaqueBuffer() const { return m_LateIndirectCommandOpaqueBuffer.Handle(); }
+        VkBuffer GetLateDrawCountOpaqueBuffer() const { return m_LateDrawCountOpaqueBuffer.Handle(); }
+        VkBuffer GetSoftwareClusterListOpaqueBuffer() const { return m_SoftwareClusterListOpaqueBuffer.Handle(); }
         // Exposed so a downstream hardware raster pass (renderer::ClusterHardwareRasterPass) can
-        // bind the exact same ClusterCullMetadataSSBO this pass populated -- both EARLY and LATE
-        // draw commands' firstInstance (see ClusterHZBOcclusionCull.comp's EmitEarlyDraw/
+        // bind the exact same (borrowed) ClusterCullMetadataSSBO this pass reads -- both EARLY and
+        // LATE draw commands' firstInstance (see ClusterHZBOcclusionCull.comp's EmitEarlyDraw/
         // EmitLateDraw) is this buffer's own array index for that cluster.
-        VkBuffer GetClusterMetadataBuffer() const { return m_ClusterMetadataBuffer.Handle(); }
+        VkBuffer GetClusterMetadataBuffer() const { return m_CandidateMetadataBuffer; }
         uint32_t GetMaxClusters() const { return m_MaxClusters; }
-        // DEBUG (temporary): binding 11, uint[maxClusters], one outcome code per cluster slot --
-        // see ClusterHZBOcclusionCull.comp's DebugOutcomeSSBO for the encoding. Not cleared per
-        // frame (each frame's early/late passes unconditionally overwrite every candidate's entry
-        // they touch), read back once via ClusterRenderPipeline's debug histogram dump.
-        VkBuffer GetDebugOutcomeBuffer() const { return m_DebugOutcomeBuffer.Handle(); }
 
     private:
         static constexpr uint32_t kWorkgroupSize = 64; // Matches ClusterHZBOcclusionCull.comp's local_size_x.
 
         VkDevice m_Device = VK_NULL_HANDLE;
-        VmaAllocator m_Allocator = VK_NULL_HANDLE; // Retained only for UploadClusterMetadata()'s staging buffer.
         uint32_t m_MaxClusters = 0;
 
         // HZB pyramid dimensions captured at Init, baked into every frame's HZBOcclusionViewParams
@@ -245,18 +265,36 @@ namespace renderer {
         // surviving RecordBuildLateDispatchArgs()'s intervening pipeline layout bind.
         float m_LastSoftwareRasterThresholdPixels = 0.0f;
 
-        GpuBuffer m_ClusterMetadataBuffer;   // binding 0: ClusterCullMetadata[maxClusters], std430, GPU_ONLY.
+        // binding 0: ClusterCullMetadata[maxClusters] -- BORROWED from
+        // renderer::ClusterLODSelectionPass::GetCandidateMetadataBuffer(), not owned/allocated here.
+        VkBuffer m_CandidateMetadataBuffer = VK_NULL_HANDLE;
+        // binding 11: single uint32 atomic count -- BORROWED from
+        // renderer::ClusterLODSelectionPass::GetCandidateCountBuffer(); read-only here (the early
+        // specialization's bound check reads it instead of a push-constant clusterCount, now that
+        // the candidate count is only ever known on the GPU).
+        VkBuffer m_CandidateCountBuffer = VK_NULL_HANDLE;
         GpuBuffer m_ViewParamsBuffer;        // binding 1: CullingViewParams, std140 UBO, GPU_ONLY.
         GpuBuffer m_HZBParamsBuffer;         // binding 2: HZBOcclusionViewParams, std140 UBO, GPU_ONLY.
         // binding 3: HZB texture -- m_HZBView / m_HZBSampler below, not owned as a GpuBuffer.
-        GpuBuffer m_VisibleLastFrameBuffer;  // binding 4: uint32[maxClusters], std430, GPU_ONLY, PERSISTENT across frames.
+        // binding 4: uint32[totalClusterCount], std430, GPU_ONLY, PERSISTENT across frames --
+        // indexed by each cluster's persistent, stable clusterID (NOT the transient per-frame
+        // candidate slot -- see the class comment's totalClusterCount note), so its size no longer
+        // tracks maxClusters.
+        GpuBuffer m_VisibleLastFrameBuffer;
         GpuBuffer m_PendingListBuffer;       // binding 5: { uint count; uint clusterIndex[maxClusters]; }, std430, GPU_ONLY.
         GpuBuffer m_EarlyIndirectCommandBuffer; // binding 6: VkDrawIndexedIndirectCommand[maxClusters], std430, GPU_ONLY.
         GpuBuffer m_EarlyDrawCountBuffer;       // binding 7: single uint32 atomic counter, GPU_ONLY.
         GpuBuffer m_LateIndirectCommandBuffer;  // binding 8: VkDrawIndexedIndirectCommand[maxClusters], std430, GPU_ONLY.
         GpuBuffer m_LateDrawCountBuffer;        // binding 9: single uint32 atomic counter, GPU_ONLY.
         GpuBuffer m_SoftwareClusterListBuffer;  // binding 10: { uint count; uint clusterIndex[maxClusters]; }, std430, GPU_ONLY.
-        GpuBuffer m_DebugOutcomeBuffer;         // binding 11 (DEBUG, temporary): uint[maxClusters], std430, GPU_ONLY.
+
+        // Opaque-list counterparts of the five buffers above (bindings 12-16) -- see
+        // ClusterHZBOcclusionCull.comp's "Opaque / masked classification" class comment.
+        GpuBuffer m_EarlyIndirectCommandOpaqueBuffer; // binding 12.
+        GpuBuffer m_EarlyDrawCountOpaqueBuffer;       // binding 13.
+        GpuBuffer m_LateIndirectCommandOpaqueBuffer;  // binding 14.
+        GpuBuffer m_LateDrawCountOpaqueBuffer;        // binding 15.
+        GpuBuffer m_SoftwareClusterListOpaqueBuffer;  // binding 16.
 
         GpuBuffer m_LateDispatchArgsBuffer; // VkDispatchIndirectCommand (3x uint32), GPU_ONLY, written by BuildDispatchIndirectArgs.comp.
 

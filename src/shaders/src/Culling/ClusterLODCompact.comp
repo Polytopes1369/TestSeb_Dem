@@ -1,0 +1,89 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+
+// Third and final dispatch of renderer::ClusterLODSelectionPass's per-frame LOD-cut evaluation
+// (see that class's comment for the full 3-dispatch sequence, and ClusterLODResidencyFallback.comp
+// for the parent-fallback pass whose output this one consumes). For every DAG node, decides
+// whether to emit it into this frame's candidate ClusterCullMetadata list -- the same list
+// renderer::ClusterOcclusionCullingPass's early/late passes consume as their candidate set,
+// replacing the previous static, CPU-baked "always DAG level 0" upload.
+
+#include "include/cluster_culling_common.glsl"
+#include "include/cluster_lod_node_metadata.glsl"
+
+#define PAGE_TABLE_SET 0
+#define PAGE_TABLE_BINDING 2
+#include "include/geometry_page_table.glsl"
+
+// Matches geometry::kMaxClusterVertices / kMaxClusterTriangles (ClusterFormat.h) -- duplicated
+// here (rather than #included via cluster_vertex_decode.glsl) so this shader does not need to
+// declare and bind an unused CompressedClusterPoolSSBO purely to reach these two constants.
+#define CLUSTER_MAX_VERTICES 64u
+#define CLUSTER_MAX_INDICES 384u
+
+#define DAG_DECISION_DRAW      0u
+#define DAG_DECISION_SUBDIVIDE 1u
+#define DAG_DECISION_SKIP      2u
+
+layout(std430, set = 0, binding = 0) readonly buffer DAGDecisionSSBO {
+    uint decisions[];
+} g_DAGDecisions;
+
+layout(std430, set = 0, binding = 1) readonly buffer LODNodeMetadataSSBO {
+    LODNodeMetadata nodes[];
+} g_LODNodes;
+
+// binding 2 == g_GeometryPageTable, declared by geometry_page_table.glsl.
+
+layout(std430, set = 0, binding = 3) readonly buffer ForceDrawSSBO {
+    uint forceDraw[];
+} g_ForceDraw;
+
+layout(std430, set = 0, binding = 4) buffer CandidateCountSSBO {
+    uint count;
+} g_CandidateCount;
+
+layout(std430, set = 0, binding = 5) writeonly buffer CandidateMetadataSSBO {
+    ClusterCullMetadata clusters[];
+} g_CandidateMetadata;
+
+layout(local_size_x = 64) in;
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    if (index >= g_LODNodes.nodes.length()) {
+        return;
+    }
+
+    LODNodeMetadata node = g_LODNodes.nodes[index];
+    if (!IsClusterResident(node.logicalPageID)) {
+        return; // Never emitted -- either not needed this frame, or just requested (via
+                // ClusterLODResidencyFallback.comp) for a future one.
+    }
+
+    bool shouldDraw = (g_DAGDecisions.decisions[index] == DAG_DECISION_DRAW) || (g_ForceDraw.forceDraw[index] != 0u);
+    if (!shouldDraw) {
+        return;
+    }
+
+    uint physicalPageIndex = g_GeometryPageTable.physicalPageIndex[node.logicalPageID];
+
+    ClusterCullMetadata meta;
+    meta.boundsMin = node.boundsMin;
+    meta.boundsMax = node.boundsMax;
+    meta.sphereCenter = node.sphereCenter;
+    meta.sphereRadius = node.sphereRadius;
+    meta.coneAxis = node.coneAxis;
+    meta.coneCutoff = node.coneCutoff;
+    meta.indexCount = node.indexCount;
+    meta.firstIndex = physicalPageIndex * CLUSTER_MAX_INDICES;
+    meta.vertexOffset = physicalPageIndex * CLUSTER_MAX_VERTICES;
+    meta.clusterID = node.clusterID;
+    meta.maxWPOAmplitude = node.maxWPOAmplitude;
+    meta.maskTextureIndex = node.maskTextureIndex;
+
+    uint slot = atomicAdd(g_CandidateCount.count, 1u);
+    if (slot < g_CandidateMetadata.clusters.length()) {
+        g_CandidateMetadata.clusters[slot] = meta;
+    }
+}

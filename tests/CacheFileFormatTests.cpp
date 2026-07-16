@@ -19,8 +19,10 @@
 // pulling in any external test framework or requiring a window/device.
 
 #include "io/CacheFileManager.h"
+#include "geometry/CardGenerator.h"
 #include "geometry/ClusterDAG.h"
 #include "geometry/ClusterFormat.h"
+#include "geometry/FallbackMeshBuilder.h"
 #include "geometry/GeometryEncoding.h"
 #include "core/maths/Maths.h"
 #include "renderer/RenderTypes.h"
@@ -34,6 +36,7 @@
 #include <fstream>
 #include <future>
 #include <iostream>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -101,6 +104,43 @@ namespace {
         return entry;
     }
 
+    // Mirrors VirtualGeometryCacheTest.cpp's own BuildFallbackMeshData (kept private to that file):
+    // converts a geometry::FallbackMesh into an on-disk-ready geometry::FallbackMeshData.
+    // vertexDataOffset/indexDataOffset are left zeroed -- WriteCacheFile fills them in place.
+    geometry::FallbackMeshData BuildFallbackMeshData(uint32_t entityID, const geometry::FallbackMesh& mesh) {
+        geometry::FallbackMeshData data;
+        data.indexEntry.entityID = entityID;
+        data.indexEntry.vertexCount = static_cast<uint32_t>(mesh.positions.size());
+        data.indexEntry.triangleCount = static_cast<uint32_t>(mesh.triangles.size() / 3u);
+        data.indexEntry.vertexDataOffset = 0;
+        data.indexEntry.indexDataOffset = 0;
+
+        maths::vec3 boundsMin{ std::numeric_limits<float>::max(), std::numeric_limits<float>::max(), std::numeric_limits<float>::max() };
+        maths::vec3 boundsMax{ std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest() };
+
+        data.vertices.reserve(mesh.positions.size());
+        for (size_t v = 0; v < mesh.positions.size(); ++v) {
+            const maths::vec3& p = mesh.positions[v];
+            boundsMin.x = std::min(boundsMin.x, p.x); boundsMin.y = std::min(boundsMin.y, p.y); boundsMin.z = std::min(boundsMin.z, p.z);
+            boundsMax.x = std::max(boundsMax.x, p.x); boundsMax.y = std::max(boundsMax.y, p.y); boundsMax.z = std::max(boundsMax.z, p.z);
+
+            geometry::FallbackVertex fv{};
+            fv.position[0] = p.x; fv.position[1] = p.y; fv.position[2] = p.z;
+            fv.normal[0] = mesh.normals[v].x; fv.normal[1] = mesh.normals[v].y; fv.normal[2] = mesh.normals[v].z;
+            fv.uv[0] = mesh.uvs[v].x; fv.uv[1] = mesh.uvs[v].y;
+            data.vertices.push_back(fv);
+        }
+        if (mesh.positions.empty()) {
+            boundsMin = maths::vec3{ 0.0f, 0.0f, 0.0f };
+            boundsMax = maths::vec3{ 0.0f, 0.0f, 0.0f };
+        }
+        data.indexEntry.boundsMin[0] = boundsMin.x; data.indexEntry.boundsMin[1] = boundsMin.y; data.indexEntry.boundsMin[2] = boundsMin.z;
+        data.indexEntry.boundsMax[0] = boundsMax.x; data.indexEntry.boundsMax[1] = boundsMax.y; data.indexEntry.boundsMax[2] = boundsMax.z;
+
+        data.indices = mesh.triangles;
+        return data;
+    }
+
     // Reads `sizeBytes` raw bytes at `offset` from `filePath` via a plain buffered read.
     bool ReadRawBytes(const std::filesystem::path& filePath, uint64_t offset, size_t sizeBytes, std::vector<uint8_t>& outBytes) {
         std::ifstream file(filePath, std::ios::binary);
@@ -138,10 +178,12 @@ int main() {
     std::vector<geometry::ClusterIndexEntry> indexEntries;
     std::vector<geometry::DAGNodeEntry> dagEntries;
     std::vector<geometry::ClusterData> clusterData;
+    std::vector<geometry::FallbackMeshData> fallbackMeshes;
+    std::vector<geometry::SurfaceCacheCardEntry> cardEntries;
     uint32_t entitiesWithGeometry = 0;
 
     for (uint32_t meshID : { 0u, 1u }) {
-        geometry::ClusterDAG dag = geometry::BuildClusterDAG(meshID, vertices, indices);
+        geometry::ClusterDAG dag = geometry::BuildClusterDAG(meshID, vertices, indices, geometry::kInvalidMaskTextureIndex);
         if (!Check(!dag.nodes.empty(), "expected a non-empty DAG for meshID " + std::to_string(meshID))) {
             continue;
         }
@@ -149,6 +191,22 @@ int main() {
 
         std::vector<std::string> dagErrors;
         Check(geometry::ValidateClusterDAG(dag, dagErrors), "pre-write DAG must validate cleanly for meshID " + std::to_string(meshID));
+
+        geometry::FallbackMesh fallbackMesh = geometry::BuildFallbackMesh(dag);
+        Check(!fallbackMesh.triangles.empty(), "expected a non-empty fallback mesh for meshID " + std::to_string(meshID));
+        if (!fallbackMesh.triangles.empty()) {
+            fallbackMeshes.push_back(BuildFallbackMeshData(meshID, fallbackMesh));
+
+            // Surface-cache cards from the same AABB the fallback-mesh entry carries -- a solid
+            // sphere's AABB has 6 non-degenerate faces, so exactly kMaxCardsPerEntity cards.
+            const geometry::FallbackMeshIndexEntry& fbEntry = fallbackMeshes.back().indexEntry;
+            std::vector<geometry::SurfaceCacheCardEntry> entityCards = geometry::GenerateEntityCards(meshID,
+                maths::vec3{ fbEntry.boundsMin[0], fbEntry.boundsMin[1], fbEntry.boundsMin[2] },
+                maths::vec3{ fbEntry.boundsMax[0], fbEntry.boundsMax[1], fbEntry.boundsMax[2] });
+            Check(entityCards.size() == geometry::kMaxCardsPerEntity,
+                "a solid sphere's AABB must produce all 6 cards for meshID " + std::to_string(meshID));
+            cardEntries.insert(cardEntries.end(), entityCards.begin(), entityCards.end());
+        }
 
         uint32_t baseGlobalID = static_cast<uint32_t>(indexEntries.size());
         std::vector<uint32_t> localToGlobal(dag.nodes.size());
@@ -218,7 +276,11 @@ int main() {
     std::error_code removeEc;
     std::filesystem::remove(filePath, removeEc);
 
-    bool wrote = cacheManager.WriteCacheFile(filePath, indexEntries, dagEntries, clusterData, entitiesWithGeometry);
+    // Pack every card into the atlas BEFORE writing -- WriteCacheFile persists the mapping
+    // verbatim, so an unpacked table would round-trip "successfully" while being useless.
+    Check(geometry::PackCardsIntoAtlas(cardEntries), "PackCardsIntoAtlas must fit both entities' cards");
+
+    bool wrote = cacheManager.WriteCacheFile(filePath, indexEntries, dagEntries, clusterData, fallbackMeshes, cardEntries, entitiesWithGeometry);
     Check(wrote, "WriteCacheFile must succeed");
     if (!wrote) {
         std::cerr << "[CacheFileFormatTests] " << g_failCount << " check(s) FAILED.\n";
@@ -233,6 +295,13 @@ int main() {
     Check(header.geometryDataBaseOffset % geometry::kPageSizeBytes == 0, "geometry data base offset must be page-aligned");
     Check(header.clusterIndexTableOffset == geometry::kCacheFileHeaderPaddedSizeBytes,
         "cluster index table must immediately follow the page-sized header");
+    Check(header.fallbackMeshTableOffset % geometry::kPageSizeBytes == 0, "fallback-mesh table offset must be page-aligned");
+    Check(header.fallbackMeshDataBaseOffset % geometry::kPageSizeBytes == 0, "fallback-mesh data base offset must be page-aligned");
+    Check(header.fallbackMeshCount == fallbackMeshes.size(), "fallback-mesh count must match how many entities produced a fallback mesh");
+    Check(header.cardTableOffset % geometry::kPageSizeBytes == 0, "surface-cache card table offset must be page-aligned");
+    Check(header.cardCount == cardEntries.size(), "surface-cache card count must match the packed card list");
+    Check(header.cardTableSizeBytes == cardEntries.size() * sizeof(geometry::SurfaceCacheCardEntry),
+        "surface-cache card table size must be the unpadded entry count * entry size");
 
     std::error_code sizeEc;
     uint64_t actualFileSize = std::filesystem::file_size(filePath, sizeEc);
@@ -311,6 +380,65 @@ int main() {
         std::future<bool> future = cacheManager.ReadClusterDataAsync(filePath, readIndexEntries[sampleIdx].virtualAddress, readBack);
         bool clusterOk = future.get() && std::memcmp(&readBack, &clusterData[sampleIdx], sizeof(geometry::ClusterData)) == 0;
         Check(clusterOk, "sample cluster geometry block must round-trip byte-exact");
+    }
+
+    // --- Fallback-mesh section: table + every entity's geometry round-trip byte-exact ---------
+    std::vector<geometry::FallbackMeshIndexEntry> expectedFallbackTable;
+    expectedFallbackTable.reserve(fallbackMeshes.size());
+    for (const geometry::FallbackMeshData& f : fallbackMeshes) {
+        expectedFallbackTable.push_back(f.indexEntry);
+    }
+    std::vector<geometry::FallbackMeshIndexEntry> readFallbackTable;
+    bool fallbackTableOk = cacheManager.ReadFallbackMeshTable(filePath, header, readFallbackTable)
+        && readFallbackTable.size() == expectedFallbackTable.size()
+        && (expectedFallbackTable.empty() || std::memcmp(readFallbackTable.data(), expectedFallbackTable.data(),
+            expectedFallbackTable.size() * sizeof(geometry::FallbackMeshIndexEntry)) == 0);
+    Check(fallbackTableOk, "fallback-mesh index table must round-trip byte-exact");
+
+    for (size_t i = 0; i < fallbackMeshes.size(); ++i) {
+        const geometry::FallbackMeshData& expected = fallbackMeshes[i];
+        std::vector<geometry::FallbackVertex> readVertices;
+        std::vector<uint32_t> readIndices;
+        bool geometryOk = cacheManager.ReadFallbackMeshGeometry(filePath, expected.indexEntry, readVertices, readIndices)
+            && readVertices.size() == expected.vertices.size()
+            && readIndices.size() == expected.indices.size()
+            && (expected.vertices.empty() || std::memcmp(readVertices.data(), expected.vertices.data(), expected.vertices.size() * sizeof(geometry::FallbackVertex)) == 0)
+            && (expected.indices.empty() || std::memcmp(readIndices.data(), expected.indices.data(), expected.indices.size() * sizeof(uint32_t)) == 0);
+        Check(geometryOk, "fallback mesh " + std::to_string(i) + " geometry must round-trip byte-exact");
+    }
+
+    // --- Surface-cache card section: byte-exact round-trip + the two invariants every consumer
+    // relies on, verified on the ON-DISK bytes: (1) pairwise non-overlapping atlas rects,
+    // (2) uvMin/uvMax exactly equal to the texel rect normalized by the atlas size ---------------
+    std::vector<geometry::SurfaceCacheCardEntry> readCardTable;
+    bool cardTableOk = cacheManager.ReadSurfaceCacheCardTable(filePath, header, readCardTable)
+        && readCardTable.size() == cardEntries.size()
+        && (cardEntries.empty() || std::memcmp(readCardTable.data(), cardEntries.data(),
+            cardEntries.size() * sizeof(geometry::SurfaceCacheCardEntry)) == 0);
+    Check(cardTableOk, "surface-cache card table must round-trip byte-exact");
+
+    if (cardTableOk) {
+        const float invAtlas = 1.0f / static_cast<float>(geometry::kSurfaceCacheAtlasSize);
+        for (size_t a = 0; a < readCardTable.size(); ++a) {
+            const geometry::SurfaceCacheCardEntry& ca = readCardTable[a];
+            Check(ca.atlasOffset[0] + ca.atlasSize[0] <= geometry::kSurfaceCacheAtlasSize
+                && ca.atlasOffset[1] + ca.atlasSize[1] <= geometry::kSurfaceCacheAtlasSize,
+                "card " + std::to_string(a) + " must lie fully inside the atlas");
+            Check(ca.uvMin[0] == static_cast<float>(ca.atlasOffset[0]) * invAtlas
+                && ca.uvMin[1] == static_cast<float>(ca.atlasOffset[1]) * invAtlas
+                && ca.uvMax[0] == static_cast<float>(ca.atlasOffset[0] + ca.atlasSize[0]) * invAtlas
+                && ca.uvMax[1] == static_cast<float>(ca.atlasOffset[1] + ca.atlasSize[1]) * invAtlas,
+                "card " + std::to_string(a) + "'s UV rect must be its texel rect normalized by the atlas size");
+            for (size_t b = a + 1; b < readCardTable.size(); ++b) {
+                const geometry::SurfaceCacheCardEntry& cb = readCardTable[b];
+                bool overlap =
+                    ca.atlasOffset[0] < cb.atlasOffset[0] + cb.atlasSize[0] &&
+                    cb.atlasOffset[0] < ca.atlasOffset[0] + ca.atlasSize[0] &&
+                    ca.atlasOffset[1] < cb.atlasOffset[1] + cb.atlasSize[1] &&
+                    cb.atlasOffset[1] < ca.atlasOffset[1] + ca.atlasSize[1];
+                Check(!overlap, "cards " + std::to_string(a) + " and " + std::to_string(b) + " must not overlap in the atlas");
+            }
+        }
     }
 
     std::cout << "[CacheFileFormatTests] " << indexEntries.size() << " cluster(s), "

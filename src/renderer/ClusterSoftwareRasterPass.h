@@ -61,13 +61,22 @@ namespace renderer {
         // GENERAL for its entire lifetime, since it is only ever touched by compute shaders), the
         // view-params UBO, the dispatch-args buffer, and all 3 compute pipelines (clear, raster,
         // build-dispatch-args). `clusterMetadataBuffer`/`compressedPhysicalPoolBuffer`/
-        // `softwareClusterListBuffer` are NOT owned here -- they must come from the same
-        // renderer::ClusterOcclusionCullingPass instance/frame whose GetClusterMetadataBuffer() /
-        // GetSoftwareClusterListBuffer() populate them (`compressedPhysicalPoolBuffer` is
-        // renderer::GpuGeometryPagePool::GetPhysicalPoolBuffer()), exactly like
-        // renderer::ClusterHardwareRasterPass::Init's own external-buffer parameters.
+        // `softwareClusterListBuffer`/`wpoGlobalsBuffer` are NOT owned here -- they must come from
+        // the same renderer::ClusterOcclusionCullingPass instance/frame whose
+        // GetClusterMetadataBuffer() / GetSoftwareClusterListBuffer() populate them
+        // (`compressedPhysicalPoolBuffer` is renderer::GpuGeometryPagePool::GetPhysicalPoolBuffer(),
+        // `wpoGlobalsBuffer` is renderer::ClusterRenderPipeline's own WPOGlobalsUBO -- see
+        // wpo_deformation.glsl), exactly like renderer::ClusterHardwareRasterPass::Init's own
+        // external-buffer parameters. `maskImageInfos` is renderer::ProceduralMaskGenerator::
+        // GetMaskImageInfos(), bound as binding 6 for ClusterSoftwareRaster.comp's opacity-mask
+        // cutout (mask_sampling.glsl).
+        // `softwareClusterListOpaqueBuffer` is renderer::ClusterOcclusionCullingPass::
+        // GetSoftwareClusterListOpaqueBuffer() -- the opaque-only counterpart list, consumed by a
+        // second, mask-sampling-free compute pipeline (ClusterSoftwareRasterOpaque.comp) this
+        // Init() also builds; see RecordRaster().
         void Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue, VkExtent2D renderExtent,
-            VkBuffer clusterMetadataBuffer, VkBuffer compressedPhysicalPoolBuffer, VkBuffer softwareClusterListBuffer);
+            VkBuffer clusterMetadataBuffer, VkBuffer compressedPhysicalPoolBuffer, VkBuffer softwareClusterListBuffer,
+            VkBuffer softwareClusterListOpaqueBuffer, VkBuffer wpoGlobalsBuffer, const std::vector<VkDescriptorImageInfo>& maskImageInfos);
 
         void Shutdown();
 
@@ -76,12 +85,15 @@ namespace renderer {
         // per frame, before RecordRaster().
         void RecordClear(VkCommandBuffer cmd);
 
-        // Uploads `viewProj` into the view-params UBO, builds this dispatch's
-        // VkDispatchIndirectCommand from the software cluster list's own atomic count (via
-        // BuildDispatchIndirectArgs.comp, perElementMultiplier = geometry::kMaxClusterTriangles --
-        // see ClusterSoftwareRaster.comp's dispatch-shape comment), then records the indirect
-        // rasterization dispatch itself. Ends with the barrier making the atomic VisBuffer's writes
-        // visible to a later compute read (renderer::ClusterResolvePass).
+        // Uploads `viewProj` into the view-params UBO, then for EACH of the masked and opaque
+        // software cluster lists in turn: builds that dispatch's VkDispatchIndirectCommand from the
+        // list's own atomic count (via BuildDispatchIndirectArgs.comp, perElementMultiplier ==
+        // geometry::kMaxClusterTriangles -- see ClusterSoftwareRaster.comp's dispatch-shape
+        // comment), then records the indirect rasterization dispatch against that list's own
+        // pipeline (masked: ClusterSoftwareRaster.comp, samples the mask array; opaque:
+        // ClusterSoftwareRasterOpaque.comp, no mask sampling at all). Ends with the barrier making
+        // the atomic VisBuffer's writes visible to a later compute read
+        // (renderer::ClusterResolvePass).
         void RecordRaster(VkCommandBuffer cmd, const maths::mat4& viewProj);
 
         VkImage GetVisBufferAtomicImage() const { return m_VisBufferAtomicImage; }
@@ -100,13 +112,21 @@ namespace renderer {
         VkImageView m_VisBufferAtomicView = VK_NULL_HANDLE;
 
         GpuBuffer m_ViewParamsBuffer;   // SoftwareRasterViewParamsUBO, std140, GPU_ONLY.
-        GpuBuffer m_DispatchArgsBuffer; // VkDispatchIndirectCommand (3x uint32), GPU_ONLY.
+        GpuBuffer m_DispatchArgsBuffer; // VkDispatchIndirectCommand (3x uint32), GPU_ONLY, masked list.
+        GpuBuffer m_DispatchArgsOpaqueBuffer; // VkDispatchIndirectCommand (3x uint32), GPU_ONLY, opaque list.
 
-        // Main raster descriptor set/pipeline (ClusterSoftwareRaster.comp).
+        // Masked raster descriptor set/pipeline (ClusterSoftwareRaster.comp -- samples the mask array).
         VkDescriptorSetLayout m_RasterSetLayout = VK_NULL_HANDLE;
         VkDescriptorSet m_RasterDescriptorSet = VK_NULL_HANDLE;
         VkPipelineLayout m_RasterPipelineLayout = VK_NULL_HANDLE;
         VkPipeline m_RasterPipeline = VK_NULL_HANDLE;
+
+        // Opaque raster descriptor set/pipeline (ClusterSoftwareRasterOpaque.comp -- no mask array
+        // binding at all, genuinely smaller descriptor set than the masked one above).
+        VkDescriptorSetLayout m_OpaqueRasterSetLayout = VK_NULL_HANDLE;
+        VkDescriptorSet m_OpaqueRasterDescriptorSet = VK_NULL_HANDLE;
+        VkPipelineLayout m_OpaqueRasterPipelineLayout = VK_NULL_HANDLE;
+        VkPipeline m_OpaqueRasterPipeline = VK_NULL_HANDLE;
 
         // Clear descriptor set/pipeline (ClearVisBufferAtomic.comp).
         VkDescriptorSetLayout m_ClearSetLayout = VK_NULL_HANDLE;
@@ -115,9 +135,13 @@ namespace renderer {
         VkPipeline m_ClearPipeline = VK_NULL_HANDLE;
 
         // BuildDispatchIndirectArgs descriptor set/pipeline (shared shader with
-        // renderer::ClusterOcclusionCullingPass, own separate pipeline/descriptor instance).
+        // renderer::ClusterOcclusionCullingPass, own separate pipeline/descriptor instances --
+        // one set for the masked list, one for the opaque list, both against the same pipeline
+        // since the shader itself is generic over which SourceCountSSBO/DispatchArgsSSBO pair it's
+        // bound to).
         VkDescriptorSetLayout m_BuildArgsSetLayout = VK_NULL_HANDLE;
         VkDescriptorSet m_BuildArgsDescriptorSet = VK_NULL_HANDLE;
+        VkDescriptorSet m_BuildArgsOpaqueDescriptorSet = VK_NULL_HANDLE;
         VkPipelineLayout m_BuildArgsPipelineLayout = VK_NULL_HANDLE;
         VkPipeline m_BuildArgsPipeline = VK_NULL_HANDLE;
 

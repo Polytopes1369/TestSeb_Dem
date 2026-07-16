@@ -1,0 +1,64 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+
+// Procedurally generates every slot of the bindless cutout mask array (renderer::
+// ProceduralMaskGenerator / mask_sampling.glsl) -- zero image assets, matching the project's
+// "100% procedural, no data in the exe" rule. One dispatch covers every slot at once (dispatch Z =
+// K_MAX_MASK_TEXTURES, local_size_z = 1, so gl_GlobalInvocationID.z is workgroup-uniform and needs
+// no nonuniformEXT indexing here -- unlike the per-cluster sampling in mask_sampling.glsl, this
+// generation-time indexing is uniform across each invocation group by construction).
+//
+// Pattern: a simple two-octave hashed value-noise threshold, seeded per-slot so every one of the
+// K_MAX_MASK_TEXTURES slots gets a visually distinct blotchy cutout silhouette (foliage/leaf-
+// cluster style), without any RNG state or external asset.
+
+#define K_MASK_TEXTURE_SIZE 128u
+#define K_MAX_MASK_TEXTURES 64u
+
+layout(r8, set = 0, binding = 0) uniform writeonly image2D g_MaskOutputs[K_MAX_MASK_TEXTURES];
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+uint HashUint(uint x) {
+    x ^= x >> 16u;
+    x *= 0x7feb352du;
+    x ^= x >> 15u;
+    x *= 0x846ca68bu;
+    x ^= x >> 16u;
+    return x;
+}
+
+// Value noise at integer cell corners, hashed by (cellX, cellY, slot), bilinearly interpolated
+// with a smoothstep-shaped blend so adjacent cells join without hard seams.
+float ValueNoise(vec2 p, uint slot) {
+    vec2 cell = floor(p);
+    vec2 frac = p - cell;
+    vec2 smoothFrac = frac * frac * (3.0 - 2.0 * frac);
+
+    uint ix = uint(cell.x), iy = uint(cell.y);
+    float h00 = float(HashUint(ix * 1973u + iy * 9277u + slot * 26699u) & 0xFFFFu) / 65535.0;
+    float h10 = float(HashUint((ix + 1u) * 1973u + iy * 9277u + slot * 26699u) & 0xFFFFu) / 65535.0;
+    float h01 = float(HashUint(ix * 1973u + (iy + 1u) * 9277u + slot * 26699u) & 0xFFFFu) / 65535.0;
+    float h11 = float(HashUint((ix + 1u) * 1973u + (iy + 1u) * 9277u + slot * 26699u) & 0xFFFFu) / 65535.0;
+
+    float top = mix(h00, h10, smoothFrac.x);
+    float bottom = mix(h01, h11, smoothFrac.x);
+    return mix(top, bottom, smoothFrac.y);
+}
+
+void main() {
+    uint slot = gl_GlobalInvocationID.z;
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (pixel.x >= int(K_MASK_TEXTURE_SIZE) || pixel.y >= int(K_MASK_TEXTURE_SIZE) || slot >= K_MAX_MASK_TEXTURES) {
+        return;
+    }
+
+    vec2 uv = vec2(pixel) / float(K_MASK_TEXTURE_SIZE);
+
+    // Two octaves at different frequencies, combined, then thresholded -- gives blotchy,
+    // leaf-cluster-like cutout silhouettes rather than pure white noise.
+    float n = ValueNoise(uv * 6.0, slot) * 0.6 + ValueNoise(uv * 13.0, slot) * 0.4;
+    float alpha = smoothstep(0.35, 0.55, n);
+
+    imageStore(g_MaskOutputs[slot], pixel, vec4(alpha, 0.0, 0.0, 0.0));
+}

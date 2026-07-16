@@ -30,14 +30,16 @@ namespace renderer {
     } // namespace
 
     void ClusterHardwareRasterPass::Init(VkDevice device, VkBuffer clusterMetadataBuffer, VkBuffer compressedPhysicalPoolBuffer,
+        VkBuffer wpoGlobalsBuffer, const std::vector<VkDescriptorImageInfo>& maskImageInfos,
         const std::array<VkFormat, 2>& visBufferColorFormats, VkFormat depthFormat) {
         Shutdown();
 
         m_Device = device;
+        uint32_t maskTextureCount = static_cast<uint32_t>(maskImageInfos.size());
 
-        // --- Descriptor set layout: 2 bindings, both vertex-stage-only (ClusterRaster.frag reads
-        // no descriptors at all). ---
-        VkDescriptorSetLayoutBinding bindings[2]{};
+        // --- Descriptor set layout: 4 bindings -- 0/1/2 vertex-stage-only, 3 (the bindless mask
+        // array) fragment-stage-only, since ClusterRaster.vert never samples it. ---
+        VkDescriptorSetLayoutBinding bindings[4]{};
         bindings[0].binding = 0;
         bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; // ClusterCullMetadataSSBO
         bindings[0].descriptorCount = 1;
@@ -48,16 +50,29 @@ namespace renderer {
         bindings[1].descriptorCount = 1;
         bindings[1].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
 
+        bindings[2].binding = 2;
+        bindings[2].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; // WPOGlobalsUBO
+        bindings[2].descriptorCount = 1;
+        bindings[2].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+
+        bindings[3].binding = 3;
+        bindings[3].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; // g_MaskTextures[] (mask_sampling.glsl)
+        bindings[3].descriptorCount = maskTextureCount;
+        bindings[3].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
         VkDescriptorSetLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-        layoutInfo.bindingCount = 2;
+        layoutInfo.bindingCount = 4;
         layoutInfo.pBindings = bindings;
         VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &layoutInfo, nullptr, &m_DescriptorSetLayout));
 
-        VkDescriptorPoolSize poolSize{ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 };
+        VkDescriptorPoolSize poolSizes[3]{};
+        poolSizes[0] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 };
+        poolSizes[1] = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 };
+        poolSizes[2] = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, maskTextureCount };
         VkDescriptorPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
         poolInfo.maxSets = 1;
-        poolInfo.poolSizeCount = 1;
-        poolInfo.pPoolSizes = &poolSize;
+        poolInfo.poolSizeCount = 3;
+        poolInfo.pPoolSizes = poolSizes;
         VK_CHECK(vkCreateDescriptorPool(m_Device, &poolInfo, nullptr, &m_DescriptorPool));
 
         VkDescriptorSetAllocateInfo allocInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
@@ -68,8 +83,9 @@ namespace renderer {
 
         VkDescriptorBufferInfo metadataInfo{ clusterMetadataBuffer, 0, VK_WHOLE_SIZE };
         VkDescriptorBufferInfo compressedInfo{ compressedPhysicalPoolBuffer, 0, VK_WHOLE_SIZE };
+        VkDescriptorBufferInfo wpoGlobalsInfo{ wpoGlobalsBuffer, 0, VK_WHOLE_SIZE };
 
-        VkWriteDescriptorSet writes[2]{};
+        VkWriteDescriptorSet writes[4]{};
         writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[0].dstSet = m_DescriptorSet;
         writes[0].dstBinding = 0;
@@ -84,7 +100,21 @@ namespace renderer {
         writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         writes[1].pBufferInfo = &compressedInfo;
 
-        vkUpdateDescriptorSets(m_Device, 2, writes, 0, nullptr);
+        writes[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[2].dstSet = m_DescriptorSet;
+        writes[2].dstBinding = 2;
+        writes[2].descriptorCount = 1;
+        writes[2].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        writes[2].pBufferInfo = &wpoGlobalsInfo;
+
+        writes[3].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[3].dstSet = m_DescriptorSet;
+        writes[3].dstBinding = 3;
+        writes[3].descriptorCount = maskTextureCount;
+        writes[3].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        writes[3].pImageInfo = maskImageInfos.data();
+
+        vkUpdateDescriptorSets(m_Device, 4, writes, 0, nullptr);
 
         // --- Pipeline layout + pipeline: reuses VulkanPipeline::CreateGraphicsPipeline exactly as
         // draw.vert/draw.frag's own pipeline does (empty vertex input state, dynamic viewport/
@@ -103,20 +133,27 @@ namespace renderer {
         VK_CHECK(vkCreatePipelineLayout(m_Device, &pipelineLayoutInfo, nullptr, &m_PipelineLayout));
 
         std::vector<char> vertCode = ReadShaderFile("shaders/ClusterRaster.vert.spv");
-        std::vector<char> fragCode = ReadShaderFile("shaders/ClusterRaster.frag.spv");
+        std::vector<char> maskedFragCode = ReadShaderFile("shaders/ClusterRaster.frag.spv");
+        std::vector<char> opaqueFragCode = ReadShaderFile("shaders/ClusterRasterOpaque.frag.spv");
         VkShaderModule vertModule = VulkanPipeline::CreateShaderModule(m_Device, vertCode);
-        VkShaderModule fragModule = VulkanPipeline::CreateShaderModule(m_Device, fragCode);
+        VkShaderModule maskedFragModule = VulkanPipeline::CreateShaderModule(m_Device, maskedFragCode);
+        VkShaderModule opaqueFragModule = VulkanPipeline::CreateShaderModule(m_Device, opaqueFragCode);
 
-        m_Pipeline = VulkanPipeline::CreateGraphicsPipeline(m_Device, m_PipelineLayout, vertModule, fragModule, visBufferColorFormats, depthFormat);
+        m_MaskedPipeline = VulkanPipeline::CreateGraphicsPipeline(m_Device, m_PipelineLayout, vertModule, maskedFragModule, visBufferColorFormats, depthFormat);
+        m_OpaquePipeline = VulkanPipeline::CreateGraphicsPipeline(m_Device, m_PipelineLayout, vertModule, opaqueFragModule, visBufferColorFormats, depthFormat);
 
         vkDestroyShaderModule(m_Device, vertModule, nullptr);
-        vkDestroyShaderModule(m_Device, fragModule, nullptr);
+        vkDestroyShaderModule(m_Device, maskedFragModule, nullptr);
+        vkDestroyShaderModule(m_Device, opaqueFragModule, nullptr);
     }
 
     void ClusterHardwareRasterPass::Shutdown() {
         if (m_Device != VK_NULL_HANDLE) {
-            if (m_Pipeline != VK_NULL_HANDLE) {
-                vkDestroyPipeline(m_Device, m_Pipeline, nullptr);
+            if (m_OpaquePipeline != VK_NULL_HANDLE) {
+                vkDestroyPipeline(m_Device, m_OpaquePipeline, nullptr);
+            }
+            if (m_MaskedPipeline != VK_NULL_HANDLE) {
+                vkDestroyPipeline(m_Device, m_MaskedPipeline, nullptr);
             }
             if (m_PipelineLayout != VK_NULL_HANDLE) {
                 vkDestroyPipelineLayout(m_Device, m_PipelineLayout, nullptr);
@@ -130,7 +167,8 @@ namespace renderer {
             }
         }
 
-        m_Pipeline = VK_NULL_HANDLE;
+        m_OpaquePipeline = VK_NULL_HANDLE;
+        m_MaskedPipeline = VK_NULL_HANDLE;
         m_PipelineLayout = VK_NULL_HANDLE;
         m_DescriptorPool = VK_NULL_HANDLE;
         m_DescriptorSet = VK_NULL_HANDLE;
@@ -139,8 +177,9 @@ namespace renderer {
     }
 
     void ClusterHardwareRasterPass::RecordDraw(VkCommandBuffer cmd, const CameraPushConstants& camera, VkExtent2D renderExtent,
-        VkBuffer decompressedIndexPoolBuffer, VkBuffer indirectCommandBuffer, VkBuffer drawCountBuffer, uint32_t maxDrawCount) {
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_Pipeline);
+        VkBuffer decompressedIndexPoolBuffer, VkBuffer indirectCommandBuffer, VkBuffer drawCountBuffer,
+        uint32_t maxDrawCount, bool opaque) {
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, opaque ? m_OpaquePipeline : m_MaskedPipeline);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_PipelineLayout, 0, 1, &m_DescriptorSet, 0, nullptr);
         vkCmdPushConstants(cmd, m_PipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(CameraPushConstants), &camera);
 

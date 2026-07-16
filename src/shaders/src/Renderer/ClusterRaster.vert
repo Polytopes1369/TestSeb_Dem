@@ -29,10 +29,21 @@
 #define COMPRESSED_POOL_SET 0
 #define COMPRESSED_POOL_BINDING 1
 #include "include/cluster_vertex_decode.glsl"
+#include "include/wpo_deformation.glsl"
 
 layout(std430, set = 0, binding = 0) readonly buffer ClusterCullMetadataSSBO {
     ClusterCullMetadata clusters[];
 } g_Clusters;
+
+// Uploaded once per frame by renderer::ClusterRenderPipeline (vkCmdUpdateBuffer) -- see
+// wpo_deformation.glsl's ApplyWPODeformation for how globalTime is used. _pad exists only to mirror
+// the owning C++ WPOGlobalsUBO struct's explicit 16-byte size; std140 does not require it here.
+layout(std140, set = 0, binding = 2) uniform WPOGlobalsUBO {
+    float globalTime;
+    float _pad0;
+    float _pad1;
+    float _pad2;
+} g_WPOGlobals;
 
 // Camera matrices via Push Constants -- same layout as draw.vert's CameraPushConstants.
 layout(push_constant) uniform CameraPushConstants {
@@ -52,6 +63,11 @@ layout(push_constant) uniform CameraPushConstants {
 // VkDrawIndexedIndirectCommand), making it exactly this cluster's local triangle ordinal with no
 // manual bookkeeping needed here.
 layout(location = 0) flat out uint outClusterID;
+// Interpolated UV + flat mask index, consumed only by ClusterRaster.frag's opacity-mask discard
+// (mask_sampling.glsl) -- both are exact no-ops for any cluster whose maskTextureIndex is the
+// kInvalidMaskTextureIndex sentinel (0xFFFFFFFF), the common (non-foliage) case.
+layout(location = 1) out vec2 outUV;
+layout(location = 2) flat out uint outMaskTextureIndex;
 
 void main() {
     ClusterCullMetadata cluster = g_Clusters.clusters[gl_InstanceIndex];
@@ -68,8 +84,11 @@ void main() {
     // (cluster_vertex_decode.glsl) -- no dependency on renderer::GeometryDecompressionPass's
     // vertex pool having already decompressed this exact page this frame.
     vec3 worldPos = DecodeClusterPosition(pageByteBase, localVertexIndex, cluster.boundsMin, cluster.boundsMax);
+    worldPos = ApplyWPODeformation(worldPos, cluster.clusterID, cluster.maxWPOAmplitude, g_WPOGlobals.globalTime);
 
     outClusterID = uint(gl_InstanceIndex);
+    outUV = DecodeClusterUV(pageByteBase, localVertexIndex);
+    outMaskTextureIndex = cluster.maskTextureIndex;
 
     gl_Position = camera.proj * camera.view * vec4(worldPos, 1.0);
 }

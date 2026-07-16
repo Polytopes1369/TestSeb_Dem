@@ -1,6 +1,7 @@
 #include "geometry/ClusterPartitioner.h"
 
 #include "geometry/ClusterFormat.h"
+#include "geometry/ProceduralMaskSampler.h"
 
 #include <algorithm>
 #include <limits>
@@ -218,12 +219,154 @@ namespace geometry {
             return cluster;
         }
 
+        // Barycentric sample grid resolution for opacity classification: a triangular grid with
+        // kOpacitySampleSubdivisions steps per edge yields (N+1)(N+2)/2 = 15 sample points,
+        // including all 3 corners exactly. A fixed, small sample count (rather than one driven by
+        // mask texture resolution or the triangle's UV footprint size) keeps classification cost
+        // bounded regardless of how large a triangle's UV footprint is.
+        constexpr int kOpacitySampleSubdivisions = 4;
+
+        // True if any of the fixed barycentric samples across this triangle's UV footprint would be
+        // discarded by the alpha-test cutoff -- i.e. the triangle is not safely, uniformly opaque.
+        bool IsTriangleMasked(const maths::vec2& uv0, const maths::vec2& uv1, const maths::vec2& uv2, uint32_t maskTextureIndex) {
+            for (int a = 0; a <= kOpacitySampleSubdivisions; ++a) {
+                for (int b = 0; a + b <= kOpacitySampleSubdivisions; ++b) {
+                    float u = static_cast<float>(a) / static_cast<float>(kOpacitySampleSubdivisions);
+                    float v = static_cast<float>(b) / static_cast<float>(kOpacitySampleSubdivisions);
+                    float w = 1.0f - u - v;
+                    maths::vec2 uv = uv0 * w + uv1 * u + uv2 * v;
+                    if (SampleMaskAlphaCPU(maskTextureIndex, uv) < kMaskAlphaCutoff) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+
+        // Recompacts the subset of `src`'s triangles selected by `keepTriangle` (parallel to its
+        // triangle list, src.localTriangleIndices.size()/3 entries) into a new, independently
+        // locally-indexed MeshCluster -- the same "select triangles, then recompact vertices"
+        // pattern ClusterDAG.cpp's ClampMeshToCapacity/SplitSimplifiableMesh already use for the
+        // same kind of triangle-subset extraction, specialized here to MeshCluster's own layout
+        // (uint8_t local indices, parallel originalTriangleIndices for coverage traceability).
+        MeshCluster ExtractTriangleSubset(const MeshCluster& src, const std::vector<bool>& keepTriangle,
+            bool isMasked, const std::vector<renderer::Vertex>& allVertices) {
+
+            MeshCluster out;
+            out.isMasked = isMasked;
+
+            uint32_t triCount = static_cast<uint32_t>(src.localTriangleIndices.size() / 3u);
+            std::unordered_map<uint8_t, uint8_t> localRemap;
+            out.globalVertexIndices.reserve(src.globalVertexIndices.size());
+            out.localTriangleIndices.reserve(src.localTriangleIndices.size());
+            out.originalTriangleIndices.reserve(src.originalTriangleIndices.size());
+
+            for (uint32_t t = 0; t < triCount; ++t) {
+                if (!keepTriangle[t]) {
+                    continue;
+                }
+                for (uint32_t k = 0; k < 3u; ++k) {
+                    uint8_t srcLocal = src.localTriangleIndices[t * 3u + k];
+                    auto it = localRemap.find(srcLocal);
+                    uint8_t newLocal;
+                    if (it == localRemap.end()) {
+                        newLocal = static_cast<uint8_t>(out.globalVertexIndices.size());
+                        localRemap.emplace(srcLocal, newLocal);
+                        out.globalVertexIndices.push_back(src.globalVertexIndices[srcLocal]);
+                    }
+                    else {
+                        newLocal = it->second;
+                    }
+                    out.localTriangleIndices.push_back(newLocal);
+                }
+                out.originalTriangleIndices.push_back(src.originalTriangleIndices[t]);
+            }
+
+            maths::vec3 boundsMin{ std::numeric_limits<float>::max(), std::numeric_limits<float>::max(), std::numeric_limits<float>::max() };
+            maths::vec3 boundsMax{ std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest() };
+            for (uint32_t g : out.globalVertexIndices) {
+                const maths::vec3& p = allVertices[g].position;
+                boundsMin.x = std::min(boundsMin.x, p.x); boundsMin.y = std::min(boundsMin.y, p.y); boundsMin.z = std::min(boundsMin.z, p.z);
+                boundsMax.x = std::max(boundsMax.x, p.x); boundsMax.y = std::max(boundsMax.y, p.y); boundsMax.z = std::max(boundsMax.z, p.z);
+            }
+            out.boundsMin = boundsMin;
+            out.boundsMax = boundsMax;
+            out.sphereCenter = (boundsMin + boundsMax) * 0.5f;
+            out.sphereRadius = (boundsMax - boundsMin).Length() * 0.5f;
+
+            return out;
+        }
+
+        // Classifies every triangle of every cluster in `clusters` against the entity's opacity
+        // mask, splitting any cluster whose masked-triangle fraction exceeds
+        // kMaskedClusterSplitThreshold into a pure-opaque + pure-masked replacement pair (see
+        // ClusterPartitioner.h's PartitionMeshIntoClusters doc comment for the full contract).
+        // No-op (every cluster keeps isMasked == false) when maskTextureIndex is the sentinel.
+        void ClassifyAndSplitForOpacity(std::vector<MeshCluster>& clusters, uint32_t maskTextureIndex,
+            const std::vector<renderer::Vertex>& allVertices) {
+
+            if (maskTextureIndex == kInvalidMaskTextureIndex) {
+                return;
+            }
+
+            std::vector<MeshCluster> result;
+            result.reserve(clusters.size());
+
+            for (MeshCluster& cluster : clusters) {
+                uint32_t triCount = static_cast<uint32_t>(cluster.localTriangleIndices.size() / 3u);
+                std::vector<bool> triangleMasked(triCount, false);
+                uint32_t maskedCount = 0u;
+                for (uint32_t t = 0; t < triCount; ++t) {
+                    uint32_t g0 = cluster.globalVertexIndices[cluster.localTriangleIndices[t * 3u + 0u]];
+                    uint32_t g1 = cluster.globalVertexIndices[cluster.localTriangleIndices[t * 3u + 1u]];
+                    uint32_t g2 = cluster.globalVertexIndices[cluster.localTriangleIndices[t * 3u + 2u]];
+                    bool masked = IsTriangleMasked(allVertices[g0].uv, allVertices[g1].uv, allVertices[g2].uv, maskTextureIndex);
+                    triangleMasked[t] = masked;
+                    maskedCount += masked ? 1u : 0u;
+                }
+
+                if (maskedCount == 0u) {
+                    cluster.isMasked = false;
+                    result.push_back(std::move(cluster));
+                    continue;
+                }
+
+                float maskedFraction = static_cast<float>(maskedCount) / static_cast<float>(triCount);
+                if (maskedFraction <= kMaskedClusterSplitThreshold) {
+                    // Below the split threshold: fold the whole cluster into the masked path rather
+                    // than fragment a near-pure cluster over a small minority of triangles.
+                    cluster.isMasked = true;
+                    result.push_back(std::move(cluster));
+                    continue;
+                }
+
+                std::vector<bool> keepOpaque(triCount);
+                std::vector<bool> keepMasked(triCount);
+                for (uint32_t t = 0; t < triCount; ++t) {
+                    keepOpaque[t] = !triangleMasked[t];
+                    keepMasked[t] = triangleMasked[t];
+                }
+
+                MeshCluster opaquePart = ExtractTriangleSubset(cluster, keepOpaque, false, allVertices);
+                MeshCluster maskedPart = ExtractTriangleSubset(cluster, keepMasked, true, allVertices);
+                if (!opaquePart.localTriangleIndices.empty()) {
+                    result.push_back(std::move(opaquePart));
+                }
+                if (!maskedPart.localTriangleIndices.empty()) {
+                    result.push_back(std::move(maskedPart));
+                }
+            }
+
+            clusters = std::move(result);
+        }
+
     } // namespace
 
     std::vector<MeshCluster> PartitionMeshIntoClusters(
         uint32_t targetMeshID,
         const std::vector<renderer::Vertex>& allVertices,
-        const std::vector<uint32_t>& allIndices) {
+        const std::vector<uint32_t>& allIndices,
+        uint32_t maskTextureIndex) {
 
         std::vector<TriangleRef> tris;
         for (size_t t = 0; t + 2 < allIndices.size(); t += 3) {
@@ -254,6 +397,8 @@ namespace geometry {
         for (const auto& group : groups) {
             result.push_back(BuildClusterFromGroup(tris, allVertices, group));
         }
+
+        ClassifyAndSplitForOpacity(result, maskTextureIndex, allVertices);
         return result;
     }
 

@@ -45,8 +45,10 @@ namespace renderer {
     } // namespace
 
     void ClusterSoftwareRasterPass::Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue, VkExtent2D renderExtent,
-        VkBuffer clusterMetadataBuffer, VkBuffer compressedPhysicalPoolBuffer, VkBuffer softwareClusterListBuffer) {
+        VkBuffer clusterMetadataBuffer, VkBuffer compressedPhysicalPoolBuffer, VkBuffer softwareClusterListBuffer,
+        VkBuffer softwareClusterListOpaqueBuffer, VkBuffer wpoGlobalsBuffer, const std::vector<VkDescriptorImageInfo>& maskImageInfos) {
         Shutdown();
+        uint32_t maskTextureCount = static_cast<uint32_t>(maskImageInfos.size());
 
         m_Device = device;
         m_Allocator = allocator;
@@ -60,6 +62,12 @@ namespace renderer {
             VMA_MEMORY_USAGE_GPU_ONLY);
 
         m_DispatchArgsBuffer.Create(
+            allocator,
+            sizeof(VkDispatchIndirectCommand),
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
+            VMA_MEMORY_USAGE_GPU_ONLY);
+
+        m_DispatchArgsOpaqueBuffer.Create(
             allocator,
             sizeof(VkDispatchIndirectCommand),
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
@@ -136,17 +144,34 @@ namespace renderer {
         }
 
         // --- Descriptor set layouts ---
-        VkDescriptorSetLayoutBinding rasterBindings[5]{};
+        VkDescriptorSetLayoutBinding rasterBindings[7]{};
         rasterBindings[0] = { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // ClusterCullMetadataSSBO
         rasterBindings[1] = { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // CompressedClusterPoolSSBO
         rasterBindings[2] = { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // SoftwareClusterListSSBO
         rasterBindings[3] = { 3, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // SoftwareRasterViewParamsUBO
         rasterBindings[4] = { 4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };  // g_VisBufferAtomic (r64ui)
+        rasterBindings[5] = { 5, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // WPOGlobalsUBO
+        rasterBindings[6] = { 6, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, maskTextureCount, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // g_MaskTextures[]
 
         VkDescriptorSetLayoutCreateInfo rasterLayoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-        rasterLayoutInfo.bindingCount = 5;
+        rasterLayoutInfo.bindingCount = 7;
         rasterLayoutInfo.pBindings = rasterBindings;
         VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &rasterLayoutInfo, nullptr, &m_RasterSetLayout));
+
+        // Opaque raster set: identical to bindings 0-5 above, minus binding 6 (the mask array) --
+        // ClusterSoftwareRasterOpaque.comp never references it at all.
+        VkDescriptorSetLayoutBinding opaqueRasterBindings[6]{};
+        opaqueRasterBindings[0] = { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // ClusterCullMetadataSSBO
+        opaqueRasterBindings[1] = { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // CompressedClusterPoolSSBO
+        opaqueRasterBindings[2] = { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // SoftwareClusterListSSBO (opaque list)
+        opaqueRasterBindings[3] = { 3, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // SoftwareRasterViewParamsUBO
+        opaqueRasterBindings[4] = { 4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };  // g_VisBufferAtomic (r64ui)
+        opaqueRasterBindings[5] = { 5, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // WPOGlobalsUBO
+
+        VkDescriptorSetLayoutCreateInfo opaqueRasterLayoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+        opaqueRasterLayoutInfo.bindingCount = 6;
+        opaqueRasterLayoutInfo.pBindings = opaqueRasterBindings;
+        VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &opaqueRasterLayoutInfo, nullptr, &m_OpaqueRasterSetLayout));
 
         VkDescriptorSetLayoutBinding clearBindings[1]{};
         clearBindings[0] = { 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // g_VisBufferAtomic (r64ui)
@@ -165,15 +190,16 @@ namespace renderer {
         buildArgsLayoutInfo.pBindings = buildArgsBindings;
         VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &buildArgsLayoutInfo, nullptr, &m_BuildArgsSetLayout));
 
-        // --- One shared descriptor pool for all 3 sets ---
-        VkDescriptorPoolSize poolSizes[3]{};
-        poolSizes[0] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3 + 2 };      // Raster set's 3 SSBOs + BuildArgs set's 2 SSBOs.
-        poolSizes[1] = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 };         // Raster set's view-params UBO.
-        poolSizes[2] = { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1 + 1 };      // Raster set's + Clear set's g_VisBufferAtomic.
+        // --- One shared descriptor pool for all 5 sets ---
+        VkDescriptorPoolSize poolSizes[4]{};
+        poolSizes[0] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3 + 3 + 2 + 2 };  // Raster(3) + OpaqueRaster(3) + BuildArgs(2) + OpaqueBuildArgs(2) SSBOs.
+        poolSizes[1] = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2 + 2 };          // Raster's + OpaqueRaster's view-params UBO + WPOGlobalsUBO.
+        poolSizes[2] = { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1 + 1 + 1 };       // Raster's + OpaqueRaster's + Clear's g_VisBufferAtomic.
+        poolSizes[3] = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, maskTextureCount }; // Raster set's g_MaskTextures[] (opaque set has none).
 
         VkDescriptorPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
-        poolInfo.maxSets = 3;
-        poolInfo.poolSizeCount = 3;
+        poolInfo.maxSets = 5;
+        poolInfo.poolSizeCount = 4;
         poolInfo.pPoolSizes = poolSizes;
         VK_CHECK(vkCreateDescriptorPool(m_Device, &poolInfo, nullptr, &m_DescriptorPool));
 
@@ -182,6 +208,12 @@ namespace renderer {
         rasterSetAlloc.descriptorSetCount = 1;
         rasterSetAlloc.pSetLayouts = &m_RasterSetLayout;
         VK_CHECK(vkAllocateDescriptorSets(m_Device, &rasterSetAlloc, &m_RasterDescriptorSet));
+
+        VkDescriptorSetAllocateInfo opaqueRasterSetAlloc{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+        opaqueRasterSetAlloc.descriptorPool = m_DescriptorPool;
+        opaqueRasterSetAlloc.descriptorSetCount = 1;
+        opaqueRasterSetAlloc.pSetLayouts = &m_OpaqueRasterSetLayout;
+        VK_CHECK(vkAllocateDescriptorSets(m_Device, &opaqueRasterSetAlloc, &m_OpaqueRasterDescriptorSet));
 
         VkDescriptorSetAllocateInfo clearSetAlloc{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
         clearSetAlloc.descriptorPool = m_DescriptorPool;
@@ -195,6 +227,12 @@ namespace renderer {
         buildArgsSetAlloc.pSetLayouts = &m_BuildArgsSetLayout;
         VK_CHECK(vkAllocateDescriptorSets(m_Device, &buildArgsSetAlloc, &m_BuildArgsDescriptorSet));
 
+        VkDescriptorSetAllocateInfo buildArgsOpaqueSetAlloc{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+        buildArgsOpaqueSetAlloc.descriptorPool = m_DescriptorPool;
+        buildArgsOpaqueSetAlloc.descriptorSetCount = 1;
+        buildArgsOpaqueSetAlloc.pSetLayouts = &m_BuildArgsSetLayout;
+        VK_CHECK(vkAllocateDescriptorSets(m_Device, &buildArgsOpaqueSetAlloc, &m_BuildArgsOpaqueDescriptorSet));
+
         // --- Raster set descriptor writes ---
         VkDescriptorBufferInfo clusterMetadataInfo{ clusterMetadataBuffer, 0, VK_WHOLE_SIZE };
         VkDescriptorBufferInfo compressedPoolInfo{ compressedPhysicalPoolBuffer, 0, VK_WHOLE_SIZE };
@@ -205,13 +243,32 @@ namespace renderer {
         atomicImageInfo.imageView = m_VisBufferAtomicView;
         atomicImageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
-        VkWriteDescriptorSet rasterWrites[5]{};
+        VkDescriptorBufferInfo wpoGlobalsInfo{ wpoGlobalsBuffer, 0, VK_WHOLE_SIZE };
+
+        VkWriteDescriptorSet rasterWrites[7]{};
         rasterWrites[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_RasterDescriptorSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &clusterMetadataInfo, nullptr };
         rasterWrites[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_RasterDescriptorSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &compressedPoolInfo, nullptr };
         rasterWrites[2] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_RasterDescriptorSet, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &softwareListInfo, nullptr };
         rasterWrites[3] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_RasterDescriptorSet, 3, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &viewParamsInfo, nullptr };
         rasterWrites[4] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_RasterDescriptorSet, 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &atomicImageInfo, nullptr, nullptr };
-        vkUpdateDescriptorSets(m_Device, 5, rasterWrites, 0, nullptr);
+        rasterWrites[5] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_RasterDescriptorSet, 5, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &wpoGlobalsInfo, nullptr };
+        rasterWrites[6] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_RasterDescriptorSet, 6, 0, maskTextureCount, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, maskImageInfos.data(), nullptr, nullptr };
+        vkUpdateDescriptorSets(m_Device, 7, rasterWrites, 0, nullptr);
+
+        // --- Opaque raster set descriptor writes -- same shapes as the masked set's bindings 0-5,
+        // bound to the opaque software cluster list and sharing the same view-params/WPO-globals/
+        // atomic-image resources (no separate copies needed: both dispatches rasterize into the
+        // same VisBuffer against the same frame's camera). No binding 6 (mask array) here. ---
+        VkDescriptorBufferInfo softwareListOpaqueInfo{ softwareClusterListOpaqueBuffer, 0, VK_WHOLE_SIZE };
+
+        VkWriteDescriptorSet opaqueRasterWrites[6]{};
+        opaqueRasterWrites[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_OpaqueRasterDescriptorSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &clusterMetadataInfo, nullptr };
+        opaqueRasterWrites[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_OpaqueRasterDescriptorSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &compressedPoolInfo, nullptr };
+        opaqueRasterWrites[2] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_OpaqueRasterDescriptorSet, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &softwareListOpaqueInfo, nullptr };
+        opaqueRasterWrites[3] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_OpaqueRasterDescriptorSet, 3, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &viewParamsInfo, nullptr };
+        opaqueRasterWrites[4] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_OpaqueRasterDescriptorSet, 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &atomicImageInfo, nullptr, nullptr };
+        opaqueRasterWrites[5] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_OpaqueRasterDescriptorSet, 5, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &wpoGlobalsInfo, nullptr };
+        vkUpdateDescriptorSets(m_Device, 6, opaqueRasterWrites, 0, nullptr);
 
         VkWriteDescriptorSet clearWrites[1]{};
         clearWrites[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ClearDescriptorSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &atomicImageInfo, nullptr, nullptr };
@@ -221,6 +278,14 @@ namespace renderer {
         // BuildDispatchIndirectArgs.comp's SourceCountSSBO).
         VkDescriptorBufferInfo sourceCountInfo{ softwareClusterListBuffer, 0, sizeof(uint32_t) };
         VkDescriptorBufferInfo dispatchArgsInfo{ m_DispatchArgsBuffer.Handle(), 0, m_DispatchArgsBuffer.Size() };
+
+        VkDescriptorBufferInfo sourceCountOpaqueInfo{ softwareClusterListOpaqueBuffer, 0, sizeof(uint32_t) };
+        VkDescriptorBufferInfo dispatchArgsOpaqueInfo{ m_DispatchArgsOpaqueBuffer.Handle(), 0, m_DispatchArgsOpaqueBuffer.Size() };
+
+        VkWriteDescriptorSet buildArgsOpaqueWrites[2]{};
+        buildArgsOpaqueWrites[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_BuildArgsOpaqueDescriptorSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &sourceCountOpaqueInfo, nullptr };
+        buildArgsOpaqueWrites[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_BuildArgsOpaqueDescriptorSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &dispatchArgsOpaqueInfo, nullptr };
+        vkUpdateDescriptorSets(m_Device, 2, buildArgsOpaqueWrites, 0, nullptr);
 
         VkWriteDescriptorSet buildArgsWrites[2]{};
         buildArgsWrites[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_BuildArgsDescriptorSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &sourceCountInfo, nullptr };
@@ -244,6 +309,21 @@ namespace renderer {
         VkShaderModule rasterShaderModule = VulkanPipeline::CreateShaderModule(m_Device, rasterShaderCode);
         m_RasterPipeline = VulkanPipeline::CreateComputePipeline(m_Device, m_RasterPipelineLayout, rasterShaderModule);
         vkDestroyShaderModule(m_Device, rasterShaderModule, nullptr);
+
+        // Opaque raster pipeline: same push-constant shape, its own (smaller) set layout, own shader.
+        VkPushConstantRange opaqueRasterPushConstantRange = rasterPushConstantRange;
+
+        VkPipelineLayoutCreateInfo opaqueRasterPipelineLayoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+        opaqueRasterPipelineLayoutInfo.setLayoutCount = 1;
+        opaqueRasterPipelineLayoutInfo.pSetLayouts = &m_OpaqueRasterSetLayout;
+        opaqueRasterPipelineLayoutInfo.pushConstantRangeCount = 1;
+        opaqueRasterPipelineLayoutInfo.pPushConstantRanges = &opaqueRasterPushConstantRange;
+        VK_CHECK(vkCreatePipelineLayout(m_Device, &opaqueRasterPipelineLayoutInfo, nullptr, &m_OpaqueRasterPipelineLayout));
+
+        std::vector<char> opaqueRasterShaderCode = ReadShaderFile("shaders/ClusterSoftwareRasterOpaque.comp.spv");
+        VkShaderModule opaqueRasterShaderModule = VulkanPipeline::CreateShaderModule(m_Device, opaqueRasterShaderCode);
+        m_OpaqueRasterPipeline = VulkanPipeline::CreateComputePipeline(m_Device, m_OpaqueRasterPipelineLayout, opaqueRasterShaderModule);
+        vkDestroyShaderModule(m_Device, opaqueRasterShaderModule, nullptr);
 
         VkPushConstantRange clearPushConstantRange{};
         clearPushConstantRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -283,9 +363,11 @@ namespace renderer {
     void ClusterSoftwareRasterPass::Shutdown() {
         if (m_Device != VK_NULL_HANDLE) {
             if (m_RasterPipeline != VK_NULL_HANDLE) vkDestroyPipeline(m_Device, m_RasterPipeline, nullptr);
+            if (m_OpaqueRasterPipeline != VK_NULL_HANDLE) vkDestroyPipeline(m_Device, m_OpaqueRasterPipeline, nullptr);
             if (m_ClearPipeline != VK_NULL_HANDLE) vkDestroyPipeline(m_Device, m_ClearPipeline, nullptr);
             if (m_BuildArgsPipeline != VK_NULL_HANDLE) vkDestroyPipeline(m_Device, m_BuildArgsPipeline, nullptr);
             if (m_RasterPipelineLayout != VK_NULL_HANDLE) vkDestroyPipelineLayout(m_Device, m_RasterPipelineLayout, nullptr);
+            if (m_OpaqueRasterPipelineLayout != VK_NULL_HANDLE) vkDestroyPipelineLayout(m_Device, m_OpaqueRasterPipelineLayout, nullptr);
             if (m_ClearPipelineLayout != VK_NULL_HANDLE) vkDestroyPipelineLayout(m_Device, m_ClearPipelineLayout, nullptr);
             if (m_BuildArgsPipelineLayout != VK_NULL_HANDLE) vkDestroyPipelineLayout(m_Device, m_BuildArgsPipelineLayout, nullptr);
             if (m_DescriptorPool != VK_NULL_HANDLE) {
@@ -293,28 +375,35 @@ namespace renderer {
                 vkDestroyDescriptorPool(m_Device, m_DescriptorPool, nullptr);
             }
             if (m_RasterSetLayout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(m_Device, m_RasterSetLayout, nullptr);
+            if (m_OpaqueRasterSetLayout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(m_Device, m_OpaqueRasterSetLayout, nullptr);
             if (m_ClearSetLayout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(m_Device, m_ClearSetLayout, nullptr);
             if (m_BuildArgsSetLayout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(m_Device, m_BuildArgsSetLayout, nullptr);
             if (m_VisBufferAtomicView != VK_NULL_HANDLE) vkDestroyImageView(m_Device, m_VisBufferAtomicView, nullptr);
         }
 
         m_RasterPipeline = VK_NULL_HANDLE;
+        m_OpaqueRasterPipeline = VK_NULL_HANDLE;
         m_ClearPipeline = VK_NULL_HANDLE;
         m_BuildArgsPipeline = VK_NULL_HANDLE;
         m_RasterPipelineLayout = VK_NULL_HANDLE;
+        m_OpaqueRasterPipelineLayout = VK_NULL_HANDLE;
         m_ClearPipelineLayout = VK_NULL_HANDLE;
         m_BuildArgsPipelineLayout = VK_NULL_HANDLE;
         m_DescriptorPool = VK_NULL_HANDLE;
         m_RasterSetLayout = VK_NULL_HANDLE;
+        m_OpaqueRasterSetLayout = VK_NULL_HANDLE;
         m_ClearSetLayout = VK_NULL_HANDLE;
         m_BuildArgsSetLayout = VK_NULL_HANDLE;
         m_RasterDescriptorSet = VK_NULL_HANDLE;
+        m_OpaqueRasterDescriptorSet = VK_NULL_HANDLE;
         m_ClearDescriptorSet = VK_NULL_HANDLE;
         m_BuildArgsDescriptorSet = VK_NULL_HANDLE;
+        m_BuildArgsOpaqueDescriptorSet = VK_NULL_HANDLE;
         m_VisBufferAtomicView = VK_NULL_HANDLE;
 
         m_ViewParamsBuffer.Destroy();
         m_DispatchArgsBuffer.Destroy();
+        m_DispatchArgsOpaqueBuffer.Destroy();
 
         // vmaDestroyImage tolerates VK_NULL_HANDLE for both handle arguments (no-op), matching
         // GpuBuffer::Destroy()'s own null-safe convention.
@@ -373,13 +462,20 @@ namespace renderer {
         uboDependency.pMemoryBarriers = &uboBarrier;
         vkCmdPipelineBarrier2(cmd, &uboDependency);
 
-        // --- Build this dispatch's indirect args from the software cluster list's own atomic
-        // count -- perElementMultiplier = geometry::kMaxClusterTriangles, since
-        // ClusterSoftwareRaster.comp dispatches one thread per (cluster, triangleSlot) pair. ---
+        // --- Build BOTH dispatches' indirect args from each list's own atomic count --
+        // perElementMultiplier = geometry::kMaxClusterTriangles for both, since both
+        // ClusterSoftwareRaster.comp and ClusterSoftwareRasterOpaque.comp dispatch one thread per
+        // (cluster, triangleSlot) pair. Two separate 1x1x1 dispatches against the same
+        // m_BuildArgsPipeline/m_BuildArgsPipelineLayout (the shader is generic over which
+        // SourceCountSSBO/DispatchArgsSSBO pair its descriptor set binds), one per list. ---
         uint32_t buildArgsPushConstants[2] = { kWorkgroupSize, geometry::kMaxClusterTriangles };
 
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_BuildArgsPipeline);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_BuildArgsPipelineLayout, 0, 1, &m_BuildArgsDescriptorSet, 0, nullptr);
+        vkCmdPushConstants(cmd, m_BuildArgsPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(buildArgsPushConstants), buildArgsPushConstants);
+        vkCmdDispatch(cmd, 1, 1, 1);
+
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_BuildArgsPipelineLayout, 0, 1, &m_BuildArgsOpaqueDescriptorSet, 0, nullptr);
         vkCmdPushConstants(cmd, m_BuildArgsPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(buildArgsPushConstants), buildArgsPushConstants);
         vkCmdDispatch(cmd, 1, 1, 1);
 
@@ -394,7 +490,10 @@ namespace renderer {
         argsDependency.pMemoryBarriers = &argsBarrier;
         vkCmdPipelineBarrier2(cmd, &argsDependency);
 
-        // --- Indirect rasterization dispatch ---
+        // --- Indirect rasterization dispatches: masked list against the mask-sampling pipeline,
+        // opaque list against the mask-free pipeline. Both write the same atomic VisBuffer image;
+        // imageAtomicMax makes the relative order between the two dispatches irrelevant to
+        // correctness (see ClusterSoftwareRaster.comp's own class comment on the atomic packing). ---
         uint32_t maxTrianglesPerCluster = geometry::kMaxClusterTriangles;
 
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_RasterPipeline);
@@ -402,7 +501,12 @@ namespace renderer {
         vkCmdPushConstants(cmd, m_RasterPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(uint32_t), &maxTrianglesPerCluster);
         vkCmdDispatchIndirect(cmd, m_DispatchArgsBuffer.Handle(), 0);
 
-        // The rasterization dispatch's atomic writes must be visible to a later compute read
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_OpaqueRasterPipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_OpaqueRasterPipelineLayout, 0, 1, &m_OpaqueRasterDescriptorSet, 0, nullptr);
+        vkCmdPushConstants(cmd, m_OpaqueRasterPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(uint32_t), &maxTrianglesPerCluster);
+        vkCmdDispatchIndirect(cmd, m_DispatchArgsOpaqueBuffer.Handle(), 0);
+
+        // Both rasterization dispatches' atomic writes must be visible to a later compute read
         // (renderer::ClusterResolvePass).
         VkMemoryBarrier2 outputBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
         outputBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;

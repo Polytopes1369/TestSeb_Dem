@@ -58,6 +58,12 @@ namespace geometry {
         // on the caller's struct having already been zero-initialized. `paddedSizeBytes` must be a
         // multiple of kPageSizeBytes and >= dataSizeBytes.
         bool WriteZeroPaddedSection(HANDLE fileHandle, const void* data, size_t dataSizeBytes, size_t paddedSizeBytes) {
+            if (paddedSizeBytes == 0) {
+                // A genuinely empty section (e.g. zero fallback meshes or zero surface-cache cards)
+                // contributes no bytes at all -- VirtualAlloc(size=0) fails on Windows, so this must
+                // be handled explicitly rather than falling into the allocation below.
+                return true;
+            }
             AlignedPageBuffer scratch(paddedSizeBytes);
             if (!scratch.IsValid()) {
                 LOG_ERROR(std::format(
@@ -112,6 +118,8 @@ namespace geometry {
         std::vector<ClusterIndexEntry>& indexEntries,
         const std::vector<DAGNodeEntry>& dagEntries,
         const std::vector<ClusterData>& clusterData,
+        std::vector<FallbackMeshData>& fallbackMeshes,
+        const std::vector<SurfaceCacheCardEntry>& cardEntries,
         uint32_t entityCount) const {
 
         const uint32_t clusterCount = static_cast<uint32_t>(indexEntries.size());
@@ -132,7 +140,34 @@ namespace geometry {
         const uint64_t dagTablePaddedSizeBytes = RoundUpToPage(dagTableSizeBytes);
 
         const uint64_t geometryDataBaseOffset = dagTableOffset + dagTablePaddedSizeBytes;
-        const uint64_t totalFileSizeBytes = geometryDataBaseOffset + static_cast<uint64_t>(clusterCount) * kPageSizeBytes;
+        const uint64_t geometryDataSectionSizeBytes = static_cast<uint64_t>(clusterCount) * kPageSizeBytes;
+
+        const uint32_t fallbackMeshCount = static_cast<uint32_t>(fallbackMeshes.size());
+        const uint64_t fallbackMeshTableOffset = geometryDataBaseOffset + geometryDataSectionSizeBytes;
+        const uint64_t fallbackMeshTableSizeBytes = static_cast<uint64_t>(fallbackMeshCount) * sizeof(FallbackMeshIndexEntry);
+        const uint64_t fallbackMeshTablePaddedSizeBytes = RoundUpToPage(fallbackMeshTableSizeBytes);
+
+        const uint64_t fallbackMeshDataBaseOffset = fallbackMeshTableOffset + fallbackMeshTablePaddedSizeBytes;
+
+        // Stamp each fallback mesh's absolute vertex/index blob offsets (concatenated, in order,
+        // NOT individually page-aligned -- see ClusterFormat.h's file header comment) and compute
+        // the total blob size up front.
+        uint64_t runningBlobOffset = fallbackMeshDataBaseOffset;
+        for (FallbackMeshData& fallback : fallbackMeshes) {
+            fallback.indexEntry.vertexDataOffset = runningBlobOffset;
+            runningBlobOffset += static_cast<uint64_t>(fallback.vertices.size()) * sizeof(FallbackVertex);
+            fallback.indexEntry.indexDataOffset = runningBlobOffset;
+            runningBlobOffset += static_cast<uint64_t>(fallback.indices.size()) * sizeof(uint32_t);
+        }
+        const uint64_t fallbackMeshDataSizeBytes = runningBlobOffset - fallbackMeshDataBaseOffset;
+        const uint64_t fallbackMeshDataPaddedSizeBytes = RoundUpToPage(fallbackMeshDataSizeBytes);
+
+        const uint32_t cardCount = static_cast<uint32_t>(cardEntries.size());
+        const uint64_t cardTableOffset = fallbackMeshDataBaseOffset + fallbackMeshDataPaddedSizeBytes;
+        const uint64_t cardTableSizeBytes = static_cast<uint64_t>(cardCount) * sizeof(SurfaceCacheCardEntry);
+        const uint64_t cardTablePaddedSizeBytes = RoundUpToPage(cardTableSizeBytes);
+
+        const uint64_t totalFileSizeBytes = cardTableOffset + cardTablePaddedSizeBytes;
 
         // Now that the layout is known, stamp each cluster's own page-aligned block address back
         // into its index entry -- the writer, not the caller, owns this decision (see the header
@@ -153,6 +188,13 @@ namespace geometry {
         header.dagTableSizeBytes = dagTableSizeBytes;
         header.geometryDataBaseOffset = geometryDataBaseOffset;
         header.totalFileSizeBytes = totalFileSizeBytes;
+        header.fallbackMeshTableOffset = fallbackMeshTableOffset;
+        header.fallbackMeshTableSizeBytes = fallbackMeshTableSizeBytes;
+        header.fallbackMeshDataBaseOffset = fallbackMeshDataBaseOffset;
+        header.fallbackMeshCount = fallbackMeshCount;
+        header.cardTableOffset = cardTableOffset;
+        header.cardTableSizeBytes = cardTableSizeBytes;
+        header.cardCount = cardCount;
 
         HANDLE fileHandle = CreateFileW(
             filePath.wstring().c_str(),
@@ -202,13 +244,54 @@ namespace geometry {
             }
         }
 
+        // --- Section 5: fallback-mesh index table, zero-padded to the next page boundary -------
+        std::vector<FallbackMeshIndexEntry> fallbackIndexEntries;
+        fallbackIndexEntries.reserve(fallbackMeshCount);
+        for (const FallbackMeshData& fallback : fallbackMeshes) {
+            fallbackIndexEntries.push_back(fallback.indexEntry);
+        }
+        if (!WriteZeroPaddedSection(fileHandle, fallbackIndexEntries.data(), static_cast<size_t>(fallbackMeshTableSizeBytes), static_cast<size_t>(fallbackMeshTablePaddedSizeBytes))) {
+            LOG_ERROR(std::format("[CacheFileManager] Failed writing the fallback-mesh index table to '{}' (GetLastError={})", filePath.string(), GetLastError()));
+            CloseHandle(fileHandle);
+            return false;
+        }
+
+        // --- Section 6: concatenated fallback-mesh vertex/index blobs, zero-padded to the next
+        // page boundary as a single write (entries are NOT individually page-aligned -- see
+        // ClusterFormat.h's file header comment) -----------------------------------------------
+        std::vector<uint8_t> fallbackDataBlob(static_cast<size_t>(fallbackMeshDataSizeBytes));
+        {
+            size_t writeOffset = 0;
+            for (const FallbackMeshData& fallback : fallbackMeshes) {
+                size_t vertexBytes = fallback.vertices.size() * sizeof(FallbackVertex);
+                std::memcpy(fallbackDataBlob.data() + writeOffset, fallback.vertices.data(), vertexBytes);
+                writeOffset += vertexBytes;
+                size_t indexBytes = fallback.indices.size() * sizeof(uint32_t);
+                std::memcpy(fallbackDataBlob.data() + writeOffset, fallback.indices.data(), indexBytes);
+                writeOffset += indexBytes;
+            }
+        }
+        if (!WriteZeroPaddedSection(fileHandle, fallbackDataBlob.data(), static_cast<size_t>(fallbackMeshDataSizeBytes), static_cast<size_t>(fallbackMeshDataPaddedSizeBytes))) {
+            LOG_ERROR(std::format("[CacheFileManager] Failed writing the fallback-mesh data blob to '{}' (GetLastError={})", filePath.string(), GetLastError()));
+            CloseHandle(fileHandle);
+            return false;
+        }
+
+        // --- Section 7: surface-cache card table, zero-padded to the next page boundary --------
+        if (!WriteZeroPaddedSection(fileHandle, cardEntries.data(), static_cast<size_t>(cardTableSizeBytes), static_cast<size_t>(cardTablePaddedSizeBytes))) {
+            LOG_ERROR(std::format("[CacheFileManager] Failed writing the surface-cache card table to '{}' (GetLastError={})", filePath.string(), GetLastError()));
+            CloseHandle(fileHandle);
+            return false;
+        }
+
         CloseHandle(fileHandle);
 
         LOG_INFO(std::format(
-            "[CacheFileManager] Wrote '{}': {} cluster(s) across {} entit(y/ies), {} bytes total "
-            "(index table {} B, DAG table {} B, geometry {} B).",
-            filePath.string(), clusterCount, entityCount, totalFileSizeBytes,
-            clusterIndexTablePaddedSizeBytes, dagTablePaddedSizeBytes, static_cast<uint64_t>(clusterCount) * kPageSizeBytes));
+            "[CacheFileManager] Wrote '{}': {} cluster(s) across {} entit(y/ies), {} fallback mesh(es), {} surface-cache card(s), {} bytes total "
+            "(index table {} B, DAG table {} B, geometry {} B, fallback table {} B, fallback data {} B, card table {} B).",
+            filePath.string(), clusterCount, entityCount, fallbackMeshCount, cardCount, totalFileSizeBytes,
+            clusterIndexTablePaddedSizeBytes, dagTablePaddedSizeBytes, static_cast<uint64_t>(clusterCount) * kPageSizeBytes,
+            fallbackMeshTablePaddedSizeBytes, fallbackMeshDataPaddedSizeBytes, cardTablePaddedSizeBytes));
         return true;
     }
 
@@ -285,6 +368,64 @@ namespace geometry {
     bool CacheFileManager::ReadDAGTable(
         const std::filesystem::path& filePath, const CacheFileHeader& header, std::vector<DAGNodeEntry>& outEntries) const {
         return ReadTable(filePath, header.dagTableOffset, header.clusterCount, outEntries);
+    }
+
+    bool CacheFileManager::ReadFallbackMeshTable(
+        const std::filesystem::path& filePath, const CacheFileHeader& header, std::vector<FallbackMeshIndexEntry>& outEntries) const {
+        return ReadTable(filePath, header.fallbackMeshTableOffset, header.fallbackMeshCount, outEntries);
+    }
+
+    bool CacheFileManager::ReadSurfaceCacheCardTable(
+        const std::filesystem::path& filePath, const CacheFileHeader& header, std::vector<SurfaceCacheCardEntry>& outEntries) const {
+        return ReadTable(filePath, header.cardTableOffset, header.cardCount, outEntries);
+    }
+
+    bool CacheFileManager::ReadFallbackMeshGeometry(
+        const std::filesystem::path& filePath, const FallbackMeshIndexEntry& entry,
+        std::vector<FallbackVertex>& outVertices, std::vector<uint32_t>& outIndices) const {
+
+        outVertices.assign(entry.vertexCount, FallbackVertex{});
+        outIndices.assign(static_cast<size_t>(entry.triangleCount) * 3u, 0u);
+        if (entry.vertexCount == 0 && entry.triangleCount == 0) {
+            return true;
+        }
+
+        HANDLE fileHandle = CreateFileW(
+            filePath.wstring().c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (fileHandle == INVALID_HANDLE_VALUE) {
+            LOG_ERROR(std::format(
+                "[CacheFileManager] CreateFileW (read fallback mesh) failed for '{}' (GetLastError={})", filePath.string(), GetLastError()));
+            return false;
+        }
+
+        bool ok = true;
+
+        if (entry.vertexCount > 0) {
+            LARGE_INTEGER vertexSeek{};
+            vertexSeek.QuadPart = static_cast<LONGLONG>(entry.vertexDataOffset);
+            DWORD vertexBytesToRead = static_cast<DWORD>(static_cast<uint64_t>(entry.vertexCount) * sizeof(FallbackVertex));
+            DWORD vertexBytesRead = 0;
+            ok = ok && SetFilePointerEx(fileHandle, vertexSeek, nullptr, FILE_BEGIN)
+                     && ReadFile(fileHandle, outVertices.data(), vertexBytesToRead, &vertexBytesRead, nullptr)
+                     && vertexBytesRead == vertexBytesToRead;
+        }
+
+        if (ok && entry.triangleCount > 0) {
+            LARGE_INTEGER indexSeek{};
+            indexSeek.QuadPart = static_cast<LONGLONG>(entry.indexDataOffset);
+            DWORD indexBytesToRead = static_cast<DWORD>(static_cast<uint64_t>(entry.triangleCount) * 3u * sizeof(uint32_t));
+            DWORD indexBytesRead = 0;
+            ok = ok && SetFilePointerEx(fileHandle, indexSeek, nullptr, FILE_BEGIN)
+                     && ReadFile(fileHandle, outIndices.data(), indexBytesToRead, &indexBytesRead, nullptr)
+                     && indexBytesRead == indexBytesToRead;
+        }
+
+        CloseHandle(fileHandle);
+
+        if (!ok) {
+            LOG_ERROR(std::format("[CacheFileManager] Failed reading fallback mesh geometry (entityID={}) from '{}'", entry.entityID, filePath.string()));
+        }
+        return ok;
     }
 
     std::future<bool> CacheFileManager::ReadClusterDataAsync(

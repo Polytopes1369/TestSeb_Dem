@@ -68,7 +68,7 @@ namespace {
             };
 
         std::vector<GroundTruthTriangle> groundTruth = ExtractGroundTruthTriangles(meshID, vertices, indices);
-        std::vector<geometry::MeshCluster> clusters = geometry::PartitionMeshIntoClusters(meshID, vertices, indices);
+        std::vector<geometry::MeshCluster> clusters = geometry::PartitionMeshIntoClusters(meshID, vertices, indices, geometry::kInvalidMaskTextureIndex);
 
         if (groundTruth.empty()) {
             return check(clusters.empty(), "expected zero clusters for a meshID with no matching triangles");

@@ -58,18 +58,47 @@ namespace geometry {
         // sphere convention already used elsewhere in the virtual geometry cache.
         maths::vec3 sphereCenter;
         float sphereRadius = 0.0f;
+
+        // True if this cluster should sample the entity's opacity-cutout mask at render time (see
+        // ProceduralMaskSampler.h) -- i.e. it is either 100% masked triangles, or a mix that fell at
+        // or below kMaskedClusterSplitThreshold and was conservatively folded into the masked path
+        // rather than fragmented. False means the cluster is provably 100% opaque: none of its
+        // triangles ever need a mask sample, so it is eligible for the zero-overhead opaque
+        // rasterizer path. Always false when PartitionMeshIntoClusters was called with
+        // kInvalidMaskTextureIndex (the owning entity has no cutout material at all).
+        bool isMasked = false;
     };
+
+    // Fraction of a cluster's triangles that must be classified "masked" (see IsTriangleMasked in
+    // the .cpp) before the cluster is split into a pure-opaque and a pure-masked MeshCluster rather
+    // than being folded whole into the masked path. Kept as a named, tunable constant rather than a
+    // magic literal since the right trade-off (extra cluster/culling overhead vs. wasted mask
+    // sampling on an opaque majority) is workload-dependent.
+    constexpr float kMaskedClusterSplitThreshold = 0.10f;
 
     // Partitions every triangle of `allIndices` whose vertices carry Vertex::meshID == targetMeshID
     // (the per-vertex ID the procedural PrimitiveGen compute shaders already stamp) into spatially
     // compact clusters, each respecting geometry::kMaxClusterVertices / geometry::kMaxClusterTriangles.
     //
+    // `maskTextureIndex` is the owning entity's resolved opacity-cutout mask slot (geometry::
+    // EntityMaterialTable::GetEntityMaterialProperties(...).maskTextureIndex), or
+    // geometry::kInvalidMaskTextureIndex if the entity has no cutout material at all -- in that case
+    // every triangle is trivially opaque and no opacity analysis runs (zero cost). Otherwise every
+    // triangle's UV footprint is tested against the procedural cutout mask (ProceduralMaskSampler.h,
+    // the exact same formula the GPU samples at render time) and any leaf cluster whose masked-
+    // triangle fraction exceeds kMaskedClusterSplitThreshold is split in two: a MeshCluster with
+    // isMasked == false containing only its opaque triangles, and one with isMasked == true
+    // containing the rest. A cluster at or below the threshold stays whole with isMasked == true if
+    // it has any masked triangle at all (conservative: not worth fragmenting a near-pure cluster).
+    //
     // Returns an empty vector if no triangle matches targetMeshID. The union of every returned
     // cluster's originalTriangleIndices is exactly the set [0, N) with no gaps and no duplicates,
-    // where N is the number of matching triangles.
+    // where N is the number of matching triangles (this holds even after an opacity split, since a
+    // split only ever partitions one cluster's triangles between its two replacements).
     std::vector<MeshCluster> PartitionMeshIntoClusters(
         uint32_t targetMeshID,
         const std::vector<renderer::Vertex>& allVertices,
-        const std::vector<uint32_t>& allIndices);
+        const std::vector<uint32_t>& allIndices,
+        uint32_t maskTextureIndex);
 
 }

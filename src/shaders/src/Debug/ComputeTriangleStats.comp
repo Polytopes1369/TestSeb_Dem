@@ -1,0 +1,125 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+
+// Debug-only (see renderer::debug::ClusterTriangleStatsPass's own class comment for why this
+// entire feature is compiled out of Release): sums up the triangle count actually drawn by the
+// hardware path (renderer::ClusterHardwareRasterPass, via the early + late indirect command
+// buffers renderer::ClusterOcclusionCullingPass already exposes) versus the software path
+// (renderer::ClusterSoftwareRasterPass, via the software cluster list), for the debug overlay's
+// HW/SW triangle-split readout. Deliberately a standalone pass reading only already-public,
+// stable accessors rather than adding a new binding inside
+// ClusterHZBOcclusionCull.comp/ClusterOcclusionCullingPass's own descriptor set, so this overlay
+// feature never has to touch that pass's internal layout.
+//
+// ClusterOcclusionCullingPass now maintains SIX worklists (opaque/masked x early-hw/late-hw/
+// software, see its own "Opaque / masked classification" class comment) -- this shader must sum
+// both the masked lists (bindings 0-5) AND their opaque counterparts (bindings 7-11) or the HW
+// triangle count would silently undercount by however much opaque (non-cutout) geometry the scene
+// contains, which for a diagnostic readout claiming to report "the" HW/SW split would be wrong,
+// not just incomplete.
+//
+// One shared pipeline, dispatched up to 6 times per frame with a different `pc.mode`:
+//   mode 0: sum indexCount/3 over the early MASKED hardware indirect command list.
+//   mode 1: sum indexCount/3 over the late MASKED hardware indirect command list.
+//   mode 2: sum indexCount/3 over every cluster listed in the MASKED software worklist
+//           (looked up via the shared cluster metadata buffer, since the software list itself only
+//           stores cluster slot indices, not triangle counts).
+//   mode 3: sum indexCount/3 over the early OPAQUE hardware indirect command list.
+//   mode 4: sum indexCount/3 over the late OPAQUE hardware indirect command list.
+//   mode 5: sum indexCount/3 over every cluster listed in the OPAQUE software worklist.
+// Each dispatch is sized generously (ceil(maxClusters/64) workgroups) and self-bounds against the
+// relevant list's own atomic count, exactly like every other fixed-size-dispatch-with-early-out
+// worklist consumer in this codebase (e.g. ClusterDAGScreenError.comp).
+
+#include "include/cluster_culling_common.glsl"
+
+struct DrawIndexedIndirectCommand {
+    uint indexCount;
+    uint instanceCount;
+    uint firstIndex;
+    uint vertexOffset;
+    uint firstInstance;
+};
+
+layout(std430, set = 0, binding = 0) readonly buffer EarlyIndirectCommandsSSBO {
+    DrawIndexedIndirectCommand commands[];
+} g_EarlyIndirectCommands;
+
+layout(std430, set = 0, binding = 1) readonly buffer EarlyDrawCountSSBO {
+    uint count;
+} g_EarlyDrawCount;
+
+layout(std430, set = 0, binding = 2) readonly buffer LateIndirectCommandsSSBO {
+    DrawIndexedIndirectCommand commands[];
+} g_LateIndirectCommands;
+
+layout(std430, set = 0, binding = 3) readonly buffer LateDrawCountSSBO {
+    uint count;
+} g_LateDrawCount;
+
+layout(std430, set = 0, binding = 4) readonly buffer ClusterCullMetadataSSBO {
+    ClusterCullMetadata clusters[];
+} g_Clusters;
+
+layout(std430, set = 0, binding = 5) readonly buffer SoftwareClusterListSSBO {
+    uint count;
+    uint clusterIndex[];
+} g_SoftwareClusterList;
+
+layout(std430, set = 0, binding = 6) buffer TriangleCountStatsSSBO {
+    uint hwTriangleCount;
+    uint swTriangleCount;
+} g_Stats;
+
+layout(std430, set = 0, binding = 7) readonly buffer EarlyIndirectCommandsOpaqueSSBO {
+    DrawIndexedIndirectCommand commands[];
+} g_EarlyIndirectCommandsOpaque;
+
+layout(std430, set = 0, binding = 8) readonly buffer EarlyDrawCountOpaqueSSBO {
+    uint count;
+} g_EarlyDrawCountOpaque;
+
+layout(std430, set = 0, binding = 9) readonly buffer LateIndirectCommandsOpaqueSSBO {
+    DrawIndexedIndirectCommand commands[];
+} g_LateIndirectCommandsOpaque;
+
+layout(std430, set = 0, binding = 10) readonly buffer LateDrawCountOpaqueSSBO {
+    uint count;
+} g_LateDrawCountOpaque;
+
+layout(std430, set = 0, binding = 11) readonly buffer SoftwareClusterListOpaqueSSBO {
+    uint count;
+    uint clusterIndex[];
+} g_SoftwareClusterListOpaque;
+
+layout(push_constant) uniform TriangleStatsPushConstants {
+    uint mode; // 0=early masked HW, 1=late masked HW, 2=masked SW, 3=early opaque HW, 4=late opaque HW, 5=opaque SW.
+} pc;
+
+layout(local_size_x = 64) in;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+
+    if (pc.mode == 0u) {
+        if (idx >= g_EarlyDrawCount.count) return;
+        atomicAdd(g_Stats.hwTriangleCount, g_EarlyIndirectCommands.commands[idx].indexCount / 3u);
+    } else if (pc.mode == 1u) {
+        if (idx >= g_LateDrawCount.count) return;
+        atomicAdd(g_Stats.hwTriangleCount, g_LateIndirectCommands.commands[idx].indexCount / 3u);
+    } else if (pc.mode == 2u) {
+        if (idx >= g_SoftwareClusterList.count) return;
+        uint clusterSlot = g_SoftwareClusterList.clusterIndex[idx];
+        atomicAdd(g_Stats.swTriangleCount, g_Clusters.clusters[clusterSlot].indexCount / 3u);
+    } else if (pc.mode == 3u) {
+        if (idx >= g_EarlyDrawCountOpaque.count) return;
+        atomicAdd(g_Stats.hwTriangleCount, g_EarlyIndirectCommandsOpaque.commands[idx].indexCount / 3u);
+    } else if (pc.mode == 4u) {
+        if (idx >= g_LateDrawCountOpaque.count) return;
+        atomicAdd(g_Stats.hwTriangleCount, g_LateIndirectCommandsOpaque.commands[idx].indexCount / 3u);
+    } else {
+        if (idx >= g_SoftwareClusterListOpaque.count) return;
+        uint clusterSlot = g_SoftwareClusterListOpaque.clusterIndex[idx];
+        atomicAdd(g_Stats.swTriangleCount, g_Clusters.clusters[clusterSlot].indexCount / 3u);
+    }
+}

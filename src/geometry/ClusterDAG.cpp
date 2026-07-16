@@ -66,7 +66,14 @@ namespace geometry {
         // reflect real, shared original-mesh topology after independent simplification (see the
         // file header). The weight is the number of shared locked positions, mirroring
         // ClusterGrouping's shared-global-vertex weight for level 0->1 pairing.
-        std::unordered_map<uint64_t, uint32_t> BuildLevelAdjacencyWeights(const std::vector<const SimplifiableMesh*>& levelMeshes) {
+        //
+        // `nodeIsMasked` is parallel to `levelMeshes` (the owning ClusterDAGNode::isMasked for each
+        // entry); a cross-classification pair (one opaque, one masked) is never recorded, exactly
+        // like ClusterGrouping::BuildClusterAdjacencyWeights at level 0->1 -- see that function's
+        // doc comment for why.
+        std::unordered_map<uint64_t, uint32_t> BuildLevelAdjacencyWeights(
+            const std::vector<const SimplifiableMesh*>& levelMeshes, const std::vector<bool>& nodeIsMasked) {
+
             std::unordered_map<PositionKey, std::vector<uint32_t>, PositionKeyHash> positionToMeshes;
             for (uint32_t mi = 0; mi < levelMeshes.size(); ++mi) {
                 const SimplifiableMesh& mesh = *levelMeshes[mi];
@@ -86,6 +93,9 @@ namespace geometry {
                 }
                 for (size_t a = 0; a < owners.size(); ++a) {
                     for (size_t b = a + 1; b < owners.size(); ++b) {
+                        if (nodeIsMasked[owners[a]] != nodeIsMasked[owners[b]]) {
+                            continue;
+                        }
                         weights[PackIndexPairKey(owners[a], owners[b])] += 1u;
                     }
                 }
@@ -118,6 +128,7 @@ namespace geometry {
             const std::vector<const SimplifiableMesh*>& levelMeshes) {
 
             std::vector<maths::vec3> positions;
+            std::vector<maths::vec2> uvs;
             std::unordered_map<PositionKey, uint32_t, PositionKeyHash> lockedPositionToMergedIndex;
             std::vector<uint32_t> triangles;
             uint32_t originalTriangleCount = 0;
@@ -143,12 +154,14 @@ namespace geometry {
                         else {
                             mergedIdx = static_cast<uint32_t>(positions.size());
                             positions.push_back(p);
+                            uvs.push_back(src.uvs[srcLocalIdx]);
                             lockedPositionToMergedIndex.emplace(key, mergedIdx);
                         }
                     }
                     else {
                         mergedIdx = static_cast<uint32_t>(positions.size());
                         positions.push_back(p);
+                        uvs.push_back(src.uvs[srcLocalIdx]);
                     }
                     srcToMerged[srcLocalIdx] = mergedIdx;
                     return mergedIdx;
@@ -182,6 +195,7 @@ namespace geometry {
             MergedLevelResult result;
             result.mesh.positions = std::move(positions);
             result.mesh.locked = std::move(locked);
+            result.mesh.uvs = std::move(uvs);
             result.mesh.triangles = std::move(triangles);
             result.originalTriangleCount = originalTriangleCount;
             return result;
@@ -254,6 +268,7 @@ namespace geometry {
                         if (srcToOut[v[s]] == kNone) {
                             srcToOut[v[s]] = static_cast<uint32_t>(out.positions.size());
                             out.positions.push_back(src.positions[v[s]]);
+                            out.uvs.push_back(src.uvs[v[s]]);
                         }
                     }
                     uint32_t a = srcToOut[v[0]], b = srcToOut[v[1]], c = srcToOut[v[2]];
@@ -315,6 +330,7 @@ namespace geometry {
             std::vector<uint32_t> remap(origVerts, kNone);
             std::vector<maths::vec3> newPos;
             std::vector<bool> newLocked;
+            std::vector<maths::vec2> newUVs;
             std::vector<uint32_t> newTris;
             newPos.reserve(maxVerts);
             newTris.reserve(keptTriangles.size());
@@ -324,12 +340,14 @@ namespace geometry {
                     remap[idx] = static_cast<uint32_t>(newPos.size());
                     newPos.push_back(mesh.positions[idx]);
                     newLocked.push_back(idx < mesh.locked.size() ? mesh.locked[idx] : false);
+                    newUVs.push_back(idx < mesh.uvs.size() ? mesh.uvs[idx] : maths::vec2{ 0.0f, 0.0f });
                 }
                 newTris.push_back(remap[idx]);
             }
 
             mesh.positions = std::move(newPos);
             mesh.locked = std::move(newLocked);
+            mesh.uvs = std::move(newUVs);
             mesh.triangles = std::move(newTris);
         }
 
@@ -369,6 +387,10 @@ namespace geometry {
             parentNode.childIndices = childDagIndices;
             parentNode.level        = level;
             parentNode.clusterError = nodeError;
+            // Every child is guaranteed the same isMasked classification (the adjacency-weight
+            // filters above never let an opaque and a masked node pair up), so any one child's
+            // value is authoritative for the new parent.
+            parentNode.isMasked     = dag.nodes[childDagIndices[0]].isMasked;
             UpdateNodeBounds(parentNode);
 
             uint32_t parentDagIndex = static_cast<uint32_t>(dag.nodes.size());
@@ -386,11 +408,12 @@ namespace geometry {
     ClusterDAG BuildClusterDAG(
         uint32_t targetMeshID,
         const std::vector<renderer::Vertex>& allVertices,
-        const std::vector<uint32_t>& allIndices) {
+        const std::vector<uint32_t>& allIndices,
+        uint32_t maskTextureIndex) {
 
         ClusterDAG dag;
 
-        std::vector<MeshCluster> leafClusters = PartitionMeshIntoClusters(targetMeshID, allVertices, allIndices);
+        std::vector<MeshCluster> leafClusters = PartitionMeshIntoClusters(targetMeshID, allVertices, allIndices, maskTextureIndex);
         if (leafClusters.empty()) {
             return dag;
         }
@@ -402,9 +425,12 @@ namespace geometry {
             ClusterDAGNode node;
             node.level = 0;
             node.clusterError = 0.0f;
+            node.isMasked = cluster.isMasked;
             node.mesh.positions.reserve(cluster.globalVertexIndices.size());
+            node.mesh.uvs.reserve(cluster.globalVertexIndices.size());
             for (uint32_t g : cluster.globalVertexIndices) {
                 node.mesh.positions.push_back(allVertices[g].position);
+                node.mesh.uvs.push_back(allVertices[g].uv);
             }
             node.mesh.locked.assign(cluster.globalVertexIndices.size(), false);
             node.mesh.triangles.assign(cluster.localTriangleIndices.begin(), cluster.localTriangleIndices.end());
@@ -445,12 +471,15 @@ namespace geometry {
             }
             else {
                 std::vector<const SimplifiableMesh*> levelMeshes;
+                std::vector<bool> levelIsMasked;
                 levelMeshes.reserve(currentLevel.size());
+                levelIsMasked.reserve(currentLevel.size());
                 for (uint32_t nodeIdx : currentLevel) {
                     levelMeshes.push_back(&dag.nodes[nodeIdx].mesh);
+                    levelIsMasked.push_back(dag.nodes[nodeIdx].isMasked);
                 }
 
-                std::unordered_map<uint64_t, uint32_t> weights = BuildLevelAdjacencyWeights(levelMeshes);
+                std::unordered_map<uint64_t, uint32_t> weights = BuildLevelAdjacencyWeights(levelMeshes, levelIsMasked);
                 std::vector<std::vector<uint32_t>> memberLists =
                     GreedyPairByWeight(static_cast<uint32_t>(currentLevel.size()), weights);
 
@@ -554,6 +583,15 @@ namespace geometry {
                         MarkFailure(outErrors, label + " violates strict LOD error monotonicity: parentError (" +
                             std::to_string(node.parentError) + ") is not strictly greater than clusterError (" +
                             std::to_string(node.clusterError) + ")");
+                    }
+
+                    // isMasked purity: a node's classification must match its parent's -- proves the
+                    // opaque/masked split's purity guarantee (never merging differently-classified
+                    // nodes, see BuildClusterAdjacencyWeights/BuildLevelAdjacencyWeights) actually
+                    // held for the DAG as constructed, not just for one merge in isolation.
+                    if (node.isMasked != parent.isMasked) {
+                        MarkFailure(outErrors, label + "'s isMasked (" + std::to_string(node.isMasked) +
+                            ") does not match its parent's isMasked (" + std::to_string(parent.isMasked) + ")");
                     }
 
                     // Mutual consistency: `node` must actually appear in its declared parent's childIndices.

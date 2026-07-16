@@ -30,6 +30,7 @@
 //      the barrier making GetOutputColorImage() visible to a later sampled read or blit.
 
 #include <cstdint>
+#include <vector>
 #include <vulkan/vulkan.h>
 #include <vk_mem_alloc.h>
 
@@ -67,10 +68,12 @@ namespace renderer {
         // are actually in those exact layouts every time RecordResolve() executes (see the class
         // comment's per-frame sequence), since a descriptor's declared imageLayout is fixed at
         // write time, not re-validated per use.
+        // `maskImageInfos` is renderer::ProceduralMaskGenerator::GetMaskImageInfos(), bound as
+        // binding 8 for ClusterResolve.comp's soft opacity-mask edge blending (mask_sampling.glsl).
         void Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue, VkExtent2D renderExtent,
             VkBuffer clusterMetadataBuffer, VkBuffer compressedPhysicalPoolBuffer,
             VkImageView hwClusterIDView, VkImageView hwTriangleIDView, VkImageView hwDepthView,
-            VkImageView swVisBufferAtomicView);
+            VkImageView swVisBufferAtomicView, const std::vector<VkDescriptorImageInfo>& maskImageInfos);
 
         void Shutdown();
 
@@ -79,7 +82,7 @@ namespace renderer {
         // VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT / VK_ACCESS_2_SHADER_SAMPLED_READ_BIT (a future
         // sampled read) and VK_PIPELINE_STAGE_2_COPY_BIT / VK_ACCESS_2_TRANSFER_READ_BIT (a future
         // blit to the swapchain) -- whichever the caller ends up using.
-        void RecordResolve(VkCommandBuffer cmd, const maths::mat4& viewProj);
+        void RecordResolve(VkCommandBuffer cmd, const maths::mat4& viewProj, uint32_t debugViewMode = 0);
 
         VkImage GetOutputColorImage() const { return m_OutputColorImage; }
         VkImageView GetOutputColorView() const { return m_OutputColorView; }

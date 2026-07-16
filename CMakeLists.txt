@@ -80,12 +80,31 @@ add_executable(CacheFileFormatTests
     src/geometry/ClusterGrouping.cpp
     src/geometry/MeshSimplifier.cpp
     src/geometry/ClusterDAG.cpp
+    src/geometry/CardGenerator.cpp
+    src/geometry/FallbackMeshBuilder.cpp
     src/io/CacheFileManager.cpp
     src/core/Logger.cpp
     tests/CacheFileFormatTests.cpp
 )
 target_include_directories(CacheFileFormatTests PRIVATE src ${Vulkan_INCLUDE_DIRS})
 add_test(NAME CacheFileFormatTests COMMAND CacheFileFormatTests)
+
+add_executable(MeshSDFTests
+    src/geometry/MeshSDFGenerator.cpp
+    tests/MeshSDFTests.cpp
+)
+target_include_directories(MeshSDFTests PRIVATE src)
+add_test(NAME MeshSDFTests COMMAND MeshSDFTests)
+
+add_executable(ClusterMaskSplitTests
+    src/geometry/ClusterPartitioner.cpp
+    src/geometry/ClusterGrouping.cpp
+    src/geometry/MeshSimplifier.cpp
+    src/geometry/ClusterDAG.cpp
+    tests/ClusterMaskSplitTests.cpp
+)
+target_include_directories(ClusterMaskSplitTests PRIVATE src)
+add_test(NAME ClusterMaskSplitTests COMMAND ClusterMaskSplitTests)
 
 # ==============================================================================
 # AUTOMATIZED SHADER COMPILATION & POST-BUILD COPY

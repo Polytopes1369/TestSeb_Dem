@@ -11,6 +11,74 @@
 #include <exception>
 #include <format>
 
+#ifndef NDEBUG
+struct DebugState {
+    uint32_t viewMode = 0;
+    bool disableOcclusionCulling = false;
+    uint32_t naniteSubMode = 1; // 1 to 7 for Nanite modes
+};
+static DebugState g_DebugState;
+
+static void KeyCallback(GLFWwindow* window, int key, int scancode, int action, int mods) {
+    if (action != GLFW_PRESS) return;
+
+    switch (key) {
+    case GLFW_KEY_KP_DIVIDE: // '/'
+        g_DebugState.viewMode = DEBUG_VIEW_NORMAL;
+        LOG_INFO("[Debug] View Mode: NORMAL");
+        break;
+    case GLFW_KEY_KP_MULTIPLY: // '*'
+        g_DebugState.viewMode = g_DebugState.naniteSubMode;
+        LOG_INFO(std::format("[Debug] View Mode: NANITE SUBMODE {}", g_DebugState.naniteSubMode));
+        // Cycle nanite sub-mode for next press
+        g_DebugState.naniteSubMode++;
+        if (g_DebugState.naniteSubMode > DEBUG_VIEW_NANITE_WPO) g_DebugState.naniteSubMode = DEBUG_VIEW_NANITE_TRIANGLES;
+        break;
+    case GLFW_KEY_KP_SUBTRACT: // '-'
+        g_DebugState.viewMode = DEBUG_VIEW_OVERDRAWS;
+        LOG_INFO("[Debug] View Mode: OVERDRAWS");
+        break;
+    case GLFW_KEY_KP_ADD: // '+'
+        g_DebugState.viewMode = DEBUG_VIEW_GLOBAL_SDF;
+        LOG_INFO("[Debug] View Mode: GLOBAL SDF");
+        break;
+    case GLFW_KEY_KP_7:
+        g_DebugState.viewMode = DEBUG_VIEW_DEPTH;
+        LOG_INFO("[Debug] View Mode: DEPTH");
+        break;
+    case GLFW_KEY_KP_8:
+        g_DebugState.viewMode = DEBUG_VIEW_NORMALS;
+        LOG_INFO("[Debug] View Mode: NORMALS");
+        break;
+    case GLFW_KEY_KP_9:
+        g_DebugState.viewMode = DEBUG_VIEW_MOTION_VECTORS;
+        LOG_INFO("[Debug] View Mode: MOTION VECTORS");
+        break;
+    case GLFW_KEY_KP_4:
+    case GLFW_KEY_KP_5:
+    case GLFW_KEY_KP_6:
+        g_DebugState.viewMode = DEBUG_VIEW_LUMEN;
+        LOG_INFO("[Debug] View Mode: LUMEN");
+        break;
+    case GLFW_KEY_KP_1:
+    case GLFW_KEY_KP_2:
+    case GLFW_KEY_KP_3:
+        g_DebugState.viewMode = DEBUG_VIEW_SPATIAL_PROBES;
+        LOG_INFO("[Debug] View Mode: SPATIAL PROBES");
+        break;
+    case GLFW_KEY_KP_0:
+        LOG_INFO("[Debug] System Stats: VRAM/RAM streaming OK. (Overlay placeholder)");
+        break;
+    case GLFW_KEY_KP_DECIMAL: // '.'
+        g_DebugState.disableOcclusionCulling = !g_DebugState.disableOcclusionCulling;
+        LOG_INFO(std::format("[Debug] Occlusion Culling: {}", g_DebugState.disableOcclusionCulling ? "DISABLED" : "ENABLED"));
+        break;
+    default:
+        break;
+    }
+}
+#endif
+
 int main() {
     LOG_INIT("demo_log.txt");
     LOG_INFO("Starting DemoScene Engine...");
@@ -29,6 +97,10 @@ int main() {
         glfwTerminate();
         return -1;
     }
+
+#ifndef NDEBUG
+    glfwSetKeyCallback(window, KeyCallback);
+#endif
 
     VulkanContext vkContext;
     vkContext.Init("DemoScene", window);
@@ -132,6 +204,11 @@ int main() {
             static_cast<float>(vkContext.GetSwapchainExtent().height);
         camera.Update(aspect);
 
+#ifndef NDEBUG
+        camera.SetDebugViewMode(g_DebugState.viewMode);
+        camera.SetDebugOcclusionCullingDisabled(g_DebugState.disableOcclusionCulling);
+#endif
+
         // --- DEBUG: dump the camera position and the resulting view/proj matrices on the
         // very first frame only, to rule out a degenerate/NaN transform hiding the sphere. ---
         static bool loggedFirstFrame = false;
@@ -204,7 +281,7 @@ int main() {
         vkBeginCommandBuffer(vkContext.GetCommandBuffer(), &beginInfo);
 
         clusterPipeline.RecordFrame(vkContext.GetCommandBuffer(), camera.GetPushConstants(),
-            camera.GetPosition(), vkContext.GetSwapchainImages()[imageIndex]);
+            camera.GetPosition(), static_cast<float>(glfwGetTime()), vkContext.GetSwapchainImages()[imageIndex]);
 
         vkEndCommandBuffer(vkContext.GetCommandBuffer());
 
