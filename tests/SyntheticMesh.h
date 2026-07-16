@@ -14,10 +14,11 @@
 
 namespace testutil {
 
-    // Appends a standard indexed UV-sphere (rings x segments quads, 2 triangles per quad) to
-    // outVertices/outIndices, offsetting new indices past whatever geometry is already present so
-    // multiple primitives can share one combined vertex/index buffer (mirroring how the engine
-    // packs every spawned entity into its shared procedural geometry SSBOs).
+    // Appends a standard indexed UV-sphere (rings x segments quads, 2 triangles per quad, except
+    // the pole rings -- see the index-generation loop below) to outVertices/outIndices, offsetting
+    // new indices past whatever geometry is already present so multiple primitives can share one
+    // combined vertex/index buffer (mirroring how the engine packs every spawned entity into its
+    // shared procedural geometry SSBOs).
     inline void GenerateUVSphere(uint32_t meshID, uint32_t rings, uint32_t segments, float radius, const maths::vec3& center,
         std::vector<renderer::Vertex>& outVertices, std::vector<uint32_t>& outIndices) {
 
@@ -56,8 +57,24 @@ namespace testutil {
                 uint32_t i2 = vertexOffset + (ring + 1u) * ringStride + seg + 1u;
                 uint32_t i3 = vertexOffset + ring * ringStride + seg + 1u;
 
-                outIndices.push_back(i0); outIndices.push_back(i1); outIndices.push_back(i2);
-                outIndices.push_back(i0); outIndices.push_back(i2); outIndices.push_back(i3);
+                // Ring 0 (phi = 0) and ring `rings` (phi = PI) are poles: every column of that
+                // ring collapses to the exact same position (sinPhi = 0), so a "quad" touching a
+                // pole ring only has 3 geometrically distinct corners, not 4. Splitting it into 2
+                // triangles the normal way always produces one legitimate triangle and one
+                // zero-area triangle whose two pole-ring corners (i0/i3 at the top pole, i1/i2 at
+                // the bottom pole) are numerically identical positions -- see the same bug class
+                // fixed for CONE/CAPSULE/CYLINDER/PYRAMID's own cap rings (VulkanContext.cpp's
+                // GenerateCone et al. and their geom_*.comp shaders).
+                if (ring == 0u) {
+                    // Top pole: i0 and i3 are both the pole vertex -- keep only the fan triangle.
+                    outIndices.push_back(i0); outIndices.push_back(i1); outIndices.push_back(i2);
+                } else if (ring == rings - 1u) {
+                    // Bottom pole: i1 and i2 are both the pole vertex -- keep only the fan triangle.
+                    outIndices.push_back(i0); outIndices.push_back(i2); outIndices.push_back(i3);
+                } else {
+                    outIndices.push_back(i0); outIndices.push_back(i1); outIndices.push_back(i2);
+                    outIndices.push_back(i0); outIndices.push_back(i2); outIndices.push_back(i3);
+                }
             }
         }
     }
