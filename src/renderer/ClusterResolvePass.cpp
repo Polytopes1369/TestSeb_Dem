@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "core/Logger.h"
+#include "renderer/MaterialParameterTable.h"
 #include "renderer/VulkanPipeline.h"
 
 namespace renderer {
@@ -90,10 +91,11 @@ namespace renderer {
         viewInfo.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
         VK_CHECK(vkCreateImageView(m_Device, &viewInfo, nullptr, &m_OutputColorView));
 
-        // --- Minimal GBuffer: normal/depth/albedo, same extent, same STORAGE|SAMPLED usage as the
-        // color image above (renderer::ScreenProbeGIPass samples all 3; only this shader ever
-        // writes them) minus COLOR_ATTACHMENT_BIT -- none of these 3 images is ever bound as a
-        // render attachment, unlike the color image above (see its own usage-flags comment). ---
+        // --- Minimal GBuffer: normal/depth/albedo/roughness-metallic, same extent, same
+        // STORAGE|SAMPLED usage as the color image above (renderer::ScreenProbeGIPass samples the
+        // first 3; only this shader ever writes any of them) minus COLOR_ATTACHMENT_BIT -- none of
+        // these 4 images is ever bound as a render attachment, unlike the color image above (see
+        // its own usage-flags comment). ---
         VkImageCreateInfo gbufferImageInfo = imageInfo;
         gbufferImageInfo.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
         gbufferImageInfo.format = kOutputNormalFormat;
@@ -102,6 +104,8 @@ namespace renderer {
         VK_CHECK(vmaCreateImage(allocator, &gbufferImageInfo, &imageAllocInfo, &m_OutputDepthImage, &m_OutputDepthAllocation, nullptr));
         gbufferImageInfo.format = kOutputAlbedoFormat;
         VK_CHECK(vmaCreateImage(allocator, &gbufferImageInfo, &imageAllocInfo, &m_OutputAlbedoImage, &m_OutputAlbedoAllocation, nullptr));
+        gbufferImageInfo.format = kOutputRoughnessMetallicFormat;
+        VK_CHECK(vmaCreateImage(allocator, &gbufferImageInfo, &imageAllocInfo, &m_OutputRoughnessMetallicImage, &m_OutputRoughnessMetallicAllocation, nullptr));
 
         viewInfo.image = m_OutputNormalImage;
         viewInfo.format = kOutputNormalFormat;
@@ -112,6 +116,9 @@ namespace renderer {
         viewInfo.image = m_OutputAlbedoImage;
         viewInfo.format = kOutputAlbedoFormat;
         VK_CHECK(vkCreateImageView(m_Device, &viewInfo, nullptr, &m_OutputAlbedoView));
+        viewInfo.image = m_OutputRoughnessMetallicImage;
+        viewInfo.format = kOutputRoughnessMetallicFormat;
+        VK_CHECK(vkCreateImageView(m_Device, &viewInfo, nullptr, &m_OutputRoughnessMetallicView));
 
         // --- One-time UNDEFINED -> GENERAL transition (mirrors HZBPass::Init /
         // ClusterSoftwareRasterPass::Init's own one-shot pattern) -- stays in GENERAL for its
@@ -129,7 +136,7 @@ namespace renderer {
             beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
             vkBeginCommandBuffer(cmd, &beginInfo);
 
-            VkImageMemoryBarrier2 barriers[4]{};
+            VkImageMemoryBarrier2 barriers[5]{};
             for (auto& barrier : barriers) {
                 barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
                 barrier.srcStageMask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
@@ -146,11 +153,25 @@ namespace renderer {
             barriers[1].image = m_OutputNormalImage;
             barriers[2].image = m_OutputDepthImage;
             barriers[3].image = m_OutputAlbedoImage;
+            barriers[4].image = m_OutputRoughnessMetallicImage;
 
             VkDependencyInfo depInfo{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-            depInfo.imageMemoryBarrierCount = 4;
+            depInfo.imageMemoryBarrierCount = 5;
             depInfo.pImageMemoryBarriers = barriers;
             vkCmdPipelineBarrier2(cmd, &depInfo);
+
+            // --- Material parameter table: a small, CPU-authored constexpr array (renderer::
+            // kMaterialParameterTable, renderer/MaterialParameterTable.h), not a per-frame value --
+            // filled once, here, in the same one-time command buffer as the image transitions above
+            // (no ordering dependency between them, so recording order doesn't matter). Well under
+            // vkCmdUpdateBuffer's 65536-byte limit (kMaxMaterials * sizeof(MaterialParameters) =
+            // 32 * 32 = 1024 bytes). No intra-command-buffer barrier is needed after this write --
+            // the vkQueueWaitIdle below fully orders it before any later-submitted command buffer's
+            // reads, exactly like ClusterRenderPipeline::Init()'s own one-time setup submit.
+            m_MaterialParamsBuffer.Create(allocator, sizeof(MaterialParameters) * kMaxMaterials,
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
+            vkCmdUpdateBuffer(cmd, m_MaterialParamsBuffer.Handle(), 0,
+                sizeof(MaterialParameters) * kMaxMaterials, kMaterialParameterTable.data());
 
             vkEndCommandBuffer(cmd);
 
@@ -186,10 +207,11 @@ namespace renderer {
             VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
             VMA_MEMORY_USAGE_GPU_ONLY);
 
-        // --- Descriptor set layout: 13 bindings, matching ClusterResolve.comp's set = 0 bindings
-        // 0..12 exactly (9..11 are the GBuffer outputs, 12 is the WPOGlobalsUBO this shader needs
-        // to reapply the same sway deformation the rasterizers already applied). ---
-        VkDescriptorSetLayoutBinding bindings[13]{};
+        // --- Descriptor set layout: 15 bindings, matching ClusterResolve.comp's set = 0 bindings
+        // 0..14 exactly (9..11 are the GBuffer outputs, 12 is the WPOGlobalsUBO this shader needs
+        // to reapply the same sway deformation the rasterizers already applied, 13 is the material
+        // parameter table SSBO, 14 is the roughness/metallic GBuffer output). ---
+        VkDescriptorSetLayoutBinding bindings[15]{};
         bindings[0] = { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };         // ClusterCullMetadataSSBO
         bindings[1] = { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };         // CompressedClusterPoolSSBO
         bindings[2] = { 2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };          // g_HWClusterIDImage (r32ui)
@@ -203,15 +225,17 @@ namespace renderer {
         bindings[10] = { 10, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };        // g_OutputDepth (r32f)
         bindings[11] = { 11, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };        // g_OutputAlbedo (rgba8)
         bindings[12] = { 12, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };       // WPOGlobalsUBO
+        bindings[13] = { 13, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };       // MaterialParamsSSBO
+        bindings[14] = { 14, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };        // g_OutputRoughnessMetallic (rg8)
 
         VkDescriptorSetLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-        layoutInfo.bindingCount = 13;
+        layoutInfo.bindingCount = 15;
         layoutInfo.pBindings = bindings;
         VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &layoutInfo, nullptr, &m_SetLayout));
 
         VkDescriptorPoolSize poolSizes[4]{};
-        poolSizes[0] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 };
-        poolSizes[1] = { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 7 };
+        poolSizes[0] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3 };
+        poolSizes[1] = { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 8 };
         poolSizes[2] = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1 + maskTextureCount };
         poolSizes[3] = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2 };
 
@@ -269,7 +293,17 @@ namespace renderer {
         // like the two raster passes already borrow it.
         VkDescriptorBufferInfo wpoGlobalsInfo{ wpoGlobalsBuffer, 0, VK_WHOLE_SIZE };
 
-        VkWriteDescriptorSet writes[13]{};
+        // renderer::kMaterialParameterTable, already fully filled by the one-time command buffer
+        // above (m_MaterialParamsBuffer.Handle() is valid the moment Create() returns -- the fill
+        // itself is only ORDERED, not required to have already executed, by the time this VkBuffer
+        // handle is written into a descriptor).
+        VkDescriptorBufferInfo materialParamsInfo{ m_MaterialParamsBuffer.Handle(), 0, m_MaterialParamsBuffer.Size() };
+
+        VkDescriptorImageInfo outputRoughnessMetallicInfo{};
+        outputRoughnessMetallicInfo.imageView = m_OutputRoughnessMetallicView;
+        outputRoughnessMetallicInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+        VkWriteDescriptorSet writes[15]{};
         writes[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_DescriptorSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &clusterMetadataInfo, nullptr };
         writes[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_DescriptorSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &compressedPoolInfo, nullptr };
         writes[2] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_DescriptorSet, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &hwClusterIDInfo, nullptr, nullptr };
@@ -283,7 +317,9 @@ namespace renderer {
         writes[10] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_DescriptorSet, 10, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &outputDepthInfo, nullptr, nullptr };
         writes[11] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_DescriptorSet, 11, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &outputAlbedoInfo, nullptr, nullptr };
         writes[12] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_DescriptorSet, 12, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &wpoGlobalsInfo, nullptr };
-        vkUpdateDescriptorSets(m_Device, 13, writes, 0, nullptr);
+        writes[13] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_DescriptorSet, 13, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &materialParamsInfo, nullptr };
+        writes[14] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_DescriptorSet, 14, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &outputRoughnessMetallicInfo, nullptr, nullptr };
+        vkUpdateDescriptorSets(m_Device, 15, writes, 0, nullptr);
 
         // --- Pipeline layout + pipeline ---
         VkPipelineLayoutCreateInfo pipelineLayoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
@@ -321,6 +357,7 @@ namespace renderer {
             if (m_OutputNormalView != VK_NULL_HANDLE) vkDestroyImageView(m_Device, m_OutputNormalView, nullptr);
             if (m_OutputDepthView != VK_NULL_HANDLE) vkDestroyImageView(m_Device, m_OutputDepthView, nullptr);
             if (m_OutputAlbedoView != VK_NULL_HANDLE) vkDestroyImageView(m_Device, m_OutputAlbedoView, nullptr);
+            if (m_OutputRoughnessMetallicView != VK_NULL_HANDLE) vkDestroyImageView(m_Device, m_OutputRoughnessMetallicView, nullptr);
         }
 
         m_Pipeline = VK_NULL_HANDLE;
@@ -333,8 +370,10 @@ namespace renderer {
         m_OutputNormalView = VK_NULL_HANDLE;
         m_OutputDepthView = VK_NULL_HANDLE;
         m_OutputAlbedoView = VK_NULL_HANDLE;
+        m_OutputRoughnessMetallicView = VK_NULL_HANDLE;
 
         m_ViewParamsBuffer.Destroy();
+        m_MaterialParamsBuffer.Destroy();
 
         // vmaDestroyImage tolerates VK_NULL_HANDLE for both handle arguments (no-op), matching
         // GpuBuffer::Destroy()'s own null-safe convention.
@@ -343,6 +382,7 @@ namespace renderer {
             vmaDestroyImage(m_Allocator, m_OutputNormalImage, m_OutputNormalAllocation);
             vmaDestroyImage(m_Allocator, m_OutputDepthImage, m_OutputDepthAllocation);
             vmaDestroyImage(m_Allocator, m_OutputAlbedoImage, m_OutputAlbedoAllocation);
+            vmaDestroyImage(m_Allocator, m_OutputRoughnessMetallicImage, m_OutputRoughnessMetallicAllocation);
         }
         m_OutputColorImage = VK_NULL_HANDLE;
         m_OutputColorAllocation = VK_NULL_HANDLE;
@@ -352,6 +392,8 @@ namespace renderer {
         m_OutputDepthAllocation = VK_NULL_HANDLE;
         m_OutputAlbedoImage = VK_NULL_HANDLE;
         m_OutputAlbedoAllocation = VK_NULL_HANDLE;
+        m_OutputRoughnessMetallicImage = VK_NULL_HANDLE;
+        m_OutputRoughnessMetallicAllocation = VK_NULL_HANDLE;
 
         m_RenderExtent = { 0, 0 };
         m_Allocator = VK_NULL_HANDLE;

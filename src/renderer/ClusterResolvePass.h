@@ -59,7 +59,13 @@ namespace renderer {
         // (motion vectors) / 14 (spatial probes).
         static constexpr VkFormat kOutputNormalFormat = VK_FORMAT_R16G16_SFLOAT;   // Octahedral-encoded world-space normal (include/octahedral.glsl).
         static constexpr VkFormat kOutputDepthFormat = VK_FORMAT_R32_SFLOAT;       // The winning (hw-vs-sw arbitrated) NDC depth -- not stored anywhere else.
-        static constexpr VkFormat kOutputAlbedoFormat = VK_FORMAT_R8G8B8A8_UNORM;  // The procedural material's base color, pre-lighting.
+        static constexpr VkFormat kOutputAlbedoFormat = VK_FORMAT_R8G8B8A8_UNORM;  // The real per-material PBR base color (renderer::MaterialParameterTable), pre-lighting.
+        // R=roughness, G=metallic, sampled from renderer::MaterialParameterTable (materialID looked
+        // up via ClusterCullMetadata) -- kept as its OWN image rather than reusing the albedo
+        // image's alpha channel (that channel is written but never read by any consumer today; a
+        // future reader should not have to guess whether "1.0" there means "opaque" or "unset").
+        // This is the channel Phase 2 (Lumen-style reflections) will read.
+        static constexpr VkFormat kOutputRoughnessMetallicFormat = VK_FORMAT_R8G8_UNORM;
 
         // Allocates the output color image (sized to `renderExtent`, transitioned once to
         // VK_IMAGE_LAYOUT_GENERAL via a blocking one-time submit, mirroring HZBPass::Init /
@@ -107,6 +113,7 @@ namespace renderer {
         VkImageView GetOutputNormalView() const { return m_OutputNormalView; }
         VkImageView GetOutputDepthView() const { return m_OutputDepthView; }
         VkImageView GetOutputAlbedoView() const { return m_OutputAlbedoView; }
+        VkImageView GetOutputRoughnessMetallicView() const { return m_OutputRoughnessMetallicView; }
 
     private:
         static constexpr uint32_t kWorkgroupSize = 8; // Matches ClusterResolve.comp's local_size_x/y.
@@ -127,10 +134,18 @@ namespace renderer {
         VkImage m_OutputAlbedoImage = VK_NULL_HANDLE;
         VmaAllocation m_OutputAlbedoAllocation = VK_NULL_HANDLE;
         VkImageView m_OutputAlbedoView = VK_NULL_HANDLE;
+        VkImage m_OutputRoughnessMetallicImage = VK_NULL_HANDLE;
+        VmaAllocation m_OutputRoughnessMetallicAllocation = VK_NULL_HANDLE;
+        VkImageView m_OutputRoughnessMetallicView = VK_NULL_HANDLE;
 
         VkSampler m_DepthSampler = VK_NULL_HANDLE; // Nearest filtering, matching HZBPass's own depth-sampling convention.
 
-        GpuBuffer m_ViewParamsBuffer; // ResolveViewParamsUBO, std140, GPU_ONLY.
+        GpuBuffer m_ViewParamsBuffer;     // ResolveViewParamsUBO, std140, GPU_ONLY.
+        // renderer::MaterialParameters[kMaxMaterials] (renderer::kMaterialParameterTable), filled
+        // once at Init() time via vkCmdUpdateBuffer -- a CPU-authored constexpr table, not a
+        // per-frame upload (unlike m_ViewParamsBuffer above), so Init() needs no extra caller-
+        // supplied parameter for it.
+        GpuBuffer m_MaterialParamsBuffer;
 
         VkDescriptorSetLayout m_SetLayout = VK_NULL_HANDLE;
         VkDescriptorPool m_DescriptorPool = VK_NULL_HANDLE;

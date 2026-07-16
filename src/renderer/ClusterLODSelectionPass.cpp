@@ -105,6 +105,7 @@ namespace renderer {
             lodNode.maskTextureIndex = entry.maskTextureIndex;
             lodNode.maxWPOAmplitude = entry.maxWPOAmplitude;
             lodNode.entityID = entry.entityID;
+            lodNode.materialID = entry.materialID;
         }
 
         // =====================================================================================

@@ -61,7 +61,7 @@ namespace geometry {
     // -----------------------------------------------------------------------------------------
     struct CacheFileHeader {
         static constexpr uint32_t kMagic = 0x4F45474Cu;   // "LGEO" little-endian ("Local GEOmetry cache")
-        static constexpr uint32_t kVersion = 5u;           // Bumped: added the surface-cache card table section (SurfaceCacheCardEntry).
+        static constexpr uint32_t kVersion = 6u;           // Bumped: added ClusterIndexEntry::materialID.
 
         uint32_t magic;
         uint32_t version;
@@ -172,8 +172,18 @@ namespace geometry {
         // call site.
         float maxWPOAmplitude;
         uint32_t maskTextureIndex;
+
+        // The owning entity's core::EntityData::materialID, copied verbatim (same "stamped
+        // uniformly across every DAG level of a given entity" contract as maxWPOAmplitude/
+        // maskTextureIndex above) -- see VirtualGeometryCacheTest.cpp's BuildIndexEntry call site.
+        // Indexes renderer::MaterialParameterTable's runtime PBR parameter lookup (baseColor/
+        // roughness/metallic/emissive), consumed by ClusterResolve.comp. Unlike maskTextureIndex
+        // (per-cluster, purity-enforced through ClusterDAG because opacity can vary by triangle),
+        // materialID is per-ENTITY: every cluster of a given entity carries the same value, exactly
+        // like entityID itself, so no DAG purity enforcement is needed for this field.
+        uint32_t materialID;
     };
-    static_assert(sizeof(ClusterIndexEntry) == 80, "ClusterIndexEntry size drifted from the expected 80 bytes");
+    static_assert(sizeof(ClusterIndexEntry) == 84, "ClusterIndexEntry size drifted from the expected 84 bytes");
 
     // Sentinel for ClusterIndexEntry::maskTextureIndex (and its GPU-side mirrors) meaning "this
     // cluster is fully opaque -- do not sample the cutout mask array at all."

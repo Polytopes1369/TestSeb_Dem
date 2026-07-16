@@ -68,12 +68,14 @@ namespace renderer {
         // geometry::ClusterIndexEntry::entityID -- the owning entity's meshID, copied verbatim.
         // Used by ClusterResolve.comp's DEBUG_VIEW_NANITE_INSTANCES hash-color visualization.
         uint32_t entityID = 0;
-        // Explicit trailing padding: adding the 4 bytes above makes the raw struct size 92, which
-        // is NOT a multiple of 16 -- GLSL's std430 rules round an array's element stride up to the
-        // struct's base alignment (16, from the vec3 members) regardless, silently making the real
-        // GPU stride 96 whether or not this pad field exists. Declaring it explicitly keeps the
-        // CPU-side struct's sizeof() honest about the stride the GPU actually uses.
-        float _padTrailing[1] = { 0.0f };
+        // geometry::ClusterIndexEntry::materialID, copied verbatim (same path as entityID above,
+        // via LODNodeMetadata -- see ClusterLODSelectionPass.h). Indexes ClusterResolve.comp's real
+        // PBR material parameter lookup (baseColor/roughness/metallic/emissive), replacing the old
+        // clusterID-hashed procedural color. Occupies what used to be this struct's trailing
+        // padding float -- same 96-byte std430 stride, no size change (see the removed field's own
+        // former comment: the struct's base alignment already forced a 96-byte GPU stride whether
+        // or not this slot was declared explicitly).
+        uint32_t materialID = 0;
     };
     static_assert(sizeof(ClusterCullMetadata) == 96,
         "ClusterCullMetadata must match ClusterCullMetadata in cluster_culling_common.glsl exactly (std430 layout)");

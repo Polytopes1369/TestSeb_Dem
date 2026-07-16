@@ -190,9 +190,11 @@ namespace geometry {
         // WriteCacheFile fills them in once it has computed the file's physical layout.
         // maxWPOAmplitude/maskTextureIndex come from the owning entity's GetEntityMaterialProperties
         // lookup (see the call site below) and are stamped identically into every DAG level of a
-        // given entity, exactly like entityID itself.
+        // given entity, exactly like entityID itself. materialID is the raw core::EntityData::
+        // materialID the caller looked maxWPOAmplitude/maskTextureIndex up with -- stamped verbatim
+        // (no further resolution needed here), same "identical across every DAG level" contract.
         ClusterIndexEntry BuildIndexEntry(uint32_t globalClusterID, uint32_t entityID, const ClusterDAGNode& node,
-            float maxWPOAmplitude, uint32_t maskTextureIndex) {
+            float maxWPOAmplitude, uint32_t maskTextureIndex, uint32_t materialID) {
             // The cone must bound each triangle's flat FACE normal -- what IsClusterBackFacing
             // (cluster_culling_tests.glsl) actually tests against -- not smoothed per-vertex
             // normals. Vertex normals average together neighboring face normals, which narrows
@@ -243,6 +245,7 @@ namespace geometry {
             entry.coneCutoff = static_cast<int8_t>(std::lround(coneCutoff * 127.0f));
             entry.maxWPOAmplitude = maxWPOAmplitude;
             entry.maskTextureIndex = maskTextureIndex;
+            entry.materialID = materialID;
             return entry;
         }
 
@@ -458,7 +461,8 @@ namespace geometry {
                 // cutout material, which is exactly what lets the (Part 2) opaque rasterizer path
                 // route it with zero mask-sampling overhead.
                 indexEntries.push_back(BuildIndexEntry(globalID, meshID, node, materialProps.maxWPOAmplitude,
-                    node.isMasked ? materialProps.maskTextureIndex : kInvalidMaskTextureIndex));
+                    node.isMasked ? materialProps.maskTextureIndex : kInvalidMaskTextureIndex,
+                    entityData[entityIdx].materialID));
 
                 DAGNodeEntry dagEntry{};
                 dagEntry.clusterID = globalID;

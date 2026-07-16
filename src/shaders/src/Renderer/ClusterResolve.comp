@@ -32,12 +32,13 @@
 // this pass ever needing to store barycentrics itself.
 //
 // --- Step 3: evaluate the material ---
-// This codebase has no texture/material-binding system yet (no sampler2D material atlas, no
-// per-cluster material ID) -- decoded UVs are computed and available for that future integration,
-// but the actual shading here reuses draw.frag's own procedural approach (hash the identifying ID
-// to a stable hue, Lambertian-shade with the reconstructed normal) via procedural_material.glsl,
-// so this pass produces a genuinely complete, visually verifiable image today rather than a
-// stubbed placeholder.
+// Real PBR material parameters (baseColor/roughness/metallic/emissive), looked up from
+// g_MaterialParams (material_params.glsl) by cluster.materialID -- see
+// renderer::MaterialParameterTable.h for the CPU-authored table this SSBO is filled from once at
+// renderer::ClusterResolvePass::Init(). materialID is per-ENTITY (every cluster of a given entity
+// shares the same value, exactly like entityID), not per-triangle -- there is still no texture
+// atlas / UV-mapped material sampling (decoded UVs remain used only for the cutout-mask edge
+// feathering below); Lambertian shading with the reconstructed normal, same as before.
 
 #include "include/cluster_culling_common.glsl"
 
@@ -49,6 +50,7 @@
 #include "include/procedural_material.glsl"
 #include "include/octahedral.glsl"
 #include "include/wpo_deformation.glsl"
+#include "include/material_params.glsl"
 
 #define MASK_ARRAY_SET 0
 #define MASK_ARRAY_BINDING 8
@@ -92,6 +94,17 @@ layout(std140, set = 0, binding = 12) uniform WPOGlobalsUBO {
     float _pad1;
     float _pad2;
 } g_WPOGlobals;
+
+// renderer::kMaterialParameterTable (renderer/MaterialParameterTable.h), filled once at
+// renderer::ClusterResolvePass::Init() -- see material_params.glsl's own comment.
+layout(std430, set = 0, binding = 13) readonly buffer MaterialParamsSSBO {
+    MaterialParams params[];
+} g_MaterialParams;
+
+// R=roughness, G=metallic (renderer::ClusterResolvePass's own comment on why this is a separate
+// image from g_OutputAlbedo rather than reusing that image's unused alpha channel). This is the
+// channel a future Lumen-style reflection pass reads.
+layout(rg8, set = 0, binding = 14) uniform writeonly image2D g_OutputRoughnessMetallic;
 
 #ifdef _DEBUG
 layout(push_constant) uniform DebugPC {
@@ -196,6 +209,7 @@ void main() {
     float gbufferDepth = 0.0;
     vec3 gbufferNormal = vec3(0.0, 1.0, 0.0);
     vec3 gbufferAlbedo = vec3(0.0);
+    vec2 gbufferRoughnessMetallic = vec2(0.0, 0.0);
 
     if (hasAnyData) {
         // --- Step 2: re-fetch the winning triangle's 3 vertices and reconstruct barycentrics ---
@@ -270,8 +284,7 @@ void main() {
         vec3 normal = normalize(pw0 * n0 + pw1 * n1 + pw2 * n2);
         vec2 uv = pw0 * uv0 + pw1 * uv1 + pw2 * uv2;
 
-        // --- Step 3: procedural material evaluation (see the class comment for why no texture
-        // sampling happens here yet) ---
+        // --- Step 3: material evaluation (see the class comment above) ---
         vec3 lightDir = normalize(vec3(0.5, 1.0, 0.5));
         float diff = max(dot(normal, lightDir), 0.0);
 
@@ -287,15 +300,22 @@ void main() {
         // clusterID has no such instability: it is fixed at cache-build time and never reassigned.
         uint hashed = HashID(cluster.clusterID);
         float hue = float(hashed) / 4294967295.0;
-        vec3 albedo = HsvToRgb(vec3(hue, 0.65, 0.85));
-        finalColor = albedo * 0.15 + albedo * diff;
+
+        // Real PBR material lookup (see this file's Step 3 class comment) -- clamped against
+        // MATERIAL_TABLE_SIZE (material_params.glsl) so an out-of-range materialID safely falls
+        // back to the table's last slot instead of indexing past g_MaterialParams' real allocation.
+        uint materialSlot = min(cluster.materialID, MATERIAL_TABLE_SIZE - 1u);
+        MaterialParams mat = g_MaterialParams.params[materialSlot];
+        vec3 albedo = mat.baseColor;
+        finalColor = albedo * 0.15 + albedo * diff + mat.emissive;
 
         // GBuffer capture (renderer::ClusterResolvePass's new outputs -- see this file's own
         // binding comment): the same winning (hw-vs-sw arbitrated) depth already used to pick
-        // clusterSlotIndex/triangleOrdinal above, plus the reconstructed normal/albedo.
+        // clusterSlotIndex/triangleOrdinal above, plus the reconstructed normal/albedo/material.
         gbufferDepth = hwWins ? hwDepth : swDepth;
         gbufferNormal = normal;
         gbufferAlbedo = albedo;
+        gbufferRoughnessMetallic = vec2(mat.roughness, mat.metallic);
 
         // Opacity-mask soft edge feathering: the hard cutout already happened upstream
         // (ClusterRaster.frag's discard / ClusterSoftwareRaster.comp's skipped atomic write), so
@@ -335,11 +355,12 @@ void main() {
             vec3 hot = vec3(1.0, 0.0, 0.0);
             finalColor = (density < 0.5) ? mix(cold, mid, density * 2.0) : mix(mid, hot, (density - 0.5) * 2.0);
         } else if (pc.viewMode == 5) { // DEBUG_VIEW_NANITE_SHADING_BINS
-            // Hash-color by cluster.maskTextureIndex -- the closest existing real analog to a
-            // material/shading bin in this codebase, which has no texture/material-binding system
-            // yet (see this file's own class comment); every opaque (0xFFFFFFFF) cluster shares one
-            // bin, every distinct mask texture index gets its own.
-            uint hashedBin = HashID(cluster.maskTextureIndex);
+            // Hash-color by cluster.materialID -- every cluster sharing a material shares a color,
+            // visualizing the actual grouping a future shading-bin classification pass (sorting
+            // VisBuffer pixels by material for warp-coherent shading -- not yet implemented, see
+            // this file's own class comment) would bin together. Distinct from
+            // DEBUG_VIEW_NANITE_CLUSTERS (per-cluster) and DEBUG_VIEW_NANITE_INSTANCES (per-entity).
+            uint hashedBin = HashID(cluster.materialID);
             finalColor = HsvToRgb(vec3(float(hashedBin) / 4294967295.0, 0.8, 0.8));
         } else if (pc.viewMode == 6) { // DEBUG_VIEW_NANITE_RASTER_BINS
             // Hash-color by a bucketed clusterSlotIndex -- visualizes rasterization submission
@@ -421,6 +442,7 @@ void main() {
     imageStore(g_OutputNormal, pixel, vec4(OctEncode(gbufferNormal), 0.0, 0.0));
     imageStore(g_OutputDepth, pixel, vec4(gbufferDepth, 0.0, 0.0, 0.0));
     imageStore(g_OutputAlbedo, pixel, vec4(gbufferAlbedo, 1.0));
+    imageStore(g_OutputRoughnessMetallic, pixel, vec4(gbufferRoughnessMetallic, 0.0, 0.0));
 
 #ifdef _DEBUG
     ivec2 uiPixel = pixel / 2;
