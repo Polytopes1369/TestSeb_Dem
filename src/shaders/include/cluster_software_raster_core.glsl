@@ -35,6 +35,14 @@ void RasterizeClusterTriangle(ClusterCullMetadata cluster, uint clusterSlotIndex
     vec3 p1World = DecodeClusterPosition(pageByteBase, i1, cluster.boundsMin, cluster.boundsMax);
     vec3 p2World = DecodeClusterPosition(pageByteBase, i2, cluster.boundsMin, cluster.boundsMax);
 
+    // Apply entity self-rotation
+    EntityData ed = entityData[cluster.entityID];
+    EntityTransform xform = entityTransforms[ed.meshID];
+    mat3 rotation = mat3(xform.rotation);
+    p0World = xform.center + rotation * (p0World - xform.center);
+    p1World = xform.center + rotation * (p1World - xform.center);
+    p2World = xform.center + rotation * (p2World - xform.center);
+
 #if HAS_MASK_SUPPORT
     // Only decoded when this cluster is actually masked -- sparing the opaque case (impossible in
     // this variant's own dispatch, but a masked-variant cluster can still be fully opaque) a

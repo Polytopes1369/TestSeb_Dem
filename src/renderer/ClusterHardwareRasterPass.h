@@ -91,7 +91,8 @@ namespace renderer {
         // attachment-compatible with the render targets RecordDraw() will be called against.
         void Init(VkDevice device, VkBuffer clusterMetadataBuffer, VkBuffer compressedPhysicalPoolBuffer,
             VkBuffer wpoGlobalsBuffer, const std::vector<VkDescriptorImageInfo>& maskImageInfos,
-            const std::array<VkFormat, 2>& visBufferColorFormats, VkFormat depthFormat);
+            const std::array<VkFormat, 2>& visBufferColorFormats, VkFormat depthFormat,
+            VkBuffer entityTransformBuffer, VkBuffer entityDataBuffer);
 
         void Shutdown();
 

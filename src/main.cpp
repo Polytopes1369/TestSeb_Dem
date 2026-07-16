@@ -188,6 +188,8 @@ int main() {
     pipelineInfo.depthImageView = vkContext.GetDepthImageView();
     pipelineInfo.depthFormat = vkContext.GetDepthFormat();
     pipelineInfo.cacheFilePath = "scene.cache";
+    pipelineInfo.entityTransformBuffer = vkContext.GetEntityTransformBuffer();
+    pipelineInfo.entityDataBuffer = vkContext.GetEntityBuffer();
 
     // Init is wrapped so an uncaught std::runtime_error (GpuBuffer allocation failure, missing
     // SPIR-V file, ...) surfaces as a logged message instead of a silent std::terminate -- the
@@ -236,10 +238,8 @@ int main() {
         static float azimuth = 0.0f;
         azimuth += 0.05f;
 
-        // NOTE: UpdateEntityRotations() is no longer called -- the clustered pipeline renders the
-        // static geometry exactly as captured into scene.cache (per-entity self-rotation is not
-        // yet applied by ClusterRaster.vert / ClusterSoftwareRaster.comp; the camera orbit is the
-        // scene's only motion for now).
+        // Update entity rotations every frame so dynamic primitives spin
+        vkContext.UpdateEntityRotations(static_cast<float>(glfwGetTime()));
         // Orbit around 0,0,0 at a distance sized to keep the whole 7-primitive grid
         // (roughly a 6m x 6m footprint centered on the origin) in view: bounding radius from
         // the farthest grid corner (~4.3m) plus primitive half-extent (~0.8m) is ~5.1m, so a

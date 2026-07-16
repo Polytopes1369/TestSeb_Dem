@@ -116,6 +116,10 @@ namespace renderer {
 
         // The consolidated scene cache written at startup (geometry::RunVirtualGeometryCacheTest).
         std::filesystem::path cacheFilePath = "scene.cache";
+
+        // Entity transform and data buffers for dynamic primitive rotations
+        VkBuffer entityTransformBuffer = VK_NULL_HANDLE;
+        VkBuffer entityDataBuffer = VK_NULL_HANDLE;
     };
 
     class ClusterRenderPipeline {

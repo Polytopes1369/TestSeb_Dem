@@ -1653,7 +1653,8 @@ void VulkanContext::GeneratePyramid(
 void VulkanContext::GeneratePlane(
     float Length, float Width,
     uint32_t meshID, maths::vec2 slot,
-    uint32_t& runningVertexOffset, uint32_t& runningIndexOffset) {
+    uint32_t& runningVertexOffset, uint32_t& runningIndexOffset,
+    float worldOffsetY) {
   // Validate dimensions are positive and non-zero
   assert(Length > 0.0f);
   assert(Width > 0.0f);
@@ -1671,7 +1672,7 @@ void VulkanContext::GeneratePlane(
   params.vertexOffset = runningVertexOffset;
   params.indexOffset = runningIndexOffset;
   params.worldOffsetX = slot.x;
-  params.worldOffsetY = 0.0f;
+  params.worldOffsetY = worldOffsetY;
   params.worldOffsetZ = slot.y;
 
   uint32_t totalVerts = params.widthSegments * params.lengthSegments;
@@ -1983,6 +1984,15 @@ void VulkanContext::GenerateGeometry() {
     runningIndexOffset += 6u * params.sideSegs * ringCount;
   }
 
+  // -------------------------------------------------------------------------
+  // FLOOR PLANE (slot 12) — large 300m x 300m plane acting as the floor
+  // -------------------------------------------------------------------------
+  {
+    maths::vec2 slot = {0.0f, 0.0f}; // centered at the world origin
+    GeneratePlane(300.0f, 300.0f, m_EntityData[12].meshID, slot,
+                  runningVertexOffset, runningIndexOffset, -0.8f);
+  }
+
   m_TotalVertexCount = runningVertexOffset;
   m_TotalIndexCount = runningIndexOffset;
 
@@ -2005,7 +2015,7 @@ void VulkanContext::GenerateGeometry() {
         "Procedural geometry buffers overflowed -- see log for exact sizes.");
   }
 
-  LOG_INFO(std::format("[GenerateGeometry] All 12 primitives generated: "
+  LOG_INFO(std::format("[GenerateGeometry] All 13 primitives generated: "
                        "totalVertexCount={} totalIndexCount={} "
                        "(buffers hold {} verts / {} indices max)",
                        runningVertexOffset, runningIndexOffset,
@@ -2015,8 +2025,8 @@ void VulkanContext::GenerateGeometry() {
 
 void VulkanContext::UpdateEntityRotations(float timeSeconds) {
   // Distinct per-axis angular speeds (radians/sec) and a per-entity phase
-  // offset so the 9 primitives tumble out of sync with each other rather than
-  // spinning in lockstep.
+  // offset so the 12 primitives tumble out of sync with each other rather than
+  // spinning in lockstep. The floor plane remains completely static.
   constexpr float kSpeedX = 0.7f;
   constexpr float kSpeedY = 1.1f;
   constexpr float kSpeedZ = 0.5f;
@@ -2025,27 +2035,36 @@ void VulkanContext::UpdateEntityRotations(float timeSeconds) {
   std::array<EntityTransform, kEntityCount> transforms{};
 
   for (uint32_t meshID = 0; meshID < kEntityCount; ++meshID) {
-    float phase = static_cast<float>(meshID) * kPhaseStep;
-
-    maths::mat4 rotation = maths::mat4::RotateY(timeSeconds * kSpeedY + phase) *
-                           maths::mat4::RotateX(timeSeconds * kSpeedX + phase) *
-                           maths::mat4::RotateZ(timeSeconds * kSpeedZ + phase);
-
-    // Every primitive's baked world-space center coincides exactly with its
-    // grid slot position at Y=0: each geom_*.comp shader either generates a
-    // shape already centered on its own local origin
-    // (icosphere/box/sphere/torus/plane/torusKnot/chamferBox), or one that
-    // spans y=[0,height] recentered via worldOffsetY=-height/2 in
-    // GenerateGeometry() (cone/tube/cylinder/capsule/pyramid) — both cases land
-    // the shape's true vertical midpoint at Y=0.
-    maths::vec2 slot = GridSlot(static_cast<int>(meshID));
-
     EntityTransform &xform = transforms[meshID];
-    xform.rotation = rotation;
-    xform.centerX = slot.x;
-    xform.centerY = 0.0f;
-    xform.centerZ = slot.y;
-    xform._pad0 = 0.0f;
+    if (meshID == 12) {
+      // Floor plane: static at Y = -0.8f
+      xform.rotation = maths::mat4{};
+      xform.centerX = 0.0f;
+      xform.centerY = -0.8f;
+      xform.centerZ = 0.0f;
+      xform._pad0 = 0.0f;
+    } else {
+      float phase = static_cast<float>(meshID) * kPhaseStep;
+
+      maths::mat4 rotation = maths::mat4::RotateY(timeSeconds * kSpeedY + phase) *
+                             maths::mat4::RotateX(timeSeconds * kSpeedX + phase) *
+                             maths::mat4::RotateZ(timeSeconds * kSpeedZ + phase);
+
+      // Every primitive's baked world-space center coincides exactly with its
+      // grid slot position at Y=0: each geom_*.comp shader either generates a
+      // shape already centered on its own local origin
+      // (icosphere/box/sphere/torus/plane/torusKnot/chamferBox), or one that
+      // spans y=[0,height] recentered via worldOffsetY=-height/2 in
+      // GenerateGeometry() (cone/tube/cylinder/capsule/pyramid) — both cases land
+      // the shape's true vertical midpoint at Y=0.
+      maths::vec2 slot = GridSlot(static_cast<int>(meshID));
+
+      xform.rotation = rotation;
+      xform.centerX = slot.x;
+      xform.centerY = 0.0f;
+      xform.centerZ = slot.y;
+      xform._pad0 = 0.0f;
+    }
   }
 
   void *mapped = nullptr;

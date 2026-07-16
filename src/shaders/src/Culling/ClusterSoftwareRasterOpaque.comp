@@ -24,6 +24,7 @@
 // VisBuffer write rationale -- both apply identically here.
 
 #include "include/cluster_culling_common.glsl"
+#include "include/struct_custo.glsl"
 
 #define COMPRESSED_POOL_SET 0
 #define COMPRESSED_POOL_BINDING 1
@@ -60,6 +61,14 @@ layout(std140, set = 0, binding = 5) uniform WPOGlobalsUBO {
     float _pad1;
     float _pad2;
 } g_WPOGlobals;
+
+layout(std430, set = 0, binding = 6) readonly buffer EntityTransformBuffer {
+    EntityTransform entityTransforms[];
+};
+
+layout(std430, set = 0, binding = 7) readonly buffer EntityDataBuffer {
+    EntityData entityData[];
+};
 
 layout(push_constant) uniform SoftwareRasterPushConstants {
     uint maxTrianglesPerCluster; // == CLUSTER_MAX_TRIANGLES, used only to decode the flattened dispatch index.

@@ -25,6 +25,7 @@
 // needed to address the compressed page's SoA vertex block.
 
 #include "include/cluster_culling_common.glsl"
+#include "include/struct_custo.glsl"
 
 #define COMPRESSED_POOL_SET 0
 #define COMPRESSED_POOL_BINDING 1
@@ -34,6 +35,14 @@
 layout(std430, set = 0, binding = 0) readonly buffer ClusterCullMetadataSSBO {
     ClusterCullMetadata clusters[];
 } g_Clusters;
+
+layout(std430, set = 0, binding = 4) readonly buffer EntityTransformBuffer {
+    EntityTransform entityTransforms[];
+};
+
+layout(std430, set = 0, binding = 5) readonly buffer EntityDataBuffer {
+    EntityData entityData[];
+};
 
 // Uploaded once per frame by renderer::ClusterRenderPipeline (vkCmdUpdateBuffer) -- see
 // wpo_deformation.glsl's ApplyWPODeformation for how globalTime is used. _pad exists only to mirror
@@ -84,6 +93,14 @@ void main() {
     // (cluster_vertex_decode.glsl) -- no dependency on renderer::GeometryDecompressionPass's
     // vertex pool having already decompressed this exact page this frame.
     vec3 worldPos = DecodeClusterPosition(pageByteBase, localVertexIndex, cluster.boundsMin, cluster.boundsMax);
+
+    // Apply entity self-rotation
+    EntityData ed = entityData[cluster.entityID];
+    EntityTransform xform = entityTransforms[ed.meshID];
+    mat3 rotation = mat3(xform.rotation);
+    vec3 localPos = worldPos - xform.center;
+    worldPos = xform.center + rotation * localPos;
+
     worldPos = ApplyWPODeformation(worldPos, cluster.clusterID, cluster.maxWPOAmplitude, g_WPOGlobals.globalTime);
 
     outClusterID = uint(gl_InstanceIndex);

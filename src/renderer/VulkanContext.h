@@ -78,6 +78,8 @@ public:
     VkBuffer GetIndexBuffer() const { return m_IndexBuffer; }
     const core::EntityData* GetEntityData() const { return m_EntityData.data(); }
     uint32_t GetEntityCount() const { return kEntityCount; }
+    VkBuffer GetEntityTransformBuffer() const { return m_EntityTransformBuffer; }
+    VkBuffer GetEntityBuffer() const { return m_EntityBuffer; }
 
 private:
     VkInstance m_Instance = VK_NULL_HANDLE;
@@ -175,8 +177,8 @@ private:
     uint32_t m_TotalVertexCount = 0;
     uint32_t m_TotalIndexCount = 0;
 
-    // One EntityTransform slot per primitive meshID (box=0 .. chamferBox=11); see struct_custo.glsl.
-    static constexpr uint32_t kEntityCount = 12;
+    // One EntityTransform slot per primitive meshID (box=0 .. floor=12); see struct_custo.glsl.
+    static constexpr uint32_t kEntityCount = 13;
 
     // CPU-authoritative entity records: built once by BuildEntityData() (meshID assigned via
     // core::IDManager) before GenerateGeometry() runs, then copied to m_EntityBuffer by
@@ -248,7 +250,8 @@ private:
     void GeneratePlane(
         float Length, float Width,
         uint32_t meshID, maths::vec2 slot,
-        uint32_t& runningVertexOffset, uint32_t& runningIndexOffset);
+        uint32_t& runningVertexOffset, uint32_t& runningIndexOffset,
+        float worldOffsetY = 0.0f);
 
     void GenerateCapsule(
         float Radius, float Height,

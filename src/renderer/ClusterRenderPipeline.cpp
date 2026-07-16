@@ -237,7 +237,9 @@ bool ClusterRenderPipeline::Init(
                         m_PagePool.GetPhysicalPoolBuffer(),
                         m_WPOGlobalsBuffer.Handle(),
                         m_MaskGenerator.GetMaskImageInfos(), visBufferFormats,
-                        createInfo.depthFormat);
+                        createInfo.depthFormat,
+                        createInfo.entityTransformBuffer,
+                        createInfo.entityDataBuffer);
 
   m_SoftwareRaster.Init(createInfo.device, createInfo.allocator,
                         createInfo.commandPool, createInfo.queue,
@@ -247,7 +249,9 @@ bool ClusterRenderPipeline::Init(
                         m_OcclusionCulling.GetSoftwareClusterListBuffer(),
                         m_OcclusionCulling.GetSoftwareClusterListOpaqueBuffer(),
                         m_WPOGlobalsBuffer.Handle(),
-                        m_MaskGenerator.GetMaskImageInfos());
+                        m_MaskGenerator.GetMaskImageInfos(),
+                        createInfo.entityTransformBuffer,
+                        createInfo.entityDataBuffer);
 
   m_Resolve.Init(
       createInfo.device, createInfo.allocator, createInfo.commandPool,
@@ -257,7 +261,9 @@ bool ClusterRenderPipeline::Init(
       createInfo.visBufferTriangleIDView, createInfo.depthImageView,
       m_SoftwareRaster.GetVisBufferAtomicView(),
       m_MaskGenerator.GetMaskImageInfos(),
-      m_WPOGlobalsBuffer.Handle());
+      m_WPOGlobalsBuffer.Handle(),
+      createInfo.entityTransformBuffer,
+      createInfo.entityDataBuffer);
 
   // =========================================================================================
   // STEP 7 -- Lumen-style GI infrastructure: sun shadow map, Surface Cache, Global SDF clipmap
