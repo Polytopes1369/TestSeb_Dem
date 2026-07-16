@@ -10,6 +10,7 @@
 #include "core/Logger.h"
 #include "geometry/CardGenerator.h" // geometry::kSurfaceCacheAtlasSize / kCardGutterTexels
 #include "io/CacheFileManager.h"
+#include "renderer/VirtualShadowMapPass.h"
 
 namespace renderer {
 
@@ -62,15 +63,18 @@ namespace renderer {
         static_assert(sizeof(PointLightGPU) == 32,
             "PointLightGPU must match SurfaceCacheCapture.frag's PointLightGPU exactly");
 
+        // Phase 3 (UE5.8 parity roadmap): no longer carries a single `lightViewProj` -- shadow
+        // lookups now go through renderer::VirtualShadowMapPass's own dedicated UBOs (set 0,
+        // bindings 4/5, see STEP 4 below), which SurfaceCacheCapture.frag's shadow_sun_sampling
+        // .glsl / shadow_point_sampling.glsl read directly instead of a single matrix passed here.
         struct SurfaceCacheLightingUBO {
-            maths::mat4 lightViewProj;
             float sunDirectionAndIntensity[4]; // xyz = direction (light -> scene), w = intensity.
             float sunColor[4];                 // rgb = color, a unused.
             uint32_t pointLightCount;
             uint32_t _pad0[3];
             PointLightGPU pointLights[kMaxPointLights];
         };
-        static_assert(sizeof(SurfaceCacheLightingUBO) == 368,
+        static_assert(sizeof(SurfaceCacheLightingUBO) == 304,
             "SurfaceCacheLightingUBO must match SurfaceCacheCapture.frag's SurfaceCacheLightingUBO exactly");
 
         // Per-face world-space outward normal, orthographic "up" vector (chosen non-parallel to
@@ -439,36 +443,58 @@ namespace renderer {
 
         // =====================================================================================
         // STEP 4 -- Lighting descriptor set (set 0): binding 0 = SurfaceCacheLightingUBO (written
-        // every frame by UpdateLighting(), persistently mapped so that is a plain memcpy), binding
-        // 1 = the sun's shadow map (bound once by SetShadowMap(), called after ShadowMapPass::Init()
-        // since the shadow view/sampler live in that separate pass -- see SetShadowMap()'s own
-        // comment). The UBO's descriptor is written right here, since m_LightingUBO's VkBuffer
-        // handle is already known and never changes for the rest of this pass's lifetime.
+        // every frame by UpdateLighting(), persistently mapped so that is a plain memcpy); bindings
+        // 1-5 are renderer::VirtualShadowMapPass's own resources (physical page atlas, page table,
+        // feedback buffer, sun clipmap levels UBO, point light cube faces UBO -- see
+        // shadow_atlas_sampling.glsl / shadow_page_table.glsl / shadow_feedback.glsl /
+        // shadow_sun_sampling.glsl / shadow_point_sampling.glsl for the exact binding contract each
+        // is meant to satisfy), all bound once by SetVirtualShadowMap() (called after
+        // VirtualShadowMapPass::Init(), since those resources live in that separate pass -- see
+        // that method's own comment). The UBO's descriptor is written right here, since
+        // m_LightingUBO's VkBuffer handle is already known and never changes for the rest of this
+        // pass's lifetime.
         // =====================================================================================
         m_LightingUBO.Create(allocator, sizeof(SurfaceCacheLightingUBO),
             VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, VMA_MEMORY_USAGE_CPU_TO_GPU, /*mapped=*/true);
 
-        VkDescriptorSetLayoutBinding lightingBindings[2]{};
+        VkDescriptorSetLayoutBinding lightingBindings[6]{};
         lightingBindings[0].binding = 0;
         lightingBindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
         lightingBindings[0].descriptorCount = 1;
         lightingBindings[0].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-        lightingBindings[1].binding = 1;
+        lightingBindings[1].binding = 1; // g_ShadowPhysicalAtlas (sampler2DArray).
         lightingBindings[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         lightingBindings[1].descriptorCount = 1;
         lightingBindings[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        lightingBindings[2].binding = 2; // g_ShadowPageTable (SSBO, readonly).
+        lightingBindings[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        lightingBindings[2].descriptorCount = 1;
+        lightingBindings[2].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        lightingBindings[3].binding = 3; // g_ShadowFeedback (SSBO, read-write via atomics).
+        lightingBindings[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        lightingBindings[3].descriptorCount = 1;
+        lightingBindings[3].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        lightingBindings[4].binding = 4; // g_ShadowSunLevels (UBO).
+        lightingBindings[4].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        lightingBindings[4].descriptorCount = 1;
+        lightingBindings[4].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        lightingBindings[5].binding = 5; // g_ShadowPointFaces (UBO).
+        lightingBindings[5].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        lightingBindings[5].descriptorCount = 1;
+        lightingBindings[5].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
 
         VkDescriptorSetLayoutCreateInfo lightingSetLayoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-        lightingSetLayoutInfo.bindingCount = 2;
+        lightingSetLayoutInfo.bindingCount = 6;
         lightingSetLayoutInfo.pBindings = lightingBindings;
         VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &lightingSetLayoutInfo, nullptr, &m_LightingSetLayout));
 
-        VkDescriptorPoolSize lightingPoolSizes[2]{};
-        lightingPoolSizes[0] = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 };
-        lightingPoolSizes[1] = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1 };
+        VkDescriptorPoolSize lightingPoolSizes[3]{};
+        lightingPoolSizes[0] = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 3 };          // Bindings 0, 4, 5.
+        lightingPoolSizes[1] = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1 };  // Binding 1.
+        lightingPoolSizes[2] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 };          // Bindings 2, 3.
         VkDescriptorPoolCreateInfo lightingPoolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
         lightingPoolInfo.maxSets = 1;
-        lightingPoolInfo.poolSizeCount = 2;
+        lightingPoolInfo.poolSizeCount = 3;
         lightingPoolInfo.pPoolSizes = lightingPoolSizes;
         VK_CHECK(vkCreateDescriptorPool(m_Device, &lightingPoolInfo, nullptr, &m_LightingDescriptorPool));
 
@@ -490,11 +516,12 @@ namespace renderer {
         lightingUboWrite.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
         lightingUboWrite.pBufferInfo = &lightingBufferInfo;
         vkUpdateDescriptorSets(m_Device, 1, &lightingUboWrite, 0, nullptr);
-        // Binding 1 (the shadow map sampler) is intentionally left unwritten here -- SetShadowMap()
-        // writes it once the caller has a ShadowMapPass to bind (see that method's own comment).
-        // Validation layers correctly flag sampling through an unwritten descriptor, but nothing
-        // samples set 0 binding 1 until SetShadowMap() has run, which every caller must do before
-        // its first RecordCapture() call (documented on both methods).
+        // Bindings 1-5 (VirtualShadowMapPass's own resources) are intentionally left unwritten
+        // here -- SetVirtualShadowMap() writes them once the caller has a VirtualShadowMapPass to
+        // bind (see that method's own comment). Validation layers correctly flag sampling through
+        // an unwritten descriptor, but nothing samples set 0 bindings 1-5 until
+        // SetVirtualShadowMap() has run, which every caller must do before its first
+        // RecordCapture() call (documented on both methods).
 
         // =====================================================================================
         // STEP 5 -- Capture pipeline: plain vertex-buffer input (geometry::FallbackVertex), set 0
@@ -660,28 +687,31 @@ namespace renderer {
         m_Device = VK_NULL_HANDLE;
     }
 
-    void SurfaceCachePass::SetShadowMap(VkImageView shadowMapView, VkSampler shadowMapSampler) {
-        VkDescriptorImageInfo shadowImageInfo{};
-        shadowImageInfo.sampler = shadowMapSampler;
-        shadowImageInfo.imageView = shadowMapView;
-        // renderer::ShadowMapPass keeps its depth image in GENERAL for its entire lifetime (valid
-        // for both the depth-attachment write AND this sampled read, with no ping-ponging -- see
-        // that class's own Init() comment on why GENERAL, not DEPTH_ATTACHMENT_OPTIMAL, which is
-        // NOT a legal sampled-image descriptor layout).
-        shadowImageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    void SurfaceCachePass::SetVirtualShadowMap(const VirtualShadowMapPass& vsm) {
+        VkDescriptorImageInfo atlasImageInfo{};
+        atlasImageInfo.sampler = vsm.GetPhysicalAtlasSampler();
+        atlasImageInfo.imageView = vsm.GetPhysicalAtlasView();
+        // renderer::VirtualShadowMapPool keeps its physical page pool in GENERAL for its entire
+        // lifetime (valid for both a page's depth-attachment write AND this sampled read, no
+        // ping-ponging -- mirrors the pre-Phase-3 ShadowMapPass's own identical choice).
+        atlasImageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
-        VkWriteDescriptorSet shadowWrite{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
-        shadowWrite.dstSet = m_LightingDescriptorSet;
-        shadowWrite.dstBinding = 1;
-        shadowWrite.descriptorCount = 1;
-        shadowWrite.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        shadowWrite.pImageInfo = &shadowImageInfo;
-        vkUpdateDescriptorSets(m_Device, 1, &shadowWrite, 0, nullptr);
+        VkDescriptorBufferInfo pageTableInfo{ vsm.GetPageTableBuffer(), 0, VK_WHOLE_SIZE };
+        VkDescriptorBufferInfo feedbackInfo{ vsm.GetFeedbackDeviceBuffer(), 0, VK_WHOLE_SIZE };
+        VkDescriptorBufferInfo sunLevelsInfo{ vsm.GetSunLevelsBuffer(), 0, VK_WHOLE_SIZE };
+        VkDescriptorBufferInfo pointFacesInfo{ vsm.GetPointFacesBuffer(), 0, VK_WHOLE_SIZE };
+
+        VkWriteDescriptorSet writes[5]{};
+        writes[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_LightingDescriptorSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &atlasImageInfo, nullptr, nullptr };
+        writes[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_LightingDescriptorSet, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &pageTableInfo, nullptr };
+        writes[2] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_LightingDescriptorSet, 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &feedbackInfo, nullptr };
+        writes[3] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_LightingDescriptorSet, 4, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &sunLevelsInfo, nullptr };
+        writes[4] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_LightingDescriptorSet, 5, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &pointFacesInfo, nullptr };
+        vkUpdateDescriptorSets(m_Device, 5, writes, 0, nullptr);
     }
 
-    void SurfaceCachePass::UpdateLighting(const SceneLights& lights, const maths::mat4& lightViewProj) {
+    void SurfaceCachePass::UpdateLighting(const SceneLights& lights) {
         SurfaceCacheLightingUBO ubo{};
-        ubo.lightViewProj = lightViewProj;
         ubo.sunDirectionAndIntensity[0] = lights.sun.direction.x;
         ubo.sunDirectionAndIntensity[1] = lights.sun.direction.y;
         ubo.sunDirectionAndIntensity[2] = lights.sun.direction.z;

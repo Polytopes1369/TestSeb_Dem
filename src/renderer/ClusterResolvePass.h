@@ -40,6 +40,7 @@
 namespace renderer {
 
     class ClusterShadingBinPass; // Phase 1b: see InitBinnedResolve()/RecordResolveBinned()'s own comments.
+    class VirtualShadowMapPass;  // Phase 3: see SetVirtualShadowMap()'s own comment.
 
     class ClusterResolvePass {
     public:
@@ -107,8 +108,12 @@ namespace renderer {
         // `prevViewProj` is the previous frame's combined matrix (renderer::ClusterRenderPipeline's
         // own m_PrevViewProj) -- used only by DEBUG_VIEW_MOTION_VECTORS to reproject this frame's
         // reconstructed world position; pass an identity matrix on the very first frame (no
-        // previous frame exists yet).
-        void RecordResolve(VkCommandBuffer cmd, const maths::mat4& viewProj, const maths::mat4& prevViewProj, uint32_t debugViewMode = 0);
+        // previous frame exists yet). `sunDirection` (Phase 3, points FROM the light TOWARD the
+        // scene) feeds the direct-lighting term's light direction AND its shadow lookup (see
+        // ClusterResolve.comp's own Step 3 comment) -- must be the SAME direction
+        // renderer::VirtualShadowMapPass::RecordBeginFrame() was called with this frame.
+        void RecordResolve(VkCommandBuffer cmd, const maths::mat4& viewProj, const maths::mat4& prevViewProj,
+            const maths::vec3& sunDirection, uint32_t debugViewMode = 0);
 
         // --- Phase 1b: binned resolve path (renderer::ClusterShadingBinPass) ---
         // Second-phase init, called once after BOTH Init() above AND `shadingBinPass.Init()` have
@@ -135,8 +140,20 @@ namespace renderer {
         // the exact per-frame ordering (this path replaces RecordResolve() entirely whenever
         // `camera.debugViewMode == 0`; Release always takes this path, see that field's own
         // Debug-only gating in core/Camera.h). Ends with the identical trailing barrier
-        // RecordResolve() itself ends with.
-        void RecordResolveBinned(VkCommandBuffer cmd, const maths::mat4& viewProj, const ClusterShadingBinPass& shadingBinPass);
+        // RecordResolve() itself ends with. `sunDirection` -- see RecordResolve()'s own comment.
+        void RecordResolveBinned(VkCommandBuffer cmd, const maths::mat4& viewProj,
+            const maths::vec3& sunDirection, const ClusterShadingBinPass& shadingBinPass);
+
+        // Binds Phase 3's renderer::VirtualShadowMapPass resources (physical page atlas + sampler,
+        // page table, feedback buffer, sun clipmap levels UBO) into BOTH this pass's descriptor
+        // sets (the Debug-only full-screen set AND the always-live binned-resolve set -- see
+        // ClusterResolve.comp's / ClusterResolveBinned.comp's own binding-15-18 / 14-17 comments).
+        // Must be called exactly once after Init() AND InitBinnedResolve() have BOTH already run
+        // (needs both sets to already be allocated), before the first RecordResolve()/
+        // RecordResolveBinned() call. Point light cube faces are NOT bound here -- unlike
+        // renderer::SurfaceCachePass, this shader's direct-lighting term only shadows the sun (see
+        // this phase's own plan for why point-light direct-visible shading was left unchanged).
+        void SetVirtualShadowMap(const VirtualShadowMapPass& vsm);
 
         VkImage GetOutputColorImage() const { return m_OutputColorImage; }
         VkImageView GetOutputColorView() const { return m_OutputColorView; }

@@ -1,8 +1,9 @@
 #pragma once
 // Direct-lighting scene data consumed by the Surface Cache capture pipeline (renderer::
-// ShadowMapPass casts the sun's shadow map, renderer::SurfaceCachePass / SurfaceCacheCapture.frag
-// shade each captured texel with it). No shared light representation exists anywhere else in this
-// codebase yet -- every other shading pass hardcodes a single fixed light direction inline (e.g.
+// VirtualShadowMapPass casts both the sun's clipmap and every active point light's 6-face cube of
+// shadows, Phase 3 onward; renderer::SurfaceCachePass / SurfaceCacheCapture.frag shade each
+// captured texel with them). No shared light representation exists anywhere else in this codebase
+// yet -- every other shading pass hardcodes a single fixed light direction inline (e.g.
 // ClusterResolve.comp's own `lightDir = normalize(vec3(0.5, 1.0, 0.5))`); this is the first one.
 
 #include <array>
@@ -19,20 +20,22 @@ namespace renderer {
     // bindless count.
     constexpr uint32_t kMaxPointLights = 8u;
 
-    // The Surface Cache's only shadow-casting light. `direction` points FROM the light TOWARD the
-    // scene (matching the codebase's other directional conventions, e.g. ClusterResolve.comp's own
-    // `lightDir`, which is instead the surface-to-light direction -- SurfaceCacheCapture.frag negates
-    // this one before using it, see that shader's own comment).
+    // The Surface Cache's sun -- shadowed via renderer::VirtualShadowMapPass's 3-level clipmap
+    // (Phase 3). `direction` points FROM the light TOWARD the scene (matching the codebase's other
+    // directional conventions, e.g. ClusterResolve.comp's own `lightDir`, which is instead the
+    // surface-to-light direction -- SurfaceCacheCapture.frag negates this one before using it, see
+    // that shader's own comment).
     struct DirectionalLight {
         maths::vec3 direction = { -0.4f, -1.0f, -0.3f };
         maths::vec3 color = { 1.0f, 0.95f, 0.85f };
         float intensity = 3.0f;
     };
 
-    // Point lights contribute distance-attenuated, UNSHADOWED light only -- a deliberate scope
-    // limit (see renderer::ShadowMapPass's class comment): a correct per-point-light shadow needs a
-    // cube map (6 faces) per light, a materially bigger feature than the sun's single orthographic
-    // map, and out of scope for this pass.
+    // Point lights contribute distance-attenuated light, shadowed via renderer::
+    // VirtualShadowMapPass's own per-light 6-face cube of Virtual Shadow Maps (Phase 3 onward --
+    // pre-Phase-3 these were unshadowed, since a correct per-point-light shadow needs a cube map
+    // per light, a materially bigger feature than the sun's single orthographic map that the
+    // pre-Phase-3 ShadowMapPass did not attempt).
     struct PointLight {
         maths::vec3 position{};
         maths::vec3 color = { 1.0f, 1.0f, 1.0f };

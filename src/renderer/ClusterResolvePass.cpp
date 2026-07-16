@@ -8,6 +8,7 @@
 #include "core/Logger.h"
 #include "renderer/ClusterShadingBinPass.h"
 #include "renderer/MaterialParameterTable.h"
+#include "renderer/VirtualShadowMapPass.h"
 #include "renderer/VulkanPipeline.h"
 
 namespace renderer {
@@ -30,10 +31,13 @@ namespace renderer {
             return buffer;
         }
 
-        // Byte-for-byte mirror of ResolveViewParamsUBO in ClusterResolve.comp (std140): mat4 (64
-        // bytes) + mat4 (64 bytes, prevViewProj -- DEBUG_VIEW_MOTION_VECTORS' own reprojection) +
-        // vec2 (8 bytes) + 2 pad floats rounding up to the struct's own 16-byte base alignment
-        // (144 bytes total) -- same shape as ClusterSoftwareRasterPass.cpp's SoftwareRasterViewParams.
+        // Byte-for-byte mirror of ResolveViewParamsUBO in ClusterResolve.comp/ClusterResolveBinned
+        // .comp (std140): mat4 (64 bytes) + mat4 (64 bytes, prevViewProj -- DEBUG_VIEW_MOTION_VECTORS'
+        // own reprojection) + vec2 (8 bytes) + 2 pad floats rounding up to a 16-byte boundary (144
+        // bytes) + vec3 sunDirection (Phase 3 -- points FROM the light TOWARD the scene, same
+        // convention as renderer::DirectionalLight, needed so this shader's direct-lighting term
+        // uses the SAME sun direction the shadow was rendered from) + 1 trailing pad float rounding
+        // back up to a 16-byte boundary (160 bytes total).
         struct ResolveViewParams {
             maths::mat4 viewProj;
             maths::mat4 prevViewProj;
@@ -41,8 +45,12 @@ namespace renderer {
             float viewportHeight = 0.0f;
             float _pad0 = 0.0f;
             float _pad1 = 0.0f;
+            float sunDirectionX = 0.0f;
+            float sunDirectionY = 0.0f;
+            float sunDirectionZ = 0.0f;
+            float _pad2 = 0.0f;
         };
-        static_assert(sizeof(ResolveViewParams) == 144,
+        static_assert(sizeof(ResolveViewParams) == 160,
             "ResolveViewParams must match ResolveViewParamsUBO in ClusterResolve.comp exactly (std140 layout)");
 
     } // namespace
@@ -216,11 +224,12 @@ namespace renderer {
             VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
             VMA_MEMORY_USAGE_GPU_ONLY);
 
-        // --- Descriptor set layout: 15 bindings, matching ClusterResolve.comp's set = 0 bindings
-        // 0..14 exactly (9..11 are the GBuffer outputs, 12 is the WPOGlobalsUBO this shader needs
+        // --- Descriptor set layout: 19 bindings, matching ClusterResolve.comp's set = 0 bindings
+        // 0..18 exactly (9..11 are the GBuffer outputs, 12 is the WPOGlobalsUBO this shader needs
         // to reapply the same sway deformation the rasterizers already applied, 13 is the material
-        // parameter table SSBO, 14 is the roughness/metallic GBuffer output). ---
-        VkDescriptorSetLayoutBinding bindings[15]{};
+        // parameter table SSBO, 14 is the roughness/metallic GBuffer output, 15-18 are Phase 3's
+        // renderer::VirtualShadowMapPass resources -- see SetVirtualShadowMap()'s own comment). ---
+        VkDescriptorSetLayoutBinding bindings[19]{};
         bindings[0] = { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };         // ClusterCullMetadataSSBO
         bindings[1] = { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };         // CompressedClusterPoolSSBO
         bindings[2] = { 2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };          // g_HWClusterIDImage (r32ui)
@@ -236,17 +245,21 @@ namespace renderer {
         bindings[12] = { 12, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };       // WPOGlobalsUBO
         bindings[13] = { 13, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };       // MaterialParamsSSBO
         bindings[14] = { 14, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };        // g_OutputRoughnessMetallic (rg8)
+        bindings[15] = { 15, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // g_ShadowPhysicalAtlas
+        bindings[16] = { 16, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };       // g_ShadowPageTable
+        bindings[17] = { 17, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };       // g_ShadowFeedback
+        bindings[18] = { 18, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };       // g_ShadowSunLevels
 
         VkDescriptorSetLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-        layoutInfo.bindingCount = 15;
+        layoutInfo.bindingCount = 19;
         layoutInfo.pBindings = bindings;
         VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &layoutInfo, nullptr, &m_SetLayout));
 
         VkDescriptorPoolSize poolSizes[4]{};
-        poolSizes[0] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3 };
+        poolSizes[0] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 5 };  // + g_ShadowPageTable, g_ShadowFeedback.
         poolSizes[1] = { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 8 };
-        poolSizes[2] = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1 + maskTextureCount };
-        poolSizes[3] = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2 };
+        poolSizes[2] = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2 + maskTextureCount }; // + g_ShadowPhysicalAtlas.
+        poolSizes[3] = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 3 };  // + g_ShadowSunLevels.
 
         VkDescriptorPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
         poolInfo.maxSets = 1;
@@ -329,6 +342,10 @@ namespace renderer {
         writes[13] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_DescriptorSet, 13, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &materialParamsInfo, nullptr };
         writes[14] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_DescriptorSet, 14, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &outputRoughnessMetallicInfo, nullptr, nullptr };
         vkUpdateDescriptorSets(m_Device, 15, writes, 0, nullptr);
+        // Bindings 15-18 (Phase 3's renderer::VirtualShadowMapPass resources) are intentionally
+        // left unwritten here -- SetVirtualShadowMap() writes them once the caller has a
+        // VirtualShadowMapPass to bind, same convention as renderer::SurfaceCachePass's own
+        // SetVirtualShadowMap().
 
         // --- Pipeline layout + pipeline ---
         VkPipelineLayoutCreateInfo pipelineLayoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
@@ -428,12 +445,16 @@ namespace renderer {
         m_Device = VK_NULL_HANDLE;
     }
 
-    void ClusterResolvePass::RecordResolve(VkCommandBuffer cmd, const maths::mat4& viewProj, const maths::mat4& prevViewProj, uint32_t debugViewMode) {
+    void ClusterResolvePass::RecordResolve(VkCommandBuffer cmd, const maths::mat4& viewProj, const maths::mat4& prevViewProj,
+        const maths::vec3& sunDirection, uint32_t debugViewMode) {
         ResolveViewParams viewParams{};
         viewParams.viewProj = viewProj;
         viewParams.prevViewProj = prevViewProj;
         viewParams.viewportWidth = static_cast<float>(m_RenderExtent.width);
         viewParams.viewportHeight = static_cast<float>(m_RenderExtent.height);
+        viewParams.sunDirectionX = sunDirection.x;
+        viewParams.sunDirectionY = sunDirection.y;
+        viewParams.sunDirectionZ = sunDirection.z;
         vkCmdUpdateBuffer(cmd, m_ViewParamsBuffer.Handle(), 0, sizeof(ResolveViewParams), &viewParams);
 
         VkMemoryBarrier2 uboBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
@@ -483,13 +504,14 @@ namespace renderer {
         (void)queue; // Reserved for parity with every other Init()-shaped method; no one-time submit needed here.
         uint32_t maskTextureCount = static_cast<uint32_t>(m_MaskImageInfos.size());
 
-        // --- Descriptor set layout: 14 bindings, matching ClusterResolveBinned.comp's set = 0
-        // bindings 0..13 exactly. Bindings 2-4 (VisBuffer/HW-depth/SW-atomic) from the original
+        // --- Descriptor set layout: 18 bindings, matching ClusterResolveBinned.comp's set = 0
+        // bindings 0..17 exactly. Bindings 2-4 (VisBuffer/HW-depth/SW-atomic) from the original
         // 15-binding layout are absent here -- visibility is already fully resolved by
         // `shadingBinPass` before this pipeline ever runs -- replaced by bindings 2-4 for the
         // sorted-pixel-list/bin-offsets/bin-histogram buffers that carry that resolved visibility
-        // forward instead. ---
-        std::array<VkDescriptorSetLayoutBinding, 14> bindings{};
+        // forward instead. Bindings 14-17 are Phase 3's renderer::VirtualShadowMapPass resources --
+        // see SetVirtualShadowMap()'s own comment. ---
+        std::array<VkDescriptorSetLayoutBinding, 18> bindings{};
         bindings[0] = { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };  // ClusterCullMetadataSSBO
         bindings[1] = { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };  // CompressedClusterPoolSSBO
         bindings[2] = { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };  // g_SortedPixelList
@@ -504,6 +526,10 @@ namespace renderer {
         bindings[11] = { 11, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // g_OutputDepth
         bindings[12] = { 12, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // g_OutputAlbedo
         bindings[13] = { 13, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // g_OutputRoughnessMetallic
+        bindings[14] = { 14, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // g_ShadowPhysicalAtlas
+        bindings[15] = { 15, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // g_ShadowPageTable
+        bindings[16] = { 16, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // g_ShadowFeedback
+        bindings[17] = { 17, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // g_ShadowSunLevels
 
         VkDescriptorSetLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
         layoutInfo.bindingCount = static_cast<uint32_t>(bindings.size());
@@ -511,10 +537,10 @@ namespace renderer {
         VK_CHECK(vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &m_ResolveBinnedSetLayout));
 
         std::array<VkDescriptorPoolSize, 4> poolSizes{};
-        poolSizes[0] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 6 };  // cluster metadata, compressed pool, sorted list, offsets, histogram, material params
+        poolSizes[0] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8 };  // cluster metadata, compressed pool, sorted list, offsets, histogram, material params, shadow page table, shadow feedback
         poolSizes[1] = { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 5 };   // color, normal, depth, albedo, roughness-metallic
-        poolSizes[2] = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2 };  // view params, WPO globals
-        poolSizes[3] = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, maskTextureCount };
+        poolSizes[2] = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 3 };  // view params, WPO globals, shadow sun levels
+        poolSizes[3] = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, maskTextureCount + 1 }; // + shadow physical atlas
 
         VkDescriptorPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
         poolInfo.maxSets = 1;
@@ -558,6 +584,8 @@ namespace renderer {
         writes[12] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ResolveBinnedSet, 12, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &outputAlbedoInfo, nullptr, nullptr };
         writes[13] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ResolveBinnedSet, 13, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &outputRMInfo, nullptr, nullptr };
         vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+        // Bindings 14-17 (Phase 3's renderer::VirtualShadowMapPass resources) are intentionally
+        // left unwritten here -- SetVirtualShadowMap() writes them, same as the primary set above.
 
         VkPushConstantRange pushRange{ VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(uint32_t) }; // binIndex
         VkPipelineLayoutCreateInfo pipelineLayoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
@@ -575,7 +603,8 @@ namespace renderer {
         LOG_INFO("[ClusterResolvePass] Initialized binned resolve path (Phase 1b shading bins).");
     }
 
-    void ClusterResolvePass::RecordResolveBinned(VkCommandBuffer cmd, const maths::mat4& viewProj, const ClusterShadingBinPass& shadingBinPass) {
+    void ClusterResolvePass::RecordResolveBinned(VkCommandBuffer cmd, const maths::mat4& viewProj,
+        const maths::vec3& sunDirection, const ClusterShadingBinPass& shadingBinPass) {
         // prevViewProj is never read by ClusterResolveBinned.comp (this path never serves
         // DEBUG_VIEW_MOTION_VECTORS) -- `viewProj` itself is reused as a harmless placeholder value
         // rather than introducing a separate identity-matrix concept for an otherwise-dead field.
@@ -584,6 +613,9 @@ namespace renderer {
         viewParams.prevViewProj = viewProj;
         viewParams.viewportWidth = static_cast<float>(m_RenderExtent.width);
         viewParams.viewportHeight = static_cast<float>(m_RenderExtent.height);
+        viewParams.sunDirectionX = sunDirection.x;
+        viewParams.sunDirectionY = sunDirection.y;
+        viewParams.sunDirectionZ = sunDirection.z;
         vkCmdUpdateBuffer(cmd, m_ViewParamsBuffer.Handle(), 0, sizeof(ResolveViewParams), &viewParams);
 
         VkMemoryBarrier2 uboBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
@@ -623,6 +655,33 @@ namespace renderer {
         outputDependency.memoryBarrierCount = 1;
         outputDependency.pMemoryBarriers = &outputBarrier;
         vkCmdPipelineBarrier2(cmd, &outputDependency);
+    }
+
+    void ClusterResolvePass::SetVirtualShadowMap(const VirtualShadowMapPass& vsm) {
+        VkDescriptorImageInfo atlasImageInfo{};
+        atlasImageInfo.sampler = vsm.GetPhysicalAtlasSampler();
+        atlasImageInfo.imageView = vsm.GetPhysicalAtlasView();
+        atlasImageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+        VkDescriptorBufferInfo pageTableInfo{ vsm.GetPageTableBuffer(), 0, VK_WHOLE_SIZE };
+        VkDescriptorBufferInfo feedbackInfo{ vsm.GetFeedbackDeviceBuffer(), 0, VK_WHOLE_SIZE };
+        VkDescriptorBufferInfo sunLevelsInfo{ vsm.GetSunLevelsBuffer(), 0, VK_WHOLE_SIZE };
+
+        // Both descriptor sets (the always-live binned path's m_ResolveBinnedSet, and the
+        // Debug-only full-screen m_DescriptorSet used by every DEBUG_VIEW_* mode -- see
+        // ClusterRenderPipeline::RecordFrame's own branch between the two) need the identical 4
+        // shadow bindings written, just at different binding indices (15-18 vs 14-17 -- see each
+        // set's own layout comment for why the numbering differs).
+        VkWriteDescriptorSet writes[8]{};
+        writes[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_DescriptorSet, 15, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &atlasImageInfo, nullptr, nullptr };
+        writes[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_DescriptorSet, 16, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &pageTableInfo, nullptr };
+        writes[2] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_DescriptorSet, 17, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &feedbackInfo, nullptr };
+        writes[3] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_DescriptorSet, 18, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &sunLevelsInfo, nullptr };
+        writes[4] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ResolveBinnedSet, 14, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &atlasImageInfo, nullptr, nullptr };
+        writes[5] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ResolveBinnedSet, 15, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &pageTableInfo, nullptr };
+        writes[6] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ResolveBinnedSet, 16, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &feedbackInfo, nullptr };
+        writes[7] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ResolveBinnedSet, 17, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &sunLevelsInfo, nullptr };
+        vkUpdateDescriptorSets(m_Device, 8, writes, 0, nullptr);
     }
 
 }

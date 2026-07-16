@@ -730,6 +730,16 @@ void VulkanContext::CreateLogicalDevice() {
   deviceFeatures2.features.geometryShader = VK_TRUE;
   // shaderInt64: see imageAtomicInt64Features's comment above.
   deviceFeatures2.features.shaderInt64 = VK_TRUE;
+  // fragmentStoresAndAtomics (Phase 3, UE5.8 parity roadmap): SurfaceCacheCapture.frag -- a
+  // fragment shader -- calls shadow_feedback.glsl's RequestShadowPageResidency(), which does an
+  // atomicAdd + indexed write into a writable STORAGE_BUFFER (renderer::VirtualShadowMapPass's
+  // feedback buffer). Per the Vulkan spec, ANY writable storage buffer/image/texel-buffer
+  // variable in the fragment stage requires this feature enabled, or vkCreateGraphicsPipelines
+  // fails validation (VUID-RuntimeSpirv-NonWritable-06340) -- a near-universally-supported core
+  // Vulkan 1.0 feature bit on desktop GPUs (every GPU capable of this project's own mandatory
+  // ray tracing / Int64 image atomics requirements already supports it), so enabled
+  // unconditionally here, matching geometryShader's own enablement rigor above.
+  deviceFeatures2.features.fragmentStoresAndAtomics = VK_TRUE;
 
   VkDeviceCreateInfo createInfo{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
   createInfo.pNext = &deviceFeatures2;

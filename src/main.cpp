@@ -127,6 +127,13 @@ static void KeyCallback(GLFWwindow* window, int key, int scancode, int action, i
         g_DebugState.reflectionsEnabled = !g_DebugState.reflectionsEnabled;
         LOG_INFO(std::format("[Debug] Specular Reflections: {}", g_DebugState.reflectionsEnabled ? "ON" : "OFF"));
         break;
+    case GLFW_KEY_M:
+        // Phase 3 (UE5.8 parity roadmap): every NUMPAD key is already claimed by an existing view
+        // mode/toggle (see the cases above), so this one new view mode gets a plain letter key
+        // instead -- 'M' for shadow "Map" cascades.
+        g_DebugState.viewMode = DEBUG_VIEW_SHADOW_CASCADES;
+        LOG_INFO("[Debug] View Mode: SHADOW CASCADES");
+        break;
     default:
         break;
     }

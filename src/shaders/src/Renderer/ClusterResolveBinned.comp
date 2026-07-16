@@ -28,6 +28,22 @@
 #define MASK_ARRAY_BINDING 7
 #include "include/mask_sampling.glsl"
 
+// Phase 3 (UE5.8 parity roadmap): sun shadow lookup -- see ClusterResolve.comp's own identical
+// include block comment for the full rationale (this shader was, like that one, fully unshadowed
+// for direct lighting before Phase 3).
+#define SHADOW_ATLAS_SET 0
+#define SHADOW_ATLAS_BINDING 14
+#define SHADOW_PAGE_TABLE_SET 0
+#define SHADOW_PAGE_TABLE_BINDING 15
+#define SHADOW_FEEDBACK_SET 0
+#define SHADOW_FEEDBACK_BINDING 16
+#define SHADOW_SUN_LEVELS_SET 0
+#define SHADOW_SUN_LEVELS_BINDING 17
+#include "include/shadow_page_table.glsl"
+#include "include/shadow_feedback.glsl"
+#include "include/shadow_atlas_sampling.glsl"
+#include "include/shadow_sun_sampling.glsl"
+
 layout(std430, set = 0, binding = 0) readonly buffer ClusterCullMetadataSSBO {
     ClusterCullMetadata clusters[];
 } g_Clusters;
@@ -58,6 +74,9 @@ layout(std140, set = 0, binding = 6) uniform ResolveViewParamsUBO {
     vec2 viewportSize;
     float _pad0;
     float _pad1;
+    // Phase 3: sun direction -- see ClusterResolve.comp's own identical field comment.
+    vec3 sunDirection;
+    float _pad2;
 } g_ViewParams;
 
 // binding 7 == g_MaskTextures[], declared by mask_sampling.glsl.
@@ -159,11 +178,14 @@ void main() {
 
     vec3 normal = normalize(pw0 * n0 + pw1 * n1 + pw2 * n2);
     vec2 uv = pw0 * uv0 + pw1 * uv1 + pw2 * uv2;
+    vec3 worldPos = pw0 * p0 + pw1 * p1 + pw2 * p2;
 
     // --- Step 3: material evaluation -- pc.binIndex IS this dispatch's materialSlot already (every
     // thread in this dispatch shades the same material), no per-pixel lookup/clamp needed. ---
-    vec3 lightDir = normalize(vec3(0.5, 1.0, 0.5));
+    vec3 lightDir = normalize(-g_ViewParams.sunDirection);
     float diff = max(dot(normal, lightDir), 0.0);
+    // Phase 3: shadow visibility -- see ClusterResolve.comp's own identical comment.
+    float sunVisibility = (diff > 0.0) ? SampleSunShadowVSM(worldPos) : 1.0;
 
     MaterialParams mat = g_MaterialParams.params[pc.binIndex];
     vec3 albedo = mat.baseColor;
@@ -171,7 +193,7 @@ void main() {
     // for the full rationale (a pure metal has zero diffuse response; without this, metals would
     // double-count energy against ReflectionGather.comp's specular RMW).
     vec3 diffuseAlbedo = albedo * (1.0 - mat.metallic);
-    vec3 finalColor = diffuseAlbedo * 0.15 + diffuseAlbedo * diff + mat.emissive;
+    vec3 finalColor = diffuseAlbedo * 0.15 + diffuseAlbedo * diff * sunVisibility + mat.emissive;
 
     // Opacity-mask soft edge feathering -- see ClusterResolve.comp's own comment.
     if (cluster.maskTextureIndex != 0xFFFFFFFFu) {

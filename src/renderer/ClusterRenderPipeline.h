@@ -80,11 +80,11 @@
 #include "renderer/ProceduralMaskGenerator.h"
 #include "renderer/ReflectionPass.h"
 #include "renderer/ScreenProbeGIPass.h"
-#include "renderer/ShadowMapPass.h"
 #include "renderer/SurfaceCacheGIInjectPass.h"
 #include "renderer/SurfaceCachePass.h"
 #include "renderer/SurfaceCacheRayTracingPass.h"
 #include "renderer/SurfaceCacheTraceContext.h"
+#include "renderer/VirtualShadowMapPass.h"
 #include "renderer/WorldProbeGridPass.h"
 #ifndef NDEBUG
 #include "renderer/debug/ClusterTriangleStatsPass.h"
@@ -286,12 +286,20 @@ namespace renderer {
         // likewise unconditional; only the NUMPAD-DRIVEN DEBUG VIEW SWITCHING is Debug-only, per
         // CLAUDE.md's build-separation rule). Recorded every frame in RecordFrame() regardless of
         // camera.debugViewMode.
-        ShadowMapPass m_ShadowMap;
+        // Phase 3 (UE5.8 parity roadmap): replaces the pre-Phase-3 ShadowMapPass (a single
+        // whole-scene-fit 2048x2048 orthographic map, fully redrawn every frame, sun only) with a
+        // genuine page-table-virtualized system -- a 3-level clipmap of Virtual Shadow Maps for the
+        // sun plus a per-point-light 6-face cube, sharing one physical page pool, incrementally
+        // updated (bounded pages rendered per frame) instead of a full redraw -- see
+        // VirtualShadowMapPass's own class comment for the full per-frame contract.
+        // ShadowMapPass.h/.cpp remain in the repo (file deletion blocked, see memory
+        // feedback_file_deletion_blocked) but are no longer instantiated here.
+        VirtualShadowMapPass m_VirtualShadowMap;
         SurfaceCachePass m_SurfaceCache;
         GlobalSDFPass m_GlobalSDF;
-        // Fixed sun-only lighting for now (default-constructed SceneLights: no point lights) --
-        // see renderer::LightingTypes.h's own comment; a future scene-authoring system would
-        // populate this instead of leaving it default.
+        // Sun direction is fixed by default; one point light is authored in Init() specifically to
+        // exercise/verify Phase 3's point-light Virtual Shadow Maps (see Init()'s own comment) --
+        // see renderer::LightingTypes.h's own comment for the full field-by-field default.
         SceneLights m_SceneLights;
 
         // Shared trace-scene descriptor sets (mesh SDF trace + Surface Cache sampling, see

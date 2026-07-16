@@ -57,6 +57,23 @@
 #define MASK_ARRAY_BINDING 8
 #include "include/mask_sampling.glsl"
 
+// Phase 3 (UE5.8 parity roadmap): sun shadow lookup for the direct-lighting term below -- this
+// shader's `diff` term was fully unshadowed before Phase 3 (only renderer::SurfaceCachePass's
+// Surface Cache capture consumed the shadow map, feeding indirect lighting only). See
+// shadow_sun_sampling.glsl's own header comment for the 3-level clipmap this samples.
+#define SHADOW_ATLAS_SET 0
+#define SHADOW_ATLAS_BINDING 15
+#define SHADOW_PAGE_TABLE_SET 0
+#define SHADOW_PAGE_TABLE_BINDING 16
+#define SHADOW_FEEDBACK_SET 0
+#define SHADOW_FEEDBACK_BINDING 17
+#define SHADOW_SUN_LEVELS_SET 0
+#define SHADOW_SUN_LEVELS_BINDING 18
+#include "include/shadow_page_table.glsl"
+#include "include/shadow_feedback.glsl"
+#include "include/shadow_atlas_sampling.glsl"
+#include "include/shadow_sun_sampling.glsl"
+
 layout(std430, set = 0, binding = 0) readonly buffer ClusterCullMetadataSSBO {
     ClusterCullMetadata clusters[];
 } g_Clusters;
@@ -73,6 +90,13 @@ layout(std140, set = 0, binding = 7) uniform ResolveViewParamsUBO {
     vec2 viewportSize;
     float _pad0;
     float _pad1;
+    // Phase 3: sun direction (points FROM the light TOWARD the scene, matching renderer::
+    // DirectionalLight's own convention) -- this shader's direct-lighting term now uses the SAME
+    // sun direction the shadow was rendered from (see Step 3 below), instead of the pre-Phase-3
+    // hardcoded, unrelated `vec3(0.5, 1.0, 0.5)` (a light/shadow direction mismatch would have
+    // misaligned the lit/unlit transition against the shadow itself).
+    vec3 sunDirection;
+    float _pad2;
 } g_ViewParams;
 
 // Minimal GBuffer (renderer::ClusterResolvePass -- see its own class comment): written alongside
@@ -254,10 +278,18 @@ void main() {
 
         vec3 normal = normalize(pw0 * n0 + pw1 * n1 + pw2 * n2);
         vec2 uv = pw0 * uv0 + pw1 * uv1 + pw2 * uv2;
+        vec3 worldPos = pw0 * p0 + pw1 * p1 + pw2 * p2;
 
         // --- Step 3: material evaluation (see the class comment above) ---
-        vec3 lightDir = normalize(vec3(0.5, 1.0, 0.5));
+        // g_ViewParams.sunDirection points FROM the light TOWARD the scene (renderer::
+        // DirectionalLight's own convention) -- negate for the surface-to-light direction
+        // Lambertian shading needs, matching SurfaceCacheCapture.frag's identical convention.
+        vec3 lightDir = normalize(-g_ViewParams.sunDirection);
         float diff = max(dot(normal, lightDir), 0.0);
+        // Phase 3: shadow visibility for the sun, sampled from renderer::VirtualShadowMapPass's
+        // 3-level clipmap -- only the direct `diff` term is shadowed, not the ambient/fill term
+        // below (a flat 0.15 ambient approximation has no directional occluder to speak of).
+        float sunVisibility = (diff > 0.0) ? SampleSunShadowVSM(worldPos) : 1.0;
 
         // Hash by cluster.clusterID (the DAG's own dense, per-file-unique numbering, assigned once
         // at cache-build time -- see geometry::ClusterIndexEntry::clusterID), NOT clusterSlotIndex:
@@ -283,7 +315,7 @@ void main() {
         // Without this, a metallic surface would show BOTH a full Lambertian response here AND a
         // full GGX specular response from ReflectionGather.comp's own RMW, double-counting energy.
         vec3 diffuseAlbedo = albedo * (1.0 - mat.metallic);
-        finalColor = diffuseAlbedo * 0.15 + diffuseAlbedo * diff + mat.emissive;
+        finalColor = diffuseAlbedo * 0.15 + diffuseAlbedo * diff * sunVisibility + mat.emissive;
 
         // GBuffer capture (renderer::ClusterResolvePass's new outputs -- see this file's own
         // binding comment): the same winning (hw-vs-sw arbitrated) depth already used to pick
@@ -391,6 +423,31 @@ void main() {
             // renderer::ScreenProbeGIPass's gather pass (ScreenProbeGather.comp) overwrites this
             // pixel with a probe-grid visualization when this view mode is active; this branch
             // only exists to opt out of the "unhandled view mode" magenta placeholder below.
+        } else if (pc.viewMode == 15) { // DEBUG_VIEW_SHADOW_CASCADES
+            // Color-codes which sun clipmap level (renderer::VirtualShadowMapPass, Phase 3) covers
+            // this pixel's world position -- red=level 0 (finest), green=level 1, blue=level 2
+            // (coarsest) -- at full brightness if that level's covering page is already resident,
+            // dimmed to a third if not (a miss was just requested by this pixel's own
+            // SampleSunShadowVSM call above -- see that function's request+fallback comment). This
+            // mirrors the exact same level/page derivation SampleSunShadowVSM performs internally,
+            // just for visualization instead of a shadow factor.
+            const vec3 kLevelColors[SHADOW_SUN_LEVEL_COUNT] = vec3[SHADOW_SUN_LEVEL_COUNT](
+                vec3(1.0, 0.2, 0.2), vec3(0.2, 1.0, 0.2), vec3(0.2, 0.4, 1.0));
+            finalColor = vec3(0.5); // No level covers this point -- should not normally happen.
+            for (uint level = 0u; level < SHADOW_SUN_LEVEL_COUNT; ++level) {
+                vec4 dbgClip = g_ShadowSunLevels.viewProj[level] * vec4(worldPos, 1.0);
+                vec3 dbgNdc = dbgClip.xyz / dbgClip.w;
+                if (dbgNdc.x < -1.0 || dbgNdc.x > 1.0 || dbgNdc.y < -1.0 || dbgNdc.y > 1.0 || dbgNdc.z < 0.0 || dbgNdc.z > 1.0) {
+                    continue;
+                }
+                vec2 dbgPagePos = clamp((dbgNdc.xy * 0.5 + 0.5) * float(SHADOW_PAGES_PER_AXIS),
+                    vec2(0.0), vec2(float(SHADOW_PAGES_PER_AXIS) - 1.0e-4));
+                uvec2 dbgPageCoord = uvec2(floor(dbgPagePos));
+                uint dbgLogicalPageID = ShadowLogicalPageID(level, dbgPageCoord);
+                bool dbgResident = IsShadowPageResident(dbgLogicalPageID);
+                finalColor = kLevelColors[level] * (dbgResident ? 1.0 : 0.35);
+                break;
+            }
         } else if (pc.viewMode != 0 && pc.viewMode != 9 && pc.viewMode != 13) {
             // Placeholders (Global SDF / Lumen visualizations not implemented by this shader).
             finalColor = vec3(1.0, 0.0, 1.0);
@@ -404,6 +461,9 @@ void main() {
         } else if (pc.viewMode == 12 || pc.viewMode == 14) {
             // No geometry here: zero motion / no probe contribution -- leave finalColor at the
             // plain background color instead of the "unhandled view mode" magenta placeholder.
+        } else if (pc.viewMode == 15) {
+            // DEBUG_VIEW_SHADOW_CASCADES: no world position exists for a background pixel -- leave
+            // finalColor at the plain background color, matching MOTION_VECTORS/SPATIAL_PROBES above.
         } else if (pc.viewMode == 3 || pc.viewMode == 4 || pc.viewMode == 5 || pc.viewMode == 6 || pc.viewMode == 7) {
             // NANITE_INSTANCES/PRIMITIVES/SHADING_BINS/RASTER_BINS/WPO: all per-cluster
             // visualizations with nothing meaningful to show on a no-geometry pixel -- leave
@@ -456,6 +516,8 @@ void main() {
         chars[0]=71; chars[1]=76; chars[2]=79; chars[3]=66; chars[4]=65; chars[5]=76; chars[6]=32; chars[7]=83; chars[8]=68; chars[9]=70; len=10;
     } else if (pc.viewMode == 14) {
         chars[0]=83; chars[1]=80; chars[2]=65; chars[3]=84; chars[4]=73; chars[5]=65; chars[6]=76; chars[7]=32; chars[8]=80; chars[9]=82; chars[10]=79; chars[11]=66; chars[12]=69; chars[13]=83; len=14;
+    } else if (pc.viewMode == 15) { // "SHADOW CASCADES"
+        chars[0]=83; chars[1]=72; chars[2]=65; chars[3]=68; chars[4]=79; chars[5]=87; chars[6]=32; chars[7]=67; chars[8]=65; chars[9]=83; chars[10]=67; chars[11]=65; chars[12]=68; chars[13]=69; chars[14]=83; len=15;
     }
 
     if (len > 0) {

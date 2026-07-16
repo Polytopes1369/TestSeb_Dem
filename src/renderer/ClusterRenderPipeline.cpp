@@ -300,16 +300,17 @@ bool ClusterRenderPipeline::Init(
   m_Resolve.InitBinnedResolve(createInfo.device, createInfo.commandPool, createInfo.queue, m_ShadingBin);
 
   // =========================================================================================
-  // STEP 7 -- Lumen-style GI infrastructure: sun shadow map, Surface Cache, Global SDF clipmap
-  // (see ClusterRenderPipeline.h's own class-comment addendum on why these are unconditional,
-  // not Debug-only, unlike the stats/overlay block and m_SDFRayMarch below). Each pass re-reads
-  // the same consolidated .cache file independently (this codebase's established "self-contained
-  // pass" convention -- see e.g. renderer::ShadowMapPass's own class comment).
+  // STEP 7 -- Lumen-style GI infrastructure: sun+point-light Virtual Shadow Maps (Phase 3), Surface
+  // Cache, Global SDF clipmap (see ClusterRenderPipeline.h's own class-comment addendum on why
+  // these are unconditional, not Debug-only, unlike the stats/overlay block and m_SDFRayMarch
+  // below). Each pass re-reads the same consolidated .cache file independently (this codebase's
+  // established "self-contained pass" convention -- see e.g. renderer::VirtualShadowMapPass's own
+  // class comment).
   // =========================================================================================
-  if (!m_ShadowMap.Init(createInfo.device, createInfo.allocator,
-                        createInfo.commandPool, createInfo.queue,
-                        createInfo.cacheFilePath)) {
-    LOG_ERROR("[ClusterRenderPipeline] Failed to initialize ShadowMapPass.");
+  if (!m_VirtualShadowMap.Init(createInfo.device, createInfo.allocator,
+                               createInfo.commandPool, createInfo.queue,
+                               createInfo.cacheFilePath)) {
+    LOG_ERROR("[ClusterRenderPipeline] Failed to initialize VirtualShadowMapPass.");
     return false;
   }
   if (!m_SurfaceCache.Init(createInfo.device, createInfo.allocator,
@@ -318,9 +319,26 @@ bool ClusterRenderPipeline::Init(
     LOG_ERROR("[ClusterRenderPipeline] Failed to initialize SurfaceCachePass.");
     return false;
   }
-  // One-time wiring (see SurfaceCachePass::SetShadowMap's own comment): the shadow map's view/
-  // sampler never change again after ShadowMapPass::Init(), so this binding is never refreshed.
-  m_SurfaceCache.SetShadowMap(m_ShadowMap.GetShadowMapView(), m_ShadowMap.GetShadowMapSampler());
+  // One-time wiring (see SurfaceCachePass::SetVirtualShadowMap's own comment): none of
+  // VirtualShadowMapPass's exposed buffer/image handles are ever recreated after Init(), so this
+  // binding is never refreshed again. m_Resolve's own equivalent binding is deferred until after
+  // m_Resolve.InitBinnedResolve() above has already run (SetVirtualShadowMap() needs BOTH of
+  // m_Resolve's descriptor sets to already exist) -- see the call further below.
+  m_SurfaceCache.SetVirtualShadowMap(m_VirtualShadowMap);
+  m_Resolve.SetVirtualShadowMap(m_VirtualShadowMap);
+
+  // Phase 3 (UE5.8 parity roadmap) verification: SceneLights::pointLights defaults to an empty
+  // array (see LightingTypes.h) -- with zero point lights ever authored, Phase 3's point-light
+  // Virtual Shadow Maps would be entirely unexercised and unverifiable (the same difficulty this
+  // roadmap's own Phase 2 ran into for its reflections). One point light is authored here,
+  // positioned above and offset from the "box" entity (materialID 0, world position (-3,0,-3),
+  // see VulkanContext::GridSlot()/BuildEntityData()) so its shadow has a genuine chance of falling
+  // visibly toward a neighboring grid cell.
+  m_SceneLights.pointLights[0].position = maths::vec3{ -3.0f, 2.5f, -1.5f };
+  m_SceneLights.pointLights[0].color = maths::vec3{ 1.0f, 0.85f, 0.6f };
+  m_SceneLights.pointLights[0].intensity = 4.0f;
+  m_SceneLights.pointLights[0].radius = 8.0f;
+  m_SceneLights.pointLightCount = 1;
 
   if (!m_GlobalSDF.Init(createInfo.device, createInfo.allocator,
                         createInfo.commandPool, createInfo.queue,
@@ -451,7 +469,7 @@ void ClusterRenderPipeline::Shutdown() {
   m_TraceContext.Shutdown();
   m_GlobalSDF.Shutdown();
   m_SurfaceCache.Shutdown();
-  m_ShadowMap.Shutdown();
+  m_VirtualShadowMap.Shutdown();
   m_PrevViewProj = maths::mat4{};
   m_HasPrevViewProj = false;
   m_FrameIndex = 0;
@@ -566,26 +584,29 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
   m_LODSelection.RecordClear(cmd);
 
   // =========================================================================================
-  // [1z] Lumen-style GI infrastructure: sun shadow map -> Surface Cache capture -> Global SDF
-  // clipmap streaming -> (Debug-only) SDF ray march debug visualization. Independent of the
-  // Nanite VisBuffer/HZB machinery above and below (no shared images, no fence contention -- see
-  // ClusterRenderPipeline.h's own class-comment addendum), so it can run anywhere in the frame;
-  // placed early, right after the worklist clears, so it overlaps with the GPU's own internal
-  // scheduling of the culling/streaming work that follows rather than sitting at the tail end.
+  // [1z] Lumen-style GI infrastructure: Virtual Shadow Map page requests/renders (Phase 3) ->
+  // Surface Cache capture -> Global SDF clipmap streaming -> (Debug-only) SDF ray march debug
+  // visualization. Independent of the Nanite VisBuffer/HZB machinery above and below (no shared
+  // images, no fence contention -- see ClusterRenderPipeline.h's own class-comment addendum), so
+  // it can run anywhere in the frame; placed early, right after the worklist clears, so it
+  // overlaps with the GPU's own internal scheduling of the culling/streaming work that follows
+  // rather than sitting at the tail end.
   // =========================================================================================
   {
     // Sun direction is fixed for now (m_SceneLights' own default, see LightingTypes.h) -- a
     // future day/night system would rotate it per frame instead.
     const maths::vec3 sunDirection = m_SceneLights.sun.direction;
 
-    // 1. Shadow map first: SurfaceCachePass's shadow lookup (below) needs THIS frame's light
-    // view-projection, and ShadowMapPass::RecordCapture's own trailing barrier already makes its
-    // depth writes visible to a fragment-shader sampled read (see that method's own comment).
-    m_ShadowMap.RecordCapture(cmd, sunDirection);
+    // 1. Virtual Shadow Maps first: SurfaceCachePass's/m_Resolve's shadow lookups (below and at
+    // [12]) need THIS frame's VSM view-projection matrices + any pages rendered this frame already
+    // visible -- RecordBeginFrame()'s own trailing barrier (when it renders any page) covers that.
+    // See VirtualShadowMapPass's own class comment for the full one-frame-lag feedback contract.
+    m_VirtualShadowMap.RecordBeginFrame(cmd, sunDirection, m_SceneLights, cameraFrameInfo.position);
 
-    // 2. Surface Cache: feed this frame's light data (the light view-proj THIS frame's shadow map
-    // was just rendered with, not a stale one) before the visibility-driven capture draws.
-    m_SurfaceCache.UpdateLighting(m_SceneLights, m_ShadowMap.GetLightViewProj());
+    // 2. Surface Cache: feed this frame's light data before the visibility-driven capture draws --
+    // shadow lookups now read renderer::VirtualShadowMapPass's own UBOs directly (bound once via
+    // SetVirtualShadowMap()), no per-frame light-view-proj parameter needed here anymore.
+    m_SurfaceCache.UpdateLighting(m_SceneLights);
     m_SurfaceCache.UpdateVisibility(cameraFrameInfo.position, cameraFrameInfo.forward,
                                     maths::vec3{0.0f, 1.0f, 0.0f}, cameraFrameInfo.fovYRadians,
                                     cameraFrameInfo.aspectRatio, cameraFrameInfo.nearZ,
@@ -616,8 +637,8 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
       for (uint32_t bounce = 0; bounce < kRadiosityBounceCount; ++bounce) {
         m_GIInject.RecordInject(cmd, m_TraceContext, m_SurfaceCache, traceMode);
 
-        // Unlike SurfaceCachePass::RecordCapture/ShadowMapPass::RecordCapture/GlobalSDFPass::
-        // RecordUpdate, SurfaceCacheGIInjectPass::RecordInject does NOT end with its own trailing
+        // Unlike SurfaceCachePass::RecordCapture/VirtualShadowMapPass::RecordBeginFrame/
+        // GlobalSDFPass::RecordUpdate, SurfaceCacheGIInjectPass::RecordInject does NOT end with its own trailing
         // barrier -- its read-modify-write of the radiance atlas (imageLoad/imageStore, STORAGE
         // access) must be made visible here, explicitly, before the NEXT bounce's own RecordInject
         // call samples that same atlas (surface_cache_sampling.glsl's g_SurfaceCacheRadiance) --
@@ -1033,15 +1054,22 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
 #ifndef NDEBUG
   if (camera.debugViewMode == DEBUG_VIEW_NORMAL) {
     m_ShadingBin.RecordClassifyAndSort(cmd, m_RenderExtent);
-    m_Resolve.RecordResolveBinned(cmd, viewProj, m_ShadingBin);
+    m_Resolve.RecordResolveBinned(cmd, viewProj, m_SceneLights.sun.direction, m_ShadingBin);
   } else {
     maths::mat4 prevViewProjForResolve = m_HasPrevViewProj ? m_PrevViewProj : viewProj;
-    m_Resolve.RecordResolve(cmd, viewProj, prevViewProjForResolve, camera.debugViewMode);
+    m_Resolve.RecordResolve(cmd, viewProj, prevViewProjForResolve, m_SceneLights.sun.direction, camera.debugViewMode);
   }
 #else
   m_ShadingBin.RecordClassifyAndSort(cmd, m_RenderExtent);
-  m_Resolve.RecordResolveBinned(cmd, viewProj, m_ShadingBin);
+  m_Resolve.RecordResolveBinned(cmd, viewProj, m_SceneLights.sun.direction, m_ShadingBin);
 #endif
+
+  // Captures THIS frame's shadow-page miss reports (written by SurfaceCacheCapture.frag at [1z]
+  // above and by whichever ClusterResolve.comp/ClusterResolveBinned.comp path just ran) for
+  // VirtualShadowMapPass::RecordBeginFrame() to consume next frame -- see that class' own
+  // one-frame-lag contract. Placed here, right after every pass that can call
+  // RequestShadowPageResidency() this frame has run.
+  m_VirtualShadowMap.RecordEndFrame(cmd);
 
   // [12b] Screen Space Probe GI: trace -> temporal reprojection/accumulation -> bilateral
   // gather, read-modify-writing m_Resolve's own output color image directly (see
