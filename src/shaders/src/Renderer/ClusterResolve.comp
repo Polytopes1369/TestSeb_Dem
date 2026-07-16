@@ -275,7 +275,17 @@ void main() {
         vec3 lightDir = normalize(vec3(0.5, 1.0, 0.5));
         float diff = max(dot(normal, lightDir), 0.0);
 
-        uint hashed = HashID(clusterSlotIndex);
+        // Hash by cluster.clusterID (the DAG's own dense, per-file-unique numbering, assigned once
+        // at cache-build time -- see geometry::ClusterIndexEntry::clusterID), NOT clusterSlotIndex:
+        // clusterSlotIndex is this cluster's index into THIS FRAME's candidate metadata buffer,
+        // assigned by ClusterLODCompact.comp's atomicAdd(g_CandidateCount.count, ...) -- parallel
+        // GPU invocations' atomic increments do not resolve in a fixed order frame to frame, so the
+        // same physical cluster can land in a DIFFERENT slot every frame even with a static camera
+        // and an unchanged candidate set. Hashing that slot directly made every cluster's procedural
+        // color re-randomize every frame -- visually indistinguishable from genuine z-fighting at a
+        // cluster boundary, since two adjacent clusters' colors were both flickering independently.
+        // clusterID has no such instability: it is fixed at cache-build time and never reassigned.
+        uint hashed = HashID(cluster.clusterID);
         float hue = float(hashed) / 4294967295.0;
         vec3 albedo = HsvToRgb(vec3(hue, 0.65, 0.85));
         finalColor = albedo * 0.15 + albedo * diff;
@@ -302,7 +312,10 @@ void main() {
 
 #ifdef _DEBUG
         if (pc.viewMode == 1) { // DEBUG_VIEW_NANITE_TRIANGLES
-            uint hashedTri = HashID(clusterSlotIndex * 1337 + triangleOrdinal);
+            // cluster.clusterID, not clusterSlotIndex -- see the default-shading hue comment above
+            // for why the slot index flickers frame to frame; a triangle-boundary visualization
+            // needs to be temporally stable to actually be useful for inspecting triangle density.
+            uint hashedTri = HashID(cluster.clusterID * 1337u + triangleOrdinal);
             finalColor = HsvToRgb(vec3(float(hashedTri) / 4294967295.0, 0.8, 0.8));
         } else if (pc.viewMode == 2) { // DEBUG_VIEW_NANITE_CLUSTERS
             finalColor = HsvToRgb(vec3(hue, 0.8, 0.8));
