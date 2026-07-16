@@ -122,38 +122,15 @@ namespace renderer {
 
         VkDescriptorImageInfo gridStorageInfo{ VK_NULL_HANDLE, m_GridView, VK_IMAGE_LAYOUT_GENERAL };
 
-        VkWriteDescriptorSetAccelerationStructureKHR accelWrite{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR };
-        VkAccelerationStructureKHR tlasHandle = rtPass.GetTLASHandle();
-        accelWrite.accelerationStructureCount = 1;
-        accelWrite.pAccelerationStructures = &tlasHandle;
-
-        VkDescriptorBufferInfo vertexBufferInfo{ surfaceCache.GetVertexBuffer(), 0, VK_WHOLE_SIZE };
-        VkDescriptorBufferInfo indexBufferInfo{ surfaceCache.GetIndexBuffer(), 0, VK_WHOLE_SIZE };
-        VkDescriptorBufferInfo drawRangeBufferInfo{ rtPass.GetDrawRangeBuffer(), 0, VK_WHOLE_SIZE };
-
-        VkWriteDescriptorSet writes[5]{};
+        VkWriteDescriptorSet writes[1]{};
         writes[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
         writes[0].dstSet = m_Set; writes[0].dstBinding = 0; writes[0].descriptorCount = 1;
         writes[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; writes[0].pImageInfo = &gridStorageInfo;
 
-        writes[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
-        writes[1].pNext = &accelWrite;
-        writes[1].dstSet = m_Set; writes[1].dstBinding = 1; writes[1].descriptorCount = 1;
-        writes[1].descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+        vkUpdateDescriptorSets(m_Device, 1, writes, 0, nullptr);
 
-        writes[2] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
-        writes[2].dstSet = m_Set; writes[2].dstBinding = 2; writes[2].descriptorCount = 1;
-        writes[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; writes[2].pBufferInfo = &vertexBufferInfo;
-
-        writes[3] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
-        writes[3].dstSet = m_Set; writes[3].dstBinding = 3; writes[3].descriptorCount = 1;
-        writes[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; writes[3].pBufferInfo = &indexBufferInfo;
-
-        writes[4] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
-        writes[4].dstSet = m_Set; writes[4].dstBinding = 4; writes[4].descriptorCount = 1;
-        writes[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; writes[4].pBufferInfo = &drawRangeBufferInfo;
-
-        vkUpdateDescriptorSets(m_Device, 5, writes, 0, nullptr);
+        VulkanUtils::WriteSharedGeometryBindings(m_Device, m_Set, 1, rtPass.GetTLASHandle(),
+            surfaceCache.GetVertexBuffer(), surfaceCache.GetIndexBuffer(), rtPass.GetDrawRangeBuffer());
 
         // =====================================================================================
         // STEP 3 -- pipeline layout (set 0 above + set 1 mesh SDF trace scene + set 2 surface

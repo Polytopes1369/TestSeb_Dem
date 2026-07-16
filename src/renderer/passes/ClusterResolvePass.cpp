@@ -420,16 +420,9 @@ namespace renderer {
         viewParams.sunDirectionZ = sunDirection.z;
         vkCmdUpdateBuffer(cmd, m_ViewParamsBuffer.Handle(), 0, sizeof(ResolveViewParams), &viewParams);
 
-        VkMemoryBarrier2 uboBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
-        uboBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
-        uboBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-        uboBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-        uboBarrier.dstAccessMask = VK_ACCESS_2_UNIFORM_READ_BIT;
-
-        VkDependencyInfo uboDependency{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-        uboDependency.memoryBarrierCount = 1;
-        uboDependency.pMemoryBarriers = &uboBarrier;
-        vkCmdPipelineBarrier2(cmd, &uboDependency);
+        VulkanUtils::RecordMemoryBarrier(cmd,
+            VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_UNIFORM_READ_BIT);
 
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_Pipeline);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_PipelineLayout, 0, 1, &m_DescriptorSet, 0, nullptr);
@@ -449,16 +442,10 @@ namespace renderer {
         // renderer::ScreenProbeGIPass reads the 3 new GBuffer outputs (normal/depth/albedo) via
         // plain imageLoad, not a sampler -- and read-modify-writes GetOutputColorImage() itself
         // the same way.
-        VkMemoryBarrier2 outputBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
-        outputBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-        outputBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-        outputBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_COPY_BIT;
-        outputBarrier.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_TRANSFER_READ_BIT;
-
-        VkDependencyInfo outputDependency{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-        outputDependency.memoryBarrierCount = 1;
-        outputDependency.pMemoryBarriers = &outputBarrier;
-        vkCmdPipelineBarrier2(cmd, &outputDependency);
+        VulkanUtils::RecordMemoryBarrier(cmd,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_COPY_BIT,
+            VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_TRANSFER_READ_BIT);
     }
 
     void ClusterResolvePass::InitBinnedResolve(VkDevice device, VkCommandPool commandPool, VkQueue queue,
@@ -592,16 +579,9 @@ namespace renderer {
         viewParams.sunDirectionZ = sunDirection.z;
         vkCmdUpdateBuffer(cmd, m_ViewParamsBuffer.Handle(), 0, sizeof(ResolveViewParams), &viewParams);
 
-        VkMemoryBarrier2 uboBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
-        uboBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
-        uboBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-        uboBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-        uboBarrier.dstAccessMask = VK_ACCESS_2_UNIFORM_READ_BIT;
-
-        VkDependencyInfo uboDependency{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-        uboDependency.memoryBarrierCount = 1;
-        uboDependency.pMemoryBarriers = &uboBarrier;
-        vkCmdPipelineBarrier2(cmd, &uboDependency);
+        VulkanUtils::RecordMemoryBarrier(cmd,
+            VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_UNIFORM_READ_BIT);
 
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_ResolveBinnedPipeline);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_ResolveBinnedPipelineLayout, 0, 1, &m_ResolveBinnedSet, 0, nullptr);
@@ -619,16 +599,10 @@ namespace renderer {
         }
 
         // Identical trailing barrier to RecordResolve()'s own -- see that method's comment.
-        VkMemoryBarrier2 outputBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
-        outputBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-        outputBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-        outputBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_COPY_BIT;
-        outputBarrier.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_TRANSFER_READ_BIT;
-
-        VkDependencyInfo outputDependency{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-        outputDependency.memoryBarrierCount = 1;
-        outputDependency.pMemoryBarriers = &outputBarrier;
-        vkCmdPipelineBarrier2(cmd, &outputDependency);
+        VulkanUtils::RecordMemoryBarrier(cmd,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_COPY_BIT,
+            VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_TRANSFER_READ_BIT);
     }
 
     void ClusterResolvePass::SetVirtualShadowMap(const VirtualShadowMapPass& vsm) {

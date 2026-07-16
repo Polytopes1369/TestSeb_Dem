@@ -26,4 +26,24 @@ public:
     static VkShaderModule     LoadShaderModule(VkDevice device, const std::string& path);
 
     static VkPipeline CreateComputePipeline(VkDevice device, VkPipelineLayout layout, VkShaderModule computeShader);
+
+    // Descriptor-set-layout (2 storage-buffer bindings: SourceCountSSBO, DispatchArgsSSBO) for
+    // BuildDispatchIndirectArgs.comp -- identical across every pass that owns its own instance of
+    // this small "count word -> VkDispatchIndirectCommand" utility shader (ClusterLODSelectionPass,
+    // ClusterOcclusionCullingPass, ClusterSoftwareRasterPass). Split out from the pipeline creation
+    // below because some callers need the layout early (to size a shared descriptor pool) well
+    // before the pipeline itself is created.
+    static VkDescriptorSetLayout CreateBuildDispatchIndirectArgsSetLayout(VkDevice device);
+
+    // Pipeline-layout + compute-pipeline for BuildDispatchIndirectArgs.comp, built against a
+    // caller-owned `setLayout` (see CreateBuildDispatchIndirectArgsSetLayout above). Each caller
+    // still allocates/writes its own VkDescriptorSet from that layout (pointing at that pass's own
+    // count/args buffers), so passes remain independent at the descriptor-set/dispatch level; only
+    // the layout+pipeline creation boilerplate (previously hand-copied 3x) is shared.
+    static void CreateBuildDispatchIndirectArgsPipeline(
+        VkDevice device,
+        VkDescriptorSetLayout setLayout,
+        VkPipelineLayout& outPipelineLayout,
+        VkPipeline& outPipeline
+    );
 };

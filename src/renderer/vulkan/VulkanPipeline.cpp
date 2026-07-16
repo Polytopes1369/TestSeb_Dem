@@ -164,3 +164,40 @@ VkPipeline VulkanPipeline::CreateComputePipeline(VkDevice device, VkPipelineLayo
     VK_CHECK(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &computeInfo, nullptr, &pipeline));
     return pipeline;
 }
+
+VkDescriptorSetLayout VulkanPipeline::CreateBuildDispatchIndirectArgsSetLayout(VkDevice device) {
+    VkDescriptorSetLayoutBinding bindings[2]{};
+    bindings[0] = { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // SourceCountSSBO
+    bindings[1] = { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // DispatchArgsSSBO
+
+    VkDescriptorSetLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+    layoutInfo.bindingCount = 2;
+    layoutInfo.pBindings = bindings;
+
+    VkDescriptorSetLayout setLayout = VK_NULL_HANDLE;
+    VK_CHECK(vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &setLayout));
+    return setLayout;
+}
+
+void VulkanPipeline::CreateBuildDispatchIndirectArgsPipeline(
+    VkDevice device,
+    VkDescriptorSetLayout setLayout,
+    VkPipelineLayout& outPipelineLayout,
+    VkPipeline& outPipeline
+) {
+    VkPushConstantRange pushConstantRange{};
+    pushConstantRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    pushConstantRange.offset = 0;
+    pushConstantRange.size = 2 * sizeof(uint32_t); // Matches BuildDispatchArgsPushConstants { workgroupSize; perElementMultiplier; }.
+
+    VkPipelineLayoutCreateInfo pipelineLayoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+    pipelineLayoutInfo.setLayoutCount = 1;
+    pipelineLayoutInfo.pSetLayouts = &setLayout;
+    pipelineLayoutInfo.pushConstantRangeCount = 1;
+    pipelineLayoutInfo.pPushConstantRanges = &pushConstantRange;
+    VK_CHECK(vkCreatePipelineLayout(device, &pipelineLayoutInfo, nullptr, &outPipelineLayout));
+
+    VkShaderModule shaderModule = LoadShaderModule(device, "shaders/BuildDispatchIndirectArgs.comp.spv");
+    outPipeline = CreateComputePipeline(device, outPipelineLayout, shaderModule);
+    vkDestroyShaderModule(device, shaderModule, nullptr);
+}

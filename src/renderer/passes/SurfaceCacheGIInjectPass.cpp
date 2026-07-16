@@ -8,6 +8,7 @@
 #include "renderer/passes/SurfaceCacheRayTracingPass.h"
 #include "renderer/passes/SurfaceCacheTraceContext.h"
 #include "renderer/vulkan/VulkanPipeline.h"
+#include "renderer/vulkan/VulkanUtils.h"
 
 namespace renderer {
 
@@ -92,16 +93,7 @@ namespace renderer {
         VkDescriptorImageInfo worldPosInfo{ surfaceCache.GetAtlasSampler(), surfaceCache.GetWorldPosView(), VK_IMAGE_LAYOUT_GENERAL };
         VkDescriptorImageInfo emissiveInfo{ surfaceCache.GetAtlasSampler(), surfaceCache.GetEmissiveView(), VK_IMAGE_LAYOUT_GENERAL };
 
-        VkWriteDescriptorSetAccelerationStructureKHR accelWrite{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR };
-        VkAccelerationStructureKHR tlasHandle = rtPass.GetTLASHandle();
-        accelWrite.accelerationStructureCount = 1;
-        accelWrite.pAccelerationStructures = &tlasHandle;
-
-        VkDescriptorBufferInfo vertexBufferInfo{ surfaceCache.GetVertexBuffer(), 0, VK_WHOLE_SIZE };
-        VkDescriptorBufferInfo indexBufferInfo{ surfaceCache.GetIndexBuffer(), 0, VK_WHOLE_SIZE };
-        VkDescriptorBufferInfo drawRangeBufferInfo{ rtPass.GetDrawRangeBuffer(), 0, VK_WHOLE_SIZE };
-
-        VkWriteDescriptorSet writes[9]{};
+        VkWriteDescriptorSet writes[5]{};
         writes[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
         writes[0].dstSet = m_Set; writes[0].dstBinding = 0; writes[0].descriptorCount = 1;
         writes[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; writes[0].pImageInfo = &radianceStorageInfo;
@@ -122,24 +114,10 @@ namespace renderer {
         writes[4].dstSet = m_Set; writes[4].dstBinding = 4; writes[4].descriptorCount = 1;
         writes[4].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; writes[4].pImageInfo = &emissiveInfo;
 
-        writes[5] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
-        writes[5].pNext = &accelWrite;
-        writes[5].dstSet = m_Set; writes[5].dstBinding = 5; writes[5].descriptorCount = 1;
-        writes[5].descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+        vkUpdateDescriptorSets(m_Device, 5, writes, 0, nullptr);
 
-        writes[6] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
-        writes[6].dstSet = m_Set; writes[6].dstBinding = 6; writes[6].descriptorCount = 1;
-        writes[6].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; writes[6].pBufferInfo = &vertexBufferInfo;
-
-        writes[7] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
-        writes[7].dstSet = m_Set; writes[7].dstBinding = 7; writes[7].descriptorCount = 1;
-        writes[7].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; writes[7].pBufferInfo = &indexBufferInfo;
-
-        writes[8] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
-        writes[8].dstSet = m_Set; writes[8].dstBinding = 8; writes[8].descriptorCount = 1;
-        writes[8].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; writes[8].pBufferInfo = &drawRangeBufferInfo;
-
-        vkUpdateDescriptorSets(m_Device, 9, writes, 0, nullptr);
+        VulkanUtils::WriteSharedGeometryBindings(m_Device, m_Set, 5, rtPass.GetTLASHandle(),
+            surfaceCache.GetVertexBuffer(), surfaceCache.GetIndexBuffer(), rtPass.GetDrawRangeBuffer());
 
         // =====================================================================================
         // STEP 3 -- pipeline layout (set 0 above + set 1 mesh SDF trace scene + set 2 surface

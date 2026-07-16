@@ -16,6 +16,20 @@ namespace renderer {
             const std::function<void(VkCommandBuffer)>& recordFunc
         );
 
+        // Records a single global VkMemoryBarrier2 (not an image/buffer barrier -- no layout
+        // transition or ownership transfer, just an execution + memory dependency) via
+        // vkCmdPipelineBarrier2. Covers the "producer wrote via stage X, consumer reads/writes via
+        // stage Y" idiom repeated throughout the cluster culling/LOD/raster passes: UBO uploads
+        // (vkCmdUpdateBuffer -> compute read), buffer clears (vkCmdFillBuffer -> compute
+        // read/write), and compute-output-visible-to-indirect-draw handoffs.
+        static void RecordMemoryBarrier(
+            VkCommandBuffer cmd,
+            VkPipelineStageFlags2 srcStage,
+            VkAccessFlags2 srcAccess,
+            VkPipelineStageFlags2 dstStage,
+            VkAccessFlags2 dstAccess
+        );
+
         // Performs a Vulkan 2 image layout transition using vkCmdPipelineBarrier2.
         static void TransitionImageLayout(
             VkCommandBuffer cmd,
@@ -59,6 +73,36 @@ namespace renderer {
         // beyond a caller-provided max LOD -- the common "point-sample this compute-written image
         // with no wraparound" convention used by HZB/occlusion/resolve/shading-bin passes.
         static VkSampler CreateNearestSampler(VkDevice device, float maxLod = 0.0f);
+
+        // Writes bindings 0/1 of `raySet` to a caller-supplied ray-request/ray-result storage
+        // buffer pair -- the "point set 0 at this frame's caller-owned ray buffers" convention
+        // shared by SurfaceCacheSWRTPass and SurfaceCacheRayTracingPass, whose SetRayBuffers()
+        // methods are otherwise interchangeable back-ends for the same trace request protocol.
+        static void WriteRayBuffersDescriptorSet(
+            VkDevice device,
+            VkDescriptorSet raySet,
+            VkBuffer rayBuffer,
+            VkDeviceSize rayBufferSize,
+            VkBuffer resultBuffer,
+            VkDeviceSize resultBufferSize
+        );
+
+        // Writes 4 consecutive bindings -- TLAS at `baseBinding`, then the SurfaceCachePass vertex
+        // buffer, index buffer, and SurfaceCacheRayTracingPass draw-range buffer at
+        // baseBinding+1/+2/+3 -- shared by every GI pass that ray/SDF-traces the scene's HWRT
+        // fallback geometry (SurfaceCacheGIInjectPass, WorldProbeGridPass, ScreenProbeGIPass,
+        // ReflectionPass). Issued as its own vkUpdateDescriptorSets call, independent of whatever
+        // other bindings the caller writes to the same set, so callers can freely interleave this
+        // with their own pass-specific writes in any order.
+        static void WriteSharedGeometryBindings(
+            VkDevice device,
+            VkDescriptorSet set,
+            uint32_t baseBinding,
+            VkAccelerationStructureKHR tlas,
+            VkBuffer vertexBuffer,
+            VkBuffer indexBuffer,
+            VkBuffer drawRangeBuffer
+        );
     };
 
 }

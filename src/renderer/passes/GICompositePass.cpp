@@ -20,16 +20,6 @@ namespace renderer {
         };
         static_assert(sizeof(GICompositeViewParams) == 96,
             "GICompositeViewParams must match GIComposite.comp's GICompositeViewParamsUBO exactly (std140 layout, debug-only)");
-
-        // Byte-for-byte mirror of world_probe_sampling.glsl's WorldProbeGridParamsUBO (std140).
-        struct WorldProbeGridParams {
-            float gridOriginX = 0.0f, gridOriginY = 0.0f, gridOriginZ = 0.0f;
-            float probeSpacing = 0.0f;
-            float gridResolution = 0.0f;
-            float _pad0 = 0.0f, _pad1 = 0.0f, _pad2 = 0.0f;
-        };
-        static_assert(sizeof(WorldProbeGridParams) == 32,
-            "WorldProbeGridParams must match world_probe_sampling.glsl's WorldProbeGridParamsUBO exactly (std140 layout)");
 #endif
 
     } // namespace

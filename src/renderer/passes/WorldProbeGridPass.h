@@ -51,6 +51,18 @@ namespace renderer {
     class SurfaceCachePass;
     class SurfaceCacheRayTracingPass;
 
+    // Byte-for-byte mirror of world_probe_sampling.glsl's WorldProbeGridParamsUBO (std140). Shared
+    // by every pass that samples the world probe grid (GICompositePass, ScreenTracePass) so the
+    // layout can never silently drift between two independently-hand-typed copies.
+    struct WorldProbeGridParams {
+        float gridOriginX = 0.0f, gridOriginY = 0.0f, gridOriginZ = 0.0f;
+        float probeSpacing = 0.0f;
+        float gridResolution = 0.0f;
+        float _pad0 = 0.0f, _pad1 = 0.0f, _pad2 = 0.0f;
+    };
+    static_assert(sizeof(WorldProbeGridParams) == 32,
+        "WorldProbeGridParams must match world_probe_sampling.glsl's WorldProbeGridParamsUBO exactly (std140 layout)");
+
     class WorldProbeGridPass {
     public:
         WorldProbeGridPass() = default;

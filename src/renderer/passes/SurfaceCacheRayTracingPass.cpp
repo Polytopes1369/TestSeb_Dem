@@ -11,6 +11,7 @@
 #include "renderer/passes/SurfaceCachePass.h"
 #include "renderer/passes/SurfaceCacheTraceContext.h"
 #include "renderer/vulkan/VulkanPipeline.h"
+#include "renderer/vulkan/VulkanUtils.h"
 
 namespace renderer {
 
@@ -383,25 +384,7 @@ namespace renderer {
     }
 
     void SurfaceCacheRayTracingPass::SetRayBuffers(VkBuffer rayBuffer, VkDeviceSize rayBufferSize, VkBuffer resultBuffer, VkDeviceSize resultBufferSize) {
-        VkDescriptorBufferInfo rayInfo{ rayBuffer, 0, rayBufferSize };
-        VkDescriptorBufferInfo resultInfo{ resultBuffer, 0, resultBufferSize };
-
-        VkWriteDescriptorSet writes[2]{};
-        writes[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
-        writes[0].dstSet = m_RaySet;
-        writes[0].dstBinding = 0;
-        writes[0].descriptorCount = 1;
-        writes[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        writes[0].pBufferInfo = &rayInfo;
-
-        writes[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
-        writes[1].dstSet = m_RaySet;
-        writes[1].dstBinding = 1;
-        writes[1].descriptorCount = 1;
-        writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        writes[1].pBufferInfo = &resultInfo;
-
-        vkUpdateDescriptorSets(m_Device, 2, writes, 0, nullptr);
+        VulkanUtils::WriteRayBuffersDescriptorSet(m_Device, m_RaySet, rayBuffer, rayBufferSize, resultBuffer, resultBufferSize);
     }
 
     void SurfaceCacheRayTracingPass::RecordTrace(VkCommandBuffer cmd, uint32_t rayCount, const SurfaceCacheTraceContext& traceContext) {
