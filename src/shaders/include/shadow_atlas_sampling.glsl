@@ -16,11 +16,21 @@ layout(set = SHADOW_ATLAS_SET, binding = SHADOW_ATLAS_BINDING) uniform sampler2D
 // codebase's pre-Phase-3 single shadow map (see renderer::ShadowMapPass's own "Plain sampler2D,
 // not shadow/compare sampler" note). `pageLocalUV` is this sample's position within the page,
 // already in [0,1]^2 (the caller has already split world-space NDC into page index + local UV --
-// see shadow_sun_sampling.glsl / shadow_point_sampling.glsl). Fixed depth bias: sufficient here
-// for the same reason as the pre-Phase-3 map -- every occluder is the same static Fallback Mesh
-// geometry the page itself was rasterized from, no skinning/animation jitter to compensate for.
+// see shadow_sun_sampling.glsl / shadow_point_sampling.glsl). Fixed (not slope-scaled) depth bias:
+// sufficient for animation jitter (every occluder is the same static Fallback Mesh geometry the
+// page itself was rasterized from, no skinning to compensate for) -- but a fixed bias is inherently
+// a worse fit at grazing surface-to-light angles than head-on ones (the same NDC-space bias maps
+// to a smaller effective world-space offset as the angle gets shallower), so curved surfaces (a
+// continuous range of angles, unlike a flat face's single constant angle) show self-shadowing
+// acne more readily. Bumped from the original 0.0015 when the sun's default direction (previously
+// a steep ~64 degree elevation) became a much shallower ~45.5 degree one (Toronto, 16:30 EDT,
+// see ClusterRenderPipeline::Init()'s own comment) -- that lower elevation made exactly this
+// grazing-angle acne visible on curved primitives (spheres/capsules) that weren't showing it
+// before. A full slope-scaled bias would need every caller (sun AND point lights, several shading
+// shaders) to also thread a normal/NdotL through -- this single-constant bump is the smaller,
+// lower-risk fix for the actual angle range this scene's sun now uses.
 float SampleShadowPagePCF(uint physicalLayer, vec2 pageLocalUV, float currentDepthNDC) {
-    const float kDepthBias = 0.0015;
+    const float kDepthBias = 0.004;
     vec2 texelSize = vec2(1.0 / float(SHADOW_PAGE_TEXELS));
     float shadow = 0.0;
     for (int y = -1; y <= 1; ++y) {
