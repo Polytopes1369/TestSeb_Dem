@@ -9,26 +9,11 @@
 #include "core/Logger.h"
 #include "renderer/MaterialParameterTable.h"
 #include "renderer/vulkan/VulkanPipeline.h"
+#include "renderer/vulkan/VulkanUtils.h"
 
 namespace renderer {
 
     namespace {
-
-        // Mirrors ClusterResolvePass.cpp's own copy -- duplicated rather than shared because this
-        // class is deliberately self-contained (no VulkanContext dependency), matching this
-        // codebase's existing per-pass convention.
-        std::vector<char> ReadShaderFile(const std::string& filename) {
-            std::ifstream file(filename, std::ios::ate | std::ios::binary);
-            if (!file.is_open()) {
-                throw std::runtime_error("ClusterShadingBinPass: failed to open SPIR-V file: " + filename);
-            }
-            size_t fileSize = static_cast<size_t>(file.tellg());
-            std::vector<char> buffer(fileSize);
-            file.seekg(0);
-            file.read(buffer.data(), static_cast<std::streamsize>(fileSize));
-            file.close();
-            return buffer;
-        }
 
         // Byte-for-byte mirror of PixelScratchEntry/SortedPixelEntry in shading_bin_common.glsl
         // (both 12 bytes: 2x uint32 + 1x float, std430 needs no padding since 12 is already a
@@ -79,21 +64,7 @@ namespace renderer {
         // shader always reads exact integer texels via texelFetch, no filtering ever happens).
         // Not exposed by ClusterResolvePass for borrowing (private, no getter), so this class owns
         // its own small, cheap copy rather than plumbing a new accessor through that class.
-        VkSampler depthSampler = VK_NULL_HANDLE;
-        {
-            VkSamplerCreateInfo samplerInfo{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
-            samplerInfo.magFilter = VK_FILTER_NEAREST;
-            samplerInfo.minFilter = VK_FILTER_NEAREST;
-            samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
-            samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-            samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-            samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-            samplerInfo.minLod = 0.0f;
-            samplerInfo.maxLod = 0.0f;
-            samplerInfo.compareEnable = VK_FALSE;
-            samplerInfo.unnormalizedCoordinates = VK_FALSE;
-            VK_CHECK(vkCreateSampler(m_Device, &samplerInfo, nullptr, &depthSampler));
-        }
+        VkSampler depthSampler = VulkanUtils::CreateNearestSampler(m_Device);
         m_DepthSampler = depthSampler;
 
         // --- Descriptor pool: sized for the union of all 3 sets' bindings (one pool, one alloc). ---
@@ -173,8 +144,7 @@ namespace renderer {
             pipelineLayoutInfo.pPushConstantRanges = &pushRange;
             VK_CHECK(vkCreatePipelineLayout(m_Device, &pipelineLayoutInfo, nullptr, &m_ClassifyPipelineLayout));
 
-            std::vector<char> shaderCode = ReadShaderFile("shaders/ClusterShadingBinClassify.comp.spv");
-            VkShaderModule shaderModule = VulkanPipeline::CreateShaderModule(m_Device, shaderCode);
+            VkShaderModule shaderModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/ClusterShadingBinClassify.comp.spv");
             m_ClassifyPipeline = VulkanPipeline::CreateComputePipeline(m_Device, m_ClassifyPipelineLayout, shaderModule);
             vkDestroyShaderModule(m_Device, shaderModule, nullptr);
         }
@@ -218,8 +188,7 @@ namespace renderer {
             pipelineLayoutInfo.pushConstantRangeCount = 0;
             VK_CHECK(vkCreatePipelineLayout(m_Device, &pipelineLayoutInfo, nullptr, &m_PrefixSumPipelineLayout));
 
-            std::vector<char> shaderCode = ReadShaderFile("shaders/ClusterShadingBinPrefixSum.comp.spv");
-            VkShaderModule shaderModule = VulkanPipeline::CreateShaderModule(m_Device, shaderCode);
+            VkShaderModule shaderModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/ClusterShadingBinPrefixSum.comp.spv");
             m_PrefixSumPipeline = VulkanPipeline::CreateComputePipeline(m_Device, m_PrefixSumPipelineLayout, shaderModule);
             vkDestroyShaderModule(m_Device, shaderModule, nullptr);
         }
@@ -262,8 +231,7 @@ namespace renderer {
             pipelineLayoutInfo.pPushConstantRanges = &pushRange;
             VK_CHECK(vkCreatePipelineLayout(m_Device, &pipelineLayoutInfo, nullptr, &m_ScatterPipelineLayout));
 
-            std::vector<char> shaderCode = ReadShaderFile("shaders/ClusterShadingBinScatter.comp.spv");
-            VkShaderModule shaderModule = VulkanPipeline::CreateShaderModule(m_Device, shaderCode);
+            VkShaderModule shaderModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/ClusterShadingBinScatter.comp.spv");
             m_ScatterPipeline = VulkanPipeline::CreateComputePipeline(m_Device, m_ScatterPipelineLayout, shaderModule);
             vkDestroyShaderModule(m_Device, shaderModule, nullptr);
         }

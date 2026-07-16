@@ -168,18 +168,7 @@ namespace renderer {
         // --- Depth sampler: nearest filtering, matching HZBPass's own depth-sampling convention
         // (the shader always reads exact integer texels via texelFetch, no filtering ever actually
         // happens). ---
-        VkSamplerCreateInfo samplerInfo{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
-        samplerInfo.magFilter = VK_FILTER_NEAREST;
-        samplerInfo.minFilter = VK_FILTER_NEAREST;
-        samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
-        samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-        samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-        samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-        samplerInfo.minLod = 0.0f;
-        samplerInfo.maxLod = 0.0f;
-        samplerInfo.compareEnable = VK_FALSE;
-        samplerInfo.unnormalizedCoordinates = VK_FALSE;
-        VK_CHECK(vkCreateSampler(m_Device, &samplerInfo, nullptr, &m_DepthSampler));
+        m_DepthSampler = VulkanUtils::CreateNearestSampler(m_Device);
 
         // --- View-params UBO ---
         m_ViewParamsBuffer.Create(

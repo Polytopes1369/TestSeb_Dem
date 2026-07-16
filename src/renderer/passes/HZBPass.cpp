@@ -156,18 +156,7 @@ namespace renderer {
         // and clamp-to-edge: the shader always reads exact integer texels via texelFetch (no
         // filtering ever actually happens), clamp-to-edge is just defensive since every sample
         // coordinate is already clamped in-shader before the fetch. ---
-        VkSamplerCreateInfo samplerInfo{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
-        samplerInfo.magFilter = VK_FILTER_NEAREST;
-        samplerInfo.minFilter = VK_FILTER_NEAREST;
-        samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
-        samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-        samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-        samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-        samplerInfo.minLod = 0.0f;
-        samplerInfo.maxLod = 0.0f;
-        samplerInfo.compareEnable = VK_FALSE; // Plain sampler2D read, not a shadow/compare sampler.
-        samplerInfo.unnormalizedCoordinates = VK_FALSE;
-        VK_CHECK(vkCreateSampler(m_Device, &samplerInfo, nullptr, &m_DepthSampler));
+        m_DepthSampler = VulkanUtils::CreateNearestSampler(m_Device);
 
         // --- Descriptor set layouts: one for the init pass (source depth sampler + mip 0 storage
         // image), one for the reduce pass (src mip storage image + dst mip storage image). ---

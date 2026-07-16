@@ -10,54 +10,12 @@
 #include "renderer/passes/SurfaceCachePass.h"
 #include "renderer/passes/SurfaceCacheRayTracingPass.h"
 #include "renderer/passes/SurfaceCacheTraceContext.h"
+#include "renderer/vulkan/VulkanPipeline.h"
+#include "renderer/vulkan/VulkanUtils.h"
 
 namespace renderer {
 
     namespace {
-
-        // Mirrors every other pass's own copy -- see GlobalSDFPass.cpp's own comment on this
-        // codebase's per-pass self-containment convention.
-        std::vector<char> ReadShaderFile(const std::string& filename) {
-            std::ifstream file(filename, std::ios::ate | std::ios::binary);
-            if (!file.is_open()) {
-                throw std::runtime_error("ReflectionPass: failed to open SPIR-V file: " + filename);
-            }
-            size_t fileSize = static_cast<size_t>(file.tellg());
-            std::vector<char> buffer(fileSize);
-            file.seekg(0);
-            file.read(buffer.data(), static_cast<std::streamsize>(fileSize));
-            file.close();
-            return buffer;
-        }
-
-        VkShaderModule CreateShaderModule(VkDevice device, const std::vector<char>& code) {
-            VkShaderModuleCreateInfo createInfo{ VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
-            createInfo.codeSize = code.size();
-            createInfo.pCode = reinterpret_cast<const uint32_t*>(code.data());
-            VkShaderModule module;
-            VK_CHECK(vkCreateShaderModule(device, &createInfo, nullptr, &module));
-            return module;
-        }
-
-        void TransitionImageLayout(VkCommandBuffer cmd, VkImage image, VkImageLayout oldLayout, VkImageLayout newLayout,
-            VkPipelineStageFlags2 srcStage, VkAccessFlags2 srcAccess, VkPipelineStageFlags2 dstStage, VkAccessFlags2 dstAccess) {
-            VkImageMemoryBarrier2 barrier{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
-            barrier.srcStageMask = srcStage;
-            barrier.srcAccessMask = srcAccess;
-            barrier.dstStageMask = dstStage;
-            barrier.dstAccessMask = dstAccess;
-            barrier.oldLayout = oldLayout;
-            barrier.newLayout = newLayout;
-            barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            barrier.image = image;
-            barrier.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-
-            VkDependencyInfo depInfo{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-            depInfo.imageMemoryBarrierCount = 1;
-            depInfo.pImageMemoryBarriers = &barrier;
-            vkCmdPipelineBarrier2(cmd, &depInfo);
-        }
 
         // Byte-for-byte std140 mirror of ReflectionViewParamsUBO in every Reflection*.comp shader.
         struct ReflectionViewParamsUBO {
@@ -146,18 +104,7 @@ namespace renderer {
         // ScreenProbeGIPass::Init's own STEP 1 pattern: radiance/worldPos start at a=0 (never
         // traced -- see kWorldPosFormat's own "validity" comment), normal = oct-encoded +Y (an
         // arbitrary but valid direction).
-        {
-            VkCommandBufferAllocateInfo cmdAllocInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
-            cmdAllocInfo.commandPool = commandPool;
-            cmdAllocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-            cmdAllocInfo.commandBufferCount = 1;
-            VkCommandBuffer cmd;
-            VK_CHECK(vkAllocateCommandBuffers(m_Device, &cmdAllocInfo, &cmd));
-
-            VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-            beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-            vkBeginCommandBuffer(cmd, &beginInfo);
-
+        VulkanUtils::ExecuteOneShotCommands(m_Device, commandPool, queue, [&](VkCommandBuffer cmd) {
             VkClearColorValue zeroClear{}; zeroClear.float32[0] = 0.0f; zeroClear.float32[1] = 0.0f; zeroClear.float32[2] = 0.0f; zeroClear.float32[3] = 0.0f;
             VkClearColorValue normalClear{}; normalClear.float32[0] = 0.5f; normalClear.float32[1] = 0.5f; normalClear.float32[2] = 0.0f; normalClear.float32[3] = 0.0f;
             VkImageSubresourceRange colorRange{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
@@ -167,24 +114,16 @@ namespace renderer {
                     { slot.radianceImage, &zeroClear }, { slot.worldPosImage, &zeroClear }, { slot.normalImage, &normalClear }
                 };
                 for (auto& entry : clears) {
-                    TransitionImageLayout(cmd, entry.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    VulkanUtils::TransitionImageLayout(cmd, entry.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                         VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0, VK_PIPELINE_STAGE_2_CLEAR_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
                     vkCmdClearColorImage(cmd, entry.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, entry.clear, 1, &colorRange);
-                    TransitionImageLayout(cmd, entry.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+                    VulkanUtils::TransitionImageLayout(cmd, entry.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
                         VK_PIPELINE_STAGE_2_CLEAR_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                         VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
                 }
             }
-
-            vkEndCommandBuffer(cmd);
-            VkSubmitInfo submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
-            submitInfo.commandBufferCount = 1;
-            submitInfo.pCommandBuffers = &cmd;
-            VK_CHECK(vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE));
-            VK_CHECK(vkQueueWaitIdle(queue));
-            vkFreeCommandBuffers(m_Device, commandPool, 1, &cmd);
-        }
+            });
 
         // =====================================================================================
         // STEP 2 -- Trace pipeline: set 0 (11 bindings, 2 slot-indexed variants) + set 1 (mesh SDF
@@ -267,7 +206,7 @@ namespace renderer {
             pipelineLayoutInfo.pPushConstantRanges = &pushRange;
             VK_CHECK(vkCreatePipelineLayout(m_Device, &pipelineLayoutInfo, nullptr, &m_TracePipelineLayout));
 
-            VkShaderModule shaderModule = CreateShaderModule(m_Device, ReadShaderFile("shaders/ReflectionTrace.comp.spv"));
+            VkShaderModule shaderModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/ReflectionTrace.comp.spv");
             VkComputePipelineCreateInfo pipelineInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
             pipelineInfo.layout = m_TracePipelineLayout;
             pipelineInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
@@ -348,7 +287,7 @@ namespace renderer {
             pipelineLayoutInfo.pPushConstantRanges = nullptr;
             VK_CHECK(vkCreatePipelineLayout(m_Device, &pipelineLayoutInfo, nullptr, &m_TemporalPipelineLayout));
 
-            VkShaderModule shaderModule = CreateShaderModule(m_Device, ReadShaderFile("shaders/ReflectionTemporal.comp.spv"));
+            VkShaderModule shaderModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/ReflectionTemporal.comp.spv");
             VkComputePipelineCreateInfo pipelineInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
             pipelineInfo.layout = m_TemporalPipelineLayout;
             pipelineInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
@@ -419,7 +358,7 @@ namespace renderer {
             pipelineLayoutInfo.pPushConstantRanges = nullptr;
             VK_CHECK(vkCreatePipelineLayout(m_Device, &pipelineLayoutInfo, nullptr, &m_GatherPipelineLayout));
 
-            VkShaderModule shaderModule = CreateShaderModule(m_Device, ReadShaderFile("shaders/ReflectionGather.comp.spv"));
+            VkShaderModule shaderModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/ReflectionGather.comp.spv");
             VkComputePipelineCreateInfo pipelineInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
             pipelineInfo.layout = m_GatherPipelineLayout;
             pipelineInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;

@@ -5,6 +5,7 @@
 
 #include "core/Logger.h"
 #include "renderer/vulkan/VulkanPipeline.h"
+#include "renderer/vulkan/VulkanUtils.h"
 
 namespace renderer {
 
@@ -135,18 +136,7 @@ namespace renderer {
         // filtering would blend two texels' (or two mips') max-depth values together, which is
         // not itself a valid max-depth bound for the blended footprint and would silently break
         // IsClusterOccluded's conservativeness (see hzb_occlusion.glsl). ---
-        VkSamplerCreateInfo samplerInfo{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
-        samplerInfo.magFilter = VK_FILTER_NEAREST;
-        samplerInfo.minFilter = VK_FILTER_NEAREST;
-        samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
-        samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-        samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-        samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-        samplerInfo.minLod = 0.0f;
-        samplerInfo.maxLod = m_HZBMipCount;
-        samplerInfo.compareEnable = VK_FALSE;
-        samplerInfo.unnormalizedCoordinates = VK_FALSE;
-        VK_CHECK(vkCreateSampler(m_Device, &samplerInfo, nullptr, &m_HZBSampler));
+        m_HZBSampler = VulkanUtils::CreateNearestSampler(m_Device, m_HZBMipCount);
 
         // --- Main descriptor set layout: 17 bindings, all compute-visible, matching
         // ClusterHZBOcclusionCull.comp's set = 0 bindings 0..16 exactly (0..11 the original set,

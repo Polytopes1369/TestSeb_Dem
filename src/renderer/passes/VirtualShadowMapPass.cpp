@@ -11,34 +11,11 @@
 #include "core/Logger.h"
 #include "geometry/ClusterFormat.h"
 #include "io/CacheFileManager.h"
+#include "renderer/vulkan/VulkanPipeline.h"
 
 namespace renderer {
 
     namespace {
-
-        // Mirrors ShadowMapPass.cpp's own copy -- see this codebase's established "self-contained
-        // pass" convention (that class' own header comment).
-        std::vector<char> ReadShaderFile(const std::string& filename) {
-            std::ifstream file(filename, std::ios::ate | std::ios::binary);
-            if (!file.is_open()) {
-                throw std::runtime_error("VirtualShadowMapPass: failed to open SPIR-V file: " + filename);
-            }
-            size_t fileSize = static_cast<size_t>(file.tellg());
-            std::vector<char> buffer(fileSize);
-            file.seekg(0);
-            file.read(buffer.data(), static_cast<std::streamsize>(fileSize));
-            file.close();
-            return buffer;
-        }
-
-        VkShaderModule CreateShaderModule(VkDevice device, const std::vector<char>& code) {
-            VkShaderModuleCreateInfo createInfo{ VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
-            createInfo.codeSize = code.size();
-            createInfo.pCode = reinterpret_cast<const uint32_t*>(code.data());
-            VkShaderModule module;
-            VK_CHECK(vkCreateShaderModule(device, &createInfo, nullptr, &module));
-            return module;
-        }
 
         // Byte-identical to ShadowMapPass.cpp's own ShadowCaptureConstants -- both pipelines share
         // the exact same ShadowMapCapture.vert unchanged (see this pass' own class comment).
@@ -232,8 +209,7 @@ namespace renderer {
         layoutInfo.pPushConstantRanges = &pushConstantRange;
         VK_CHECK(vkCreatePipelineLayout(m_Device, &layoutInfo, nullptr, &m_PipelineLayout));
 
-        std::vector<char> vertCode = ReadShaderFile("shaders/ShadowMapCapture.vert.spv");
-        VkShaderModule vertModule = CreateShaderModule(m_Device, vertCode);
+        VkShaderModule vertModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/ShadowMapCapture.vert.spv");
 
         VkPipelineShaderStageCreateInfo stage{ VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO };
         stage.stage = VK_SHADER_STAGE_VERTEX_BIT;

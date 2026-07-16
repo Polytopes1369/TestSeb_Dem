@@ -64,7 +64,9 @@ namespace renderer {
         VkAccessFlags2 dstAccess,
         VkImageAspectFlags aspectMask,
         uint32_t baseMip,
-        uint32_t mipCount
+        uint32_t mipCount,
+        uint32_t baseLayer,
+        uint32_t layerCount
     ) {
         VkImageMemoryBarrier2 barrier{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
         barrier.srcStageMask = srcStage;
@@ -76,12 +78,55 @@ namespace renderer {
         barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         barrier.image = image;
-        barrier.subresourceRange = { aspectMask, baseMip, mipCount, 0, 1 };
+        barrier.subresourceRange = { aspectMask, baseMip, mipCount, baseLayer, layerCount };
 
         VkDependencyInfo depInfo{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
         depInfo.imageMemoryBarrierCount = 1;
         depInfo.pImageMemoryBarriers = &barrier;
         vkCmdPipelineBarrier2(cmd, &depInfo);
+    }
+
+    void VulkanUtils::TransitionImageLayoutOneShot(
+        VkDevice device,
+        VkCommandPool commandPool,
+        VkQueue queue,
+        VkImage image,
+        VkImageLayout oldLayout,
+        VkImageLayout newLayout,
+        VkPipelineStageFlags2 srcStage,
+        VkAccessFlags2 srcAccess,
+        VkPipelineStageFlags2 dstStage,
+        VkAccessFlags2 dstAccess,
+        VkImageAspectFlags aspectMask,
+        uint32_t baseMip,
+        uint32_t mipCount,
+        uint32_t baseLayer,
+        uint32_t layerCount
+    ) {
+        ExecuteOneShotCommands(device, commandPool, queue, [&](VkCommandBuffer cmd) {
+            TransitionImageLayout(cmd, image, oldLayout, newLayout, srcStage, srcAccess, dstStage,
+                dstAccess, aspectMask, baseMip, mipCount, baseLayer, layerCount);
+            });
+    }
+
+    VkSampler VulkanUtils::CreateNearestSampler(VkDevice device, float maxLod) {
+        VkSamplerCreateInfo samplerInfo{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
+        samplerInfo.magFilter = VK_FILTER_NEAREST;
+        samplerInfo.minFilter = VK_FILTER_NEAREST;
+        samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+        samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        samplerInfo.minLod = 0.0f;
+        samplerInfo.maxLod = maxLod;
+        samplerInfo.compareEnable = VK_FALSE; // Plain sampler2D read, not a shadow/compare sampler.
+        samplerInfo.unnormalizedCoordinates = VK_FALSE;
+
+        VkSampler sampler = VK_NULL_HANDLE;
+        if (vkCreateSampler(device, &samplerInfo, nullptr, &sampler) != VK_SUCCESS) {
+            throw std::runtime_error("VulkanUtils: Failed to create nearest-filter sampler");
+        }
+        return sampler;
     }
 
 }

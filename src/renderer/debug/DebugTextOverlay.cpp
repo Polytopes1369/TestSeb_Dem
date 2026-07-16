@@ -44,23 +44,14 @@ namespace renderer::debug {
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
 
         {
-            VkBufferCreateInfo stagingInfo{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
-            stagingInfo.size = fontBytes;
-            stagingInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-
-            VmaAllocationCreateInfo stagingAllocInfo{};
-            stagingAllocInfo.usage = VMA_MEMORY_USAGE_CPU_ONLY;
-            stagingAllocInfo.flags = VMA_ALLOCATION_CREATE_MAPPED_BIT;
-
-            VkBuffer stagingBuffer = VK_NULL_HANDLE;
-            VmaAllocation stagingAllocation = VK_NULL_HANDLE;
-            VmaAllocationInfo stagingAllocResultInfo{};
-            VK_CHECK(vmaCreateBuffer(allocator, &stagingInfo, &stagingAllocInfo, &stagingBuffer, &stagingAllocation, &stagingAllocResultInfo));
-            std::memcpy(stagingAllocResultInfo.pMappedData, fontRows.data(), static_cast<size_t>(fontBytes));
+            GpuBuffer stagingBuffer;
+            stagingBuffer.Create(allocator, fontBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                VMA_MEMORY_USAGE_CPU_ONLY, /*mapped=*/true);
+            std::memcpy(stagingBuffer.MappedData(), fontRows.data(), static_cast<size_t>(fontBytes));
 
             VulkanUtils::ExecuteOneShotCommands(m_Device, commandPool, queue, [&](VkCommandBuffer cmd) {
                 VkBufferCopy copyRegion{ 0, 0, fontBytes };
-                vkCmdCopyBuffer(cmd, stagingBuffer, m_FontBuffer.Handle(), 1, &copyRegion);
+                vkCmdCopyBuffer(cmd, stagingBuffer.Handle(), m_FontBuffer.Handle(), 1, &copyRegion);
 
                 VkMemoryBarrier2 barrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
                 barrier.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
@@ -73,8 +64,6 @@ namespace renderer::debug {
                 depInfo.pMemoryBarriers = &barrier;
                 vkCmdPipelineBarrier2(cmd, &depInfo);
             });
-
-            vmaDestroyBuffer(allocator, stagingBuffer, stagingAllocation);
         }
 
         // --- Descriptor set: binding 0 = GlyphInstancesSSBO (vertex-stage), binding 1 =

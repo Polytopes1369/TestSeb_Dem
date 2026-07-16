@@ -1065,7 +1065,7 @@ void VulkanContext::CreatePipelinesAndDescriptors() {
       {"shaders/geom_chamferBox.comp.spv", &m_ChamferBoxPipeline},
   };
   for (const auto &desc : simplePrimitives) {
-    auto code = ReadShaderFile(desc.shaderFile);
+    auto code = VulkanPipeline::ReadShaderFile(desc.shaderFile);
     VkShaderModule module = VulkanPipeline::CreateShaderModule(m_Device, code);
 
     VkComputePipelineCreateInfo pipelineInfo{
@@ -1090,7 +1090,7 @@ void VulkanContext::CreatePipelinesAndDescriptors() {
   // face, differentiated only by VkSpecializationInfo (axis mapping + winding,
   // see kBoxFaceSpecs).
   {
-    auto boxCode = ReadShaderFile("shaders/geom_box.comp.spv");
+    auto boxCode = VulkanPipeline::ReadShaderFile("shaders/geom_box.comp.spv");
     VkShaderModule boxModule =
         VulkanPipeline::CreateShaderModule(m_Device, boxCode);
 
@@ -1149,8 +1149,8 @@ void VulkanContext::CreatePipelinesAndDescriptors() {
     throw std::runtime_error("Failed to create Graphics Pipeline Layout!");
   }
 
-  auto vertCode = ReadShaderFile("shaders/draw.vert.spv");
-  auto fragCode = ReadShaderFile("shaders/draw.frag.spv");
+  auto vertCode = VulkanPipeline::ReadShaderFile("shaders/draw.vert.spv");
+  auto fragCode = VulkanPipeline::ReadShaderFile("shaders/draw.frag.spv");
   VkShaderModule vertModule =
       VulkanPipeline::CreateShaderModule(m_Device, vertCode);
   VkShaderModule fragModule =
@@ -2224,20 +2224,6 @@ void VulkanContext::DebugReadbackGeometrySample(uint32_t vertsPerFace,
 
   vmaDestroyBuffer(m_Allocator, stagingVertexBuffer, stagingVertexAlloc);
   vmaDestroyBuffer(m_Allocator, stagingIndexBuffer, stagingIndexAlloc);
-}
-
-std::vector<char> VulkanContext::ReadShaderFile(const std::string &filename) {
-  std::ifstream file(filename, std::ios::ate | std::ios::binary);
-  if (!file.is_open()) {
-    throw std::runtime_error("Failed to open explicit SPIR-V file: " +
-                             filename);
-  }
-  size_t fileSize = (size_t)file.tellg();
-  std::vector<char> buffer(fileSize);
-  file.seekg(0);
-  file.read(buffer.data(), fileSize);
-  file.close();
-  return buffer;
 }
 
 void VulkanContext::Shutdown() {
