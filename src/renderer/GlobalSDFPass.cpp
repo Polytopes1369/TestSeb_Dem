@@ -151,6 +151,7 @@ namespace renderer {
             maths::vec3 volumeMin{};
             float voxelSize = 0.0f;
             uint32_t resolution = 0;
+            uint32_t entityID = 0;
         };
         std::vector<PendingUpload> uploads;
         uploads.reserve(fallbackTable.size());
@@ -184,6 +185,7 @@ namespace renderer {
             upload.volumeMin = sdf.volumeMin;
             upload.voxelSize = sdf.voxelSize;
             upload.resolution = sdf.resolution;
+            upload.entityID = entry.entityID;
             upload.decodedGrid.resize(static_cast<size_t>(sdf.resolution) * sdf.resolution * sdf.resolution);
             for (uint32_t z = 0; z < sdf.resolution; ++z) {
                 for (uint32_t y = 0; y < sdf.resolution; ++y) {
@@ -225,6 +227,7 @@ namespace renderer {
             entitySdf.volumeMin = uploads[i].volumeMin;
             entitySdf.voxelSize = uploads[i].voxelSize;
             entitySdf.resolution = uploads[i].resolution;
+            entitySdf.entityID = uploads[i].entityID;
 
             entityImageInfo.extent = { entitySdf.resolution, entitySdf.resolution, entitySdf.resolution };
             VK_CHECK(vmaCreateImage(allocator, &entityImageInfo, &gpuOnlyAlloc, &entitySdf.image, &entitySdf.allocation, nullptr));
@@ -462,6 +465,21 @@ namespace renderer {
         vkDestroyShaderModule(m_Device, shaderModule, nullptr);
 
         return true;
+    }
+
+    std::vector<GlobalSDFPass::TracedEntityInfo> GlobalSDFPass::GetTracedEntityInfos() const {
+        std::vector<TracedEntityInfo> infos;
+        infos.reserve(m_Entities.size());
+        for (const EntitySDF& entity : m_Entities) {
+            TracedEntityInfo info{};
+            info.entityID = entity.entityID;
+            info.sdfView = entity.view;
+            info.volumeMin = entity.volumeMin;
+            info.voxelSize = entity.voxelSize;
+            info.resolution = entity.resolution;
+            infos.push_back(info);
+        }
+        return infos;
     }
 
     void GlobalSDFPass::Shutdown() {

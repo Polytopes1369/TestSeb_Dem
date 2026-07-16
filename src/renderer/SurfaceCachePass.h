@@ -59,6 +59,23 @@ namespace renderer {
         static constexpr VkFormat kNormalFormat = VK_FORMAT_R8G8B8A8_UNORM; // Octahedral-encoded world-space normal in RG.
         static constexpr VkFormat kEmissiveFormat = VK_FORMAT_R8G8B8A8_UNORM;
         static constexpr VkFormat kDepthFormat = VK_FORMAT_D32_SFLOAT;
+        // HDR outgoing-radiance atlas: what a GI trace (SWRT/HWRT, see SurfaceCacheSWRTPass /
+        // SurfaceCacheRayTracingPass) samples as "the luminance stored at this texel," and what
+        // SurfaceCacheGIInject.comp read-modify-writes a secondary bounce into. Seeded at capture
+        // time (SurfaceCacheCapture.frag) to emissive + albedo*kInitialRadianceAmbientProxy so the
+        // very first trace before any GI injection pass has run does not sample pure black.
+        // STORAGE_BIT (unlike albedo/normal/emissive) because the injection compute shader needs
+        // imageLoad/imageStore, not just a sampled read.
+        static constexpr VkFormat kRadianceFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
+        static constexpr float kInitialRadianceAmbientProxy = 0.15f;
+        // World-space (== local-space, this codebase's entities carry no runtime transform --
+        // see SurfaceCacheCapture.vert's own comment) hit position atlas: full float precision
+        // because a demoscene-scale local position is not reliably representable in fp16. This is
+        // the "where in 3D space does this texel's captured surface actually sit" a GI injection
+        // pass needs to originate its hemisphere rays from -- the capture pass's own depth buffer
+        // is a same-lifetime scratch image (see class comment) with no sampled-read usage, so it
+        // cannot serve that purpose.
+        static constexpr VkFormat kWorldPosFormat = VK_FORMAT_R32G32B32A32_SFLOAT;
 
         // How many cards RecordCapture() (re-)captures per call -- see the class comment's
         // "asynchronous" note. Small enough that even a full command buffer's worth of capture
@@ -94,18 +111,36 @@ namespace renderer {
         VkImageView GetNormalView() const { return m_NormalView; }
         VkImage GetEmissiveImage() const { return m_EmissiveImage; }
         VkImageView GetEmissiveView() const { return m_EmissiveView; }
+        VkImage GetRadianceImage() const { return m_RadianceImage; }
+        VkImageView GetRadianceView() const { return m_RadianceView; }
+        VkImage GetWorldPosImage() const { return m_WorldPosImage; }
+        VkImageView GetWorldPosView() const { return m_WorldPosView; }
         VkSampler GetAtlasSampler() const { return m_AtlasSampler; }
 
-    private:
         // One entity's span inside the combined vertex/index buffers -- vkCmdDrawIndexed's own
         // (vertexOffset, firstIndex, indexCount) triple, so a per-card draw is one indexed draw
-        // call with no further indirection.
+        // call with no further indirection. Public (unlike the rest of this class' internals) so
+        // renderer::SurfaceCacheRayTracingPass can build one BLAS per entity directly against this
+        // pass' own combined vertex/index buffers -- see GetVertexBuffer()/GetIndexBuffer().
         struct EntityDrawRange {
             int32_t vertexOffset = 0;
             uint32_t firstIndex = 0;
             uint32_t indexCount = 0;
         };
+        const std::unordered_map<uint32_t, EntityDrawRange>& GetEntityRanges() const { return m_EntityRanges; }
 
+        // The combined Fallback Mesh vertex/index buffers every entity's cards are captured from
+        // (geometry::FallbackVertex / uint32_t, see EntityDrawRange). Created with
+        // VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
+        // VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT in addition to their vertex/index-buffer usage
+        // (see Init()) precisely so renderer::SurfaceCacheRayTracingPass can build BLAS geometry
+        // directly against them -- no duplicate upload of the same geometry for ray tracing.
+        VkBuffer GetVertexBuffer() const { return m_VertexBuffer.Handle(); }
+        VkBuffer GetIndexBuffer() const { return m_IndexBuffer.Handle(); }
+        VkDeviceSize GetVertexBufferSize() const { return m_VertexBuffer.Size(); }
+        VkDeviceSize GetIndexBufferSize() const { return m_IndexBuffer.Size(); }
+
+    private:
         VkDevice m_Device = VK_NULL_HANDLE;
         VmaAllocator m_Allocator = VK_NULL_HANDLE;
 
@@ -125,6 +160,12 @@ namespace renderer {
         VkImage m_EmissiveImage = VK_NULL_HANDLE;
         VmaAllocation m_EmissiveAllocation = VK_NULL_HANDLE;
         VkImageView m_EmissiveView = VK_NULL_HANDLE;
+        VkImage m_RadianceImage = VK_NULL_HANDLE;
+        VmaAllocation m_RadianceAllocation = VK_NULL_HANDLE;
+        VkImageView m_RadianceView = VK_NULL_HANDLE;
+        VkImage m_WorldPosImage = VK_NULL_HANDLE;
+        VmaAllocation m_WorldPosAllocation = VK_NULL_HANDLE;
+        VkImageView m_WorldPosView = VK_NULL_HANDLE;
         VkImage m_DepthImage = VK_NULL_HANDLE;
         VmaAllocation m_DepthAllocation = VK_NULL_HANDLE;
         VkImageView m_DepthView = VK_NULL_HANDLE;

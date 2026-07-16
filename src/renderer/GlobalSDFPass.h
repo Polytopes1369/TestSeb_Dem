@@ -108,6 +108,23 @@ namespace renderer {
         // large camera jump instead of only after Init().
         bool IsFullyStreamed() const { return m_PendingSlabs.empty(); }
 
+        // One entry per entity that produced a valid Mesh SDF (i.e. one entry per element of the
+        // private m_Entities list -- NOT necessarily dense/contiguous in entityID, since Init()
+        // silently skips an entity whose Fallback Mesh geometry failed to read or whose
+        // BuildMeshSDF came back empty, see Init()'s own STEP 1 comment). Exposed so
+        // renderer::SurfaceCacheSWRTPass / SurfaceCacheRayTracingPass can build their own trace-
+        // scene descriptor sets (a fixed-size sampler3D array + a matching per-entity bounds SSBO,
+        // see mesh_sdf_trace.glsl) directly against these existing per-object SDF images, instead
+        // of re-decoding geometry::MeshSDF from the cache file a second time.
+        struct TracedEntityInfo {
+            uint32_t entityID = 0;
+            VkImageView sdfView = VK_NULL_HANDLE;
+            maths::vec3 volumeMin{};
+            float voxelSize = 0.0f;
+            uint32_t resolution = 0;
+        };
+        std::vector<TracedEntityInfo> GetTracedEntityInfos() const;
+
         VkImageView GetClipmapView(uint32_t level) const { return m_Levels[level].view; }
         // World-space half-extent covered by `level`'s current window (kClipmapResolution/2 *
         // that level's voxel size) -- together with the window's center (voxelSize *
@@ -141,6 +158,7 @@ namespace renderer {
             maths::vec3 volumeMin{};
             float voxelSize = 0.0f;
             uint32_t resolution = 0;
+            uint32_t entityID = 0; // See GetTracedEntityInfos()'s own comment for why this is not implicitly the array index.
         };
 
         // One axis-aligned "newly revealed" region, in absolute world-voxel-index space (see the

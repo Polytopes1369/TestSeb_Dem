@@ -24,6 +24,17 @@ layout(push_constant) uniform SurfaceCaptureConstants {
 layout(location = 0) out vec4 outAlbedo;
 layout(location = 1) out vec4 outNormal;
 layout(location = 2) out vec4 outEmissive;
+// Seeded outgoing-radiance atlas texel (renderer::SurfaceCachePass::kRadianceFormat) -- a small
+// constant-ambient proxy on the albedo plus this card's emissive tint, so a SWRT/HWRT trace
+// sampling this texel before any SurfaceCacheGIInject.comp pass has run over it still reads a
+// plausible non-black value instead of true zero. kInitialRadianceAmbientProxy mirrors the C++
+// constant of the same name (renderer::SurfaceCachePass.h) exactly.
+layout(location = 3) out vec4 outRadiance;
+// World-space (== local-space here -- see this shader's own header comment) hit position, full
+// float precision: the 3D origin a GI injection pass fires its hemisphere rays from.
+layout(location = 4) out vec4 outWorldPos;
+
+const float kInitialRadianceAmbientProxy = 0.15;
 
 // Octahedral encoding of a unit vector into [0,1]^2 -- the same compact normal encoding this
 // codebase already uses for cluster vertex normals (geometry::ClusterVertexNormal /
@@ -61,5 +72,9 @@ void main() {
     // end-to-end rather than always writing zero -- no material system flags entities as
     // emissive/non-emissive yet (geometry::EntityMaterialProperties only carries WPO/mask data),
     // so every card gets the same small glow rather than an arbitrary on/off split.
-    outEmissive = vec4(baseColor * 0.04, 1.0);
+    vec3 emissive = baseColor * 0.04;
+    outEmissive = vec4(emissive, 1.0);
+
+    outRadiance = vec4(emissive + albedo * kInitialRadianceAmbientProxy, 1.0);
+    outWorldPos = vec4(inWorldPos, 1.0);
 }

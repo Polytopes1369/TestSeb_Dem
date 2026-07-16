@@ -1,0 +1,68 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+#extension GL_EXT_ray_tracing : require
+
+// Part 2 deliverable: Ray Generation Shader (VK_KHR_ray_tracing_pipeline). One invocation per ray
+// request, tracing against the Fallback Mesh TLAS (renderer::SurfaceCacheRayTracingPass) --
+// deliberately the SAME RayRequest/RayResult buffer contract as SurfaceCacheTraceSWRT.comp, so a
+// caller can treat the SWRT and HWRT back-ends as interchangeable. All of the actual "at the hit
+// point, resolve the Surface Cache Card and sample its radiance instead of the object's heavy
+// material shader" logic lives in SurfaceCacheHWRT.rchit -- this shader is purely the
+// launch/dispatch + payload plumbing.
+
+struct RayRequest {
+    vec3 origin;
+    float tMax;
+    vec3 dir;
+    float _pad;
+};
+
+struct RayResult {
+    vec3 color;
+    float hit;
+};
+
+layout(std430, set = 0, binding = 0) readonly buffer RayRequestBuffer {
+    RayRequest g_Rays[];
+};
+layout(std430, set = 0, binding = 1) writeonly buffer RayResultBuffer {
+    RayResult g_Results[];
+};
+layout(set = 0, binding = 2) uniform accelerationStructureEXT g_TLAS;
+
+layout(push_constant) uniform HWRTPushConstants {
+    uint rayCount;
+} pc;
+
+layout(location = 0) rayPayloadEXT RayResult g_Payload;
+
+void main() {
+    uint id = gl_LaunchIDEXT.x;
+    if (id >= pc.rayCount) {
+        return;
+    }
+
+    RayRequest ray = g_Rays[id];
+    vec3 rayDir = normalize(ray.dir);
+
+    g_Payload.color = vec3(0.0);
+    g_Payload.hit = 0.0;
+
+    // OpaqueEXT: every BLAS triangle in this TLAS is unconditionally opaque (see
+    // renderer::AccelerationStructure::BuildBLAS's own comment on why the Fallback Mesh has no
+    // masked/cutout geometry) -- skips any-hit entirely, exactly one closest-hit invocation per
+    // ray that intersects anything.
+    traceRayEXT(g_TLAS,
+        gl_RayFlagsOpaqueEXT,
+        0xFF,   // cullMask: no per-instance culling groups in this scene.
+        0,      // sbtRecordOffset: single hit group (index 0, see SurfaceCacheRayTracingPass::Init()).
+        0,      // sbtRecordStride: single hit group, stride is irrelevant.
+        0,      // missIndex: single miss shader (index 0).
+        ray.origin,
+        1.0e-3, // tMin: skip immediate self-intersection at the ray's own origin.
+        rayDir,
+        ray.tMax,
+        0);     // payload location, matches `layout(location = 0)` above.
+
+    g_Results[id] = g_Payload;
+}
