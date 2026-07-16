@@ -4,6 +4,7 @@
 #include <GLFW/glfw3.h>
 #include <vk_mem_alloc.h>
 #include "core/Camera.h"
+#include "core/EngineConfig.h" // config::VERTEX_SPACING default arg for GeneratePlane()
 #include "core/EntityData.h"
 #include "core/IDManager.h"
 #include <array>
@@ -251,7 +252,7 @@ private:
         float Length, float Width,
         uint32_t meshID, maths::vec2 slot,
         uint32_t& runningVertexOffset, uint32_t& runningIndexOffset,
-        float worldOffsetY = 0.0f);
+        float worldOffsetY = 0.0f, float spacing = config::VERTEX_SPACING);
 
     void GenerateCapsule(
         float Radius, float Height,
