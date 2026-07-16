@@ -49,6 +49,9 @@
 #include <cstdint>
 #include <vector>
 #include <vulkan/vulkan.h>
+#ifndef NDEBUG
+#include <unordered_map>
+#endif
 
 #include "geometry/GpuPageTable.h"
 #include "renderer/vulkan/GpuBuffer.h"
@@ -150,11 +153,39 @@ namespace renderer {
 
         static constexpr uint32_t kUnmappedSentinel = 0xFFFFFFFFu;
 
+        // Debug-only "eviction churn" instrumentation (2026-07-16 "clusters missing / wrong LOD"
+        // investigation): renderer::GpuGeometryPagePool::TouchPage/TouchPages exist to mark a
+        // still-in-use resident page as most-recently-used, but nothing in the live per-frame path
+        // (renderer::ClusterLODSelectionPass / renderer::GeometryStreamingCoordinator) actually
+        // calls them -- residency-fallback (ClusterLODResidencyFallback.comp) only ever requests
+        // and substitutes NON-resident pages, it never "touches" the resident ones a DAG-cut is
+        // still actively drawing every frame. If the physical pool fills up, GpuPageTable's LRU
+        // list can therefore select a page for eviction purely because it hasn't been re-BOUND
+        // recently, even though it is still being drawn every single frame -- classic thrashing.
+        // BindPage() records the frame counter a page was (re)bound at; UnbindPage() checks how
+        // many frames elapsed since and logs a warning if that gap is suspiciously small, which is
+        // the direct, observable signature of this hypothesis. Call DebugAdvanceFrame() exactly
+        // once per frame (renderer::GeometryStreamingCoordinator::ProcessFeedbackAndDrainCompletions
+        // does this) -- a no-op in Release, like every other Debug-only method in this codebase.
+        void DebugAdvanceFrame() {
+#ifndef NDEBUG
+            ++m_DebugFrameCounter;
+#endif
+        }
+
     private:
         geometry::GpuPageTable m_PageTable{ 0 };
         GpuBuffer m_PhysicalPool;
         GpuBuffer m_PageTableBuffer;
         uint32_t m_MaxLogicalPages = 0;
+
+#ifndef NDEBUG
+        // Frames elapsed below this threshold between a page's bind and its eviction are logged as
+        // likely thrashing rather than a normal, expected LRU turnover.
+        static constexpr uint64_t kDebugChurnThresholdFrames = 5;
+        uint64_t m_DebugFrameCounter = 0;
+        std::unordered_map<uint64_t, uint64_t> m_DebugBoundAtFrame; // logicalAddress -> frame counter value at bind time.
+#endif
     };
 
 }

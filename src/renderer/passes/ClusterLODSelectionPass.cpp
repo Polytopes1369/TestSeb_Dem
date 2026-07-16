@@ -138,6 +138,15 @@ namespace renderer {
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
         m_ForceDrawBuffer.Create(allocator, static_cast<VkDeviceSize>(sizeof(uint32_t)) * m_TotalNodeCount,
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
+        // 2x uint32 (forceDrawSubstitutions, ancestorWalkExhausted). TRANSFER_SRC_BIT only needed
+        // in Debug (see ReadLODFallbackStats()) -- same bit-flag-level "zero debug footprint in
+        // Release" pattern as decisionBufferUsage above.
+        VkBufferUsageFlags lodFallbackStatsUsage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+#ifndef NDEBUG
+        lodFallbackStatsUsage |= VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+#endif
+        m_LODFallbackStatsBuffer.Create(allocator, static_cast<VkDeviceSize>(sizeof(uint32_t)) * 2,
+            lodFallbackStatsUsage, VMA_MEMORY_USAGE_GPU_ONLY);
         m_ViewParamsBuffer.Create(allocator, sizeof(DAGScreenErrorViewParamsUBO),
             VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
         m_CandidateMetadataBuffer.Create(allocator, static_cast<VkDeviceSize>(sizeof(ClusterCullMetadata)) * m_LeafCount,
@@ -149,6 +158,8 @@ namespace renderer {
 
 #ifndef NDEBUG
         m_DebugDecisionReadbackBuffer.Create(allocator, static_cast<VkDeviceSize>(sizeof(uint32_t)) * m_TotalNodeCount,
+            VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_CPU_ONLY, /*mapped=*/true);
+        m_LODFallbackStatsReadbackBuffer.Create(allocator, static_cast<VkDeviceSize>(sizeof(uint32_t)) * 2,
             VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_CPU_ONLY, /*mapped=*/true);
 #endif
 
@@ -203,7 +214,7 @@ namespace renderer {
         // Descriptor pool, shared by all 4 sets.
         // =====================================================================================
         VkDescriptorPoolSize poolSizes[2]{};
-        poolSizes[0] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 5 + 5 + 7 + 2 }; // ScreenError + Fallback + Compact + BuildArgs SSBOs (ScreenError gained an EntityTransformBuffer binding for its rotated-sphereCenter LOD estimate; Compact gained an EntityDataBuffer binding for transparent-entity exclusion).
+        poolSizes[0] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 5 + 6 + 7 + 2 }; // ScreenError + Fallback + Compact + BuildArgs SSBOs (ScreenError gained an EntityTransformBuffer binding for its rotated-sphereCenter LOD estimate; Compact gained an EntityDataBuffer binding for transparent-entity exclusion; Fallback gained a LODFallbackStatsSSBO binding for residency-fallback diagnostics).
         poolSizes[1] = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 };            // DAGViewParamsUBO.
 
         VkDescriptorPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
@@ -262,18 +273,19 @@ namespace renderer {
         }
 
         // =====================================================================================
-        // Set 2 / Pipeline 2: ClusterLODResidencyFallback.comp -- bindings 0..4.
+        // Set 2 / Pipeline 2: ClusterLODResidencyFallback.comp -- bindings 0..5.
         // =====================================================================================
         {
-            VkDescriptorSetLayoutBinding bindings[5]{};
+            VkDescriptorSetLayoutBinding bindings[6]{};
             bindings[0] = { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // DAGDecisionSSBO
             bindings[1] = { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // LODNodeMetadataSSBO
             bindings[2] = { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // GeometryPageTableSSBO (borrowed)
             bindings[3] = { 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // ForceDrawSSBO
             bindings[4] = { 4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // FeedbackBufferSSBO (borrowed)
+            bindings[5] = { 5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // LODFallbackStatsSSBO (diagnostics)
 
             VkDescriptorSetLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-            layoutInfo.bindingCount = 5;
+            layoutInfo.bindingCount = 6;
             layoutInfo.pBindings = bindings;
             VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &layoutInfo, nullptr, &m_ResidencyFallbackSetLayout));
 
@@ -288,14 +300,16 @@ namespace renderer {
             VkDescriptorBufferInfo pageTableInfo{ pageTableBuffer, 0, VK_WHOLE_SIZE };
             VkDescriptorBufferInfo forceDrawInfo{ m_ForceDrawBuffer.Handle(), 0, m_ForceDrawBuffer.Size() };
             VkDescriptorBufferInfo feedbackInfo{ m_FeedbackBuffer.GetDeviceBuffer(), 0, VK_WHOLE_SIZE };
+            VkDescriptorBufferInfo lodFallbackStatsInfo{ m_LODFallbackStatsBuffer.Handle(), 0, m_LODFallbackStatsBuffer.Size() };
 
-            VkWriteDescriptorSet writes[5]{};
+            VkWriteDescriptorSet writes[6]{};
             writes[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ResidencyFallbackDescriptorSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &decisionInfo, nullptr };
             writes[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ResidencyFallbackDescriptorSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &lodNodesInfo, nullptr };
             writes[2] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ResidencyFallbackDescriptorSet, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &pageTableInfo, nullptr };
             writes[3] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ResidencyFallbackDescriptorSet, 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &forceDrawInfo, nullptr };
             writes[4] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ResidencyFallbackDescriptorSet, 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &feedbackInfo, nullptr };
-            vkUpdateDescriptorSets(m_Device, 5, writes, 0, nullptr);
+            writes[5] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ResidencyFallbackDescriptorSet, 5, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &lodFallbackStatsInfo, nullptr };
+            vkUpdateDescriptorSets(m_Device, 6, writes, 0, nullptr);
 
             VkPipelineLayoutCreateInfo pipelineLayoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
             pipelineLayoutInfo.setLayoutCount = 1;
@@ -459,6 +473,7 @@ namespace renderer {
         m_DAGLocalErrorBuffer.Destroy();
         m_DAGParentErrorBuffer.Destroy();
         m_ForceDrawBuffer.Destroy();
+        m_LODFallbackStatsBuffer.Destroy();
         m_ViewParamsBuffer.Destroy();
         m_CandidateMetadataBuffer.Destroy();
         m_CandidateCountBuffer.Destroy();
@@ -467,6 +482,7 @@ namespace renderer {
 #ifndef NDEBUG
         m_DebugDecisionReadbackBuffer.Destroy();
         m_DebugDagNodesCopy.clear();
+        m_LODFallbackStatsReadbackBuffer.Destroy();
 #endif
 
         m_TotalNodeCount = 0;
@@ -478,6 +494,7 @@ namespace renderer {
     void ClusterLODSelectionPass::RecordClear(VkCommandBuffer cmd) {
         vkCmdFillBuffer(cmd, m_CandidateCountBuffer.Handle(), 0, sizeof(uint32_t), 0u);
         vkCmdFillBuffer(cmd, m_ForceDrawBuffer.Handle(), 0, VK_WHOLE_SIZE, 0u);
+        vkCmdFillBuffer(cmd, m_LODFallbackStatsBuffer.Handle(), 0, VK_WHOLE_SIZE, 0u);
         m_FeedbackBuffer.RecordClear(cmd);
 
         VkMemoryBarrier2 barrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
@@ -493,6 +510,21 @@ namespace renderer {
     }
 
     void ClusterLODSelectionPass::RecordEvaluateAndCompact(VkCommandBuffer cmd, const ViewParams& viewParams) {
+#ifndef NDEBUG
+        // Log the PREVIOUS call's residency-fallback stats before recording this frame's own
+        // work -- mirrors GetFeedbackBuffer()'s one-frame-lag contract (the copy this same
+        // function records further down is only guaranteed visible to the host after the GPU work
+        // it was part of has completed, i.e. by the time this function runs again next frame).
+        LODFallbackStats stats = ReadLODFallbackStats();
+        if (stats.ancestorWalkExhausted > 0) {
+            LOG_WARNING(std::format("[ClusterLODSelectionPass] {} node(s) had NO resident ancestor within MAX_ANCESTOR_WALK last frame -- their screen region was a genuine hole. {} node(s) were drawn via a coarser resident-ancestor substitution (visible as wrong LOD).",
+                stats.ancestorWalkExhausted, stats.forceDrawSubstitutions));
+        } else if (stats.forceDrawSubstitutions > 0) {
+            LOG_INFO(std::format("[ClusterLODSelectionPass] {} node(s) drawn via a coarser resident-ancestor substitution last frame (non-resident fine geometry still streaming in).",
+                stats.forceDrawSubstitutions));
+        }
+#endif
+
         DAGScreenErrorViewParamsUBO uboParams{};
         uboParams.view = viewParams.view;
         uboParams.proj = viewParams.proj;
@@ -556,6 +588,42 @@ namespace renderer {
             depInfo.pMemoryBarriers = &barrier;
             vkCmdPipelineBarrier2(cmd, &depInfo);
         }
+
+#ifndef NDEBUG
+        // Copy this frame's LODFallbackStatsSSBO into the host-readable buffer ReadLODFallbackStats()
+        // reads at the top of the NEXT call -- mirrors renderer::FeedbackBuffer::RecordReadback's
+        // two-barrier copy-then-host-visibility pattern exactly. Independent of dispatch 3 (which
+        // never touches this buffer), so no ordering constraint against it either way.
+        {
+            VkMemoryBarrier2 preCopyBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+            preCopyBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+            preCopyBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+            preCopyBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+            preCopyBarrier.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+
+            VkDependencyInfo preCopyDependency{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+            preCopyDependency.memoryBarrierCount = 1;
+            preCopyDependency.pMemoryBarriers = &preCopyBarrier;
+            vkCmdPipelineBarrier2(cmd, &preCopyDependency);
+
+            VkBufferCopy copyRegion{};
+            copyRegion.srcOffset = 0;
+            copyRegion.dstOffset = 0;
+            copyRegion.size = m_LODFallbackStatsBuffer.Size();
+            vkCmdCopyBuffer(cmd, m_LODFallbackStatsBuffer.Handle(), m_LODFallbackStatsReadbackBuffer.Handle(), 1, &copyRegion);
+
+            VkMemoryBarrier2 postCopyBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+            postCopyBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+            postCopyBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+            postCopyBarrier.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT;
+            postCopyBarrier.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT;
+
+            VkDependencyInfo postCopyDependency{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+            postCopyDependency.memoryBarrierCount = 1;
+            postCopyDependency.pMemoryBarriers = &postCopyBarrier;
+            vkCmdPipelineBarrier2(cmd, &postCopyDependency);
+        }
+#endif
 
         // --- Dispatch 3: ClusterLODCompact.comp ---
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_CompactPipeline);
@@ -632,6 +700,17 @@ namespace renderer {
         postCopyDependency.memoryBarrierCount = 1;
         postCopyDependency.pMemoryBarriers = &postCopyBarrier;
         vkCmdPipelineBarrier2(cmd, &postCopyDependency);
+    }
+
+    ClusterLODSelectionPass::LODFallbackStats ClusterLODSelectionPass::ReadLODFallbackStats() const {
+        const uint32_t* mapped = static_cast<const uint32_t*>(m_LODFallbackStatsReadbackBuffer.MappedData());
+        if (mapped == nullptr) {
+            return LODFallbackStats{}; // Init() not called yet (e.g. the very first frame).
+        }
+        LODFallbackStats stats{};
+        stats.forceDrawSubstitutions = mapped[0];
+        stats.ancestorWalkExhausted = mapped[1];
+        return stats;
     }
 
     void ClusterLODSelectionPass::DebugLogDAGCutGaps() const {

@@ -75,11 +75,23 @@ namespace renderer {
             return; // Open() failed at Init -- streaming is simply inert (already logged).
         }
 
+        pagePool.DebugAdvanceFrame(); // No-op in Release -- see GpuGeometryPagePool's own doc comment.
+
         // --- 1. Fold LAST frame's residency misses into the dedup request queue. Safe to read
         // here: the caller's own per-frame contract (main.cpp's single-frame-in-flight loop
         // already waited on the previous frame's fence before RecordFrame() runs again) guarantees
         // last frame's FeedbackBuffer::RecordReadback() copy has completed and is host-visible. ---
-        std::vector<uint32_t> missedClusterIDs = feedbackBuffer.ReadRequestedClusterIDs();
+        uint32_t overflowedRequestCount = 0;
+        std::vector<uint32_t> missedClusterIDs = feedbackBuffer.ReadRequestedClusterIDs(&overflowedRequestCount);
+        if (overflowedRequestCount > 0) {
+            // The GPU-side atomic counter went past capacity: some residency misses this frame
+            // were never even reported, so they cannot be queued for a disk read until (if) a
+            // future frame reports them again -- a persistent hole/wrong-LOD source distinct from
+            // both the DAG-cut-gap bug and the page-eviction-churn one (see GpuGeometryPagePool).
+            LOG_WARNING(std::format("[GeometryStreamingCoordinator] FeedbackBuffer saturated: {} residency-miss report(s) dropped this frame (capacity={}). "
+                "Some non-resident clusters were not requested and will keep missing until pressure drops.",
+                overflowedRequestCount, feedbackBuffer.GetCapacity()));
+        }
         m_RequestQueue.SubmitFrameRequests(missedClusterIDs);
 
         // --- 2. Issue up to kMaxNewReadsPerFrame new async reads, bounded by both the per-frame
@@ -148,7 +160,19 @@ namespace renderer {
                 decompressionPass.DecompressPage(cmd, physicalPage,
                     maths::vec3{ entry.boundsMin[0], entry.boundsMin[1], entry.boundsMin[2] },
                     maths::vec3{ entry.boundsMax[0], entry.boundsMax[1], entry.boundsMax[2] });
+            } else {
+                LOG_WARNING(std::format("[GeometryStreamingCoordinator] BindPageEvictingIfFull failed for clusterID {} (virtualAddress {:#x}) -- "
+                    "pool still full after eviction budget, or already resident. This cluster's completed read is discarded; it will only reappear "
+                    "if a future frame reports it missing again.", completed.clusterID, entry.virtualAddress));
             }
+        }
+
+        // Per-frame streaming summary -- only logged when there was actual activity to report, so
+        // a steady-state frame with nothing missing/in-flight/bound does not spam demo_log.txt.
+        if (!missedClusterIDs.empty() || !drained.empty()) {
+            LOG_INFO(std::format("[GeometryStreamingCoordinator] frame summary: missed={}, pendingInQueue={}, inFlightReads={}, drainedThisFrame={}, residentPages={}/{}",
+                missedClusterIDs.size(), m_RequestQueue.PendingCount(), m_Streamer.PendingRequestCount(),
+                drained.size(), pagePool.GetResidentPageCount(), pagePool.GetPhysicalCapacity()));
         }
     }
 
