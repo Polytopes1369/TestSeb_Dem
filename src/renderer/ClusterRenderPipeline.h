@@ -67,13 +67,18 @@
 #include "renderer/ClusterSoftwareRasterPass.h"
 #include "renderer/GeometryDecompressionPass.h"
 #include "renderer/GeometryStreamingCoordinator.h"
+#include "renderer/GlobalSDFPass.h"
 #include "renderer/GpuBuffer.h"
 #include "renderer/GpuGeometryPagePool.h"
 #include "renderer/HZBPass.h"
+#include "renderer/LightingTypes.h"
 #include "renderer/ProceduralMaskGenerator.h"
+#include "renderer/ShadowMapPass.h"
+#include "renderer/SurfaceCachePass.h"
 #ifndef NDEBUG
 #include "renderer/debug/ClusterTriangleStatsPass.h"
 #include "renderer/debug/DebugTextOverlay.h"
+#include "renderer/SDFRayMarchPass.h"
 #endif
 
 namespace renderer {
@@ -139,7 +144,8 @@ namespace renderer {
         // frame into m_WPOGlobalsBuffer before either raster pass runs. The caller only
         // begins/ends/submits the command buffer and presents.
         void RecordFrame(VkCommandBuffer cmd, const CameraPushConstants& camera,
-            const maths::vec3& cameraPositionWorld, float globalTimeSeconds, VkImage swapchainImage);
+            const maths::vec3& cameraPositionWorld, const CameraFrameInfo& cameraFrameInfo,
+            float globalTimeSeconds, VkImage swapchainImage);
 
         // Upper bound on this frame's actual candidate count (the DAG's total leaf count) -- NOT
         // this frame's real candidate count, which only ever exists on the GPU now that
@@ -197,6 +203,20 @@ namespace renderer {
         ClusterSoftwareRasterPass m_SoftwareRaster;
         ClusterResolvePass m_Resolve;
 
+        // Lumen-style GI infrastructure -- unlike the debug-only stats/overlay block below, these
+        // are real (if not yet light-transport-consuming) systems, not visualization tools, so
+        // they compile in Release too (matching how the actual Nanite cluster pipeline above is
+        // likewise unconditional; only the NUMPAD-DRIVEN DEBUG VIEW SWITCHING is Debug-only, per
+        // CLAUDE.md's build-separation rule). Recorded every frame in RecordFrame() regardless of
+        // camera.debugViewMode.
+        ShadowMapPass m_ShadowMap;
+        SurfaceCachePass m_SurfaceCache;
+        GlobalSDFPass m_GlobalSDF;
+        // Fixed sun-only lighting for now (default-constructed SceneLights: no point lights) --
+        // see renderer::LightingTypes.h's own comment; a future scene-authoring system would
+        // populate this instead of leaving it default.
+        SceneLights m_SceneLights;
+
 #ifndef NDEBUG
         // Real-time stat overlay (GPU memory used, pending SSD page loads, disk read throughput,
         // HW-vs-software triangle split) -- see debug::DebugTextOverlay's own class comment. Whole
@@ -210,6 +230,13 @@ namespace renderer {
         // derived) and GeometryStreamingCoordinator::GetTotalBytesCompleted()'s running total.
         float m_LastStatsSampleTime = 0.0f;
         uint64_t m_LastStatsSampleBytes = 0;
+
+        // Two-tier SDF ray march DEBUG VISUALIZATION (see renderer::SDFRayMarchPass's own class
+        // comment: its whole output is "a full-screen debug-visualization image", never consumed
+        // by production lighting) -- Debug-only per CLAUDE.md's build-separation rule, exactly
+        // like m_TriangleStats/m_DebugOverlay above. Only recorded (and only ever blitted to the
+        // swapchain in place of m_Resolve's output) when camera.debugViewMode == DEBUG_VIEW_LUMEN.
+        SDFRayMarchPass m_SDFRayMarch;
 #endif
     };
 
