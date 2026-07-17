@@ -69,6 +69,14 @@ namespace renderer {
 
         void RecordShade(VkCommandBuffer cmd, const maths::mat4& viewProj, uint32_t frameIndex);
 
+        // Exposes the light SSBO's raw handle/size so other passes needing the same light
+        // population (e.g. renderer::TransparentForwardPass's own inline RIS shading, which has no
+        // GBuffer entry to consume a MegaLightsPass composite from) can bind it directly without
+        // duplicating the upload -- same "borrow a raw handle" convention renderer::
+        // SurfaceCacheRayTracingPass::GetTLASHandle() already establishes.
+        VkBuffer GetLightBufferHandle() const { return m_LightBuffer.Handle(); }
+        VkDeviceSize GetLightBufferSize() const { return m_LightBuffer.Size(); }
+
     private:
         VkDevice m_Device = VK_NULL_HANDLE;
         VmaAllocator m_Allocator = VK_NULL_HANDLE;

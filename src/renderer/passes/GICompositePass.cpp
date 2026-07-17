@@ -151,7 +151,16 @@ namespace renderer {
         writes[2] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_Set, 2, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &denoisedGIInfo, nullptr, nullptr };
 
 #ifndef NDEBUG
-        VkDescriptorImageInfo depthInfo{ m_NearestSampler, depthView, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL };
+        // GENERAL, not DEPTH_STENCIL_READ_ONLY_OPTIMAL: `depthView` is renderer::
+        // ClusterResolvePass::GetOutputDepthView(), a plain COLOR-aspect R32_SFLOAT GBuffer image
+        // (the winning hw-vs-sw arbitrated NDC depth, not a real depth-attachment image), kept in
+        // VK_IMAGE_LAYOUT_GENERAL for its entire lifetime -- same convention every other consumer
+        // of this exact image already follows (renderer::ATrousDenoisePass, renderer::
+        // ReflectionPass, renderer::ScreenProbeGIPass, renderer::MegaLightsPass). Binding it with a
+        // real depth-attachment layout here mismatched the image's actual COLOR aspectMask and
+        // produced a VUID-VkDescriptorImageInfo-imageLayout-09426 validation error (plus a cascade
+        // of downstream errors once the shader actually sampled it) on every Debug run.
+        VkDescriptorImageInfo depthInfo{ m_NearestSampler, depthView, VK_IMAGE_LAYOUT_GENERAL };
         VkDescriptorBufferInfo viewParamsInfo{ m_ViewParamsBuffer.Handle(), 0, m_ViewParamsBuffer.Size() };
         VkDescriptorImageInfo worldProbeGridInfo{ worldProbes.GetGridSampler(), worldProbes.GetGridView(), VK_IMAGE_LAYOUT_GENERAL };
         VkDescriptorBufferInfo worldProbeGridParamsInfo{ m_WorldProbeGridParamsBuffer.Handle(), 0, m_WorldProbeGridParamsBuffer.Size() };
