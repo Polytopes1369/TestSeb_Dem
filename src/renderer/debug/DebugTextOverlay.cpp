@@ -180,9 +180,18 @@ namespace renderer::debug {
         dynamicState.dynamicStateCount = 2;
         dynamicState.pDynamicStates = dynamicStates;
 
+        // Two pipelines, differing ONLY in pColorAttachmentFormats -- everything else (shader
+        // modules, blend/raster/depth state, layout) is shared, so both vkCreateGraphicsPipelines
+        // calls reuse the exact same VkGraphicsPipelineCreateInfo with just the rendering-info
+        // format swapped. See this class' own Init()/RecordDraw() header comments for why a second
+        // pipeline exists: real UE5.8 always composites its stat/debug canvas over the final frame,
+        // but this codebase's TAATSR history buffer (kHdrTargetFormat, RGBA16F) IS the image that
+        // gets blitted to the swapchain in the normal (non-debug-view) path, so the overlay must be
+        // able to draw onto it directly rather than only onto the RGBA8 debug-view-mode targets.
+        VkFormat primaryFormat = outputColorFormat;
         VkPipelineRenderingCreateInfo pipelineRendering{ VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO };
         pipelineRendering.colorAttachmentCount = 1;
-        pipelineRendering.pColorAttachmentFormats = &outputColorFormat;
+        pipelineRendering.pColorAttachmentFormats = &primaryFormat;
         // No depth attachment at all -- depthAttachmentFormat stays VK_FORMAT_UNDEFINED.
 
         VkGraphicsPipelineCreateInfo pipelineInfo{ VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
@@ -201,16 +210,21 @@ namespace renderer::debug {
 
         VK_CHECK(vkCreateGraphicsPipelines(m_Device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_Pipeline));
 
+        VkFormat hdrFormat = kHdrTargetFormat;
+        pipelineRendering.pColorAttachmentFormats = &hdrFormat;
+        VK_CHECK(vkCreateGraphicsPipelines(m_Device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_PipelineHDR));
+
         vkDestroyShaderModule(m_Device, vertModule, nullptr);
         vkDestroyShaderModule(m_Device, fragModule, nullptr);
 
-        LOG_INFO("[DebugTextOverlay] Initialized debug text overlay.");
+        LOG_INFO("[DebugTextOverlay] Initialized debug text overlay (2 pipeline variants: RGBA8 + HDR history).");
     }
 
     void DebugTextOverlay::Shutdown() {
         if (m_Device != VK_NULL_HANDLE) {
             LOG_INFO("[DebugTextOverlay] Shutting down debug text overlay...");
             if (m_Pipeline != VK_NULL_HANDLE) vkDestroyPipeline(m_Device, m_Pipeline, nullptr);
+            if (m_PipelineHDR != VK_NULL_HANDLE) vkDestroyPipeline(m_Device, m_PipelineHDR, nullptr);
             if (m_PipelineLayout != VK_NULL_HANDLE) vkDestroyPipelineLayout(m_Device, m_PipelineLayout, nullptr);
             if (m_DescriptorPool != VK_NULL_HANDLE) {
                 // Destroying the pool implicitly frees m_DescriptorSet.
@@ -220,6 +234,7 @@ namespace renderer::debug {
         }
 
         m_Pipeline = VK_NULL_HANDLE;
+        m_PipelineHDR = VK_NULL_HANDLE;
         m_PipelineLayout = VK_NULL_HANDLE;
         m_DescriptorPool = VK_NULL_HANDLE;
         m_SetLayout = VK_NULL_HANDLE;
@@ -286,7 +301,8 @@ namespace renderer::debug {
         AppendLine(fpsText, viewportWidthPixels - fpsTextWidth - kMarginX, kMarginY);
     }
 
-    void DebugTextOverlay::RecordDraw(VkCommandBuffer cmd, VkImage outputColorImage, VkImageView outputColorView, VkExtent2D extent) {
+    void DebugTextOverlay::RecordDraw(VkCommandBuffer cmd, VkImage outputColorImage, VkImageView outputColorView, VkExtent2D extent,
+        VkFormat outputColorFormat) {
         if (m_PendingGlyphs.empty()) {
             return; // Nothing to draw -- skip the layout transitions entirely.
         }
@@ -334,7 +350,10 @@ namespace renderer::debug {
 
         vkCmdBeginRendering(cmd, &renderingInfo);
 
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_Pipeline);
+        // See Init()'s own comment: two attachment-format-compatible pipeline variants, picked by
+        // the caller-supplied actual format of `outputColorView`'s underlying image.
+        VkPipeline pipeline = (outputColorFormat == kHdrTargetFormat) ? m_PipelineHDR : m_Pipeline;
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_PipelineLayout, 0, 1, &m_DescriptorSet, 0, nullptr);
 
         maths::vec2 viewportSize{ static_cast<float>(extent.width), static_cast<float>(extent.height) };
