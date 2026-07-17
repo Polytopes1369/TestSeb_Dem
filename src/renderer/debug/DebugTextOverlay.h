@@ -47,10 +47,23 @@ namespace renderer::debug {
         // AppendLine()'s own body.
         static constexpr float kGlyphAdvanceX = 18.0f;
 
+        // renderer::TAATSRPass::kHistoryFormat, duplicated as a plain constant (not a header
+        // include) to avoid a renderer::debug <-> renderer::passes dependency for a single format
+        // enum -- RecordDraw()'s own target-format dispatch needs to recognize this exact value.
+        // See this class' own RecordDraw()/Init() comments for why a second pipeline exists at all.
+        static constexpr VkFormat kHdrTargetFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
+
         // Builds the font bitmap SSBO (BitmapFont8x8.h, uploaded once via a blocking one-time
-        // submit) and the glyph-instance SSBO/descriptor set/pipeline. `outputColorFormat` must
-        // match renderer::ClusterResolvePass::kOutputColorFormat, so this pipeline is attachment-
-        // compatible with the image RecordDraw() will target.
+        // submit) and the glyph-instance SSBO/descriptor set/TWO pipelines: `outputColorFormat`
+        // (must match renderer::ClusterResolvePass::kOutputColorFormat -- the format every debug-
+        // view-mode RecordDraw() target uses: renderer::GICompositePass/ClusterResolvePass/
+        // renderer::debug::SDFRayMarchPass's own outputs) and kHdrTargetFormat (matches renderer::
+        // TAATSRPass::GetOutputView()'s own HDR history-buffer format -- the NORMAL, non-debug-view
+        // path's target, since real UE5.8 always composites its stat/debug canvas over the final
+        // frame rather than an intermediate HDR buffer, but this codebase's TAATSR history IS what
+        // gets blitted to the swapchain, so the overlay must be able to draw onto it directly).
+        // RecordDraw() picks between the two at draw time by comparing the target view's own known
+        // format against kHdrTargetFormat -- see that method's own comment.
         void Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
             VkFormat outputColorFormat);
 
@@ -66,7 +79,12 @@ namespace renderer::debug {
             uint32_t hwTriangleCount, uint32_t swTriangleCount, float fps, float viewportWidthPixels, float viewportHeightPixels,
             bool radiosityEnabled, bool ssrtEnabled, uint32_t traceMode, bool worldProbesEnabled);
 
-        void RecordDraw(VkCommandBuffer cmd, VkImage outputColorImage, VkImageView outputColorView, VkExtent2D extent);
+        // `outputColorFormat` must be the ACTUAL format of `outputColorView`'s underlying image --
+        // selects between the two pipelines Init() built (see that method's own comment). Every
+        // existing call site already knows this statically (each branch that picks
+        // outputColorImage/outputColorView already knows which pass produced it).
+        void RecordDraw(VkCommandBuffer cmd, VkImage outputColorImage, VkImageView outputColorView, VkExtent2D extent,
+            VkFormat outputColorFormat);
 
     private:
         struct GlyphInstance {
@@ -90,7 +108,8 @@ namespace renderer::debug {
         VkDescriptorPool m_DescriptorPool = VK_NULL_HANDLE;
         VkDescriptorSet m_DescriptorSet = VK_NULL_HANDLE;
         VkPipelineLayout m_PipelineLayout = VK_NULL_HANDLE;
-        VkPipeline m_Pipeline = VK_NULL_HANDLE;
+        VkPipeline m_Pipeline = VK_NULL_HANDLE;    // outputColorFormat (RGBA8) variant -- debug-view-mode targets.
+        VkPipeline m_PipelineHDR = VK_NULL_HANDLE; // kHdrTargetFormat variant -- the normal (TAATSR history) target.
     };
 
 }

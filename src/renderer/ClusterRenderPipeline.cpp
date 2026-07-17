@@ -1567,10 +1567,18 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
     VkImage overlayTargetImage = blitSourceImage;
     VkImageView overlayTargetView = VK_NULL_HANDLE;
     VkExtent2D overlayExtent = m_RenderExtent;
+    // renderer::debug::DebugTextOverlay owns 2 pipeline variants (see its own Init()/RecordDraw()
+    // comments) -- every branch below must report the ACTUAL format of whatever view it selects,
+    // not assume the primary (RGBA8) one. m_TAATSR's own output is the sole HDR-format candidate
+    // (renderer::debug::DebugTextOverlay::kHdrTargetFormat, matching renderer::TAATSRPass::
+    // kHistoryFormat) -- every other candidate here (m_SDFRayMarch/m_GIComposite/m_Resolve) is
+    // RGBA8_UNORM.
+    VkFormat overlayTargetFormat = ClusterResolvePass::kOutputColorFormat;
 
     if (blitSourceImage == m_TAATSR.GetOutputImage()) {
         overlayTargetView = m_TAATSR.GetOutputView();
         overlayExtent = m_DisplayExtent;
+        overlayTargetFormat = debug::DebugTextOverlay::kHdrTargetFormat;
     }
 #ifndef NDEBUG
     else if (blitSourceImage == m_SDFRayMarch.GetOutputImage()) {
@@ -1587,7 +1595,7 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
         overlayExtent = m_RenderExtent;
     }
 
-    m_DebugOverlay.RecordDraw(cmd, overlayTargetImage, overlayTargetView, overlayExtent);
+    m_DebugOverlay.RecordDraw(cmd, overlayTargetImage, overlayTargetView, overlayExtent, overlayTargetFormat);
   }
 #endif
 
