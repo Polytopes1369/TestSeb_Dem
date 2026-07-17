@@ -860,14 +860,49 @@ void VulkanContext::AllocateBindlessDescriptorSet() {
 
 void VulkanContext::CreateSwapchain(GLFWwindow *window) {
   m_SwapchainImageFormat = VK_FORMAT_B8G8R8A8_UNORM;
-  m_SwapchainExtent = {
-      config::WINDOW_WIDTH,
-      config::WINDOW_HEIGHT}; // Linked directly to config constants
+
+  // The window/config constants (config::WINDOW_WIDTH/HEIGHT) are a target, not a guarantee:
+  // on a scaled/HiDPI display the compositor can report a currentExtent smaller than the
+  // requested client size, and VK_KHR_surface REQUIRES imageExtent to fall within
+  // [minImageExtent, maxImageExtent] or vkCreateSwapchainKHR is invalid usage (VUID-
+  // VkSwapchainCreateInfoKHR-pNext-07781). Querying and clamping here is mandatory, not
+  // optional -- skipping it previously threw "Failed to create Swapchain!" on any surface whose
+  // reported extent didn't happen to match the config constants exactly.
+  VkSurfaceCapabilitiesKHR surfaceCapabilities{};
+  if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR(m_PhysicalDevice, m_Surface,
+                                                &surfaceCapabilities) !=
+      VK_SUCCESS) {
+    throw std::runtime_error(
+        "Failed to query physical device surface capabilities!");
+  }
+
+  // currentExtent.width == 0xFFFFFFFF is the surface's way of saying "you choose": in that case
+  // fall back to the configured window size, still clamped to the surface's min/max. Otherwise
+  // the compositor dictates a fixed extent (as on this HiDPI/scaled display) and every swapchain
+  // image MUST match it exactly.
+  if (surfaceCapabilities.currentExtent.width != 0xFFFFFFFFu) {
+    m_SwapchainExtent = surfaceCapabilities.currentExtent;
+  } else {
+    m_SwapchainExtent = {config::WINDOW_WIDTH, config::WINDOW_HEIGHT};
+    m_SwapchainExtent.width =
+        std::clamp(m_SwapchainExtent.width,
+                  surfaceCapabilities.minImageExtent.width,
+                  surfaceCapabilities.maxImageExtent.width);
+    m_SwapchainExtent.height =
+        std::clamp(m_SwapchainExtent.height,
+                  surfaceCapabilities.minImageExtent.height,
+                  surfaceCapabilities.maxImageExtent.height);
+  }
 
   VkSwapchainCreateInfoKHR createInfo{
       VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
   createInfo.surface = m_Surface;
-  createInfo.minImageCount = 2;
+  uint32_t minImageCount = surfaceCapabilities.minImageCount + 1;
+  if (surfaceCapabilities.maxImageCount > 0) {
+    minImageCount =
+        std::min(minImageCount, surfaceCapabilities.maxImageCount);
+  }
+  createInfo.minImageCount = std::max(minImageCount, 2u);
   createInfo.imageFormat = m_SwapchainImageFormat;
   createInfo.imageColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
   createInfo.imageExtent = m_SwapchainExtent;
