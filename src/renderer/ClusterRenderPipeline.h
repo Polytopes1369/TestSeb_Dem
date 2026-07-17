@@ -99,6 +99,7 @@
 #include "renderer/streaming/VirtualTextureStreamingCoordinator.h"
 #include "renderer/passes/WorldProbeGridPass.h"
 #include "renderer/passes/TAATSRPass.h"
+#include "renderer/passes/BloomPass.h"
 #include "renderer/passes/PostProcessPass.h"
 #include "renderer/passes/ScreenTracePass.h"
 #include "renderer/passes/GICompositePass.h"
@@ -492,6 +493,11 @@ namespace renderer {
         // view path -- see RecordFrame()'s own comment for exactly why.
         ATrousDenoisePass m_Denoiser;
         TAATSRPass m_TAATSR;
+        // Phase PP2 (post-process stack roadmap): Bloom / Lens Flare / Anamorphic Lens Flare / Lens
+        // Dirt, all one dual-filter mip chain reading m_TAATSR's own HDR output -- see BloomPass's
+        // own class comment. Recorded before m_PostProcess (below), whose composite shader samples
+        // its GetOutputView() and adds it into the scene color.
+        BloomPass m_Bloom;
         // Phase PP1 (post-process stack roadmap): Physical Camera / Auto Exposure / White Balance /
         // Color Correction / ACES Tone Mapping / Gamma Correction -- the normal-view-path blit
         // source instead of m_TAATSR's own raw HDR output directly (see PostProcessPass's own class

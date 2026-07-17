@@ -24,7 +24,7 @@ layout(local_size_x = 8, local_size_y = 8) in;
 // kFormat (that class' ping-pong images and shader's own fixed image-format layout qualifier --
 // see this file's own header comment on why reusing it forces this pass to match): linear HDR, not
 // rgba8 -- this radiance is a physically-based, inverse-square point-light contribution with no
-// upper bound near a light, so it must survive unclipped until renderer::TonemapPass's own curve
+// upper bound near a light, so it must survive unclipped until renderer::PostProcessPass's own curve
 // runs at the very end of the frame (see ClusterResolvePass::kOutputColorFormat's own comment).
 layout(rgba16f, set = 0, binding = 0) uniform writeonly image2D g_ShadeRadiance;
 
@@ -118,7 +118,7 @@ void main() {
     // see megalights_ris.glsl's own SelectLightRIS comment for the derivation.
     vec3 radiance = diffuseAlbedo * light.color * light.intensity * NdotL / distSq * window * visibility * invPdf;
     // No saturate(): g_ShadeRadiance is now linear HDR (rgba16f) -- clamping here would defeat the
-    // whole point of widening the format, re-introducing the hard-clip renderer::TonemapPass exists
+    // whole point of widening the format, re-introducing the hard-clip renderer::PostProcessPass exists
     // to replace with a soft display-referred curve.
     imageStore(g_ShadeRadiance, pixel, vec4(radiance, 1.0));
 }
