@@ -1,0 +1,91 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+
+// Stage 3/3 of renderer::PostProcessPass (Phase PP1, post-process stack roadmap): the final HDR
+// -> LDR composite. Replaces renderer::ClusterRenderPipeline's previous naive blit (which relied
+// on vkCmdBlitImage's implicit float->UNORM8 clamp as its only "tonemap") with a real UE 5.8-
+// parity chain, in Unreal's own evaluation order: Physical Camera exposure (this frame's EV100,
+// already resolved by AutoExposureAdapt.comp into g_Exposure.currentEV100 -- see that shader's own
+// comment for Auto vs Manual metering) -> White Balance -> Color Correction (Contrast -> Lift/
+// Gamma/Gain -> Saturation) -> ACES Tone Mapping -> Gamma Correction (the pipeline's only display
+// encode -- see color_grading.glsl's own GammaCorrection() comment for why it's load-bearing, not
+// decorative). Writes this pass' own owned rgba8 output image, which
+// renderer::ClusterRenderPipeline's final blit now sources from instead of renderer::TAATSRPass's
+// raw HDR output directly.
+
+#include "include/color_grading.glsl"
+#include "include/aces_tonemap.glsl"
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform sampler2D g_HDRColor;
+layout(rgba8, set = 0, binding = 1) uniform writeonly image2D g_Output;
+
+layout(std430, set = 0, binding = 2) readonly buffer ExposureStateSSBO {
+    float currentEV100;
+    float currentAvgLuminance;
+} g_Exposure;
+
+layout(std140, set = 0, binding = 3) uniform PostProcessParamsUBO {
+    // Physical Camera (informational here -- only currentEV100 above, already resolved from these
+    // by AutoExposureAdapt.comp, actually drives the exposure multiplier below).
+    float aperture;
+    float shutterSpeed;
+    float isoSensitivity;
+    uint useAutoExposure;
+
+    float exposureCompensationEV;
+    float adaptationSpeedUp;
+    float adaptationSpeedDown;
+    float _pad0;
+
+    // White Balance
+    float whiteBalanceTempKelvin;
+    float whiteBalanceTint;
+    float _pad1;
+    float _pad2;
+
+    // Color Correction (Lift/Gamma/Gain, ASC CDL)
+    vec3 lift;
+    float _padLift;
+    vec3 gamma;
+    float _padGamma;
+    vec3 gain;
+    float _padGain;
+
+    float saturation;
+    float contrast;
+    float displayGamma;
+    float _pad3;
+} g_Params;
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 res = textureSize(g_HDRColor, 0);
+    if (pixel.x >= res.x || pixel.y >= res.y) {
+        return;
+    }
+
+    vec3 color = texelFetch(g_HDRColor, pixel, 0).rgb;
+
+    // --- Physical Camera / Auto Exposure: UE's own Iso100 photometric conversion, MaxLuminance =
+    // 1.2 * 2^EV100, applied scene color scale = 1 / MaxLuminance.
+    float exposureMultiplier = 1.0 / (1.2 * exp2(g_Exposure.currentEV100));
+    color *= exposureMultiplier;
+
+    // --- White Balance ---
+    color = WhiteBalance(color, g_Params.whiteBalanceTempKelvin, g_Params.whiteBalanceTint);
+
+    // --- Color Correction ---
+    color = ApplyContrast(color, g_Params.contrast);
+    color = ColorCorrectLGG(color, g_Params.lift, g_Params.gamma, g_Params.gain);
+    color = max(ApplySaturation(color, g_Params.saturation), vec3(0.0));
+
+    // --- Tone Mapping (ACES) ---
+    color = ACESFilmicTonemap(color);
+
+    // --- Gamma Correction (final display encode) ---
+    color = GammaCorrection(color, g_Params.displayGamma);
+
+    imageStore(g_Output, pixel, vec4(clamp(color, 0.0, 1.0), 1.0));
+}
