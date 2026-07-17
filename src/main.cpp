@@ -190,11 +190,13 @@ static void KeyCallback(GLFWwindow* window, int key, int scancode, int action, i
         LOG_INFO(std::format("[Debug] Specular Reflections: {}", g_DebugState.reflectionsEnabled ? "ON" : "OFF"));
         break;
     case GLFW_KEY_J:
-        // Phase 1 (Nanite advanced): multi-octave enhanced procedural displacement on entity 2
-        // (Icosphere, see enhanced_displacement.glsl). Moved off 'B' during the Substrate merge --
+        // Phase 1 (Nanite advanced): multi-octave enhanced procedural displacement, originally on
+        // entity 2 (Icosphere) but reassigned to entity 10 (TorusKnot, "Nanite B") after Phase 7a's
+        // hero-asset tessellation independently claimed entity 2 for itself -- see
+        // VulkanContext::BuildEntityData()'s own comment. Moved off 'B' during the Substrate merge --
         // see g_DebugState.enhancedDisplacementEnabled's own doc comment for why.
         g_DebugState.enhancedDisplacementEnabled = !g_DebugState.enhancedDisplacementEnabled;
-        LOG_INFO(std::format("[Debug] Enhanced Displacement (Icosphere): {}", g_DebugState.enhancedDisplacementEnabled ? "ON" : "OFF"));
+        LOG_INFO(std::format("[Debug] Enhanced Displacement (TorusKnot): {}", g_DebugState.enhancedDisplacementEnabled ? "ON" : "OFF"));
         break;
     case GLFW_KEY_U:
         // Phase 1 (Nanite advanced): runtime Hermite-spline bend on entity 6 (Tube, see

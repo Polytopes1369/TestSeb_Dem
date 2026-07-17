@@ -1473,18 +1473,15 @@ void VulkanContext::BuildEntityData() {
     // == 2, not 6), so it stays on the normal Nanite VisBuffer/ClusterResolve path where
     // ApplySplineDeformation() runs.
     //
-    // KNOWN COLLISION (flagged, not silently resolved): entity 2's flag below (HasEnhancedDisplacement,
-    // this branch's Phase 1 "enhanced procedural displacement" demo, originally authored on the
-    // Icosphere) is set here for data-fidelity / documentation purposes, but is now EFFECTIVELY INERT
-    // post-merge -- kHeroEntityIndex == 2 means entity 2's clusters never reach ClusterRaster.vert /
-    // cluster_software_raster_core.glsl / ClusterResolve.comp / ClusterResolveBinned.comp /
-    // TransparentForward.vert any more (see HeroTessellationPass.h's own class comment: "this
-    // entity's clusters never reach any opaque raster list"), so ApplyEnhancedDisplacement() is never
-    // invoked for it. The two Phase 1/Phase 7a features picked the same flagship entity independently
-    // under concurrent development; reconciling which one keeps entity 2 (or moving enhanced
-    // displacement to a different opaque entity) is a product decision left to the user, not made
-    // unilaterally by this merge.
-    if (i == 2u) {
+    // Enhanced procedural displacement was originally authored on entity 2 (Icosphere), but Phase 7a's
+    // concurrently-developed hero-asset tessellation independently claimed the same entity
+    // (kHeroEntityIndex == 2) and routes it exclusively through renderer::HeroTessellationPass, which
+    // never reaches ClusterRaster.vert/cluster_software_raster_core.glsl/ClusterResolve*.comp -- the
+    // only places ApplyEnhancedDisplacement() is ever called. Rather than ship an EntityFlags bit that
+    // is silently a no-op, reassigned to entity 10 (TorusKnot), the zone layout's own "Nanite B" pairing
+    // to entity 2's "Nanite A" (see kLayout above) -- a normal opaque entity untouched by any other
+    // concurrent feature's override, so ApplyEnhancedDisplacement() actually runs for it.
+    if (i == 10u) {
       core::SetFlag(entity.flags, core::EntityFlags::HasEnhancedDisplacement, true);
     }
     if (i == 6u) {
