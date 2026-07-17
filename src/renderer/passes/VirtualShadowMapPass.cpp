@@ -371,7 +371,18 @@ namespace renderer {
         bool renderedAnyPage = false;
         if (config::lumen::BUILD_SHADOWS) {
             std::vector<uint32_t> missedPages = m_Feedback.ReadRequestedClusterIDs();
-            m_RequestQueue.SubmitFrameRequests(missedPages);
+            // Priority = -(vsmIndex): sun clipmap levels are indexed finest-first (kSunLevelCount
+            // levels, see RecordBeginFrame's own radius = kSunBaseRadius * 2^level loop above), so
+            // a lower vsmIndex is both a finer sun cascade AND, since point-light cube faces are
+            // indexed immediately after every sun level, always prioritized ahead of any point
+            // light's shadow pages -- one monotonic key covers both cases without a branch.
+            std::vector<float> missedPriorities;
+            missedPriorities.reserve(missedPages.size());
+            for (uint32_t logicalPageID : missedPages) {
+                uint32_t vsmIndex = logicalPageID / kShadowPagesPerVSM;
+                missedPriorities.push_back(-float(vsmIndex));
+            }
+            m_RequestQueue.SubmitFrameRequests(missedPages, missedPriorities);
 
             for (uint32_t processed = 0; processed < kMaxPagesRenderedPerFrame; ++processed) {
                 uint32_t logicalPageID = 0;

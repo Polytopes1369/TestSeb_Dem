@@ -87,18 +87,29 @@ namespace renderer {
         // since geometry::ClusterIndexEntry::clusterID is a dense 0-based index matching this
         // vector's own position -- see geometry::VirtualGeometryCacheTest.cpp's documented
         // invariant). Allocates the raw aligned I/O buffer pool and the small VMA-mapped staging
-        // ring BindPage's staging-buffer parameter needs.
+        // ring BindPage's staging-buffer parameter needs. `dagEntries` (index-aligned with
+        // `indexEntries`, same clusterID convention) supplies each cluster's DAG level, used as its
+        // streaming-request priority (see class comment) -- a coarser cluster (higher level) is
+        // requested before a finer one, since it unlocks a larger visible fallback area and is a
+        // residency prerequisite for more of the DAG-cut's descendants.
         void Init(VkDevice device, VmaAllocator allocator,
             const std::filesystem::path& cacheFilePath,
-            const std::vector<geometry::ClusterIndexEntry>& indexEntries);
+            const std::vector<geometry::ClusterIndexEntry>& indexEntries,
+            const std::vector<geometry::DAGNodeEntry>& dagEntries);
 
         void Shutdown();
 
         // See the class comment's per-frame step 1. `feedbackBuffer`/`pagePool`/`decompressionPass`
         // are borrowed (owned by renderer::ClusterLODSelectionPass / renderer::ClusterRenderPipeline
-        // respectively) -- not stored beyond this call.
-        void ProcessFeedbackAndDrainCompletions(VkCommandBuffer cmd, FeedbackBuffer& feedbackBuffer,
-            GpuGeometryPagePool& pagePool, GeometryDecompressionPass& decompressionPass);
+        // respectively) -- not stored beyond this call. `transferCmd` (VulkanContext::
+        // GetTransferCommandBuffer()) is where this frame's page uploads are recorded (dedicated
+        // hardware copy queue when one exists, see VulkanContext::GetTransferQueue()'s own
+        // comment); `cmd` remains the graphics command buffer for eviction, the ownership-transfer
+        // acquire, page-table finalization, and decompression -- see GpuGeometryPagePool's
+        // UploadPageData/Release-AcquirePhysicalPoolOwnership/FinalizeBoundPage for the exact
+        // 2-queue sequence this method now records.
+        void ProcessFeedbackAndDrainCompletions(VkCommandBuffer cmd, VkCommandBuffer transferCmd,
+            FeedbackBuffer& feedbackBuffer, GpuGeometryPagePool& pagePool, GeometryDecompressionPass& decompressionPass);
 
         uint32_t GetPendingRequestCount() const { return static_cast<uint32_t>(m_RequestQueue.PendingCount()); }
         uint32_t GetInFlightReadCount() const { return m_Streamer.PendingRequestCount(); }
@@ -125,6 +136,10 @@ namespace renderer {
         // plain index -- no separate map needed. Must outlive every reference the Init() caller's
         // own copy (a local variable in renderer::ClusterRenderPipeline::Init) does not.
         std::vector<geometry::ClusterIndexEntry> m_IndexEntries;
+
+        // clusterID -> DAGNodeEntry::level, same dense-index convention as m_IndexEntries above.
+        // Feeds each missed cluster's streaming-request priority (see Init()'s own comment).
+        std::vector<uint32_t> m_ClusterDAGLevel;
 
         // I/O destination slots: raw, sector-aligned host buffers (FILE_FLAG_NO_BUFFERING
         // requires this -- see AsyncFileStreamer.h), reused round-robin. Slot busy/free state is

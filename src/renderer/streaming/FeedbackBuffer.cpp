@@ -37,25 +37,44 @@ namespace renderer {
             VMA_MEMORY_USAGE_CPU_ONLY,
             /*mapped=*/true);
 
-        LOG_INFO(std::format("[FeedbackBuffer] Initialized feedback buffer: capacity={}, size={} KB",
-            capacity, sizeBytes / 1024));
+        // Resident-touch channel: same size/usage/memory-type shape as the miss channel above,
+        // just a second independent buffer pair (own atomic counter, own binding) -- see this
+        // class's header comment for why hits need a separate channel from misses.
+        m_TouchDeviceBuffer.Create(
+            allocator,
+            sizeBytes,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            VMA_MEMORY_USAGE_GPU_ONLY);
+        m_TouchReadbackBuffer.Create(
+            allocator,
+            sizeBytes,
+            VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            VMA_MEMORY_USAGE_CPU_ONLY,
+            /*mapped=*/true);
+
+        LOG_INFO(std::format("[FeedbackBuffer] Initialized feedback buffer: capacity={}, size={} KB (x2 channels: miss+touch)",
+            capacity, (sizeBytes * 2) / 1024));
     }
 
     void FeedbackBuffer::Shutdown() {
         LOG_INFO("[FeedbackBuffer] Shutting down feedback buffer...");
         m_DeviceBuffer.Destroy();
         m_ReadbackBuffer.Destroy();
+        m_TouchDeviceBuffer.Destroy();
+        m_TouchReadbackBuffer.Destroy();
         m_Capacity = 0;
     }
 
     void FeedbackBuffer::RecordClear(VkCommandBuffer cmd) {
-        // Only the requestCount word needs clearing every frame: ReadRequestedClusterIDs() never
-        // reads clusterIDs[] past min(requestCount, capacity), so stale entries beyond that from
-        // a previous frame are never observed and clearing them would be wasted bandwidth.
+        // Only the requestCount/touchCount words need clearing every frame: neither
+        // ReadRequestedClusterIDs() nor ReadTouchedClusterIDs() ever reads clusterIDs[] past
+        // min(count, capacity), so stale entries beyond that from a previous frame are never
+        // observed and clearing them would be wasted bandwidth.
         vkCmdFillBuffer(cmd, m_DeviceBuffer.Handle(), 0, sizeof(uint32_t), 0u);
+        vkCmdFillBuffer(cmd, m_TouchDeviceBuffer.Handle(), 0, sizeof(uint32_t), 0u);
 
-        // The clear's write must be visible to every shader stage that might run
-        // RequestClusterResidency() this frame before any of them execute.
+        // The clears' writes must be visible to every shader stage that might run
+        // RequestClusterResidency()/RecordResidentTouch() this frame before any of them execute.
         VkMemoryBarrier2 barrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
         barrier.srcStageMask = VK_PIPELINE_STAGE_2_CLEAR_BIT;
         barrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
@@ -93,6 +112,12 @@ namespace renderer {
         copyRegion.size = m_DeviceBuffer.Size();
         vkCmdCopyBuffer(cmd, m_DeviceBuffer.Handle(), m_ReadbackBuffer.Handle(), 1, &copyRegion);
 
+        VkBufferCopy touchCopyRegion{};
+        touchCopyRegion.srcOffset = 0;
+        touchCopyRegion.dstOffset = 0;
+        touchCopyRegion.size = m_TouchDeviceBuffer.Size();
+        vkCmdCopyBuffer(cmd, m_TouchDeviceBuffer.Handle(), m_TouchReadbackBuffer.Handle(), 1, &touchCopyRegion);
+
         // Barrier #2: the copy's write into the host-visible readback buffer must be made visible
         // to a subsequent host read. HOST_COHERENT memory only removes the need for an explicit
         // vkInvalidateMappedMemoryRanges call -- it does not remove the need for this execution/
@@ -119,6 +144,20 @@ namespace renderer {
 
         if (overflowedRequestCount != nullptr) {
             *overflowedRequestCount = requestCount > m_Capacity ? (requestCount - m_Capacity) : 0u;
+        }
+
+        const uint32_t* clusterIDs = mapped + 1;
+        return std::vector<uint32_t>(clusterIDs, clusterIDs + validCount);
+    }
+
+    std::vector<uint32_t> FeedbackBuffer::ReadTouchedClusterIDs(uint32_t* overflowedTouchCount) const {
+        const uint32_t* mapped = static_cast<const uint32_t*>(m_TouchReadbackBuffer.MappedData());
+
+        uint32_t touchCount = mapped[0];
+        uint32_t validCount = touchCount < m_Capacity ? touchCount : m_Capacity;
+
+        if (overflowedTouchCount != nullptr) {
+            *overflowedTouchCount = touchCount > m_Capacity ? (touchCount - m_Capacity) : 0u;
         }
 
         const uint32_t* clusterIDs = mapped + 1;

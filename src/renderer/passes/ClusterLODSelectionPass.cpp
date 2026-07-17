@@ -207,7 +207,7 @@ namespace renderer {
         // Descriptor pool, shared by all 4 sets.
         // =====================================================================================
         VkDescriptorPoolSize poolSizes[2]{};
-        poolSizes[0] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 5 + 6 + 7 + 2 }; // ScreenError + Fallback + Compact + BuildArgs SSBOs (ScreenError gained an EntityTransformBuffer binding for its rotated-sphereCenter LOD estimate; Compact gained an EntityDataBuffer binding for transparent-entity exclusion; Fallback gained a LODFallbackStatsSSBO binding for residency-fallback diagnostics).
+        poolSizes[0] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 5 + 7 + 7 + 2 }; // ScreenError + Fallback + Compact + BuildArgs SSBOs (ScreenError gained an EntityTransformBuffer binding for its rotated-sphereCenter LOD estimate; Compact gained an EntityDataBuffer binding for transparent-entity exclusion; Fallback gained a LODFallbackStatsSSBO binding for residency-fallback diagnostics plus a FeedbackTouchBufferSSBO binding for resident-touch reports, see GpuGeometryPagePool's TouchPages).
         poolSizes[1] = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 };            // DAGViewParamsUBO.
 
         VkDescriptorPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
@@ -266,19 +266,20 @@ namespace renderer {
         }
 
         // =====================================================================================
-        // Set 2 / Pipeline 2: ClusterLODResidencyFallback.comp -- bindings 0..5.
+        // Set 2 / Pipeline 2: ClusterLODResidencyFallback.comp -- bindings 0..6.
         // =====================================================================================
         {
-            VkDescriptorSetLayoutBinding bindings[6]{};
+            VkDescriptorSetLayoutBinding bindings[7]{};
             bindings[0] = { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // DAGDecisionSSBO
             bindings[1] = { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // LODNodeMetadataSSBO
             bindings[2] = { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // GeometryPageTableSSBO (borrowed)
             bindings[3] = { 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // ForceDrawSSBO
             bindings[4] = { 4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // FeedbackBufferSSBO (borrowed)
             bindings[5] = { 5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // LODFallbackStatsSSBO (diagnostics)
+            bindings[6] = { 6, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // FeedbackTouchBufferSSBO (borrowed) -- resident-touch reports for GpuGeometryPagePool's LRU.
 
             VkDescriptorSetLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-            layoutInfo.bindingCount = 6;
+            layoutInfo.bindingCount = 7;
             layoutInfo.pBindings = bindings;
             VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &layoutInfo, nullptr, &m_ResidencyFallbackSetLayout));
 
@@ -294,15 +295,17 @@ namespace renderer {
             VkDescriptorBufferInfo forceDrawInfo{ m_ForceDrawBuffer.Handle(), 0, m_ForceDrawBuffer.Size() };
             VkDescriptorBufferInfo feedbackInfo{ m_FeedbackBuffer.GetDeviceBuffer(), 0, VK_WHOLE_SIZE };
             VkDescriptorBufferInfo lodFallbackStatsInfo{ m_LODFallbackStatsBuffer.Handle(), 0, m_LODFallbackStatsBuffer.Size() };
+            VkDescriptorBufferInfo feedbackTouchInfo{ m_FeedbackBuffer.GetTouchDeviceBuffer(), 0, VK_WHOLE_SIZE };
 
-            VkWriteDescriptorSet writes[6]{};
+            VkWriteDescriptorSet writes[7]{};
             writes[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ResidencyFallbackDescriptorSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &decisionInfo, nullptr };
             writes[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ResidencyFallbackDescriptorSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &lodNodesInfo, nullptr };
             writes[2] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ResidencyFallbackDescriptorSet, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &pageTableInfo, nullptr };
             writes[3] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ResidencyFallbackDescriptorSet, 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &forceDrawInfo, nullptr };
             writes[4] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ResidencyFallbackDescriptorSet, 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &feedbackInfo, nullptr };
             writes[5] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ResidencyFallbackDescriptorSet, 5, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &lodFallbackStatsInfo, nullptr };
-            vkUpdateDescriptorSets(m_Device, 6, writes, 0, nullptr);
+            writes[6] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ResidencyFallbackDescriptorSet, 6, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &feedbackTouchInfo, nullptr };
+            vkUpdateDescriptorSets(m_Device, 7, writes, 0, nullptr);
 
             VkPipelineLayoutCreateInfo pipelineLayoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
             pipelineLayoutInfo.setLayoutCount = 1;

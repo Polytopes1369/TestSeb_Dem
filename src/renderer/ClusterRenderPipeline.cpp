@@ -148,7 +148,8 @@ bool ClusterRenderPipeline::Init(
   // occur.
   uint32_t maxLogicalPages = static_cast<uint32_t>(header.totalFileSizeBytes /
                                                    geometry::kPageSizeBytes);
-  m_PagePool.Init(createInfo.allocator, maxLogicalPages, totalClusterCount);
+  m_PagePool.Init(createInfo.allocator, maxLogicalPages, totalClusterCount,
+                  createInfo.transferQueueFamilyIndex, createInfo.graphicsQueueFamilyIndex);
   m_Decompression.Init(createInfo.device, createInfo.allocator,
                        totalClusterCount, m_PagePool.GetPhysicalPoolBuffer());
 
@@ -185,7 +186,7 @@ bool ClusterRenderPipeline::Init(
   // independent of the STEP 2/4 bulk-load path above, which already closed its own plain
   // std::ifstream by this point) and its own copy of indexEntries (clusterID -> virtualAddress).
   m_Streaming.Init(createInfo.device, createInfo.allocator,
-                   createInfo.cacheFilePath, indexEntries);
+                   createInfo.cacheFilePath, indexEntries, dagEntries);
 
   m_OcclusionCulling.Init(createInfo.device, createInfo.allocator, leafCount,
                           totalClusterCount,
@@ -207,19 +208,25 @@ bool ClusterRenderPipeline::Init(
     m_PagePool.ClearPageTable(cmd);
 
     for (const geometry::ClusterIndexEntry &entry : indexEntries) {
-      bool bound = m_PagePool.BindPage(
+      // Startup-only path: one blocking one-shot submit on a single queue (createInfo.queue), so
+      // there is no cross-queue-family hop to synchronize here -- UploadPageData()'s copy and
+      // FinalizeBoundPage()'s table write both simply record onto this same `cmd`, with no
+      // Release/AcquirePhysicalPoolOwnership() call needed (those exist only for the per-frame
+      // streaming path's transfer-queue -> graphics-queue handoff, see GeometryStreamingCoordinator).
+      bool uploaded = m_PagePool.UploadPageData(
           cmd, entry.virtualAddress, stagingBuffer.Handle(),
           entry.virtualAddress - header.geometryDataBaseOffset,
           geometry::kPageSizeBytes);
-      if (!bound) {
+      if (!uploaded) {
         LOG_ERROR(std::format(
-            "[ClusterRenderPipeline] BindPage failed for cluster {}.",
+            "[ClusterRenderPipeline] UploadPageData failed for cluster {}.",
             entry.clusterID));
-        throw std::runtime_error("ClusterRenderPipeline: BindPage failed during initialization");
+        throw std::runtime_error("ClusterRenderPipeline: UploadPageData failed during initialization");
       }
+      m_PagePool.FinalizeBoundPage(cmd, entry.virtualAddress);
 
       // The logical->physical mapping is CPU-side bookkeeping, valid the moment
-      // BindPage() records -- so the matching decompression dispatch can target
+      // UploadPageData() records -- so the matching decompression dispatch can target
       // the exact physical slot immediately, in the same command buffer.
       uint32_t physicalPage =
           m_PagePool.GetPhysicalPageIndex(entry.virtualAddress);
@@ -654,6 +661,7 @@ void ClusterRenderPipeline::BeginVisBufferRendering(
 }
 
 void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
+                                        VkCommandBuffer transferCmd,
                                         const CameraPushConstants &camera,
                                         const maths::vec3 &cameraPositionWorld,
                                         const CameraFrameInfo &cameraFrameInfo,
@@ -847,7 +855,7 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
   // time this frame's own residency checks (ClusterLODResidencyFallback.comp/ClusterLODCompact
   // .comp) run.
   // =========================================================================================
-  m_Streaming.ProcessFeedbackAndDrainCompletions(cmd, m_LODSelection.GetFeedbackBuffer(),
+  m_Streaming.ProcessFeedbackAndDrainCompletions(cmd, transferCmd, m_LODSelection.GetFeedbackBuffer(),
                                                  m_PagePool, m_Decompression);
 
   // =========================================================================================

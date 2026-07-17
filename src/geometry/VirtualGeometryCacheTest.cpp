@@ -308,7 +308,12 @@ namespace geometry {
         uint32_t iCount = 0;
         uint32_t eCount = 0;
         std::string profileName;
-        if (!(cfgFile >> spacing >> vCount >> iCount >> eCount >> profileName)) {
+        uint32_t generationVersion = 0;
+        // generationVersion is read last and defaults to 0 (never matches a real
+        // kGeometryGenerationVersion, which starts at 1) if the field is missing entirely -- so a
+        // scene.cache.cfg written by an older build of this engine (before this field existed) is
+        // correctly treated as stale rather than crashing on a short read.
+        if (!(cfgFile >> spacing >> vCount >> iCount >> eCount >> profileName >> generationVersion)) {
             return false;
         }
         if (std::abs(spacing - config::VERTEX_SPACING) > 1e-5f) {
@@ -326,6 +331,9 @@ namespace geometry {
         if (profileName != config::g_ActiveProfileName) {
             return false;
         }
+        if (generationVersion != kGeometryGenerationVersion) {
+            return false;
+        }
         return true;
     }
 
@@ -339,7 +347,8 @@ namespace geometry {
                     << totalVertexCount << " "
                     << totalIndexCount << " "
                     << entityCount << " "
-                    << config::g_ActiveProfileName << "\n";
+                    << config::g_ActiveProfileName << " "
+                    << kGeometryGenerationVersion << "\n";
         }
     }
 

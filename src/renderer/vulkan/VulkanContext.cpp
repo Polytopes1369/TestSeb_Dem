@@ -653,12 +653,48 @@ void VulkanContext::CreateLogicalDevice() {
     throw std::runtime_error(
         "Could not find combined graphics and compute queue!");
 
+  // Dedicated transfer queue (UE 5.8 RHI parity): a queue family advertising ONLY
+  // VK_QUEUE_TRANSFER_BIT (no GRAPHICS, no COMPUTE) is a hardware copy engine on most discrete
+  // GPUs -- streaming uploads (renderer::GeometryStreamingCoordinator's page copies) submitted
+  // there run in parallel with, and never contend for, the graphics queue's own command
+  // submission. Not every GPU exposes one (integrated GPUs / some vendors expose only the
+  // combined graphics+compute family), so this is a graceful runtime fallback, never a hard
+  // requirement -- m_HasDedicatedTransferQueue tells a consumer whether queue-family-ownership
+  // transfer barriers are actually needed (same family == no transfer needed, see
+  // GpuGeometryPagePool::UploadPageData/FinalizeBoundPage).
+  m_TransferQueueFamilyIndex = m_GraphicsQueueFamilyIndex;
+  m_HasDedicatedTransferQueue = false;
+  for (uint32_t i = 0; i < queueFamilyCount; i++) {
+    if ((queueFamilies[i].queueFlags & VK_QUEUE_TRANSFER_BIT) &&
+        !(queueFamilies[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) &&
+        !(queueFamilies[i].queueFlags & VK_QUEUE_COMPUTE_BIT)) {
+      m_TransferQueueFamilyIndex = i;
+      m_HasDedicatedTransferQueue = true;
+      break;
+    }
+  }
+
   float queuePriority = 1.0f;
-  VkDeviceQueueCreateInfo queueCreateInfo{
-      VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
-  queueCreateInfo.queueFamilyIndex = m_GraphicsQueueFamilyIndex;
-  queueCreateInfo.queueCount = 1;
-  queueCreateInfo.pQueuePriorities = &queuePriority;
+  std::vector<VkDeviceQueueCreateInfo> queueCreateInfos;
+  queueCreateInfos.reserve(2); // Fixed upfront: emplace_back below must never trigger a reallocation
+                               // while an earlier element's pQueuePriorities (below) still points
+                               // at this same-scope `queuePriority` local -- reserving avoids any
+                               // risk of that, though pQueuePriorities is re-pointed at &queuePriority
+                               // fresh for each entry regardless, so this is defense in depth.
+
+  VkDeviceQueueCreateInfo graphicsQueueCreateInfo{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
+  graphicsQueueCreateInfo.queueFamilyIndex = m_GraphicsQueueFamilyIndex;
+  graphicsQueueCreateInfo.queueCount = 1;
+  graphicsQueueCreateInfo.pQueuePriorities = &queuePriority;
+  queueCreateInfos.push_back(graphicsQueueCreateInfo);
+
+  if (m_HasDedicatedTransferQueue) {
+    VkDeviceQueueCreateInfo transferQueueCreateInfo{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
+    transferQueueCreateInfo.queueFamilyIndex = m_TransferQueueFamilyIndex;
+    transferQueueCreateInfo.queueCount = 1;
+    transferQueueCreateInfo.pQueuePriorities = &queuePriority;
+    queueCreateInfos.push_back(transferQueueCreateInfo);
+  }
 
   VkPhysicalDeviceVulkan13Features features13{
       VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
@@ -760,8 +796,8 @@ void VulkanContext::CreateLogicalDevice() {
 
   VkDeviceCreateInfo createInfo{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
   createInfo.pNext = &deviceFeatures2;
-  createInfo.queueCreateInfoCount = 1;
-  createInfo.pQueueCreateInfos = &queueCreateInfo;
+  createInfo.queueCreateInfoCount = static_cast<uint32_t>(queueCreateInfos.size());
+  createInfo.pQueueCreateInfos = queueCreateInfos.data();
 
   const std::vector<const char *> deviceExtensions = {
       VK_KHR_SWAPCHAIN_EXTENSION_NAME,
@@ -786,6 +822,10 @@ void VulkanContext::CreateLogicalDevice() {
   }
 
   vkGetDeviceQueue(m_Device, m_GraphicsQueueFamilyIndex, 0, &m_GraphicsQueue);
+  vkGetDeviceQueue(m_Device, m_TransferQueueFamilyIndex, 0, &m_TransferQueue);
+  LOG_INFO(std::format("[VulkanContext] Transfer queue: {} (family {})",
+      m_HasDedicatedTransferQueue ? "dedicated hardware copy queue" : "falling back to the graphics queue",
+      m_TransferQueueFamilyIndex));
 
   // See RayTracingFunctions.h's own comment: VK_KHR_acceleration_structure /
   // VK_KHR_ray_tracing_pipeline's entry points are not re-exported by this SDK's loader import
@@ -802,6 +842,19 @@ void VulkanContext::CreateCommandPool() {
       VK_SUCCESS) {
     throw std::runtime_error("Failed to create Command Pool!");
   }
+
+  // Own pool for the transfer queue's per-frame command buffer (renderer::
+  // GeometryStreamingCoordinator's page-copy uploads, see GetTransferCommandBuffer()) -- a command
+  // pool is always tied to one specific queue family, so this must be a distinct pool even when
+  // m_HasDedicatedTransferQueue is false and it targets the SAME family as m_CommandPool above
+  // (Vulkan permits multiple pools per family; nothing here needs them to be the same pool).
+  VkCommandPoolCreateInfo transferPoolInfo{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+  transferPoolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+  transferPoolInfo.queueFamilyIndex = m_TransferQueueFamilyIndex;
+  if (vkCreateCommandPool(m_Device, &transferPoolInfo, nullptr, &m_TransferCommandPool) !=
+      VK_SUCCESS) {
+    throw std::runtime_error("Failed to create Transfer Command Pool!");
+  }
 }
 
 void VulkanContext::AllocateCommandBuffer() {
@@ -813,6 +866,16 @@ void VulkanContext::AllocateCommandBuffer() {
   if (vkAllocateCommandBuffers(m_Device, &allocInfo, &m_CommandBuffer) !=
       VK_SUCCESS) {
     throw std::runtime_error("Failed to allocate principal Command Buffer!");
+  }
+
+  VkCommandBufferAllocateInfo transferAllocInfo{
+      VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+  transferAllocInfo.commandPool = m_TransferCommandPool;
+  transferAllocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+  transferAllocInfo.commandBufferCount = 1;
+  if (vkAllocateCommandBuffers(m_Device, &transferAllocInfo, &m_TransferCommandBuffer) !=
+      VK_SUCCESS) {
+    throw std::runtime_error("Failed to allocate Transfer Command Buffer!");
   }
 }
 
@@ -972,6 +1035,17 @@ void VulkanContext::CreateSyncObjects() {
         VK_SUCCESS) {
       throw std::runtime_error("Failed to create synchronization semaphores!");
     }
+  }
+
+  // Signaled once per frame when the transfer queue's command buffer (GetTransferCommandBuffer())
+  // finishes -- the graphics submission waits on this before touching any data it uploaded (see
+  // main.cpp's per-frame submit sequence). A single binary semaphore is safe here (unlike
+  // m_RenderFinishedSemaphores needing one per swapchain image): this one is only ever
+  // signaled/waited within the same frame's own pair of submissions, never handed to
+  // vkQueuePresentKHR or reused across a frame boundary before both its signal and its wait have
+  // retired -- the frameFence wait at the top of main.cpp's loop already guarantees that.
+  if (vkCreateSemaphore(m_Device, &semaphoreInfo, nullptr, &m_TransferFinishedSemaphore) != VK_SUCCESS) {
+    throw std::runtime_error("Failed to create transfer-finished semaphore!");
   }
 }
 
@@ -2388,6 +2462,10 @@ void VulkanContext::Shutdown() {
     vkDestroySemaphore(m_Device, semaphore, nullptr);
   }
   m_RenderFinishedSemaphores.clear();
+  if (m_TransferFinishedSemaphore != VK_NULL_HANDLE) {
+    vkDestroySemaphore(m_Device, m_TransferFinishedSemaphore, nullptr);
+    m_TransferFinishedSemaphore = VK_NULL_HANDLE;
+  }
 
   for (VkPipeline pipeline :
        {m_ConePipeline, m_IcospherePipeline, m_PlanePipeline, m_SpherePipeline,
@@ -2445,6 +2523,10 @@ void VulkanContext::Shutdown() {
 
   if (m_CommandPool != VK_NULL_HANDLE) {
     vkDestroyCommandPool(m_Device, m_CommandPool, nullptr);
+  }
+  if (m_TransferCommandPool != VK_NULL_HANDLE) {
+    vkDestroyCommandPool(m_Device, m_TransferCommandPool, nullptr);
+    m_TransferCommandPool = VK_NULL_HANDLE;
   }
 
   if (m_Allocator != VK_NULL_HANDLE) {

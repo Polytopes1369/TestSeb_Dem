@@ -13,11 +13,19 @@ namespace renderer {
 
     void GeometryStreamingCoordinator::Init(VkDevice device, VmaAllocator allocator,
         const std::filesystem::path& cacheFilePath,
-        const std::vector<geometry::ClusterIndexEntry>& indexEntries) {
+        const std::vector<geometry::ClusterIndexEntry>& indexEntries,
+        const std::vector<geometry::DAGNodeEntry>& dagEntries) {
         Shutdown();
 
         m_Device = device;
         m_IndexEntries = indexEntries;
+
+        // dagEntries is index-aligned with indexEntries (same clusterID == array position
+        // convention, see geometry::VirtualGeometryCacheTest.cpp's documented invariant).
+        m_ClusterDAGLevel.resize(dagEntries.size());
+        for (size_t i = 0; i < dagEntries.size(); ++i) {
+            m_ClusterDAGLevel[i] = dagEntries[i].level;
+        }
 
         if (!m_Streamer.Open(cacheFilePath)) {
             LOG_ERROR(std::format("[GeometryStreamingCoordinator] Failed to open '{}' for async streaming.",
@@ -56,6 +64,7 @@ namespace renderer {
 
         m_CompletedReads.clear();
         m_IndexEntries.clear();
+        m_ClusterDAGLevel.clear();
         m_TotalBytesCompleted.store(0, std::memory_order_relaxed);
         m_Device = VK_NULL_HANDLE;
     }
@@ -69,8 +78,8 @@ namespace renderer {
         return kInvalidSlot;
     }
 
-    void GeometryStreamingCoordinator::ProcessFeedbackAndDrainCompletions(VkCommandBuffer cmd, FeedbackBuffer& feedbackBuffer,
-        GpuGeometryPagePool& pagePool, GeometryDecompressionPass& decompressionPass) {
+    void GeometryStreamingCoordinator::ProcessFeedbackAndDrainCompletions(VkCommandBuffer cmd, VkCommandBuffer transferCmd,
+        FeedbackBuffer& feedbackBuffer, GpuGeometryPagePool& pagePool, GeometryDecompressionPass& decompressionPass) {
         if (!m_Streamer.IsOpen()) {
             return; // Open() failed at Init -- streaming is simply inert (already logged).
         }
@@ -92,7 +101,36 @@ namespace renderer {
                 "Some non-resident clusters were not requested and will keep missing until pressure drops.",
                 overflowedRequestCount, feedbackBuffer.GetCapacity()));
         }
-        m_RequestQueue.SubmitFrameRequests(missedClusterIDs);
+        std::vector<float> missedPriorities;
+        missedPriorities.reserve(missedClusterIDs.size());
+        for (uint32_t clusterID : missedClusterIDs) {
+            // Coarser cluster (higher DAG level) first -- see Init()'s own comment.
+            missedPriorities.push_back(clusterID < m_ClusterDAGLevel.size() ? float(m_ClusterDAGLevel[clusterID]) : 0.0f);
+        }
+        m_RequestQueue.SubmitFrameRequests(missedClusterIDs, missedPriorities);
+
+        // --- 1b. Fold LAST frame's resident-touch reports into the LRU BEFORE any eviction
+        // decision below (step 3's BindPageEvictingIfFull) runs -- a page reported here was drawn
+        // every frame up to and including last frame, so it must never be treated as a stale
+        // eviction candidate purely because it was never re-bound. See GpuGeometryPagePool's
+        // TouchPages doc comment and ClusterLODResidencyFallback.comp's RecordResidentTouch call. ---
+        uint32_t overflowedTouchCount = 0;
+        std::vector<uint32_t> touchedClusterIDs = feedbackBuffer.ReadTouchedClusterIDs(&overflowedTouchCount);
+        if (overflowedTouchCount > 0) {
+            LOG_WARNING(std::format("[GeometryStreamingCoordinator] FeedbackBuffer touch channel saturated: {} resident-touch report(s) dropped this frame (capacity={}). "
+                "Some still-in-use pages were not marked most-recently-used this frame and could be mistaken for eviction candidates.",
+                overflowedTouchCount, feedbackBuffer.GetCapacity()));
+        }
+        if (!touchedClusterIDs.empty()) {
+            std::vector<uint64_t> touchedLogicalAddresses;
+            touchedLogicalAddresses.reserve(touchedClusterIDs.size());
+            for (uint32_t clusterID : touchedClusterIDs) {
+                if (clusterID < m_IndexEntries.size()) {
+                    touchedLogicalAddresses.push_back(m_IndexEntries[clusterID].virtualAddress);
+                }
+            }
+            pagePool.TouchPages(touchedLogicalAddresses);
+        }
 
         // --- 2. Issue up to kMaxNewReadsPerFrame new async reads, bounded by both the per-frame
         // budget and the number of free I/O slots. ---
@@ -137,6 +175,16 @@ namespace renderer {
         }
 
         uint32_t ringSlot = 0;
+        // Uploaded on `transferCmd` this pass; each needs AcquirePhysicalPoolOwnership() +
+        // FinalizeBoundPage() (+ decompression) recorded on `cmd` afterward -- see the loop below.
+        // Copies of the owning ClusterIndexEntry (not just the logical address) since
+        // DecompressPage() needs its bounds too, and re-deriving an entry from a logical address
+        // would need the reverse of the clusterID -> virtualAddress mapping this class already
+        // has forward (ClusterIndexEntry::clusterID is NOT recoverable from
+        // GpuPageTable::LogicalAddressToPageID(virtualAddress), which yields a page-table index,
+        // not a clusterID).
+        std::vector<geometry::ClusterIndexEntry> uploadedEntries;
+        uploadedEntries.reserve(drained.size());
         for (const CompletedRead& completed : drained) {
             m_SlotBusy[completed.slotIndex] = false; // Free the I/O slot for reuse regardless of outcome.
             m_RequestQueue.MarkRequestCompleted(completed.clusterID);
@@ -153,17 +201,29 @@ namespace renderer {
                 m_RawBuffers[completed.slotIndex], geometry::kPageSizeBytes);
             ++ringSlot;
 
-            bool bound = pagePool.BindPageEvictingIfFull(cmd, entry.virtualAddress,
+            bool uploaded = pagePool.UploadPageDataEvictingIfFull(transferCmd, cmd, entry.virtualAddress,
                 m_StagingRing.Handle(), ringOffset, geometry::kPageSizeBytes);
-            if (bound) {
+            if (uploaded) {
+                uploadedEntries.push_back(entry);
+            } else {
+                LOG_WARNING(std::format("[GeometryStreamingCoordinator] UploadPageDataEvictingIfFull failed for clusterID {} (virtualAddress {:#x}) -- "
+                    "pool still full after eviction budget, or already resident. This cluster's completed read is discarded; it will only reappear "
+                    "if a future frame reports it missing again.", completed.clusterID, entry.virtualAddress));
+            }
+        }
+
+        // Finalize this frame's uploads: one ownership-transfer barrier pair for the whole batch
+        // (see GpuGeometryPagePool::Release/AcquirePhysicalPoolOwnership's own comment on why one
+        // pair per frame instead of one per page), then each page's table entry + decompression.
+        if (!uploadedEntries.empty()) {
+            pagePool.ReleasePhysicalPoolOwnership(transferCmd);
+            pagePool.AcquirePhysicalPoolOwnership(cmd);
+            for (const geometry::ClusterIndexEntry& entry : uploadedEntries) {
+                pagePool.FinalizeBoundPage(cmd, entry.virtualAddress);
                 uint32_t physicalPage = pagePool.GetPhysicalPageIndex(entry.virtualAddress);
                 decompressionPass.DecompressPage(cmd, physicalPage,
                     maths::vec3{ entry.boundsMin[0], entry.boundsMin[1], entry.boundsMin[2] },
                     maths::vec3{ entry.boundsMax[0], entry.boundsMax[1], entry.boundsMax[2] });
-            } else {
-                LOG_WARNING(std::format("[GeometryStreamingCoordinator] BindPageEvictingIfFull failed for clusterID {} (virtualAddress {:#x}) -- "
-                    "pool still full after eviction budget, or already resident. This cluster's completed read is discarded; it will only reappear "
-                    "if a future frame reports it missing again.", completed.clusterID, entry.virtualAddress));
             }
         }
 

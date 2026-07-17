@@ -125,7 +125,16 @@ namespace renderer {
         // Fold this frame's RequestPage() reports into the dedup queue as a single batch (see
         // m_PendingThisFrameKeys' own comment).
         if (!m_PendingThisFrameKeys.empty()) {
-            m_RequestQueue.SubmitFrameRequests(m_PendingThisFrameKeys);
+            // Priority = mip level (see VirtualTextureStreamingCoordinator's identical rationale) --
+            // a coarser page renders before a finer one.
+            std::vector<float> pendingPriorities;
+            pendingPriorities.reserve(m_PendingThisFrameKeys.size());
+            for (uint32_t pageKey : m_PendingThisFrameKeys) {
+                uint32_t x = 0, y = 0, mip = 0;
+                VirtualTextureManager::UnpackPageKey(pageKey, x, y, mip);
+                pendingPriorities.push_back(float(mip));
+            }
+            m_RequestQueue.SubmitFrameRequests(m_PendingThisFrameKeys, pendingPriorities);
             m_PendingThisFrameKeys.clear();
         }
 
