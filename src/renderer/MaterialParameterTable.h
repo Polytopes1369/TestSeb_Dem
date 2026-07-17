@@ -39,7 +39,14 @@ namespace renderer {
         // one" -- matching real UE5.8, where Nanite only ever renders opaque/masked geometry and
         // translucent materials always go through a distinct forward renderer.
         float alpha;
-        float _pad0 = 0.0f; // Reserved (e.g. a future IOR/refraction parameter for glass-like transparents).
+        // Phase PP3 (post-process stack roadmap): 0.0 = off (default), >0.0 = this material writes a
+        // procedural, animated screen-space refraction offset into renderer::TransparentForwardPass's
+        // own second (RG16F) color attachment -- renderer::PostProcessPass's composite shader then
+        // samples that buffer and distorts the UV it reads the HDR scene through, exactly UE5.8's own
+        // material-authored "Refraction" mechanism (a post-process material samples SceneColor at an
+        // offset UV a translucent material's shader writes), not a single global distortion knob. See
+        // TransparentForward.frag's own end-of-main() comment for the actual noise formula.
+        float heatDistortion = 0.0f;
         // UE5.8 Lumen "Output Reflections" equivalent: per-material opt-in for TransparentForward.
         // frag's traced front-layer specular reflection (HWRT/SWRT, see that shader's own comment)
         // -- NOT applied to every transparent material, only ones that need it (glass/water-like),
@@ -147,6 +154,9 @@ namespace renderer {
                 p.emissive = maths::vec3(0.0f, 0.0f, 0.0f);
                 p.alpha = 0.35f + 0.35f * unit(rng); // [0.35, 0.70]
                 p.hasReflections = 0.0f; // Frosted/soft translucency -- no clear image to reflect.
+                // ~1 in 4 Translucent materials additionally shimmers like heat haze (Phase PP3,
+                // post-process stack roadmap) -- see MaterialParameters::heatDistortion's own comment.
+                p.heatDistortion = (unit(rng) < 0.25f) ? (0.5f + 0.5f * unit(rng)) : 0.0f;
             } else {
                 // Transparent: clear/glass-like -- low roughness, low alpha, traced reflections on
                 // (see MaterialParameters::hasReflections's own comment).

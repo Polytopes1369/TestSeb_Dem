@@ -74,7 +74,9 @@ layout(std140, set = 0, binding = 5) uniform TransparentViewParamsUBO {
     mat4 view; // Unused here (vertex-stage only) -- see TransparentForward.vert.
     mat4 proj;
     vec3 cameraPositionWorld;
-    float _pad0;
+    // Phase PP3: repurposes what used to be pure std140 padding -- feeds the animated procedural
+    // refraction-offset noise at the end of main() below.
+    float globalTime;
     vec4 sunDirectionAndIntensity; // xyz = direction (points FROM the light TOWARD the scene), w = intensity.
     vec4 sunColor;                 // rgb = color, a unused.
 } g_ViewParams;
@@ -106,6 +108,9 @@ layout(push_constant) uniform TransparentPushConstants {
 } pc;
 
 layout(location = 0) out vec4 outColor;
+// Phase PP3 (post-process stack roadmap): per-material procedural refraction offset -- see
+// renderer::MaterialParameters::heatDistortion's own comment and this file's end-of-main() comment.
+layout(location = 1) out vec2 outRefractionOffset;
 
 // Direct lighting for this fragment: the sun only now (shadowed via SampleSunShadowVSM) -- point
 // lights are MegaLights' job (see this file's own header comment) -- ported from
@@ -281,4 +286,23 @@ void main() {
     }
 
     outColor = vec4(outRGB, outAlpha);
+
+    // --- Phase PP3: procedural, animated refraction offset (Heat Distortion & Refraction) --
+    // UE5.8-parity material-authored mechanism: this fragment writes a per-pixel screen-space UV
+    // offset into g_RefractionOffset (this pass' own second color attachment), which renderer::
+    // PostProcessPass's composite shader later samples and uses to distort the UV it reads the HDR
+    // scene color through -- exactly like a real UE5.8 translucent material's "Refraction" input,
+    // not a single global post-process knob. Two independently-scrolling value-noise fields (world-
+    // space XZ, offset by g_ViewParams.globalTime) drive the X/Y offset components -- cheap, no
+    // texture asset, reads as a believable rising-heat shimmer for any material with
+    // MaterialParams.heatDistortion > 0 (see MaterialParameterTable.h's own category comment for
+    // which materials roll one).
+    if (mat.heatDistortion > 0.0) {
+        vec2 flowUV = inWorldPos.xz * 0.35 + vec2(0.0, g_ViewParams.globalTime * 0.6);
+        float noiseX = Hash(flowUV) - 0.5;
+        float noiseY = Hash(flowUV * 1.7 + vec2(19.3, 7.1) + g_ViewParams.globalTime * 0.4) - 0.5;
+        outRefractionOffset = vec2(noiseX, noiseY) * mat.heatDistortion * 0.015;
+    } else {
+        outRefractionOffset = vec2(0.0);
+    }
 }

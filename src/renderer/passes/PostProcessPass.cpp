@@ -30,7 +30,8 @@ namespace renderer {
     } // namespace
 
     void PostProcessPass::Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
-        VkExtent2D displayExtent, VkImageView hdrColorView, VkImageView bloomView) {
+        VkExtent2D displayExtent, VkImageView hdrColorView, VkImageView bloomView,
+        VkImageView depthView, VkImageView refractionOffsetView) {
         Shutdown();
         m_Device = device;
         m_Allocator = allocator;
@@ -130,7 +131,9 @@ namespace renderer {
         // STORAGE_BUFFER count of 4: Histogram set uses 1 (HistogramSSBO), Adapt set uses 2
         // (HistogramSSBO + ExposureStateSSBO), Composite set uses 1 (ExposureStateSSBO read-only).
         std::array<VkDescriptorPoolSize, 4> poolSizes{ {
-            { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3 }, // Histogram HDR input + Composite HDR input + Composite g_Bloom (PP2).
+            // Histogram HDR input + Composite HDR input + Composite g_Bloom (PP2) + Composite
+            // g_Depth + Composite g_RefractionOffset (both PP3).
+            { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 5 },
             { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1 },          // Composite output.
             { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4 },
             { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 },         // Composite params.
@@ -204,12 +207,14 @@ namespace renderer {
 
         // --- Stage 3: PostProcessComposite.comp ---
         {
-            std::array<VkDescriptorSetLayoutBinding, 5> bindings{ {
+            std::array<VkDescriptorSetLayoutBinding, 7> bindings{ {
                 { 0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // g_HDRColor
                 { 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },          // g_Output
                 { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },         // ExposureStateSSBO
                 { 3, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },         // PostProcessParamsUBO
                 { 4, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // g_Bloom (Phase PP2)
+                { 5, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // g_Depth (Phase PP3)
+                { 6, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // g_RefractionOffset (Phase PP3)
             } };
             VkDescriptorSetLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
             layoutInfo.bindingCount = static_cast<uint32_t>(bindings.size());
@@ -234,7 +239,22 @@ namespace renderer {
 
         UpdateDescriptorSets(hdrColorView, bloomView);
 
-        LOG_INFO("[PostProcessPass] Initialized (Phase PP1+PP2: exposure/white-balance/color-correction/ACES/gamma + bloom/chromatic-aberration/vignette).");
+        // --- Phase PP3: g_Depth / g_RefractionOffset, written ONCE here (unlike hdrColorView/
+        // bloomView above) -- both source images keep a fixed identity for this pipeline's entire
+        // lifetime (renderer::ClusterResolvePass's depth is never ping-ponged; renderer::
+        // TransparentForwardPass's own refraction image is a single owned GpuImage -- see Init()'s
+        // own header comment). ---
+        {
+            VkDescriptorImageInfo depthInfo{ m_LinearSampler, depthView, VK_IMAGE_LAYOUT_GENERAL };
+            VkDescriptorImageInfo refractionInfo{ m_LinearSampler, refractionOffsetView, VK_IMAGE_LAYOUT_GENERAL };
+            std::array<VkWriteDescriptorSet, 2> writes{ {
+                { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_CompositeSet, 5, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &depthInfo, nullptr, nullptr },
+                { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_CompositeSet, 6, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &refractionInfo, nullptr, nullptr },
+            } };
+            vkUpdateDescriptorSets(m_Device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+        }
+
+        LOG_INFO("[PostProcessPass] Initialized (Phase PP1+PP2+PP3: exposure/color-grading + bloom/CA/vignette + motion-blur/fog/heat-distortion).");
     }
 
     void PostProcessPass::UpdateDescriptorSets(VkImageView hdrColorView, VkImageView bloomView) {
@@ -307,7 +327,8 @@ namespace renderer {
         m_Device = VK_NULL_HANDLE;
     }
 
-    void PostProcessPass::RecordComposite(VkCommandBuffer cmd, float deltaTimeSeconds, const Settings& settings) {
+    void PostProcessPass::RecordComposite(VkCommandBuffer cmd, float deltaTimeSeconds, const Settings& settings,
+        const maths::mat4& invViewProj, const maths::mat4& prevViewProj, const maths::vec3& cameraPositionWorld) {
         // --- Upload this frame's params UBO ---
         PostProcessParamsUBO params{};
         params.aperture = settings.aperture;
@@ -330,6 +351,22 @@ namespace renderer {
         params.vignetteIntensity = settings.vignetteIntensity;
         params.vignetteSmoothness = settings.vignetteSmoothness;
         params.vignetteColorBleed = settings.vignetteColorBleed;
+
+        params.invViewProj = invViewProj;
+        params.prevViewProj = prevViewProj;
+        params.cameraPosX = cameraPositionWorld.x;
+        params.cameraPosY = cameraPositionWorld.y;
+        params.cameraPosZ = cameraPositionWorld.z;
+        params.heatDistortionIntensity = settings.heatDistortionIntensity;
+        params.motionBlurIntensity = settings.motionBlurIntensity;
+        params.motionBlurMaxVelocityUV = settings.motionBlurMaxVelocityUV;
+        params.fogColor[0] = settings.fogColorR; params.fogColor[1] = settings.fogColorG; params.fogColor[2] = settings.fogColorB;
+        params.fogDensity = settings.fogDensity;
+        params.fogHeightFalloff = settings.fogHeightFalloff;
+        params.fogHeightOffset = settings.fogHeightOffset;
+        params.fogStartDistance = settings.fogStartDistance;
+        params.fogMaxOpacity = settings.fogMaxOpacity;
+
         vkCmdUpdateBuffer(cmd, m_ParamsBuffer.Handle(), 0, sizeof(PostProcessParamsUBO), &params);
 
         VkMemoryBarrier2 uploadBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };

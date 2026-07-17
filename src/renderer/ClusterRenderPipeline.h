@@ -98,6 +98,7 @@
 #include "renderer/streaming/VirtualTextureStreamingCoordinator.h"
 #include "renderer/passes/WorldProbeGridPass.h"
 #include "renderer/passes/TAATSRPass.h"
+#include "renderer/passes/DepthOfFieldPass.h"
 #include "renderer/passes/BloomPass.h"
 #include "renderer/passes/PostProcessPass.h"
 #include "renderer/passes/ScreenTracePass.h"
@@ -479,8 +480,14 @@ namespace renderer {
         // view path -- see RecordFrame()'s own comment for exactly why.
         ATrousDenoisePass m_Denoiser;
         TAATSRPass m_TAATSR;
+        // Phase PP3 (post-process stack roadmap): physically-derived Depth of Field -- reads
+        // m_TAATSR's own HDR output directly, runs BEFORE m_Bloom (below) so an out-of-focus
+        // highlight is already a soft disc by the time Bloom's own bright-pass threshold sees it --
+        // see DepthOfFieldPass's own class comment. m_Bloom and m_PostProcess both read ITS
+        // GetOutputView() now, not m_TAATSR's directly.
+        DepthOfFieldPass m_DepthOfField;
         // Phase PP2 (post-process stack roadmap): Bloom / Lens Flare / Anamorphic Lens Flare / Lens
-        // Dirt, all one dual-filter mip chain reading m_TAATSR's own HDR output -- see BloomPass's
+        // Dirt, all one dual-filter mip chain reading m_DepthOfField's own output -- see BloomPass's
         // own class comment. Recorded before m_PostProcess (below), whose composite shader samples
         // its GetOutputView() and adds it into the scene color.
         BloomPass m_Bloom;

@@ -502,6 +502,7 @@ bool ClusterRenderPipeline::Init(
   // call site must name the format of the image it actually targets, not a coincidentally-equal
   // one, so the two are free to diverge later without silently breaking this pipeline's format.
   m_TransparentForward.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
+                            m_RenderExtent,
                             m_PagePool.GetPageTableBuffer(), m_PagePool.GetPhysicalPoolBuffer(),
                             createInfo.entityTransformBuffer, createInfo.entityDataBuffer, m_WPOGlobalsBuffer.Handle(),
                             createInfo.materialTable.params, indexEntries, dagEntries,
@@ -532,19 +533,32 @@ bool ClusterRenderPipeline::Init(
       m_RenderExtent, m_DisplayExtent,
       m_GIComposite.GetOutputView(), m_Resolve.GetOutputDepthView());
 
+  // Phase PP3 (post-process stack roadmap): physically-derived Depth of Field, reading m_TAATSR's
+  // own HDR output directly -- must Init before m_Bloom/m_PostProcess so its own GetOutputView()
+  // already exists for their own source bindings (see DepthOfFieldPass's own class comment for why
+  // DOF runs before Bloom).
+  m_DepthOfField.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
+      m_DisplayExtent, m_TAATSR.GetOutputView(), m_Resolve.GetOutputDepthView());
+
   // Phase PP2 (post-process stack roadmap): Bloom/Lens Flare/Anamorphic Flare/Lens Dirt, reading
-  // the same HDR source m_PostProcess (below) does -- must Init before m_PostProcess so its own
-  // GetOutputView() already exists for m_PostProcess.Init's own g_Bloom binding.
+  // m_DepthOfField's own output -- must Init before m_PostProcess so its own GetOutputView()
+  // already exists for m_PostProcess.Init's own g_Bloom binding.
   m_Bloom.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
-      m_DisplayExtent, m_TAATSR.GetOutputView());
+      m_DisplayExtent, m_DepthOfField.GetOutputView());
 
   // Phase PP1 (post-process stack roadmap): exposure/white-balance/color-correction/ACES/gamma --
-  // linear HDR (m_TAATSR's own TAA-resolved R16G16B16A16_SFLOAT output) -> LDR swapchain-ready
-  // color. `hdrColorView` is rewritten every frame in RecordFrame via UpdateDescriptorSets()
-  // (m_TAATSR's own output view alternates between 2 ping-pong images every frame -- the same
-  // reason renderer::TAATSRPass's own UpdateDescriptorSets exists), not just bound once here.
+  // linear HDR (m_DepthOfField's own output, itself sourced from m_TAATSR's TAA-resolved
+  // R16G16B16A16_SFLOAT history -- see [13e]'s own comment) -> LDR swapchain-ready color.
+  // `hdrColorView` is rewritten every frame in RecordFrame via UpdateDescriptorSets() (m_TAATSR's
+  // own output view alternates between 2 ping-pong images every frame, so m_DepthOfField's own
+  // output view identity is likewise effectively "per-frame" even though DepthOfFieldPass itself
+  // owns a single fixed image -- the same reason renderer::TAATSRPass's own UpdateDescriptorSets
+  // exists), not just bound once here. `depthView`/`refractionOffsetView` (Phase PP3) ARE just
+  // bound once here -- both keep a fixed identity for this pipeline's entire lifetime (see
+  // PostProcessPass::Init's own comment).
   m_PostProcess.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
-      m_DisplayExtent, m_TAATSR.GetOutputView(), m_Bloom.GetOutputView());
+      m_DisplayExtent, m_DepthOfField.GetOutputView(), m_Bloom.GetOutputView(),
+      m_Resolve.GetOutputDepthView(), m_TransparentForward.GetRefractionOffsetView());
 
 #ifndef NDEBUG
   // Two-tier SDF ray march DEBUG VISUALIZATION (see ClusterRenderPipeline.h's own comment on
@@ -624,8 +638,8 @@ void ClusterRenderPipeline::Shutdown() {
   // alongside adding m_Bloom's own equivalent call.
   m_PostProcess.Shutdown();
   m_Bloom.Shutdown();
+  m_DepthOfField.Shutdown();
   m_TAATSR.Shutdown();
-  m_PostProcess.Shutdown();
   m_WorldProbes.Shutdown();
   m_GIInject.Shutdown();
   m_SurfaceCacheRT.Shutdown();
@@ -1526,7 +1540,7 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
     VkImageView transparentTargetView = m_GIComposite.GetOutputView();
     m_TransparentForward.RecordDraw(cmd, transparentTargetImage, transparentTargetView, m_DepthImageView,
         m_RenderExtent, cameraCopy.view, cameraCopy.proj, m_Decompression.GetDecompressedIndexPoolBuffer(),
-        cameraFrameInfo.position, m_SceneLights, m_TraceContext, traceMode, m_FrameIndex);
+        cameraFrameInfo.position, m_SceneLights, globalTimeSeconds, m_TraceContext, traceMode, m_FrameIndex);
   }
 
   // =========================================================================================
@@ -1548,39 +1562,59 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
   }
 
   // =========================================================================================
-  // [13e] Phase PP2 (post-process stack roadmap): Bloom/Lens Flare/Anamorphic Flare/Lens Dirt,
-  // then Phase PP1's Physical Camera auto-exposure -> White Balance -> Color Correction -> ACES
-  // Tone Mapping -> Gamma Correction composite -- both reading m_TAATSR's own freshly-written HDR
-  // output -- see BloomPass's and PostProcessPass's own class comments for why m_PostProcess must
-  // be the very last compute step before [14]'s blit (and before [13b]'s Debug-only stat overlay
-  // below, which now draws onto ITS output instead of m_TAATSR's raw HDR buffer).
-  // m_TAATSR.GetOutputView() ping-pongs between 2 images every RecordPass() call (just above), so
-  // both passes' own descriptor sets pointing at it must be re-written every frame too, exactly
-  // like m_TAATSR.UpdateDescriptorSets() itself is called every frame above. Both run
-  // unconditionally every frame, exactly like [13d]'s own TAA/TSR pass -- the debug views that
-  // substitute a different, deliberately-untonemapped diagnostic image as the blit source instead
-  // (m_GIComposite/m_SDFRayMarch/m_Resolve, see [14]'s own blitSourceImage swap below) simply
-  // never read either pass' output, same as how those views already ignore m_TAATSR's own output
-  // today.
+  // [13e] Phase PP3: physically-derived Depth of Field over m_TAATSR's own freshly-written HDR
+  // output -- must run before [13f]'s Bloom (see DepthOfFieldPass's own class comment for why: an
+  // out-of-focus highlight should itself bloom into a soft disc, which only happens if DOF's own
+  // blur runs first). m_TAATSR.GetOutputView() ping-pongs between 2 images every RecordPass() call
+  // (just above), so m_DepthOfField's own source descriptor must be re-written every frame too.
   // =========================================================================================
   {
-      m_Bloom.UpdateSourceDescriptor(m_TAATSR.GetOutputView());
-      m_PostProcess.UpdateDescriptorSets(m_TAATSR.GetOutputView(), m_Bloom.GetOutputView());
+      m_DepthOfField.UpdateSourceDescriptor(m_TAATSR.GetOutputView());
 
-      // m_TAATSR's own output image's last writer is always its own compute dispatch (the Debug-
-      // only stat overlay now draws onto m_PostProcess's OWN output instead, AFTER this pass runs
-      // -- see [13b] below) -- re-stated here explicitly rather than relying on m_TAATSR::
-      // RecordPass' own trailing barrier (which only targets a BLIT read, not this compute-shader
-      // sampled read).
-      VkMemoryBarrier2 taatsrToPostProcessBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
-      taatsrToPostProcessBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-      taatsrToPostProcessBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-      taatsrToPostProcessBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-      taatsrToPostProcessBarrier.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
-      VkDependencyInfo taatsrToPostProcessDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-      taatsrToPostProcessDep.memoryBarrierCount = 1;
-      taatsrToPostProcessDep.pMemoryBarriers = &taatsrToPostProcessBarrier;
-      vkCmdPipelineBarrier2(cmd, &taatsrToPostProcessDep);
+      // m_TAATSR's own output image's last writer is always its own compute dispatch -- re-stated
+      // here explicitly rather than relying on m_TAATSR::RecordPass' own trailing barrier (which
+      // only targets a BLIT read, not this compute-shader sampled read).
+      VkMemoryBarrier2 taatsrToDofBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+      taatsrToDofBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+      taatsrToDofBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+      taatsrToDofBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+      taatsrToDofBarrier.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+      VkDependencyInfo taatsrToDofDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+      taatsrToDofDep.memoryBarrierCount = 1;
+      taatsrToDofDep.pMemoryBarriers = &taatsrToDofBarrier;
+      vkCmdPipelineBarrier2(cmd, &taatsrToDofDep);
+
+      DepthOfFieldPass::Settings dofSettings{};
+      dofSettings.focalLengthMM = config::postprocess::DOF_FOCAL_LENGTH_MM;
+      dofSettings.focusDistanceWorldUnits = config::postprocess::DOF_FOCUS_DISTANCE_WORLD_UNITS;
+      dofSettings.maxCoCRadiusPixels = config::postprocess::DOF_MAX_COC_RADIUS_PIXELS;
+      m_DepthOfField.RecordGenerate(cmd, invViewProj, cameraPositionWorld, config::postprocess::EXPOSURE_APERTURE, dofSettings);
+  }
+
+  // =========================================================================================
+  // [13f] Phase PP2 (post-process stack roadmap): Bloom/Lens Flare/Anamorphic Flare/Lens Dirt,
+  // then Phase PP1's Physical Camera auto-exposure -> White Balance -> Color Correction -> ACES
+  // Tone Mapping -> Gamma Correction composite (also folding in Phase PP3's Motion Blur / Height
+  // Fog / Heat Distortion -- see PostProcessComposite.comp's own comment) -- both reading
+  // m_DepthOfField's own freshly-written output -- see BloomPass's and PostProcessPass's own class
+  // comments for why m_PostProcess must be the very last compute step before [14]'s blit (and
+  // before [13b]'s Debug-only stat overlay below, which now draws onto ITS output instead of
+  // m_TAATSR's raw HDR buffer). m_DepthOfField's own output view identity is effectively "per-
+  // frame" too (it wraps m_TAATSR's own ping-ponged source), so both passes' own descriptor sets
+  // pointing at it must be re-written every frame, exactly like m_TAATSR.UpdateDescriptorSets()
+  // itself is called every frame above. Both run unconditionally every frame, exactly like [13d]'s
+  // own TAA/TSR pass -- the debug views that substitute a different, deliberately-untonemapped
+  // diagnostic image as the blit source instead (m_GIComposite/m_SDFRayMarch/m_Resolve, see [14]'s
+  // own blitSourceImage swap below) simply never read either pass' output, same as how those views
+  // already ignore m_TAATSR's own output today.
+  // =========================================================================================
+  {
+      m_Bloom.UpdateSourceDescriptor(m_DepthOfField.GetOutputView());
+      m_PostProcess.UpdateDescriptorSets(m_DepthOfField.GetOutputView(), m_Bloom.GetOutputView());
+
+      // m_DepthOfField's own trailing barrier (inside RecordGenerate) already makes its output
+      // visible to COMPUTE_SHADER/SHADER_SAMPLED_READ -- no further barrier needed before m_Bloom/
+      // m_PostProcess read it here.
 
       BloomPass::Settings bloomSettings{};
       bloomSettings.threshold = config::postprocess::BLOOM_THRESHOLD;
@@ -1621,8 +1655,23 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
       ppSettings.vignetteIntensity = config::postprocess::VIGNETTE_INTENSITY;
       ppSettings.vignetteSmoothness = config::postprocess::VIGNETTE_SMOOTHNESS;
       ppSettings.vignetteColorBleed = config::postprocess::VIGNETTE_COLOR_BLEED;
+      ppSettings.heatDistortionIntensity = config::postprocess::HEAT_DISTORTION_INTENSITY;
+      ppSettings.motionBlurIntensity = config::postprocess::MOTION_BLUR_INTENSITY;
+      ppSettings.motionBlurMaxVelocityUV = config::postprocess::MOTION_BLUR_MAX_VELOCITY_UV;
+      ppSettings.fogColorR = config::postprocess::FOG_COLOR_R;
+      ppSettings.fogColorG = config::postprocess::FOG_COLOR_G;
+      ppSettings.fogColorB = config::postprocess::FOG_COLOR_B;
+      ppSettings.fogDensity = config::postprocess::FOG_DENSITY;
+      ppSettings.fogHeightFalloff = config::postprocess::FOG_HEIGHT_FALLOFF;
+      ppSettings.fogHeightOffset = config::postprocess::FOG_HEIGHT_OFFSET;
+      ppSettings.fogStartDistance = config::postprocess::FOG_START_DISTANCE;
+      ppSettings.fogMaxOpacity = config::postprocess::FOG_MAX_OPACITY;
 
-      m_PostProcess.RecordComposite(cmd, deltaTimeSeconds, ppSettings);
+      // Same prevViewProj-or-current-frame-fallback expression [13d]'s own TAA pass already
+      // resolved into its own block-scoped prevViewProjForTAA (out of scope here) -- Motion Blur's
+      // own per-pixel reprojection needs the identical semantics, recomputed inline.
+      maths::mat4 prevViewProjForPostProcess = m_HasPrevViewProj ? m_PrevViewProj : viewProj;
+      m_PostProcess.RecordComposite(cmd, deltaTimeSeconds, ppSettings, invViewProj, prevViewProjForPostProcess, cameraPositionWorld);
   }
 
 #ifndef NDEBUG
