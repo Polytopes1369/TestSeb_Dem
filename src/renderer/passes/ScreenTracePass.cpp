@@ -47,7 +47,14 @@ namespace renderer {
         imageInfo.arrayLayers = 1;
         imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
         imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
-        imageInfo.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        // TRANSFER_DST_BIT: RecordFrame()'s ssrtEnabled==false debug path (main.cpp's 'F' key)
+        // clears this image via VulkanUtils::ClearComputeImageToGeneral, which issues a real
+        // vkCmdClearColorImage (transfer-stage clear through VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        // not a compute imageStore despite the helper's name) -- without this flag that call is a
+        // validation-layer error (missing VK_IMAGE_USAGE_TRANSFER_DST_BIT), exactly as every other
+        // caller of that same helper (ReflectionPass/ScreenProbeGIPass, via
+        // VulkanUtils::CreateStorageSampledImage2D) already includes it for.
+        imageInfo.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
         imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
         imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
