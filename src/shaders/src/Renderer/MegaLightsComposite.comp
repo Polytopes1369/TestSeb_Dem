@@ -9,8 +9,12 @@
 
 layout(local_size_x = 8, local_size_y = 8) in;
 
-layout(rgba8, set = 0, binding = 0) uniform readonly image2D g_DenoisedRadiance;
-layout(rgba8, set = 0, binding = 1) uniform image2D g_OutputColor;
+// rgba16f: linear HDR -- matches renderer::MegaLightsPass::kRadianceFormat (g_DenoisedRadiance)
+// and renderer::ClusterResolvePass::kOutputColorFormat (g_OutputColor, this RMW's target) exactly.
+// See either constant's own comment for why this whole chain must stay unclipped until
+// renderer::PostProcessPass's own curve runs at the very end of the frame.
+layout(rgba16f, set = 0, binding = 0) uniform readonly image2D g_DenoisedRadiance;
+layout(rgba16f, set = 0, binding = 1) uniform image2D g_OutputColor;
 
 void main() {
     ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);

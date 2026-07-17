@@ -111,8 +111,9 @@ namespace renderer {
         // renderer::GpuGeometryPagePool's own (same handles every opaque pass already borrows);
         // `entityTransformBuffer`/`entityDataBuffer`/`wpoGlobalsBuffer` mirror ClusterRaster.vert's
         // own identically-purposed bindings. `colorFormat`/`depthFormat` must match whatever image
-        // RecordDraw() will later target (renderer::ClusterResolvePass::kOutputColorFormat and the
-        // shared hardware depth image's format, respectively).
+        // RecordDraw() will later target -- renderer::GICompositePass::kOutputFormat (the image this
+        // pass actually draws onto, see RecordDraw()'s own call site, NOT renderer::ClusterResolvePass::
+        // kOutputColorFormat) and the shared hardware depth image's format, respectively.
         //
         // Phase 5 additions, all consumed by TransparentForward.frag's new shading (see class
         // comment): `worldProbes` for indirect-diffuse sampling (GetGridView()/GetGridSampler()/

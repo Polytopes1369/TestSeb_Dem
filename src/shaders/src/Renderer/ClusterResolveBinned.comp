@@ -88,7 +88,8 @@ layout(std430, set = 0, binding = 4) readonly buffer BinHistogramSSBO {
     uint counts[]; // This bin's own count bounds how many of this dispatch's threads are valid.
 } g_BinHistogram;
 
-layout(rgba8, set = 0, binding = 5) uniform writeonly image2D g_OutputColor;
+// rgba16f: linear HDR -- see ClusterResolve.comp's own identical g_OutputColor binding comment.
+layout(rgba16f, set = 0, binding = 5) uniform writeonly image2D g_OutputColor;
 
 // Same ResolveViewParamsUBO renderer::ClusterResolvePass::RecordResolveBinned uploads before
 // issuing this shader's 32 indirect dispatches (identical struct/binding contract to

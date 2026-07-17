@@ -112,7 +112,10 @@ layout(std430, set = 0, binding = 0) readonly buffer ClusterCullMetadataSSBO {
 // bindings 2-5 == g_HWClusterIDImage/g_HWTriangleIDImage/g_HWDepthTexture/g_SWVisBufferAtomic,
 // declared by visbuffer_arbitration.glsl.
 
-layout(rgba8, set = 0, binding = 6) uniform writeonly image2D g_OutputColor;
+// rgba16f: linear HDR, matches renderer::ClusterResolvePass::kOutputColorFormat -- see that
+// constant's own comment for why (unbounded MegaLights point-light radiance composited in later
+// must not be hard-clipped by an 8-bit UNORM target before renderer::PostProcessPass ever runs).
+layout(rgba16f, set = 0, binding = 6) uniform writeonly image2D g_OutputColor;
 
 layout(std140, set = 0, binding = 7) uniform ResolveViewParamsUBO {
     mat4 viewProj;

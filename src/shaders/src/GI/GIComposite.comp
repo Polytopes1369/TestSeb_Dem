@@ -2,14 +2,16 @@
 #extension GL_GOOGLE_include_directive : enable
 
 // Final GI composite: finalColor = directLitColor + denoisedIndirectGI, written into this pass'
-// own owned rgba8 output image -- see renderer::GICompositePass's own class comment for why the
-// two debug-view-mode branches below (and every binding/push-constant they need) are entirely
-// `#ifdef _DEBUG`-gated, mirroring ClusterResolve.comp's own existing convention for its debug
-// viewMode push constant.
+// own owned rgba16f (linear HDR) output image -- see renderer::GICompositePass's own class comment
+// for why the two debug-view-mode branches below (and every binding/push-constant they need) are
+// entirely `#ifdef _DEBUG`-gated, mirroring ClusterResolve.comp's own existing convention for its
+// debug viewMode push constant.
 
 layout(local_size_x = 8, local_size_y = 8) in;
 
-layout(rgba8, set = 0, binding = 0) uniform writeonly image2D g_Output;
+// rgba16f: linear HDR, matches renderer::GICompositePass::kOutputFormat exactly -- see that
+// constant's own comment for why (direct + GI, both already HDR, must not be hard-clipped here).
+layout(rgba16f, set = 0, binding = 0) uniform writeonly image2D g_Output;
 layout(set = 0, binding = 1) uniform sampler2D g_DirectColor;
 layout(set = 0, binding = 2) uniform sampler2D g_DenoisedGI;
 
