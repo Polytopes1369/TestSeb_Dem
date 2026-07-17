@@ -29,7 +29,9 @@ namespace renderer {
         struct TransparentViewParams {
             maths::mat4 view;
             maths::mat4 proj;
-            float cameraPosX = 0.0f, cameraPosY = 0.0f, cameraPosZ = 0.0f, _cameraPad = 0.0f;
+            // Phase PP3: globalTime repurposes what used to be pure std140 padding after
+            // cameraPositionWorld -- feeds TransparentForward.frag's own animated refraction noise.
+            float cameraPosX = 0.0f, cameraPosY = 0.0f, cameraPosZ = 0.0f, globalTime = 0.0f;
             float sunDirX = 0.0f, sunDirY = 0.0f, sunDirZ = 0.0f, sunIntensity = 0.0f;
             float sunColorR = 0.0f, sunColorG = 0.0f, sunColorB = 0.0f, _sunColorPad = 0.0f;
         };
@@ -58,6 +60,7 @@ namespace renderer {
     // MegaLights' own TraceShadowRay (see class comment). `lightBuffer`/`lightBufferSize` are
     // renderer::MegaLightsPass::GetLightBufferHandle()/GetLightBufferSize(), bound at binding 12.
     void TransparentForwardPass::Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
+        VkExtent2D renderExtent,
         VkBuffer pageTableBuffer, VkBuffer compressedPhysicalPoolBuffer,
         VkBuffer entityTransformBuffer, VkBuffer entityDataBuffer, VkBuffer wpoGlobalsBuffer,
         const std::array<MaterialParameters, kMaxMaterials>& materialTable,
@@ -71,6 +74,33 @@ namespace renderer {
 
         m_Device = device;
         m_Allocator = allocator;
+
+        // --- Phase PP3: g_RefractionOffset, created UNCONDITIONALLY (before the possible zero-
+        // transparent-cluster early-return below) -- renderer::PostProcessPass needs a valid view
+        // to sample every frame regardless of whether this run's fixed random seed happened to
+        // produce any transparent geometry at all. COLOR_ATTACHMENT_BIT: this pass' own draw target
+        // (see RecordDraw()'s own comment). SAMPLED_BIT: renderer::PostProcessPass's composite
+        // shader reads it through a sampler2D. ---
+        {
+            VkImageCreateInfo refractionInfo{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+            refractionInfo.imageType = VK_IMAGE_TYPE_2D;
+            refractionInfo.format = kRefractionOffsetFormat;
+            refractionInfo.extent = { renderExtent.width, renderExtent.height, 1 };
+            refractionInfo.mipLevels = 1;
+            refractionInfo.arrayLayers = 1;
+            refractionInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+            refractionInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+            refractionInfo.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+            refractionInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+            refractionInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            m_RefractionOffsetImage.Create(allocator, device, refractionInfo, VMA_MEMORY_USAGE_GPU_ONLY, VK_IMAGE_ASPECT_COLOR_BIT);
+
+            VulkanUtils::TransitionImageLayoutOneShot(device, commandPool, queue, m_RefractionOffsetImage.Image(),
+                VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
+                VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+        }
 
         // --- Build the static leaf-cluster list for every transparent entity (see class comment
         // for why this is a one-time CPU walk, not a per-frame GPU LOD cut). ---
@@ -413,18 +443,30 @@ namespace renderer {
             colorBlendAttachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
             colorBlendAttachment.alphaBlendOp = VK_BLEND_OP_ADD;
 
+            // Phase PP3: g_RefractionOffset (attachment 1) -- a plain overwrite (blendEnable=FALSE),
+            // NOT alpha-blended like the color attachment above: a distortion vector doesn't
+            // "compose" over whatever the previous transparent surface at this pixel wrote the same
+            // way color does, and this attachment is CLEARed to (0,0) every frame anyway (see
+            // RecordDraw()'s own comment), so a plain overwrite from the last-drawn surface at this
+            // pixel is the correct, simplest behavior.
+            VkPipelineColorBlendAttachmentState refractionBlendAttachment{};
+            refractionBlendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT;
+            refractionBlendAttachment.blendEnable = VK_FALSE;
+
+            VkPipelineColorBlendAttachmentState colorBlendAttachments[2] = { colorBlendAttachment, refractionBlendAttachment };
             VkPipelineColorBlendStateCreateInfo colorBlending{ VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
-            colorBlending.attachmentCount = 1;
-            colorBlending.pAttachments = &colorBlendAttachment;
+            colorBlending.attachmentCount = 2;
+            colorBlending.pAttachments = colorBlendAttachments;
 
             VkDynamicState dynamicStates[2] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
             VkPipelineDynamicStateCreateInfo dynamicState{ VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
             dynamicState.dynamicStateCount = 2;
             dynamicState.pDynamicStates = dynamicStates;
 
+            VkFormat colorFormats[2] = { colorFormat, kRefractionOffsetFormat };
             VkPipelineRenderingCreateInfo pipelineRendering{ VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO };
-            pipelineRendering.colorAttachmentCount = 1;
-            pipelineRendering.pColorAttachmentFormats = &colorFormat;
+            pipelineRendering.colorAttachmentCount = 2;
+            pipelineRendering.pColorAttachmentFormats = colorFormats;
             pipelineRendering.depthAttachmentFormat = depthFormat;
 
             // Depth-TESTED (reversed-Z, matching every other pass, see maths::mat4::PerspectiveVulkan's
@@ -493,6 +535,7 @@ namespace renderer {
         m_ViewParamsBuffer.Destroy();
         m_MaterialParamsBuffer.Destroy();
         m_WorldProbeGridParamsBuffer.Destroy();
+        m_RefractionOffsetImage.Destroy();
 
         m_ClusterCount = 0;
         m_Allocator = VK_NULL_HANDLE;
@@ -524,7 +567,7 @@ namespace renderer {
     void TransparentForwardPass::RecordDraw(VkCommandBuffer cmd, VkImage colorImage, VkImageView colorView, VkImageView depthView,
         VkExtent2D renderExtent, const maths::mat4& view, const maths::mat4& proj,
         VkBuffer decompressedIndexPoolBuffer, const maths::vec3& cameraPositionWorld,
-        const SceneLights& sceneLights,
+        const SceneLights& sceneLights, float globalTimeSeconds,
         const SurfaceCacheTraceContext& traceContext, uint32_t traceMode, uint32_t frameIndex) {
         if (m_ClusterCount == 0) {
             return;
@@ -538,6 +581,7 @@ namespace renderer {
         viewParams.cameraPosX = cameraPositionWorld.x;
         viewParams.cameraPosY = cameraPositionWorld.y;
         viewParams.cameraPosZ = cameraPositionWorld.z;
+        viewParams.globalTime = globalTimeSeconds;
         viewParams.sunDirX = sceneLights.sun.direction.x;
         viewParams.sunDirY = sceneLights.sun.direction.y;
         viewParams.sunDirZ = sceneLights.sun.direction.z;
@@ -592,9 +636,26 @@ namespace renderer {
         toAttachment.image = colorImage;
         toAttachment.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
 
+        // Phase PP3: g_RefractionOffset undergoes the exact same GENERAL -> COLOR_ATTACHMENT_OPTIMAL
+        // dance as colorImage above, batched into the same barrier call -- its own last reader was
+        // renderer::PostProcessPass's composite shader (COMPUTE_SHADER/SAMPLED_READ), not a compute
+        // write, so its own srcStageMask/srcAccessMask differ from colorImage's.
+        VkImageMemoryBarrier2 refractionToAttachment{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
+        refractionToAttachment.srcStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        refractionToAttachment.srcAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+        refractionToAttachment.dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+        refractionToAttachment.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+        refractionToAttachment.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+        refractionToAttachment.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        refractionToAttachment.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        refractionToAttachment.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        refractionToAttachment.image = m_RefractionOffsetImage.Image();
+        refractionToAttachment.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+
+        VkImageMemoryBarrier2 toAttachmentBarriers[2] = { toAttachment, refractionToAttachment };
         VkDependencyInfo toAttachmentDependency{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-        toAttachmentDependency.imageMemoryBarrierCount = 1;
-        toAttachmentDependency.pImageMemoryBarriers = &toAttachment;
+        toAttachmentDependency.imageMemoryBarrierCount = 2;
+        toAttachmentDependency.pImageMemoryBarriers = toAttachmentBarriers;
         vkCmdPipelineBarrier2(cmd, &toAttachmentDependency);
 
         VkRenderingAttachmentInfo colorAttachment{ VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
@@ -602,6 +663,18 @@ namespace renderer {
         colorAttachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
         colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD; // Preserve the fully-composited opaque scene underneath.
         colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+
+        // Phase PP3: g_RefractionOffset -- CLEARed to (0,0) every frame, unlike colorAttachment
+        // above: a pixel's distortion must reset to "none" wherever no heat-distortion surface
+        // covers it THIS frame (entity motion/rotation/camera movement changes screen coverage
+        // frame to frame even though m_ClusterCount itself is static -- see GetRefractionOffsetView()'s
+        // own comment).
+        VkRenderingAttachmentInfo refractionAttachment{ VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
+        refractionAttachment.imageView = m_RefractionOffsetImage.View();
+        refractionAttachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        refractionAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        refractionAttachment.clearValue.color = { { 0.0f, 0.0f, 0.0f, 0.0f } };
+        refractionAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
 
         // Depth is already VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL by this point in the
         // frame (see renderer::ClusterRenderPipeline::RecordFrame's own ordering) -- no transition,
@@ -613,11 +686,12 @@ namespace renderer {
         depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
         depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
 
+        VkRenderingAttachmentInfo colorAttachments[2] = { colorAttachment, refractionAttachment };
         VkRenderingInfo renderingInfo{ VK_STRUCTURE_TYPE_RENDERING_INFO };
         renderingInfo.renderArea = { { 0, 0 }, renderExtent };
         renderingInfo.layerCount = 1;
-        renderingInfo.colorAttachmentCount = 1;
-        renderingInfo.pColorAttachments = &colorAttachment;
+        renderingInfo.colorAttachmentCount = 2;
+        renderingInfo.pColorAttachments = colorAttachments;
         renderingInfo.pDepthAttachment = &depthAttachment;
 
         vkCmdBeginRendering(cmd, &renderingInfo);
@@ -670,9 +744,25 @@ namespace renderer {
         toGeneral.image = colorImage;
         toGeneral.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
 
+        // Phase PP3: g_RefractionOffset back to GENERAL too, ready for renderer::PostProcessPass's
+        // composite shader to sample this same frame (COMPUTE_SHADER/SAMPLED_READ -- it runs later
+        // in renderer::ClusterRenderPipeline::RecordFrame's own ordering, after TAA/Bloom).
+        VkImageMemoryBarrier2 refractionToGeneral{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
+        refractionToGeneral.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+        refractionToGeneral.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+        refractionToGeneral.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        refractionToGeneral.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+        refractionToGeneral.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        refractionToGeneral.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        refractionToGeneral.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        refractionToGeneral.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        refractionToGeneral.image = m_RefractionOffsetImage.Image();
+        refractionToGeneral.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+
+        VkImageMemoryBarrier2 toGeneralBarriers[2] = { toGeneral, refractionToGeneral };
         VkDependencyInfo toGeneralDependency{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-        toGeneralDependency.imageMemoryBarrierCount = 1;
-        toGeneralDependency.pImageMemoryBarriers = &toGeneral;
+        toGeneralDependency.imageMemoryBarrierCount = 2;
+        toGeneralDependency.pImageMemoryBarriers = toGeneralBarriers;
         vkCmdPipelineBarrier2(cmd, &toGeneralDependency);
     }
 

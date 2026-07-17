@@ -37,7 +37,14 @@ namespace renderer {
         // one" -- matching real UE5.8, where Nanite only ever renders opaque/masked geometry and
         // translucent materials always go through a distinct forward renderer.
         float alpha;
-        float _pad0 = 0.0f; // Reserved (e.g. a future IOR/refraction parameter for glass-like transparents).
+        // Phase PP3 (post-process stack roadmap): 0.0 = off (default), >0.0 = this material writes a
+        // procedural, animated screen-space refraction offset into renderer::TransparentForwardPass's
+        // own second (RG16F) color attachment -- renderer::PostProcessPass's composite shader then
+        // samples that buffer and distorts the UV it reads the HDR scene through, exactly UE5.8's own
+        // material-authored "Refraction" mechanism (a post-process material samples SceneColor at an
+        // offset UV a translucent material's shader writes), not a single global distortion knob. See
+        // TransparentForward.frag's own end-of-main() comment for the actual noise formula.
+        float heatDistortion = 0.0f;
         // UE5.8 Lumen "Output Reflections" equivalent: per-material opt-in for TransparentForward.
         // frag's traced front-layer specular reflection (HWRT/SWRT, see that shader's own comment)
         // -- NOT applied to every transparent material, only ones that need it (glass/water-like),
@@ -122,8 +129,10 @@ namespace renderer {
         table.params[4] = MaterialParameters{ maths::vec3(0.75f, 0.85f, 0.95f), 0.03f, maths::vec3(0.0f, 0.0f, 0.0f), 0.0f, 0.12f, 0.0f, 1.0f, 0.0f };
 
         // Translucent (Torus, slot 5): soft frosted violet, mid alpha, no reflections (no clear
-        // image to reflect through a frosted surface).
-        table.params[5] = MaterialParameters{ maths::vec3(0.55f, 0.35f, 0.75f), 0.35f, maths::vec3(0.0f, 0.0f, 0.0f), 0.0f, 0.5f, 0.0f, 0.0f, 0.0f };
+        // image to reflect through a frosted surface). Phase PP3 (post-process stack roadmap): also
+        // this scene's own Heat Distortion & Refraction showcase -- see MaterialParameters::
+        // heatDistortion's own comment.
+        table.params[5] = MaterialParameters{ maths::vec3(0.55f, 0.35f, 0.75f), 0.35f, maths::vec3(0.0f, 0.0f, 0.0f), 0.0f, 0.5f, 0.7f, 0.0f, 0.0f };
 
         // Emissive (Tube, slot 6): near-black base, bright warm self-lit glow.
         table.params[6] = MaterialParameters{ maths::vec3(0.05f, 0.05f, 0.05f), 0.40f, maths::vec3(3.0f, 1.4f, 0.2f), 0.0f, 1.0f, 0.0f, 0.0f, 0.0f };

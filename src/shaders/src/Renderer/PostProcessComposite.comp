@@ -17,6 +17,17 @@
 //     per-channel falloff rate, mimicking real lenses' chromatic vignetting -- red/green fall off
 //     faster than blue toward the edges -- applied AFTER Color Correction, BEFORE Tone Mapping so
 //     the vignette itself still gets filmic rolloff instead of a hard-clipped dark edge).
+//   Phase PP3: Heat Distortion & Refraction (renderer::TransparentForwardPass's own material-
+//     authored g_RefractionOffset, sampled FIRST -- offsets every subsequent sample's UV, exactly
+//     like a real lens capturing already-refracted light) -> Motion Blur (per-pixel velocity
+//     reconstructed from depth + invViewProj/prevViewProj, folded into the SAME multi-tap loop that
+//     also applies Chromatic Aberration per tap) -> Screen Space / Volumetric Height Fog (analytic
+//     exponential height fog, UE5.8's own "Exponential Height Fog" closed-form integral, applied
+//     AFTER Color Correction so fog-lit areas still get filmic tonemap rolloff instead of a flat
+//     additive haze). g_HDRColor is renderer::DepthOfFieldPass's own output now, NOT renderer::
+//     TAATSRPass's raw output directly -- DOF's physically-derived Circle-of-Confusion blur runs
+//     before this stage (and before renderer::BloomPass), see DepthOfField.comp's own comment for
+//     why that ordering matters (an out-of-focus highlight should itself bloom into a soft disc).
 // Writes this pass' own owned rgba8 output image, which renderer::ClusterRenderPipeline's final
 // blit now sources from instead of renderer::TAATSRPass's raw HDR output directly.
 
@@ -73,9 +84,31 @@ layout(std140, set = 0, binding = 3) uniform PostProcessParamsUBO {
 
     float vignetteColorBleed;  // 0 = neutral (grayscale) vignette falloff, 1 = strong chromatic falloff.
     float _pad4, _pad5, _pad6;
+
+    // Phase PP3: reprojection matrices for Motion Blur / Height Fog world-position reconstruction.
+    mat4 invViewProj;
+    mat4 prevViewProj;
+
+    vec3 cameraPositionWorld;
+    float heatDistortionIntensity; // Global scale on TransparentForwardPass's own per-material offset.
+
+    // Motion Blur
+    float motionBlurIntensity; // 0 = off, 1 = full reconstructed per-pixel velocity.
+    float motionBlurMaxVelocityUV; // Clamps the UV-space velocity magnitude (avoids runaway smearing on a teleport/cut).
+    float _pad7, _pad8;
+
+    // Height Fog (analytic exponential, UE5.8's own "Exponential Height Fog")
+    vec3 fogColor;
+    float fogDensity;
+    float fogHeightFalloff;
+    float fogHeightOffset;   // World-space Y the fog's own reference density is measured at.
+    float fogStartDistance;
+    float fogMaxOpacity;
 } g_Params;
 
 layout(set = 0, binding = 4) uniform sampler2D g_Bloom;
+layout(set = 0, binding = 5) uniform sampler2D g_Depth;             // renderer::ClusterResolvePass depth, render-res, bilinear-upsampled.
+layout(set = 0, binding = 6) uniform sampler2D g_RefractionOffset;  // renderer::TransparentForwardPass's own second attachment, render-res, bilinear-upsampled.
 
 // Radial per-channel UV offset -- red sampled slightly closer to center, blue slightly further out
 // (the classic lateral chromatic aberration look), scaled by distance-from-center squared so the
@@ -103,6 +136,76 @@ vec3 ApplyVignette(vec3 color, vec2 uv, float intensity, float smoothness, float
     return color * mix(vec3(1.0), falloff, intensity);
 }
 
+// World position at `uv`, reconstructed from the (bilinear-upsampled) render-resolution depth --
+// returns false (sky/background) when the NDC depth is at the far clip.
+bool ReconstructWorldPos(vec2 uv, out vec3 worldPos) {
+    float ndcDepth = texture(g_Depth, uv).r;
+    if (ndcDepth >= 1.0) {
+        worldPos = vec3(0.0);
+        return false;
+    }
+    vec2 ndcXY = uv * 2.0 - 1.0;
+    vec4 clip = vec4(ndcXY, ndcDepth, 1.0);
+    vec4 worldPos4 = g_Params.invViewProj * clip;
+    worldPos = worldPos4.xyz / worldPos4.w;
+    return true;
+}
+
+// This pixel's UV-space motion vector: reprojects its own reconstructed world position with last
+// frame's view-projection matrix (ClusterResolve.comp's own DEBUG_VIEW_MOTION_VECTORS does the
+// identical reprojection, in screen pixels instead of UV -- see that shader's own comment) and
+// diffs against the current UV. A miss (sky) or a clamped-to-zero result both correctly produce no
+// blur.
+vec2 ComputeVelocityUV(vec2 uv, vec3 worldPos, bool hit) {
+    if (!hit) {
+        return vec2(0.0);
+    }
+    vec4 prevClip = g_Params.prevViewProj * vec4(worldPos, 1.0);
+    if (prevClip.w <= 0.0001) {
+        return vec2(0.0);
+    }
+    vec2 prevUV = (prevClip.xy / prevClip.w) * 0.5 + 0.5;
+    vec2 velocity = uv - prevUV;
+    float speed = length(velocity);
+    float maxSpeed = max(g_Params.motionBlurMaxVelocityUV, 1e-5);
+    if (speed > maxSpeed) {
+        velocity *= maxSpeed / speed;
+    }
+    return velocity * g_Params.motionBlurIntensity;
+}
+
+// UE5.8's own Exponential Height Fog closed-form integral: fog density falls off exponentially with
+// world-space height above `fogHeightOffset`, and the total optical depth along the camera-to-
+// surface ray is the analytic integral of that exponential (no ray marching) -- see Sébastien
+// Hillaire's "Physically Based Sky, Atmosphere and Cloud Rendering" (the same closed form Unreal's
+// own ExponentialHeightFog.usf uses).
+vec3 ApplyHeightFog(vec3 color, vec3 worldPos, vec3 cameraPos) {
+    vec3 rayVec = worldPos - cameraPos;
+    float rayLength = length(rayVec);
+    if (rayLength <= g_Params.fogStartDistance) {
+        return color;
+    }
+    vec3 rayDir = rayVec / max(rayLength, 1e-5);
+    float travelDistance = rayLength - g_Params.fogStartDistance;
+
+    float cameraHeight = cameraPos.y - g_Params.fogHeightOffset;
+    float falloff = max(g_Params.fogHeightFalloff, 1e-5);
+
+    // Closed-form integral of density0 * exp(-falloff * (cameraHeight + t * rayDir.y)) dt, t in [0, travelDistance].
+    float rayDirY = rayDir.y;
+    float opticalDepth;
+    if (abs(rayDirY) < 1e-4) {
+        opticalDepth = g_Params.fogDensity * exp(-falloff * cameraHeight) * travelDistance;
+    } else {
+        float startTerm = exp(-falloff * cameraHeight);
+        float endTerm = exp(-falloff * (cameraHeight + rayDirY * travelDistance));
+        opticalDepth = g_Params.fogDensity * (startTerm - endTerm) / (falloff * rayDirY);
+    }
+
+    float fogFactor = clamp(1.0 - exp(-abs(opticalDepth)), 0.0, g_Params.fogMaxOpacity);
+    return mix(color, g_Params.fogColor, fogFactor);
+}
+
 void main() {
     ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
     ivec2 res = textureSize(g_HDRColor, 0);
@@ -112,8 +215,27 @@ void main() {
 
     vec2 uv = (vec2(pixel) + 0.5) / vec2(res);
 
-    // --- Chromatic Aberration (operates on the raw HDR capture, before Bloom is layered on) ---
-    vec3 color = SampleWithChromaticAberration(uv, g_Params.chromaticAberrationIntensity);
+    // --- Heat Distortion & Refraction: distort the UV every subsequent sample reads through,
+    // exactly like a real lens capturing light that already refracted through the heat-shimmer
+    // surface -- see renderer::MaterialParameters::heatDistortion's own comment. ---
+    vec2 refractionOffset = texture(g_RefractionOffset, uv).rg * g_Params.heatDistortionIntensity;
+    vec2 distortedUV = clamp(uv + refractionOffset, vec2(0.001), vec2(0.999));
+
+    // --- Motion Blur: reconstruct this (distorted) pixel's own velocity, then gather Chromatic-
+    // Aberration-sampled taps along it -- a near-zero velocity degenerates to every tap sampling
+    // essentially the same position, i.e. the same single-sample result Phase PP2 always produced. ---
+    vec3 worldPos;
+    bool hitScene = ReconstructWorldPos(distortedUV, worldPos);
+    vec2 velocityUV = ComputeVelocityUV(distortedUV, worldPos, hitScene);
+
+    const int kMotionBlurTaps = 8;
+    vec3 color = vec3(0.0);
+    for (int i = 0; i < kMotionBlurTaps; ++i) {
+        float t = (float(i) / float(kMotionBlurTaps - 1)) - 0.5; // [-0.5, 0.5]
+        vec2 tapUV = clamp(distortedUV + velocityUV * t, vec2(0.001), vec2(0.999));
+        color += SampleWithChromaticAberration(tapUV, g_Params.chromaticAberrationIntensity);
+    }
+    color /= float(kMotionBlurTaps);
 
     // --- Physical Camera / Auto Exposure: UE's own Iso100 photometric conversion, MaxLuminance =
     // 1.2 * 2^EV100, applied scene color scale = 1 / MaxLuminance.
@@ -123,7 +245,7 @@ void main() {
     // --- Bloom (+ Lens Flare / Anamorphic Lens Flare / Lens Dirt, already baked into
     // renderer::BloomPass's own output -- see that pass' own class comment) -- added at the same
     // exposed scale as the rest of the scene color. ---
-    color += texture(g_Bloom, uv).rgb * exposureMultiplier * g_Params.bloomIntensity;
+    color += texture(g_Bloom, distortedUV).rgb * exposureMultiplier * g_Params.bloomIntensity;
 
     // --- White Balance ---
     color = WhiteBalance(color, g_Params.whiteBalanceTempKelvin, g_Params.whiteBalanceTint);
@@ -132,6 +254,11 @@ void main() {
     color = ApplyContrast(color, g_Params.contrast);
     color = ColorCorrectLGG(color, g_Params.lift, g_Params.gamma, g_Params.gain);
     color = max(ApplySaturation(color, g_Params.saturation), vec3(0.0));
+
+    // --- Screen Space / Volumetric Height Fog ---
+    if (hitScene) {
+        color = ApplyHeightFog(color, worldPos, g_Params.cameraPositionWorld);
+    }
 
     // --- Vignette + Vignette Color Bleed ---
     color = ApplyVignette(color, uv, g_Params.vignetteIntensity, g_Params.vignetteSmoothness, g_Params.vignetteColorBleed);

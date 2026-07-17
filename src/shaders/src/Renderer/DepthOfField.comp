@@ -1,0 +1,103 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+
+// renderer::DepthOfFieldPass (Phase PP3, post-process stack roadmap): physically-derived Circle of
+// Confusion (thin-lens model, driven by the SAME Physical Camera aperture renderer::PostProcessPass
+// already exposes, plus a focus distance/focal length this pass owns) followed by a Poisson-disk
+// gather blur scaled by that CoC. Runs immediately after renderer::TAATSRPass (display resolution),
+// BEFORE renderer::BloomPass -- so an out-of-focus bright highlight is already a soft disc by the
+// time Bloom's own bright-pass threshold sees it, matching how a real out-of-focus bokeh circle
+// itself blooms (the standard real-time DOF-before-Bloom ordering).
+//
+// Depth comes from renderer::ClusterResolvePass's own render-resolution g_Depth (R32_SFLOAT NDC
+// depth) -- there is no display-resolution depth anywhere in this pipeline (renderer::TAATSRPass
+// upscales COLOR only) -- sampled through a LINEAR sampler, the standard "just bilinear-upsample a
+// lower-res depth buffer" technique real-time DOF/fog/motion-blur passes use rather than a full
+// depth-aware upsample filter.
+
+#include "include/math_utils.glsl"
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform sampler2D g_HDRColor;   // renderer::TAATSRPass output, display-res.
+layout(set = 0, binding = 1) uniform sampler2D g_Depth;      // renderer::ClusterResolvePass depth, render-res, LINEAR-sampled.
+layout(rgba16f, set = 0, binding = 2) uniform writeonly image2D g_Output;
+
+layout(std140, set = 0, binding = 3) uniform DepthOfFieldParamsUBO {
+    mat4 invViewProj;
+    vec3 cameraPositionWorld;
+    float _pad0;
+    float aperture;          // f-stop -- same value as PostProcessPass::Settings::aperture.
+    float focalLengthMM;
+    float focusDistanceWorldUnits;
+    float maxCoCRadiusPixels;
+} g_Params;
+
+// 16-tap Poisson disk (Vogel spiral, golden-angle distributed) -- a well-known, cheap way to get a
+// reasonably uniform circular sample distribution without a precomputed offset table.
+vec2 VogelDiskSample(int index, int count, float phi) {
+    const float goldenAngle = 2.399963f;
+    float r = sqrt((float(index) + 0.5) / float(count));
+    float theta = float(index) * goldenAngle + phi;
+    return r * vec2(cos(theta), sin(theta));
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 res = textureSize(g_HDRColor, 0);
+    if (pixel.x >= res.x || pixel.y >= res.y) {
+        return;
+    }
+
+    vec2 uv = (vec2(pixel) + 0.5) / vec2(res);
+    vec3 baseColor = textureLod(g_HDRColor, uv, 0.0).rgb;
+
+    // --- Reconstruct this pixel's linear scene distance from the (bilinear-upsampled) depth buffer. ---
+    float ndcDepth = textureLod(g_Depth, uv, 0.0).r;
+    if (ndcDepth >= 1.0) {
+        // Sky/background -- no CoC, no blur (matches every other depth-based effect's own sky handling).
+        imageStore(g_Output, pixel, vec4(baseColor, 1.0));
+        return;
+    }
+    vec2 ndcXY = uv * 2.0 - 1.0;
+    vec4 clip = vec4(ndcXY, ndcDepth, 1.0);
+    vec4 worldPos4 = g_Params.invViewProj * clip;
+    vec3 worldPos = worldPos4.xyz / worldPos4.w;
+    float sceneDistance = distance(g_Params.cameraPositionWorld, worldPos);
+
+    // --- Thin-lens Circle of Confusion, in millimeters, converted to a pixel radius. ---
+    // CoC_mm = Aperture * FocalLength * |SceneDistance - FocusDistance| / (SceneDistance * (FocusDistance - FocalLength))
+    // Standard photographic thin-lens formula (the same one driving real physical-camera DOF in
+    // UE5.8's own Cinematic Camera). Both distances converted to millimeters (world units assumed
+    // meters, matching this engine's own scene scale) before the ratio.
+    float focusDistanceMM = max(g_Params.focusDistanceWorldUnits * 1000.0, g_Params.focalLengthMM + 1.0);
+    float sceneDistanceMM = max(sceneDistance * 1000.0, 1.0);
+    float cocMM = g_Params.aperture * g_Params.focalLengthMM * abs(sceneDistanceMM - focusDistanceMM)
+        / (sceneDistanceMM * max(focusDistanceMM - g_Params.focalLengthMM, 1.0));
+    // Millimeters -> pixels: a 35mm-equivalent sensor is ~24mm tall: this pass' own vertical
+    // resolution maps to that sensor height, giving a physically-consistent pixels-per-mm scale.
+    float pixelsPerMM = float(res.y) / 24.0;
+    float cocPixels = clamp(cocMM * pixelsPerMM, 0.0, g_Params.maxCoCRadiusPixels);
+
+    if (cocPixels < 0.6) {
+        // In-focus (sub-pixel CoC) -- skip the gather entirely, avoids a wasted 16-tap loop for the
+        // (usual) majority of a well-composed frame's pixels.
+        imageStore(g_Output, pixel, vec4(baseColor, 1.0));
+        return;
+    }
+
+    vec2 texelSize = 1.0 / vec2(res);
+    float phi = Hash(uv * float(res)) * 6.28318; // Per-pixel jitter so the 16-tap pattern doesn't band.
+
+    const int kTapCount = 16;
+    vec3 accum = baseColor;
+    float totalWeight = 1.0;
+    for (int i = 0; i < kTapCount; ++i) {
+        vec2 offset = VogelDiskSample(i, kTapCount, phi) * cocPixels * texelSize;
+        accum += textureLod(g_HDRColor, uv + offset, 0.0).rgb;
+        totalWeight += 1.0;
+    }
+    accum /= totalWeight;
+
+    imageStore(g_Output, pixel, vec4(accum, 1.0));
+}

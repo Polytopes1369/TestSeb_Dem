@@ -68,6 +68,7 @@
 #include "core/maths/Maths.h"
 #include "geometry/ClusterFormat.h"
 #include "renderer/vulkan/GpuBuffer.h"
+#include "renderer/vulkan/GpuImage.h"
 #include "renderer/MaterialParameterTable.h"
 #include "renderer/LightingTypes.h"
 
@@ -140,7 +141,14 @@ namespace renderer {
         // ClusterRenderPipeline::Init()'s own ordering comment). Per-entity point-light shadowing
         // (VSM cube faces) is deliberately NOT bound here any more -- MegaLights' own traced shadow
         // ray supersedes it for this pass, see TransparentForward.frag's own header comment.
+        // Phase PP3 (post-process stack roadmap): `renderExtent` sizes this pass' own newly-owned
+        // g_RefractionOffset image (kRefractionOffsetFormat, RG16F, render resolution) -- created
+        // and transitioned to VK_IMAGE_LAYOUT_GENERAL unconditionally, BEFORE the transparent-
+        // leaf-cluster walk's own possible zero-cluster early-return, since renderer::PostProcessPass
+        // needs a valid view to sample every frame regardless of whether any transparent geometry
+        // exists this run (see GetRefractionOffsetView()'s own comment).
         void Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
+            VkExtent2D renderExtent,
             VkBuffer pageTableBuffer, VkBuffer compressedPhysicalPoolBuffer,
             VkBuffer entityTransformBuffer, VkBuffer entityDataBuffer, VkBuffer wpoGlobalsBuffer,
             const std::array<MaterialParameters, kMaxMaterials>& materialTable,
@@ -188,20 +196,37 @@ namespace renderer {
         // / `frameIndex` -- pushed as push-constants, consumed by both the optional per-material
         // reflection trace (renderer::ReflectionPass::RecordTrace's identical convention) and
         // MegaLights' own RIS candidate decorrelation (megalights_ris.glsl's SelectLightRIS).
+        // `globalTimeSeconds` (Phase PP3): feeds TransparentForward.frag's own procedural, animated
+        // refraction-offset noise (see that shader's end-of-main() comment) -- packed into
+        // TransparentViewParamsUBO's own `globalTime` field (repurposing what used to be pure std140
+        // padding after cameraPositionWorld).
         void RecordDraw(VkCommandBuffer cmd, VkImage colorImage, VkImageView colorView, VkImageView depthView,
             VkExtent2D renderExtent, const maths::mat4& view, const maths::mat4& proj,
             VkBuffer decompressedIndexPoolBuffer, const maths::vec3& cameraPositionWorld,
-            const SceneLights& sceneLights,
+            const SceneLights& sceneLights, float globalTimeSeconds,
             const SurfaceCacheTraceContext& traceContext, uint32_t traceMode, uint32_t frameIndex);
 
         uint32_t GetTransparentClusterCount() const { return m_ClusterCount; }
 
+        // Phase PP3: the second (RG16F) color attachment TransparentForward.frag writes a per-
+        // material procedural refraction offset into (see MaterialParameters::heatDistortion's own
+        // comment) -- always valid (created unconditionally in Init(), see that method's own
+        // comment), cleared to (0,0) every RecordDraw() call before this pass' own draw, and stays
+        // VK_IMAGE_LAYOUT_GENERAL between frames, ready for renderer::PostProcessPass's composite
+        // shader to sample directly.
+        VkImageView GetRefractionOffsetView() const { return m_RefractionOffsetImage.View(); }
+
     private:
         static constexpr uint32_t kCompactWorkgroupSize = 64; // Matches TransparentClusterCompact.comp's local_size_x.
+        static constexpr VkFormat kRefractionOffsetFormat = VK_FORMAT_R16G16_SFLOAT;
 
         VkDevice m_Device = VK_NULL_HANDLE;
         VmaAllocator m_Allocator = VK_NULL_HANDLE;
         uint32_t m_ClusterCount = 0;
+
+        // Phase PP3: owned unconditionally (see Init()'s own comment), unlike every buffer below it
+        // (which only exist when m_ClusterCount > 0).
+        GpuImage m_RefractionOffsetImage;
 
         GpuBuffer m_ClusterEntriesBuffer;  // TransparentClusterEntry[m_ClusterCount], std430, GPU_ONLY. Written once at Init().
         GpuBuffer m_IndirectCommandsBuffer; // VkDrawIndexedIndirectCommand[m_ClusterCount], std430|INDIRECT, GPU_ONLY. Rewritten every frame.
