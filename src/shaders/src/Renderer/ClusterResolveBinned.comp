@@ -22,6 +22,8 @@
 #include "include/half_space_raster.glsl"
 #include "include/octahedral.glsl"
 #include "include/wpo_deformation.glsl"
+#include "include/enhanced_displacement.glsl"
+#include "include/spline_deformation.glsl"
 #include "include/material_params.glsl"
 #include "include/shading_bin_common.glsl"
 
@@ -106,8 +108,8 @@ layout(std140, set = 0, binding = 6) uniform ResolveViewParamsUBO {
 
 layout(std140, set = 0, binding = 8) uniform WPOGlobalsUBO {
     float globalTime;
-    float _pad0;
-    float _pad1;
+    float enhancedDisplacementDebugMultiplier;
+    float splineDeformationDebugMultiplier;
     float _pad2;
 } g_WPOGlobals;
 
@@ -129,6 +131,12 @@ layout(std430, set = 0, binding = 18) readonly buffer EntityTransformBuffer {
 
 layout(std430, set = 0, binding = 19) readonly buffer EntityDataBuffer {
     EntityData entityData[];
+};
+
+// Phase 1 (Nanite advanced): binding 24 -- the first free slot past this shader's full 0-23
+// range. See ClusterRaster.vert's identical binding comment.
+layout(std430, set = 0, binding = 24) readonly buffer SplineControlPointsSSBO {
+    SplineControlPoint splineControlPoints[SPLINE_CONTROL_POINT_COUNT];
 };
 
 layout(push_constant) uniform BinIndexPC {
@@ -178,15 +186,38 @@ void main() {
     EntityTransform xform = entityTransforms[ed.meshID];
     mat3 rotation = mat3(xform.rotation);
 
-    p0 = xform.center + rotation * (p0 - xform.center);
-    p1 = xform.center + rotation * (p1 - xform.center);
-    p2 = xform.center + rotation * (p2 - xform.center);
+    vec3 p0Local = p0 - xform.center;
+    vec3 p1Local = p1 - xform.center;
+    vec3 p2Local = p2 - xform.center;
+
+    // Phase 1 (Nanite advanced): spline bend, applied in LOCAL space BEFORE the per-entity rigid
+    // rotation -- see ClusterRaster.vert's identical comment.
+    if (GetFlag(ed.flags, ENTITY_FLAG_HAS_SPLINE_DEFORMATION)) {
+        p0Local = mix(p0Local, ApplySplineDeformation(p0Local, splineControlPoints), g_WPOGlobals.splineDeformationDebugMultiplier);
+        p1Local = mix(p1Local, ApplySplineDeformation(p1Local, splineControlPoints), g_WPOGlobals.splineDeformationDebugMultiplier);
+        p2Local = mix(p2Local, ApplySplineDeformation(p2Local, splineControlPoints), g_WPOGlobals.splineDeformationDebugMultiplier);
+    }
+
+    p0 = xform.center + rotation * p0Local;
+    p1 = xform.center + rotation * p1Local;
+    p2 = xform.center + rotation * p2Local;
 
     // Reapply the exact same WPO sway both rasterizers already applied -- see
     // ClusterResolve.comp's own comment for why this must happen before re-deriving barycentrics.
     p0 = ApplyWPODeformation(p0, cluster.clusterID, cluster.maxWPOAmplitude, g_WPOGlobals.globalTime);
     p1 = ApplyWPODeformation(p1, cluster.clusterID, cluster.maxWPOAmplitude, g_WPOGlobals.globalTime);
     p2 = ApplyWPODeformation(p2, cluster.clusterID, cluster.maxWPOAmplitude, g_WPOGlobals.globalTime);
+
+    // Phase 1 (Nanite advanced): multi-octave enhanced displacement, applied ADDITIVELY right
+    // after WPO sway -- see ClusterRaster.vert's identical comment.
+    if (GetFlag(ed.flags, ENTITY_FLAG_HAS_ENHANCED_DISPLACEMENT)) {
+        vec3 d0 = ApplyEnhancedDisplacement(p0, xform.center, cluster.clusterID, g_WPOGlobals.globalTime);
+        vec3 d1 = ApplyEnhancedDisplacement(p1, xform.center, cluster.clusterID, g_WPOGlobals.globalTime);
+        vec3 d2 = ApplyEnhancedDisplacement(p2, xform.center, cluster.clusterID, g_WPOGlobals.globalTime);
+        p0 = p0 + (d0 - p0) * g_WPOGlobals.enhancedDisplacementDebugMultiplier;
+        p1 = p1 + (d1 - p1) * g_WPOGlobals.enhancedDisplacementDebugMultiplier;
+        p2 = p2 + (d2 - p2) * g_WPOGlobals.enhancedDisplacementDebugMultiplier;
+    }
 
     vec3 n0 = rotation * DecodeClusterNormal(pageByteBase, i0);
     vec3 n1 = rotation * DecodeClusterNormal(pageByteBase, i1);

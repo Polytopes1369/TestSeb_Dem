@@ -87,6 +87,14 @@ struct DebugState {
     bool dumpDAGCutGapsRequested = false;
     // Toggles TAA + TSR on / off (Key 'A')
     bool taatsrEnabled = config::temporal::ENABLED_BY_DEFAULT;
+    // Phase 1 (Nanite advanced): renderer::ClusterRenderPipeline::SetDebugEnhancedDisplacementEnabled
+    // -- gates the multi-octave procedural noise displacement on entity 2 (Icosphere, see
+    // enhanced_displacement.glsl). Key 'B'.
+    bool enhancedDisplacementEnabled = true;
+    // Phase 1 (Nanite advanced): renderer::ClusterRenderPipeline::SetDebugSplineDeformationEnabled
+    // -- gates the runtime Hermite-spline bend on entity 6 (Tube, see spline_deformation.glsl).
+    // Key 'U'.
+    bool splineDeformationEnabled = true;
 };
 static DebugState g_DebugState;
 
@@ -174,6 +182,18 @@ static void KeyCallback(GLFWwindow* window, int key, int scancode, int action, i
     case GLFW_KEY_R:
         g_DebugState.reflectionsEnabled = !g_DebugState.reflectionsEnabled;
         LOG_INFO(std::format("[Debug] Specular Reflections: {}", g_DebugState.reflectionsEnabled ? "ON" : "OFF"));
+        break;
+    case GLFW_KEY_B:
+        // Phase 1 (Nanite advanced): multi-octave enhanced procedural displacement on entity 2
+        // (Icosphere, see enhanced_displacement.glsl).
+        g_DebugState.enhancedDisplacementEnabled = !g_DebugState.enhancedDisplacementEnabled;
+        LOG_INFO(std::format("[Debug] Enhanced Displacement (Icosphere): {}", g_DebugState.enhancedDisplacementEnabled ? "ON" : "OFF"));
+        break;
+    case GLFW_KEY_U:
+        // Phase 1 (Nanite advanced): runtime Hermite-spline bend on entity 6 (Tube, see
+        // spline_deformation.glsl).
+        g_DebugState.splineDeformationEnabled = !g_DebugState.splineDeformationEnabled;
+        LOG_INFO(std::format("[Debug] Spline Deformation (Tube): {}", g_DebugState.splineDeformationEnabled ? "ON" : "OFF"));
         break;
     case GLFW_KEY_X:
         // Phase A of the MegaLights native-port roadmap (see the approved plan): RIS-weighted
@@ -830,6 +850,8 @@ int main(int argc, char** argv) {
         clusterPipeline.SetDebugReflectionsEnabled(g_DebugState.reflectionsEnabled);
         clusterPipeline.SetDebugMegaLightsEnabled(g_DebugState.megaLightsEnabled);
         clusterPipeline.SetDebugTAATSREnabled(g_DebugState.taatsrEnabled);
+        clusterPipeline.SetDebugEnhancedDisplacementEnabled(g_DebugState.enhancedDisplacementEnabled);
+        clusterPipeline.SetDebugSplineDeformationEnabled(g_DebugState.splineDeformationEnabled);
         if (g_DebugState.dumpDAGCutGapsRequested) {
             clusterPipeline.RequestDebugDAGCutGapsDump();
             g_DebugState.dumpDAGCutGapsRequested = false;

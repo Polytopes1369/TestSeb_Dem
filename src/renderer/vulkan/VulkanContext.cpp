@@ -1387,14 +1387,25 @@ void VulkanContext::BuildEntityData() {
     core::SetFlag(entity.flags, core::EntityFlags::CastShadows, true);
 
     bool isTransparent = m_MaterialTable.isTransparent[i];
-    if (i == kFloorEntityIndex && isTransparent) {
-      // Force the floor opaque regardless of what GenerateRandomMaterialTable() rolled for it --
-      // see kFloorEntityIndex's own comment.
+    // Phase 1 (Nanite advanced): entity 2 (Icosphere) demos multi-octave enhanced procedural
+    // displacement, entity 6 (Tube) demos runtime Hermite-spline bending -- both forced opaque
+    // regardless of what GenerateRandomMaterialTable() rolled for them, same precedent as
+    // kFloorEntityIndex above, so the deformation is never obscured/complicated by alpha blending.
+    bool forceOpaque = (i == kFloorEntityIndex) || (i == 2u) || (i == 6u);
+    if (forceOpaque && isTransparent) {
+      // Force this entity opaque -- see kFloorEntityIndex's own comment.
       m_MaterialTable.params[i].alpha = 1.0f;
       m_MaterialTable.isTransparent[i] = false;
       isTransparent = false;
     }
     core::SetFlag(entity.flags, core::EntityFlags::IsTransparent, isTransparent);
+
+    if (i == 2u) {
+      core::SetFlag(entity.flags, core::EntityFlags::HasEnhancedDisplacement, true);
+    }
+    if (i == 6u) {
+      core::SetFlag(entity.flags, core::EntityFlags::HasSplineDeformation, true);
+    }
   }
 }
 

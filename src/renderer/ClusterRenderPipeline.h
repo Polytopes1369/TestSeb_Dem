@@ -260,6 +260,20 @@ namespace renderer {
         void SetDebugReflectionsEnabled(bool enabled) { m_DebugReflectionsEnabled = enabled; }
         void SetDebugTAATSREnabled(bool enabled) { m_DebugTAATSREnabled = enabled; }
 
+        // Phase 1 (Nanite advanced): gates RecordFrame()'s per-frame WPOGlobalsUBO upload of
+        // `enhancedDisplacementDebugMultiplier` -- 1.0 when enabled (full effect, the Release-
+        // always-on value, matching SetDebugReflectionsEnabled's own convention -- Release hardcodes
+        // this true, no toggle exists there), 0.0 when disabled (ApplyEnhancedDisplacement's output
+        // mixed all the way back to the undisplaced position, see enhanced_displacement.glsl's own
+        // call-site comment in e.g. ClusterRaster.vert). Main.cpp's 'B' key.
+        void SetDebugEnhancedDisplacementEnabled(bool enabled) { m_DebugEnhancedDisplacementEnabled = enabled; }
+
+        // Phase 1 (Nanite advanced): gates RecordFrame()'s per-frame WPOGlobalsUBO upload of
+        // `splineDeformationDebugMultiplier` -- same 1.0/0.0 convention as
+        // SetDebugEnhancedDisplacementEnabled above, mixing ApplySplineDeformation's bent local
+        // position back toward the undeformed rest pose when disabled. Main.cpp's 'U' key.
+        void SetDebugSplineDeformationEnabled(bool enabled) { m_DebugSplineDeformationEnabled = enabled; }
+
         // Phase A of the MegaLights native-port roadmap: gates RecordFrame()'s [12b3]
         // m_MegaLights.RecordShade() call -- see main.cpp's 'X' key. Same Release-always-on
         // convention as SetDebugReflectionsEnabled above (a real live consumer from frame one, via
@@ -301,6 +315,21 @@ namespace renderer {
         // 0xFFFFFFFF, depth 1.0) and the late pass's LOAD (draw on top of the early output).
         void BeginVisBufferRendering(VkCommandBuffer cmd, bool clearAttachments) const;
 
+#ifndef NDEBUG
+        // Phase 1 (Nanite advanced): C++ port of HermiteEvaluate/BuildBendFrame/ApplySplineDeformation
+        // (spline_deformation.glsl), called once at the end of Init() -- densely samples the
+        // authored curve's parameter range AND, at each step, several points around the Tube's own
+        // cross-section radius (see geom_tube.comp's outer radius constant), computing the TRUE
+        // worst-case displacement between a straight-pipe vertex and its bent counterpart. LOG_ERRORs
+        // if that true maximum ever exceeds SPLINE_MAX_DEVIATION -- the exact invariant this engine's
+        // bounds-inflation contract (ClusterDAGScreenError.comp/ClusterLODCompact.comp) depends on
+        // never being violated, mirrors geometry::ClusterDAG.cpp's own ValidateClusterDAG convention
+        // (log-and-continue, not a hard crash -- this is a diagnostic sanity check, not a recoverable-
+        // error path). Debug-only per CLAUDE.md's build-separation rule: this function's own file-
+        // scope existence is guarded out of Release entirely, not merely skipped at runtime.
+        void ValidateSplineBounds() const;
+#endif
+
         VkDevice m_Device = VK_NULL_HANDLE;
         VkExtent2D m_RenderExtent{ 0, 0 };
         VkExtent2D m_DisplayExtent{ 0, 0 };
@@ -322,6 +351,14 @@ namespace renderer {
         // both ClusterHardwareRasterPass and ClusterSoftwareRasterPass at Init() time. See
         // wpo_deformation.glsl's ApplyWPODeformation for how the raster shaders consume it.
         GpuBuffer m_WPOGlobalsBuffer;
+
+        // Phase 1 (Nanite advanced): this scene's one authored Hermite bend curve (4x
+        // SplineControlPoint, 128 bytes, std430) -- uploaded once at Init() (one-shot staged upload,
+        // see Init()'s own comment, mirroring VulkanContext::UploadEntityData's pattern) into a
+        // GPU_ONLY SSBO bound read-only by all 5 downstream vertex/compute shaders that decode
+        // entity 6 (Tube)'s clusters (see spline_deformation.glsl's own header comment for why this
+        // is applied in local space before rotation).
+        GpuBuffer m_SplineControlPointsBuffer;
 
         // Generates the bindless procedural cutout mask array (mask_sampling.glsl) once at Init()
         // time, before any raster/resolve pass is initialized -- see ProceduralMaskGenerator's own
@@ -505,6 +542,11 @@ namespace renderer {
         // m_DebugReflectionsEnabled above.
         bool m_DebugMegaLightsEnabled = true;
         bool m_DebugTAATSREnabled = config::temporal::ENABLED_BY_DEFAULT;
+        // Phase 1 (Nanite advanced): see SetDebugEnhancedDisplacementEnabled/
+        // SetDebugSplineDeformationEnabled's own comments -- both default to true (Release-always-on
+        // equivalent, no toggle exists there, matching m_DebugReflectionsEnabled's own convention).
+        bool m_DebugEnhancedDisplacementEnabled = true;
+        bool m_DebugSplineDeformationEnabled = true;
 
         // See RequestDebugDAGCutGapsDump()'s own comment: 0 = idle, 1 = "record the readback this
         // frame" (set by main.cpp's 'K' key), 2 = "readback landed, safe to log now" (set by

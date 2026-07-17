@@ -139,6 +139,12 @@ namespace renderer {
         // ClusterRenderPipeline::Init()'s own ordering comment). Per-entity point-light shadowing
         // (VSM cube faces) is deliberately NOT bound here any more -- MegaLights' own traced shadow
         // ray supersedes it for this pass, see TransparentForward.frag's own header comment.
+        // `splineControlPointsBuffer` is renderer::ClusterRenderPipeline's own
+        // m_SplineControlPointsBuffer (see ClusterHardwareRasterPass::Init's identical parameter
+        // comment) -- bound read-only, vertex-stage-only, at binding 18 (the first free slot past
+        // this pass's full 0-17 range, see m_ForwardSetLayout's own binding-layout comment in the
+        // .cpp) so TransparentForward.vert can evaluate ApplySplineDeformation() for entities with
+        // core::EntityFlags::HasSplineDeformation set (Phase 1, Nanite advanced).
         void Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
             VkBuffer pageTableBuffer, VkBuffer compressedPhysicalPoolBuffer,
             VkBuffer entityTransformBuffer, VkBuffer entityDataBuffer, VkBuffer wpoGlobalsBuffer,
@@ -148,7 +154,8 @@ namespace renderer {
             VkFormat colorFormat, VkFormat depthFormat,
             const WorldProbeGridPass& worldProbes, const SurfaceCacheTraceContext& traceContext,
             VkAccelerationStructureKHR tlas, VkBuffer lightBuffer, VkDeviceSize lightBufferSize,
-            VkBuffer fallbackVertexBuffer, VkBuffer fallbackIndexBuffer, VkBuffer drawRangeBuffer);
+            VkBuffer fallbackVertexBuffer, VkBuffer fallbackIndexBuffer, VkBuffer drawRangeBuffer,
+            VkBuffer splineControlPointsBuffer);
 
         void Shutdown();
 

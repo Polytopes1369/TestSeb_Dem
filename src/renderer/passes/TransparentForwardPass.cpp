@@ -64,7 +64,8 @@ namespace renderer {
         VkFormat colorFormat, VkFormat depthFormat,
         const WorldProbeGridPass& worldProbes, const SurfaceCacheTraceContext& traceContext,
         VkAccelerationStructureKHR tlas, VkBuffer lightBuffer, VkDeviceSize lightBufferSize,
-        VkBuffer fallbackVertexBuffer, VkBuffer fallbackIndexBuffer, VkBuffer drawRangeBuffer) {
+        VkBuffer fallbackVertexBuffer, VkBuffer fallbackIndexBuffer, VkBuffer drawRangeBuffer,
+        VkBuffer splineControlPointsBuffer) {
         Shutdown();
 
         m_Device = device;
@@ -142,7 +143,7 @@ namespace renderer {
         // exactly the class of bug -- a pool undercounted for bindings written after Init()'s own
         // first pass -- to not repeat here.
         VkDescriptorPoolSize poolSizes[4]{};
-        poolSizes[0] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 12 };           // Compact(3) + Forward(9: entries, pool, entityXform, entityData, materialParams, MegaLights g_Lights, fallbackVertex, fallbackIndex, drawRange).
+        poolSizes[0] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 13 };           // Compact(3) + Forward(10: entries, pool, entityXform, entityData, materialParams, MegaLights g_Lights, fallbackVertex, fallbackIndex, drawRange, splineControlPoints -- Phase 1 Nanite advanced).
         poolSizes[1] = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 4 };            // Forward: WPOGlobals, ViewParams, g_ShadowSunLevels, WorldProbeGridParams.
         poolSizes[2] = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2 };    // Forward: shadow physical atlas, World Probe Grid sampler.
         poolSizes[3] = { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1 }; // Forward: shared g_TLAS.
@@ -200,7 +201,7 @@ namespace renderer {
         // MegaLights point-light shading, see class comment).
         // =====================================================================================
         {
-            VkDescriptorSetLayoutBinding bindings[18]{};
+            VkDescriptorSetLayoutBinding bindings[19]{};
             bindings[0] = { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, nullptr };   // TransparentClusterEntriesSSBO
             bindings[1] = { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, nullptr };   // CompressedClusterPoolSSBO
             bindings[2] = { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, nullptr };   // EntityTransformBuffer
@@ -226,9 +227,12 @@ namespace renderer {
             bindings[15] = { 15, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr }; // FallbackVertexBuffer
             bindings[16] = { 16, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr }; // FallbackIndexBuffer
             bindings[17] = { 17, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr }; // EntityDrawRangeBuffer
+            // Phase 1 (Nanite advanced): binding 18, the first free slot past this set's full 0-17
+            // range -- see TransparentForward.vert's identical binding comment.
+            bindings[18] = { 18, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, nullptr }; // SplineControlPointsSSBO
 
             VkDescriptorSetLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-            layoutInfo.bindingCount = 18;
+            layoutInfo.bindingCount = 19;
             layoutInfo.pBindings = bindings;
             VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &layoutInfo, nullptr, &m_ForwardSetLayout));
 
@@ -267,7 +271,11 @@ namespace renderer {
             // MegaLights light SSBO (binding 12).
             VkDescriptorBufferInfo lightBufferInfo{ lightBuffer, 0, lightBufferSize };
 
-            VkWriteDescriptorSet writes[10]{};
+            // Phase 1 (Nanite advanced): binding 18 -- see TransparentForward.vert's identical
+            // binding comment.
+            VkDescriptorBufferInfo splineControlPointsInfo{ splineControlPointsBuffer, 0, VK_WHOLE_SIZE };
+
+            VkWriteDescriptorSet writes[11]{};
             writes[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ForwardDescriptorSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &entriesInfo, nullptr };
             writes[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ForwardDescriptorSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &compressedPoolInfo, nullptr };
             writes[2] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ForwardDescriptorSet, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &entityTransformInfo, nullptr };
@@ -278,7 +286,8 @@ namespace renderer {
             writes[7] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ForwardDescriptorSet, 12, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &lightBufferInfo, nullptr };
             writes[8] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ForwardDescriptorSet, 13, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &worldProbeGridParamsInfo, nullptr };
             writes[9] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ForwardDescriptorSet, 14, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &worldProbeGridInfo, nullptr, nullptr };
-            vkUpdateDescriptorSets(m_Device, 10, writes, 0, nullptr);
+            writes[10] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ForwardDescriptorSet, 18, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &splineControlPointsInfo, nullptr };
+            vkUpdateDescriptorSets(m_Device, 11, writes, 0, nullptr);
             // Bindings 7-10 (Phase 3's renderer::VirtualShadowMapPass resources) are intentionally
             // left unwritten here -- SetVirtualShadowMap() writes them once the caller has a
             // VirtualShadowMapPass to bind, same convention as renderer::ClusterResolvePass's own.

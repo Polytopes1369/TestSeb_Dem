@@ -74,10 +74,15 @@ namespace renderer {
         // GetSoftwareClusterListOpaqueBuffer() -- the opaque-only counterpart list, consumed by a
         // second, mask-sampling-free compute pipeline (ClusterSoftwareRasterOpaque.comp) this
         // Init() also builds; see RecordRaster().
+        // `splineControlPointsBuffer` is renderer::ClusterRenderPipeline's own
+        // m_SplineControlPointsBuffer (see ClusterHardwareRasterPass::Init's identical parameter
+        // comment) -- bound read-only at the first free slot past each set's existing bindings:
+        // binding 9 for the masked raster set (ClusterSoftwareRaster.comp), binding 8 for the
+        // opaque raster set (ClusterSoftwareRasterOpaque.comp).
         void Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue, VkExtent2D renderExtent,
             VkBuffer clusterMetadataBuffer, VkBuffer compressedPhysicalPoolBuffer, VkBuffer softwareClusterListBuffer,
             VkBuffer softwareClusterListOpaqueBuffer, VkBuffer wpoGlobalsBuffer, const std::vector<VkDescriptorImageInfo>& maskImageInfos,
-            VkBuffer entityTransformBuffer, VkBuffer entityDataBuffer);
+            VkBuffer entityTransformBuffer, VkBuffer entityDataBuffer, VkBuffer splineControlPointsBuffer);
 
         void Shutdown();
 

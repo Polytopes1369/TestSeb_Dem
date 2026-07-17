@@ -12,15 +12,15 @@ namespace renderer {
     void ClusterHardwareRasterPass::Init(VkDevice device, VkBuffer clusterMetadataBuffer, VkBuffer compressedPhysicalPoolBuffer,
         VkBuffer wpoGlobalsBuffer, const std::vector<VkDescriptorImageInfo>& maskImageInfos,
         const std::array<VkFormat, 2>& visBufferColorFormats, VkFormat depthFormat,
-        VkBuffer entityTransformBuffer, VkBuffer entityDataBuffer) {
+        VkBuffer entityTransformBuffer, VkBuffer entityDataBuffer, VkBuffer splineControlPointsBuffer) {
         Shutdown();
 
         m_Device = device;
         uint32_t maskTextureCount = static_cast<uint32_t>(maskImageInfos.size());
 
-        // --- Descriptor set layout: 6 bindings -- 0/1/2/4/5 vertex-stage-only, 3 (the bindless mask
-        // array) fragment-stage-only, since ClusterRaster.vert never samples it. ---
-        VkDescriptorSetLayoutBinding bindings[6]{};
+        // --- Descriptor set layout: 7 bindings -- 0/1/2/4/5/6 vertex-stage-only, 3 (the bindless
+        // mask array) fragment-stage-only, since ClusterRaster.vert never samples it. ---
+        VkDescriptorSetLayoutBinding bindings[7]{};
         bindings[0].binding = 0;
         bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; // ClusterCullMetadataSSBO
         bindings[0].descriptorCount = 1;
@@ -51,13 +51,18 @@ namespace renderer {
         bindings[5].descriptorCount = 1;
         bindings[5].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
 
+        bindings[6].binding = 6;
+        bindings[6].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; // SplineControlPointsSSBO (Phase 1, Nanite advanced)
+        bindings[6].descriptorCount = 1;
+        bindings[6].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+
         VkDescriptorSetLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-        layoutInfo.bindingCount = 6;
+        layoutInfo.bindingCount = 7;
         layoutInfo.pBindings = bindings;
         VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &layoutInfo, nullptr, &m_DescriptorSetLayout));
 
         VkDescriptorPoolSize poolSizes[3]{};
-        poolSizes[0] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4 };
+        poolSizes[0] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 5 };
         poolSizes[1] = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 };
         poolSizes[2] = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, maskTextureCount };
         VkDescriptorPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
@@ -77,8 +82,9 @@ namespace renderer {
         VkDescriptorBufferInfo wpoGlobalsInfo{ wpoGlobalsBuffer, 0, VK_WHOLE_SIZE };
         VkDescriptorBufferInfo entityTransformInfo{ entityTransformBuffer, 0, VK_WHOLE_SIZE };
         VkDescriptorBufferInfo entityDataInfo{ entityDataBuffer, 0, VK_WHOLE_SIZE };
+        VkDescriptorBufferInfo splineControlPointsInfo{ splineControlPointsBuffer, 0, VK_WHOLE_SIZE };
 
-        VkWriteDescriptorSet writes[6]{};
+        VkWriteDescriptorSet writes[7]{};
         writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[0].dstSet = m_DescriptorSet;
         writes[0].dstBinding = 0;
@@ -121,7 +127,14 @@ namespace renderer {
         writes[5].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         writes[5].pBufferInfo = &entityDataInfo;
 
-        vkUpdateDescriptorSets(m_Device, 6, writes, 0, nullptr);
+        writes[6].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[6].dstSet = m_DescriptorSet;
+        writes[6].dstBinding = 6;
+        writes[6].descriptorCount = 1;
+        writes[6].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[6].pBufferInfo = &splineControlPointsInfo;
+
+        vkUpdateDescriptorSets(m_Device, 7, writes, 0, nullptr);
 
         // --- Pipeline layout + pipeline: reuses VulkanPipeline::CreateGraphicsPipeline exactly as
         // draw.vert/draw.frag's own pipeline does (empty vertex input state, dynamic viewport/

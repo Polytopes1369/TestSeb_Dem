@@ -14,9 +14,11 @@
 // discard, no mask sampling" contract for the hardware path. The includer must also already have
 // declared (before this include): ClusterCullMetadata (cluster_culling_common.glsl),
 // DecodeClusterPosition/DecodeClusterUV (cluster_vertex_decode.glsl), EdgeFunction
-// (half_space_raster.glsl), ApplyWPODeformation (wpo_deformation.glsl), SampleMaskAlpha
+// (half_space_raster.glsl), ApplyWPODeformation (wpo_deformation.glsl), ApplyEnhancedDisplacement
+// (enhanced_displacement.glsl), ApplySplineDeformation (spline_deformation.glsl), SampleMaskAlpha
 // (mask_sampling.glsl, only when HAS_MASK_SUPPORT == 1), and the g_ViewParams/g_WPOGlobals/
-// g_VisBufferAtomic bindings this function reads/writes.
+// g_VisBufferAtomic/entityData/entityTransforms/splineControlPoints bindings this function
+// reads/writes.
 
 // Packs (clusterSlotIndex, localTriangleOrdinal) into the atomic word's low 32 bits. 7 bits are
 // enough for CLUSTER_MAX_TRIANGLES (128), so the shift never loses triangle-ordinal bits and never
@@ -39,9 +41,23 @@ void RasterizeClusterTriangle(ClusterCullMetadata cluster, uint clusterSlotIndex
     EntityData ed = entityData[cluster.entityID];
     EntityTransform xform = entityTransforms[ed.meshID];
     mat3 rotation = mat3(xform.rotation);
-    p0World = xform.center + rotation * (p0World - xform.center);
-    p1World = xform.center + rotation * (p1World - xform.center);
-    p2World = xform.center + rotation * (p2World - xform.center);
+
+    vec3 p0Local = p0World - xform.center;
+    vec3 p1Local = p1World - xform.center;
+    vec3 p2Local = p2World - xform.center;
+
+    // Phase 1 (Nanite advanced): spline bend, applied in LOCAL space BEFORE the per-entity rigid
+    // rotation -- see spline_deformation.glsl's own header comment. Mixed toward the undeformed
+    // local position by the debug multiplier (see ClusterRaster.vert's identical comment).
+    if (GetFlag(ed.flags, ENTITY_FLAG_HAS_SPLINE_DEFORMATION)) {
+        p0Local = mix(p0Local, ApplySplineDeformation(p0Local, splineControlPoints), g_WPOGlobals.splineDeformationDebugMultiplier);
+        p1Local = mix(p1Local, ApplySplineDeformation(p1Local, splineControlPoints), g_WPOGlobals.splineDeformationDebugMultiplier);
+        p2Local = mix(p2Local, ApplySplineDeformation(p2Local, splineControlPoints), g_WPOGlobals.splineDeformationDebugMultiplier);
+    }
+
+    p0World = xform.center + rotation * p0Local;
+    p1World = xform.center + rotation * p1Local;
+    p2World = xform.center + rotation * p2Local;
 
 #if HAS_MASK_SUPPORT
     // Only decoded when this cluster is actually masked -- sparing the opaque case (impossible in
@@ -60,6 +76,17 @@ void RasterizeClusterTriangle(ClusterCullMetadata cluster, uint clusterSlotIndex
     p0World = ApplyWPODeformation(p0World, cluster.clusterID, cluster.maxWPOAmplitude, g_WPOGlobals.globalTime);
     p1World = ApplyWPODeformation(p1World, cluster.clusterID, cluster.maxWPOAmplitude, g_WPOGlobals.globalTime);
     p2World = ApplyWPODeformation(p2World, cluster.clusterID, cluster.maxWPOAmplitude, g_WPOGlobals.globalTime);
+
+    // Phase 1 (Nanite advanced): multi-octave enhanced displacement, applied ADDITIVELY right after
+    // WPO sway -- see ClusterRaster.vert's identical comment for the debug-multiplier rationale.
+    if (GetFlag(ed.flags, ENTITY_FLAG_HAS_ENHANCED_DISPLACEMENT)) {
+        vec3 d0 = ApplyEnhancedDisplacement(p0World, xform.center, cluster.clusterID, g_WPOGlobals.globalTime);
+        vec3 d1 = ApplyEnhancedDisplacement(p1World, xform.center, cluster.clusterID, g_WPOGlobals.globalTime);
+        vec3 d2 = ApplyEnhancedDisplacement(p2World, xform.center, cluster.clusterID, g_WPOGlobals.globalTime);
+        p0World = p0World + (d0 - p0World) * g_WPOGlobals.enhancedDisplacementDebugMultiplier;
+        p1World = p1World + (d1 - p1World) * g_WPOGlobals.enhancedDisplacementDebugMultiplier;
+        p2World = p2World + (d2 - p2World) * g_WPOGlobals.enhancedDisplacementDebugMultiplier;
+    }
 
     vec4 clip0 = g_ViewParams.viewProj * vec4(p0World, 1.0);
     vec4 clip1 = g_ViewParams.viewProj * vec4(p1World, 1.0);

@@ -207,7 +207,7 @@ namespace renderer {
         // Descriptor pool, shared by all 4 sets.
         // =====================================================================================
         VkDescriptorPoolSize poolSizes[2]{};
-        poolSizes[0] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 5 + 7 + 7 + 2 }; // ScreenError + Fallback + Compact + BuildArgs SSBOs (ScreenError gained an EntityTransformBuffer binding for its rotated-sphereCenter LOD estimate; Compact gained an EntityDataBuffer binding for transparent-entity exclusion; Fallback gained a LODFallbackStatsSSBO binding for residency-fallback diagnostics plus a FeedbackTouchBufferSSBO binding for resident-touch reports, see GpuGeometryPagePool's TouchPages).
+        poolSizes[0] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 6 + 7 + 7 + 2 }; // ScreenError + Fallback + Compact + BuildArgs SSBOs (ScreenError gained an EntityTransformBuffer binding for its rotated-sphereCenter LOD estimate, plus (Phase 1, Nanite advanced) an EntityDataBuffer binding for its own displacement-bound inflation; Compact gained an EntityDataBuffer binding for transparent-entity exclusion; Fallback gained a LODFallbackStatsSSBO binding for residency-fallback diagnostics plus a FeedbackTouchBufferSSBO binding for resident-touch reports, see GpuGeometryPagePool's TouchPages).
         poolSizes[1] = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 };            // DAGViewParamsUBO.
 
         VkDescriptorPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
@@ -220,16 +220,22 @@ namespace renderer {
         // Set 1 / Pipeline 1: ClusterDAGScreenError.comp -- bindings 0..4.
         // =====================================================================================
         {
-            VkDescriptorSetLayoutBinding bindings[6]{};
+            VkDescriptorSetLayoutBinding bindings[7]{};
             bindings[0] = { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // DAGNodesSSBO
             bindings[1] = { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // DAGDecisionSSBO
             bindings[2] = { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // DAGLocalErrorSSBO
             bindings[3] = { 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // DAGParentErrorSSBO
             bindings[4] = { 4, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // DAGViewParamsUBO
             bindings[5] = { 5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // EntityTransformBuffer
+            // Phase 1 (Nanite advanced): binding 6 -- the same entityDataBuffer handle
+            // ClusterLODCompact.comp's own set (below) already borrows, wired into this second
+            // descriptor set so this shader can inflate its projected-error bound for entities with
+            // enhanced-displacement/spline-deformation flags set (see ClusterDAGScreenError.comp's
+            // own main() comment).
+            bindings[6] = { 6, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // EntityDataBuffer
 
             VkDescriptorSetLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-            layoutInfo.bindingCount = 6;
+            layoutInfo.bindingCount = 7;
             layoutInfo.pBindings = bindings;
             VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &layoutInfo, nullptr, &m_ScreenErrorSetLayout));
 
@@ -245,15 +251,17 @@ namespace renderer {
             VkDescriptorBufferInfo parentErrorInfo{ m_DAGParentErrorBuffer.Handle(), 0, m_DAGParentErrorBuffer.Size() };
             VkDescriptorBufferInfo viewParamsInfo{ m_ViewParamsBuffer.Handle(), 0, m_ViewParamsBuffer.Size() };
             VkDescriptorBufferInfo entityTransformInfo{ entityTransformBuffer, 0, VK_WHOLE_SIZE };
+            VkDescriptorBufferInfo screenErrorEntityDataInfo{ entityDataBuffer, 0, VK_WHOLE_SIZE };
 
-            VkWriteDescriptorSet writes[6]{};
+            VkWriteDescriptorSet writes[7]{};
             writes[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ScreenErrorDescriptorSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &dagNodesInfo, nullptr };
             writes[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ScreenErrorDescriptorSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &decisionInfo, nullptr };
             writes[2] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ScreenErrorDescriptorSet, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &localErrorInfo, nullptr };
             writes[3] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ScreenErrorDescriptorSet, 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &parentErrorInfo, nullptr };
             writes[4] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ScreenErrorDescriptorSet, 4, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &viewParamsInfo, nullptr };
             writes[5] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ScreenErrorDescriptorSet, 5, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &entityTransformInfo, nullptr };
-            vkUpdateDescriptorSets(m_Device, 6, writes, 0, nullptr);
+            writes[6] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ScreenErrorDescriptorSet, 6, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &screenErrorEntityDataInfo, nullptr };
+            vkUpdateDescriptorSets(m_Device, 7, writes, 0, nullptr);
 
             VkPipelineLayoutCreateInfo pipelineLayoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
             pipelineLayoutInfo.setLayoutCount = 1;

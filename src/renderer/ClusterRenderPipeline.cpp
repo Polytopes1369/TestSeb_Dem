@@ -1,5 +1,6 @@
 #include "renderer/ClusterRenderPipeline.h"
 
+#include <algorithm>
 #include <array>
 #include <cassert>
 #include <cmath>
@@ -30,14 +31,44 @@ namespace renderer {
         // codebase's own convention, e.g. ClusterSoftwareRasterPass.cpp's SoftwareRasterViewParams)
         // so the CPU-side struct's sizeof() stays an honest, self-documenting match for the UBO's
         // actual GPU size.
+        //
+        // Phase 1 (Nanite advanced): the two previously-dead pad floats are repurposed as debug
+        // toggle multipliers (enhancedDisplacementDebugMultiplier/splineDeformationDebugMultiplier,
+        // see SetDebugEnhancedDisplacementEnabled/SetDebugSplineDeformationEnabled's own comments) --
+        // zero struct size change, sizeof() stays exactly 16 bytes (see the static_assert below).
         struct WPOGlobalsUBO {
             float globalTime = 0.0f;
-            float _pad0 = 0.0f;
-            float _pad1 = 0.0f;
+            float enhancedDisplacementDebugMultiplier = 1.0f;
+            float splineDeformationDebugMultiplier = 1.0f;
             float _pad2 = 0.0f;
         };
         static_assert(sizeof(WPOGlobalsUBO) == 16,
             "WPOGlobalsUBO must match the WPOGlobalsUBO block in ClusterRaster.vert / ClusterSoftwareRaster.comp exactly (std140 layout)");
+
+        // Byte-for-byte mirror of SplineControlPoint (spline_deformation.glsl, std430): a position
+        // and an (un-normalized, magnitude matters) tangent, each vec3 padded to 16 bytes by its own
+        // implicit std430 alignment -- the explicit pad floats below add zero hidden slack, matching
+        // this codebase's own "keep sizeof() honest" convention (see WPOGlobalsUBO's own comment).
+        struct SplineControlPoint {
+            maths::vec3 position;
+            float _pad0 = 0.0f;
+            maths::vec3 tangent;
+            float _pad1 = 0.0f;
+        };
+        static_assert(sizeof(SplineControlPoint) == 32,
+            "SplineControlPoint must match SplineControlPoint in spline_deformation.glsl exactly (std430 layout)");
+
+        // The authored demo curve: a gentle S-curve spanning entity 6 (Tube)'s rest-pose local Y
+        // range [-SPLINE_REST_POSE_HALF_HEIGHT, +SPLINE_REST_POSE_HALF_HEIGHT] (see
+        // spline_deformation.glsl's own header comment), with a lateral offset up to ~0.5 in X.
+        // Tangents point predominantly along +Y (magnitude 1.4, matching the segment's own Y span)
+        // so the bend reads as one continuous curve, never a kink, across all 3 Hermite segments.
+        constexpr std::array<SplineControlPoint, 4> kSplineControlPoints = { {
+            { maths::vec3{0.00f, -0.70f, 0.0f}, 0.0f, maths::vec3{0.00f, 1.4f, 0.0f}, 0.0f },
+            { maths::vec3{0.25f, -0.233f, 0.0f}, 0.0f, maths::vec3{0.30f, 1.4f, 0.0f}, 0.0f },
+            { maths::vec3{0.45f,  0.233f, 0.0f}, 0.0f, maths::vec3{0.10f, 1.4f, 0.0f}, 0.0f },
+            { maths::vec3{0.50f,  0.70f, 0.0f}, 0.0f, maths::vec3{0.00f, 1.4f, 0.0f}, 0.0f },
+        } };
 
         float RadicalInverse(uint32_t index, uint32_t base) {
             float result = 0.0f;
@@ -261,6 +292,55 @@ bool ClusterRenderPipeline::Init(
       VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
       VMA_MEMORY_USAGE_GPU_ONLY);
 
+  // Phase 1 (Nanite advanced): m_SplineControlPointsBuffer -- 128 bytes (4x SplineControlPoint,
+  // std430), the one authored Hermite bend curve every spline-deformation call site reads. A
+  // one-time CPU->GPU staged upload (not a per-frame vkCmdUpdateBuffer like m_WPOGlobalsBuffer
+  // above -- this curve never changes after Init()), mirroring VulkanContext::UploadEntityData's
+  // own staging-buffer + one-shot-command-buffer pattern exactly.
+  {
+    m_SplineControlPointsBuffer.Create(createInfo.allocator, sizeof(kSplineControlPoints),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        VMA_MEMORY_USAGE_GPU_ONLY);
+
+    VkBufferCreateInfo stagingInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    stagingInfo.size = sizeof(kSplineControlPoints);
+    stagingInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+
+    VmaAllocationCreateInfo stagingAllocInfo{};
+    stagingAllocInfo.usage = VMA_MEMORY_USAGE_CPU_ONLY;
+    stagingAllocInfo.flags = VMA_ALLOCATION_CREATE_MAPPED_BIT;
+
+    VkBuffer stagingBuffer = VK_NULL_HANDLE;
+    VmaAllocation stagingAllocation = VK_NULL_HANDLE;
+    VmaAllocationInfo stagingAllocResultInfo{};
+    VK_CHECK(vmaCreateBuffer(createInfo.allocator, &stagingInfo, &stagingAllocInfo,
+        &stagingBuffer, &stagingAllocation, &stagingAllocResultInfo));
+    std::memcpy(stagingAllocResultInfo.pMappedData, kSplineControlPoints.data(), sizeof(kSplineControlPoints));
+
+    VulkanUtils::ExecuteOneShotCommands(m_Device, createInfo.commandPool, createInfo.queue, [&](VkCommandBuffer cmd) {
+      VkBufferCopy copyRegion{};
+      copyRegion.srcOffset = 0;
+      copyRegion.dstOffset = 0;
+      copyRegion.size = sizeof(kSplineControlPoints);
+      vkCmdCopyBuffer(cmd, stagingBuffer, m_SplineControlPointsBuffer.Handle(), 1, &copyRegion);
+
+      // Explicit barrier: the copy's writes must be visible to every vertex/compute shader stage
+      // that reads this SSBO (all 5 spline-deformation call sites, see the class comment).
+      VkMemoryBarrier2 memBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+      memBarrier.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+      memBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+      memBarrier.dstStageMask = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+      memBarrier.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
+
+      VkDependencyInfo depInfo{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+      depInfo.memoryBarrierCount = 1;
+      depInfo.pMemoryBarriers = &memBarrier;
+      vkCmdPipelineBarrier2(cmd, &depInfo);
+    });
+
+    vmaDestroyBuffer(createInfo.allocator, stagingBuffer, stagingAllocation);
+  }
+
   // Procedurally generates the bindless cutout mask array once, before any consumer pass below
   // is initialized (each one binds GetMaskImageInfos() into its own descriptor set).
   m_MaskGenerator.Init(createInfo.device, createInfo.allocator,
@@ -275,7 +355,8 @@ bool ClusterRenderPipeline::Init(
                         m_MaskGenerator.GetMaskImageInfos(), visBufferFormats,
                         createInfo.depthFormat,
                         createInfo.entityTransformBuffer,
-                        createInfo.entityDataBuffer);
+                        createInfo.entityDataBuffer,
+                        m_SplineControlPointsBuffer.Handle());
 
   m_SoftwareRaster.Init(createInfo.device, createInfo.allocator,
                         createInfo.commandPool, createInfo.queue,
@@ -287,7 +368,8 @@ bool ClusterRenderPipeline::Init(
                         m_WPOGlobalsBuffer.Handle(),
                         m_MaskGenerator.GetMaskImageInfos(),
                         createInfo.entityTransformBuffer,
-                        createInfo.entityDataBuffer);
+                        createInfo.entityDataBuffer,
+                        m_SplineControlPointsBuffer.Handle());
 
   m_Resolve.Init(
       createInfo.device, createInfo.allocator, createInfo.commandPool,
@@ -300,7 +382,8 @@ bool ClusterRenderPipeline::Init(
       m_WPOGlobalsBuffer.Handle(),
       createInfo.entityTransformBuffer,
       createInfo.entityDataBuffer,
-      createInfo.materialTable.params);
+      createInfo.materialTable.params,
+      m_SplineControlPointsBuffer.Handle());
 
   // Phase 1b: the shading-bin sort pass needs m_Resolve's own 5 output image views (its Classify
   // stage writes background pixels directly into them, see ClusterShadingBinPass's own class
@@ -503,7 +586,8 @@ bool ClusterRenderPipeline::Init(
                             m_WorldProbes, m_TraceContext, m_SurfaceCacheRT.GetTLASHandle(),
                             m_MegaLights.GetLightBufferHandle(), m_MegaLights.GetLightBufferSize(),
                             m_SurfaceCache.GetVertexBuffer(), m_SurfaceCache.GetIndexBuffer(),
-                            m_SurfaceCacheRT.GetDrawRangeBuffer());
+                            m_SurfaceCacheRT.GetDrawRangeBuffer(),
+                            m_SplineControlPointsBuffer.Handle());
   m_TransparentForward.SetVirtualShadowMap(m_VirtualShadowMap);
 
   // Screen Trace GI -- linear screen-space depth raymarching falling back to the World Probe grid.
@@ -566,12 +650,137 @@ bool ClusterRenderPipeline::Init(
                       ClusterResolvePass::kOutputColorFormat);
 #endif
 
+#ifndef NDEBUG
+  // Phase 1 (Nanite advanced): cross-checks SPLINE_MAX_DEVIATION against the authored curve's true
+  // worst-case displacement -- see ValidateSplineBounds()'s own comment.
+  ValidateSplineBounds();
+#endif
+
   LOG_INFO(
       std::format("[ClusterRenderPipeline] Initialized: {} clusters streamed "
                   "from cache ({} leaf candidates, {} logical pages).",
                   totalClusterCount, m_ClusterCount, maxLogicalPages));
   return true;
 }
+
+#ifndef NDEBUG
+namespace {
+
+    // C++ mirror of spline_deformation.glsl's HermiteEvaluate -- see that function's own comment
+    // for the basis-function derivation. `outTangent` is the analytic derivative w.r.t. u, not
+    // renormalized to arc length (only its direction is used by BuildBendFrame below).
+    void HermiteEvaluateCPU(const maths::vec3& p0, const maths::vec3& t0, const maths::vec3& p1, const maths::vec3& t1,
+        float u, maths::vec3& outPosition, maths::vec3& outTangent) {
+        float u2 = u * u;
+        float u3 = u2 * u;
+
+        float h00 = 2.0f * u3 - 3.0f * u2 + 1.0f;
+        float h10 = u3 - 2.0f * u2 + u;
+        float h01 = -2.0f * u3 + 3.0f * u2;
+        float h11 = u3 - u2;
+        outPosition = p0 * h00 + t0 * h10 + p1 * h01 + t1 * h11;
+
+        float dh00 = 6.0f * u2 - 6.0f * u;
+        float dh10 = 3.0f * u2 - 4.0f * u + 1.0f;
+        float dh01 = -6.0f * u2 + 6.0f * u;
+        float dh11 = 3.0f * u2 - 2.0f * u;
+        outTangent = p0 * dh00 + t0 * dh10 + p1 * dh01 + t1 * dh11;
+    }
+
+    // C++ mirror of spline_deformation.glsl's BuildBendFrame -- see that function's own comment.
+    void BuildBendFrameCPU(const maths::vec3& tangentDir, maths::vec3& bendRight, maths::vec3& bendForward) {
+        maths::vec3 reference{1.0f, 0.0f, 0.0f};
+        if (std::abs(tangentDir.Dot(reference)) > 0.98f) {
+            reference = maths::vec3{0.0f, 0.0f, 1.0f};
+        }
+        bendRight = tangentDir.Cross(reference).Normalize();
+        bendForward = bendRight.Cross(tangentDir);
+    }
+
+    // C++ mirror of spline_deformation.glsl's ApplySplineDeformation -- see that function's own
+    // comment. `controlPoints` must have exactly 4 entries (SPLINE_CONTROL_POINT_COUNT).
+    maths::vec3 ApplySplineDeformationCPU(const maths::vec3& localPos, const std::array<SplineControlPoint, 4>& controlPoints) {
+        constexpr float kSplineRestPoseHalfHeight = 0.7f; // Must match SPLINE_REST_POSE_HALF_HEIGHT (spline_deformation.glsl).
+        float tNormalized = std::clamp((localPos.y + kSplineRestPoseHalfHeight) / (2.0f * kSplineRestPoseHalfHeight), 0.0f, 1.0f);
+        float globalT = tNormalized * 3.0f; // SPLINE_CONTROL_POINT_COUNT - 1 == 3.
+
+        int segmentIndex = static_cast<int>(std::floor(globalT));
+        segmentIndex = std::clamp(segmentIndex, 0, 2); // SPLINE_CONTROL_POINT_COUNT - 2 == 2.
+        float localU = globalT - static_cast<float>(segmentIndex);
+
+        const SplineControlPoint& c0 = controlPoints[static_cast<size_t>(segmentIndex)];
+        const SplineControlPoint& c1 = controlPoints[static_cast<size_t>(segmentIndex) + 1];
+
+        maths::vec3 curvePos, curveTangent;
+        HermiteEvaluateCPU(c0.position, c0.tangent, c1.position, c1.tangent, localU, curvePos, curveTangent);
+
+        maths::vec3 bendRight, bendForward;
+        BuildBendFrameCPU(curveTangent.Normalize(), bendRight, bendForward);
+
+        return curvePos + bendRight * localPos.x + bendForward * localPos.z;
+    }
+
+} // namespace
+
+void ClusterRenderPipeline::ValidateSplineBounds() const {
+    // Must match SPLINE_MAX_DEVIATION (spline_deformation.glsl) exactly -- this function's whole
+    // purpose is cross-checking that constant against the true worst-case displacement the authored
+    // curve (kSplineControlPoints) actually produces, so it cannot read the constant FROM that same
+    // file (no C++/GLSL shared-header mechanism exists in this codebase for #define constants).
+    constexpr float kSplineMaxDeviation = 1.6f;
+    // Tube (entity 6)'s own outer radius (see VulkanContext::GenerateGeometry's Radius1 = 0.7f
+    // passed to GenerateTube, and geom_tube.comp's "outer radius" field) -- the cross-section extent
+    // ApplySplineDeformation's bendRight/bendForward terms actually displace.
+    constexpr float kTubeOuterRadius = 0.7f;
+    constexpr float kTubeInnerRadius = 0.5f;
+    constexpr uint32_t kCurveSteps = 1000;
+    constexpr uint32_t kAngleSteps = 16;
+
+    float maxDisplacement = 0.0f;
+    maths::vec3 worstLocalPos{};
+    float worstT = 0.0f;
+
+    for (uint32_t step = 0; step <= kCurveSteps; ++step) {
+        float tNormalized = static_cast<float>(step) / static_cast<float>(kCurveSteps);
+        float y = -0.7f + tNormalized * 1.4f; // SPLINE_REST_POSE_HALF_HEIGHT range [-0.7, 0.7].
+
+        // Sample the pipe's actual cross-section: both radii (outer wall + inner wall, the hollow
+        // pipe's two concentric rings -- see geom_tube.comp) at every angle, plus the degenerate
+        // r=0 centerline point (a lower bound, included for completeness/symmetry, not expected to
+        // ever be the worst case).
+        for (uint32_t angleStep = 0; angleStep < kAngleSteps; ++angleStep) {
+            float angle = (static_cast<float>(angleStep) / static_cast<float>(kAngleSteps)) * 6.28318530718f;
+            float cosA = std::cos(angle);
+            float sinA = std::sin(angle);
+
+            for (float radius : { 0.0f, kTubeInnerRadius, kTubeOuterRadius }) {
+                maths::vec3 localPos{cosA * radius, y, sinA * radius};
+                maths::vec3 bentPos = ApplySplineDeformationCPU(localPos, kSplineControlPoints);
+                float displacement = (bentPos - localPos).Length();
+                if (displacement > maxDisplacement) {
+                    maxDisplacement = displacement;
+                    worstLocalPos = localPos;
+                    worstT = tNormalized;
+                }
+            }
+        }
+    }
+
+    if (maxDisplacement > kSplineMaxDeviation) {
+        LOG_ERROR(std::format(
+            "[ClusterRenderPipeline] ValidateSplineBounds: true worst-case spline displacement {:.4f} "
+            "EXCEEDS SPLINE_MAX_DEVIATION ({:.4f}) at t={:.4f}, localPos=({:.4f}, {:.4f}, {:.4f}) -- "
+            "the bounds-inflation contract (ClusterDAGScreenError.comp/ClusterLODCompact.comp) is "
+            "violated, bent geometry can pop through a bounding volume culling already decided was "
+            "safe. Increase SPLINE_MAX_DEVIATION in spline_deformation.glsl to at least this value.",
+            maxDisplacement, kSplineMaxDeviation, worstT, worstLocalPos.x, worstLocalPos.y, worstLocalPos.z));
+    } else {
+        LOG_INFO(std::format(
+            "[ClusterRenderPipeline] ValidateSplineBounds: true worst-case spline displacement {:.4f} "
+            "is within SPLINE_MAX_DEVIATION ({:.4f}). OK.", maxDisplacement, kSplineMaxDeviation));
+    }
+}
+#endif
 
 void ClusterRenderPipeline::Shutdown() {
   if (m_Device != VK_NULL_HANDLE) {
@@ -635,6 +844,7 @@ void ClusterRenderPipeline::Shutdown() {
   m_Decompression.Shutdown();
   m_PagePool.Shutdown();
   m_WPOGlobalsBuffer.Destroy();
+  m_SplineControlPointsBuffer.Destroy();
 
   m_ClusterCount = 0;
   m_VisBufferClusterIDImage = VK_NULL_HANDLE;
@@ -939,6 +1149,16 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
   {
     WPOGlobalsUBO wpoGlobals{};
     wpoGlobals.globalTime = globalTimeSeconds;
+    // Phase 1 (Nanite advanced) debug toggles ('B'/'U' in main.cpp) -- 1.0 = full effect, 0.0 =
+    // fully off, same Release-always-on convention as every other SetDebug*Enabled toggle above
+    // (Release hardcodes both multipliers to 1.0, no toggle exists there).
+#ifndef NDEBUG
+    wpoGlobals.enhancedDisplacementDebugMultiplier = m_DebugEnhancedDisplacementEnabled ? 1.0f : 0.0f;
+    wpoGlobals.splineDeformationDebugMultiplier = m_DebugSplineDeformationEnabled ? 1.0f : 0.0f;
+#else
+    wpoGlobals.enhancedDisplacementDebugMultiplier = 1.0f;
+    wpoGlobals.splineDeformationDebugMultiplier = 1.0f;
+#endif
     vkCmdUpdateBuffer(cmd, m_WPOGlobalsBuffer.Handle(), 0, sizeof(WPOGlobalsUBO), &wpoGlobals);
 
     VkMemoryBarrier2 wpoBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};

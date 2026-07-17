@@ -32,6 +32,8 @@
 
 #include "include/half_space_raster.glsl"
 #include "include/wpo_deformation.glsl"
+#include "include/enhanced_displacement.glsl"
+#include "include/spline_deformation.glsl"
 
 layout(std430, set = 0, binding = 0) readonly buffer ClusterCullMetadataSSBO {
     ClusterCullMetadata clusters[];
@@ -57,8 +59,8 @@ layout(r64ui, set = 0, binding = 4) uniform u64image2D g_VisBufferAtomic;
 // ClusterRaster.vert binds, so both rasterization paths apply identical WPO displacement.
 layout(std140, set = 0, binding = 5) uniform WPOGlobalsUBO {
     float globalTime;
-    float _pad0;
-    float _pad1;
+    float enhancedDisplacementDebugMultiplier;
+    float splineDeformationDebugMultiplier;
     float _pad2;
 } g_WPOGlobals;
 
@@ -68,6 +70,11 @@ layout(std430, set = 0, binding = 6) readonly buffer EntityTransformBuffer {
 
 layout(std430, set = 0, binding = 7) readonly buffer EntityDataBuffer {
     EntityData entityData[];
+};
+
+// Phase 1 (Nanite advanced): see ClusterRaster.vert's identical binding comment.
+layout(std430, set = 0, binding = 8) readonly buffer SplineControlPointsSSBO {
+    SplineControlPoint splineControlPoints[SPLINE_CONTROL_POINT_COUNT];
 };
 
 layout(push_constant) uniform SoftwareRasterPushConstants {

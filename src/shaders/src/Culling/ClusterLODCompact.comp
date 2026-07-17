@@ -11,6 +11,8 @@
 #include "include/cluster_culling_common.glsl"
 #include "include/cluster_lod_node_metadata.glsl"
 #include "include/struct_custo.glsl"
+#include "include/enhanced_displacement.glsl"
+#include "include/spline_deformation.glsl"
 
 #define PAGE_TABLE_SET 0
 #define PAGE_TABLE_BINDING 2
@@ -75,8 +77,19 @@ void main() {
         return;
     }
 
-    if (GetFlag(entityData[node.entityID].flags, ENTITY_FLAG_IS_TRANSPARENT)) {
+    uint entityFlags = entityData[node.entityID].flags;
+    if (GetFlag(entityFlags, ENTITY_FLAG_IS_TRANSPARENT)) {
         return; // Shaded by TransparentForwardPass instead -- see EntityDataBuffer's own comment.
+    }
+
+    // Phase 1 (Nanite advanced): see ClusterDAGScreenError.comp's identical comment for why these
+    // two bounds accumulate additively on top of the existing WPO amplitude.
+    float displacementBound = node.maxWPOAmplitude;
+    if (GetFlag(entityFlags, ENTITY_FLAG_HAS_ENHANCED_DISPLACEMENT)) {
+        displacementBound += ENHANCED_DISPLACEMENT_MAX_AMPLITUDE;
+    }
+    if (GetFlag(entityFlags, ENTITY_FLAG_HAS_SPLINE_DEFORMATION)) {
+        displacementBound += SPLINE_MAX_DEVIATION;
     }
 
     uint physicalPageIndex = g_GeometryPageTable.physicalPageIndex[node.logicalPageID];
@@ -100,7 +113,7 @@ void main() {
     meta.firstIndex = physicalPageIndex * CLUSTER_MAX_INDICES;
     meta.vertexOffset = physicalPageIndex * CLUSTER_MAX_VERTICES;
     meta.clusterID = node.clusterID;
-    meta.maxWPOAmplitude = node.maxWPOAmplitude;
+    meta.maxWPOAmplitude = displacementBound;
     meta.maskTextureIndex = node.maskTextureIndex;
     meta.entityID = node.entityID;
     meta.materialID = node.materialID;
