@@ -90,6 +90,8 @@
 #include "renderer/passes/VirtualShadowMapPass.h"
 #include "renderer/passes/WorldProbeGridPass.h"
 #include "renderer/passes/TAATSRPass.h"
+#include "renderer/passes/ScreenTracePass.h"
+#include "renderer/passes/GICompositePass.h"
 #ifndef NDEBUG
 #include "renderer/debug/ClusterTriangleStatsPass.h"
 #include "renderer/debug/DebugTextOverlay.h"
@@ -409,6 +411,8 @@ namespace renderer {
         // this dispatch until a real consumer exists (planned once entity movement/dynamic objects
         // are supported).
         WorldProbeGridPass m_WorldProbes;
+        ScreenTracePass m_ScreenTrace;
+        GICompositePass m_GIComposite;
 
         // Final spatial denoiser (À-Trous wavelet, edge-guided by m_Resolve's own G-buffer normal/
         // depth): a spatial cleanup pass over the fully composited frame (direct light +

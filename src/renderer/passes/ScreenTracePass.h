@@ -79,6 +79,7 @@ namespace renderer {
         void RecordTrace(VkCommandBuffer cmd, const CameraPushConstants& camera,
             const maths::vec3& cameraPositionWorld, const maths::vec3& worldProbeGridOrigin, uint32_t frameIndex);
 
+        VkImage GetOutputImage() const { return m_OutputImage; }
         VkImageView GetOutputView() const { return m_OutputView; }
 
     private:
