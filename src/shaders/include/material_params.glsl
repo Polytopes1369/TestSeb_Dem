@@ -32,4 +32,8 @@ struct MaterialParams {
     float _pad2;
 };
 
+// Phase 7b (UE5.8 parity roadmap, terrain heightfield): mirror of renderer::kTerrainMaterialID
+// (MaterialParameterTable.h) -- keep in sync.
+#define MATERIAL_ID_TERRAIN 16u
+
 #endif // MATERIAL_PARAMS_GLSL

@@ -52,6 +52,7 @@
 #include "include/octahedral.glsl"
 #include "include/wpo_deformation.glsl"
 #include "include/material_params.glsl"
+#include "include/terrain_shading.glsl" // Phase 7b (UE5.8 parity roadmap, terrain heightfield)
 #include "include/visbuffer_arbitration.glsl"
 
 #define MASK_ARRAY_SET 0
@@ -362,6 +363,13 @@ void main() {
         uint materialSlot = min(cluster.materialID, MATERIAL_TABLE_SIZE - 1u);
         MaterialParams mat = g_MaterialParams.params[materialSlot];
         vec3 albedo = mat.baseColor;
+        // Phase 7b (UE5.8 parity roadmap, terrain heightfield): override the flat fallback
+        // baseColor with a procedural height/slope biome blend (grass/rock/snow) for the terrain
+        // material -- worldPos/normal are already available here (this step's barycentric
+        // reconstruction above), no new binding needed.
+        if (cluster.materialID == MATERIAL_ID_TERRAIN) {
+            albedo = ComputeTerrainAlbedo(worldPos, normal, albedo);
+        }
 
         // Step 4: Runtime Virtual Texture detail multiply -- worldPos.xz mapped into the VT volume's
         // [0,1]^2 UV space, sampled through the page table (miss-detection + coarse-mip fallback
