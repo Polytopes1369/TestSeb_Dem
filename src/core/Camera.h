@@ -91,6 +91,8 @@ public:
 
   maths::vec3 GetTarget() const;
   maths::vec3 GetForwardVector() const;
+  maths::vec3 GetRightVector() const;
+  maths::vec3 GetUpVector() const;
 
   float GetPitch() const { return m_PitchDegrees; }
   float GetYaw() const { return m_YawDegrees; }
