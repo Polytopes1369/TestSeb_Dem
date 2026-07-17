@@ -630,10 +630,22 @@ namespace geometry {
 
     std::vector<maths::vec3> ComputeFaceAccumulatedNormals(const SimplifiableMesh& mesh) {
         std::vector<maths::vec3> normals(mesh.positions.size(), maths::vec3{ 0.0f, 0.0f, 0.0f });
+        const uint32_t vertexCount = static_cast<uint32_t>(mesh.positions.size());
         for (size_t t = 0; t + 2 < mesh.triangles.size(); t += 3) {
             uint32_t i0 = mesh.triangles[t + 0];
             uint32_t i1 = mesh.triangles[t + 1];
             uint32_t i2 = mesh.triangles[t + 2];
+            // Diagnostic bounds check (2026-07-17 investigation, see FallbackMeshBuilder.cpp's
+            // MergeRootsWeldingAllVertices own identical comment): an out-of-range index here would
+            // silently corrupt the heap via normals[iN] below (undefined behavior on
+            // std::vector::operator[]) instead of failing cleanly.
+            if (i0 >= vertexCount || i1 >= vertexCount || i2 >= vertexCount) {
+                LOG_ERROR(std::format(
+                    "[MeshSimplifier] ComputeFaceAccumulatedNormals: triangle at offset {} references "
+                    "out-of-range vertex index/indices ({}, {}, {}) against {} position(s) -- skipping.",
+                    t, i0, i1, i2, vertexCount));
+                continue;
+            }
             maths::vec3 faceNormal = (mesh.positions[i1] - mesh.positions[i0]).Cross(mesh.positions[i2] - mesh.positions[i0]);
             normals[i0] = normals[i0] + faceNormal;
             normals[i1] = normals[i1] + faceNormal;

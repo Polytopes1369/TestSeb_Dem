@@ -25,11 +25,13 @@
 // submits on its own).
 //
 // --- Material ---
-// This codebase has no texture/material-binding system (see ClusterResolve.comp's own comment) --
-// SurfaceCacheCapture.frag reuses the exact same procedural-material approach every other shading
-// pass in this codebase already uses (procedural_material.glsl's HashID/HsvToRgb, keyed by
-// entityID) plus a small triplanar value-noise modulation so a captured card is not perfectly
-// flat-shaded -- a genuinely complete (if intentionally simple) procedural material, not a stub.
+// SurfaceCacheCapture.frag samples the same Substrate material table every other shading pass in
+// this codebase reads (material_params.glsl / substrate_bsdf.glsl -- see ClusterResolve.comp's own
+// Step 3 comment): each entity's real materialID is looked up via core::EntityData (bound at set 0
+// binding 6) and used to index g_MaterialParams (binding 7 -- the SAME SSBO renderer::
+// ClusterResolvePass::Init() already fills, bound directly here via GetMaterialParamsBuffer(), no
+// re-upload), plus a small triplanar value-noise modulation on top of the real albedo so a
+// captured card is not perfectly flat-shaded.
 //
 // --- Atlas layout convention ---
 // The 6 atlas images (albedo/normal/emissive/direct-lighting/radiance/world-position) are
@@ -133,8 +135,15 @@ namespace renderer {
         // rather than undefined memory), and builds the capture graphics pipeline. A scene with
         // zero cards is valid (Init() succeeds, RecordCapture() is then a no-op) -- only an actual
         // I/O failure reading the cache file returns false.
+        // `entityDataBuffer` (core::EntityData[], the SAME buffer renderer::ClusterResolvePass::Init
+        // already receives) and `materialParamsBuffer` (renderer::ClusterResolvePass::
+        // GetMaterialParamsBuffer(), the already-filled MaterialParams SSBO -- no re-upload here)
+        // are bound at set 0 bindings 6/7 of the lighting descriptor set (see STEP 4 in the .cpp),
+        // so SurfaceCacheCapture.frag can look up each entity's real materialID and sample the same
+        // Substrate material table every other shading pass reads, instead of an independently
+        // invented procedural color.
         bool Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
-            const std::filesystem::path& cacheFilePath);
+            const std::filesystem::path& cacheFilePath, VkBuffer entityDataBuffer, VkBuffer materialParamsBuffer);
 
         void Shutdown();
 

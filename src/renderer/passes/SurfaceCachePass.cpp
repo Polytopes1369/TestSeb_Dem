@@ -130,7 +130,7 @@ namespace renderer {
     } // namespace
 
     bool SurfaceCachePass::Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
-        const std::filesystem::path& cacheFilePath) {
+        const std::filesystem::path& cacheFilePath, VkBuffer entityDataBuffer, VkBuffer materialParamsBuffer) {
         kCardsPerFrameBudget = config::lumen::CARDS_PER_FRAME_BUDGET;
         kEvictionFrameDelay = config::lumen::EVICTION_FRAME_DELAY;
 
@@ -378,14 +378,17 @@ namespace renderer {
         // shadow_sun_sampling.glsl / shadow_point_sampling.glsl for the exact binding contract each
         // is meant to satisfy), all bound once by SetVirtualShadowMap() (called after
         // VirtualShadowMapPass::Init(), since those resources live in that separate pass -- see
-        // that method's own comment). The UBO's descriptor is written right here, since
-        // m_LightingUBO's VkBuffer handle is already known and never changes for the rest of this
-        // pass's lifetime.
+        // that method's own comment). Bindings 6/7 (Substrate integration) are `entityDataBuffer` /
+        // `materialParamsBuffer` (Init()'s own new parameters -- see that method's doc comment),
+        // letting SurfaceCacheCapture.frag look up each entity's real materialID and sample the
+        // same MaterialParams table every other shading pass reads. The UBO's descriptor (binding
+        // 0) and bindings 6/7 are all written right here, since their VkBuffer handles are already
+        // known at Init() time and never change for the rest of this pass's lifetime.
         // =====================================================================================
         m_LightingUBO.Create(allocator, sizeof(SurfaceCacheLightingUBO),
             VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, VMA_MEMORY_USAGE_CPU_TO_GPU, /*mapped=*/true);
 
-        VkDescriptorSetLayoutBinding lightingBindings[6]{};
+        VkDescriptorSetLayoutBinding lightingBindings[8]{};
         lightingBindings[0].binding = 0;
         lightingBindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
         lightingBindings[0].descriptorCount = 1;
@@ -410,16 +413,24 @@ namespace renderer {
         lightingBindings[5].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
         lightingBindings[5].descriptorCount = 1;
         lightingBindings[5].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        lightingBindings[6].binding = 6; // EntityDataBuffer (SSBO, readonly) -- Substrate integration.
+        lightingBindings[6].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        lightingBindings[6].descriptorCount = 1;
+        lightingBindings[6].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        lightingBindings[7].binding = 7; // MaterialParamsSSBO (SSBO, readonly) -- Substrate integration.
+        lightingBindings[7].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        lightingBindings[7].descriptorCount = 1;
+        lightingBindings[7].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
 
         VkDescriptorSetLayoutCreateInfo lightingSetLayoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-        lightingSetLayoutInfo.bindingCount = 6;
+        lightingSetLayoutInfo.bindingCount = 8;
         lightingSetLayoutInfo.pBindings = lightingBindings;
         VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &lightingSetLayoutInfo, nullptr, &m_LightingSetLayout));
 
         VkDescriptorPoolSize lightingPoolSizes[3]{};
         lightingPoolSizes[0] = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 3 };          // Bindings 0, 4, 5.
         lightingPoolSizes[1] = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1 };  // Binding 1.
-        lightingPoolSizes[2] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 };          // Bindings 2, 3.
+        lightingPoolSizes[2] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4 };          // Bindings 2, 3, 6, 7.
         VkDescriptorPoolCreateInfo lightingPoolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
         lightingPoolInfo.maxSets = 1;
         lightingPoolInfo.poolSizeCount = 3;
@@ -437,13 +448,32 @@ namespace renderer {
         lightingBufferInfo.offset = 0;
         lightingBufferInfo.range = sizeof(SurfaceCacheLightingUBO);
 
+        VkDescriptorBufferInfo entityDataBufferInfo{ entityDataBuffer, 0, VK_WHOLE_SIZE };
+        VkDescriptorBufferInfo materialParamsBufferInfo{ materialParamsBuffer, 0, VK_WHOLE_SIZE };
+
         VkWriteDescriptorSet lightingUboWrite{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
         lightingUboWrite.dstSet = m_LightingDescriptorSet;
         lightingUboWrite.dstBinding = 0;
         lightingUboWrite.descriptorCount = 1;
         lightingUboWrite.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
         lightingUboWrite.pBufferInfo = &lightingBufferInfo;
-        vkUpdateDescriptorSets(m_Device, 1, &lightingUboWrite, 0, nullptr);
+
+        VkWriteDescriptorSet entityDataWrite{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+        entityDataWrite.dstSet = m_LightingDescriptorSet;
+        entityDataWrite.dstBinding = 6;
+        entityDataWrite.descriptorCount = 1;
+        entityDataWrite.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        entityDataWrite.pBufferInfo = &entityDataBufferInfo;
+
+        VkWriteDescriptorSet materialParamsWrite{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+        materialParamsWrite.dstSet = m_LightingDescriptorSet;
+        materialParamsWrite.dstBinding = 7;
+        materialParamsWrite.descriptorCount = 1;
+        materialParamsWrite.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        materialParamsWrite.pBufferInfo = &materialParamsBufferInfo;
+
+        VkWriteDescriptorSet initWrites[3] = { lightingUboWrite, entityDataWrite, materialParamsWrite };
+        vkUpdateDescriptorSets(m_Device, 3, initWrites, 0, nullptr);
         // Bindings 1-5 (VirtualShadowMapPass's own resources) are intentionally left unwritten
         // here -- SetVirtualShadowMap() writes them once the caller has a VirtualShadowMapPass to
         // bind (see that method's own comment). Validation layers correctly flag sampling through

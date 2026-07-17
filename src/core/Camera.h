@@ -18,7 +18,11 @@ enum DebugViewMode : uint32_t {
   DEBUG_VIEW_MOTION_VECTORS = 12,
   DEBUG_VIEW_LUMEN = 13,
   DEBUG_VIEW_SPATIAL_PROBES = 14,
-  DEBUG_VIEW_SHADOW_CASCADES = 15
+  DEBUG_VIEW_SHADOW_CASCADES = 15,
+  // Substrate integration: color-codes each pixel's Top slab (vertical layering) -- grey = no top
+  // slab (topWeight == 0), blue-tinted = Clear Coat, orange-tinted = Fuzz/Cloth, brightness scaled
+  // by topWeight (coverage) -- see ClusterResolve.comp's own viewMode==16 branch.
+  DEBUG_VIEW_SUBSTRATE_SLABS = 16
 };
 #endif
 
