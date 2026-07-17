@@ -338,6 +338,51 @@ bool ClusterRenderPipeline::Init(
   m_SurfaceCache.SetVirtualShadowMap(m_VirtualShadowMap);
   m_Resolve.SetVirtualShadowMap(m_VirtualShadowMap);
 
+  // Step 4 (Virtual Texturing / RVT-SVT, UE 5.8 parity roadmap): a single Albedo-only physical pool
+  // (RGBA8_UNORM, matching ClusterResolvePass::kOutputAlbedoFormat's own choice of format for the
+  // exact same "simplest, most broadly supported color-attachment-and-storage-capable format"
+  // reason) -- see renderer::VirtualTextureConfig's own struct defaults for the virtual space/tile/
+  // border/physical-capacity sizing this demo uses unmodified. Always Init()'d and always wired into
+  // m_Resolve's descriptor sets below regardless of config::lumen::BUILD_VIRTUAL_TEXTURES (that flag
+  // only gates the expensive per-frame disk-streaming work, see VirtualTextureStreamingCoordinator::
+  // RecordBeginFrame's own comment) -- exactly like m_VirtualShadowMap's own unconditional Init()
+  // above, gated the same way by config::lumen::BUILD_SHADOWS instead.
+  VirtualTextureConfig vtConfig{};
+  std::vector<VkFormat> vtPoolFormats{ VK_FORMAT_R8G8B8A8_UNORM };
+  if (!m_VTManager.Init(createInfo.physicalDevice, createInfo.device, createInfo.allocator,
+                        createInfo.commandPool, createInfo.queue, vtConfig, vtPoolFormats)) {
+    LOG_ERROR("[ClusterRenderPipeline] Failed to initialize VirtualTextureManager.");
+    return false;
+  }
+
+  // Default volume bounds (see VirtualTextureVolumeBounds' own struct defaults, [-8,8]^2 XZ / [-4,4]
+  // Y) already cover this demo's scene bounding sphere (~6.4m radius, see VirtualShadowMapPass's own
+  // scene-bounds read) with generous margin -- kept as-is rather than re-deriving from the geometry
+  // cache file's own bounds.
+  m_VTBounds = VirtualTextureVolumeBounds{};
+  if (!m_VTRenderPass.Init(createInfo.device, &m_VTManager, m_VTBounds)) {
+    LOG_ERROR("[ClusterRenderPipeline] Failed to initialize VirtualTextureRenderPass.");
+    return false;
+  }
+
+  // Streams previously-baked tiles back from disk (.vtcache, sibling to the geometry .cache file at
+  // the same path with a different extension) -- see VirtualTextureStreamingCoordinator::Init's own
+  // comment for why a missing file is not a hard failure (nothing has ever been baked/persisted yet
+  // on a from-scratch run -- this demo has no offline VT bake step wired up yet, matching this
+  // phase's own scope: the streaming PLUMBING is real and complete, the content SOURCE is future
+  // work, exactly like VirtualTextureRenderPass itself is not yet driven by any real page-visibility
+  // system either).
+  std::filesystem::path vtCacheFilePath = createInfo.cacheFilePath;
+  vtCacheFilePath.replace_extension(".vtcache");
+  if (!m_VTStreaming.Init(createInfo.device, createInfo.allocator, createInfo.commandPool,
+                          createInfo.queue, vtCacheFilePath, &m_VTManager)) {
+    LOG_ERROR("[ClusterRenderPipeline] Failed to initialize VirtualTextureStreamingCoordinator.");
+    return false;
+  }
+
+  m_Resolve.SetVirtualTexture(m_VTManager, m_VTBounds.worldMinXZ, m_VTBounds.worldMaxXZ,
+                              m_VTStreaming.GetFeedbackDeviceBuffer());
+
   // Forward-rendered translucent/transparent materials (see TransparentForwardPass's own class
   // comment) -- reuses the SAME indexEntries/dagEntries this function loaded above for
   // m_LODSelection.Init(), and the SAME page pool/compressed pool/entity/WPO buffer handles every
@@ -526,6 +571,13 @@ void ClusterRenderPipeline::Shutdown() {
   // is itself destructed -- that is the only point its worker pool should ever die.
   m_SurfaceCache.Shutdown();
   m_VirtualShadowMap.Shutdown();
+  // Step 4: shut down in the reverse of Init()'s own dependency order (m_VTStreaming borrows
+  // &m_VTManager, m_VTRenderPass borrows it too -- neither is used again after this point this
+  // frame/session, so plain declaration-adjacent ordering is safe here, unlike Init()'s own
+  // pointer-validity requirement).
+  m_VTStreaming.Shutdown();
+  m_VTRenderPass.Shutdown();
+  m_VTManager.Shutdown();
   m_PrevViewProj = maths::mat4{};
   m_HasPrevViewProj = false;
   m_FrameIndex = 0;
@@ -694,6 +746,13 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
     // visible -- RecordBeginFrame()'s own trailing barrier (when it renders any page) covers that.
     // See VirtualShadowMapPass's own class comment for the full one-frame-lag feedback contract.
     m_VirtualShadowMap.RecordBeginFrame(cmd, sunDirection, m_SceneLights, cameraFrameInfo.position);
+
+    // 1b. Virtual Texture streaming: reads back LAST frame's page-miss feedback (m_Resolve's own
+    // ClusterResolve.comp/ClusterResolveBinned.comp VT sampling call, see SetVirtualTexture()'s own
+    // comment), issues new async tile reads, and drains/uploads completed ones -- must run before
+    // m_Resolve's own dispatch below (same one-frame-lag contract as VirtualShadowMapPass's own
+    // RecordBeginFrame, see VirtualTextureStreamingCoordinator's own class comment).
+    m_VTStreaming.RecordBeginFrame(cmd);
 
     // 2. Surface Cache: feed this frame's light data before the visibility-driven capture draws --
     // shadow lookups now read renderer::VirtualShadowMapPass's own UBOs directly (bound once via
@@ -1173,6 +1232,12 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
   // one-frame-lag contract. Placed here, right after every pass that can call
   // RequestShadowPageResidency() this frame has run.
   m_VirtualShadowMap.RecordEndFrame(cmd);
+
+  // Captures THIS frame's virtual texture page-miss reports (written by the same ClusterResolve
+  // .comp/ClusterResolveBinned.comp path that just ran, see virtual_texture_lookup.glsl's own
+  // miss-detection comment) for VirtualTextureStreamingCoordinator::RecordBeginFrame() to consume
+  // next frame -- identical one-frame-lag placement to m_VirtualShadowMap.RecordEndFrame() above.
+  m_VTStreaming.RecordEndFrame(cmd);
 
   // [12b] Screen Trace GI (Lumen Screen Trace + World Probe fallback): traces linear screen-space
   // rays against the GBuffer depth/normal, falling back to the 3D world probe grid on miss.

@@ -29,6 +29,12 @@ namespace renderer {
     constexpr uint32_t kInvalidPhysicalPageIndex = 0xFFFFu;
     constexpr uint32_t kInvalidLogicalPageKey = 0xFFFFFFFFu;
 
+    // Must match virtual_texture_limits.glsl's K_MAX_VT_PHYSICAL_POOLS exactly (GLSL has no way to
+    // #include a C++ constant, same manual-sync caveat as renderer::ProceduralMaskGenerator::
+    // kMaxMaskTextures / mask_texture_limits.glsl's own K_MAX_MASK_TEXTURES) -- a bounded, not
+    // unsized/runtime, bindless array (see that GLSL file's own comment for why).
+    constexpr uint32_t kMaxPhysicalPools = 8u;
+
     class VirtualTextureManager {
         friend class VirtualTextureTests;
         friend class VirtualTextureRenderPassTests; // Same device-less bookkeeping-only test bypass.

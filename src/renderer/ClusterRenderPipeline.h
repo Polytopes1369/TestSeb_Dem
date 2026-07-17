@@ -91,6 +91,9 @@
 #include "renderer/passes/SurfaceCacheTraceContext.h"
 #include "renderer/passes/TransparentForwardPass.h"
 #include "renderer/passes/VirtualShadowMapPass.h"
+#include "renderer/passes/VirtualTextureRenderPass.h"
+#include "renderer/streaming/VirtualTextureManager.h"
+#include "renderer/streaming/VirtualTextureStreamingCoordinator.h"
 #include "renderer/passes/WorldProbeGridPass.h"
 #include "renderer/passes/TAATSRPass.h"
 #include "renderer/passes/ScreenTracePass.h"
@@ -367,6 +370,24 @@ namespace renderer {
         // ShadowMapPass.h/.cpp remain in the repo (file deletion blocked, see memory
         // feedback_file_deletion_blocked) but are no longer instantiated here.
         VirtualShadowMapPass m_VirtualShadowMap;
+        // Step 4 (Virtual Texturing / RVT-SVT, UE 5.8 parity): renderer::VirtualTextureManager owns
+        // the page table + physical atlas (own single Albedo pool, see Init()'s own comment on the
+        // format chosen), renderer::VirtualTextureRenderPass renders terrain/decal pages on demand
+        // (not yet driven by any real per-frame page-visibility source -- see Init()'s own comment),
+        // and renderer::VirtualTextureStreamingCoordinator streams previously-baked tiles back off
+        // disk (.vtcache, io::VirtualTextureCacheFormat.h) via GPU feedback misses -- mirrors the
+        // exact three-way split VirtualShadowMapPass/m_Streaming already establish for shadow pages/
+        // geometry clusters respectively. Gated by config::lumen::BUILD_VIRTUAL_TEXTURES at the
+        // per-frame streaming step only (see VirtualTextureStreamingCoordinator::RecordBeginFrame's
+        // own comment) -- Init() and the descriptor wiring below always run unconditionally, exactly
+        // like VirtualShadowMapPass's own config::lumen::BUILD_SHADOWS gating.
+        VirtualTextureManager m_VTManager;
+        VirtualTextureRenderPass m_VTRenderPass;
+        VirtualTextureStreamingCoordinator m_VTStreaming;
+        // The world-space volume m_VTRenderPass/m_Resolve's VirtualTextureVolumeUBO both address --
+        // retained so RecordFrame() (or a future terrain system) can call m_VTRenderPass::RequestPage
+        // using the SAME bounds Init() wired into the consuming shader.
+        VirtualTextureVolumeBounds m_VTBounds;
         SurfaceCachePass m_SurfaceCache;
         GlobalSDFPass m_GlobalSDF;
         // Sun direction is fixed by default; one point light is authored in Init() specifically to
