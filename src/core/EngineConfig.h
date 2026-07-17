@@ -99,6 +99,17 @@ inline float SCREEN_PROBE_TEMPORAL_ALPHA = 0.05f;
 
 inline bool BUILD_SHADOWS = true;
 
+// Temporary kill-switch (Step 4, Virtual Texturing / RVT-SVT): skipping renderer::
+// ClusterRenderPipeline's Virtual Texture wiring entirely (no VirtualTextureManager::Init, no
+// VirtualTextureRenderPass/VirtualTextureStreamingCoordinator per-frame calls, no descriptor writes
+// into ClusterResolve.comp/ClusterResolveBinned.comp's VT bindings) leaves every page-table lookup
+// unavailable -- ClusterResolve.comp's own VT sampling call is itself guarded by this same flag (a
+// compile-time-visible, always-white multiply is skipped entirely when false), so re-enabling this
+// flag later needs no other change. Not per-quality-profile-tiered (unlike BUILD_SHADOWS): every
+// profile leaves this at its default `true` -- virtual texturing has no meaningful "quality knob"
+// analogous to shadow cascade count yet, only an on/off switch.
+inline bool BUILD_VIRTUAL_TEXTURES = true;
+
 constexpr uint32_t VSM_SUN_LEVEL_COUNT = 3u;
 inline float VSM_SUN_BASE_RADIUS = 2.0f;
 inline uint32_t VSM_PHYSICAL_PAGE_CAPACITY = 4096u;

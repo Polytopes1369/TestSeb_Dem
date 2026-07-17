@@ -43,6 +43,7 @@ namespace renderer {
 
     class ClusterShadingBinPass; // Phase 1b: see InitBinnedResolve()/RecordResolveBinned()'s own comments.
     class VirtualShadowMapPass;  // Phase 3: see SetVirtualShadowMap()'s own comment.
+    class VirtualTextureManager; // Step 4: see SetVirtualTexture()'s own comment.
 
     class ClusterResolvePass {
     public:
@@ -161,6 +162,27 @@ namespace renderer {
         // this phase's own plan for why point-light direct-visible shading was left unchanged).
         void SetVirtualShadowMap(const VirtualShadowMapPass& vsm);
 
+        // Step 4 (Virtual Texturing): binds `vt`'s page table + physical pool atlas into BOTH this
+        // pass's descriptor sets (mirrors SetVirtualShadowMap()'s own two-set-write pattern exactly
+        // -- see ClusterResolve.comp's/ClusterResolveBinned.comp's own binding-2x comments). Only
+        // `vt`'s pool 0 is wired (this demo's Albedo-only RVT layer) -- every one of the shader's
+        // K_MAX_VT_PHYSICAL_POOLS array slots is written with THAT SAME view/sampler (rather than
+        // left unwritten) because this engine does not enable
+        // VkPhysicalDeviceVulkan12Features::descriptorBindingPartiallyBound, so every element of a
+        // statically-referenced descriptor array binding must hold a valid descriptor (see
+        // virtual_texture_limits.glsl's own comment on why this is a bounded, not runtime, array) --
+        // harmless, since ClusterResolve.comp/ClusterResolveBinned.comp only ever index slot 0.
+        // `worldMinXZ`/`worldMaxXZ` must be the SAME world-space volume bounds the caller's
+        // renderer::VirtualTextureRenderPass instance was Init()'d with (see that class's own
+        // VirtualTextureVolumeBounds), so a world position maps to the same virtual UV both a
+        // page-render and this consuming sample agree on. `feedbackBuffer` is renderer::
+        // VirtualTextureStreamingCoordinator::GetFeedbackDeviceBuffer(). Must be called exactly once
+        // after Init() AND InitBinnedResolve() have BOTH already run, before the first
+        // RecordResolve()/RecordResolveBinned() call -- same ordering contract as
+        // SetVirtualShadowMap().
+        void SetVirtualTexture(const VirtualTextureManager& vt, const maths::vec2& worldMinXZ,
+            const maths::vec2& worldMaxXZ, VkBuffer feedbackBuffer);
+
         VkImage GetOutputColorImage() const { return m_OutputColorImage; }
         VkImageView GetOutputColorView() const { return m_OutputColorView; }
         VkImageView GetOutputNormalView() const { return m_OutputNormalView; }
@@ -194,6 +216,11 @@ namespace renderer {
         VkSampler m_DepthSampler = VK_NULL_HANDLE; // Nearest filtering, matching HZBPass's own depth-sampling convention.
 
         GpuBuffer m_ViewParamsBuffer;     // ResolveViewParamsUBO, std140, GPU_ONLY.
+        // Step 4: VirtualTextureVolumeUBO, std140, CPU_TO_GPU mapped -- filled once by
+        // SetVirtualTexture() (the volume bounds never change per-frame, unlike m_ViewParamsBuffer
+        // above), not recreated by InitBinnedResolve() (shared by both descriptor sets, same
+        // convention as m_ViewParamsBuffer itself).
+        GpuBuffer m_VTVolumeUBO;
         // renderer::MaterialParameters[kMaxMaterials], filled once at Init() time via
         // vkCmdUpdateBuffer from Init()'s own `materialTable` parameter -- not a per-frame upload
         // (unlike m_ViewParamsBuffer above).

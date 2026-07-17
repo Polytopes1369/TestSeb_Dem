@@ -241,14 +241,50 @@ namespace renderer {
         VulkanUtils::ExecuteOneShotCommands(device, commandPool, queue, [&](VkCommandBuffer cmd) {
             ClearPageTable(cmd);
 
+            // Clear every physical pool to opaque white BEFORE transitioning to SHADER_READ_ONLY:
+            // slot 0 (the root page) is permanently marked resident by ClearPageTable() above from
+            // the very first frame (see that function's own comment), and every other page-table
+            // entry initially falls back to it via PropagatePageTable -- so a consumer shader can
+            // legally sample ANY physical pool slot before renderer::VirtualTextureRenderPass or
+            // renderer::VirtualTextureStreamingCoordinator has ever written real content into it.
+            // Leaving that memory at its post-vmaCreateImage UNDEFINED contents would make that
+            // sample read undefined/garbage data (not a Vulkan validation error, but a real visual
+            // corruption risk the moment this manager is wired into a live material shader). White
+            // is chosen -- not black or magenta -- so a "multiply the procedural albedo by the VT
+            // sample" integration (see ClusterResolve.comp) is a no-op until real content streams
+            // in, exactly like Unreal Engine 5.8's own RVT fallback-to-neutral convention.
+            for (size_t i = 0; i < m_PhysicalPoolImages.size(); ++i) {
+                VkImageMemoryBarrier2 toClearDst{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
+                toClearDst.srcStageMask = VK_PIPELINE_STAGE_2_NONE;
+                toClearDst.srcAccessMask = 0;
+                toClearDst.dstStageMask = VK_PIPELINE_STAGE_2_CLEAR_BIT;
+                toClearDst.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+                toClearDst.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+                toClearDst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                toClearDst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                toClearDst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                toClearDst.image = m_PhysicalPoolImages[i].Image();
+                toClearDst.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, config.physicalPageCapacity };
+
+                VkDependencyInfo toClearDstDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+                toClearDstDep.imageMemoryBarrierCount = 1;
+                toClearDstDep.pImageMemoryBarriers = &toClearDst;
+                vkCmdPipelineBarrier2(cmd, &toClearDstDep);
+
+                VkClearColorValue white{};
+                white.float32[0] = 1.0f; white.float32[1] = 1.0f; white.float32[2] = 1.0f; white.float32[3] = 1.0f;
+                VkImageSubresourceRange clearRange{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, config.physicalPageCapacity };
+                vkCmdClearColorImage(cmd, m_PhysicalPoolImages[i].Image(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &white, 1, &clearRange);
+            }
+
             // Transition physical pools
             for (size_t i = 0; i < m_PhysicalPoolImages.size(); ++i) {
                 VkImageMemoryBarrier2 barrier{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
-                barrier.srcStageMask = VK_PIPELINE_STAGE_2_NONE;
-                barrier.srcAccessMask = 0;
+                barrier.srcStageMask = VK_PIPELINE_STAGE_2_CLEAR_BIT;
+                barrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
                 barrier.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
                 barrier.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
-                barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+                barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
                 barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
                 barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
                 barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;

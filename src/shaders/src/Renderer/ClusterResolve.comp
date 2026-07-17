@@ -75,6 +75,32 @@
 #include "include/shadow_atlas_sampling.glsl"
 #include "include/shadow_sun_sampling.glsl"
 
+// Step 4 (Virtual Texturing / RVT-SVT parity roadmap): terrain/decal material detail sampled from
+// renderer::VirtualTextureManager's page table + physical atlas, exactly like UE 5.8's Runtime
+// Virtual Texture material expression -- see this shader's own Step 3 material-evaluation comment
+// for where the sample is actually applied, and virtual_texture_lookup.glsl's header comment for
+// why the coarse-mip-clamping fallback this needs costs zero extra instructions here.
+#define VIRTUAL_TEXTURE_SET 0
+#define PAGE_TABLE_BINDING 21
+#define PHYSICAL_POOL_BINDING 22
+#define VT_FEEDBACK_SET 0
+#define VT_FEEDBACK_BINDING 23
+#include "include/virtual_texture_feedback.glsl"
+#include "include/virtual_texture_lookup.glsl"
+
+// World-space volume renderer::VirtualTextureRenderPass's page table addresses (see that class's
+// own VirtualTextureVolumeBounds) -- must match whatever bounds renderer::ClusterRenderPipeline
+// initialized the SAME VirtualTextureRenderPass instance with, so a world position maps to the same
+// virtual UV both a page-render and this consuming sample agree on.
+layout(std140, set = 0, binding = 24) uniform VirtualTextureVolumeUBO {
+    vec2 worldMinXZ;
+    vec2 worldMaxXZ;
+    float virtualTextureSize;
+    float tileSize;
+    float borderSize;
+    float _pad0;
+} g_VTVolume;
+
 layout(std430, set = 0, binding = 0) readonly buffer ClusterCullMetadataSSBO {
     ClusterCullMetadata clusters[];
 } g_Clusters;
@@ -333,6 +359,30 @@ void main() {
         uint materialSlot = min(cluster.materialID, MATERIAL_TABLE_SIZE - 1u);
         MaterialParams mat = g_MaterialParams.params[materialSlot];
         vec3 albedo = mat.baseColor;
+
+        // Step 4: Runtime Virtual Texture detail multiply -- worldPos.xz mapped into the VT volume's
+        // [0,1]^2 UV space, sampled through the page table (miss-detection + coarse-mip fallback
+        // entirely inside SampleVirtualTextureLOD, see that function's own comment). Every physical
+        // pool slot is guaranteed cleared to opaque white at VirtualTextureManager::Init() time (see
+        // that function's own comment), so this multiply is a mathematical no-op -- zero visual
+        // change to the existing procedural material -- until real tile content has actually been
+        // baked (renderer::VirtualTextureRenderPass) or streamed in (renderer::
+        // VirtualTextureStreamingCoordinator) for the page(s) this pixel falls into.
+        //
+        // Uses the explicit-LOD entry point rather than screen-space-derivative-based
+        // TranslateVirtualTextureUV/SampleVirtualTextureGrad: dFdx/dFdy are not natively available
+        // in a compute shader at all (would need GL_NV_compute_shader_derivatives, an NVIDIA-only
+        // extension unsupported on AMD/Intel -- unacceptable for this engine's general Windows x64
+        // target, see CLAUDE.md's own hardware scope). `perspNorm` (already computed above for
+        // perspective-correct barycentric interpolation) IS this pixel's own perspective-correct
+        // interpolated clip.w, i.e. its view-space distance from the camera -- see
+        // ClusterResolveBinned.comp's own identical use of this same heuristic for the full
+        // derivation and why it is portable across every dispatch topology.
+        const float kVTReferenceDistance = 2.0;
+        float vtLod = log2(max(perspNorm, 0.01) / kVTReferenceDistance);
+        vec2 vtUV = (worldPos.xz - g_VTVolume.worldMinXZ) / (g_VTVolume.worldMaxXZ - g_VTVolume.worldMinXZ);
+        vec3 vtAlbedo = SampleVirtualTextureLOD(0u, vtUV, vtLod, g_VTVolume.virtualTextureSize, g_VTVolume.tileSize, g_VTVolume.borderSize).rgb;
+        albedo *= vtAlbedo;
         // Metallic workflow energy conservation (Phase 2): a pure metal has zero diffuse response
         // -- all incident light either reflects specularly or is absorbed, none scatters diffusely.
         // Without this, a metallic surface would show BOTH a full Lambertian response here AND a
