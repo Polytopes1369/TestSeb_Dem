@@ -1,0 +1,87 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+
+// Stage 2/3 of renderer::PostProcessPass's exposure pipeline (Phase PP1, post-process stack
+// roadmap). Single workgroup, 256 threads (one per histogram bin, matching AutoExposureHistogram
+// .comp's bin count exactly): parallel-reduces g_Histogram into a sample-count-weighted mean bin
+// index (bin 0, the "near black" bucket, contributes zero weight by construction -- see
+// AutoExposureHistogram.comp's own comment), converts that back to average scene luminance, derives
+// this frame's target EV100 (Auto Exposure Histogram metering, replicating Unreal Engine's own
+// `EV100 = log2(avgLuminance * 100 / K)` calibration with K=12.5, the standard reflected-light-
+// meter constant) OR takes the Physical-Camera manual EV100 computed CPU-side in
+// renderer::PostProcessPass::RecordComposite() (aperture/shutter/ISO -- cheap scalar math, not
+// worth a second shader dispatch), applies the Exposure Compensation bias, then either
+// exponentially adapts g_Exposure.currentEV100 toward that target (Auto mode -- "Eye Adaptation",
+// UE's own Speed Up/Speed Down asymmetric rates depending on whether the scene got darker or
+// brighter) or snaps to it instantly (Manual mode -- a real camera's manual exposure has no eye-
+// adaptation lag). Also clears g_Histogram.bins back to zero for next frame's
+// AutoExposureHistogram.comp run (see that shader's own comment for why it needs no separate
+// clear step of its own).
+
+layout(local_size_x = 256) in;
+
+layout(std430, set = 0, binding = 0) buffer HistogramSSBO {
+    uint bins[256];
+} g_Histogram;
+
+layout(std430, set = 0, binding = 1) buffer ExposureStateSSBO {
+    float currentEV100;
+    float currentAvgLuminance;
+} g_Exposure;
+
+layout(push_constant) uniform PC {
+    float minLogLuminance;
+    float logLuminanceRange;
+    float pixelCount;
+    float deltaTimeSeconds;
+    float adaptationSpeedUp;   // EV/sec rate when the scene got darker (exposure increasing).
+    float adaptationSpeedDown; // EV/sec rate when the scene got brighter (exposure decreasing).
+    float exposureCompensationEV;
+    float manualEV100;         // CPU-computed from Physical Camera aperture/shutter/ISO.
+    uint useAutoExposure;      // 0 = Manual (instant), nonzero = Auto Exposure Histogram (adapted).
+} pc;
+
+shared uint sWeightedSum[256];
+shared uint sBin0Count;
+
+void main() {
+    uint i = gl_LocalInvocationIndex;
+    uint countForThisBin = g_Histogram.bins[i];
+    if (i == 0u) {
+        sBin0Count = countForThisBin;
+    }
+    sWeightedSum[i] = countForThisBin * i;
+    g_Histogram.bins[i] = 0u; // Cleared here so AutoExposureHistogram.comp needs no clear of its own.
+    barrier();
+
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (i < stride) {
+            sWeightedSum[i] += sWeightedSum[i + stride];
+        }
+        barrier();
+    }
+
+    if (i == 0u) {
+        float totalNonBlack = max(pc.pixelCount - float(sBin0Count), 1.0);
+        float meanBin = float(sWeightedSum[0]) / totalNonBlack; // Weighted mean bin index, [1..255] range.
+        float logLum = ((meanBin - 1.0) / 254.0) * pc.logLuminanceRange + pc.minLogLuminance;
+        float avgLuminance = exp2(logLum);
+
+        float targetEV100 = log2(max(avgLuminance, 0.0001) * 100.0 / 12.5);
+        float desiredEV100 = (pc.useAutoExposure != 0u) ? targetEV100 : pc.manualEV100;
+        desiredEV100 -= pc.exposureCompensationEV; // Positive compensation brightens -> lowers EV100.
+
+        float prevEV100 = g_Exposure.currentEV100;
+        float newEV100;
+        if (pc.useAutoExposure != 0u) {
+            float adaptSpeed = (desiredEV100 > prevEV100) ? pc.adaptationSpeedDown : pc.adaptationSpeedUp;
+            float alpha = clamp(1.0 - exp(-pc.deltaTimeSeconds * adaptSpeed), 0.0, 1.0);
+            newEV100 = mix(prevEV100, desiredEV100, alpha);
+        } else {
+            newEV100 = desiredEV100;
+        }
+
+        g_Exposure.currentEV100 = newEV100;
+        g_Exposure.currentAvgLuminance = avgLuminance;
+    }
+}

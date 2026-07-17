@@ -1,0 +1,65 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+
+// Stage 1/3 of renderer::PostProcessPass's exposure pipeline (Phase PP1, post-process stack
+// roadmap): builds a 256-bin log2-luminance histogram of the frame's HDR color
+// (renderer::TAATSRPass's own display-resolution output), the standard technique behind every
+// histogram-based "eye adaptation" auto exposure (Unreal Engine's own Auto Exposure Histogram
+// metering mode works the same way). Each workgroup reduces its own 16x16 tile into a
+// `shared` local histogram first (one atomicAdd per occupied bin), then does exactly 256 global
+// atomicAdd calls total (one per bin, whichever bins that workgroup actually touched) instead of
+// one global atomic PER PIXEL -- the classic trick to keep this affordable at display resolution.
+// renderer::PostProcessPass::RecordComposite() dispatches this BEFORE AutoExposureAdapt.comp
+// every frame; AutoExposureAdapt.comp both consumes and clears g_Histogram.bins, so this shader
+// never needs its own separate clear step.
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 0) uniform sampler2D g_HDRColor;
+
+layout(std430, set = 0, binding = 1) buffer HistogramSSBO {
+    uint bins[256];
+} g_Histogram;
+
+layout(push_constant) uniform PC {
+    vec2 imageSize;
+    float minLogLuminance;   // log2(luminance) mapped to bin 1.
+    float logLuminanceRange; // log2(luminance) span covered by bins [1..255].
+} pc;
+
+shared uint sSharedHistogram[256];
+
+float GetLuminance(vec3 color) {
+    return dot(color, vec3(0.2126, 0.7152, 0.0722)); // Rec.709 luma weights.
+}
+
+// Bin 0 is a dedicated "near black" bucket (excluded from the weighted mean in
+// AutoExposureAdapt.comp, exactly like Unreal's own metering ignores near-zero samples so mostly-
+// empty/void frames don't drag the average toward total darkness); bins [1..255] linearly cover
+// [minLogLuminance, minLogLuminance + logLuminanceRange] in log2 space.
+uint ColorToBin(vec3 color, float minLogLum, float invLogLumRange) {
+    float lum = GetLuminance(color);
+    if (lum < 0.005) {
+        return 0u;
+    }
+    float logLum = clamp((log2(lum) - minLogLum) * invLogLumRange, 0.0, 1.0);
+    return uint(logLum * 254.0 + 1.0);
+}
+
+void main() {
+    uint localIndex = gl_LocalInvocationIndex;
+    sSharedHistogram[localIndex] = 0u;
+    barrier();
+
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (pixel.x < int(pc.imageSize.x) && pixel.y < int(pc.imageSize.y)) {
+        vec3 color = texelFetch(g_HDRColor, pixel, 0).rgb;
+        uint binIndex = ColorToBin(color, pc.minLogLuminance, 1.0 / pc.logLuminanceRange);
+        atomicAdd(sSharedHistogram[binIndex], 1u);
+    }
+
+    barrier();
+    if (sSharedHistogram[localIndex] > 0u) {
+        atomicAdd(g_Histogram.bins[localIndex], sSharedHistogram[localIndex]);
+    }
+}
