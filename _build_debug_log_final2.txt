@@ -1,0 +1,194 @@
+'vswhere.exe' is not recognized as an internal or external command,
+operable program or batch file.
+**********************************************************************
+** Visual Studio 2026 Developer Command Prompt v18.0
+** Copyright (c) 2026 Microsoft Corporation
+**********************************************************************
+[vcvarsall.bat] Environment initialized for: 'x64'
+-- Including Win32 support
+-- Shader compiler found: C:/VulkanSDK/1.4.350.0/Bin/glslc.exe
+-- Enabling segment heap for target: DemoSceneVK
+-- Enabling segment heap for target: ClusterPartitionerTests
+-- Enabling segment heap for target: ClusterSimplificationTests
+-- Enabling segment heap for target: ClusterDAGTests
+-- Enabling segment heap for target: CacheFileFormatTests
+-- Enabling segment heap for target: MeshSDFTests
+-- Enabling segment heap for target: ClusterMaskSplitTests
+-- Enabling segment heap for target: LoadingManagerTests
+-- Enabling segment heap for target: StreamingManagerTests
+-- Enabling segment heap for target: BlockCodecTests
+-- Enabling segment heap for target: AsyncDecompressingLoaderTests
+-- Enabling segment heap for target: VirtualTextureTests
+-- Enabling segment heap for target: VirtualTextureRenderPassTests
+-- Enabling segment heap for target: OfpaSerializationTests
+-- Enabling segment heap for target: SpatialHashGridTests
+-- Enabling segment heap for target: HlodPipelineTests
+-- Configuring done (0.2s)
+-- Generating done (0.1s)
+-- Build files have been written to: D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/out/build/x64-debug
+[0/2] Re-checking globbed directories...
+[1/165] Scanning D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\io\BlockCodec.cpp for CXX dependencies
+[2/165] Scanning D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\core\Camera.cpp for CXX dependencies
+[3/165] Scanning D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\core\debug\ValidationMessageSink.cpp for CXX dependencies
+[4/165] Scanning D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\io\StreamingRequestQueue.cpp for CXX dependencies
+[5/165] Scanning D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\core\LoadingManager.cpp for CXX dependencies
+[6/165] Scanning D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\geometry\ClusterGrouping.cpp for CXX dependencies
+[7/165] Scanning D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\geometry\FallbackMeshBuilder.cpp for CXX dependencies
+[8/165] Scanning D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\geometry\MeshSDFGenerator.cpp for CXX dependencies
+[9/165] Scanning D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\geometry\SurfaceCacheAtlasAllocator.cpp for CXX dependencies
+[10/165] Scanning D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\geometry\CardGenerator.cpp for CXX dependencies
+[11/165] Scanning D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\geometry\MeshSimplifier.cpp for CXX dependencies
+[12/165] Scanning D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\geometry\EntityBVH.cpp for CXX dependencies
+[13/165] Scanning D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\geometry\GpuPageTable.cpp for CXX dependencies
+[14/165] Scanning D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\core\debug\TestReport.cpp for CXX dependencies
+[15/165] Scanning D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\geometry\ClusterPartitioner.cpp for CXX dependencies
+[16/165] Scanning D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\geometry\ClusterDAG.cpp for CXX dependencies
+[17/165] Scanning D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\core\Logger.cpp for CXX dependencies
+[18/165] Scanning D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\io\ObjExport.cpp for CXX dependencies
+[19/165] Scanning D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\geometry\VirtualGeometryCacheTest.cpp for CXX dependencies
+[20/165] Scanning D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\MegaLightsTypes.cpp for CXX dependencies
+[21/165] Scanning D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\debug\ClusterTriangleStatsPass.cpp for CXX dependencies
+[22/165] Scanning D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\debug\ScreenshotCapture.cpp for CXX dependencies
+[23/165] Scanning D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\passes\ATrousDenoisePass.cpp for CXX dependencies
+[24/165] Scanning D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\io\AsyncDecompressingLoader.cpp for CXX dependencies
+[25/165] Scanning D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\io\AsyncFileStreamer.cpp for CXX dependencies
+[26/165] Scanning D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\io\VirtualTextureCacheFileManager.cpp for CXX dependencies
+[27/165] Scanning D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\io\CacheFileManager.cpp for CXX dependencies
+[28/165] Scanning D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\passes\ClusterHardwareRasterPass.cpp for CXX dependencies
+[29/165] Scanning D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\passes\ClusterCullingPass.cpp for CXX dependencies
+[30/165] Scanning D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\passes\ClusterOcclusionCullingPass.cpp for CXX dependencies
+[31/165] Scanning D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\passes\ClusterShadingBinPass.cpp for CXX dependencies
+[32/165] Scanning D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\debug\DebugTextOverlay.cpp for CXX dependencies
+[33/165] Scanning D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\passes\HZBPass.cpp for CXX dependencies
+[34/165] Scanning D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\passes\ClusterLODSelectionPass.cpp for CXX dependencies
+[35/165] Scanning D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\passes\ClusterSoftwareRasterPass.cpp for CXX dependencies
+[36/165] Scanning D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\passes\GeometryDecompressionPass.cpp for CXX dependencies
+[37/165] Scanning D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\passes\GICompositePass.cpp for CXX dependencies
+[38/165] Scanning D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\passes\ProceduralMaskGenerator.cpp for CXX dependencies
+[39/165] Scanning D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\passes\ClusterResolvePass.cpp for CXX dependencies
+[40/165] Scanning D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\passes\MegaLightsPass.cpp for CXX dependencies
+[41/165] Scanning D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\passes\GlobalSDFPass.cpp for CXX dependencies
+[42/165] Scanning D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\ClusterRenderPipeline.cpp for CXX dependencies
+[43/165] Scanning D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\core\debug\DebugTestPipeline.cpp for CXX dependencies
+[44/165] Scanning D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\main.cpp for CXX dependencies
+[45/165] Scanning D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\passes\ScreenTracePass.cpp for CXX dependencies
+[46/165] Scanning D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\passes\ReflectionPass.cpp for CXX dependencies
+[47/165] Scanning D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\passes\ShadowMapPass.cpp for CXX dependencies
+[48/165] Scanning D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\passes\SDFRayMarchPass.cpp for CXX dependencies
+[49/165] Scanning D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\passes\ScreenProbeGIPass.cpp for CXX dependencies
+[50/165] Scanning D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\passes\SurfaceCachePass.cpp for CXX dependencies
+[51/165] Scanning D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\passes\SurfaceCacheGIInjectPass.cpp for CXX dependencies
+[52/165] Scanning D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\streaming\FeedbackBuffer.cpp for CXX dependencies
+[53/165] Scanning D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\passes\VirtualShadowMapPool.cpp for CXX dependencies
+[54/165] Scanning D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\passes\SurfaceCacheRayTracingPass.cpp for CXX dependencies
+[55/165] Scanning D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\passes\SurfaceCacheSWRTPass.cpp for CXX dependencies
+[56/165] Scanning D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\passes\SurfaceCacheTraceContext.cpp for CXX dependencies
+[57/165] Scanning D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\passes\TAATSRPass.cpp for CXX dependencies
+[58/165] Scanning D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\passes\VirtualTextureRenderPass.cpp for CXX dependencies
+[59/165] Scanning D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\streaming\VirtualTextureManager.cpp for CXX dependencies
+[60/165] Scanning D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\passes\VirtualShadowMapPass.cpp for CXX dependencies
+[61/165] Scanning D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\vendor\imgui\imgui_demo.cpp for CXX dependencies
+[62/165] Scanning D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\vendor\imgui\imgui_tables.cpp for CXX dependencies
+[63/165] Scanning D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\streaming\GpuGeometryPagePool.cpp for CXX dependencies
+[64/165] Scanning D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\vulkan\AccelerationStructure.cpp for CXX dependencies
+[65/165] Scanning D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\vendor\imgui\imgui_widgets.cpp for CXX dependencies
+[66/165] Scanning D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\vendor\imgui\imgui_draw.cpp for CXX dependencies
+[67/165] Scanning D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\passes\TransparentForwardPass.cpp for CXX dependencies
+[68/165] Scanning D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\vulkan\RayTracingFunctions.cpp for CXX dependencies
+[69/165] Scanning D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\passes\WorldProbeGridPass.cpp for CXX dependencies
+[70/165] Scanning D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\vulkan\GpuBuffer.cpp for CXX dependencies
+[71/165] Scanning D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\vendor\imgui\backends\imgui_impl_vulkan.cpp for CXX dependencies
+[72/165] Scanning D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\vulkan\VmaUsage.cpp for CXX dependencies
+[73/165] Scanning D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\vulkan\GpuImage.cpp for CXX dependencies
+[74/165] Scanning D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\vulkan\VulkanUtils.cpp for CXX dependencies
+[75/165] Scanning D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\world\StreamingManager.cpp for CXX dependencies
+[76/165] Scanning D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\vulkan\VulkanPipeline.cpp for CXX dependencies
+[77/165] Scanning D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\vendor\imgui\imgui.cpp for CXX dependencies
+[78/165] Scanning D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\streaming\VirtualTextureStreamingCoordinator.cpp for CXX dependencies
+[79/165] Scanning D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\streaming\GeometryStreamingCoordinator.cpp for CXX dependencies
+[80/165] Scanning D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\vendor\imgui\backends\imgui_impl_glfw.cpp for CXX dependencies
+[81/165] Scanning D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\src\renderer\vulkan\VulkanContext.cpp for CXX dependencies
+[82/165] Generating CXX dyndep file CMakeFiles\DemoSceneVK.dir\CXX.dd
+[83/165] Building CXX object CMakeFiles\DemoSceneVK.dir\src\core\Camera.cpp.obj
+[84/165] Building CXX object CMakeFiles\DemoSceneVK.dir\src\io\StreamingRequestQueue.cpp.obj
+[85/165] Building CXX object CMakeFiles\DemoSceneVK.dir\src\io\BlockCodec.cpp.obj
+[86/165] Building CXX object CMakeFiles\DemoSceneVK.dir\src\core\debug\ValidationMessageSink.cpp.obj
+[87/165] Building CXX object CMakeFiles\DemoSceneVK.dir\src\core\LoadingManager.cpp.obj
+[88/165] Building CXX object CMakeFiles\DemoSceneVK.dir\src\geometry\FallbackMeshBuilder.cpp.obj
+[89/165] Building CXX object CMakeFiles\DemoSceneVK.dir\src\geometry\SurfaceCacheAtlasAllocator.cpp.obj
+[90/165] Building CXX object CMakeFiles\DemoSceneVK.dir\src\geometry\MeshSDFGenerator.cpp.obj
+[91/165] Building CXX object CMakeFiles\DemoSceneVK.dir\src\geometry\MeshSimplifier.cpp.obj
+[92/165] Building CXX object CMakeFiles\DemoSceneVK.dir\src\renderer\debug\ScreenshotCapture.cpp.obj
+[93/165] Building CXX object CMakeFiles\DemoSceneVK.dir\src\renderer\MegaLightsTypes.cpp.obj
+[94/165] Building CXX object CMakeFiles\DemoSceneVK.dir\src\renderer\passes\ATrousDenoisePass.cpp.obj
+[95/165] Building CXX object CMakeFiles\DemoSceneVK.dir\src\geometry\ClusterGrouping.cpp.obj
+[96/165] Building CXX object CMakeFiles\DemoSceneVK.dir\src\renderer\debug\ClusterTriangleStatsPass.cpp.obj
+[97/165] Building CXX object CMakeFiles\DemoSceneVK.dir\src\geometry\EntityBVH.cpp.obj
+[98/165] Building CXX object CMakeFiles\DemoSceneVK.dir\src\geometry\CardGenerator.cpp.obj
+[99/165] Building CXX object CMakeFiles\DemoSceneVK.dir\src\core\Logger.cpp.obj
+[100/165] Building CXX object CMakeFiles\DemoSceneVK.dir\src\geometry\GpuPageTable.cpp.obj
+[101/165] Building CXX object CMakeFiles\DemoSceneVK.dir\src\io\VirtualTextureCacheFileManager.cpp.obj
+[102/165] Building CXX object CMakeFiles\DemoSceneVK.dir\src\io\AsyncDecompressingLoader.cpp.obj
+[103/165] Building CXX object CMakeFiles\DemoSceneVK.dir\src\core\debug\TestReport.cpp.obj
+[104/165] Building CXX object CMakeFiles\DemoSceneVK.dir\src\io\ObjExport.cpp.obj
+[105/165] Building CXX object CMakeFiles\DemoSceneVK.dir\src\geometry\ClusterPartitioner.cpp.obj
+[106/165] Building CXX object CMakeFiles\DemoSceneVK.dir\src\io\AsyncFileStreamer.cpp.obj
+[107/165] Building CXX object CMakeFiles\DemoSceneVK.dir\src\core\debug\DebugTestPipeline.cpp.obj
+[108/165] Building CXX object CMakeFiles\DemoSceneVK.dir\src\renderer\passes\ClusterHardwareRasterPass.cpp.obj
+[109/165] Building CXX object CMakeFiles\DemoSceneVK.dir\src\renderer\passes\ClusterCullingPass.cpp.obj
+[110/165] Building CXX object CMakeFiles\DemoSceneVK.dir\src\renderer\passes\ClusterOcclusionCullingPass.cpp.obj
+[111/165] Building CXX object CMakeFiles\DemoSceneVK.dir\src\geometry\ClusterDAG.cpp.obj
+[112/165] Building CXX object CMakeFiles\DemoSceneVK.dir\src\renderer\debug\DebugTextOverlay.cpp.obj
+[113/165] Building CXX object CMakeFiles\DemoSceneVK.dir\src\io\CacheFileManager.cpp.obj
+[114/165] Building CXX object CMakeFiles\DemoSceneVK.dir\src\main.cpp.obj
+[115/165] Building CXX object CMakeFiles\DemoSceneVK.dir\src\renderer\passes\ClusterShadingBinPass.cpp.obj
+[116/165] Building CXX object CMakeFiles\DemoSceneVK.dir\src\renderer\ClusterRenderPipeline.cpp.obj
+[117/165] Building CXX object CMakeFiles\DemoSceneVK.dir\src\geometry\VirtualGeometryCacheTest.cpp.obj
+[118/165] Building CXX object CMakeFiles\DemoSceneVK.dir\src\renderer\passes\MegaLightsPass.cpp.obj
+[119/165] Building CXX object CMakeFiles\DemoSceneVK.dir\src\renderer\passes\HZBPass.cpp.obj
+[120/165] Building CXX object CMakeFiles\DemoSceneVK.dir\src\renderer\passes\ProceduralMaskGenerator.cpp.obj
+[121/165] Building CXX object CMakeFiles\DemoSceneVK.dir\src\renderer\passes\ClusterSoftwareRasterPass.cpp.obj
+[122/165] Building CXX object CMakeFiles\DemoSceneVK.dir\src\renderer\passes\ClusterLODSelectionPass.cpp.obj
+[123/165] Building CXX object CMakeFiles\DemoSceneVK.dir\src\renderer\passes\ClusterResolvePass.cpp.obj
+[124/165] Building CXX object CMakeFiles\DemoSceneVK.dir\src\renderer\passes\GeometryDecompressionPass.cpp.obj
+[125/165] Building CXX object CMakeFiles\DemoSceneVK.dir\src\renderer\passes\GICompositePass.cpp.obj
+[126/165] Building CXX object CMakeFiles\DemoSceneVK.dir\src\renderer\passes\VirtualShadowMapPool.cpp.obj
+[127/165] Building CXX object CMakeFiles\DemoSceneVK.dir\src\renderer\passes\ScreenTracePass.cpp.obj
+[128/165] Building CXX object CMakeFiles\DemoSceneVK.dir\src\renderer\passes\ReflectionPass.cpp.obj
+[129/165] Building CXX object CMakeFiles\DemoSceneVK.dir\src\renderer\passes\VirtualTextureRenderPass.cpp.obj
+[130/165] Building CXX object CMakeFiles\DemoSceneVK.dir\src\renderer\passes\SurfaceCacheGIInjectPass.cpp.obj
+[131/165] Building CXX object CMakeFiles\DemoSceneVK.dir\src\renderer\passes\GlobalSDFPass.cpp.obj
+[132/165] Building CXX object CMakeFiles\DemoSceneVK.dir\src\renderer\passes\ScreenProbeGIPass.cpp.obj
+[133/165] Building CXX object CMakeFiles\DemoSceneVK.dir\src\renderer\streaming\FeedbackBuffer.cpp.obj
+[134/165] Building CXX object CMakeFiles\DemoSceneVK.dir\src\renderer\vulkan\RayTracingFunctions.cpp.obj
+[135/165] Building CXX object CMakeFiles\DemoSceneVK.dir\src\renderer\vulkan\AccelerationStructure.cpp.obj
+[136/165] Building CXX object CMakeFiles\DemoSceneVK.dir\src\renderer\passes\SurfaceCacheRayTracingPass.cpp.obj
+[137/165] Building CXX object CMakeFiles\DemoSceneVK.dir\src\renderer\passes\TAATSRPass.cpp.obj
+[138/165] Building CXX object CMakeFiles\DemoSceneVK.dir\src\renderer\passes\TransparentForwardPass.cpp.obj
+[139/165] Building CXX object CMakeFiles\DemoSceneVK.dir\src\renderer\passes\SDFRayMarchPass.cpp.obj
+[140/165] Building CXX object CMakeFiles\DemoSceneVK.dir\src\renderer\passes\SurfaceCacheTraceContext.cpp.obj
+[141/165] Building CXX object CMakeFiles\DemoSceneVK.dir\src\renderer\passes\ShadowMapPass.cpp.obj
+[142/165] Building CXX object CMakeFiles\DemoSceneVK.dir\src\renderer\passes\SurfaceCacheSWRTPass.cpp.obj
+[143/165] Building CXX object CMakeFiles\DemoSceneVK.dir\src\renderer\passes\SurfaceCachePass.cpp.obj
+[144/165] Building CXX object CMakeFiles\DemoSceneVK.dir\src\renderer\vulkan\VmaUsage.cpp.obj
+[145/165] Building CXX object CMakeFiles\DemoSceneVK.dir\src\renderer\vulkan\GpuBuffer.cpp.obj
+[146/165] Building CXX object CMakeFiles\DemoSceneVK.dir\vendor\imgui\imgui_demo.cpp.obj
+[147/165] Building CXX object CMakeFiles\DemoSceneVK.dir\src\renderer\passes\WorldProbeGridPass.cpp.obj
+[148/165] Building CXX object CMakeFiles\DemoSceneVK.dir\src\renderer\vulkan\GpuImage.cpp.obj
+[149/165] Building CXX object CMakeFiles\DemoSceneVK.dir\src\renderer\vulkan\VulkanUtils.cpp.obj
+[150/165] Building CXX object CMakeFiles\DemoSceneVK.dir\vendor\imgui\backends\imgui_impl_vulkan.cpp.obj
+[151/165] Building CXX object CMakeFiles\DemoSceneVK.dir\vendor\imgui\imgui_draw.cpp.obj
+[152/165] Building CXX object CMakeFiles\DemoSceneVK.dir\vendor\imgui\imgui_tables.cpp.obj
+[153/165] Building CXX object CMakeFiles\DemoSceneVK.dir\vendor\imgui\imgui.cpp.obj
+[154/165] Building CXX object CMakeFiles\DemoSceneVK.dir\vendor\imgui\imgui_widgets.cpp.obj
+[155/165] Building CXX object CMakeFiles\DemoSceneVK.dir\src\renderer\passes\VirtualShadowMapPass.cpp.obj
+[156/165] Building CXX object CMakeFiles\DemoSceneVK.dir\src\renderer\streaming\VirtualTextureManager.cpp.obj
+[157/165] Building CXX object CMakeFiles\DemoSceneVK.dir\vendor\imgui\backends\imgui_impl_glfw.cpp.obj
+[158/165] Building CXX object CMakeFiles\DemoSceneVK.dir\src\world\StreamingManager.cpp.obj
+[159/165] Building CXX object CMakeFiles\DemoSceneVK.dir\src\renderer\vulkan\VulkanPipeline.cpp.obj
+[160/165] Building CXX object CMakeFiles\DemoSceneVK.dir\src\renderer\streaming\GeometryStreamingCoordinator.cpp.obj
+[161/165] Building CXX object CMakeFiles\DemoSceneVK.dir\src\renderer\streaming\GpuGeometryPagePool.cpp.obj
+[162/165] Building CXX object CMakeFiles\DemoSceneVK.dir\src\renderer\streaming\VirtualTextureStreamingCoordinator.cpp.obj
+[163/165] Building CXX object CMakeFiles\DemoSceneVK.dir\src\renderer\vulkan\VulkanContext.cpp.obj
+[164/165] Linking CXX executable DemoSceneVK.exe; Deploying shader BuildDispatchIndirectArgs.comp.spv to executable directory; Deploying shader ClearVisBufferAtomic.comp.spv to executable directory; Deploying shader ClusterDAGScreenError.comp.spv to executable directory; Deploying shader ClusterFrustumCull.comp.spv to executable directory; Deploying shader ClusterHZBOcclusionCull.comp.spv to executable directory; Deploying shader ClusterLODCompact.comp.spv to executable directory; Deploying shader ClusterLODResidencyFallback.comp.spv to executable directory; Deploying shader ClusterResidencyCheck.comp.spv to executable directory; Deploying shader ClusterSoftwareRaster.comp.spv to executable directory; Deploying shader ClusterSoftwareRasterOpaque.comp.spv to executable directory; Deploying shader HZBBuildInit.comp.spv to executable directory; Deploying shader HZBReduce.comp.spv to executable directory; Deploying shader TransparentClusterCompact.comp.spv to executable directory; Deploying shader ComputeTriangleStats.comp.spv to executable directory; Deploying shader DebugText.frag.spv to executable directory; Deploying shader DebugText.vert.spv to executable directory; Deploying shader ATrousDenoise.comp.spv to executable directory; Deploying shader GIComposite.comp.spv to executable directory; Deploying shader GlobalSDFComposite.comp.spv to executable directory; Deploying shader ReflectionGather.comp.spv to executable directory; Deploying shader ReflectionTemporal.comp.spv to executable directory; Deploying shader ReflectionTrace.comp.spv to executable directory; Deploying shader SDFRayMarch.comp.spv to executable directory; Deploying shader ScreenProbeGather.comp.spv to executable directory; Deploying shader ScreenProbeTemporal.comp.spv to executable directory; Deploying shader ScreenProbeTrace.comp.spv to executable directory; Deploying shader ScreenTrace.comp.spv to executable directory; Deploying shader SurfaceCacheGIInject.comp.spv to executable directory; Deploying shader SurfaceCacheTraceSWRT.comp.spv to executable directory; Deploying shader WorldProbeInject.comp.spv to executable directory; Deploying shader autosmooth.comp.spv to executable directory; Deploying shader draw.comp.spv to executable directory; Deploying shader geom_TorusKnot.comp.spv to executable directory; Deploying shader geom_box.comp.spv to executable directory; Deploying shader geom_capsule.comp.spv to executable directory; Deploying shader geom_chamferBox.comp.spv to executable directory; Deploying shader geom_cone.comp.spv to executable directory; Deploying shader geom_cylinder.comp.spv to executable directory; Deploying shader geom_icosphere.comp.spv to executable directory; Deploying shader geom_plane.comp.spv to executable directory; Deploying shader geom_pyramide.comp.spv to executable directory; Deploying shader geom_sphere.comp.spv to executable directory; Deploying shader geom_torus.comp.spv to executable directory; Deploying shader geom_tube.comp.spv to executable directory; Deploying shader SurfaceCacheHWRT.rchit.spv to executable directory; Deploying shader SurfaceCacheHWRT.rgen.spv to executable directory; Deploying shader SurfaceCacheHWRT.rmiss.spv to executable directory; Deploying shader ClusterRaster.frag.spv to executable directory; Deploying shader ClusterRaster.vert.spv to executable directory; Deploying shader ClusterRasterOpaque.frag.spv to executable directory; Deploying shader ClusterResolve.comp.spv to executable directory; Deploying shader ClusterResolveBinned.comp.spv to executable directory; Deploying shader ClusterShadingBinClassify.comp.spv to executable directory; Deploying shader ClusterShadingBinPrefixSum.comp.spv to executable directory; Deploying shader ClusterShadingBinScatter.comp.spv to executable directory; Deploying shader MegaLightsComposite.comp.spv to executable directory; Deploying shader MegaLightsShade.comp.spv to executable directory; Deploying shader ShadowMapCapture.vert.spv to executable directory; Deploying shader SurfaceCacheCapture.frag.spv to executable directory; Deploying shader SurfaceCacheCapture.vert.spv to executable directory; Deploying shader TAATSR.comp.spv to executable directory; Deploying shader TransparentForward.frag.spv to executable directory; Deploying shader TransparentForward.vert.spv to executable directory; Deploying shader draw.frag.spv to executable directory; Deploying shader draw.vert.spv to executable directory; Deploying shader DecompressClusterIndices.comp.spv to executable directory; Deploying shader DecompressClusterVertices.comp.spv to executable directory; Deploying shader ProceduralMaskGenerate.comp.spv to executable directory
+BUILD_DONE errorlevel=0
