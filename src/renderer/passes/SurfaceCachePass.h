@@ -111,7 +111,12 @@ namespace renderer {
         // How many cards RecordCapture() (re-)captures per call -- see the class comment's
         // "asynchronous" note. Small enough that even a full command buffer's worth of capture
         // draws costs a handful of tiny (card-sized, not full-screen) rasterization scopes.
-        static inline uint32_t kCardsPerFrameBudget = 16u;
+        // Bumped 16->48 for the Phase 4 integration (dynamic scenes onto main): while
+        // config::ENTITY_SELF_ROTATION_ENABLED is on, MarkAllRotatingEntityCardsDirty() re-queues
+        // every resident card every frame (up to ~kEntityCount x 6 faces), so a too-small budget
+        // would visibly lag the Surface Cache behind the actual rotation -- generous rather than
+        // dimensioned to the exact worst case, adjustable via the log if still insufficient.
+        static inline uint32_t kCardsPerFrameBudget = 48u;
 
         // How many consecutive UpdateVisibility() calls a resident card is allowed to go unwanted
         // before its atlas page is actually freed -- see UpdateVisibility()'s own comment. A short
@@ -166,10 +171,12 @@ namespace renderer {
         void UpdateLighting(const SceneLights& lights);
 
         // Records up to kCardsPerFrameBudget cards' worth of capture draws into `cmd`, draining
-        // from the front of the dirty-card queue UpdateVisibility() fills (a card is dirty exactly
-        // once, right after (re)gaining residency -- there is no periodic re-capture of an
-        // already-captured resident card, since this engine's entities are static, see
-        // renderer::GlobalSDFPass's own "Scope" note). See the class comment for the atlas images'
+        // from the front of the dirty-card queue UpdateVisibility() fills (a card is normally dirty
+        // exactly once, right after (re)gaining residency -- this engine's entities are static by
+        // default). Phase 4 integration (dynamic scenes onto main): when
+        // config::ENTITY_SELF_ROTATION_ENABLED is on, this method ALSO calls
+        // MarkAllRotatingEntityCardsDirty() first, re-queuing every resident card every call, since
+        // a rotating entity's captured surface data goes stale every frame. See the class comment for the atlas images'
         // fixed GENERAL layout contract (no caller-side transition needed, before or between
         // calls). Ends with a VkMemoryBarrier2 making every texel captured THIS call visible to a
         // later fragment/compute sampled read.
@@ -245,6 +252,19 @@ namespace renderer {
         // GI-facing placement -- see GetCards()'s own comment) and queuing it for capture exactly
         // once (idempotent: calling this again on an already-dirty card does not requeue it).
         void ApplyCardPlacement(uint32_t cardIndex, const geometry::AtlasRect& paddedRect);
+
+        // Phase 4 integration (UE5.8 parity roadmap, dynamic scenes onto main): re-queues EVERY
+        // already-resident card for capture, every call -- called internally from RecordCapture(),
+        // gated by config::ENTITY_SELF_ROTATION_ENABLED (see that call site's own comment). Reuses
+        // ApplyCardPlacement's own idempotent enqueue check (CardRuntimeState::dirty), so calling
+        // this every frame while a card is still awaiting its OWN previous capture does not
+        // requeue it a second time. Deliberately does NOT try to exclude the one entity
+        // (VulkanContext's floor, always static) that never actually rotates -- doing so would
+        // need a hardcoded entityID here duplicating a fact only VulkanContext currently owns;
+        // the floor's cards being harmlessly re-captured every frame while the global rotation
+        // switch is on is an accepted, bounded inefficiency (see kCardsPerFrameBudget's own bump),
+        // not a correctness issue.
+        void MarkAllRotatingEntityCardsDirty();
 
         // Frees every resident card whose framesSinceVisible > 0 (i.e. not wanted THIS call),
         // regardless of kEvictionFrameDelay -- the fallback AllocateCardPage() reaches for once a

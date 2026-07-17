@@ -14,6 +14,7 @@
 #include <vulkan/vulkan.h>
 #include <vk_mem_alloc.h>
 
+#include "core/EntityData.h" // core::EntityTransformCPU
 #include "renderer/vulkan/AccelerationStructure.h"
 #include "renderer/vulkan/GpuBuffer.h"
 
@@ -49,6 +50,16 @@ namespace renderer {
         // SurfaceCacheSWRTPass::RecordTrace().
         void RecordTrace(VkCommandBuffer cmd, uint32_t rayCount, const SurfaceCacheTraceContext& traceContext);
 
+        // Phase 4 integration (UE5.8 parity roadmap, dynamic scenes onto main): rebuilds m_TLAS's
+        // instance transforms from this frame's `entityTransformsCPU` (renderer::VulkanContext::
+        // GetEntityTransformsCPU(), index == meshID) and records a full refit DIRECTLY into `cmd`
+        // (see AccelerationStructure.h's own RecordRefitTLAS comment -- no separate submit/wait,
+        // unlike Init()'s one-shot BuildTLAS). BLAS geometry/device addresses are untouched (rigid
+        // transform only, no vertex displacement). Must be called before anything else this frame
+        // traces against GetTLASHandle() -- see ClusterRenderPipeline::RecordFrame's own call site
+        // comment for why it runs first in the [1z] GI block.
+        void RecordRefreshTLAS(VkCommandBuffer cmd, const core::EntityTransformCPU* entityTransformsCPU);
+
         // Exposed so renderer::SurfaceCacheGIInjectPass can bind the SAME TLAS + draw-range table
         // into its own inline-ray-query (VK_KHR_ray_query) descriptor set, instead of building a
         // second TLAS over the same geometry -- see SurfaceCacheGIInject.comp's own TraceHWRT.
@@ -60,6 +71,22 @@ namespace renderer {
 
         std::vector<AccelerationStructure> m_BLASList; // Index-aligned with SurfaceCacheTraceContext::GetTracedEntities().
         AccelerationStructure m_TLAS;
+
+        // Phase 4 integration: persistent per-frame TLAS refit buffers (see AccelerationStructure.h's
+        // own TlasRefitResources comment) + the per-BLAS bookkeeping RecordRefreshTLAS needs to
+        // rebuild `instances` every frame. NOT simply index-aligned with GetTracedEntities() --
+        // Init()'s own loop below SKIPS (via `continue`) any traced entity with empty Fallback Mesh
+        // geometry, so m_BLASList/m_RefitInstanceInfos are a COMPACTED subset, in traversal order,
+        // of the entities that actually got a BLAS -- each entry explicitly records which
+        // tracedEntities index (for instanceCustomIndex) and which entityID (to look up this
+        // frame's rotation in entityTransformsCPU) it corresponds to, rather than assuming any
+        // implicit 1:1 alignment.
+        struct RefitInstanceInfo {
+            uint32_t instanceCustomIndex = 0; // == the tracedEntities dense index (matches SurfaceCacheHWRT.rchit's own resolution).
+            uint32_t entityID = 0;            // meshID -- indexes entityTransformsCPU.
+        };
+        std::vector<RefitInstanceInfo> m_RefitInstanceInfos; // Index-aligned with m_BLASList.
+        TlasRefitResources m_TlasRefitResources;
 
         GpuBuffer m_DrawRangeBuffer; // set 3, binding 2 -- EntityDrawRangeGpu[], index-aligned with m_BLASList.
 

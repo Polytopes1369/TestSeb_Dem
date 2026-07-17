@@ -211,7 +211,19 @@ int main(int argc, char** argv) {
 #endif
 
     VulkanContext vkContext;
-    vkContext.Init("DemoScene", window);
+    // Mirrors ClusterRenderPipeline::Init's own try/catch below: an exception escaping Init()
+    // (bad SPIR-V, VkResult failure, unsupported surface config, ...) otherwise unwinds straight
+    // past main() into std::terminate() with zero diagnostic -- the process just vanishes with
+    // exit code 3 and nothing in the log to say why.
+    try {
+        vkContext.Init("DemoScene", window);
+    }
+    catch (const std::exception& e) {
+        LOG_CRITICAL(std::format("[Main] VulkanContext::Init threw: {}", e.what()));
+        glfwDestroyWindow(window);
+        glfwTerminate();
+        return -1;
+    }
 
 #ifndef NDEBUG
     // Setup Dear ImGui context
@@ -283,11 +295,17 @@ int main(int argc, char** argv) {
         LOG_INFO("[Main] scene.cache is up to date with current parameters. Skipping geometry cache build.");
     } else {
         LOG_INFO("[Main] scene.cache is missing or out of date. Rebuilding geometry cache...");
-        geometryCacheTestPassed = geometry::RunVirtualGeometryCacheTest(
-            vkContext.GetDevice(), vkContext.GetAllocator(), vkContext.GetGraphicsQueue(), vkContext.GetCommandPool(),
-            vkContext.GetVertexBuffer(), vkContext.GetIndexBuffer(),
-            vkContext.GetTotalVertexCount(), vkContext.GetTotalIndexCount(),
-            vkContext.GetEntityData(), vkContext.GetEntityCount());
+        try {
+            geometryCacheTestPassed = geometry::RunVirtualGeometryCacheTest(
+                vkContext.GetDevice(), vkContext.GetAllocator(), vkContext.GetGraphicsQueue(), vkContext.GetCommandPool(),
+                vkContext.GetVertexBuffer(), vkContext.GetIndexBuffer(),
+                vkContext.GetTotalVertexCount(), vkContext.GetTotalIndexCount(),
+                vkContext.GetEntityData(), vkContext.GetEntityCount());
+        }
+        catch (const std::exception& e) {
+            LOG_CRITICAL(std::format("[Main] RunVirtualGeometryCacheTest threw: {}", e.what()));
+            geometryCacheTestPassed = false;
+        }
         if (geometryCacheTestPassed) {
             geometry::SaveCacheConfig(vkContext.GetTotalVertexCount(), vkContext.GetTotalIndexCount(), vkContext.GetEntityCount());
         }
@@ -791,7 +809,8 @@ int main(int argc, char** argv) {
         clusterPipeline.RecordFrame(vkContext.GetCommandBuffer(), camera.GetPushConstants(),
             camera.GetPosition(), camera.GetFrameInfo(aspect), static_cast<float>(glfwGetTime()),
             vkContext.GetSwapchainImages()[imageIndex],
-            vkContext.GetSwapchainImageViews()[imageIndex]);
+            vkContext.GetSwapchainImageViews()[imageIndex],
+            vkContext.GetEntityTransformsCPU());
 
         vkEndCommandBuffer(vkContext.GetCommandBuffer());
 

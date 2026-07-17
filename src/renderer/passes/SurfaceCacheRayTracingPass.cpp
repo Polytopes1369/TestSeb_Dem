@@ -111,6 +111,10 @@ namespace renderer {
             instances.push_back(instance);
 
             m_BLASList.push_back(std::move(blas));
+            // Phase 4 integration: records exactly which tracedEntities index/entityID this BLAS
+            // (now m_BLASList's newest entry) corresponds to -- see m_RefitInstanceInfos' own
+            // header comment on why this is NOT assumed to be an implicit 1:1 index alignment.
+            m_RefitInstanceInfos.push_back(RefitInstanceInfo{ i, tracedEntities[i].entityID });
         }
 
         LOG_INFO(std::format("[SurfaceCacheRayTracingPass] Built {} BLAS / {} TLAS instance(s).",
@@ -120,6 +124,10 @@ namespace renderer {
         // STEP 2 -- TLAS.
         // =====================================================================================
         m_TLAS = BuildTLAS(physicalDevice, device, allocator, commandPool, queue, instances);
+
+        // Phase 4 integration: persistent per-frame refit buffers, sized for the SAME instance
+        // count this initial build just used -- see RecordRefreshTLAS's own comment.
+        m_TlasRefitResources = CreateTlasRefitResources(physicalDevice, device, allocator, static_cast<uint32_t>(instances.size()));
 
         // =====================================================================================
         // STEP 3 -- set 3's draw-range SSBO (index-aligned with EVERY traced entity, including
@@ -363,6 +371,10 @@ namespace renderer {
             if (m_GeometrySetLayout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(m_Device, m_GeometrySetLayout, nullptr);
         }
         m_BLASList.clear();
+        m_RefitInstanceInfos.clear();
+        m_TlasRefitResources.instanceBuffer.Destroy();
+        m_TlasRefitResources.scratchBuffer.Destroy();
+        m_TlasRefitResources.scratchAddress = 0;
         m_TLAS.Destroy();
         m_DrawRangeBuffer.Destroy();
         m_RaygenSBT.Destroy();
@@ -402,6 +414,46 @@ namespace renderer {
         vkCmdPushConstants(cmd, m_PipelineLayout, VK_SHADER_STAGE_RAYGEN_BIT_KHR, 0, sizeof(pc), &pc);
 
         g_RTFunctions.vkCmdTraceRaysKHR(cmd, &m_RaygenRegion, &m_MissRegion, &m_HitRegion, &m_CallableRegion, rayCount, 1, 1);
+    }
+
+    void SurfaceCacheRayTracingPass::RecordRefreshTLAS(VkCommandBuffer cmd, const core::EntityTransformCPU* entityTransformsCPU) {
+        // Rebuilds the instance array fresh every frame from this frame's rotation data -- BLAS
+        // device addresses/instanceCustomIndex/mask/SBT-record-offset/flags are identical to
+        // Init()'s own build (geometry never changes), only .transform differs.
+        std::vector<VkAccelerationStructureInstanceKHR> instances;
+        instances.reserve(m_RefitInstanceInfos.size());
+
+        for (size_t k = 0; k < m_RefitInstanceInfos.size(); ++k) {
+            const RefitInstanceInfo& info = m_RefitInstanceInfos[k];
+            const core::EntityTransformCPU& xform = entityTransformsCPU[info.entityID];
+
+            // VkTransformMatrixKHR = [R | center - R*center] -- the BLAS stores geometry already
+            // positioned at its rest-pose world location, so the correct instance transform
+            // rotates around the entity's OWN pivot (xform.center), not the world origin: a point
+            // p transforms as p' = center + R*(p - center) = R*p + (center - R*center), giving the
+            // 3x4 affine form Vulkan's row-major VkTransformMatrixKHR expects directly.
+            const maths::mat4& rot = xform.rotation;
+            maths::vec3 translation = xform.center - maths::vec3{
+                rot.m[0] * xform.center.x + rot.m[4] * xform.center.y + rot.m[8]  * xform.center.z,
+                rot.m[1] * xform.center.x + rot.m[5] * xform.center.y + rot.m[9]  * xform.center.z,
+                rot.m[2] * xform.center.x + rot.m[6] * xform.center.y + rot.m[10] * xform.center.z};
+
+            VkTransformMatrixKHR transform{};
+            transform.matrix[0][0] = rot.m[0]; transform.matrix[0][1] = rot.m[4]; transform.matrix[0][2] = rot.m[8];  transform.matrix[0][3] = translation.x;
+            transform.matrix[1][0] = rot.m[1]; transform.matrix[1][1] = rot.m[5]; transform.matrix[1][2] = rot.m[9];  transform.matrix[1][3] = translation.y;
+            transform.matrix[2][0] = rot.m[2]; transform.matrix[2][1] = rot.m[6]; transform.matrix[2][2] = rot.m[10]; transform.matrix[2][3] = translation.z;
+
+            VkAccelerationStructureInstanceKHR instance{};
+            instance.transform = transform;
+            instance.instanceCustomIndex = info.instanceCustomIndex;
+            instance.mask = 0xFF;
+            instance.instanceShaderBindingTableRecordOffset = 0;
+            instance.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
+            instance.accelerationStructureReference = m_BLASList[k].DeviceAddress();
+            instances.push_back(instance);
+        }
+
+        RecordRefitTLAS(cmd, m_Device, m_TLAS.Handle(), m_TlasRefitResources, instances);
     }
 
 }

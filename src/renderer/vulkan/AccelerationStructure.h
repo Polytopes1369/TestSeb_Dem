@@ -5,11 +5,16 @@
 // combined Fallback Mesh vertex/index buffers (no geometry duplication -- see that class'
 // GetVertexBuffer()/GetIndexBuffer() comment) and one TLAS instancing them.
 //
-// Entities are static in this engine (see renderer::GlobalSDFPass's own class comment: "dynamic
-// object add/remove/move is future work"), so every BuildBLAS()/BuildTLAS() call here is a
-// one-shot, Init()-time-only build (VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR,
-// never VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR) -- there is deliberately no
-// RecordRefit()/Update() anywhere in this file.
+// BLAS geometry is static in this engine (no vertex displacement/skinning), so every BuildBLAS()
+// call here is a one-shot, Init()-time-only build (VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR,
+// never VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR) -- there is deliberately no BLAS
+// refit/update path anywhere in this file. The TLAS, however, DOES get a per-frame refit path
+// (TlasRefitResources/CreateTlasRefitResources/RecordRefitTLAS below, Phase 4 integration) --
+// entity RIGID TRANSFORMS can change per frame (renderer::VulkanContext::UpdateEntityRotations,
+// gated by config::ENTITY_SELF_ROTATION_ENABLED), and a TLAS instance's transform is exactly the
+// per-instance data that needs refreshing to keep ray-traced GI/reflections consistent with what
+// the rasterized/culled path already shows. Still always MODE_BUILD, never MODE_UPDATE/
+// ALLOW_UPDATE -- see RecordRefitTLAS's own comment for why.
 
 #include <cstdint>
 #include <vector>
@@ -68,6 +73,38 @@ namespace renderer {
     // Init()-time-only discipline as BuildBLAS().
     AccelerationStructure BuildTLAS(VkPhysicalDevice physicalDevice, VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
         const std::vector<VkAccelerationStructureInstanceKHR>& instances);
+
+    // Phase 4 integration (UE5.8 parity roadmap, dynamic scenes onto main): PERSISTENT buffers for
+    // a per-frame TLAS refit (see RecordRefitTLAS below) -- deliberately separate from the one-shot
+    // builders above, which this file's own header comment documents as intentionally lacking any
+    // refit/update path. `instanceBuffer` is host-visible mapped and memcpy'd fresh every frame by
+    // the caller; `scratchBuffer` is sized once (instance count is fixed for this engine's static
+    // entity list) and reused every frame -- neither is ever reallocated, so a refit costs no
+    // per-frame VMA allocation churn.
+    struct TlasRefitResources {
+        GpuBuffer instanceBuffer;
+        GpuBuffer scratchBuffer;
+        VkDeviceAddress scratchAddress = 0; // Pre-aligned device address into scratchBuffer, cached once.
+    };
+
+    // Allocates a TlasRefitResources sized for exactly `instanceCount` TLAS instances -- call once
+    // at Init() time, immediately after the first (one-shot) BuildTLAS() call for the same
+    // instance count.
+    TlasRefitResources CreateTlasRefitResources(VkPhysicalDevice physicalDevice, VkDevice device, VmaAllocator allocator, uint32_t instanceCount);
+
+    // Records a full MODE_BUILD rebuild (never ALLOW_UPDATE -- see this file's own header comment:
+    // the instance count here is tiny, ~a dozen, so there is no real performance case for an
+    // incremental update) DIRECTLY INTO `cmd` -- no separate one-shot submit/wait, unlike
+    // BuildTLAS() above. Targets the SAME already-allocated `dstTlas` handle every frame (a
+    // MODE_BUILD rebuild does not depend on the acceleration structure's previous contents, unlike
+    // MODE_UPDATE, so reusing the same backing buffer across frames is valid as long as the
+    // instance count -- and therefore the required backing-buffer size -- never changes, which it
+    // doesn't for this engine's fixed, static entity list). Includes its own pre-build (WAR) and
+    // post-build (RAW) VkMemoryBarrier2 pair -- see the .cpp's own comment for the exact stage/
+    // access masks and why a same-command-buffer barrier is sufficient given this engine's
+    // single-frame-in-flight model (no extra cross-frame semaphore needed).
+    void RecordRefitTLAS(VkCommandBuffer cmd, VkDevice device, VkAccelerationStructureKHR dstTlas,
+        TlasRefitResources& resources, const std::vector<VkAccelerationStructureInstanceKHR>& instances);
 
     // vkGetBufferDeviceAddress wrapper -- every BLAS/TLAS geometry description below addresses its
     // input buffers by GPU virtual address rather than a bound descriptor (the whole reason

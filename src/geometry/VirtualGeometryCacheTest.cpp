@@ -9,6 +9,7 @@
 #include "geometry/GeometryEncoding.h"
 #include "core/Logger.h"
 #include "core/EngineConfig.h"
+#include "core/LoadingManager.h"
 #include "renderer/RenderTypes.h"
 
 #include <algorithm>
@@ -398,7 +399,23 @@ namespace geometry {
         bool allEntitiesOk = true;
         uint32_t entitiesWithGeometry = 0;
 
-        // We will process entities in parallel using std::async
+        // We process entities in parallel through core::LoadingManager's bounded worker pool rather
+        // than firing one raw std::async(std::launch::async, ...) thread per entity unconditionally.
+        // The unbounded version (this codebase's own prior approach) never actually oversubscribed
+        // CPU cores -- hardware_concurrency() comfortably exceeds a typical entity count -- but it did
+        // launch every entity's DAG build (each one a burst of thousands of small std::vector
+        // allocations: per-cluster positions/uvs/triangles, repeated across every merge level) fully
+        // concurrently, and every one of those allocations serializes on the C++ runtime's single
+        // process-wide heap lock (far worse in a Debug CRT build, where malloc/free/new/delete also do
+        // heap-integrity validation under that same lock). The result was minutes-long apparent hangs
+        // building scene.cache (observed on a 13-entity scene with a 90k-vertex floor primitive) with
+        // most worker threads sitting blocked on the heap lock rather than computing -- the clustered
+        // ("Nanite") render pipeline can't run without scene.cache (see this function's own header
+        // comment), so this looked exactly like Nanite rendering itself being broken. Capping
+        // concurrency to a small, fixed worker count keeps enough parallelism to overlap entities'
+        // work while keeping simultaneous heap-lock contention low enough that each build actually
+        // makes progress.
+        constexpr uint32_t kMaxConcurrentDagBuilds = 4u;
         struct EntityResult {
             uint32_t meshID = 0;
             ClusterDAG dag;
@@ -413,74 +430,76 @@ namespace geometry {
             std::vector<ClusterData> localClusterData;
         };
 
-        std::vector<std::future<EntityResult>> futures;
-        futures.reserve(entityCount);
+        // Pre-sized so each submitted job writes only into its own disjoint results[entityIdx] slot --
+        // safe without any extra locking, exactly like a parallel-for (see core::LoadingManager's
+        // class comment on its fan-out/blocking usage mode).
+        std::vector<EntityResult> results(entityCount);
+        {
+            core::LoadingManager dagBuildPool(std::min(kMaxConcurrentDagBuilds, std::max(entityCount, 1u)));
 
-        for (uint32_t entityIdx = 0; entityIdx < entityCount; ++entityIdx) {
-            futures.push_back(std::async(std::launch::async, [entityIdx, entityCount, &entityData, &allVertices, &allIndices]() -> EntityResult {
-                EntityResult res;
-                res.meshID = entityData[entityIdx].meshID;
-                EntityMaterialProperties materialProps = GetEntityMaterialProperties(entityData[entityIdx].materialID);
+            for (uint32_t entityIdx = 0; entityIdx < entityCount; ++entityIdx) {
+                dagBuildPool.Submit([entityIdx, &entityData, &allVertices, &allIndices, &results]() {
+                    EntityResult& res = results[entityIdx];
+                    res.meshID = entityData[entityIdx].meshID;
+                    EntityMaterialProperties materialProps = GetEntityMaterialProperties(entityData[entityIdx].materialID);
 
-                res.dag = BuildClusterDAG(res.meshID, allVertices, allIndices, materialProps.maskTextureIndex);
-                if (res.dag.nodes.empty()) {
-                    return res; // Empty DAG, success remains true
-                }
-
-                if (!ValidateClusterDAG(res.dag, res.dagErrors)) {
-                    res.success = false;
-                    return res;
-                }
-
-                res.fallbackMesh = BuildFallbackMesh(res.dag);
-                if (!res.fallbackMesh.triangles.empty()) {
-                    res.hasFallback = true;
-                    res.fallbackMeshData = BuildFallbackMeshData(res.meshID, res.fallbackMesh);
-
-                    // Surface-cache cards
-                    const FallbackMeshIndexEntry& fbEntry = res.fallbackMeshData.indexEntry;
-                    res.entityCards = GenerateEntityCards(res.meshID,
-                        maths::vec3{ fbEntry.boundsMin[0], fbEntry.boundsMin[1], fbEntry.boundsMin[2] },
-                        maths::vec3{ fbEntry.boundsMax[0], fbEntry.boundsMax[1], fbEntry.boundsMax[2] });
-                }
-
-                res.localIndexEntries.reserve(res.dag.nodes.size());
-                res.localDagEntries.reserve(res.dag.nodes.size());
-                res.localClusterData.reserve(res.dag.nodes.size());
-
-                for (size_t i = 0; i < res.dag.nodes.size(); ++i) {
-                    const ClusterDAGNode& node = res.dag.nodes[i];
-
-                    ClusterData data{};
-                    if (!EncodeClusterData(node, data)) {
-                        res.success = false;
+                    res.dag = BuildClusterDAG(res.meshID, allVertices, allIndices, materialProps.maskTextureIndex);
+                    if (res.dag.nodes.empty()) {
+                        return; // Empty DAG, success remains true
                     }
-                    res.localClusterData.push_back(data);
 
-                    res.localIndexEntries.push_back(BuildIndexEntry(0, res.meshID, node, materialProps.maxWPOAmplitude,
-                        node.isMasked ? materialProps.maskTextureIndex : kInvalidMaskTextureIndex,
-                        entityData[entityIdx].materialID));
+                    if (!ValidateClusterDAG(res.dag, res.dagErrors)) {
+                        res.success = false;
+                        return;
+                    }
 
-                    DAGNodeEntry dagEntry{};
-                    dagEntry.clusterID = static_cast<uint32_t>(i);
-                    dagEntry.parentClusterID = node.parentIndex;
-                    dagEntry.childClusterID[0] = (node.childIndices.size() > 0) ? node.childIndices[0] : kInvalidClusterID;
-                    dagEntry.childClusterID[1] = (node.childIndices.size() > 1) ? node.childIndices[1] : kInvalidClusterID;
-                    dagEntry.level = node.level;
-                    dagEntry.clusterError = node.clusterError;
-                    dagEntry.parentError = node.parentError;
-                    res.localDagEntries.push_back(dagEntry);
-                }
+                    res.fallbackMesh = BuildFallbackMesh(res.dag);
+                    if (!res.fallbackMesh.triangles.empty()) {
+                        res.hasFallback = true;
+                        res.fallbackMeshData = BuildFallbackMeshData(res.meshID, res.fallbackMesh);
 
-                return res;
-            }));
-        }
+                        // Surface-cache cards
+                        const FallbackMeshIndexEntry& fbEntry = res.fallbackMeshData.indexEntry;
+                        res.entityCards = GenerateEntityCards(res.meshID,
+                            maths::vec3{ fbEntry.boundsMin[0], fbEntry.boundsMin[1], fbEntry.boundsMin[2] },
+                            maths::vec3{ fbEntry.boundsMax[0], fbEntry.boundsMax[1], fbEntry.boundsMax[2] });
+                    }
 
-        // Wait for all futures and gather results
-        std::vector<EntityResult> results;
-        results.reserve(entityCount);
-        for (auto& f : futures) {
-            results.push_back(f.get());
+                    res.localIndexEntries.reserve(res.dag.nodes.size());
+                    res.localDagEntries.reserve(res.dag.nodes.size());
+                    res.localClusterData.reserve(res.dag.nodes.size());
+
+                    for (size_t i = 0; i < res.dag.nodes.size(); ++i) {
+                        const ClusterDAGNode& node = res.dag.nodes[i];
+
+                        ClusterData data{};
+                        if (!EncodeClusterData(node, data)) {
+                            res.success = false;
+                        }
+                        res.localClusterData.push_back(data);
+
+                        res.localIndexEntries.push_back(BuildIndexEntry(0, res.meshID, node, materialProps.maxWPOAmplitude,
+                            node.isMasked ? materialProps.maskTextureIndex : kInvalidMaskTextureIndex,
+                            entityData[entityIdx].materialID));
+
+                        DAGNodeEntry dagEntry{};
+                        dagEntry.clusterID = static_cast<uint32_t>(i);
+                        dagEntry.parentClusterID = node.parentIndex;
+                        dagEntry.childClusterID[0] = (node.childIndices.size() > 0) ? node.childIndices[0] : kInvalidClusterID;
+                        dagEntry.childClusterID[1] = (node.childIndices.size() > 1) ? node.childIndices[1] : kInvalidClusterID;
+                        dagEntry.level = node.level;
+                        dagEntry.clusterError = node.clusterError;
+                        dagEntry.parentError = node.parentError;
+                        res.localDagEntries.push_back(dagEntry);
+                    }
+                });
+            }
+
+            // Blocks until every submitted job's background work has finished (core::LoadingManager's
+            // fan-out/blocking mode); dagBuildPool's destructor (end of this scope) then shuts the pool
+            // down, matching the "Init()-time bake all of a class's callers assume is complete" pattern
+            // its own class comment documents.
+            dagBuildPool.WaitIdle();
         }
 
         // Stitch everything sequentially
