@@ -99,8 +99,9 @@ namespace renderer {
         // renderer::GpuGeometryPagePool's own (same handles every opaque pass already borrows);
         // `entityTransformBuffer`/`entityDataBuffer`/`wpoGlobalsBuffer` mirror ClusterRaster.vert's
         // own identically-purposed bindings. `colorFormat`/`depthFormat` must match whatever image
-        // RecordDraw() will later target (renderer::ClusterResolvePass::kOutputColorFormat and the
-        // shared hardware depth image's format, respectively). `tlas`/`lightBuffer`/
+        // RecordDraw() will later target -- renderer::GICompositePass::kOutputFormat (the image this
+        // pass actually draws onto, see RecordDraw()'s own call site) and the shared hardware depth
+        // image's format, respectively. `tlas`/`lightBuffer`/
         // `lightBufferSize` (MegaLights Phase A follow-up) are renderer::SurfaceCacheRayTracingPass
         // ::GetTLASHandle() and renderer::MegaLightsPass::GetLightBufferHandle()/GetLightBufferSize()
         // -- both must already exist by the time this is called (the caller must Init() those two

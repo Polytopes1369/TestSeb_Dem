@@ -50,8 +50,9 @@ namespace renderer {
         }
 
         // =====================================================================================
-        // STEP 2 -- Raw shade radiance image (RGBA8_UNORM -- see MegaLightsPass::kRadianceFormat's
-        // own comment for why this format is forced) + the dedicated ATrousDenoisePass instance.
+        // STEP 2 -- Raw shade radiance image (rgba16f linear HDR -- see MegaLightsPass::
+        // kRadianceFormat's own comment for why this format is forced) + the dedicated
+        // ATrousDenoisePass instance.
         // =====================================================================================
         VulkanUtils::CreateStorageSampledImage2D(allocator, device, kRadianceFormat, renderExtent,
             m_RawRadianceImage, m_RawRadianceAllocation, m_RawRadianceView);

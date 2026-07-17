@@ -719,9 +719,19 @@ int main(int argc, char** argv) {
             glfwSetWindowShouldClose(window, GLFW_TRUE);
         }
 
-        // Orbit azimuth evolution
+        // Orbit azimuth evolution -- scaled by wall-clock delta time (not a fixed per-FRAME step)
+        // so the camera's angular velocity stays constant regardless of frame-time variance (GPU
+        // stalls, load spikes): a fixed 0.05deg/frame step directly couples orbital speed to
+        // instantaneous frame time, which reads as camera judder/trembling whenever frame time
+        // isn't perfectly steady. 3.0 deg/sec matches the old 0.05 deg/frame step exactly at this
+        // engine's own 60fps config::TARGET_FPS default, so the demo's visual pacing is unchanged.
+        constexpr float kOrbitAngularSpeedDegPerSec = 3.0f;
         static float azimuth = 0.0f;
-        azimuth += 0.05f;
+        static double s_LastOrbitUpdateTime = glfwGetTime();
+        double orbitNowTime = glfwGetTime();
+        float orbitDeltaTime = static_cast<float>(orbitNowTime - s_LastOrbitUpdateTime);
+        s_LastOrbitUpdateTime = orbitNowTime;
+        azimuth += kOrbitAngularSpeedDegPerSec * orbitDeltaTime;
 
         // Update entity rotations every frame so dynamic primitives spin
         vkContext.UpdateEntityRotations(static_cast<float>(glfwGetTime()));

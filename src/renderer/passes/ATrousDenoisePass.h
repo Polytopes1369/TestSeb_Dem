@@ -39,14 +39,15 @@ namespace renderer {
         // the O(radius^2) cost a single, equivalently-wide dense kernel would have).
         static constexpr uint32_t kIterations = 5;
 
-        // RGBA8, matching renderer::ClusterResolvePass::kOutputColorFormat exactly (not a higher-
-        // precision HDR format): this pass' own output image is a candidate blit source AND a
-        // candidate renderer::debug::DebugTextOverlay draw target (both selected by
-        // ClusterRenderPipeline's own `applyDenoise` condition, see RecordFrame's own comment) --
-        // DebugTextOverlay's graphics pipeline is compiled once at Init() against a FIXED
-        // attachment format, so this pass' output must format-match m_Resolve's own output color
-        // image for that Debug-only draw to remain valid regardless of which image ends up chosen.
-        static constexpr VkFormat kFormat = VK_FORMAT_R8G8B8A8_UNORM;
+        // R16G16B16A16_SFLOAT (linear HDR): matches renderer::ScreenTracePass::kOutputFormat, the
+        // noisy indirect-GI radiance this pass actually denoises -- an 8-bit UNORM target would
+        // hard-clip that signal to [0,1] before renderer::GICompositePass ever adds it to the
+        // direct-lit term, contributing to this codebase's "burned" overexposure bug exactly like
+        // renderer::ClusterResolvePass::kOutputColorFormat's own identical fix (see that constant's
+        // comment). Also reused, via this exact class, as renderer::MegaLightsPass::kRadianceFormat
+        // for its own dedicated denoiser instance -- that constant must stay equal to this one (see
+        // its own comment).
+        static constexpr VkFormat kFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
 
         // Allocates the 2 ping-pong images (renderExtent-sized) and the 3 descriptor sets this
         // class alternates between across kIterations passes (external-input -> ping A, ping A ->

@@ -98,6 +98,7 @@
 #include "renderer/streaming/VirtualTextureStreamingCoordinator.h"
 #include "renderer/passes/WorldProbeGridPass.h"
 #include "renderer/passes/TAATSRPass.h"
+#include "renderer/passes/PostProcessPass.h"
 #include "renderer/passes/ScreenTracePass.h"
 #include "renderer/passes/GICompositePass.h"
 #ifndef NDEBUG
@@ -477,6 +478,13 @@ namespace renderer {
         // view path -- see RecordFrame()'s own comment for exactly why.
         ATrousDenoisePass m_Denoiser;
         TAATSRPass m_TAATSR;
+        // Final post-process stack (Phase PP1: Physical Camera auto-exposure -> White Balance ->
+        // Color Correction -> ACES Tone Mapping -> Gamma Correction), the normal-view-path blit
+        // source instead of m_TAATSR's own raw HDR output directly -- see PostProcessPass's own
+        // class comment for why this must be the very last compute step before the final blit.
+        PostProcessPass m_PostProcess;
+        PostProcessPass::Settings m_PostProcessSettings; // UE5.8 Post Process Volume defaults (see Settings' own comment).
+        float m_LastFrameTimeSeconds = 0.0f; // Wall-clock delta feeding m_PostProcess's own eye-adaptation speed.
 
         // Previous frame's combined view-projection matrix -- ClusterResolve.comp's own
         // DEBUG_VIEW_MOTION_VECTORS reprojects a pixel's (static, see this class' own "Entity self-

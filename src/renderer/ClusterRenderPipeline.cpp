@@ -484,11 +484,16 @@ bool ClusterRenderPipeline::Init(
   // not right after m_LODSelection where it used to sit) so its own MegaLights Phase A follow-up
   // bindings (TLAS + light SSBO, bindings 11/12) can be bound immediately at Init() time -- see
   // TransparentForwardPass::Init()'s own parameter comment.
+  // colorFormat = GICompositePass::kOutputFormat, NOT ClusterResolvePass::kOutputColorFormat: this
+  // pass draws directly onto m_GIComposite's own output image (see its RecordDraw() call site
+  // below), not m_Resolve's -- the two constants happen to hold the same value today, but this
+  // call site must name the format of the image it actually targets, not a coincidentally-equal
+  // one, so the two are free to diverge later without silently breaking this pipeline's format.
   m_TransparentForward.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
                             m_PagePool.GetPageTableBuffer(), m_PagePool.GetPhysicalPoolBuffer(),
                             createInfo.entityTransformBuffer, createInfo.entityDataBuffer, m_WPOGlobalsBuffer.Handle(),
                             createInfo.materialTable.params, indexEntries, dagEntries,
-                            ClusterResolvePass::kOutputColorFormat, createInfo.depthFormat,
+                            GICompositePass::kOutputFormat, createInfo.depthFormat,
                             m_SurfaceCacheRT.GetTLASHandle(), m_MegaLights.GetLightBufferHandle(),
                             m_MegaLights.GetLightBufferSize());
   m_TransparentForward.SetVirtualShadowMap(m_VirtualShadowMap);
@@ -520,6 +525,13 @@ bool ClusterRenderPipeline::Init(
   m_TAATSR.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
       m_RenderExtent, m_DisplayExtent,
       m_GIComposite.GetOutputView(), m_Resolve.GetOutputDepthView());
+
+  // Final post-process stack: linear HDR (m_TAATSR's own TAA-resolved output) -> LDR swapchain-
+  // ready color. `hdrColorView` is rewritten every frame in RecordFrame via UpdateDescriptorSets()
+  // (m_TAATSR's own output view alternates between 2 ping-pong images every frame -- the same
+  // reason renderer::TAATSRPass's own UpdateDescriptorSets exists), not just bound once here.
+  m_PostProcess.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
+      m_DisplayExtent, m_TAATSR.GetOutputView());
 
 #ifndef NDEBUG
   // Two-tier SDF ray march DEBUG VISUALIZATION (see ClusterRenderPipeline.h's own comment on
@@ -556,9 +568,14 @@ bool ClusterRenderPipeline::Init(
                        m_OcclusionCulling.GetLateIndirectCommandOpaqueBuffer(),
                        m_OcclusionCulling.GetLateDrawCountOpaqueBuffer(),
                        m_OcclusionCulling.GetSoftwareClusterListOpaqueBuffer());
+  // outputColorFormat = SDFRayMarchPass::kOutputFormat (RGBA8_UNORM): the only remaining candidate
+  // RecordDraw() target that ISN'T renderer::TAATSRPass's own HDR history buffer -- m_Resolve and
+  // m_GIComposite are both HDR (rgba16f) now (see ClusterResolvePass::kOutputColorFormat's own
+  // comment), so their overlay draws route through kHdrTargetFormat's pipeline below instead (see
+  // the overlayTargetFormat selection a few hundred lines down in RecordFrame).
   m_DebugOverlay.Init(createInfo.device, createInfo.allocator,
                       createInfo.commandPool, createInfo.queue,
-                      ClusterResolvePass::kOutputColorFormat);
+                      SDFRayMarchPass::kOutputFormat);
 #endif
 
   LOG_INFO(
@@ -588,6 +605,7 @@ void ClusterRenderPipeline::Shutdown() {
   m_GIComposite.Shutdown();
   m_Denoiser.Shutdown();
   m_TAATSR.Shutdown();
+  m_PostProcess.Shutdown();
   m_WorldProbes.Shutdown();
   m_GIInject.Shutdown();
   m_SurfaceCacheRT.Shutdown();
@@ -1509,6 +1527,44 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
       m_TAATSR.RecordPass(cmd, viewProj, prevViewProjForTAA, invViewProj, passJitterX, passJitterY, m_FrameIndex, resetHistory);
   }
 
+  // =========================================================================================
+  // [13e] Final post-process stack (Physical Camera auto-exposure -> White Balance -> Color
+  // Correction -> ACES Tone Mapping -> Gamma Correction): linear HDR (m_TAATSR's own TAA-resolved
+  // output) -> LDR swapchain-ready color -- see renderer::PostProcessPass's own class comment for
+  // why this must be the very last compute step before [14]'s blit (and before [13b]'s Debug-only
+  // stat overlay below, which now draws onto ITS output instead of m_TAATSR's raw HDR buffer).
+  // Runs unconditionally every frame, exactly like [13d]'s own TAA/TSR pass -- the debug views that
+  // substitute a different, deliberately-untonemapped diagnostic image as the blit source instead
+  // (m_GIComposite/m_SDFRayMarch/m_Resolve, see [14]'s own blitSourceImage swap below) simply never
+  // read this pass' output, same as how those views already ignore m_TAATSR's own output today.
+  // =========================================================================================
+  {
+    // m_TAATSR's own output image's last writer is always its own compute dispatch (the Debug-only
+    // stat overlay now draws onto m_PostProcess's OWN output instead, AFTER this pass runs -- see
+    // [13b] below) -- re-stated here explicitly rather than relying on m_TAATSR::RecordPass' own
+    // trailing barrier (which only targets a BLIT read, not this compute-shader sampled read).
+    VkMemoryBarrier2 barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    barrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    barrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+    barrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    barrier.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+
+    VkDependencyInfo depInfo{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    depInfo.memoryBarrierCount = 1;
+    depInfo.pMemoryBarriers = &barrier;
+    vkCmdPipelineBarrier2(cmd, &depInfo);
+
+    // Wall-clock delta feeding the eye-adaptation speed -- same "globalTimeSeconds is main.cpp's
+    // glfwGetTime(), monotonically increasing" convention [13b]'s own FPS/bytes-per-second sampling
+    // already uses below, sampled once here instead since m_PostProcess needs it in Release too
+    // (unlike that Debug-only stats block).
+    float ppDeltaTime = (m_LastFrameTimeSeconds > 0.0f) ? (globalTimeSeconds - m_LastFrameTimeSeconds) : 0.0f;
+    m_LastFrameTimeSeconds = globalTimeSeconds;
+
+    m_PostProcess.UpdateDescriptorSets(m_TAATSR.GetOutputView());
+    m_PostProcess.RecordComposite(cmd, ppDeltaTime, m_PostProcessSettings);
+  }
+
 #ifndef NDEBUG
   // =========================================================================================
   // [13b] Debug-only stat overlay (whole block compiled out in Release). Timing contract: read
@@ -1558,8 +1614,12 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
         fps, static_cast<float>(m_RenderExtent.width), static_cast<float>(m_RenderExtent.height),
         m_DebugRadiosityEnabled, m_DebugSSRTEnabled, traceMode, m_DebugWorldProbesEnabled);
 
-    // Determine blitSourceImage early to draw HUD directly onto it
-    VkImage blitSourceImage = m_TAATSR.GetOutputImage();
+    // Determine blitSourceImage early to draw HUD directly onto it -- m_PostProcess's own output
+    // (not m_TAATSR's raw HDR buffer) in the normal path now, so the HUD's own colors (e.g. plain
+    // white text) pass through the SAME tone curve/gamma as the rest of the frame instead of being
+    // drawn pre-tonemap and distorted by it (see renderer::PostProcessPass's own imageInfo.usage
+    // comment on why its output image gained COLOR_ATTACHMENT_BIT, Debug only, for exactly this).
+    VkImage blitSourceImage = m_PostProcess.GetOutputImage();
 #ifndef NDEBUG
     if (cameraCopy.debugViewMode != DEBUG_VIEW_NORMAL && cameraCopy.debugViewMode != DEBUG_VIEW_MOTION_VECTORS) {
         if (cameraCopy.debugViewMode == DEBUG_VIEW_LUMEN || cameraCopy.debugViewMode == DEBUG_VIEW_SPATIAL_PROBES) {
@@ -1577,16 +1637,17 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
     VkExtent2D overlayExtent = m_RenderExtent;
     // renderer::debug::DebugTextOverlay owns 2 pipeline variants (see its own Init()/RecordDraw()
     // comments) -- every branch below must report the ACTUAL format of whatever view it selects,
-    // not assume the primary (RGBA8) one. m_TAATSR's own output is the sole HDR-format candidate
-    // (renderer::debug::DebugTextOverlay::kHdrTargetFormat, matching renderer::TAATSRPass::
-    // kHistoryFormat) -- every other candidate here (m_SDFRayMarch/m_GIComposite/m_Resolve) is
-    // RGBA8_UNORM.
-    VkFormat overlayTargetFormat = ClusterResolvePass::kOutputColorFormat;
+    // not assume one default. m_GIComposite/m_Resolve are rgba16f HDR (see ClusterResolvePass::
+    // kOutputColorFormat's own comment), matching renderer::debug::DebugTextOverlay::
+    // kHdrTargetFormat exactly -- m_PostProcess/m_SDFRayMarch are both RGBA8_UNORM (renderer::
+    // PostProcessPass::kOutputFormat / SDFRayMarchPass::kOutputFormat), matching the OTHER pipeline
+    // variant Init() built (see this class' own DebugTextOverlay::Init() call site) -- so the
+    // default below covers m_PostProcess and only the two HDR branches need to override it.
+    VkFormat overlayTargetFormat = SDFRayMarchPass::kOutputFormat;
 
-    if (blitSourceImage == m_TAATSR.GetOutputImage()) {
-        overlayTargetView = m_TAATSR.GetOutputView();
+    if (blitSourceImage == m_PostProcess.GetOutputImage()) {
+        overlayTargetView = m_PostProcess.GetOutputView();
         overlayExtent = m_DisplayExtent;
-        overlayTargetFormat = debug::DebugTextOverlay::kHdrTargetFormat;
     }
 #ifndef NDEBUG
     else if (blitSourceImage == m_SDFRayMarch.GetOutputImage()) {
@@ -1597,10 +1658,12 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
     else if (blitSourceImage == m_GIComposite.GetOutputImage()) {
         overlayTargetView = m_GIComposite.GetOutputView();
         overlayExtent = m_RenderExtent;
+        overlayTargetFormat = debug::DebugTextOverlay::kHdrTargetFormat;
     }
     else {
         overlayTargetView = m_Resolve.GetOutputColorView();
         overlayExtent = m_RenderExtent;
+        overlayTargetFormat = debug::DebugTextOverlay::kHdrTargetFormat;
     }
 
     m_DebugOverlay.RecordDraw(cmd, overlayTargetImage, overlayTargetView, overlayExtent, overlayTargetFormat);
@@ -1608,7 +1671,7 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
 #endif
 
   // =========================================================================================
-  // [14] Blit the final image (m_TAATSR's own upscaled output in the normal view path -- itself
+  // [14] Blit the final image (m_PostProcess's own tonemapped/graded output in the normal view path -- itself
   // always sourced from m_GIComposite's output, see [13d] above -- or one of the debug-view
   // substitutes below) to the swapchain image and hand it to present. Every candidate image stays
   // in GENERAL (valid blit source layout); each one's own trailing barrier already targeted the
@@ -1617,21 +1680,25 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
   // barriers change.
   // =========================================================================================
   // DEBUG_VIEW_LUMEN and DEBUG_VIEW_SPATIAL_PROBES both swap the blit SOURCE to m_GIComposite's
-  // own output image instead of m_TAATSR's upscaled one -- GIComposite.comp's own viewMode 13/14
-  // branches (see that shader's own comment) already picked which visualization filled it this
-  // frame, so no separate per-mode image is needed here. DEBUG_VIEW_GLOBAL_SDF instead swaps to
-  // m_SDFRayMarch's own debug-visualization image -- see ClusterRenderPipeline.h's own comment on
-  // why this (not sampling it from within ClusterResolve.comp) is the chosen mechanism. Every
-  // candidate image's format (VK_FORMAT_R8G8B8A8_UNORM for m_GIComposite/m_SDFRayMarch) and
-  // permanent layout (GENERAL) match, so the SAME barrier below (targeting COMPUTE_SHADER_BIT/
-  // SHADER_STORAGE_WRITE_BIT -> BLIT_BIT/TRANSFER_READ_BIT) covers any choice with no changes
-  // needed -- only which VkImage is actually blitted differs.
+  // own output image instead of m_PostProcess's tonemapped one -- GIComposite.comp's own viewMode
+  // 13/14 branches (see that shader's own comment) already picked which visualization filled it
+  // this frame, so no separate per-mode image is needed here. DEBUG_VIEW_GLOBAL_SDF instead swaps
+  // to m_SDFRayMarch's own debug-visualization image -- see ClusterRenderPipeline.h's own comment
+  // on why this (not sampling it from within ClusterResolve.comp) is the chosen mechanism. Every
+  // candidate image stays in GENERAL layout (formats now differ -- m_PostProcess/m_SDFRayMarch are
+  // RGBA8_UNORM, m_GIComposite/m_Resolve are rgba16f HDR, see ClusterResolvePass::
+  // kOutputColorFormat's own comment -- but vkCmdBlitImage performs the format conversion itself,
+  // so the SAME barrier below, targeting COMPUTE_SHADER_BIT/SHADER_STORAGE_WRITE_BIT ->
+  // BLIT_BIT/TRANSFER_READ_BIT, still covers any choice with no changes needed -- only which
+  // VkImage is actually blitted differs, and only m_GIComposite/m_Resolve's own HDR values reach
+  // the swapchain untonemapped in those specific debug views, which is intentional: see [13e]'s own
+  // comment on why those raw diagnostic visualizations are deliberately not tonemapped).
   // Denoised (see [12d] above) unless a debug view substitutes a different image entirely
   // (DEBUG_VIEW_LUMEN/DEBUG_VIEW_SPATIAL_PROBES/DEBUG_VIEW_GLOBAL_SDF all route through
-  // m_GIComposite or m_SDFRayMarch instead of m_TAATSR's upscaled output) -- applyDenoise
+  // m_GIComposite or m_SDFRayMarch instead of m_PostProcess's tonemapped output) -- applyDenoise
   // (computed at [12d]) tracks exactly the same DEBUG_VIEW_LUMEN condition for whether m_Denoiser
   // itself ran this frame.
-  VkImage blitSourceImage = m_TAATSR.GetOutputImage();
+  VkImage blitSourceImage = m_PostProcess.GetOutputImage();
 #ifndef NDEBUG
   if (cameraCopy.debugViewMode != DEBUG_VIEW_NORMAL && cameraCopy.debugViewMode != DEBUG_VIEW_MOTION_VECTORS) {
       if (cameraCopy.debugViewMode == DEBUG_VIEW_LUMEN || cameraCopy.debugViewMode == DEBUG_VIEW_SPATIAL_PROBES) {
@@ -1645,7 +1712,7 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
 #endif
 
   VkExtent2D blitSrcExtent = m_RenderExtent;
-  if (blitSourceImage == m_TAATSR.GetOutputImage()) {
+  if (blitSourceImage == m_PostProcess.GetOutputImage()) {
       blitSrcExtent = m_DisplayExtent;
   }
 
