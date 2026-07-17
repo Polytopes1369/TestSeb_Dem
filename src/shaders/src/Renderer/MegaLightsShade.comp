@@ -1,0 +1,121 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+#extension GL_EXT_ray_query : require
+
+// Phase A of the MegaLights native-port roadmap (see the approved plan,
+// C:\Users\Seb\.claude\plans\memoized-splashing-seal.md, for the full derivation). One invocation
+// per pixel, full resolution. Selects one of up to renderer::kMaxMegaLights procedurally-authored
+// point lights per pixel via RIS-weighted streaming reservoir sampling (megalights_ris.glsl's
+// SelectLightRIS, M=16 cheap weight evaluations), then traces EXACTLY ONE ray-traced shadow-
+// visibility query against the winner -- the entire point of RIS: O(1) expensive rays per pixel
+// regardless of how many lights exist. Writes RAW, unfiltered radiance (this phase has no temporal/
+// spatial reservoir reuse yet -- that is Phase B) into its own dedicated image; renderer::
+// MegaLightsPass denoises it with its own owned renderer::ATrousDenoisePass instance before
+// compositing (MegaLightsComposite.comp) -- see that class' own header comment for why a dedicated
+// instance is needed here rather than inheriting renderer::ClusterRenderPipeline's own [12d]
+// instance (which denoises Screen Trace GI specifically, not this pass' output).
+
+#include "include/math_utils.glsl"
+#include "include/octahedral.glsl"
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+// RGBA8_UNORM, NOT rgba16f: renderer::MegaLightsPass reuses renderer::ATrousDenoisePass as-is for
+// its spatial cleanup (see this file's own header comment), and that class' ping-pong images -- and
+// therefore its shader's own fixed image-format layout qualifier -- are hardcoded RGBA8_UNORM
+// (ATrousDenoisePass::kFormat), the same non-HDR convention renderer::ClusterResolvePass's own
+// output color image already uses throughout this direct-lighting pipeline. Values are saturated
+// before imageStore below.
+layout(rgba8, set = 0, binding = 0) uniform writeonly image2D g_ShadeRadiance;
+
+layout(rg16f, set = 0, binding = 1) uniform readonly image2D g_GBufferNormal;
+layout(r32f, set = 0, binding = 2) uniform readonly image2D g_GBufferDepth;
+layout(rgba8, set = 0, binding = 3) uniform readonly image2D g_GBufferAlbedo;
+layout(rg8, set = 0, binding = 4) uniform readonly image2D g_GBufferRoughnessMetallic;
+
+layout(set = 0, binding = 5) uniform accelerationStructureEXT g_TLAS;
+
+#define MEGALIGHTS_LIGHTS_SET 0
+#define MEGALIGHTS_LIGHTS_BINDING 6
+#include "include/megalights_ris.glsl"
+
+layout(std140, set = 0, binding = 7) uniform MegaLightsViewParamsUBO {
+    mat4 invViewProj;
+    vec2 viewportSize;
+    vec2 _pad0;
+} g_ViewParams;
+
+layout(push_constant) uniform MegaLightsPushConstants {
+    uint frameIndex;
+} pc;
+
+// Boolean shadow-visibility query, terminating at the first hit -- unlike ReflectionTrace.comp's
+// own TraceHWRT (which needs the hit surface to sample Surface Cache radiance from), a shadow ray
+// only needs to know whether ANYTHING occludes the light, so no entity/triangle reconstruction is
+// needed here. Not shared with ReflectionTrace.comp's TraceHWRT: same established convention of
+// per-shader-duplicated trace code (see megalights_ris.glsl's own header comment).
+bool TraceShadowRay(vec3 origin, vec3 dir, float tMax) {
+    rayQueryEXT rq;
+    rayQueryInitializeEXT(rq, g_TLAS, gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT, 0xFF, origin, 1.0e-3, dir, tMax);
+    while (rayQueryProceedEXT(rq)) {
+        // Every BLAS triangle is unconditionally opaque -- nothing to confirm/reject manually.
+    }
+    return rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT;
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 viewportSize = ivec2(g_ViewParams.viewportSize);
+    if (pixel.x >= viewportSize.x || pixel.y >= viewportSize.y) {
+        return;
+    }
+
+    float depth = imageLoad(g_GBufferDepth, pixel).r;
+    if (depth <= 0.0) {
+        // Background pixel (matches ClusterResolve.comp's own reversed-Z "depth == 0.0" sentinel).
+        imageStore(g_ShadeRadiance, pixel, vec4(0.0));
+        return;
+    }
+
+    vec3 normal = OctDecode(imageLoad(g_GBufferNormal, pixel).rg);
+    vec2 ndcXY = ((vec2(pixel) + 0.5) / g_ViewParams.viewportSize) * 2.0 - 1.0;
+    vec4 worldPos4 = g_ViewParams.invViewProj * vec4(ndcXY, depth, 1.0);
+    vec3 worldPos = worldPos4.xyz / worldPos4.w;
+
+    uint pixelSeed = uint(pixel.y) * uint(viewportSize.x) + uint(pixel.x);
+    uint selectedIndex;
+    float invPdf;
+    bool valid = SelectLightRIS(worldPos, normal, pixelSeed, pc.frameIndex, selectedIndex, invPdf);
+    if (!valid) {
+        imageStore(g_ShadeRadiance, pixel, vec4(0.0));
+        return;
+    }
+
+    MegaLight light = g_Lights.lights[selectedIndex];
+    vec3 toLight = light.position - worldPos;
+    float dist = length(toLight);
+    vec3 lightDir = toLight / max(dist, 1.0e-4);
+    float NdotL = saturate(dot(normal, lightDir));
+
+    // A grazing/back-facing candidate needs no shadow ray -- it already contributes zero.
+    vec3 biasedOrigin = worldPos + normal * 1.0e-2;
+    bool occluded = (NdotL > 0.0) ? TraceShadowRay(biasedOrigin, lightDir, max(dist - 2.0e-2, 1.0e-3)) : true;
+    float visibility = occluded ? 0.0 : 1.0;
+
+    float distSq = max(dist * dist, 1.0e-4);
+    float normalizedDist = saturate(dist / max(light.radius, 1.0e-4));
+    float nd2 = normalizedDist * normalizedDist;
+    float windowSq = 1.0 - nd2 * nd2;
+    float window = saturate(windowSq * windowSq);
+
+    // Metallic energy conservation -- same convention as ClusterResolve.comp's own diffuseAlbedo
+    // fix (a pure metal has no diffuse response); no GGX specular MegaLights term in Phase A.
+    vec4 albedoSample = imageLoad(g_GBufferAlbedo, pixel);
+    vec2 roughMetal = imageLoad(g_GBufferRoughnessMetallic, pixel).rg;
+    vec3 diffuseAlbedo = albedoSample.rgb * (1.0 - roughMetal.g);
+
+    // Full shading contribution of the selected light, times the RIS unbiased-estimator factor --
+    // see megalights_ris.glsl's own SelectLightRIS comment for the derivation.
+    vec3 radiance = diffuseAlbedo * light.color * light.intensity * NdotL / distSq * window * visibility * invPdf;
+    imageStore(g_ShadeRadiance, pixel, vec4(saturate(radiance), 1.0));
+}

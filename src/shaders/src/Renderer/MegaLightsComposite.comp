@@ -1,0 +1,25 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+
+// Final step of renderer::MegaLightsPass::RecordShade (see MegaLightsShade.comp's own header for
+// why a discrete denoise pass sits between shading and this composite). Additively read-modify-
+// writes renderer::ClusterResolvePass's own output color image with the À-Trous-denoised MegaLights
+// radiance -- the same direct-RMW compositing convention ReflectionGather.comp already uses for
+// specular reflections, just additive rather than Fresnel-weighted (Phase A is diffuse-only).
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(rgba8, set = 0, binding = 0) uniform readonly image2D g_DenoisedRadiance;
+layout(rgba8, set = 0, binding = 1) uniform image2D g_OutputColor;
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(g_OutputColor);
+    if (pixel.x >= size.x || pixel.y >= size.y) {
+        return;
+    }
+
+    vec3 radiance = imageLoad(g_DenoisedRadiance, pixel).rgb;
+    vec4 existing = imageLoad(g_OutputColor, pixel);
+    imageStore(g_OutputColor, pixel, vec4(existing.rgb + radiance, existing.a));
+}

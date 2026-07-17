@@ -16,6 +16,7 @@
 #endif
 #include "geometry/ClusterFormat.h"
 #include "io/CacheFileManager.h"
+#include "renderer/MegaLightsTypes.h"
 #include "renderer/vulkan/GpuBuffer.h"
 #include "renderer/vulkan/VulkanUtils.h"
 
@@ -461,6 +462,19 @@ bool ClusterRenderPipeline::Init(
     LOG_ERROR("[ClusterRenderPipeline] Failed to initialize ReflectionPass.");
     return false;
   }
+  // Phase A of the MegaLights native-port roadmap: procedurally scatter kMaxMegaLights point
+  // lights around the demo's 13-entity grid (see MegaLightsTypes.h's own GenerateProceduralLights
+  // comment), then Init the pass -- needs m_Resolve's GBuffer (same as m_Reflection above) and
+  // m_SurfaceCacheRT's TLAS for its own shadow-visibility ray.
+  {
+    MegaLightsData megaLightsData = GenerateProceduralLights(4242u);
+    if (!m_MegaLights.Init(createInfo.device, createInfo.allocator, createInfo.commandPool,
+                           createInfo.queue, createInfo.renderExtent, m_Resolve,
+                           m_SurfaceCacheRT, megaLightsData)) {
+      LOG_ERROR("[ClusterRenderPipeline] Failed to initialize MegaLightsPass.");
+      return false;
+    }
+  }
   // World Probe grid (Lumen "Translucency Volume") -- reuses the same shared trace-scene sets and
   // HWRT/BLAS/TLAS as every other GI consumer above; see ClusterRenderPipeline.h's own comment on
   // its live consumers (m_ScreenTrace's fallback, GICompositePass's debug visualization).
@@ -551,6 +565,7 @@ void ClusterRenderPipeline::Shutdown() {
   m_LastStatsSampleBytes = 0;
   m_SDFRayMarch.Shutdown();
 #endif
+  m_MegaLights.Shutdown();
   m_Reflection.Shutdown();
   m_ScreenTrace.Shutdown();
   m_GIComposite.Shutdown();
@@ -1289,6 +1304,34 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
       m_Reflection.RecordTrace(cmd, m_TraceContext, m_TraceContext.GetEntityCount(), traceMode, m_FrameIndex);
       m_Reflection.RecordTemporal(cmd);
       m_Reflection.RecordGather(cmd);
+    }
+  }
+
+  // =========================================================================================
+  // [12b3] Phase A of the MegaLights native-port roadmap: RIS-weighted stochastic multi-point-
+  // light direct lighting + 1 ray-traced shadow-visibility ray per pixel, additively read-modify-
+  // writing m_Resolve's own output color image -- same additive-RMW convention as [12b2] above.
+  // Grouped right after [12b2] since both read the same GBuffer and compose into the same color
+  // image. UNLIKE [12b2] reflections, this pass owns its OWN dedicated À-Trous denoiser instance
+  // (m_MegaLights internally denoises its raw 1-sample-per-pixel Monte Carlo noise before
+  // compositing) rather than relying on [12d]'s shared m_Denoiser -- that shared instance denoises
+  // m_ScreenTrace's own Screen Trace GI output specifically (see GICompositePass's own header
+  // comment), not the composited direct+reflections color the way it did before renderer::
+  // ScreenTracePass/GICompositePass were wired up. See MegaLightsPass's own class comment for the
+  // full "discovered mid-implementation" explanation.
+  //
+  // `megaLightsEnabled` (debug-only toggle, main.cpp's 'X' key) gates the call entirely, same
+  // Release-always-on convention as `reflectionsEnabled` above (a real live consumer from frame
+  // one).
+  // =========================================================================================
+  {
+#ifndef NDEBUG
+    bool megaLightsEnabled = m_DebugMegaLightsEnabled;
+#else
+    bool megaLightsEnabled = true;
+#endif
+    if (megaLightsEnabled) {
+      m_MegaLights.RecordShade(cmd, viewProj, m_FrameIndex);
     }
   }
 
