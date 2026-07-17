@@ -22,6 +22,13 @@
 // atomics run at full on-die speed, not across the PCIe bus) that is the only one shaders ever
 // write to, and a CPU_ONLY host-visible/coherent buffer that RecordReadback() copies into once
 // per frame -- the host only ever reads the latter, never the device-local buffer directly.
+//
+// A second, independent pair of buffers (same layout, own atomic counter, own binding --
+// FeedbackTouchBufferSSBO in feedback_buffer.glsl) carries RESIDENT-touch reports: which clusters
+// a shader needed this frame and found already resident. Without this, the CPU-side LRU
+// (renderer::GpuGeometryPagePool::TouchPage/TouchPages) has no way to learn about pages that are
+// still actively in use, since the miss-only channel above structurally cannot report hits -- see
+// GetTouchDeviceBuffer()/ReadTouchedClusterIDs()'s own comments.
 
 #include <cstdint>
 #include <vector>
@@ -66,13 +73,28 @@ namespace renderer {
         // frame did not fit (0 if the frame did not saturate the buffer).
         std::vector<uint32_t> ReadRequestedClusterIDs(uint32_t* overflowedRequestCount = nullptr) const;
 
+        // Reads back this frame's RESIDENT-touch reports (RecordResidentTouch() in
+        // feedback_buffer.glsl) -- the clusters a shader needed this frame and found already
+        // resident. Same clamp/overflow/one-frame-lag contract as ReadRequestedClusterIDs(); the
+        // caller (renderer::GeometryStreamingCoordinator) resolves each clusterID to a logical
+        // address and calls renderer::GpuGeometryPagePool::TouchPages() with them, before this
+        // frame's own eviction pass runs.
+        std::vector<uint32_t> ReadTouchedClusterIDs(uint32_t* overflowedTouchCount = nullptr) const;
+
         uint32_t GetCapacity() const { return m_Capacity; }
         VkBuffer GetDeviceBuffer() const { return m_DeviceBuffer.Handle(); }
+
+        // The device-local half of the resident-touch feedback channel -- bind this into
+        // FeedbackTouchBufferSSBO's binding (see feedback_buffer.glsl's FEEDBACK_TOUCH_BUFFER_SET/
+        // FEEDBACK_TOUCH_BUFFER_BINDING). Same capacity as GetDeviceBuffer().
+        VkBuffer GetTouchDeviceBuffer() const { return m_TouchDeviceBuffer.Handle(); }
 
     private:
         uint32_t m_Capacity = 0;
         GpuBuffer m_DeviceBuffer;
         GpuBuffer m_ReadbackBuffer;
+        GpuBuffer m_TouchDeviceBuffer;
+        GpuBuffer m_TouchReadbackBuffer;
     };
 
 }

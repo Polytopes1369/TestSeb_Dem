@@ -178,11 +178,19 @@ namespace debugpipeline {
                 ImGui::NewFrame();
                 ImGui::Render();
 
+                // Transfer queue's per-frame command buffer (see main.cpp's identical sequence for
+                // the full rationale) -- geometry page uploads land here, ahead of the graphics
+                // submission below.
+                VkCommandBuffer transferCmd = vkContext.GetTransferCommandBuffer();
+                vkResetCommandBuffer(transferCmd, 0);
+                VkCommandBufferBeginInfo transferBeginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+                vkBeginCommandBuffer(transferCmd, &transferBeginInfo);
+
                 vkResetCommandBuffer(vkContext.GetCommandBuffer(), 0);
                 VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
                 vkBeginCommandBuffer(vkContext.GetCommandBuffer(), &beginInfo);
 
-                clusterPipeline.RecordFrame(vkContext.GetCommandBuffer(), camera.GetPushConstants(),
+                clusterPipeline.RecordFrame(vkContext.GetCommandBuffer(), transferCmd, camera.GetPushConstants(),
                     camera.GetPosition(), camera.GetFrameInfo(aspect), static_cast<float>(glfwGetTime()),
                     vkContext.GetSwapchainImages()[imageIndex], vkContext.GetSwapchainImageViews()[imageIndex],
                     vkContext.GetEntityTransformsCPU());
@@ -194,13 +202,23 @@ namespace debugpipeline {
                         vkContext.GetSwapchainExtent(), pendingStagingBuffer, pendingStagingAllocation);
                 }
 
+                vkEndCommandBuffer(transferCmd);
                 vkEndCommandBuffer(vkContext.GetCommandBuffer());
+
+                VkSemaphore transferFinished = vkContext.GetTransferFinishedSemaphore();
+                VkSubmitInfo transferSubmitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
+                transferSubmitInfo.commandBufferCount = 1;
+                transferSubmitInfo.pCommandBuffers = &transferCmd;
+                transferSubmitInfo.signalSemaphoreCount = 1;
+                transferSubmitInfo.pSignalSemaphores = &transferFinished;
+                VK_CHECK(vkQueueSubmit(vkContext.GetTransferQueue(), 1, &transferSubmitInfo, VK_NULL_HANDLE));
 
                 VkCommandBuffer cmd = vkContext.GetCommandBuffer();
                 VkSubmitInfo submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
-                VkPipelineStageFlags waitStages[] = { VK_PIPELINE_STAGE_TRANSFER_BIT };
-                submitInfo.waitSemaphoreCount = 1;
-                submitInfo.pWaitSemaphores = &imgAvailable;
+                VkSemaphore waitSemaphores[] = { imgAvailable, transferFinished };
+                VkPipelineStageFlags waitStages[] = { VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT };
+                submitInfo.waitSemaphoreCount = 2;
+                submitInfo.pWaitSemaphores = waitSemaphores;
                 submitInfo.pWaitDstStageMask = waitStages;
                 submitInfo.commandBufferCount = 1;
                 submitInfo.pCommandBuffers = &cmd;

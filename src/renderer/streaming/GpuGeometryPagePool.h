@@ -70,7 +70,15 @@ namespace renderer {
         // record any GPU commands -- call ClearPageTable() once afterwards (with a command buffer
         // the caller submits) before the pool is first read by a shader, so every entry starts
         // out as kUnmappedSentinel rather than undefined device memory content.
-        void Init(VmaAllocator allocator, uint32_t maxLogicalPages, uint32_t maxPhysicalPages);
+        // `transferQueueFamilyIndex`/`graphicsQueueFamilyIndex` (VulkanContext::
+        // GetTransferQueueFamilyIndex/GetGraphicsQueueFamilyIndex) decide whether
+        // UploadPageData()/ReleasePhysicalPoolOwnership()/AcquirePhysicalPoolOwnership() need to
+        // record actual queue-family-ownership-transfer barriers -- when both indices are equal
+        // (no dedicated transfer queue on this GPU, see VulkanContext's own fallback), those calls
+        // record nothing, since same-queue-family data is already implicitly visible once its own
+        // execution/memory barrier fires.
+        void Init(VmaAllocator allocator, uint32_t maxLogicalPages, uint32_t maxPhysicalPages,
+            uint32_t transferQueueFamilyIndex, uint32_t graphicsQueueFamilyIndex);
 
         void Shutdown();
 
@@ -80,14 +88,49 @@ namespace renderer {
         void ClearPageTable(VkCommandBuffer cmd);
 
         // Allocates a free physical page slot for `logicalAddress` (must be a multiple of
-        // geometry::kPageSizeBytes and < maxLogicalPages * kPageSizeBytes), copies
-        // `dataSizeBytes` (<= kPageSizeBytes) bytes from `srcStagingBuffer[srcOffset]` into that
-        // slot, and updates the GPU-resident page table entry to point at it. Records the copy,
-        // the table update, and the VkMemoryBarrier2 synchronization needed before either
-        // resource is read by a later shader stage into `cmd`. Returns false, recording nothing,
-        // if `logicalAddress` is already resident or the physical pool is full.
-        bool BindPage(VkCommandBuffer cmd, uint64_t logicalAddress, VkBuffer srcStagingBuffer,
+        // geometry::kPageSizeBytes and < maxLogicalPages * kPageSizeBytes) and records the copy
+        // of `dataSizeBytes` (<= kPageSizeBytes) bytes from `srcStagingBuffer[srcOffset]` into
+        // that slot into `transferCmd` (VulkanContext::GetTransferCommandBuffer(), the dedicated
+        // hardware copy queue's command buffer when one exists -- see Init()'s own comment).
+        // Returns false, recording nothing, if `logicalAddress` is already resident or the
+        // physical pool is full. Unlike the old single-call BindPage(), this does NOT update the
+        // GPU-resident page table or make anything shader-visible -- the CPU-side allocation
+        // (GetPhysicalPageIndex()/IsResident()) is valid immediately (same "valid the moment this
+        // records" contract as before), but the caller MUST also call
+        // ReleasePhysicalPoolOwnership()/AcquirePhysicalPoolOwnership() once, and FinalizeBoundPage()
+        // once per page uploaded, before ANY shader reads this page -- see those methods' own
+        // comments for the full 4-call sequence a streaming coordinator records each frame.
+        bool UploadPageData(VkCommandBuffer transferCmd, uint64_t logicalAddress, VkBuffer srcStagingBuffer,
             VkDeviceSize srcOffset, VkDeviceSize dataSizeBytes);
+
+        // Records the RELEASE half of a queue-family-ownership transfer for the WHOLE physical
+        // pool buffer (not scoped to individual pages -- see class-level rationale: batching one
+        // pair of barriers per frame instead of one pair per page trades a small amount of
+        // granularity for a much simpler, easier-to-verify-correct synchronization story, and this
+        // pool's per-frame upload volume is small enough that the extra breadth costs nothing
+        // observable). No-op (records nothing) if Init() found no distinct transfer queue family.
+        // Call once per frame on `transferCmd`, after every UploadPageData() call for the frame,
+        // before that command buffer is submitted.
+        void ReleasePhysicalPoolOwnership(VkCommandBuffer transferCmd);
+
+        // The matching ACQUIRE half of ReleasePhysicalPoolOwnership() -- call once per frame on
+        // the graphics command buffer, after the transfer queue's submission is guaranteed to have
+        // completed (i.e. after that submission's signal semaphore is waited on by this
+        // submission -- see main.cpp's per-frame sequence), before any FinalizeBoundPage() call.
+        // No-op if Init() found no distinct transfer queue family (same-family data needs no
+        // ownership transfer, only the usual execution/memory barrier FinalizeBoundPage() itself
+        // records).
+        void AcquirePhysicalPoolOwnership(VkCommandBuffer graphicsCmd);
+
+        // Second half of the old BindPage(): writes the GPU-resident page table entry for
+        // `logicalAddress` (already allocated by a prior, successful UploadPageData() call this
+        // frame) and records the barrier making both the page table entry AND the physical pool
+        // bytes UploadPageData() copied visible to a later shader read. Must be called on the
+        // graphics command buffer, after AcquirePhysicalPoolOwnership() -- see that method's own
+        // comment for why. No-op / undefined if `logicalAddress` was not just allocated by
+        // UploadPageData() this frame (this method does not itself validate that, matching
+        // BindPage()'s own prior trust-the-caller contract for its single-call form).
+        void FinalizeBoundPage(VkCommandBuffer graphicsCmd, uint64_t logicalAddress);
 
         // Frees the physical page slot bound to `logicalAddress` (making it eligible for reuse by
         // a future BindPage() call) and writes kUnmappedSentinel into its GPU-resident page table
@@ -125,15 +168,20 @@ namespace renderer {
         // this same command buffer.
         std::vector<uint64_t> EvictLeastRecentlyUsedPages(VkCommandBuffer cmd, uint32_t maxPagesToEvict);
 
-        // Streaming entry point: binds `logicalAddress` exactly as BindPage() does, but first
-        // evicts up to `maxEvictions` least-recently-used resident pages (see
-        // EvictLeastRecentlyUsedPages) if the physical pool is already at capacity, so a
+        // Streaming entry point: uploads `logicalAddress` exactly as UploadPageData() does, but
+        // first evicts up to `maxEvictions` least-recently-used resident pages (see
+        // EvictLeastRecentlyUsedPages, recorded on `evictionCmd` -- the graphics command buffer,
+        // since eviction only ever touches the page table, never physical pool bytes, so it needs
+        // no transfer queue involvement) if the physical pool is already at capacity, so a
         // freshly-completed disk read is not rejected purely because the pool was full at the
         // moment the LRU policy has an eviction candidate available. Returns false if
         // `logicalAddress` is already resident, or if the pool is still full after evicting up to
-        // `maxEvictions` pages -- the same failure semantics as BindPage(), so callers do not need
-        // to distinguish "already resident" from "pool exhausted."
-        bool BindPageEvictingIfFull(VkCommandBuffer cmd, uint64_t logicalAddress, VkBuffer srcStagingBuffer,
+        // `maxEvictions` pages -- the same failure semantics as UploadPageData(), so callers do
+        // not need to distinguish "already resident" from "pool exhausted." Same remaining-call
+        // obligations as UploadPageData() on success (Release/AcquirePhysicalPoolOwnership() once
+        // per frame, FinalizeBoundPage() once per uploaded page).
+        bool UploadPageDataEvictingIfFull(VkCommandBuffer transferCmd, VkCommandBuffer evictionCmd,
+            uint64_t logicalAddress, VkBuffer srcStagingBuffer,
             VkDeviceSize srcOffset, VkDeviceSize dataSizeBytes, uint32_t maxEvictions = 1);
 
         bool IsResident(uint64_t logicalAddress) const { return m_PageTable.IsResident(logicalAddress); }
@@ -154,19 +202,20 @@ namespace renderer {
         static constexpr uint32_t kUnmappedSentinel = 0xFFFFFFFFu;
 
         // Debug-only "eviction churn" instrumentation (2026-07-16 "clusters missing / wrong LOD"
-        // investigation): renderer::GpuGeometryPagePool::TouchPage/TouchPages exist to mark a
-        // still-in-use resident page as most-recently-used, but nothing in the live per-frame path
-        // (renderer::ClusterLODSelectionPass / renderer::GeometryStreamingCoordinator) actually
-        // calls them -- residency-fallback (ClusterLODResidencyFallback.comp) only ever requests
-        // and substitutes NON-resident pages, it never "touches" the resident ones a DAG-cut is
-        // still actively drawing every frame. If the physical pool fills up, GpuPageTable's LRU
-        // list can therefore select a page for eviction purely because it hasn't been re-BOUND
-        // recently, even though it is still being drawn every single frame -- classic thrashing.
-        // BindPage() records the frame counter a page was (re)bound at; UnbindPage() checks how
-        // many frames elapsed since and logs a warning if that gap is suspiciously small, which is
-        // the direct, observable signature of this hypothesis. Call DebugAdvanceFrame() exactly
-        // once per frame (renderer::GeometryStreamingCoordinator::ProcessFeedbackAndDrainCompletions
-        // does this) -- a no-op in Release, like every other Debug-only method in this codebase.
+        // investigation; fixed 2026-07-17, see below). renderer::GpuGeometryPagePool::TouchPage/
+        // TouchPages mark a still-in-use resident page as most-recently-used.
+        // ClusterLODResidencyFallback.comp's RecordResidentTouch() reports every DRAW-decided node
+        // found already resident (not just the non-resident ones it requests/substitutes), and
+        // renderer::GeometryStreamingCoordinator::ProcessFeedbackAndDrainCompletions reads that
+        // report back and calls TouchPages() with it every frame, before any eviction runs -- so a
+        // page still being drawn every frame keeps its LRU recency fresh and is not evicted purely
+        // for having gone unbound a while. BindPage() records the frame counter a page was (re)bound
+        // at; UnbindPage() checks how many frames elapsed since and logs a warning if that gap is
+        // suspiciously small -- with the touch wiring above in place, this should no longer fire
+        // under normal (non-overflowing) camera movement; if it does, treat it as a regression, not
+        // an expected condition. Call DebugAdvanceFrame() exactly once per frame
+        // (renderer::GeometryStreamingCoordinator::ProcessFeedbackAndDrainCompletions does this) --
+        // a no-op in Release, like every other Debug-only method in this codebase.
         void DebugAdvanceFrame() {
 #ifndef NDEBUG
             ++m_DebugFrameCounter;
@@ -178,6 +227,13 @@ namespace renderer {
         GpuBuffer m_PhysicalPool;
         GpuBuffer m_PageTableBuffer;
         uint32_t m_MaxLogicalPages = 0;
+
+        // See Init()'s own comment: when these differ, UploadPageData()'s copies land on a
+        // different queue family than the one that later reads them, so
+        // Release/AcquirePhysicalPoolOwnership() must record real ownership-transfer barriers.
+        uint32_t m_TransferQueueFamilyIndex = 0;
+        uint32_t m_GraphicsQueueFamilyIndex = 0;
+        bool m_NeedsOwnershipTransfer = false;
 
 #ifndef NDEBUG
         // Frames elapsed below this threshold between a page's bind and its eviction are logged as

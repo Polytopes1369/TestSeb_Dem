@@ -118,6 +118,14 @@ namespace renderer {
         VmaAllocator allocator = VK_NULL_HANDLE;
         VkCommandPool commandPool = VK_NULL_HANDLE;
         VkQueue queue = VK_NULL_HANDLE;
+
+        // Dedicated transfer queue (UE 5.8 RHI parity) -- see VulkanContext::GetTransferQueue()'s
+        // own comment. Forwarded to m_PagePool.Init() so it knows whether the geometry page pool's
+        // upload path needs queue-family-ownership-transfer barriers (distinct family) or none
+        // (fallback: same family as `queue` above).
+        uint32_t graphicsQueueFamilyIndex = 0;
+        uint32_t transferQueueFamilyIndex = 0;
+
         VkExtent2D renderExtent{ 0, 0 };
         VkExtent2D displayExtent{ 0, 0 };
 
@@ -197,7 +205,11 @@ namespace renderer {
         // GetEntityTransformsCPU(), index == meshID) drives this frame's TLAS refit
         // (m_SurfaceCacheRT.RecordRefreshTLAS) and Global SDF object-space compositing
         // (m_GlobalSDF.RecordUpdate) -- see those two call sites' own comments.
-        void RecordFrame(VkCommandBuffer cmd, const CameraPushConstants& camera,
+        // `transferCmd` (VulkanContext::GetTransferCommandBuffer(), already begun/ended and
+        // submitted to the transfer queue by the caller with the ordering main.cpp's per-frame
+        // sequence establishes) is where this frame's geometry page uploads are recorded -- see
+        // GeometryStreamingCoordinator::ProcessFeedbackAndDrainCompletions's own comment.
+        void RecordFrame(VkCommandBuffer cmd, VkCommandBuffer transferCmd, const CameraPushConstants& camera,
             const maths::vec3& cameraPositionWorld, const CameraFrameInfo& cameraFrameInfo,
             float globalTimeSeconds, VkImage swapchainImage, VkImageView swapchainImageView,
             const core::EntityTransformCPU* entityTransformsCPU);

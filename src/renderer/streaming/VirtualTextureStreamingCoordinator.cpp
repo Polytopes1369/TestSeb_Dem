@@ -179,7 +179,18 @@ namespace renderer {
                 "[VirtualTextureStreamingCoordinator] Feedback buffer saturated: {} page-miss report(s) dropped this frame (capacity={}).",
                 overflowedRequestCount, m_Feedback.GetCapacity()));
         }
-        m_RequestQueue.SubmitFrameRequests(missedPageKeys);
+        // Priority = mip level (packed into the low 4 bits of the key, see
+        // VirtualTextureManager::PackPageKey) -- a coarser (higher mip) tile is requested before a
+        // finer one, matching geometry::GeometryStreamingCoordinator's DAG-level priority for the
+        // same reason: it unlocks a larger visible fallback area sooner.
+        std::vector<float> missedPriorities;
+        missedPriorities.reserve(missedPageKeys.size());
+        for (uint32_t pageKey : missedPageKeys) {
+            uint32_t x = 0, y = 0, mip = 0;
+            VirtualTextureManager::UnpackPageKey(pageKey, x, y, mip);
+            missedPriorities.push_back(float(mip));
+        }
+        m_RequestQueue.SubmitFrameRequests(missedPageKeys, missedPriorities);
 
         // --- 2. Issue up to kMaxNewReadsPerFrame new async reads, bounded by free I/O slots. ---
         for (uint32_t issued = 0; issued < kMaxNewReadsPerFrame; ++issued) {

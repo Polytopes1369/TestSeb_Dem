@@ -15,6 +15,21 @@
 
 namespace geometry {
 
+    // Bump this by hand whenever VulkanContext::GenerateGeometry()'s primitive generation code
+    // changes in a way that changes the produced geometry WITHOUT changing any of the runtime
+    // config values IsCacheUpToDate() already checks (VERTEX_SPACING, vertex/index/entity counts,
+    // GPU profile) -- e.g. editing a hardcoded primitive parameter (a GenerateBox() dimension, a
+    // sphere's segment count, ...), reordering/adding/removing a GenerateX() call, or changing
+    // GeometryEncoding.h's quantization. None of the config-value checks below can see a plain
+    // source-code edit, since procedural generation has no imported source asset to content-hash
+    // (unlike UE 5.8's DDC, which hashes imported source data -- see this project's own DDC-parity
+    // investigation) -- an explicit, manually-maintained generator-version key is the standard
+    // substitute UE 5.8 itself uses for its own non-asset-backed procedural generators. Forgetting
+    // to bump this after such an edit just means a developer manually deletes scene.cache once
+    // (same recovery as today, before this field existed) -- this is a convenience/correctness
+    // improvement, not a safety-critical guarantee.
+    constexpr uint32_t kGeometryGenerationVersion = 1;
+
     // Must be called after VulkanContext::GenerateGeometry() has completed (i.e. any time after
     // VulkanContext::Init() returns) so the Vertex/Index SSBOs already hold the live scene's
     // procedural geometry.
@@ -40,15 +55,16 @@ namespace geometry {
         const core::EntityData* entityData,
         uint32_t entityCount);
 
-    // Checks if the cached geometry file (scene.cache) exists and is up to date
-    // with current configuration settings, vertex/index counts, and entity counts.
+    // Checks if the cached geometry file (scene.cache) exists and is up to date with current
+    // configuration settings, vertex/index counts, entity count, and kGeometryGenerationVersion
+    // (see that constant's own comment).
     bool IsCacheUpToDate(
         uint32_t totalVertexCount,
         uint32_t totalIndexCount,
         uint32_t entityCount);
 
-    // Persists configuration settings, vertex/index counts, and entity counts
-    // to scene.cache.cfg alongside the compiled scene.cache.
+    // Persists configuration settings, vertex/index counts, entity count, and
+    // kGeometryGenerationVersion to scene.cache.cfg alongside the compiled scene.cache.
     void SaveCacheConfig(
         uint32_t totalVertexCount,
         uint32_t totalIndexCount,

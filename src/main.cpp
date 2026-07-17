@@ -342,6 +342,8 @@ int main(int argc, char** argv) {
     pipelineInfo.allocator = vkContext.GetAllocator();
     pipelineInfo.commandPool = vkContext.GetCommandPool();
     pipelineInfo.queue = vkContext.GetGraphicsQueue();
+    pipelineInfo.graphicsQueueFamilyIndex = vkContext.GetGraphicsQueueFamilyIndex();
+    pipelineInfo.transferQueueFamilyIndex = vkContext.GetTransferQueueFamilyIndex();
     VkExtent2D swapchainExtent = vkContext.GetSwapchainExtent();
     VkExtent2D renderExtent = swapchainExtent;
     renderExtent.width = static_cast<uint32_t>(static_cast<float>(swapchainExtent.width) * config::temporal::RENDER_SCALE);
@@ -387,8 +389,13 @@ int main(int argc, char** argv) {
 
     // Frame-pacing fence, created signaled so the first frame's wait passes immediately. Replaces
     // the old per-frame vkDeviceWaitIdle: the CPU now only waits for the previous frame's own
-    // submission (never for a full device drain), and every frame is exactly ONE vkQueueSubmit
-    // with zero mid-frame waits -- the two properties that keep the frame loop stutter-free.
+    // submission (never for a full device drain) and there are zero mid-frame CPU waits -- the
+    // two properties that keep the frame loop stutter-free. Since the dedicated transfer queue
+    // was added (UE 5.8 RHI parity, VulkanContext::GetTransferQueue()), the frame now records
+    // exactly TWO vkQueueSubmit calls (transfer, then graphics) instead of one, linked by a
+    // semaphore the graphics submission waits on -- but this is a second, independent, non-
+    // blocking GPU-side submission, not a second CPU wait, so it does not reintroduce the stall
+    // this fence itself eliminates.
     VkFence frameFence = VK_NULL_HANDLE;
     VkFenceCreateInfo fenceInfo{ VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
     fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
@@ -814,29 +821,63 @@ int main(int argc, char** argv) {
         // of it, now that the per-frame vkDeviceWaitIdle is gone.
         VkSemaphore rndFinished = vkContext.GetRenderFinishedSemaphore(imageIndex);
 
-        // 3. Record the entire frame (culling -> hybrid raster -> resolve -> blit + present
-        // transition) into ONE command buffer -- every inter-pass barrier lives inside
-        // ClusterRenderPipeline::RecordFrame and the passes it drives.
+        // 3a. Record this frame's geometry page uploads into the transfer queue's OWN command
+        // buffer first (UE 5.8 RHI parity -- dedicated hardware copy queue, see VulkanContext::
+        // GetTransferQueue()'s own comment; falls back to the graphics queue/family transparently
+        // when the GPU exposes none). Safe to re-record without waiting again here: the fence wait
+        // above already guarantees the PREVIOUS frame's transfer submission (which the previous
+        // frame's graphics submission itself waited on, see step 4 below) has completed.
+        VkCommandBuffer transferCmd = vkContext.GetTransferCommandBuffer();
+        vkResetCommandBuffer(transferCmd, 0);
+        VkCommandBufferBeginInfo transferBeginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+        vkBeginCommandBuffer(transferCmd, &transferBeginInfo);
+
+        // 3b. Record the entire frame (culling -> hybrid raster -> resolve -> blit + present
+        // transition) into ONE graphics command buffer -- every inter-pass barrier lives inside
+        // ClusterRenderPipeline::RecordFrame and the passes it drives. RecordFrame() records into
+        // BOTH command buffers (transferCmd for page uploads, cmd for everything else) in the
+        // correct internal order before either is ended below.
         vkResetCommandBuffer(vkContext.GetCommandBuffer(), 0);
         VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
         vkBeginCommandBuffer(vkContext.GetCommandBuffer(), &beginInfo);
 
-        clusterPipeline.RecordFrame(vkContext.GetCommandBuffer(), camera.GetPushConstants(),
+        clusterPipeline.RecordFrame(vkContext.GetCommandBuffer(), transferCmd, camera.GetPushConstants(),
             camera.GetPosition(), camera.GetFrameInfo(aspect), static_cast<float>(glfwGetTime()),
             vkContext.GetSwapchainImages()[imageIndex],
             vkContext.GetSwapchainImageViews()[imageIndex],
             vkContext.GetEntityTransformsCPU());
 
+        vkEndCommandBuffer(transferCmd);
         vkEndCommandBuffer(vkContext.GetCommandBuffer());
 
+        // 3c. Submit the transfer queue's work FIRST, signaling a semaphore the graphics
+        // submission (step 4) waits on before touching anything it uploaded -- an additional,
+        // non-blocking vkQueueSubmit alongside the graphics one below. This does not reintroduce
+        // the CPU-GPU stall the frame-pacing fence comment above was written to eliminate (no CPU
+        // wait is added here, only a GPU-side semaphore dependency between two queues that would
+        // otherwise race), it just means "one vkQueueSubmit" no longer literally describes the
+        // frame now that a second, independent queue is genuinely in play.
+        VkSemaphore transferFinished = vkContext.GetTransferFinishedSemaphore();
+        VkSubmitInfo transferSubmitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
+        transferSubmitInfo.commandBufferCount = 1;
+        transferSubmitInfo.pCommandBuffers = &transferCmd;
+        transferSubmitInfo.signalSemaphoreCount = 1;
+        transferSubmitInfo.pSignalSemaphores = &transferFinished;
+        VK_CHECK(vkQueueSubmit(vkContext.GetTransferQueue(), 1, &transferSubmitInfo, VK_NULL_HANDLE));
+
         // 4. Submit to Graphics Queue -- the acquire semaphore gates the frame's first use of the
-        // swapchain image, which is the blit at the very end of RecordFrame (TRANSFER stage).
+        // swapchain image, which is the blit at the very end of RecordFrame (TRANSFER stage). The
+        // transfer-finished wait uses ALL_COMMANDS (not a narrower stage like COMPUTE_SHADER_BIT):
+        // GpuGeometryPagePool::FinalizeBoundPage's vkCmdUpdateBuffer is classified under the
+        // Vulkan spec's "Clear" pseudo-stage, which an earlier pipeline stage than
+        // VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT could otherwise let race ahead of this wait.
         VkCommandBuffer cmd = vkContext.GetCommandBuffer();
         VkSubmitInfo submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
 
-        VkPipelineStageFlags waitStages[] = { VK_PIPELINE_STAGE_TRANSFER_BIT };
-        submitInfo.waitSemaphoreCount = 1;
-        submitInfo.pWaitSemaphores = &imgAvailable;
+        VkSemaphore waitSemaphores[] = { imgAvailable, transferFinished };
+        VkPipelineStageFlags waitStages[] = { VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT };
+        submitInfo.waitSemaphoreCount = 2;
+        submitInfo.pWaitSemaphores = waitSemaphores;
         submitInfo.pWaitDstStageMask = waitStages;
         submitInfo.commandBufferCount = 1;
         submitInfo.pCommandBuffers = &cmd;

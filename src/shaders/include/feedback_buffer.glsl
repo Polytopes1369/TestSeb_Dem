@@ -33,4 +33,33 @@ void RequestClusterResidency(uint clusterID) {
     }
 }
 
+// Second, independent feedback channel: reports that `clusterID` is required this frame AND was
+// found already resident (the counterpart to RequestClusterResidency's non-resident case). Without
+// this, the CPU-side LRU (renderer::GpuGeometryPagePool::TouchPage/TouchPages) never learns which
+// resident pages are still actively in use, since a page-table-only miss channel structurally
+// cannot report hits -- a page drawn every single frame could still be evicted purely for having
+// gone a while since its last BIND (not its last USE). Mirrors UE 5.8 Nanite's streaming request
+// buffer, which records every page a frame references, hit or miss alike, for exactly this reason.
+// Same bounded-atomic-counter pattern as RequestClusterResidency, own buffer/binding so it does not
+// share (and contend on) the miss channel's atomic counter or capacity.
+//
+// Opt-in: only shaders that #define FEEDBACK_TOUCH_BUFFER_SET / FEEDBACK_TOUCH_BUFFER_BINDING
+// before including this header get this second binding declared -- not every consumer of the
+// miss channel above (RequestClusterResidency) also reports touches, so this is not mandatory.
+// touchCount must be reset to 0 by the CPU (renderer::FeedbackBuffer::RecordClear()) before any
+// shader in this frame calls RecordResidentTouch() -- this header never clears it itself.
+#ifdef FEEDBACK_TOUCH_BUFFER_SET
+layout(std430, set = FEEDBACK_TOUCH_BUFFER_SET, binding = FEEDBACK_TOUCH_BUFFER_BINDING) buffer FeedbackTouchBufferSSBO {
+    uint touchCount; // Atomically incremented once per resident-touch report this frame.
+    uint clusterIDs[]; // Valid entries are [0, min(touchCount, clusterIDs.length())).
+} g_FeedbackTouchBuffer;
+
+void RecordResidentTouch(uint clusterID) {
+    uint slot = atomicAdd(g_FeedbackTouchBuffer.touchCount, 1u);
+    if (slot < g_FeedbackTouchBuffer.clusterIDs.length()) {
+        g_FeedbackTouchBuffer.clusterIDs[slot] = clusterID;
+    }
+}
+#endif // FEEDBACK_TOUCH_BUFFER_SET
+
 #endif // FEEDBACK_BUFFER_GLSL

@@ -40,17 +40,19 @@ namespace renderer {
         imageInfo.arrayLayers = 1;
         imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
         imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+        // COLOR_ATTACHMENT_BIT: unconditional, NOT Debug-only -- renderer::TransparentForwardPass::
+        // RecordDraw() draws directly onto this image via vkCmdBeginRendering in BOTH Debug and
+        // Release (renderer::ClusterRenderPipeline::RecordFrame's own transparent-forward call site
+        // has no `#ifndef NDEBUG` guard around it). The comment this replaced only accounted for
+        // renderer::debug::DebugTextOverlay::RecordDraw's own Debug-only use of this same flag,
+        // which is real but not the only one -- gating the flag behind NDEBUG left Release builds
+        // creating this image without the usage its own always-on transparent draw needs.
+        // SAMPLED_BIT: unconditional -- renderer::TAATSRPass::UpdateDescriptorSets() binds this
+        // image as a VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER (its own `g_LowResColor` binding 0),
+        // also unconditional. Missing this produced VUID-VkWriteDescriptorSet-descriptorType-00337
+        // every frame.
         imageInfo.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
-#ifndef NDEBUG
-            // Debug builds only: renderer::debug::DebugTextOverlay::RecordDraw draws its stat
-            // overlay directly onto this image via a graphics pipeline / vkCmdBeginRendering (see
-            // that class' own comment), which requires COLOR_ATTACHMENT_BIT on the target image --
-            // a Release build never calls RecordDraw at all (renderer::ClusterRenderPipeline's own
-            // `#ifndef NDEBUG` guard around that whole block), so this extra usage flag would be
-            // pure waste there.
-            | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
-#endif
-            ;
+            | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
         imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
         imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 

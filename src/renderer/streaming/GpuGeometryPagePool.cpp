@@ -6,11 +6,15 @@
 
 namespace renderer {
 
-    void GpuGeometryPagePool::Init(VmaAllocator allocator, uint32_t maxLogicalPages, uint32_t maxPhysicalPages) {
+    void GpuGeometryPagePool::Init(VmaAllocator allocator, uint32_t maxLogicalPages, uint32_t maxPhysicalPages,
+        uint32_t transferQueueFamilyIndex, uint32_t graphicsQueueFamilyIndex) {
         Shutdown();
 
         m_MaxLogicalPages = maxLogicalPages;
         m_PageTable = geometry::GpuPageTable(maxPhysicalPages);
+        m_TransferQueueFamilyIndex = transferQueueFamilyIndex;
+        m_GraphicsQueueFamilyIndex = graphicsQueueFamilyIndex;
+        m_NeedsOwnershipTransfer = transferQueueFamilyIndex != graphicsQueueFamilyIndex;
 
         m_PhysicalPool.Create(
             allocator,
@@ -56,14 +60,14 @@ namespace renderer {
         vkCmdPipelineBarrier2(cmd, &depInfo);
     }
 
-    bool GpuGeometryPagePool::BindPage(VkCommandBuffer cmd, uint64_t logicalAddress, VkBuffer srcStagingBuffer,
+    bool GpuGeometryPagePool::UploadPageData(VkCommandBuffer transferCmd, uint64_t logicalAddress, VkBuffer srcStagingBuffer,
         VkDeviceSize srcOffset, VkDeviceSize dataSizeBytes) {
         assert(logicalAddress % geometry::kPageSizeBytes == 0 && "logicalAddress must be page-aligned");
         assert(dataSizeBytes <= geometry::kPageSizeBytes && "a single page bind cannot exceed kPageSizeBytes");
 
         uint32_t pageID = geometry::GpuPageTable::LogicalAddressToPageID(logicalAddress);
         if (pageID >= m_MaxLogicalPages) {
-            LOG_ERROR(std::format("[GpuGeometryPagePool] BindPage failed: pageID {} is out of range (max: {})", pageID, m_MaxLogicalPages));
+            LOG_ERROR(std::format("[GpuGeometryPagePool] UploadPageData failed: pageID {} is out of range (max: {})", pageID, m_MaxLogicalPages));
             return false;
         }
 
@@ -84,19 +88,92 @@ namespace renderer {
         copyRegion.srcOffset = srcOffset;
         copyRegion.dstOffset = dstOffset;
         copyRegion.size = dataSizeBytes;
-        vkCmdCopyBuffer(cmd, srcStagingBuffer, m_PhysicalPool.Handle(), 1, &copyRegion);
+        vkCmdCopyBuffer(transferCmd, srcStagingBuffer, m_PhysicalPool.Handle(), 1, &copyRegion);
+
+        LOG_INFO(std::format("[GpuGeometryPagePool] Uploaded logicalAddress {:#x} to physical page slot {} (offset: {:#x})",
+            logicalAddress, physicalPage, dstOffset));
+
+#ifndef NDEBUG
+        m_DebugBoundAtFrame[logicalAddress] = m_DebugFrameCounter;
+#endif
+
+        return true;
+    }
+
+    void GpuGeometryPagePool::ReleasePhysicalPoolOwnership(VkCommandBuffer transferCmd) {
+        if (!m_NeedsOwnershipTransfer) {
+            return; // Same queue family as the graphics/compute consumer -- nothing to release.
+        }
+
+        // RELEASE half of the ownership transfer: makes this frame's UploadPageData() copies
+        // available to be acquired by m_GraphicsQueueFamilyIndex. Per the Vulkan spec, a queue
+        // family ownership transfer's release operation's dstAccessMask is ignored (the acquiring
+        // queue's own barrier is what actually makes the data visible to it), so it is left 0 here
+        // -- only srcStageMask/srcAccessMask (what must complete before the release) are
+        // meaningful on this side.
+        VkBufferMemoryBarrier2 releaseBarrier{ VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2 };
+        releaseBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+        releaseBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        releaseBarrier.dstStageMask = VK_PIPELINE_STAGE_2_NONE;
+        releaseBarrier.dstAccessMask = VK_ACCESS_2_NONE;
+        releaseBarrier.srcQueueFamilyIndex = m_TransferQueueFamilyIndex;
+        releaseBarrier.dstQueueFamilyIndex = m_GraphicsQueueFamilyIndex;
+        releaseBarrier.buffer = m_PhysicalPool.Handle();
+        releaseBarrier.offset = 0;
+        releaseBarrier.size = VK_WHOLE_SIZE;
+
+        VkDependencyInfo depInfo{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+        depInfo.bufferMemoryBarrierCount = 1;
+        depInfo.pBufferMemoryBarriers = &releaseBarrier;
+        vkCmdPipelineBarrier2(transferCmd, &depInfo);
+    }
+
+    void GpuGeometryPagePool::AcquirePhysicalPoolOwnership(VkCommandBuffer graphicsCmd) {
+        if (!m_NeedsOwnershipTransfer) {
+            return;
+        }
+
+        // ACQUIRE half: per the spec, the release side's srcAccessMask is the one that matters for
+        // "what must complete first" (already encoded in the release barrier above via the
+        // semaphore ordering main.cpp's submit establishes); this side's srcAccessMask is ignored
+        // by the spec and left 0, while dstStageMask/dstAccessMask describe the first real
+        // consumer -- FinalizeBoundPage()'s own barrier further narrows this to the exact shader
+        // stages that read the pool, so this acquire only needs to make the transferred bytes
+        // available to this queue family at all, not yet visible to any specific stage.
+        VkBufferMemoryBarrier2 acquireBarrier{ VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2 };
+        acquireBarrier.srcStageMask = VK_PIPELINE_STAGE_2_NONE;
+        acquireBarrier.srcAccessMask = VK_ACCESS_2_NONE;
+        acquireBarrier.dstStageMask = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        acquireBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+        acquireBarrier.srcQueueFamilyIndex = m_TransferQueueFamilyIndex;
+        acquireBarrier.dstQueueFamilyIndex = m_GraphicsQueueFamilyIndex;
+        acquireBarrier.buffer = m_PhysicalPool.Handle();
+        acquireBarrier.offset = 0;
+        acquireBarrier.size = VK_WHOLE_SIZE;
+
+        VkDependencyInfo depInfo{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+        depInfo.bufferMemoryBarrierCount = 1;
+        depInfo.pBufferMemoryBarriers = &acquireBarrier;
+        vkCmdPipelineBarrier2(graphicsCmd, &depInfo);
+    }
+
+    void GpuGeometryPagePool::FinalizeBoundPage(VkCommandBuffer graphicsCmd, uint64_t logicalAddress) {
+        uint32_t pageID = geometry::GpuPageTable::LogicalAddressToPageID(logicalAddress);
+        uint32_t physicalPage = m_PageTable.GetPhysicalPageIndex(logicalAddress);
 
         // Page-table entry update: exactly 4 bytes at a 4-byte-aligned offset, well within
         // vkCmdUpdateBuffer's 65536-byte limit, so no staging buffer is needed for the
         // indirection-table half of this bind.
         VkDeviceSize entryOffset = static_cast<VkDeviceSize>(pageID) * sizeof(uint32_t);
-        vkCmdUpdateBuffer(cmd, m_PageTableBuffer.Handle(), entryOffset, sizeof(uint32_t), &physicalPage);
+        vkCmdUpdateBuffer(graphicsCmd, m_PageTableBuffer.Handle(), entryOffset, sizeof(uint32_t), &physicalPage);
 
-        // Two writes (the geometry copy into m_PhysicalPool, the table entry update into
-        // m_PageTableBuffer) both need to become visible to shader storage-buffer reads before
-        // any subsequent draw/dispatch can safely dereference either resource; a shader must read
-        // the table entry to learn the offset, then read the pool at that offset, so both writes
-        // share the same destination stage/access mask and are covered by one VkDependencyInfo.
+        // Two writes (UploadPageData()'s geometry copy into m_PhysicalPool -- already made visible
+        // to this queue family by AcquirePhysicalPoolOwnership(), or trivially visible if no
+        // ownership transfer was needed -- and the table entry update into m_PageTableBuffer just
+        // above) both need to become visible to shader storage-buffer reads before any subsequent
+        // draw/dispatch can safely dereference either resource; a shader must read the table entry
+        // to learn the offset, then read the pool at that offset, so both writes share the same
+        // destination stage/access mask and are covered by one VkDependencyInfo.
         VkMemoryBarrier2 barriers[2]{};
         barriers[0].sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
         barriers[0].srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
@@ -113,16 +190,10 @@ namespace renderer {
         VkDependencyInfo depInfo{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
         depInfo.memoryBarrierCount = 2;
         depInfo.pMemoryBarriers = barriers;
-        vkCmdPipelineBarrier2(cmd, &depInfo);
+        vkCmdPipelineBarrier2(graphicsCmd, &depInfo);
 
-        LOG_INFO(std::format("[GpuGeometryPagePool] Bound logicalAddress {:#x} to physical page slot {} (offset: {:#x})",
-            logicalAddress, physicalPage, dstOffset));
-
-#ifndef NDEBUG
-        m_DebugBoundAtFrame[logicalAddress] = m_DebugFrameCounter;
-#endif
-
-        return true;
+        LOG_INFO(std::format("[GpuGeometryPagePool] Finalized logicalAddress {:#x} at physical page slot {}",
+            logicalAddress, physicalPage));
     }
 
     bool GpuGeometryPagePool::UnbindPage(VkCommandBuffer cmd, uint64_t logicalAddress) {
@@ -139,16 +210,20 @@ namespace renderer {
 #ifndef NDEBUG
         // Eviction-churn check: see this class's DebugAdvanceFrame() doc comment for why a page
         // evicted only a handful of frames after being bound is suspicious -- it strongly suggests
-        // the page was still being drawn every frame and got evicted purely because nothing ever
-        // called TouchPage()/TouchPages() to refresh its LRU recency, not because it genuinely
-        // stopped being needed.
+        // the page was still being drawn every frame and got evicted purely because its LRU
+        // recency was never refreshed, not because it genuinely stopped being needed.
+        // renderer::GeometryStreamingCoordinator::ProcessFeedbackAndDrainCompletions now calls
+        // TouchPages() every frame with resident-touch reports from
+        // ClusterLODResidencyFallback.comp's RecordResidentTouch(), so this warning firing under
+        // normal (non-overflowing) camera movement would indicate a regression in that wiring, not
+        // an open/expected issue.
         auto boundIt = m_DebugBoundAtFrame.find(logicalAddress);
         if (boundIt != m_DebugBoundAtFrame.end()) {
             uint64_t framesSinceBind = m_DebugFrameCounter - boundIt->second;
             if (framesSinceBind < kDebugChurnThresholdFrames) {
                 LOG_WARNING(std::format("[GpuGeometryPagePool] POSSIBLE THRASHING: logicalAddress {:#x} (physical slot {}) evicted only {} frame(s) after being bound -- "
-                    "TouchPage()/TouchPages() are never called anywhere in the live per-frame path, so a page still in active use has no way to refresh its LRU "
-                    "recency and can be evicted while still needed. If clusters keep flickering between resident/non-resident, this is the likely root cause.",
+                    "either the resident-touch feedback channel overflowed this frame (see FeedbackBuffer saturation warnings), or the page genuinely stopped "
+                    "being required and this is expected LRU turnover. If clusters keep flickering between resident/non-resident with no matching overflow warning, investigate.",
                     logicalAddress, physicalPage, framesSinceBind));
             }
             m_DebugBoundAtFrame.erase(boundIt);
@@ -199,24 +274,29 @@ namespace renderer {
         return candidates;
     }
 
-    bool GpuGeometryPagePool::BindPageEvictingIfFull(VkCommandBuffer cmd, uint64_t logicalAddress, VkBuffer srcStagingBuffer,
+    bool GpuGeometryPagePool::UploadPageDataEvictingIfFull(VkCommandBuffer transferCmd, VkCommandBuffer evictionCmd,
+        uint64_t logicalAddress, VkBuffer srcStagingBuffer,
         VkDeviceSize srcOffset, VkDeviceSize dataSizeBytes, uint32_t maxEvictions) {
         if (m_PageTable.IsResident(logicalAddress)) {
-            // Matches BindPage()'s own already-resident failure case -- no eviction should ever
-            // be attempted for a page that does not actually need a free slot.
+            // Matches UploadPageData()'s own already-resident failure case -- no eviction should
+            // ever be attempted for a page that does not actually need a free slot.
             return false;
         }
 
         if (m_PageTable.GetResidentPageCount() >= m_PageTable.GetCapacity()) {
             // Every physical slot is currently resident: free the least-recently-used ones first
-            // so BindPage() below has somewhere to put the new page. The freed slot(s) go back
-            // onto geometry::GpuPageTable's free list as part of EvictLeastRecentlyUsedPages(),
-            // making them immediately available to the AllocatePage() call BindPage() performs
-            // next, in this same command buffer.
-            EvictLeastRecentlyUsedPages(cmd, maxEvictions);
+            // so UploadPageData() below has somewhere to put the new page. Recorded on
+            // `evictionCmd` (the graphics command buffer): eviction only ever touches the page
+            // table, never physical pool bytes, so it needs no transfer-queue involvement at all.
+            // The freed slot(s) go back onto geometry::GpuPageTable's free list as part of
+            // EvictLeastRecentlyUsedPages(), making them immediately available to the
+            // AllocatePage() call UploadPageData() performs next -- this is pure CPU-side
+            // bookkeeping, so it is available the instant this function call returns, regardless
+            // of which command buffer/queue either eviction or upload actually executes on.
+            EvictLeastRecentlyUsedPages(evictionCmd, maxEvictions);
         }
 
-        return BindPage(cmd, logicalAddress, srcStagingBuffer, srcOffset, dataSizeBytes);
+        return UploadPageData(transferCmd, logicalAddress, srcStagingBuffer, srcOffset, dataSizeBytes);
     }
 
 }

@@ -47,6 +47,21 @@ public:
     VkImageView GetVisBufferTriangleIDView() const { return m_VisBufferTriangleIDImageView; }
     static constexpr VkFormat GetVisBufferFormat() { return kVisBufferFormat; }
 
+    // Dedicated hardware copy queue (UE 5.8 RHI parity), used by renderer::
+    // GeometryStreamingCoordinator for its per-frame page uploads so they never contend for the
+    // graphics queue's own command submission. Falls back to the graphics queue/family when the
+    // GPU exposes no distinct transfer-only family (see CreateLogicalDevice()'s own comment) --
+    // HasDedicatedTransferQueue() tells a caller whether queue-family-ownership-transfer barriers
+    // are actually needed (same family == none needed).
+    VkQueue GetTransferQueue() const { return m_TransferQueue; }
+    uint32_t GetTransferQueueFamilyIndex() const { return m_TransferQueueFamilyIndex; }
+    bool HasDedicatedTransferQueue() const { return m_HasDedicatedTransferQueue; }
+    VkCommandBuffer GetTransferCommandBuffer() const { return m_TransferCommandBuffer; }
+    // Signaled when GetTransferCommandBuffer()'s submission finishes -- the graphics submission
+    // waits on this before consuming anything the transfer queue uploaded this frame. See
+    // main.cpp's per-frame submit sequence.
+    VkSemaphore GetTransferFinishedSemaphore() const { return m_TransferFinishedSemaphore; }
+
     VkSemaphore GetImageAvailableSemaphore() const { return m_ImageAvailableSemaphore; }
     // One render-finished semaphore per swapchain image (indexed by the acquired image index),
     // NOT a single shared one: vkQueuePresentKHR's wait on this semaphore is not guaranteed
@@ -107,6 +122,15 @@ private:
     uint32_t m_GraphicsQueueFamilyIndex = 0;
     VkCommandPool m_CommandPool = VK_NULL_HANDLE;
     VkCommandBuffer m_CommandBuffer = VK_NULL_HANDLE;
+
+    // Dedicated transfer queue (or a fallback alias of m_GraphicsQueue/m_GraphicsQueueFamilyIndex)
+    // -- see GetTransferQueue()'s own comment.
+    VkQueue m_TransferQueue = VK_NULL_HANDLE;
+    uint32_t m_TransferQueueFamilyIndex = 0;
+    bool m_HasDedicatedTransferQueue = false;
+    VkCommandPool m_TransferCommandPool = VK_NULL_HANDLE;
+    VkCommandBuffer m_TransferCommandBuffer = VK_NULL_HANDLE;
+    VkSemaphore m_TransferFinishedSemaphore = VK_NULL_HANDLE;
 
     VkDescriptorSetLayout m_BindlessLayout = VK_NULL_HANDLE;
     VkDescriptorPool m_DescriptorPool = VK_NULL_HANDLE;

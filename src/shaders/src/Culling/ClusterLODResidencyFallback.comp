@@ -23,6 +23,8 @@
 
 #define FEEDBACK_BUFFER_SET 0
 #define FEEDBACK_BUFFER_BINDING 4
+#define FEEDBACK_TOUCH_BUFFER_SET 0
+#define FEEDBACK_TOUCH_BUFFER_BINDING 6
 #include "include/feedback_buffer.glsl"
 
 #define DAG_DECISION_DRAW      0u
@@ -59,6 +61,11 @@ layout(std430, set = 0, binding = 5) buffer LODFallbackStatsSSBO {
                                  // the node's region is missing for this frame (a visible hole).
 } g_LODFallbackStats;
 
+// binding 6 == g_FeedbackTouchBuffer, declared by feedback_buffer.glsl -- reports every DRAW-
+// decided node found ALREADY resident (see this shader's early-return below), so the CPU-side LRU
+// (renderer::GpuGeometryPagePool::TouchPages) can mark it most-recently-used before this frame's
+// eviction pass runs, instead of only ever learning about non-resident misses.
+
 // Bounds the ancestor walk below: comfortably above any realistic DAG depth (this engine's own
 // grouping roughly halves the cluster count per level).
 #define MAX_ANCESTOR_WALK 24u
@@ -77,7 +84,11 @@ void main() {
 
     LODNodeMetadata node = g_LODNodes.nodes[index];
     if (IsClusterResident(node.logicalPageID)) {
-        return; // ClusterLODCompact.comp picks this node up directly -- nothing to do here.
+        // ClusterLODCompact.comp picks this node up directly for drawing -- but the CPU-side LRU
+        // still needs to know this page was actively required THIS frame, or it can be evicted as
+        // stale purely for not having been re-bound recently (see RecordResidentTouch's comment).
+        RecordResidentTouch(node.clusterID);
+        return;
     }
 
     // This DRAW-decided node's own fine geometry isn't resident yet: request it for a future
