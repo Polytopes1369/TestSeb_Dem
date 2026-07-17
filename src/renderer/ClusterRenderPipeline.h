@@ -81,6 +81,7 @@
 #include "renderer/passes/GlobalSDFPass.h"
 #include "renderer/vulkan/GpuBuffer.h"
 #include "renderer/streaming/GpuGeometryPagePool.h"
+#include "renderer/passes/HeroTessellationPass.h"
 #include "renderer/passes/HZBPass.h"
 #include "renderer/LightingTypes.h"
 #include "renderer/passes/ProceduralMaskGenerator.h"
@@ -377,6 +378,19 @@ namespace renderer {
         // transparency draws on top of the final lit result), always initialized (not Debug-only),
         // same build-separation rule as m_ShadingBin above.
         TransparentForwardPass m_TransparentForward;
+
+        // Phase 7a (UE5.8 parity roadmap, hero asset tessellation): forward-rendered, screen-space-
+        // adaptively-tessellated, procedurally-displaced hero Icosphere (materialID
+        // kHeroMaterialID, culled out of the opaque Nanite path entirely via core::EntityFlags::
+        // IsTransparent -- see VulkanContext::BuildEntityData()'s own comment) -- lit exactly like
+        // m_TransparentForward above (direct+shadowed sun, MegaLights RIS point lights,
+        // m_WorldProbes' indirect diffuse, an optional single-sample front-layer specular
+        // reflection), but fully OPAQUE and depth-WRITING (unlike glass). Recorded right BEFORE
+        // m_TransparentForward's own draw -- specifically so that pass' own read-only depth test
+        // correctly occludes glass/translucent entities against this entity's real (displaced)
+        // surface, see HeroTessellationPass's own class comment for the resulting barrier-scope
+        // consequence.
+        HeroTessellationPass m_HeroTessellation;
 
         // Lumen-style GI infrastructure -- unlike the debug-only stats/overlay block below, these
         // are real (if not yet light-transport-consuming) systems, not visualization tools, so

@@ -61,6 +61,17 @@ namespace renderer {
     // entity gets its own unique materialID today, see GenerateShowcaseMaterialTable's own comment).
     inline constexpr uint32_t kMaxMaterials = 32u;
 
+    // Phase 7a (UE5.8 parity roadmap, hero asset tessellation): the single tessellated/displaced
+    // hero material. Deliberately set to VulkanContext::kEntityCount (15) -- one past the highest
+    // entity-index-derived materialID GenerateShowcaseMaterialTable() ever hand-authors (entities
+    // 0..14 each get materialID == their own index, see that function's own zone-layout comment)
+    // -- so this reserved slot can never collide with a real entity's own showcase material (in
+    // particular slot 13, the green Cornell-box wall -- an earlier revision of this constant
+    // mistakenly reused that exact slot and silently clobbered it; see [[feedback_clean_merge_not_correct]]).
+    // Assigned explicitly to exactly one entity (the Icosphere, VulkanContext::kHeroEntityIndex) in
+    // VulkanContext::BuildEntityData(), never reached via the per-entity assignment loop.
+    inline constexpr uint32_t kHeroMaterialID = 15u;
+
     // One generated table: the PBR parameters themselves, plus a parallel convenience flag so
     // callers (VulkanContext::BuildEntityData, deciding each entity's core::EntityFlags::
     // IsTransparent bit) don't need to re-derive "alpha < 1.0" themselves.
@@ -158,6 +169,21 @@ namespace renderer {
         for (uint32_t i = 0; i < kMaxMaterials; ++i) {
             table.isTransparent[i] = (table.params[i].alpha < 1.0f);
         }
+
+        // Phase 7a (UE5.8 parity roadmap, hero asset tessellation): hero rocky/stone recipe --
+        // earthy brown-gray, high roughness (no sharp specular, matching a weathered rock
+        // surface), fully opaque, reflections ON (a subtle sheen, showcasing
+        // renderer::HeroTessellationPass's own GGX-VNDF reflection trace the same way the
+        // "Transparent/glass" material above showcases it for TransparentForwardPass). Rendered
+        // ONLY by renderer::HeroTessellationPass; never reaches the opaque Nanite resolve shaders
+        // (its entity is unconditionally excluded from that path via core::EntityFlags::
+        // IsTransparent, see VulkanContext::BuildEntityData()'s own comment) nor
+        // TransparentForwardPass (table.isTransparent[kHeroMaterialID] stays false).
+        // kHeroMaterialID (15) sits past every hand-authored slot above (0-14, one per real
+        // entity -- see this function's own zone-layout comment), so the loop above never touches
+        // it -- still at this function's own top-of-array neutral default until overwritten here.
+        table.params[kHeroMaterialID] = MaterialParameters{
+            maths::vec3(0.40f, 0.33f, 0.27f), 0.92f, maths::vec3(0.0f, 0.0f, 0.0f), 0.0f, 1.0f, 0.0f, 1.0f, 0.0f };
 
         return table;
     }

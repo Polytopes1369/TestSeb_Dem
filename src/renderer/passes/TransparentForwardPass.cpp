@@ -1,6 +1,8 @@
 #include "renderer/passes/TransparentForwardPass.h"
 
+#include <cstring>
 #include <format>
+#include <stdexcept>
 
 #include "core/Logger.h"
 #include "geometry/GpuPageTable.h"
@@ -154,12 +156,50 @@ namespace renderer {
         gridParams.gridOriginZ = worldProbes.GetGridOriginWorld().z;
         gridParams.probeSpacing = WorldProbeGridPass::kProbeSpacing;
         gridParams.gridResolution = static_cast<float>(WorldProbeGridPass::kGridResolution);
+
+        // m_ClusterEntriesBuffer's byte size scales with m_ClusterCount (scene-composition-
+        // dependent -- every entity with an alpha < 1.0 material contributes its leaf clusters, see
+        // this function's own loop above), so vkCmdUpdateBuffer's hard 65536-byte spec ceiling
+        // (VUID-vkCmdUpdateBuffer-dataSize-00037) cannot be assumed to hold for it the way it safely
+        // does for the two small, fixed-size buffers below. Staged through a temporary host-visible
+        // buffer + vkCmdCopyBuffer instead, mirroring VulkanContext::UploadEntityData's own identical
+        // staging pattern for the same reason (its own upload size is scene/entity-count-dependent).
+        const VkDeviceSize clusterEntriesBytes = sizeof(TransparentClusterEntry) * m_ClusterCount;
+        VkBufferCreateInfo stagingInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        stagingInfo.size = clusterEntriesBytes;
+        stagingInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+        VmaAllocationCreateInfo stagingAllocInfo{};
+        stagingAllocInfo.usage = VMA_MEMORY_USAGE_CPU_ONLY;
+        stagingAllocInfo.flags = VMA_ALLOCATION_CREATE_MAPPED_BIT;
+        VkBuffer stagingBuffer = VK_NULL_HANDLE;
+        VmaAllocation stagingAllocation = VK_NULL_HANDLE;
+        VmaAllocationInfo stagingAllocResultInfo{};
+        if (vmaCreateBuffer(allocator, &stagingInfo, &stagingAllocInfo,
+                            &stagingBuffer, &stagingAllocation, &stagingAllocResultInfo) != VK_SUCCESS) {
+            throw std::runtime_error("Failed to allocate TransparentForwardPass cluster-entries staging buffer!");
+        }
+        std::memcpy(stagingAllocResultInfo.pMappedData, hostEntries.data(), static_cast<size_t>(clusterEntriesBytes));
+
         VulkanUtils::ExecuteOneShotCommands(m_Device, commandPool, queue, [&](VkCommandBuffer cmd) {
-            vkCmdUpdateBuffer(cmd, m_ClusterEntriesBuffer.Handle(), 0,
-                sizeof(TransparentClusterEntry) * m_ClusterCount, hostEntries.data());
+            VkBufferCopy copyRegion{0, 0, clusterEntriesBytes};
+            vkCmdCopyBuffer(cmd, stagingBuffer, m_ClusterEntriesBuffer.Handle(), 1, &copyRegion);
             vkCmdUpdateBuffer(cmd, m_DrawCountBuffer.Handle(), 0, sizeof(uint32_t), &m_ClusterCount);
             vkCmdUpdateBuffer(cmd, m_WorldProbeGridParamsBuffer.Handle(), 0, sizeof(WorldProbeGridParams), &gridParams);
+
+            // The copy's writes must be visible before the SSBO is read (matches
+            // VulkanContext::UploadEntityData's own barrier for the same staged-copy pattern).
+            VkMemoryBarrier2 copyBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+            copyBarrier.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+            copyBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+            copyBarrier.dstStageMask = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+            copyBarrier.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
+            VkDependencyInfo depInfo{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+            depInfo.memoryBarrierCount = 1;
+            depInfo.pMemoryBarriers = &copyBarrier;
+            vkCmdPipelineBarrier2(cmd, &depInfo);
         });
+
+        vmaDestroyBuffer(allocator, stagingBuffer, stagingAllocation);
 
         // =====================================================================================
         // Descriptor pool, shared by both descriptor sets below.

@@ -812,6 +812,13 @@ void VulkanContext::CreateLogicalDevice() {
   // then rejects. A near-universally-supported core Vulkan 1.0 feature bit on desktop GPUs, so
   // enabled unconditionally here, matching multiDrawIndirect's own enablement rigor above.
   deviceFeatures2.features.independentBlend = VK_TRUE;
+  // tessellationShader (Phase 7a, UE5.8 parity roadmap): core Vulkan 1.0 feature bit, no device
+  // extension required -- gates VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT/_EVALUATION_BIT
+  // (renderer::HeroTessellationPass, the hero Icosphere's own screen-space-adaptive
+  // displacement-mapped pipeline). A near-universally-supported core feature on desktop GPUs
+  // (same rigor as geometryShader/fragmentStoresAndAtomics/multiDrawIndirect above), enabled
+  // unconditionally here.
+  deviceFeatures2.features.tessellationShader = VK_TRUE;
 
   VkDeviceCreateInfo createInfo{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
   createInfo.pNext = &deviceFeatures2;
@@ -1428,7 +1435,26 @@ void VulkanContext::BuildEntityData() {
     entity.cellID = 0u;
     entity.flags = 0u;
     core::SetFlag(entity.flags, core::EntityFlags::CastShadows, true);
-    core::SetFlag(entity.flags, core::EntityFlags::IsTransparent, m_MaterialTable.isTransparent[i]);
+
+    bool isTransparent = m_MaterialTable.isTransparent[i];
+    // Phase 7a (UE5.8 parity roadmap, hero asset tessellation): the Icosphere (kHeroEntityIndex)
+    // is the single tessellated/displaced hero asset, rendered ONLY by
+    // renderer::HeroTessellationPass -- never by the opaque Nanite VisBuffer pipeline (no
+    // representation for runtime-displaced geometry there) nor by TransparentForwardPass.
+    // Overrides its materialID to the reserved renderer::kHeroMaterialID slot (see that
+    // constant's own comment) and forces its entity IsTransparent flag true -- NOT because it's
+    // actually alpha-blended (kHeroMaterialID's own alpha is 1.0, fully opaque), but because
+    // ClusterLODCompact.comp's existing per-entity IsTransparent exclusion (see that shader's own
+    // EntityDataBuffer comment) is the exact "never enters the opaque candidate list" mechanism
+    // this entity also needs. TransparentForwardPass itself stays unaffected: it filters by
+    // materialTable.isTransparent[materialID], which correctly stays false for kHeroMaterialID
+    // (GenerateShowcaseMaterialTable() never sets it true -- see that function's own hero-recipe
+    // comment), so the hero entity's clusters never enter ITS candidate list either.
+    if (i == kHeroEntityIndex) {
+      entity.materialID = renderer::kHeroMaterialID;
+      isTransparent = true;
+    }
+    core::SetFlag(entity.flags, core::EntityFlags::IsTransparent, isTransparent);
   }
 }
 
