@@ -40,13 +40,6 @@ const std::vector<const char *> validationLayers = {
 #endif // NDEBUG
 
 namespace {
-// Procedural geometry SSBO capacities. Sized with real headroom above the
-// current 12-primitive total (~6k vertices / ~31k indices at the time of
-// writing) since GenerateGeometry() asserts against these below -- growing a
-// primitive's segment counts past this ceiling now fails loudly at startup
-// instead of silently overflowing into adjacent GPU memory.
-constexpr VkDeviceSize kVertexBufferBytes = config::nanite::VERTEX_BUFFER_BYTES;
-constexpr VkDeviceSize kIndexBufferBytes = config::nanite::INDEX_BUFFER_BYTES;
 
 // --- Per-shader Params blocks, mirrored 1:1 from their geom_*.comp
 // UBO/push-constant declarations (all fields are 4-byte scalars, so std140
@@ -320,6 +313,10 @@ void VulkanContext::Init(std::string_view appName, GLFWwindow *window) {
   SetupDebugMessenger();
   CreateSurface(window);
   PickPhysicalDevice();
+
+  m_VertexBufferBytes = config::nanite::VERTEX_BUFFER_BYTES;
+  m_IndexBufferBytes = config::nanite::INDEX_BUFFER_BYTES;
+
   CreateLogicalDevice();
 
   CreateCommandPool();
@@ -375,9 +372,9 @@ void VulkanContext::Init(std::string_view appName, GLFWwindow *window) {
   UploadEntityData();
 
   // Allocate Procedural Geometry Buffers (see
-  // kVertexBufferBytes/kIndexBufferBytes; 256B for internal parameters)
+  // m_VertexBufferBytes/m_IndexBufferBytes; 256B for internal parameters)
   VkBufferCreateInfo vInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-  vInfo.size = kVertexBufferBytes;
+  vInfo.size = m_VertexBufferBytes;
   // TRANSFER_SRC_BIT is required for the DEBUG readback (vkCmdCopyBuffer) in
   // DebugReadbackGeometrySample()
   vInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
@@ -388,10 +385,10 @@ void VulkanContext::Init(std::string_view appName, GLFWwindow *window) {
                       &m_VertexAllocation, nullptr) != VK_SUCCESS) {
     throw std::runtime_error("Failed to allocate vertex SSBO!");
   }
-  LOG_INFO(std::format("[VulkanContext] Allocated vertex SSBO: size={} MB.", kVertexBufferBytes / (1024 * 1024)));
+  LOG_INFO(std::format("[VulkanContext] Allocated vertex SSBO: size={} MB.", m_VertexBufferBytes / (1024 * 1024)));
 
   VkBufferCreateInfo iInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-  iInfo.size = kIndexBufferBytes;
+  iInfo.size = m_IndexBufferBytes;
   // TRANSFER_SRC_BIT is required for the DEBUG readback (vkCmdCopyBuffer) in
   // DebugReadbackGeometrySample()
   iInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
@@ -401,7 +398,7 @@ void VulkanContext::Init(std::string_view appName, GLFWwindow *window) {
                       &m_IndexAllocation, nullptr) != VK_SUCCESS) {
     throw std::runtime_error("Failed to allocate index SSBO!");
   }
-  LOG_INFO(std::format("[VulkanContext] Allocated index SSBO: size={} MB.", kIndexBufferBytes / (1024 * 1024)));
+  LOG_INFO(std::format("[VulkanContext] Allocated index SSBO: size={} MB.", m_IndexBufferBytes / (1024 * 1024)));
 
   VkBufferCreateInfo pInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
   pInfo.size = 256;
@@ -618,6 +615,13 @@ void VulkanContext::PickPhysicalDevice() {
   std::vector<VkPhysicalDevice> devices(deviceCount);
   vkEnumeratePhysicalDevices(m_Instance, &deviceCount, devices.data());
   m_PhysicalDevice = devices[0];
+
+  VkPhysicalDeviceProperties properties;
+  vkGetPhysicalDeviceProperties(m_PhysicalDevice, &properties);
+  std::string deviceName(properties.deviceName);
+  LOG_INFO(std::format("[VulkanContext] Detected physical device: {}", deviceName));
+
+  config::InitializeProfileFromGPU(deviceName);
 }
 
 void VulkanContext::CreateLogicalDevice() {
@@ -2052,17 +2056,17 @@ void VulkanContext::GenerateGeometry() {
       static_cast<VkDeviceSize>(m_TotalVertexCount) * sizeof(renderer::Vertex);
   const VkDeviceSize indexBytesUsed =
       static_cast<VkDeviceSize>(m_TotalIndexCount) * sizeof(uint32_t);
-  if (vertexBytesUsed > kVertexBufferBytes ||
-      indexBytesUsed > kIndexBufferBytes) {
+  if (vertexBytesUsed > m_VertexBufferBytes ||
+      indexBytesUsed > m_IndexBufferBytes) {
     LOG_CRITICAL(std::format("[GenerateGeometry] Procedural geometry "
                              "OVERFLOWED its fixed-size SSBOs: "
                              "vertices used {}/{} bytes, indices used {}/{} "
                              "bytes. GPU writes past this point are "
                              "undefined behavior (silent corruption of "
-                             "adjacent buffers). Increase kVertexBufferBytes/"
-                             "kIndexBufferBytes in VulkanContext.cpp.",
-                             vertexBytesUsed, kVertexBufferBytes,
-                             indexBytesUsed, kIndexBufferBytes));
+                             "adjacent buffers). Increase VERTEX_BUFFER_BYTES/"
+                             "INDEX_BUFFER_BYTES in the chosen configuration profile.",
+                             vertexBytesUsed, m_VertexBufferBytes,
+                             indexBytesUsed, m_IndexBufferBytes));
     throw std::runtime_error(
         "Procedural geometry buffers overflowed -- see log for exact sizes.");
   }
@@ -2071,8 +2075,8 @@ void VulkanContext::GenerateGeometry() {
                        "totalVertexCount={} totalIndexCount={} "
                        "(buffers hold {} verts / {} indices max)",
                        runningVertexOffset, runningIndexOffset,
-                       kVertexBufferBytes / sizeof(renderer::Vertex),
-                       kIndexBufferBytes / sizeof(uint32_t)));
+                       m_VertexBufferBytes / sizeof(renderer::Vertex),
+                       m_IndexBufferBytes / sizeof(uint32_t)));
 }
 
 void VulkanContext::UpdateEntityRotations(float timeSeconds) {
@@ -2142,7 +2146,7 @@ void VulkanContext::DebugReadbackGeometrySample(uint32_t vertsPerFace,
   // proves (or disproves) that the compute dispatch wrote data past the first
   // face.
   const uint32_t maxVertsInBuffer =
-      static_cast<uint32_t>(kVertexBufferBytes / sizeof(renderer::Vertex));
+      static_cast<uint32_t>(m_VertexBufferBytes / sizeof(renderer::Vertex));
   const uint32_t sampleVertexCount =
       std::min<uint32_t>(vertsPerFace + 8u, maxVertsInBuffer);
   const uint32_t sampleIndexCount = std::min<uint32_t>(12u, expectedIndexCount);

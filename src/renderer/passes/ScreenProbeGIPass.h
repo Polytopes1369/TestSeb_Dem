@@ -68,10 +68,10 @@ namespace renderer {
         ScreenProbeGIPass(const ScreenProbeGIPass&) = delete;
         ScreenProbeGIPass& operator=(const ScreenProbeGIPass&) = delete;
 
-        static constexpr uint32_t kProbeTileSize = config::lumen::SCREEN_PROBE_TILE_SIZE;   // Screen pixels per probe tile, both axes.
-        static constexpr uint32_t kProbeRayCount = config::lumen::SCREEN_PROBE_RAY_COUNT;  // Fibonacci-sphere rays traced per probe per frame.
+        static inline uint32_t kProbeTileSize = 8u;   // Screen pixels per probe tile, both axes.
+        static inline uint32_t kProbeRayCount = 64u;  // Fibonacci-sphere rays traced per probe per frame.
         static constexpr uint32_t kGridWorkgroupSize = 8; // RecordTemporal's/RecordGather's local_size_x/y.
-        static constexpr float kTemporalAlpha = config::lumen::SCREEN_PROBE_TEMPORAL_ALPHA;  // Exponential moving-average blend factor.
+        static inline float kTemporalAlpha = 0.05f;  // Exponential moving-average blend factor.
 
         static constexpr VkFormat kSHFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
         static constexpr VkFormat kWorldPosFormat = VK_FORMAT_R32G32B32A32_SFLOAT; // rgb = world pos, a = validity.

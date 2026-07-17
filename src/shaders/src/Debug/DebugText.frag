@@ -17,19 +17,42 @@ layout(location = 1) flat in uint inCharCode;
 
 layout(location = 0) out vec4 outColor;
 
+bool hasBit(int x, int y) {
+    int fontX = int(floor(float(x) / 2.0));
+    int fontY = int(floor(float(y) / 2.0));
+    if (fontX < 0 || fontX >= 8 || fontY < 0 || fontY >= 8) return false;
+    uint rowBits = g_Font.rows[inCharCode * 8u + uint(fontY)];
+    return ((rowBits >> (7u - uint(fontX))) & 1u) != 0u;
+}
+
 void main() {
     ivec2 texel = ivec2(floor(inGlyphLocalPixel));
-    if (texel.x < 0 || texel.x >= 8 || texel.y < 0 || texel.y >= 8) {
-        discard;
+
+    // 1. Check if the center pixel itself is set (White text)
+    if (hasBit(texel.x, texel.y)) {
+        outColor = vec4(1.0, 1.0, 1.0, 0.9); // White text with 0.9 alpha
+        return;
     }
 
-    uint rowBits = g_Font.rows[inCharCode * 8u + uint(texel.y)];
-    uint bit = (rowBits >> (7u - uint(texel.x))) & 1u;
-    if (bit == 0u) {
-        discard;
+    // 2. Check if any neighboring pixel within 2px is set (Black outline)
+    bool isOutline = false;
+    for (int dy = -2; dy <= 2; ++dy) {
+        for (int dx = -2; dx <= 2; ++dx) {
+            if (dx == 0 && dy == 0) continue;
+            // 2px circle radius: dx^2 + dy^2 <= 5
+            if (dx * dx + dy * dy <= 5) {
+                if (hasBit(texel.x + dx, texel.y + dy)) {
+                    isOutline = true;
+                    break;
+                }
+            }
+        }
+        if (isOutline) break;
     }
 
-    // Fixed bright yellow, matching this codebase's existing debug-text convention (see
-    // ClusterResolve.comp's own DEBUG view-mode string drawing, DrawString/finalColor = (1,1,0)).
-    outColor = vec4(1.0, 1.0, 0.0, 0.9);
+    if (isOutline) {
+        outColor = vec4(0.0, 0.0, 0.0, 0.9); // Black outline with 0.9 alpha
+    } else {
+        discard;
+    }
 }

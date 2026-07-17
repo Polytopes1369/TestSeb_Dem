@@ -72,17 +72,17 @@ namespace renderer {
 
         // Cubic probe count per axis -- see the class comment's "why a full rebuild" note for why
         // this stays small enough that a full rebuild every frame is affordable.
-        static constexpr uint32_t kGridResolution = config::lumen::PROBE_GRID_RESOLUTION;
+        static inline uint32_t kGridResolution = 64u;
         // World-space distance between adjacent probes -- together with kGridResolution, this
         // grid covers a (kGridResolution * kProbeSpacing)^3 = 64^3 world-unit cube centered on the
         // camera, recentered every RecordUpdate() call (see that method's own comment).
-        static constexpr float kProbeSpacing = config::lumen::PROBE_SPACING;
+        static inline float kProbeSpacing = 1.0f;
         // Matches WorldProbeInject.comp's local_size_x/y/z exactly.
         static constexpr uint32_t kWorkgroupSize = 4;
         // Fixed omnidirectional sample set per probe -- see the class comment's own "why no
         // hemisphere sampling" note. Matches WorldProbeInject.comp's kProbeSampleDirections array
         // length exactly.
-        static constexpr uint32_t kProbeSampleDirections = config::lumen::PROBE_SAMPLE_DIRECTIONS;
+        static inline uint32_t kProbeSampleDirections = 14u;
 
         static constexpr VkFormat kGridFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
 

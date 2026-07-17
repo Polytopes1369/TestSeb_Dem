@@ -117,6 +117,8 @@ private:
     VkBuffer m_EntityBuffer = VK_NULL_HANDLE;
     VmaAllocation m_EntityAllocation = VK_NULL_HANDLE;
 
+    VkDeviceSize m_VertexBufferBytes = 0;
+    VkDeviceSize m_IndexBufferBytes = 0;
     VkBuffer m_VertexBuffer = VK_NULL_HANDLE;
     VmaAllocation m_VertexAllocation = VK_NULL_HANDLE;
     VkBuffer m_IndexBuffer = VK_NULL_HANDLE;

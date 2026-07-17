@@ -55,6 +55,10 @@ namespace renderer {
     bool ScreenProbeGIPass::Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
         VkExtent2D renderExtent, const SurfaceCacheTraceContext& traceContext, const SurfaceCachePass& surfaceCache,
         const SurfaceCacheRayTracingPass& rtPass, const ClusterResolvePass& resolvePass) {
+        kProbeTileSize = config::lumen::SCREEN_PROBE_TILE_SIZE;
+        kProbeRayCount = config::lumen::SCREEN_PROBE_RAY_COUNT;
+        kTemporalAlpha = config::lumen::SCREEN_PROBE_TEMPORAL_ALPHA;
+
         Shutdown();
 
         m_Device = device;

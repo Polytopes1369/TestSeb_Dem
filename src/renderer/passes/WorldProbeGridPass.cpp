@@ -30,6 +30,10 @@ namespace renderer {
     bool WorldProbeGridPass::Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
         const SurfaceCacheTraceContext& traceContext, const SurfaceCachePass& surfaceCache,
         const SurfaceCacheRayTracingPass& rtPass) {
+        kGridResolution = config::lumen::PROBE_GRID_RESOLUTION;
+        kProbeSpacing = config::lumen::PROBE_SPACING;
+        kProbeSampleDirections = config::lumen::PROBE_SAMPLE_DIRECTIONS;
+
         Shutdown();
         m_Device = device;
         m_Allocator = allocator;

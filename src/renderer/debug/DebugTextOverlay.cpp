@@ -10,6 +10,8 @@
 #include "renderer/vulkan/VulkanUtils.h"
 #include "renderer/debug/BitmapFont8x8.h"
 
+#include "core/EngineConfig.h"
+
 namespace renderer::debug {
 
     namespace {
@@ -245,13 +247,13 @@ namespace renderer::debug {
     }
 
     void DebugTextOverlay::BuildFrameText(float gpuMemUsedMB, uint32_t pendingPageLoads, float bytesPerSecond,
-        uint32_t hwTriangleCount, uint32_t swTriangleCount, float fps, float viewportWidthPixels,
+        uint32_t hwTriangleCount, uint32_t swTriangleCount, float fps, float viewportWidthPixels, float viewportHeightPixels,
         bool radiosityEnabled, bool ssrtEnabled, uint32_t traceMode, bool worldProbesEnabled) {
         m_PendingGlyphs.clear();
 
         constexpr float kMarginX = 8.0f;
         constexpr float kMarginY = 8.0f;
-        constexpr float kLineHeight = 10.0f;
+        constexpr float kLineHeight = 20.0f;
 
         float y = kMarginY;
         AppendLine(std::format("GPU MEM: {:.1f} MB", gpuMemUsedMB), kMarginX, y); y += kLineHeight;
@@ -268,6 +270,14 @@ namespace renderer::debug {
         // that fact stays visible instead of implying parity with the other three.
         AppendLine(std::format("WORLDPROBES={} (not yet sampled)", worldProbesEnabled ? "ON" : "OFF"),
             kMarginX, y); y += kLineHeight;
+
+        // Bottom-left profile name overlay (e.g. low, medium, high)
+        std::string profileLower = "";
+        for (char c : config::g_ActiveProfileName) {
+            profileLower += std::tolower(static_cast<unsigned char>(c));
+        }
+        float profileY = viewportHeightPixels - 40.0f - kLineHeight;
+        AppendLine(profileLower, kMarginX, profileY);
 
         // Top-right FPS counter -- right-aligned against the render extent's own width using
         // kGlyphAdvanceX's fixed per-glyph pixel advance to measure the line before it's drawn.

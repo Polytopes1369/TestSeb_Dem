@@ -177,9 +177,11 @@ uint GetFontChar(int c) {
     return 0u;
 }
 
-bool DrawString(ivec2 pixel, ivec2 startPos, int chars[32], int len) {
-    ivec2 local = pixel - startPos;
-    if (local.x < 0 || local.y < 0 || local.y >= 5) return false;
+bool DrawStringScaled(ivec2 pixel, ivec2 startPos, int chars[32], int len) {
+    ivec2 diff = pixel - startPos;
+    if (diff.x < 0 || diff.y < 0) return false;
+    ivec2 local = diff / 2;
+    if (local.y >= 5) return false;
     int charIdx = local.x / 6;
     if (charIdx >= len) return false;
     int localX = local.x % 6;
@@ -542,16 +544,34 @@ void main() {
     }
 
     if (len > 0) {
-        int strWidth = len * 6;
-        ivec2 startPos = ivec2(uiRes.x - strWidth - 4, uiRes.y - 5 - 4);
+        int strWidth = len * 12;
+        ivec2 startPos = ivec2(uiRes.x - strWidth - 8, uiRes.y - 10 - 8);
         
-        if (uiPixel.x >= startPos.x - 2 && uiPixel.x <= startPos.x + strWidth + 1 &&
-            uiPixel.y >= startPos.y - 2 && uiPixel.y <= startPos.y + 6) {
-            finalColor = vec3(0.0);
-        }
-
-        if (DrawString(uiPixel, startPos, chars, len)) {
-            finalColor = vec3(1.0, 1.0, 0.0);
+        // Restrict outline / text processing to bounding box plus padding for performance
+        if (uiPixel.x >= startPos.x - 4 && uiPixel.x <= startPos.x + strWidth + 3 &&
+            uiPixel.y >= startPos.y - 4 && uiPixel.y <= startPos.y + 13) {
+            
+            bool isText = DrawStringScaled(uiPixel, startPos, chars, len);
+            if (isText) {
+                finalColor = vec3(1.0, 1.0, 1.0); // White text
+            } else {
+                bool isOutline = false;
+                for (int dy = -2; dy <= 2; ++dy) {
+                    for (int dx = -2; dx <= 2; ++dx) {
+                        if (dx == 0 && dy == 0) continue;
+                        if (dx * dx + dy * dy <= 5) {
+                            if (DrawStringScaled(uiPixel + ivec2(dx, dy), startPos, chars, len)) {
+                                isOutline = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (isOutline) break;
+                }
+                if (isOutline) {
+                    finalColor = vec3(0.0, 0.0, 0.0); // Black outline
+                }
+            }
         }
     }
 #endif

@@ -31,6 +31,8 @@ namespace renderer {
 
     bool SurfaceCacheTraceContext::Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
         const GlobalSDFPass& globalSDF, const SurfaceCachePass& surfaceCache) {
+        kMaxTracedEntities = config::lumen::MAX_TRACED_ENTITIES;
+
         Shutdown();
         m_Device = device;
         m_Allocator = allocator;

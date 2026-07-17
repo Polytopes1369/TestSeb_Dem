@@ -71,15 +71,15 @@ namespace renderer {
         VirtualShadowMapPass& operator=(const VirtualShadowMapPass&) = delete;
 
         static constexpr uint32_t kSunLevelCount = config::lumen::VSM_SUN_LEVEL_COUNT;
-        static constexpr float kSunBaseRadius = config::lumen::VSM_SUN_BASE_RADIUS; // Level 0's ortho half-extent; level L = kSunBaseRadius * 2^L.
+        static inline float kSunBaseRadius = 2.0f; // Level 0's ortho half-extent; level L = kSunBaseRadius * 2^L.
         static constexpr float kSunNearMarginFactor = 0.05f; // Matches ShadowMapPass's own convention.
         static constexpr float kSunFarMarginFactor = 2.0f;
 
         static constexpr uint32_t kMaxPointLightVSMs = kMaxPointLights * 6u; // 48.
-        static constexpr uint32_t kTotalVSMCount = kSunLevelCount + kMaxPointLightVSMs; // 51.
+        static constexpr uint32_t kTotalVSMCount = kSunLevelCount + kMaxPointLightVSMs;
 
-        static constexpr uint32_t kPhysicalPageCapacity = config::lumen::VSM_PHYSICAL_PAGE_CAPACITY; // 256 * 128^2 * 4B = 16 MB.
-        static constexpr uint32_t kMaxPagesRenderedPerFrame = config::lumen::VSM_MAX_PAGES_RENDERED_PER_FRAME; // Generous: the Fallback Mesh is tiny to render.
+        static inline uint32_t kPhysicalPageCapacity = 4096u; // 256 * 128^2 * 4B = 16 MB.
+        static inline uint32_t kMaxPagesRenderedPerFrame = 512u; // Generous: the Fallback Mesh is tiny to render.
         static constexpr uint32_t kFeedbackCapacity = 256; // Bounded reports/frame, see FeedbackBuffer's own comment.
 
         // Reads every fallback mesh's geometry from `cacheFilePath` (mirrors ShadowMapPass::Init's

@@ -45,7 +45,7 @@ namespace renderer::debug {
         // BuildFrameText() to estimate a line's pixel width for right-aligned placement (the FPS
         // counter), so it must stay a single shared constant rather than a value duplicated in
         // AppendLine()'s own body.
-        static constexpr float kGlyphAdvanceX = 9.0f;
+        static constexpr float kGlyphAdvanceX = 18.0f;
 
         // Builds the font bitmap SSBO (BitmapFont8x8.h, uploaded once via a blocking one-time
         // submit) and the glyph-instance SSBO/descriptor set/pipeline. `outputColorFormat` must
@@ -63,7 +63,7 @@ namespace renderer::debug {
         // counter; `radiosityEnabled`/`ssrtEnabled`/`traceMode` (0 = SWRT, 1 = HWRT)/
         // `worldProbesEnabled` mirror ClusterRenderPipeline's own current debug-toggle state exactly.
         void BuildFrameText(float gpuMemUsedMB, uint32_t pendingPageLoads, float bytesPerSecond,
-            uint32_t hwTriangleCount, uint32_t swTriangleCount, float fps, float viewportWidthPixels,
+            uint32_t hwTriangleCount, uint32_t swTriangleCount, float fps, float viewportWidthPixels, float viewportHeightPixels,
             bool radiosityEnabled, bool ssrtEnabled, uint32_t traceMode, bool worldProbesEnabled);
 
         void RecordDraw(VkCommandBuffer cmd, VkImage outputColorImage, VkImageView outputColorView, VkExtent2D extent);

@@ -39,7 +39,7 @@ namespace renderer {
         SurfaceCacheTraceContext& operator=(const SurfaceCacheTraceContext&) = delete;
 
         // Must match mesh_sdf_trace.glsl's kMaxTracedEntities exactly.
-        static constexpr uint32_t kMaxTracedEntities = config::lumen::MAX_TRACED_ENTITIES;
+        static inline uint32_t kMaxTracedEntities = 128u;
         // Sentinel SDF value the unused (>= entityCount) g_EntitySDF array slots are filled with --
         // matches GlobalSDFPass::kFarValue's role (always farther than kSphereTraceEpsilon, so a
         // ray that reaches an unused slot's dummy volume can never register a false hit).

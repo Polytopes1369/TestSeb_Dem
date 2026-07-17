@@ -130,6 +130,9 @@ namespace renderer {
 
     bool SurfaceCachePass::Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
         const std::filesystem::path& cacheFilePath) {
+        kCardsPerFrameBudget = config::lumen::CARDS_PER_FRAME_BUDGET;
+        kEvictionFrameDelay = config::lumen::EVICTION_FRAME_DELAY;
+
         Shutdown();
 
         m_Device = device;

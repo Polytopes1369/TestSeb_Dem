@@ -45,6 +45,10 @@ namespace renderer {
 
     bool VirtualShadowMapPass::Init(VkPhysicalDevice physicalDevice, VkDevice device, VmaAllocator allocator,
         VkCommandPool commandPool, VkQueue queue, const std::filesystem::path& cacheFilePath) {
+        kSunBaseRadius = config::lumen::VSM_SUN_BASE_RADIUS;
+        kPhysicalPageCapacity = config::lumen::VSM_PHYSICAL_PAGE_CAPACITY;
+        kMaxPagesRenderedPerFrame = config::lumen::VSM_MAX_PAGES_RENDERED_PER_FRAME;
+
         Shutdown();
 
         m_Device = device;
@@ -365,7 +369,7 @@ namespace renderer {
         // comment on this flag. m_SunLevelsUBO/m_PointFacesUBO above still get this frame's valid
         // view-projection matrices either way, so re-enabling this flag later needs no other change.
         bool renderedAnyPage = false;
-        if constexpr (config::lumen::BUILD_SHADOWS) {
+        if (config::lumen::BUILD_SHADOWS) {
             std::vector<uint32_t> missedPages = m_Feedback.ReadRequestedClusterIDs();
             m_RequestQueue.SubmitFrameRequests(missedPages);
 

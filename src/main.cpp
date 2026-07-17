@@ -161,6 +161,12 @@ int main() {
     LOG_INIT("demo_log.txt");
     LOG_INFO("Starting DemoScene Engine...");
 
+    if (config::LoadProfileLocal()) {
+        LOG_INFO(std::format("[Main] Loaded saved GPU profile '{}' from cache, skipping startup GPU scan.", config::g_ActiveProfileName));
+    } else {
+        LOG_INFO("[Main] No saved GPU profile cache found. A GPU scan will run during Vulkan device setup.");
+    }
+
     if (!glfwInit()) {
         LOG_CRITICAL("Failed to initialize GLFW!");
         return -1;

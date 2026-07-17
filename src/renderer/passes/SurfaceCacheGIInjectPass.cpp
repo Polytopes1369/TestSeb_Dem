@@ -30,6 +30,9 @@ namespace renderer {
 
     bool SurfaceCacheGIInjectPass::Init(VkDevice device, VmaAllocator /*allocator*/, const SurfaceCacheTraceContext& traceContext,
         const SurfaceCachePass& surfaceCache, const SurfaceCacheRayTracingPass& rtPass) {
+        kCardsPerFrameBudget = config::lumen::CARDS_PER_FRAME_BUDGET;
+        kSampleCountPerTexel = config::lumen::SURFACE_CACHE_GI_SAMPLE_COUNT;
+
         Shutdown();
         m_Device = device;
 

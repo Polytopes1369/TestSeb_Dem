@@ -31,19 +31,23 @@ const vec2 kQuadCorners[6] = vec2[6](
     vec2(0.0, 1.0), vec2(1.0, 0.0), vec2(1.0, 1.0)
 );
 
-const float kGlyphPixelSize = 8.0; // 8x8 font (BitmapFont8x8.h), drawn at 1:1 pixel scale.
+const float kGlyphPixelSize = 16.0; // 8x8 font (BitmapFont8x8.h), drawn at 2:1 pixel scale.
 
 void main() {
     GlyphInstance inst = g_Glyphs.instances[gl_InstanceIndex];
     vec2 corner = kQuadCorners[gl_VertexIndex];
 
-    vec2 pixelPos = inst.screenPosPixels + corner * kGlyphPixelSize;
+    // Expand local quad size by 2 pixels on each border to make room for a 2px black outline
+    float kPadding = 2.0;
+    vec2 localPos = -kPadding + corner * (kGlyphPixelSize + 2.0 * kPadding);
+    vec2 pixelPos = inst.screenPosPixels + localPos;
+
     // Pixel space (origin top-left, +Y down) -> NDC (origin center, +Y down in Vulkan) needs only
     // a scale + bias, no Y flip -- Vulkan's own y-down clip space already matches framebuffer
     // pixel-space orientation.
     vec2 ndc = (pixelPos / pc.viewportSize) * 2.0 - 1.0;
 
-    outGlyphLocalPixel = corner * kGlyphPixelSize;
+    outGlyphLocalPixel = localPos;
     outCharCode = inst.charCode;
 
     gl_Position = vec4(ndc, 0.0, 1.0);

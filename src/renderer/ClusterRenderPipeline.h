@@ -143,13 +143,13 @@ namespace renderer {
 
         // Average estimated triangle screen size (pixels) below which a cluster is routed to the
         // software rasterizer -- see ClusterHZBOcclusionCull.comp's ShouldUseSoftwareRaster().
-        static constexpr float kSoftwareRasterThresholdPixels = config::nanite::SOFTWARE_RASTER_THRESHOLD_PIXELS;
+        static inline float kSoftwareRasterThresholdPixels = 8.0f;
 
         // Target on-screen geometric error (pixels) for the LOD DAG cut -- see
         // ClusterDAGScreenError.comp's pixelThreshold. A node draws once its own projected error
         // drops below this value while its parent's still exceeds it; typical Nanite-style engines
         // target roughly 1 pixel.
-        static constexpr float kLODPixelErrorThreshold = config::nanite::LOD_PIXEL_ERROR_THRESHOLD;
+        static inline float kLODPixelErrorThreshold = 0.5f;
 
         // Number of consecutive SurfaceCacheGIInjectPass::RecordInject calls made THIS frame (see
         // RecordFrame()'s own [1z] block). Each call advances m_GIInject's own round-robin cursor by
@@ -161,7 +161,7 @@ namespace renderer {
         // visibly wrap a corner within a single frame without tripling GI cost for a barely-visible
         // 4th+ bounce (each bounce's marginal energy contribution falls off quickly against typical
         // scene albedo).
-        static constexpr uint32_t kRadiosityBounceCount = config::lumen::RADIOSITY_BOUNCE_COUNT;
+        static inline uint32_t kRadiosityBounceCount = 4u;
 
         // Reads the .cache file's header/tables, streams every cluster's 4 KB geometry page into
         // the physical pool (one staging buffer, one setup command buffer, one blocking submit --

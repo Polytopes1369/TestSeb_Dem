@@ -84,6 +84,39 @@ namespace renderer::debug {
         set('W', { 0b10001, 0b10001, 0b10001, 0b10101, 0b10101, 0b11011, 0b10001 });
         set('Y', { 0b10001, 0b10001, 0b01010, 0b00100, 0b00100, 0b00100, 0b00100 });
 
+        // Add missing uppercase characters J, Q, X, Z
+        set('J', { 0b00001, 0b00001, 0b00001, 0b00001, 0b10001, 0b10001, 0b01110 });
+        set('Q', { 0b01110, 0b10001, 0b10001, 0b10001, 0b10101, 0b10010, 0b01101 });
+        set('X', { 0b10001, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001, 0b10001 });
+        set('Z', { 0b11111, 0b00010, 0b00100, 0b01000, 0b10000, 0b10000, 0b11111 });
+
+        // Add actual lowercase characters for "low", "medium", "high"
+        set('d', { 0b00001, 0b00001, 0b01111, 0b10001, 0b10001, 0b10001, 0b01111 });
+        set('e', { 0b00000, 0b00000, 0b01110, 0b10001, 0b11111, 0b10000, 0b01111 });
+        set('g', { 0b00000, 0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b01110 });
+        set('h', { 0b10000, 0b10000, 0b10110, 0b11001, 0b10001, 0b10001, 0b10001 });
+        set('i', { 0b00100, 0b00000, 0b01100, 0b00100, 0b00100, 0b00100, 0b01110 });
+        set('l', { 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110 });
+        set('m', { 0b00000, 0b00000, 0b11010, 0b10101, 0b10101, 0b10101, 0b10101 });
+        set('o', { 0b00000, 0b00000, 0b01110, 0b10001, 0b10001, 0b10001, 0b01110 });
+        set('u', { 0b00000, 0b00000, 0b10001, 0b10001, 0b10001, 0b10011, 0b01101 });
+        set('w', { 0b00000, 0b00000, 0b10001, 0b10001, 0b10101, 0b10101, 0b01010 });
+
+        // Fallback mapping for the rest of lowercase characters to uppercase
+        for (int c = 'a'; c <= 'z'; ++c) {
+            bool allZero = true;
+            for (int r = 0; r < 8; ++r) {
+                if (font[static_cast<uint8_t>(c)][r] != 0) {
+                    allZero = false;
+                    break;
+                }
+            }
+            if (allZero) {
+                char upper = static_cast<char>(std::toupper(c));
+                font[static_cast<uint8_t>(c)] = font[static_cast<uint8_t>(upper)];
+            }
+        }
+
         return font;
     }
 

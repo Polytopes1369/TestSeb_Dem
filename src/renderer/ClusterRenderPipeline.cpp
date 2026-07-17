@@ -55,6 +55,10 @@ namespace renderer {
 
 bool ClusterRenderPipeline::Init(
     const ClusterRenderPipelineCreateInfo &createInfo) {
+  kSoftwareRasterThresholdPixels = config::nanite::SOFTWARE_RASTER_THRESHOLD_PIXELS;
+  kLODPixelErrorThreshold = config::nanite::LOD_PIXEL_ERROR_THRESHOLD;
+  kRadiosityBounceCount = config::lumen::RADIOSITY_BOUNCE_COUNT;
+
   Shutdown();
 
   m_Device = createInfo.device;
@@ -1390,8 +1394,8 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
     m_LastStatsSampleBytes = totalBytesCompleted;
 
     m_DebugOverlay.BuildFrameText(gpuMemUsedMB, pendingPageLoads, bytesPerSecond, hwTriangleCount, swTriangleCount,
-        fps, static_cast<float>(m_RenderExtent.width), m_DebugRadiosityEnabled, m_DebugSSRTEnabled, traceMode,
-        m_DebugWorldProbesEnabled);
+        fps, static_cast<float>(m_RenderExtent.width), static_cast<float>(m_RenderExtent.height),
+        m_DebugRadiosityEnabled, m_DebugSSRTEnabled, traceMode, m_DebugWorldProbesEnabled);
 
     // Determine blitSourceImage early to draw HUD directly onto it
     VkImage blitSourceImage = m_TAATSR.GetOutputImage();
