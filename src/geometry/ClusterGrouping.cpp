@@ -61,6 +61,48 @@ namespace geometry {
         return groups;
     }
 
+    std::vector<std::vector<uint32_t>> GroupItemsIntoQuads(
+        uint32_t count, const std::unordered_map<uint64_t, uint32_t>& weights) {
+
+        std::vector<std::vector<uint32_t>> pairs = GreedyPairByWeight(count, weights);
+
+        // Which pair (index into `pairs`) now owns each original item -- lets the loop below turn
+        // an item-to-item weight into a pair-to-pair weight.
+        std::vector<uint32_t> itemToPair(count, 0xFFFFFFFFu);
+        for (uint32_t pi = 0; pi < pairs.size(); ++pi) {
+            for (uint32_t item : pairs[pi]) {
+                itemToPair[item] = pi;
+            }
+        }
+
+        std::unordered_map<uint64_t, uint32_t> pairWeights;
+        for (const auto& [packedKey, weight] : weights) {
+            uint32_t a = static_cast<uint32_t>(packedKey >> 32);
+            uint32_t b = static_cast<uint32_t>(packedKey & 0xFFFFFFFFu);
+            uint32_t pa = itemToPair[a];
+            uint32_t pb = itemToPair[b];
+            if (pa == pb) {
+                continue; // Both endpoints already landed in the same pair from pass 1.
+            }
+            pairWeights[PackIndexPairKey(pa, pb)] += weight;
+        }
+
+        std::vector<std::vector<uint32_t>> pairGroups =
+            GreedyPairByWeight(static_cast<uint32_t>(pairs.size()), pairWeights);
+
+        std::vector<std::vector<uint32_t>> groups;
+        groups.reserve(pairGroups.size());
+        for (const auto& memberPairIndices : pairGroups) {
+            std::vector<uint32_t> flattened;
+            flattened.reserve(4);
+            for (uint32_t pi : memberPairIndices) {
+                flattened.insert(flattened.end(), pairs[pi].begin(), pairs[pi].end());
+            }
+            groups.push_back(std::move(flattened));
+        }
+        return groups;
+    }
+
     namespace {
 
         // Builds, for every unordered cluster pair sharing at least one global vertex, the count
@@ -181,7 +223,7 @@ namespace geometry {
         }
 
         std::unordered_map<uint64_t, uint32_t> adjacencyWeights = BuildClusterAdjacencyWeights(clusters);
-        std::vector<std::vector<uint32_t>> memberLists = GreedyPairByWeight(static_cast<uint32_t>(clusters.size()), adjacencyWeights);
+        std::vector<std::vector<uint32_t>> memberLists = GroupItemsIntoQuads(static_cast<uint32_t>(clusters.size()), adjacencyWeights);
 
         std::vector<ClusterGroup> groups;
         groups.reserve(memberLists.size());

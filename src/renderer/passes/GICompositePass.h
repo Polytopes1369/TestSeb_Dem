@@ -49,15 +49,16 @@ namespace renderer {
         // tonemap curve lives downstream of TAA, in renderer::PostProcessPass.
         static constexpr VkFormat kOutputFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
 
-        // `directColorView` (renderer::ClusterResolvePass::GetOutputColorView()) and
-        // `denoisedGIView` (renderer::ATrousDenoisePass::GetOutputView()) are always bound (set 0,
-        // bindings 1/2). In a Debug build only, `depthView` and `worldProbes` are ALSO bound (see
-        // the class comment) to support the two debug view modes; both parameters are ignored
-        // entirely in a Release build (still accepted unconditionally so call sites do not need
-        // their own `#ifndef NDEBUG` branch).
+        // `directColorView` (renderer::ClusterResolvePass::GetOutputColorView()), `denoisedGIView`
+        // (renderer::ATrousDenoisePass::GetOutputView()), and `aoView` (Phase PP4, renderer::
+        // ScreenSpaceEffectsPass::GetAOView() -- multiplies the denoised GI term, see GIComposite
+        // .comp's own comment) are always bound (set 0, bindings 1/2/3). In a Debug build only,
+        // `depthView` and `worldProbes` are ALSO bound (see the class comment) to support the two
+        // debug view modes; both parameters are ignored entirely in a Release build (still accepted
+        // unconditionally so call sites do not need their own `#ifndef NDEBUG` branch).
         void Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
             VkExtent2D renderExtent, VkImageView directColorView, VkImageView denoisedGIView,
-            VkImageView depthView, const WorldProbeGridPass& worldProbes);
+            VkImageView aoView, VkImageView depthView, const WorldProbeGridPass& worldProbes);
 
         void Shutdown();
 

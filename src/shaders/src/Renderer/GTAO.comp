@@ -1,0 +1,130 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+
+// Phase PP4 (post-process stack roadmap): Ground Truth Ambient Occlusion, horizon-based -- one
+// invocation per render-resolution pixel. For a fixed number of screen-space directions around this
+// pixel, marches outward a few steps (world-space search radius, converted to a screen-space pixel
+// radius via this frame's `projScale` -- see renderer::ScreenSpaceEffectsPass::RecordAmbientOcclusion
+// for that CPU-side computation), reconstructs each sampled texel's own world position from
+// renderer::ClusterResolvePass's depth GBuffer, and tracks the steepest elevation angle above this
+// pixel's own tangent plane (defined by its GBuffer normal) found along that direction -- the
+// direction's "horizon". Averaging sin(horizon) over every direction and inverting gives an ambient
+// occlusion term in [0,1] via the same core horizon-search principle Activision/Jimenez's GTAO and
+// UE5.8's own Screen Space GTAO are both built on, simplified here to a single per-direction max
+// (no multi-bounce/thin-occluder refinement term) to keep this a single full-resolution dispatch.
+//
+// Written to this pass' own owned r8 output image; renderer::GICompositePass multiplies the
+// denoised indirect GI term by this value (NOT the direct sun term, which is already shadow-tested
+// by renderer::VirtualShadowMapPass -- ambient occlusion should only attenuate ambient/indirect
+// light, exactly like UE5.8's own GTAO only ever modulates the diffuse+specular indirect lighting
+// stack, never the direct lighting pass).
+
+#include "include/math_utils.glsl"
+#include "include/octahedral.glsl"
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(r32f, set = 0, binding = 0) uniform readonly image2D g_GBufferDepth;
+layout(rg16f, set = 0, binding = 1) uniform readonly image2D g_GBufferNormal;
+layout(r8, set = 0, binding = 2) uniform writeonly image2D g_AOOutput;
+
+layout(std140, set = 0, binding = 3) uniform GTAOParamsUBO {
+    mat4 invViewProj;
+    vec3 cameraPositionWorld;
+    float radiusWorld;      // World-space search radius -- occluders beyond this contribute nothing.
+    vec2 viewportSize;
+    float projScale;        // viewportHeight / (2 * tan(fovY * 0.5)) -- world-radius -> screen-pixel-radius conversion.
+    float intensity;        // 0 = no occlusion applied, 1 = full horizon-based result.
+    float power;            // Contrast/falloff shaping exponent on the final [0,1] AO term.
+    float _pad0, _pad1, _pad2;
+} g_Params;
+
+const int kDirectionCount = 8;
+const int kStepsPerDirection = 4;
+const float kTwoPi = 6.28318530718;
+
+bool ReconstructWorldPos(ivec2 pixel, out vec3 worldPos, out float ndcDepth) {
+    ndcDepth = imageLoad(g_GBufferDepth, pixel).r;
+    if (ndcDepth <= 0.0) {
+        worldPos = vec3(0.0);
+        return false;
+    }
+    vec2 uv = (vec2(pixel) + 0.5) / g_Params.viewportSize;
+    vec4 clip = vec4(uv * 2.0 - 1.0, ndcDepth, 1.0);
+    vec4 world = g_Params.invViewProj * clip;
+    worldPos = world.xyz / world.w;
+    return true;
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 res = ivec2(g_Params.viewportSize);
+    if (pixel.x >= res.x || pixel.y >= res.y) {
+        return;
+    }
+
+    vec3 worldPos;
+    float ndcDepth;
+    if (!ReconstructWorldPos(pixel, worldPos, ndcDepth)) {
+        imageStore(g_AOOutput, pixel, vec4(1.0)); // Sky/background: fully unoccluded.
+        return;
+    }
+    vec3 normal = OctDecode(imageLoad(g_GBufferNormal, pixel).rg);
+
+    // World-radius -> screen-pixel-radius: geometry closer to the camera subtends more screen
+    // pixels per world unit, so the search radius must shrink with distance (perspective-correct),
+    // exactly like renderer::HZBPass's own screen-space footprint math elsewhere in this codebase.
+    float viewDistance = max(length(worldPos - g_Params.cameraPositionWorld), 1.0e-4);
+    float screenRadiusPixels = clamp(g_Params.projScale * g_Params.radiusWorld / viewDistance, 2.0, 256.0);
+
+    // Per-pixel rotation of the fixed direction fan -- without this, the 8 fixed directions leave
+    // visible directional banding on curved surfaces (same decorrelation rationale as
+    // ReflectionTrace.comp's own per-pixel `xi` hash for GGX-VNDF sampling).
+    uint64_t pixelSeed = uint64_t(uint(pixel.x)) | (uint64_t(uint(pixel.y)) << 32);
+    float rotationOffset = hashFloat(pixelSeed, 0x9E3779B97F4A7C15UL) * kTwoPi;
+
+    float horizonSinSum = 0.0;
+    for (int dirIndex = 0; dirIndex < kDirectionCount; ++dirIndex) {
+        float angle = rotationOffset + (float(dirIndex) / float(kDirectionCount)) * kTwoPi;
+        vec2 dir = vec2(cos(angle), sin(angle));
+
+        // Horizon search: the steepest elevation angle (as sin(elevation), so no acos/asin needed)
+        // found along this direction wins -- a closer, steeper occluder always dominates a farther,
+        // shallower one within the same slice, matching the horizon-based AO algorithm family.
+        float maxSin = 0.0;
+        for (int stepIndex = 1; stepIndex <= kStepsPerDirection; ++stepIndex) {
+            float t = float(stepIndex) / float(kStepsPerDirection);
+            ivec2 samplePixel = pixel + ivec2(dir * screenRadiusPixels * t);
+            if (samplePixel.x < 0 || samplePixel.y < 0 || samplePixel.x >= res.x || samplePixel.y >= res.y) {
+                continue;
+            }
+
+            float sampleDepth = imageLoad(g_GBufferDepth, samplePixel).r;
+            if (sampleDepth <= 0.0) {
+                continue; // Sky/background -- not an occluder.
+            }
+
+            vec2 sampleUV = (vec2(samplePixel) + 0.5) / g_Params.viewportSize;
+            vec4 sampleClip = vec4(sampleUV * 2.0 - 1.0, sampleDepth, 1.0);
+            vec4 sampleWorld4 = g_Params.invViewProj * sampleClip;
+            vec3 sampleWorld = sampleWorld4.xyz / sampleWorld4.w;
+
+            vec3 toSample = sampleWorld - worldPos;
+            float sampleDist = length(toSample);
+            if (sampleDist < 1.0e-4 || sampleDist > g_Params.radiusWorld) {
+                continue;
+            }
+
+            float sinElevation = dot(toSample, normal) / sampleDist;
+            float rangeFalloff = clamp(1.0 - (sampleDist / g_Params.radiusWorld), 0.0, 1.0);
+            maxSin = max(maxSin, sinElevation * rangeFalloff);
+        }
+        horizonSinSum += clamp(maxSin, 0.0, 1.0);
+    }
+
+    float averageHorizonSin = horizonSinSum / float(kDirectionCount);
+    float ao = pow(clamp(1.0 - averageHorizonSin, 0.0, 1.0), g_Params.power);
+    ao = mix(1.0, ao, g_Params.intensity);
+
+    imageStore(g_AOOutput, pixel, vec4(ao));
+}

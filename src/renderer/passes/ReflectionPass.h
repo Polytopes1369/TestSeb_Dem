@@ -98,6 +98,13 @@ namespace renderer {
         // output color image (the same instance passed to Init()).
         void RecordGather(VkCommandBuffer cmd);
 
+        // Phase PP4: 1.0 where RecordTrace()'s ray found real geometry this frame, 0.0 everywhere
+        // else (background, grazing-angle skip, or a genuine miss) -- NOT ping-ponged (a single
+        // fixed image, unlike the 3 ReflectionSlot fields above), since renderer::
+        // ScreenSpaceEffectsPass's SSRFallback.comp consumes it the SAME frame RecordTrace() wrote
+        // it, right after RecordGather() -- no cross-frame reprojection needed.
+        VkImageView GetHitMaskView() const { return m_HitMaskView; }
+
     private:
         // One ping-pong slot's 3 fields, all sized to `m_RenderExtent` (full resolution, unlike
         // ScreenProbeGIPass::ProbeSlot's coarser probe-grid sizing).
@@ -114,6 +121,12 @@ namespace renderer {
 
         ReflectionSlot m_Slots[2];
         uint32_t m_CurrentSlotIndex = 0;
+
+        // Phase PP4: single fixed (not ping-ponged) hit-mask image -- see GetHitMaskView()'s own comment.
+        static constexpr VkFormat kHitMaskFormat = VK_FORMAT_R8_UNORM;
+        VkImage m_HitMaskImage = VK_NULL_HANDLE;
+        VmaAllocation m_HitMaskAllocation = VK_NULL_HANDLE;
+        VkImageView m_HitMaskView = VK_NULL_HANDLE;
 
         VkSampler m_ReflectionSampler = VK_NULL_HANDLE; // Linear, clamp-to-edge -- history reprojection taps.
 

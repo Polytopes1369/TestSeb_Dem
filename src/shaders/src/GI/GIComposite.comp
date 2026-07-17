@@ -14,11 +14,15 @@ layout(local_size_x = 8, local_size_y = 8) in;
 layout(rgba16f, set = 0, binding = 0) uniform writeonly image2D g_Output;
 layout(set = 0, binding = 1) uniform sampler2D g_DirectColor;
 layout(set = 0, binding = 2) uniform sampler2D g_DenoisedGI;
+// Phase PP4: renderer::ScreenSpaceEffectsPass's own GTAO.comp output (r8, [0,1]) -- multiplies
+// ONLY the denoised indirect GI term below, never the direct sun term (already shadow-tested by
+// renderer::VirtualShadowMapPass), matching UE5.8's own GTAO scope.
+layout(set = 0, binding = 3) uniform sampler2D g_AO;
 
 #ifdef _DEBUG
-layout(set = 0, binding = 3) uniform sampler2D g_Depth;
+layout(set = 0, binding = 7) uniform sampler2D g_Depth;
 
-layout(std140, set = 0, binding = 4) uniform GICompositeViewParamsUBO {
+layout(std140, set = 0, binding = 8) uniform GICompositeViewParamsUBO {
     mat4 invViewProj;
     vec3 cameraPos;
     float _pad0;
@@ -28,8 +32,8 @@ layout(std140, set = 0, binding = 4) uniform GICompositeViewParamsUBO {
 } g_ViewParams;
 
 #define WORLD_PROBE_GRID_SET 0
-#define WORLD_PROBE_GRID_BINDING 5
-#define WORLD_PROBE_GRID_PARAMS_BINDING 6
+#define WORLD_PROBE_GRID_BINDING 9
+#define WORLD_PROBE_GRID_PARAMS_BINDING 10
 #include "include/world_probe_sampling.glsl"
 
 layout(push_constant) uniform DebugPC {
@@ -53,7 +57,8 @@ void main() {
 
     vec3 directColor = texelFetch(g_DirectColor, pixel, 0).rgb;
     vec3 denoisedGI = texelFetch(g_DenoisedGI, pixel, 0).rgb;
-    vec3 finalColor = directColor + denoisedGI;
+    float ao = texelFetch(g_AO, pixel, 0).r;
+    vec3 finalColor = directColor + denoisedGI * ao;
 
 #ifdef _DEBUG
     if (pc.viewMode == 13u) { // DEBUG_VIEW_LUMEN: the denoised indirect GI term alone.

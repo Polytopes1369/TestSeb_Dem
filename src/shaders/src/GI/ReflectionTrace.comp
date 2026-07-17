@@ -49,6 +49,13 @@ layout(rgba32f, set = 0, binding = 9) uniform writeonly image2D g_ReflectionWorl
 // This pixel's own octahedral-encoded normal (NOT the reflection ray's direction).
 layout(rg16f, set = 0, binding = 10) uniform writeonly image2D g_ReflectionNormal;
 
+// Phase PP4: 1.0 = the traced ray actually hit scene geometry (a real Surface Cache radiance was
+// sampled), 0.0 = every other case (background pixel, grazing-angle skip, or a genuine trace miss)
+// -- renderer::ScreenSpaceEffectsPass' own SSRFallback.comp reads this SAME-FRAME (no ping-pong,
+// unlike g_ReflectionRadiance/WorldPos/Normal above) to raymarch a screen-space fallback reflection
+// only where this pass found nothing real to reflect.
+layout(r8, set = 0, binding = 11) uniform writeonly image2D g_ReflectionHitMask;
+
 layout(push_constant) uniform TracePushConstants {
     uint entityCount; // Dynamically uniform -- see mesh_sdf_trace.glsl's own requirement.
     uint traceMode;   // 0 = SWRT (TraceMeshSDFScene), 1 = HWRT (TraceHWRT, inline ray query).
@@ -109,6 +116,7 @@ void main() {
         imageStore(g_ReflectionRadiance, pixel, vec4(0.0));
         imageStore(g_ReflectionWorldPos, pixel, vec4(0.0));
         imageStore(g_ReflectionNormal, pixel, vec4(0.5, 0.5, 0.0, 0.0));
+        imageStore(g_ReflectionHitMask, pixel, vec4(0.0));
         return;
     }
 
@@ -149,6 +157,7 @@ void main() {
     // as an immediate miss (radiance = 0) rather than tracing a physically invalid ray.
     if (dot(rayDir, normal) <= 0.0) {
         imageStore(g_ReflectionRadiance, pixel, vec4(0.0, 0.0, 0.0, 1.0));
+        imageStore(g_ReflectionHitMask, pixel, vec4(0.0));
         return;
     }
 
@@ -170,4 +179,5 @@ void main() {
     }
 
     imageStore(g_ReflectionRadiance, pixel, vec4(radiance, 1.0));
+    imageStore(g_ReflectionHitMask, pixel, vec4(hit ? 1.0 : 0.0));
 }

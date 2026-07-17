@@ -115,6 +115,14 @@ namespace renderer {
             float fogHeightOffset = 0.0f;
             float fogStartDistance = 5.0f;
             float fogMaxOpacity = 0.85f;
+
+            // Phase PP4: Volumetric Light Shafts / God Rays (Crepuscular Rays) -- radial screen-
+            // space raymarch of this pass' own HDR input toward the sun's screen-projected position
+            // (see RecordComposite's own `sunDirection`/`viewProj` parameters).
+            float godRaysIntensity = 0.5f;
+            float godRaysDecay = 0.95f;
+            float godRaysDensity = 1.0f;
+            float godRaysWeight = 0.25f;
         };
 
         // `bloomView` (renderer::BloomPass::GetOutputView(), its own upsample-chain mip 0) is
@@ -149,8 +157,13 @@ namespace renderer {
         // reads it). Caller owns the barrier that makes the HDR input visible to COMPUTE_SHADER
         // reads beforehand, and the barrier that makes GetOutputImage() visible to its own next
         // consumer afterward (this pass' own trailing barrier only covers COMPUTE_SHADER writes).
+        // `viewProj`/`sunDirection` (Phase PP4): projects the sun's screen-space position for God
+        // Rays -- `sunDirection` points FROM the light TOWARD the scene (same convention as
+        // renderer::ClusterResolvePass::RecordResolve's own sunDirection parameter), so the sun
+        // itself sits along -sunDirection from the camera.
         void RecordComposite(VkCommandBuffer cmd, float deltaTimeSeconds, const Settings& settings,
-            const maths::mat4& invViewProj, const maths::mat4& prevViewProj, const maths::vec3& cameraPositionWorld);
+            const maths::mat4& invViewProj, const maths::mat4& prevViewProj, const maths::vec3& cameraPositionWorld,
+            const maths::mat4& viewProj, const maths::vec3& sunDirection);
 
         VkImage GetOutputImage() const { return m_OutputImage; }
         VkImageView GetOutputView() const { return m_OutputView; }
@@ -210,8 +223,17 @@ namespace renderer {
             float fogHeightOffset = 0.0f;
             float fogStartDistance = 5.0f;
             float fogMaxOpacity = 0.85f;
+
+            // Phase PP4: God Rays.
+            float sunScreenU = 0.5f, sunScreenV = 0.5f;
+            float sunScreenValid = 0.0f;
+            float godRaysIntensity = 0.5f;
+            float godRaysDecay = 0.95f;
+            float godRaysDensity = 1.0f;
+            float godRaysWeight = 0.25f;
+            float _padGodRays = 0.0f;
         };
-        static_assert(sizeof(PostProcessParamsUBO) == 336,
+        static_assert(sizeof(PostProcessParamsUBO) == 368,
             "PostProcessParamsUBO must match PostProcessComposite.comp's PostProcessParamsUBO exactly (std140 layout)");
 
         // Byte-for-byte mirror of AutoExposureAdapt.comp's push_constant block.

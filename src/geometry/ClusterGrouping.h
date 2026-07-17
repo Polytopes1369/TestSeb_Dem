@@ -1,20 +1,25 @@
 #pragma once
-// Cluster grouping (Nanite-style "cluster group" construction): pairs up spatially/topologically
-// adjacent clusters produced by ClusterPartitioner.h and merges each pair into one local mesh
-// ready for DAG-parent simplification (see MeshSimplifier.h).
+// Cluster grouping (Nanite-style "cluster group" construction): groups spatially/topologically
+// adjacent clusters produced by ClusterPartitioner.h (up to 4 at a time, see GroupItemsIntoQuads)
+// and merges each group into one local mesh ready for DAG-parent simplification (see
+// MeshSimplifier.h). Grouping 4 at a time instead of pairing 2 at a time mirrors Nanite's actual
+// cluster-graph partitioning granularity: a bigger group frees proportionally more of its members'
+// shared boundary (turned interior by the merge) relative to the group's true external boundary
+// that must stay locked, so QEM has more room to simplify before hitting the per-cluster
+// vertex/triangle cap -- see ClusterDAG.cpp's EmitSimplifiedGroup for what happens on that cap.
 //
 // Two clusters coming out of geometry::PartitionMeshIntoClusters are considered adjacent if they
 // share at least one *global* vertex index of the original mesh -- since the partitioner never
 // duplicates vertices, a shared global index means the two clusters are stitched together along
 // an exact edge/vertex chain of the source mesh, not just spatially close.
 //
-// Merging a pair lets the boundary that used to sit *between* them become interior (used by two
-// triangles instead of one) in the merged mesh, so it can be freely simplified away. Only the
-// resulting group's true outer boundary -- edges still used by exactly one triangle after the
-// merge, because they border a cluster that was NOT included in this group -- is marked locked.
-// This is the crack-prevention contract MeshSimplifier.h enforces: a locked vertex never moves
-// and is never removed, so neighboring, differently-grouped/simplified geometry can still stitch
-// against it exactly.
+// Merging a group lets every boundary that used to sit *between* two of its members become
+// interior (used by two triangles instead of one) in the merged mesh, so it can be freely
+// simplified away. Only the resulting group's true outer boundary -- edges still used by exactly
+// one triangle after the merge, because they border a cluster that was NOT included in this group
+// -- is marked locked. This is the crack-prevention contract MeshSimplifier.h enforces: a locked
+// vertex never moves and is never removed, so neighboring, differently-grouped/simplified geometry
+// can still stitch against it exactly.
 
 #include <cstdint>
 #include <unordered_map>
@@ -41,10 +46,28 @@ namespace geometry {
     std::vector<std::vector<uint32_t>> GreedyPairByWeight(
         uint32_t count, const std::unordered_map<uint64_t, uint32_t>& weights);
 
-    // One cluster group: a pair (or, for a leftover odd cluster, a singleton) of source clusters
-    // merged into a single boundary-locked local mesh.
+    // Hierarchically groups `count` items into groups of up to 4, by running GreedyPairByWeight
+    // twice: pass 1 pairs individual items (exactly like GreedyPairByWeight alone); pass 2 pairs
+    // those pairs, using as each pair-to-pair weight the sum of every original `weights` entry
+    // connecting a member of one pair to a member of the other (so the second pass still prefers
+    // the most naturally connected quads, not an arbitrary combination). This is a recursive
+    // bisection of the same adjacency graph GreedyPairByWeight already walks -- the practical
+    // stand-in this engine uses for the graph-partitioning step real Nanite runs (e.g. METIS) to
+    // reach the same ~4-cluster group granularity, without pulling in a heavyweight graph-
+    // partitioning library the project's "no heavy frameworks" constraint rules out.
+    //
+    // A cross-classification edge (opaque vs. masked) never appears in `weights` to begin with
+    // (see BuildClusterAdjacencyWeights/BuildLevelAdjacencyWeights), so no synthesized pair-to-pair
+    // weight can connect an opaque-only pair to a masked-only pair either -- the purity invariant
+    // survives both passes for free. Returns one entry per final group (size 1 to 4), each holding
+    // the flattened original item indices.
+    std::vector<std::vector<uint32_t>> GroupItemsIntoQuads(
+        uint32_t count, const std::unordered_map<uint64_t, uint32_t>& weights);
+
+    // One cluster group: up to 4 source clusters (fewer at the edges of the adjacency graph, e.g.
+    // a topologically isolated island) merged into a single boundary-locked local mesh.
     struct ClusterGroup {
-        // Indices into the `clusters` vector passed to GroupAdjacentClusters (size 1 or 2).
+        // Indices into the `clusters` vector passed to GroupAdjacentClusters (size 1 to 4).
         std::vector<uint32_t> memberClusterIndices;
 
         // Merged, deduplicated local mesh: mesh.locked[v] is true for every vertex lying on an
@@ -57,11 +80,9 @@ namespace geometry {
         uint32_t originalTriangleCount = 0;
     };
 
-    // Greedily pairs up adjacent clusters (see file header for the adjacency definition) and
-    // builds one merged, boundary-locked ClusterGroup per pair. Pairing prefers, among an
-    // unpaired cluster's still-unpaired neighbors, the one sharing the most global vertices (the
-    // most natural/compact merge). A cluster with no unpaired adjacent neighbor forms a singleton
-    // group on its own.
+    // Groups adjacent clusters into groups of up to 4 (see file header for the adjacency
+    // definition and GroupItemsIntoQuads for the grouping strategy) and builds one merged,
+    // boundary-locked ClusterGroup per group.
     //
     // `allVertices` must be the same array the clusters' MeshCluster::globalVertexIndices index
     // into (i.e. whatever was passed to PartitionMeshIntoClusters to produce `clusters`).

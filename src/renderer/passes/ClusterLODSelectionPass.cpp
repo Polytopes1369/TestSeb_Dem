@@ -72,25 +72,25 @@ namespace renderer {
             node.sphereCenter = sphereCenter;
             node.sphereRadius = entry.sphereRadius;
             node.clusterID = dagNode.clusterID;
-            node.parentClusterID = dagNode.parentClusterID;
+            node.parentClusterID0 = dagNode.parentClusterID[0];
+            node.parentClusterID1 = dagNode.parentClusterID[1];
             node.childClusterID0 = dagNode.childClusterID[0];
             node.childClusterID1 = dagNode.childClusterID[1];
+            node.childClusterID2 = dagNode.childClusterID[2];
+            node.childClusterID3 = dagNode.childClusterID[3];
             node.level = dagNode.level;
             node.clusterError = dagNode.clusterError;
             node.parentError = dagNode.parentError;
             node.maxWPOAmplitude = entry.maxWPOAmplitude;
             node.entityID = entry.entityID;
-            // Read directly from the fully-populated INPUT indexEntries vector (not the `dagNodes`
-            // vector this same loop is still building) -- parentClusterID commonly points forward
-            // (a leaf's parent sits at a higher, not-yet-processed index in this loop, since level-0
-            // leaves are assigned the lowest clusterIDs), so `dagNodes[parentClusterID]` would not
-            // yet be initialized if read here instead. See ClusterDAGScreenError.comp's
-            // DAGNodePayload::parentSphereCenter comment for why this field exists.
-            node.parentSphereCenter = (dagNode.parentClusterID != geometry::kInvalidClusterID)
-                ? maths::vec3{ indexEntries[dagNode.parentClusterID].sphereCenter[0],
-                               indexEntries[dagNode.parentClusterID].sphereCenter[1],
-                               indexEntries[dagNode.parentClusterID].sphereCenter[2] }
-                : maths::vec3{};
+            // Baked directly into the cache file at write time (geometry::DAGNodeEntry::
+            // parentSphereCenter, geometry::ClusterDAGGroup::groupSphereCenter) instead of derived
+            // here from a single parentClusterID lookup -- with up to 2 possible parents sharing
+            // this one group, there is no longer a single "the parent's" ClusterIndexEntry to read
+            // forward from; see ClusterDAGScreenError.comp's DAGNodePayload::parentSphereCenter
+            // comment for why this must be one unambiguous shared value.
+            node.parentSphereCenter = maths::vec3{
+                dagNode.parentSphereCenter[0], dagNode.parentSphereCenter[1], dagNode.parentSphereCenter[2] };
 
             LODNodeMetadata& lodNode = lodNodes[i];
             lodNode.boundsMin = boundsMin;
@@ -101,7 +101,8 @@ namespace renderer {
             lodNode.coneCutoff = coneCutoff;
             lodNode.indexCount = entry.indexCount;
             lodNode.clusterID = entry.clusterID;
-            lodNode.parentClusterID = dagNode.parentClusterID;
+            lodNode.parentClusterID0 = dagNode.parentClusterID[0];
+            lodNode.parentClusterID1 = dagNode.parentClusterID[1];
             lodNode.logicalPageID = logicalPageID;
             lodNode.maskTextureIndex = entry.maskTextureIndex;
             lodNode.maxWPOAmplitude = entry.maxWPOAmplitude;
@@ -636,7 +637,11 @@ namespace renderer {
 
         for (uint32_t i = 0; i < m_TotalNodeCount; ++i) {
             const DAGNodePayload& node = m_DebugDagNodesCopy[i];
-            bool isLeaf = node.childClusterID0 == geometry::kInvalidClusterID && node.childClusterID1 == geometry::kInvalidClusterID;
+            // Slot 0 is always filled first (geometry::VirtualGeometryCacheTest.cpp's
+            // BuildIndexEntry/DAGNodeEntry-flatten loop assigns childClusterID sequentially from
+            // a group's memberClusterIndices), so an invalid slot 0 alone already proves zero
+            // children -- no need to also check slots 1-3.
+            bool isLeaf = node.childClusterID0 == geometry::kInvalidClusterID;
             if (!isLeaf) {
                 continue;
             }
@@ -644,23 +649,37 @@ namespace renderer {
             EntityGapStats& stats = statsByEntity[node.entityID];
             ++stats.leafCount;
 
-            // Walk this leaf's own node and every ancestor up to the root, looking for a single
-            // DRAW decision anywhere on the path. Bounded by m_TotalNodeCount as a hard safety cap
-            // (the DAG is acyclic by construction/ValidateClusterDAG, so this should never actually
-            // be reached) rather than trusting an unbounded while(true) on data this debug tool
-            // itself must remain robust against if the DAG were ever corrupt.
+            // Walk this leaf's own node and every ancestor up to the root(s), looking for a single
+            // DRAW decision anywhere reachable. A node can now have up to 2 parents (one of a
+            // group's up to kMaxGroupOutputClusters output siblings, see geometry::ClusterDAGGroup)
+            // so this is a small bounded BFS over both parent branches at every step, not a single
+            // linear walk -- `visited` keeps it from re-exploring a node reachable through more
+            // than one path (e.g. two siblings that later share a common further ancestor) and
+            // bounds total work by m_TotalNodeCount regardless of branching, exactly like the old
+            // single-path walk's own step cap (the DAG is acyclic by construction/
+            // ValidateClusterDAG, so this should never actually be exhausted) rather than trusting
+            // an unbounded traversal on data this debug tool itself must remain robust against if
+            // the DAG were ever corrupt.
             bool foundDraw = false;
-            uint32_t currentIndex = i;
-            for (uint32_t step = 0; step < m_TotalNodeCount; ++step) {
-                if (decisions[currentIndex] == kDagDecisionDraw) {
-                    foundDraw = true;
-                    break;
+            std::vector<bool> visited(m_TotalNodeCount, false);
+            std::vector<uint32_t> frontier{ i };
+            visited[i] = true;
+            for (uint32_t step = 0; step < m_TotalNodeCount && !frontier.empty() && !foundDraw; ++step) {
+                std::vector<uint32_t> nextFrontier;
+                for (uint32_t currentIndex : frontier) {
+                    if (decisions[currentIndex] == kDagDecisionDraw) {
+                        foundDraw = true;
+                        break;
+                    }
+                    const DAGNodePayload& current = m_DebugDagNodesCopy[currentIndex];
+                    for (uint32_t parentClusterID : { current.parentClusterID0, current.parentClusterID1 }) {
+                        if (parentClusterID != geometry::kInvalidClusterID && !visited[parentClusterID]) {
+                            visited[parentClusterID] = true;
+                            nextFrontier.push_back(parentClusterID);
+                        }
+                    }
                 }
-                uint32_t parentClusterID = m_DebugDagNodesCopy[currentIndex].parentClusterID;
-                if (parentClusterID == geometry::kInvalidClusterID) {
-                    break; // Reached the root without finding a DRAW decision.
-                }
-                currentIndex = parentClusterID;
+                frontier = std::move(nextFrontier);
             }
 
             if (!foundDraw) {
@@ -692,19 +711,22 @@ namespace renderer {
             // log size) -- decision values: 0=DRAW, 1=SUBDIVIDE, 2=SKIP (DAG_DECISION_* in
             // ClusterDAGScreenError.comp). Directly shows WHY no node on the path ever satisfies
             // the DRAW condition (e.g. every node stuck at SUBDIVIDE, or a monotonicity break).
+            // Follows parentClusterID0 only (a single illustrative path is enough for this dump;
+            // the existence check above already explored both parent branches) -- logged
+            // explicitly so parentClusterID1, when present, isn't mistaken for having been walked.
             std::string chainDump;
             if (!stats.exampleGapClusterIDs.empty()) {
                 uint32_t chainIndex = stats.exampleGapClusterIDs[0];
                 for (uint32_t step = 0; step < m_TotalNodeCount; ++step) {
                     const DAGNodePayload& chainNode = m_DebugDagNodesCopy[chainIndex];
-                    chainDump += std::format("    [{}] clusterID={} level={} decision={} clusterError={:.6f} parentError={:.6f} parentClusterID={}\n",
+                    chainDump += std::format("    [{}] clusterID={} level={} decision={} clusterError={:.6f} parentError={:.6f} parentClusterID0={}\n",
                         step, chainIndex, chainNode.level, decisions[chainIndex],
                         chainNode.clusterError, chainNode.parentError,
-                        chainNode.parentClusterID == geometry::kInvalidClusterID ? -1 : static_cast<int32_t>(chainNode.parentClusterID));
-                    if (chainNode.parentClusterID == geometry::kInvalidClusterID) {
+                        chainNode.parentClusterID0 == geometry::kInvalidClusterID ? -1 : static_cast<int32_t>(chainNode.parentClusterID0));
+                    if (chainNode.parentClusterID0 == geometry::kInvalidClusterID) {
                         break;
                     }
-                    chainIndex = chainNode.parentClusterID;
+                    chainIndex = chainNode.parentClusterID0;
                 }
             }
 
@@ -749,9 +771,9 @@ namespace renderer {
             if (yBad || xBad || zBad) {
                 ++floorOutliers;
                 if (floorOutliers <= 10) {
-                    outlierExamples += std::format("  clusterID={} level={} sphereCenter=({:.3f},{:.3f},{:.3f}) sphereRadius={:.3f} parentClusterID={}\n",
+                    outlierExamples += std::format("  clusterID={} level={} sphereCenter=({:.3f},{:.3f},{:.3f}) sphereRadius={:.3f} parentClusterID0={}\n",
                         i, node.level, node.sphereCenter.x, node.sphereCenter.y, node.sphereCenter.z, node.sphereRadius,
-                        node.parentClusterID == geometry::kInvalidClusterID ? -1 : static_cast<int32_t>(node.parentClusterID));
+                        node.parentClusterID0 == geometry::kInvalidClusterID ? -1 : static_cast<int32_t>(node.parentClusterID0));
                 }
             }
         }
