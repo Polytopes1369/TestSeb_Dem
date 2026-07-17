@@ -156,7 +156,6 @@ namespace renderer {
         gridParams.gridOriginZ = worldProbes.GetGridOriginWorld().z;
         gridParams.probeSpacing = WorldProbeGridPass::kProbeSpacing;
         gridParams.gridResolution = static_cast<float>(WorldProbeGridPass::kGridResolution);
-
         // m_ClusterEntriesBuffer's byte size scales with m_ClusterCount (scene-composition-
         // dependent -- every entity with an alpha < 1.0 material contributes its leaf clusters, see
         // this function's own loop above), so vkCmdUpdateBuffer's hard 65536-byte spec ceiling

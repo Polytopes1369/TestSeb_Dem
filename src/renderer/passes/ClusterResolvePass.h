@@ -37,6 +37,7 @@
 
 #include "core/maths/Maths.h"
 #include "renderer/vulkan/GpuBuffer.h"
+#include "renderer/LightingTypes.h"
 #include "renderer/MaterialParameterTable.h"
 
 namespace renderer {
@@ -127,16 +128,17 @@ namespace renderer {
         // `prevViewProj` is the previous frame's combined matrix (renderer::ClusterRenderPipeline's
         // own m_PrevViewProj) -- used only by DEBUG_VIEW_MOTION_VECTORS to reproject this frame's
         // reconstructed world position; pass an identity matrix on the very first frame (no
-        // previous frame exists yet). `sunDirection` (Phase 3, points FROM the light TOWARD the
-        // scene) feeds the direct-lighting term's light direction AND its shadow lookup (see
-        // ClusterResolve.comp's own Step 3 comment) -- must be the SAME direction
-        // renderer::VirtualShadowMapPass::RecordBeginFrame() was called with this frame.
-        // `cameraPositionWorld` (Substrate integration): feeds EvaluateSubstrateMaterial's specular/
-        // Fresnel view-direction term -- the pre-Substrate shader had no view-dependent term at all,
-        // so this is new; same value renderer::ClusterRenderPipeline already threads into
+        // previous frame exists yet). `sun` (Phase 3 direction, points FROM the light TOWARD the
+        // scene; real-photometric color+intensity in LUX, see renderer::DirectionalLight's own
+        // comment) feeds the direct-lighting term's physically-based Lambertian evaluation AND its
+        // shadow lookup (see ClusterResolve.comp's own Step 3 comment) -- `sun.direction` must be
+        // the SAME direction renderer::VirtualShadowMapPass::RecordBeginFrame() was called with
+        // this frame. `cameraPositionWorld` (Substrate integration): feeds EvaluateSubstrateMaterial's
+        // specular/Fresnel view-direction term -- the pre-Substrate shader had no view-dependent term
+        // at all, so this is new; same value renderer::ClusterRenderPipeline already threads into
         // ReflectionPass/TransparentForwardPass's own view-params UBOs.
         void RecordResolve(VkCommandBuffer cmd, const maths::mat4& viewProj, const maths::mat4& prevViewProj,
-            const maths::vec3& sunDirection, const maths::vec3& cameraPositionWorld, uint32_t debugViewMode = 0);
+            const DirectionalLight& sun, const maths::vec3& cameraPositionWorld, uint32_t debugViewMode = 0);
 
         // --- Phase 1b: binned resolve path (renderer::ClusterShadingBinPass) ---
         // Second-phase init, called once after BOTH Init() above AND `shadingBinPass.Init()` have
@@ -163,10 +165,10 @@ namespace renderer {
         // the exact per-frame ordering (this path replaces RecordResolve() entirely whenever
         // `camera.debugViewMode == 0`; Release always takes this path, see that field's own
         // Debug-only gating in core/Camera.h). Ends with the identical trailing barrier
-        // RecordResolve() itself ends with. `sunDirection` -- see RecordResolve()'s own comment.
-        // `cameraPositionWorld` -- see RecordResolve()'s own comment.
+        // RecordResolve() itself ends with. `sun`/`cameraPositionWorld` -- see RecordResolve()'s own
+        // comment.
         void RecordResolveBinned(VkCommandBuffer cmd, const maths::mat4& viewProj,
-            const maths::vec3& sunDirection, const maths::vec3& cameraPositionWorld, const ClusterShadingBinPass& shadingBinPass);
+            const DirectionalLight& sun, const maths::vec3& cameraPositionWorld, const ClusterShadingBinPass& shadingBinPass);
 
         // Binds Phase 3's renderer::VirtualShadowMapPass resources (physical page atlas + sampler,
         // page table, feedback buffer, sun clipmap levels UBO) into BOTH this pass's descriptor

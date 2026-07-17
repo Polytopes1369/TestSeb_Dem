@@ -22,23 +22,45 @@ layout(push_constant) uniform PC {
     uint isFirstMip;      // Nonzero: apply the bright-pass threshold below.
 } pc;
 
+// Firefly/NaN guard: a single specular highlight reflecting a bright light (renderer::
+// ReflectionGather.comp's additive RMW, or any other HDR source feeding g_Source) can produce a
+// non-finite (Inf, or NaN from an Inf-Inf/Inf*0 downstream) pixel value. Bloom's own box/tent
+// filters are a chain of additions -- one non-finite tap poisons its ENTIRE weighted sum via IEEE
+// NaN propagation, and each successive mip level spreads that single bad texel across a wider and
+// wider footprint, eventually contaminating the WHOLE final bloom image (which
+// PostProcessComposite.comp then unconditionally adds to the final scene color, so one firefly
+// anywhere on screen can turn the ENTIRE frame black once `clamp(NaN, 0, 1)` -- itself
+// implementation-defined for NaN input, commonly 0 on this project's target hardware -- is reached
+// at the very end of that shader). Sanitized at this single choke point (bloom's mip-0 read is the
+// first place the combined opaque+transparent+reflection+MegaLights output is ever consumed) rather
+// than chasing every individual upstream producer.
+vec3 SanitizeHDR(vec3 c) {
+    bvec3 bad = bvec3(isnan(c.r) || isinf(c.r), isnan(c.g) || isinf(c.g), isnan(c.b) || isinf(c.b));
+    c = mix(c, vec3(0.0), bad);
+    // Also hard-clamp merely-large-but-finite fireflies (a single unclamped specular highlight can
+    // still be, say, 1e6 -- not NaN/Inf, but still large enough that summing several such taps in
+    // the box/tent filters below risks overflowing fp16's ~65504 max, which WOULD produce a fresh
+    // Inf even though every individual input here was technically finite).
+    return min(c, vec3(50000.0));
+}
+
 // 13-tap box filter over a 4x4 neighborhood (COD Advanced Warfare's own downsample kernel): 4
 // overlapping 2x2 boxes plus the center 2x2 box, weighted so the result stays a soft low-pass
 // instead of aliasing high-frequency bright pixels into flicker under camera motion.
 vec3 SampleBox13(vec2 uv, vec2 texelSize) {
-    vec3 a = textureLod(g_Source, uv + texelSize * vec2(-1.0, -1.0), 0.0).rgb;
-    vec3 b = textureLod(g_Source, uv + texelSize * vec2( 0.0, -1.0), 0.0).rgb;
-    vec3 c = textureLod(g_Source, uv + texelSize * vec2( 1.0, -1.0), 0.0).rgb;
-    vec3 d = textureLod(g_Source, uv + texelSize * vec2(-0.5, -0.5), 0.0).rgb;
-    vec3 e = textureLod(g_Source, uv + texelSize * vec2( 0.5, -0.5), 0.0).rgb;
-    vec3 f = textureLod(g_Source, uv + texelSize * vec2(-1.0,  0.0), 0.0).rgb;
-    vec3 g = textureLod(g_Source, uv, 0.0).rgb;
-    vec3 h = textureLod(g_Source, uv + texelSize * vec2( 1.0,  0.0), 0.0).rgb;
-    vec3 i = textureLod(g_Source, uv + texelSize * vec2(-0.5,  0.5), 0.0).rgb;
-    vec3 j = textureLod(g_Source, uv + texelSize * vec2( 0.5,  0.5), 0.0).rgb;
-    vec3 k = textureLod(g_Source, uv + texelSize * vec2(-1.0,  1.0), 0.0).rgb;
-    vec3 l = textureLod(g_Source, uv + texelSize * vec2( 0.0,  1.0), 0.0).rgb;
-    vec3 m = textureLod(g_Source, uv + texelSize * vec2( 1.0,  1.0), 0.0).rgb;
+    vec3 a = SanitizeHDR(textureLod(g_Source, uv + texelSize * vec2(-1.0, -1.0), 0.0).rgb);
+    vec3 b = SanitizeHDR(textureLod(g_Source, uv + texelSize * vec2( 0.0, -1.0), 0.0).rgb);
+    vec3 c = SanitizeHDR(textureLod(g_Source, uv + texelSize * vec2( 1.0, -1.0), 0.0).rgb);
+    vec3 d = SanitizeHDR(textureLod(g_Source, uv + texelSize * vec2(-0.5, -0.5), 0.0).rgb);
+    vec3 e = SanitizeHDR(textureLod(g_Source, uv + texelSize * vec2( 0.5, -0.5), 0.0).rgb);
+    vec3 f = SanitizeHDR(textureLod(g_Source, uv + texelSize * vec2(-1.0,  0.0), 0.0).rgb);
+    vec3 g = SanitizeHDR(textureLod(g_Source, uv, 0.0).rgb);
+    vec3 h = SanitizeHDR(textureLod(g_Source, uv + texelSize * vec2( 1.0,  0.0), 0.0).rgb);
+    vec3 i = SanitizeHDR(textureLod(g_Source, uv + texelSize * vec2(-0.5,  0.5), 0.0).rgb);
+    vec3 j = SanitizeHDR(textureLod(g_Source, uv + texelSize * vec2( 0.5,  0.5), 0.0).rgb);
+    vec3 k = SanitizeHDR(textureLod(g_Source, uv + texelSize * vec2(-1.0,  1.0), 0.0).rgb);
+    vec3 l = SanitizeHDR(textureLod(g_Source, uv + texelSize * vec2( 0.0,  1.0), 0.0).rgb);
+    vec3 m = SanitizeHDR(textureLod(g_Source, uv + texelSize * vec2( 1.0,  1.0), 0.0).rgb);
 
     vec3 centerBox = (d + e + i + j) * 0.5;
     vec3 topLeftBox = (a + b + f + g) * 0.125;
