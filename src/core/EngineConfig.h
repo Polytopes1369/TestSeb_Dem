@@ -136,6 +136,40 @@ inline uint32_t _QUALITY = 4;
 inline uint32_t _EFFECTS_QUALITY = 4;
 inline uint32_t _TRANSLUCENCY_LIGHTING_VOLUME_DIM = 64;
 inline uint32_t _REFRACTION_QUALITY = 3;
+
+// --- Phase PP1 (post-process stack roadmap): Physical Camera / Auto Exposure / White Balance /
+// Color Correction / Tone Mapping / Gamma Correction -- renderer::PostProcessPass's own tunable
+// artistic controls, mirrored here so they can be tweaked without touching pass code. NOT wired
+// into ApplyProfile()'s per-hardware-tier overrides below (unlike every other value in this file):
+// these are scene/artistic knobs, not a GPU performance/quality axis, so they stay constant across
+// Low/Medium/High/Extrem profiles. Defaults match Unreal Engine 5.8's own Post Process Volume
+// defaults -- see renderer::PostProcessPass::Settings' own comment for the same defaults mirrored
+// C++-side, and PostProcessComposite.comp for how each one is actually consumed.
+
+// Physical Camera
+inline float EXPOSURE_APERTURE = 4.0f;             // f-stop.
+inline float EXPOSURE_SHUTTER_SPEED_SECONDS = 1.0f / 60.0f;
+inline float EXPOSURE_ISO = 100.0f;
+inline bool EXPOSURE_USE_AUTO = true;               // false = Manual metering (instant, no eye-adaptation).
+inline float EXPOSURE_COMPENSATION_EV = 0.0f;
+inline float EXPOSURE_ADAPTATION_SPEED_UP_EV_PER_SEC = 3.0f;   // Scene darkened -> exposure rising.
+inline float EXPOSURE_ADAPTATION_SPEED_DOWN_EV_PER_SEC = 1.0f; // Scene brightened -> exposure falling.
+
+// White Balance
+inline float WHITE_BALANCE_TEMP_KELVIN = 6500.0f;  // 6500 = neutral (D65).
+inline float WHITE_BALANCE_TINT = 0.0f;
+
+// Color Correction (ASC CDL Lift/Gamma/Gain)
+inline float COLOR_LIFT_R = 0.0f, COLOR_LIFT_G = 0.0f, COLOR_LIFT_B = 0.0f;
+inline float COLOR_GAMMA_R = 1.0f, COLOR_GAMMA_G = 1.0f, COLOR_GAMMA_B = 1.0f;
+inline float COLOR_GAIN_R = 1.0f, COLOR_GAIN_G = 1.0f, COLOR_GAIN_B = 1.0f;
+inline float COLOR_SATURATION = 1.0f;
+inline float COLOR_CONTRAST = 1.0f;
+
+// Gamma Correction (final display encode -- see PostProcessComposite.comp's own comment for why
+// this is load-bearing: the swapchain surface format is VK_FORMAT_B8G8R8A8_UNORM, not an _SRGB
+// format, so nothing else in the present path applies a display gamma encode).
+inline float DISPLAY_GAMMA = 2.2f;
 } // namespace postprocess
 
 namespace volumetrics {
