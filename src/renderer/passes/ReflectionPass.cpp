@@ -262,27 +262,34 @@ namespace renderer {
         }
 
         // =====================================================================================
-        // STEP 4 -- Gather pipeline: set 0 (7 bindings, 2 slot-indexed variants).
+        // STEP 4 -- Gather pipeline: set 0 (9 bindings, 2 slot-indexed variants). Bindings 7/8
+        // (Substrate integration): this pixel's materialID GBuffer image + the material params
+        // SSBO renderer::ClusterResolvePass already filled -- see ReflectionGather.comp's own
+        // binding comments. Both are the SAME resource for both slot variants, unlike the
+        // per-slot curRadiance binding.
         // =====================================================================================
         {
-            VkDescriptorSetLayoutBinding bindings[7]{};
+            VkDescriptorSetLayoutBinding bindings[9]{};
             for (uint32_t b = 0; b <= 5; ++b) {
                 bindings[b] = { b, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
             }
             bindings[6] = { 6, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+            bindings[7] = { 7, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+            bindings[8] = { 8, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
 
             VkDescriptorSetLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-            layoutInfo.bindingCount = 7;
+            layoutInfo.bindingCount = 9;
             layoutInfo.pBindings = bindings;
             VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &layoutInfo, nullptr, &m_GatherSetLayout));
 
-            VkDescriptorPoolSize poolSizes[2] = {
-                { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 6 * 2 },
-                { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 * 2 }
+            VkDescriptorPoolSize poolSizes[3] = {
+                { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 7 * 2 },
+                { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 * 2 },
+                { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1 * 2 }
             };
             VkDescriptorPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
             poolInfo.maxSets = 2;
-            poolInfo.poolSizeCount = 2;
+            poolInfo.poolSizeCount = 3;
             poolInfo.pPoolSizes = poolSizes;
             VK_CHECK(vkCreateDescriptorPool(m_Device, &poolInfo, nullptr, &m_GatherDescriptorPool));
 
@@ -299,6 +306,8 @@ namespace renderer {
             VkDescriptorImageInfo gbufferRoughnessMetallicInfo{ VK_NULL_HANDLE, resolvePass.GetOutputRoughnessMetallicView(), VK_IMAGE_LAYOUT_GENERAL };
             VkDescriptorImageInfo outputColorInfo{ VK_NULL_HANDLE, resolvePass.GetOutputColorView(), VK_IMAGE_LAYOUT_GENERAL };
             VkDescriptorBufferInfo viewParamsInfo{ m_ViewParamsBuffer.Handle(), 0, m_ViewParamsBuffer.Size() };
+            VkDescriptorImageInfo gbufferMaterialIDInfo{ VK_NULL_HANDLE, resolvePass.GetOutputMaterialIDView(), VK_IMAGE_LAYOUT_GENERAL };
+            VkDescriptorBufferInfo materialParamsInfo{ resolvePass.GetMaterialParamsBuffer(), 0, VK_WHOLE_SIZE };
 
             for (uint32_t slotIndex = 0; slotIndex < 2; ++slotIndex) {
                 const ReflectionSlot& current = m_Slots[slotIndex];
@@ -306,12 +315,14 @@ namespace renderer {
 
                 VkDescriptorImageInfo* storageInfos[6] = { &curRadiance, &gbufferNormalInfo, &gbufferDepthInfo, &gbufferAlbedoInfo, &gbufferRoughnessMetallicInfo, &outputColorInfo };
 
-                VkWriteDescriptorSet writes[7]{};
+                VkWriteDescriptorSet writes[9]{};
                 for (uint32_t b = 0; b <= 5; ++b) {
                     writes[b] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_GatherSet[slotIndex], b, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, storageInfos[b], nullptr, nullptr };
                 }
                 writes[6] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_GatherSet[slotIndex], 6, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &viewParamsInfo, nullptr };
-                vkUpdateDescriptorSets(m_Device, 7, writes, 0, nullptr);
+                writes[7] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_GatherSet[slotIndex], 7, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &gbufferMaterialIDInfo, nullptr, nullptr };
+                writes[8] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_GatherSet[slotIndex], 8, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &materialParamsInfo, nullptr };
+                vkUpdateDescriptorSets(m_Device, 9, writes, 0, nullptr);
             }
 
             VkPipelineLayoutCreateInfo pipelineLayoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };

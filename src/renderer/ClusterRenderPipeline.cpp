@@ -316,7 +316,7 @@ bool ClusterRenderPipeline::Init(
                     createInfo.depthImageView, m_SoftwareRaster.GetVisBufferAtomicView(),
                     m_Resolve.GetOutputColorView(), m_Resolve.GetOutputNormalView(),
                     m_Resolve.GetOutputDepthView(), m_Resolve.GetOutputAlbedoView(),
-                    m_Resolve.GetOutputRoughnessMetallicView());
+                    m_Resolve.GetOutputRoughnessMetallicView(), m_Resolve.GetOutputMaterialIDView());
   m_Resolve.InitBinnedResolve(createInfo.device, createInfo.commandPool, createInfo.queue, m_ShadingBin);
 
   // =========================================================================================
@@ -335,7 +335,8 @@ bool ClusterRenderPipeline::Init(
   }
   if (!m_SurfaceCache.Init(createInfo.device, createInfo.allocator,
                            createInfo.commandPool, createInfo.queue,
-                           createInfo.cacheFilePath)) {
+                           createInfo.cacheFilePath, createInfo.entityDataBuffer,
+                           m_Resolve.GetMaterialParamsBuffer())) {
     LOG_ERROR("[ClusterRenderPipeline] Failed to initialize SurfaceCachePass.");
     return false;
   }
@@ -1339,14 +1340,14 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
 #ifndef NDEBUG
   if (cameraCopy.debugViewMode == DEBUG_VIEW_NORMAL) {
     m_ShadingBin.RecordClassifyAndSort(cmd, m_RenderExtent);
-    m_Resolve.RecordResolveBinned(cmd, viewProj, m_SceneLights.sun.direction, m_ShadingBin);
+    m_Resolve.RecordResolveBinned(cmd, viewProj, m_SceneLights.sun.direction, cameraPositionWorld, m_ShadingBin);
   } else {
     maths::mat4 prevViewProjForResolve = m_HasPrevViewProj ? m_PrevViewProj : viewProj;
-    m_Resolve.RecordResolve(cmd, viewProj, prevViewProjForResolve, m_SceneLights.sun.direction, cameraCopy.debugViewMode);
+    m_Resolve.RecordResolve(cmd, viewProj, prevViewProjForResolve, m_SceneLights.sun.direction, cameraPositionWorld, cameraCopy.debugViewMode);
   }
 #else
   m_ShadingBin.RecordClassifyAndSort(cmd, m_RenderExtent);
-  m_Resolve.RecordResolveBinned(cmd, viewProj, m_SceneLights.sun.direction, m_ShadingBin);
+  m_Resolve.RecordResolveBinned(cmd, viewProj, m_SceneLights.sun.direction, cameraPositionWorld, m_ShadingBin);
 #endif
 
   // =========================================================================================
@@ -1473,7 +1474,7 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
     bool megaLightsEnabled = true;
 #endif
     if (megaLightsEnabled) {
-      m_MegaLights.RecordShade(cmd, viewProj, m_FrameIndex);
+      m_MegaLights.RecordShade(cmd, viewProj, cameraPositionWorld, m_FrameIndex);
     }
   }
 

@@ -18,16 +18,23 @@ namespace geometry {
 
     namespace {
 
-        void UpdateNodeBounds(ClusterDAGNode& node) {
-            maths::vec3 boundsMin, boundsMax;
-            maths::ResetAABB(boundsMin, boundsMax);
-            for (const maths::vec3& p : node.mesh.positions) {
-                maths::ExpandAABB(boundsMin, boundsMax, p);
+        // Shared by UpdateNodeBounds (a node's own bounds) and EmitSimplifiedGroup (a group's
+        // shared bounding sphere, computed from its merged+simplified mesh before any re-split --
+        // see ClusterDAGGroup's own comment for why that value must be computed once, here, rather
+        // than re-derived per output fragment).
+        void ComputeMeshBounds(const SimplifiableMesh& mesh,
+            maths::vec3& outBoundsMin, maths::vec3& outBoundsMax,
+            maths::vec3& outSphereCenter, float& outSphereRadius) {
+            maths::ResetAABB(outBoundsMin, outBoundsMax);
+            for (const maths::vec3& p : mesh.positions) {
+                maths::ExpandAABB(outBoundsMin, outBoundsMax, p);
             }
-            node.boundsMin = boundsMin;
-            node.boundsMax = boundsMax;
-            node.sphereCenter = maths::AABBCenter(boundsMin, boundsMax);
-            node.sphereRadius = maths::AABBRadius(boundsMin, boundsMax);
+            outSphereCenter = maths::AABBCenter(outBoundsMin, outBoundsMax);
+            outSphereRadius = maths::AABBRadius(outBoundsMin, outBoundsMax);
+        }
+
+        void UpdateNodeBounds(ClusterDAGNode& node) {
+            ComputeMeshBounds(node.mesh, node.boundsMin, node.boundsMax, node.sphereCenter, node.sphereRadius);
         }
 
         // Adjacency between same-level (level >= 1) DAG nodes: two nodes are adjacent if they
@@ -40,8 +47,25 @@ namespace geometry {
         // entry); a cross-classification pair (one opaque, one masked) is never recorded, exactly
         // like ClusterGrouping::BuildClusterAdjacencyWeights at level 0->1 -- see that function's
         // doc comment for why.
+        //
+        // `nodeSourceGroupIndex` is likewise parallel to `levelMeshes`: two nodes produced by the
+        // SAME immediately-preceding re-split (EmitSimplifiedGroup, same non-invalid
+        // sourceGroupIndex) never get a weight entry either, even though they typically share by
+        // far the largest number of locked positions of any pair at this level -- the entire split
+        // plane SplitSimplifiableMesh cut them along. Without this exclusion, GreedyPairByWeight's
+        // "always prefer the highest-weight neighbor" rule would pick these two siblings right back
+        // over any other candidate, re-merging them into essentially the same oversized mesh their
+        // shared group just failed to fit in one cluster -- forcing the exact same re-split again,
+        // producing near-identical siblings that are once again each other's top candidate, forever
+        // (observed running past level 11000 with no convergence in testing). This is the same
+        // class of non-termination as the reverted 2026-07-16 pass-through-node fix attempt
+        // (ClusterDAG.h's own comment on ClusterDAGGroup), just reached through re-pairing instead
+        // of a trivial wrapper -- excluding the edge here forces each sibling to look for a
+        // genuinely different neighbor (their own external boundary, distinct from the shared cut),
+        // making real progress instead of oscillating between merge and re-split.
         std::unordered_map<uint64_t, uint32_t> BuildLevelAdjacencyWeights(
-            const std::vector<const SimplifiableMesh*>& levelMeshes, const std::vector<bool>& nodeIsMasked) {
+            const std::vector<const SimplifiableMesh*>& levelMeshes, const std::vector<bool>& nodeIsMasked,
+            const std::vector<uint32_t>& nodeSourceGroupIndex) {
 
             std::unordered_map<PositionKey, std::vector<uint32_t>, PositionKeyHash> positionToMeshes;
             for (uint32_t mi = 0; mi < levelMeshes.size(); ++mi) {
@@ -64,6 +88,10 @@ namespace geometry {
                     for (size_t b = a + 1; b < owners.size(); ++b) {
                         if (nodeIsMasked[owners[a]] != nodeIsMasked[owners[b]]) {
                             continue;
+                        }
+                        if (nodeSourceGroupIndex[owners[a]] != kInvalidDAGGroupIndex
+                            && nodeSourceGroupIndex[owners[a]] == nodeSourceGroupIndex[owners[b]]) {
+                            continue; // Re-split siblings -- see this function's own comment.
                         }
                         weights[PackIndexPairKey(owners[a], owners[b])] += 1u;
                     }
@@ -170,9 +198,9 @@ namespace geometry {
             return result;
         }
 
-        // One group awaiting simplification + promotion into a new, coarser DAG node.
+        // One group awaiting simplification + promotion into one or more new, coarser DAG nodes.
         struct PendingGroup {
-            std::vector<uint32_t> childDagIndices; // Indices into dag.nodes (the group's members).
+            std::vector<uint32_t> memberDagIndices; // Indices into dag.nodes (the group's members).
             SimplifiableMesh mesh;                  // Merged mesh, ready for SimplifyMeshQEM.
             uint32_t originalTriangleCount = 0;
         };
@@ -265,32 +293,47 @@ namespace geometry {
 
 
         // ----------------------------------------------------------------------------------
-        // Simplifies `mesh` and emits one DAG parent node into `dag`. If QEM alone cannot
-        // reduce the vertex count to kMaxClusterVertices (locked-vertex saturation -- common on
-        // hard-edged, multi-face-seam primitives like a box/cylinder/tube/pyramid/plane, whose
-        // many permanently-locked boundary vertices QEM can never collapse, vs. a smoothly-curved
-        // shape's much sparser locked set), this used to silently CLAMP the mesh: drop every
-        // triangle referencing a vertex beyond the cap and re-compact. That is a real, confirmed
-        // bug (2026-07-16 "some clusters just don't render" investigation) -- it punches an
-        // actual hole in the merged surface at that DAG level, and every level built on top of it
-        // inherits the hole.
+        // Simplifies `mesh` (merged from up to 4 same-level members, see ClusterGrouping::
+        // GroupItemsIntoQuads) and emits one ClusterDAGGroup into `dag`, producing either a single
+        // output node (the common case: the simplified mesh already fits one cluster's vertex/
+        // triangle cap) or, when it doesn't, exactly kMaxGroupOutputClusters output nodes via one
+        // spatial re-split (SplitSimplifiableMesh) -- both siblings sharing this group's error and
+        // bounding sphere (see ClusterDAGGroup's own comment). This indirection through a group,
+        // rather than simplifying straight into one parent node the way a 2-member merge always
+        // could, is what lets a group of up to 4 members legitimately need more than one coarser
+        // representative without any single member ever needing more than one parent reference.
         //
-        // Fixed by making each of this group's children a ROOT right here instead of forcing them
-        // into one lossy merged parent -- NOT by re-wrapping them in a trivial pass-through parent
-        // and feeding them back into `nextLevel` (a first attempt at this fix that shipped
-        // briefly and was caught before merging: since a pass-through node is byte-for-byte the
-        // same mesh with the same locked vertices, the exact same 2-child merge fails again next
-        // level, and the level after that, forever -- observed running past level 300 with no
-        // convergence in testing). Diverting straight to `outEarlyRoots` instead guarantees
+        // If QEM alone cannot reduce the vertex count to kMaxClusterVertices even after the
+        // re-split (locked-vertex saturation -- common on hard-edged, multi-face-seam primitives
+        // like a box/cylinder/tube/pyramid/plane, whose many permanently-locked boundary vertices
+        // QEM can never collapse, vs. a smoothly-curved shape's much sparser locked set), this
+        // used to (2026-07-16, before groups existed at all) silently CLAMP the mesh: drop every
+        // triangle referencing a vertex beyond the cap and re-compact. That is a real, confirmed
+        // bug ("some clusters just don't render" investigation) -- it punches an actual hole in
+        // the merged surface at that DAG level, and every level built on top of it inherits the
+        // hole.
+        //
+        // Fixed by making every one of this group's MEMBERS a ROOT right here instead of forcing
+        // them into a lossy merged/re-split output -- NOT by re-wrapping them in a trivial pass-
+        // through parent and feeding them back into `nextLevel` (a first attempt at this fix that
+        // shipped briefly and was caught before merging: since a pass-through node is byte-for-byte
+        // the same mesh with the same locked vertices, the exact same merge fails again next level,
+        // and the level after that, forever -- observed running past level 300 with no convergence
+        // in testing). Diverting straight to `outEarlyRoots` instead guarantees
         // `currentLevel.size()` strictly shrinks every time this fires, so BuildClusterDAG's
-        // `while (currentLevel.size() > 1)` loop is still guaranteed to terminate. Costs strictly
-        // less LOD compression for just this one problematic pair (each child becomes its own
-        // root one or more levels earlier than it would if it had been mergeable), never any lost
-        // geometry.
+        // `while (currentLevel.size() > 1)` loop is still guaranteed to terminate. The re-split
+        // path this function adds does not reopen that risk: SplitSimplifiableMesh strictly
+        // shrinks the triangle count of whichever half still doesn't fit relative to the
+        // already-simplified group mesh it split from, so this function still only ever calls it
+        // once per group (never recursively) -- an oversized half after that one split falls
+        // straight through to the exact same, already-proven-terminating earlyRoots path, never a
+        // second split attempt. Costs strictly less LOD compression for just this one problematic
+        // group (each member becomes its own root one or more levels earlier than it would if it
+        // had been mergeable), never any lost geometry.
         // ----------------------------------------------------------------------------------
-        void EmitSimplifiedNodes(
+        void EmitSimplifiedGroup(
             SimplifiableMesh mesh,
-            const std::vector<uint32_t>& childDagIndices,
+            const std::vector<uint32_t>& memberDagIndices,
             uint32_t originalTriangleCount,
             uint32_t level,
             ClusterDAG& dag,
@@ -301,47 +344,97 @@ namespace geometry {
             float simplificationError = 0.0f;
             SimplifyMeshQEM(mesh, targetTriangleCount, kMaxClusterVertices, &simplificationError);
 
-            if (mesh.positions.size() > kMaxClusterVertices || mesh.triangles.size() > kMaxClusterIndices) {
-                LOG_WARNING(std::format(
-                    "[ClusterDAG] Level {}: a {}-child merge still has {} vertices/{} triangles after "
-                    "simplification (cap: {} vertices/{} triangles) -- locked-vertex saturation. "
-                    "Each child becomes its own root here instead of merging, to avoid dropping geometry.",
-                    level, childDagIndices.size(), mesh.positions.size(), mesh.triangles.size() / 3,
-                    kMaxClusterVertices, kMaxClusterIndices / 3));
-                for (uint32_t childIdx : childDagIndices) {
-                    outEarlyRoots.push_back(childIdx); // dag.nodes[childIdx].parentIndex is already
-                                                        // kInvalidDAGNodeIndex (never touched) -- a
-                                                        // genuine root, not a dangling reference.
+            float membersMaxError = 0.0f;
+            for (uint32_t memberIdx : memberDagIndices) {
+                membersMaxError = std::max(membersMaxError, dag.nodes[memberIdx].clusterError);
+            }
+            float errorFloor = std::max(kMinimumErrorStepAbsolute, membersMaxError * kMinimumErrorStepRelative);
+            float groupError = std::max(simplificationError, membersMaxError + errorFloor);
+
+            // The group's shared bounding sphere: computed from the merged+simplified mesh BEFORE
+            // any re-split below, so both potential output siblings project the identical "parent"
+            // error/position -- see ClusterDAGGroup's own comment for why that must not depend on
+            // which specific sibling a runtime LOD cut ends up actually drawing.
+            maths::vec3 groupBoundsMin, groupBoundsMax, groupSphereCenter;
+            float groupSphereRadius = 0.0f;
+            ComputeMeshBounds(mesh, groupBoundsMin, groupBoundsMax, groupSphereCenter, groupSphereRadius);
+
+            std::vector<SimplifiableMesh> outputMeshes;
+            bool fits = mesh.positions.size() <= kMaxClusterVertices && mesh.triangles.size() <= kMaxClusterIndices;
+            if (fits) {
+                outputMeshes.push_back(std::move(mesh));
+            }
+            else if (mesh.triangles.size() >= 6) { // SplitSimplifiableMesh's own precondition (>= 2 triangles).
+                static_assert(kMaxGroupOutputClusters == 2u,
+                    "EmitSimplifiedGroup performs exactly one SplitSimplifiableMesh call, producing exactly "
+                    "2 halves -- update this split logic if kMaxGroupOutputClusters ever changes.");
+                SimplifiableMesh half0, half1;
+                SplitSimplifiableMesh(mesh, half0, half1);
+                outputMeshes.push_back(std::move(half0));
+                outputMeshes.push_back(std::move(half1));
+            }
+            else {
+                // Fewer than 2 triangles yet still over the vertex cap: pathological (would need
+                // hundreds of locked vertices packed onto a single triangle) but structurally
+                // possible, and SplitSimplifiableMesh cannot be called on it -- treat exactly like
+                // an unsplit oversized mesh below (this group produces zero outputs).
+                outputMeshes.push_back(std::move(mesh));
+            }
+
+            for (const SimplifiableMesh& piece : outputMeshes) {
+                if (piece.positions.size() > kMaxClusterVertices || piece.triangles.size() > kMaxClusterIndices) {
+                    LOG_WARNING(std::format(
+                        "[ClusterDAG] Level {}: a {}-member group still has an oversized piece ({} vertices/{} "
+                        "triangles; cap: {} vertices/{} triangles) after simplification{} -- locked-vertex "
+                        "saturation. Every member becomes its own root here instead of merging, to avoid "
+                        "dropping geometry.",
+                        level, memberDagIndices.size(), piece.positions.size(), piece.triangles.size() / 3,
+                        kMaxClusterVertices, kMaxClusterIndices / 3,
+                        outputMeshes.size() > 1 ? " and re-splitting" : ""));
+                    for (uint32_t memberIdx : memberDagIndices) {
+                        outEarlyRoots.push_back(memberIdx); // dag.nodes[memberIdx].parentGroupIndex is
+                                                             // already kInvalidDAGGroupIndex (never
+                                                             // touched) -- a genuine root, not a
+                                                             // dangling reference.
+                    }
+                    return;
                 }
-                return;
             }
 
-            float childrenMaxError = 0.0f;
-            for (uint32_t childIdx : childDagIndices) {
-                childrenMaxError = std::max(childrenMaxError, dag.nodes[childIdx].clusterError);
-            }
-            float errorFloor = std::max(kMinimumErrorStepAbsolute, childrenMaxError * kMinimumErrorStepRelative);
-            float nodeError  = std::max(simplificationError, childrenMaxError + errorFloor);
+            uint32_t groupIndex = static_cast<uint32_t>(dag.groups.size()); // Slot this group will occupy.
 
-            ClusterDAGNode parentNode;
-            parentNode.mesh         = std::move(mesh);
-            parentNode.childIndices = childDagIndices;
-            parentNode.level        = level;
-            parentNode.clusterError = nodeError;
-            // Every child is guaranteed the same isMasked classification (the adjacency-weight
-            // filters above never let an opaque and a masked node pair up), so any one child's
-            // value is authoritative for the new parent.
-            parentNode.isMasked     = dag.nodes[childDagIndices[0]].isMasked;
-            UpdateNodeBounds(parentNode);
+            std::vector<uint32_t> outputIndices;
+            outputIndices.reserve(outputMeshes.size());
+            for (SimplifiableMesh& outputMesh : outputMeshes) {
+                ClusterDAGNode outputNode;
+                outputNode.mesh            = std::move(outputMesh);
+                outputNode.sourceGroupIndex = groupIndex;
+                outputNode.level            = level;
+                outputNode.clusterError     = groupError;
+                // Every member is guaranteed the same isMasked classification (the adjacency-
+                // weight filters above never let an opaque and a masked node merge into one
+                // group), so any one member's value is authoritative for every output node.
+                outputNode.isMasked = dag.nodes[memberDagIndices[0]].isMasked;
+                UpdateNodeBounds(outputNode);
 
-            uint32_t parentDagIndex = static_cast<uint32_t>(dag.nodes.size());
-            for (uint32_t childIdx : childDagIndices) {
-                dag.nodes[childIdx].parentIndex = parentDagIndex;
-                dag.nodes[childIdx].parentError = nodeError;
+                uint32_t outputDagIndex = static_cast<uint32_t>(dag.nodes.size());
+                dag.nodes.push_back(std::move(outputNode));
+                outputIndices.push_back(outputDagIndex);
+                nextLevel.push_back(outputDagIndex);
             }
 
-            dag.nodes.push_back(std::move(parentNode));
-            nextLevel.push_back(parentDagIndex);
+            ClusterDAGGroup group;
+            group.memberClusterIndices = memberDagIndices;
+            group.outputClusterIndices = std::move(outputIndices);
+            group.groupError           = groupError;
+            group.groupSphereCenter    = groupSphereCenter;
+            group.groupSphereRadius    = groupSphereRadius;
+            dag.groups.push_back(std::move(group));
+
+            for (uint32_t memberIdx : memberDagIndices) {
+                dag.nodes[memberIdx].parentGroupIndex = groupIndex;
+                dag.nodes[memberIdx].parentError = groupError;
+            }
         }
 
     } // namespace
@@ -386,10 +479,11 @@ namespace geometry {
         uint32_t level = 1;
         bool isFirstPass = true;
 
-        // Nodes EmitSimplifiedNodes diverts straight to root status because their group's merge
-        // never fit within capacity even after simplification (see that function's own comment).
-        // Accumulated across every level and appended to dag.rootIndices at the end, alongside
-        // whatever's left in currentLevel once the main loop below terminates normally.
+        // Nodes EmitSimplifiedGroup diverts straight to root status because their group's merge
+        // never fit within capacity even after simplification and one re-split attempt (see that
+        // function's own comment). Accumulated across every level and appended to dag.rootIndices
+        // at the end, alongside whatever's left in currentLevel once the main loop below
+        // terminates normally.
         std::vector<uint32_t> earlyRoots;
 
         while (currentLevel.size() > 1) {
@@ -408,10 +502,24 @@ namespace geometry {
 
                 pendingGroups.reserve(groups.size());
                 for (ClusterGroup& g : groups) {
+                    // A singleton "group" (no adjacent partner -- e.g. a disconnected mesh
+                    // island) has nothing to merge with; wrapping it in a new node anyway would
+                    // simplify it against ITSELF (no other member contributes any new locked-
+                    // boundary constraint), producing an identical or near-identical mesh every
+                    // time this same singleton keeps failing to find a partner at the next level
+                    // too -- an unbounded chain of pass-through nodes, one per level, the same
+                    // non-termination class EmitSimplifiedGroup's own comment describes for its
+                    // reverted 2026-07-16 fix attempt. Promoting it straight to a root instead
+                    // costs nothing (it was never going to compress further) and guarantees this
+                    // level's node count can only shrink, never idle in place.
+                    if (g.memberClusterIndices.size() < 2) {
+                        earlyRoots.push_back(currentLevel[g.memberClusterIndices[0]]);
+                        continue;
+                    }
                     PendingGroup pg;
-                    pg.childDagIndices.reserve(g.memberClusterIndices.size());
+                    pg.memberDagIndices.reserve(g.memberClusterIndices.size());
                     for (uint32_t localIdx : g.memberClusterIndices) {
-                        pg.childDagIndices.push_back(currentLevel[localIdx]);
+                        pg.memberDagIndices.push_back(currentLevel[localIdx]);
                     }
                     pg.mesh = std::move(g.mesh);
                     pg.originalTriangleCount = g.originalTriangleCount;
@@ -421,16 +529,20 @@ namespace geometry {
             else {
                 std::vector<const SimplifiableMesh*> levelMeshes;
                 std::vector<bool> levelIsMasked;
+                std::vector<uint32_t> levelSourceGroupIndex;
                 levelMeshes.reserve(currentLevel.size());
                 levelIsMasked.reserve(currentLevel.size());
+                levelSourceGroupIndex.reserve(currentLevel.size());
                 for (uint32_t nodeIdx : currentLevel) {
                     levelMeshes.push_back(&dag.nodes[nodeIdx].mesh);
                     levelIsMasked.push_back(dag.nodes[nodeIdx].isMasked);
+                    levelSourceGroupIndex.push_back(dag.nodes[nodeIdx].sourceGroupIndex);
                 }
 
-                std::unordered_map<uint64_t, uint32_t> weights = BuildLevelAdjacencyWeights(levelMeshes, levelIsMasked);
+                std::unordered_map<uint64_t, uint32_t> weights =
+                    BuildLevelAdjacencyWeights(levelMeshes, levelIsMasked, levelSourceGroupIndex);
                 std::vector<std::vector<uint32_t>> memberLists =
-                    GreedyPairByWeight(static_cast<uint32_t>(currentLevel.size()), weights);
+                    GroupItemsIntoQuads(static_cast<uint32_t>(currentLevel.size()), weights);
 
                 bool anyPairFormed = false;
                 for (const auto& members : memberLists) {
@@ -442,11 +554,18 @@ namespace geometry {
 
                 pendingGroups.reserve(memberLists.size());
                 for (const auto& members : memberLists) {
+                    // A singleton (no adjacent partner left this level -- see the isFirstPass
+                    // branch's own comment for why this must promote straight to a root instead
+                    // of wrapping a new pass-through node around it).
+                    if (members.size() < 2) {
+                        earlyRoots.push_back(currentLevel[members[0]]);
+                        continue;
+                    }
                     MergedLevelResult merged = MergeLevelMeshes(members, levelMeshes);
                     PendingGroup pg;
-                    pg.childDagIndices.reserve(members.size());
+                    pg.memberDagIndices.reserve(members.size());
                     for (uint32_t localIdx : members) {
-                        pg.childDagIndices.push_back(currentLevel[localIdx]);
+                        pg.memberDagIndices.push_back(currentLevel[localIdx]);
                     }
                     pg.mesh = std::move(merged.mesh);
                     pg.originalTriangleCount = merged.originalTriangleCount;
@@ -454,17 +573,18 @@ namespace geometry {
                 }
             }
 
-            // --- Simplify each group and promote it into one coarser DAG node, or (when QEM
-            // alone can't reduce vertex count below kMaxClusterVertices -- locked-vertex
-            // saturation) divert the group's children straight into `earlyRoots` instead of
-            // ever dropping geometry to force a fit -- see EmitSimplifiedNodes's own comment.
+            // --- Simplify each group and promote it into one (or, when QEM alone can't reduce
+            // vertex count below kMaxClusterVertices even after a re-split -- locked-vertex
+            // saturation -- zero) coarser DAG node(s), diverting the group's members straight into
+            // `earlyRoots` instead of ever dropping geometry to force a fit -- see
+            // EmitSimplifiedGroup's own comment.
             std::vector<uint32_t> nextLevel;
             nextLevel.reserve(pendingGroups.size());
 
             for (PendingGroup& pg : pendingGroups) {
-                EmitSimplifiedNodes(
+                EmitSimplifiedGroup(
                     std::move(pg.mesh),
-                    pg.childDagIndices,
+                    pg.memberDagIndices,
                     pg.originalTriangleCount,
                     level,
                     dag,
@@ -519,7 +639,10 @@ namespace geometry {
                 return;
             }
             if (state[nodeIndex] == VisitState::Done) {
-                return; // Already fully validated via another path (should not happen in a proper forest, but harmless).
+                return; // Already fully validated via another path -- the EXPECTED case for a node
+                        // reachable through more than one of its group's output siblings (this is a
+                        // true DAG, not a strict tree; see ClusterDAGGroup's own comment), not just
+                        // a defensive "should not happen" fallback.
             }
 
             state[nodeIndex] = VisitState::InProgress;
@@ -614,76 +737,120 @@ namespace geometry {
                     }
                 }
 
-                // 4. On-disk format contract: childClusterID is a fixed 2-element array (ClusterFormat.h's
-                // DAGNodeEntry) -- a node with more than 2 children could never be represented on disk.
-                if (node.childIndices.size() > 2) {
-                    MarkFailure(outErrors, label + " has " + std::to_string(node.childIndices.size()) +
-                        " children, more than the on-disk format's 2-child limit");
+                // 4. On-disk format contract: childClusterID is a fixed 4-element array (ClusterFormat.h's
+                // DAGNodeEntry) -- a node with more than 4 children could never be represented on disk.
+                size_t childCount = (node.sourceGroupIndex != kInvalidDAGGroupIndex && node.sourceGroupIndex < dag.groups.size())
+                    ? dag.groups[node.sourceGroupIndex].memberClusterIndices.size()
+                    : 0;
+                if (childCount > 4) {
+                    MarkFailure(outErrors, label + " has " + std::to_string(childCount) +
+                        " children, more than the on-disk format's 4-child limit");
                 }
 
                 // 5. A leaf (level 0, no children) must carry exactly zero clusterError, per this
                 // struct's own documented invariant -- it IS the exact original geometry.
-                if (node.childIndices.empty() && node.clusterError != 0.0f) {
+                if (childCount == 0 && node.clusterError != 0.0f) {
                     MarkFailure(outErrors, label + " is a leaf but clusterError is " +
                         std::to_string(node.clusterError) + " instead of the documented 0.0f");
                 }
             }
 #endif
 
-            // --- Error monotonicity ------------------------------------------------------------
-            if (node.parentIndex == kInvalidDAGNodeIndex) {
+            // --- Error monotonicity (parent GROUP side) ----------------------------------------
+            if (node.parentGroupIndex == kInvalidDAGGroupIndex) {
                 if (!std::isinf(node.parentError) || node.parentError < 0.0f) {
                     MarkFailure(outErrors, label + " is a root but parentError is not +infinity");
                 }
             }
+            else if (node.parentGroupIndex >= dag.groups.size()) {
+                MarkFailure(outErrors, label + " has an out-of-range parentGroupIndex " + std::to_string(node.parentGroupIndex));
+            }
             else {
-                if (node.parentIndex >= dag.nodes.size()) {
-                    MarkFailure(outErrors, label + " has an out-of-range parentIndex " + std::to_string(node.parentIndex));
+                const ClusterDAGGroup& parentGroup = dag.groups[node.parentGroupIndex];
+                if (node.parentError != parentGroup.groupError) {
+                    MarkFailure(outErrors, label + " cached parentError (" + std::to_string(node.parentError) +
+                        ") does not match its parent group's actual groupError (" + std::to_string(parentGroup.groupError) + ")");
                 }
-                else {
-                    const ClusterDAGNode& parent = dag.nodes[node.parentIndex];
-                    if (node.parentError != parent.clusterError) {
-                        MarkFailure(outErrors, label + " cached parentError (" + std::to_string(node.parentError) +
-                            ") does not match its parent's actual clusterError (" + std::to_string(parent.clusterError) + ")");
-                    }
-                    if (!(node.parentError > node.clusterError)) {
-                        MarkFailure(outErrors, label + " violates strict LOD error monotonicity: parentError (" +
-                            std::to_string(node.parentError) + ") is not strictly greater than clusterError (" +
-                            std::to_string(node.clusterError) + ")");
-                    }
+                if (!(node.parentError > node.clusterError)) {
+                    MarkFailure(outErrors, label + " violates strict LOD error monotonicity: parentError (" +
+                        std::to_string(node.parentError) + ") is not strictly greater than clusterError (" +
+                        std::to_string(node.clusterError) + ")");
+                }
 
-                    // isMasked purity: a node's classification must match its parent's -- proves the
-                    // opaque/masked split's purity guarantee (never merging differently-classified
-                    // nodes, see BuildClusterAdjacencyWeights/BuildLevelAdjacencyWeights) actually
-                    // held for the DAG as constructed, not just for one merge in isolation.
-                    if (node.isMasked != parent.isMasked) {
+                // Mutual consistency: `node` must actually appear in its declared parent group's
+                // memberClusterIndices.
+                const auto& members = parentGroup.memberClusterIndices;
+                if (std::find(members.begin(), members.end(), nodeIndex) == members.end()) {
+                    MarkFailure(outErrors, label + "'s parent group (" + std::to_string(node.parentGroupIndex) +
+                        ") does not list it back as a member");
+                }
+
+                // isMasked purity: a node's classification must match every one of its parent
+                // group's other members -- proves the opaque/masked split's purity guarantee
+                // (never merging differently-classified nodes, see BuildClusterAdjacencyWeights/
+                // BuildLevelAdjacencyWeights) actually held for the DAG as constructed, not just
+                // for one merge in isolation.
+                for (uint32_t siblingIdx : members) {
+                    if (siblingIdx < dag.nodes.size() && dag.nodes[siblingIdx].isMasked != node.isMasked) {
                         MarkFailure(outErrors, label + "'s isMasked (" + std::to_string(node.isMasked) +
-                            ") does not match its parent's isMasked (" + std::to_string(parent.isMasked) + ")");
-                    }
-
-                    // Mutual consistency: `node` must actually appear in its declared parent's childIndices.
-                    const auto& siblings = parent.childIndices;
-                    if (std::find(siblings.begin(), siblings.end(), nodeIndex) == siblings.end()) {
-                        MarkFailure(outErrors, label + "'s parent (node " + std::to_string(node.parentIndex) +
-                            ") does not list it back as a child");
+                            ") does not match sibling group member " + std::to_string(siblingIdx) +
+                            "'s isMasked (" + std::to_string(dag.nodes[siblingIdx].isMasked) + ")");
+                        break;
                     }
                 }
             }
 
-            // --- Descend into children, checking the reverse (child -> parent) consistency ----
-            for (uint32_t childIdx : node.childIndices) {
-                if (childIdx >= dag.nodes.size()) {
-                    MarkFailure(outErrors, label + " has an out-of-range child index " + std::to_string(childIdx));
-                    continue;
+            // --- If this node was itself produced by a group, verify that group lists it back as
+            // one of its outputs, then descend into that group's members (this node's children),
+            // checking the reverse (child -> parent-group) consistency ---------------------------
+            if (node.sourceGroupIndex != kInvalidDAGGroupIndex) {
+                if (node.sourceGroupIndex >= dag.groups.size()) {
+                    MarkFailure(outErrors, label + " has an out-of-range sourceGroupIndex " + std::to_string(node.sourceGroupIndex));
                 }
-                if (dag.nodes[childIdx].parentIndex != nodeIndex) {
-                    MarkFailure(outErrors, label + " lists node " + std::to_string(childIdx) +
-                        " as a child, but that node's parentIndex does not point back");
+                else {
+                    const ClusterDAGGroup& sourceGroup = dag.groups[node.sourceGroupIndex];
+                    const auto& outputs = sourceGroup.outputClusterIndices;
+                    if (std::find(outputs.begin(), outputs.end(), nodeIndex) == outputs.end()) {
+                        MarkFailure(outErrors, label + "'s source group (" + std::to_string(node.sourceGroupIndex) +
+                            ") does not list it back as an output");
+                    }
+
+                    for (uint32_t childIdx : sourceGroup.memberClusterIndices) {
+                        if (childIdx >= dag.nodes.size()) {
+                            MarkFailure(outErrors, label + " has an out-of-range child index " + std::to_string(childIdx));
+                            continue;
+                        }
+                        if (dag.nodes[childIdx].parentGroupIndex != node.sourceGroupIndex) {
+                            MarkFailure(outErrors, label + " lists node " + std::to_string(childIdx) +
+                                " as a child, but that node's parentGroupIndex does not point back to this node's source group");
+                        }
+                        ValidateReachableFrom(dag, childIdx, state, outErrors);
+                    }
                 }
-                ValidateReachableFrom(dag, childIdx, state, outErrors);
             }
 
             state[nodeIndex] = VisitState::Done;
+        }
+
+        // Group-scoped invariants ValidateReachableFrom's per-node walk doesn't already cover
+        // directly: every group must actually have produced at least one output (a group with zero
+        // outputs would mean EmitSimplifiedGroup's earlyRoots bailout path leaked a group entry it
+        // should never have created -- that path returns before ever calling dag.groups.push_back)
+        // and must stay within the documented 1-4 member / 1-kMaxGroupOutputClusters output range.
+        void ValidateGroupShapes(const ClusterDAG& dag, std::vector<std::string>& outErrors) {
+            for (uint32_t gi = 0; gi < dag.groups.size(); ++gi) {
+                const ClusterDAGGroup& group = dag.groups[gi];
+                const std::string label = "group " + std::to_string(gi);
+
+                if (group.memberClusterIndices.empty() || group.memberClusterIndices.size() > 4) {
+                    MarkFailure(outErrors, label + " has " + std::to_string(group.memberClusterIndices.size()) +
+                        " members, outside the documented 1-4 range");
+                }
+                if (group.outputClusterIndices.empty() || group.outputClusterIndices.size() > kMaxGroupOutputClusters) {
+                    MarkFailure(outErrors, label + " has " + std::to_string(group.outputClusterIndices.size()) +
+                        " outputs, outside the documented 1-" + std::to_string(kMaxGroupOutputClusters) + " range");
+                }
+            }
         }
 
     } // namespace
@@ -698,9 +865,9 @@ namespace geometry {
                 MarkFailure(outErrors, "rootIndices contains an out-of-range index " + std::to_string(rootIdx));
                 continue;
             }
-            if (dag.nodes[rootIdx].parentIndex != kInvalidDAGNodeIndex) {
+            if (dag.nodes[rootIdx].parentGroupIndex != kInvalidDAGGroupIndex) {
                 MarkFailure(outErrors, "node " + std::to_string(rootIdx) +
-                    " is listed in rootIndices but has a non-null parentIndex");
+                    " is listed in rootIndices but has a non-null parentGroupIndex");
             }
             ValidateReachableFrom(dag, rootIdx, state, outErrors);
         }
@@ -711,6 +878,8 @@ namespace geometry {
                     " is not reachable from any declared root (orphaned/disconnected from the DAG's forest)");
             }
         }
+
+        ValidateGroupShapes(dag, outErrors);
 
         return outErrors.empty();
     }
