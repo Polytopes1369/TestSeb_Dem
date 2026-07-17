@@ -40,4 +40,18 @@ namespace geometry {
         const core::EntityData* entityData,
         uint32_t entityCount);
 
+    // Checks if the cached geometry file (scene.cache) exists and is up to date
+    // with current configuration settings, vertex/index counts, and entity counts.
+    bool IsCacheUpToDate(
+        uint32_t totalVertexCount,
+        uint32_t totalIndexCount,
+        uint32_t entityCount);
+
+    // Persists configuration settings, vertex/index counts, and entity counts
+    // to scene.cache.cfg alongside the compiled scene.cache.
+    void SaveCacheConfig(
+        uint32_t totalVertexCount,
+        uint32_t totalIndexCount,
+        uint32_t entityCount);
+
 }

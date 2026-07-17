@@ -21,6 +21,8 @@ namespace renderer {
         , m_PageTableImage(std::move(other.m_PageTableImage))
         , m_PhysicalPoolImages(std::move(other.m_PhysicalPoolImages))
         , m_PhysicalPoolViews(std::move(other.m_PhysicalPoolViews))
+        , m_PhysicalPoolFormats(std::move(other.m_PhysicalPoolFormats))
+        , m_PhysicalPoolLayerViews(std::move(other.m_PhysicalPoolLayerViews))
         , m_PageTableSampler(other.m_PageTableSampler)
         , m_PhysicalPoolSampler(other.m_PhysicalPoolSampler)
         , m_PageTableStagingBuffer(std::move(other.m_PageTableStagingBuffer))
@@ -66,6 +68,8 @@ namespace renderer {
             m_PageTableImage = std::move(other.m_PageTableImage);
             m_PhysicalPoolImages = std::move(other.m_PhysicalPoolImages);
             m_PhysicalPoolViews = std::move(other.m_PhysicalPoolViews);
+            m_PhysicalPoolFormats = std::move(other.m_PhysicalPoolFormats);
+            m_PhysicalPoolLayerViews = std::move(other.m_PhysicalPoolLayerViews);
             m_PageTableSampler = other.m_PageTableSampler;
             m_PhysicalPoolSampler = other.m_PhysicalPoolSampler;
             m_PageTableStagingBuffer = std::move(other.m_PageTableStagingBuffer);
@@ -181,9 +185,14 @@ namespace renderer {
         m_PageTableStagingMapped = m_PageTableStagingBuffer.MappedData();
 
         // 6. Create Physical Pool images (2D Array)
+        // VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT is required alongside TRANSFER_DST/SAMPLED because
+        // renderer::VirtualTextureRenderPass (Step 3, RVT) writes tiles directly via Dynamic
+        // Rendering (a color attachment), not only via UploadTileData's buffer-to-image copy.
         uint32_t tileSizeWithBorder = GetTileSizeWithBorder();
+        m_PhysicalPoolFormats = physicalPoolFormats;
         m_PhysicalPoolImages.resize(physicalPoolFormats.size());
         m_PhysicalPoolViews.resize(physicalPoolFormats.size());
+        m_PhysicalPoolLayerViews.resize(physicalPoolFormats.size());
         for (size_t i = 0; i < physicalPoolFormats.size(); ++i) {
             VkImageCreateInfo poolImageInfo{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
             poolImageInfo.imageType = VK_IMAGE_TYPE_2D;
@@ -193,7 +202,8 @@ namespace renderer {
             poolImageInfo.arrayLayers = config.physicalPageCapacity;
             poolImageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
             poolImageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
-            poolImageInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+            poolImageInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT
+                | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
             poolImageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
             poolImageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
@@ -212,6 +222,19 @@ namespace renderer {
             viewInfo.subresourceRange.layerCount = config.physicalPageCapacity;
 
             VK_CHECK(vkCreateImageView(m_Device, &viewInfo, nullptr, &m_PhysicalPoolViews[i]));
+
+            // Per-layer VK_IMAGE_VIEW_TYPE_2D views: one per physical page slot, used as
+            // VkRenderingAttachmentInfo color attachment targets by VirtualTextureRenderPass (a
+            // VK_IMAGE_VIEW_TYPE_2D_ARRAY view cannot be bound as a single-layer color attachment).
+            m_PhysicalPoolLayerViews[i].resize(config.physicalPageCapacity);
+            for (uint32_t layer = 0; layer < config.physicalPageCapacity; ++layer) {
+                VkImageViewCreateInfo layerViewInfo{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+                layerViewInfo.image = m_PhysicalPoolImages[i].Image();
+                layerViewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+                layerViewInfo.format = physicalPoolFormats[i];
+                layerViewInfo.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, layer, 1 };
+                VK_CHECK(vkCreateImageView(m_Device, &layerViewInfo, nullptr, &m_PhysicalPoolLayerViews[i][layer]));
+            }
         }
 
         // Initialize layouts via a one-shot command
@@ -254,6 +277,15 @@ namespace renderer {
             }
             m_PhysicalPoolViews.clear();
 
+            for (auto& poolLayerViews : m_PhysicalPoolLayerViews) {
+                for (VkImageView view : poolLayerViews) {
+                    if (view != VK_NULL_HANDLE) {
+                        vkDestroyImageView(m_Device, view, nullptr);
+                    }
+                }
+            }
+            m_PhysicalPoolLayerViews.clear();
+
             if (m_PageTableSampler != VK_NULL_HANDLE) {
                 vkDestroySampler(m_Device, m_PageTableSampler, nullptr);
                 m_PageTableSampler = VK_NULL_HANDLE;
@@ -269,6 +301,7 @@ namespace renderer {
             poolImage.Destroy();
         }
         m_PhysicalPoolImages.clear();
+        m_PhysicalPoolFormats.clear();
 
         m_PageTableStagingBuffer.Destroy();
         m_PageTableStagingMapped = nullptr;

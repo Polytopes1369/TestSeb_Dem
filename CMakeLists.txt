@@ -9,6 +9,8 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # Static runtime for MSVC (Autonomous .exe)
 if(MSVC)
     set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    # Enable multi-processor compilation
+    add_compile_options(/MP)
 endif()
 
 # --- Dépendances ---
@@ -178,6 +180,22 @@ add_executable(VirtualTextureTests
 target_include_directories(VirtualTextureTests PRIVATE src ${Vulkan_INCLUDE_DIRS} vendor/vma)
 target_link_libraries(VirtualTextureTests PRIVATE Vulkan::Vulkan)
 add_test(NAME VirtualTextureTests COMMAND VirtualTextureTests)
+
+add_executable(VirtualTextureRenderPassTests
+    src/renderer/streaming/VirtualTextureManager.cpp
+    src/renderer/passes/VirtualTextureRenderPass.cpp
+    src/io/StreamingRequestQueue.cpp
+    src/renderer/vulkan/GpuBuffer.cpp
+    src/renderer/vulkan/GpuImage.cpp
+    src/renderer/vulkan/VmaUsage.cpp
+    src/renderer/vulkan/VulkanUtils.cpp
+    src/renderer/vulkan/VulkanPipeline.cpp
+    src/core/Logger.cpp
+    tests/VirtualTextureRenderPassTests.cpp
+)
+target_include_directories(VirtualTextureRenderPassTests PRIVATE src ${Vulkan_INCLUDE_DIRS} vendor/vma)
+target_link_libraries(VirtualTextureRenderPassTests PRIVATE Vulkan::Vulkan)
+add_test(NAME VirtualTextureRenderPassTests COMMAND VirtualTextureRenderPassTests)
 
 # ==============================================================================
 # AUTOMATIZED SHADER COMPILATION & POST-BUILD COPY

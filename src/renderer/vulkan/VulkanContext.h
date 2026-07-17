@@ -172,6 +172,7 @@ private:
     VkPipeline m_PyramidPipeline = VK_NULL_HANDLE;
     VkPipeline m_TorusKnotPipeline = VK_NULL_HANDLE;
     VkPipeline m_ChamferBoxPipeline = VK_NULL_HANDLE;
+    VkPipeline m_AutosmoothPipeline = VK_NULL_HANDLE;
 
     // The box is generated via 6 dispatches (one per cube face) of the same geom_box.comp
     // module, each specialized with a different VkSpecializationInfo (axis mapping / winding)

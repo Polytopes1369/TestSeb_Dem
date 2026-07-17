@@ -432,16 +432,26 @@ bool ClusterRenderPipeline::Init(
     LOG_ERROR("[ClusterRenderPipeline] Failed to initialize WorldProbeGridPass.");
     return false;
   }
-  // Final spatial denoiser: denoises m_Resolve's own output color image (direct light +, after
-  // RecordFrame()'s own [12b] step, m_ScreenProbeGI's gathered indirect term), guided by
+
+  // Screen Trace GI -- linear screen-space depth raymarching falling back to the World Probe grid.
+  m_ScreenTrace.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
+                     createInfo.renderExtent, m_Resolve.GetOutputDepthView(), m_Resolve.GetOutputNormalView(),
+                     m_Resolve.GetOutputColorView(), m_WorldProbes);
+
+  // Final spatial denoiser: denoises m_ScreenTrace's own output GI image, guided by
   // m_Resolve's own G-buffer normal/depth -- both already Init'd (STEP 6 above).
   m_Denoiser.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
-      createInfo.renderExtent, m_Resolve.GetOutputColorView(), m_Resolve.GetOutputDepthView(),
+      createInfo.renderExtent, m_ScreenTrace.GetOutputView(), m_Resolve.GetOutputDepthView(),
       m_Resolve.GetOutputNormalView());
+
+  // GI Composite: blends m_Resolve's direct lighting / reflections with the denoised indirect GI.
+  m_GIComposite.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
+      createInfo.renderExtent, m_Resolve.GetOutputColorView(), m_Denoiser.GetOutputView(),
+      m_Resolve.GetOutputDepthView(), m_WorldProbes);
 
   m_TAATSR.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
       m_RenderExtent, m_DisplayExtent,
-      m_Denoiser.GetOutputView(), m_Resolve.GetOutputDepthView());
+      m_GIComposite.GetOutputView(), m_Resolve.GetOutputDepthView());
 
 #ifndef NDEBUG
   // Two-tier SDF ray march DEBUG VISUALIZATION (see ClusterRenderPipeline.h's own comment on
@@ -506,6 +516,8 @@ void ClusterRenderPipeline::Shutdown() {
 #endif
   m_Reflection.Shutdown();
   m_ScreenProbeGI.Shutdown();
+  m_ScreenTrace.Shutdown();
+  m_GIComposite.Shutdown();
   m_Denoiser.Shutdown();
   m_TAATSR.Shutdown();
   m_WorldProbes.Shutdown();
@@ -1171,33 +1183,25 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
   // RequestShadowPageResidency() this frame has run.
   m_VirtualShadowMap.RecordEndFrame(cmd);
 
-  // [12b] Screen Space Probe GI: trace -> temporal reprojection/accumulation -> bilateral
-  // gather, read-modify-writing m_Resolve's own output color image directly (see
-  // renderer::ScreenProbeGIPass's own class comment for the exact per-frame call contract). Runs
-  // after [12] Resolve (needs its GBuffer) and after [1z]'s GI injection (this frame's Surface
-  // Cache radiance atlas already reflects this frame's own lighting/capture/injection updates).
+  // [12b] Screen Trace GI (Lumen Screen Trace + World Probe fallback): traces linear screen-space
+  // rays against the GBuffer depth/normal, falling back to the 3D world probe grid on miss.
+  // Writes to its own dedicated output image (m_ScreenTrace.GetOutputImage()).
   // =========================================================================================
   {
-    maths::mat4 prevViewProjForProbes = m_HasPrevViewProj ? m_PrevViewProj : maths::mat4{};
-    m_ScreenProbeGI.RecordUpdateViewParams(cmd, viewProj, prevViewProjForProbes);
-
-    // `ssrtEnabled` (debug-only toggle, main.cpp's 'F' key) gates the trace/temporal/gather trio
-    // entirely -- skipped means zero screen-space probe indirect contribution this frame at all,
-    // isolating this stage's own cost/visual contribution from the rest of the GI stack. Release
-    // always runs the trio.
 #ifndef NDEBUG
     bool ssrtEnabled = m_DebugSSRTEnabled;
 #else
     bool ssrtEnabled = true;
 #endif
     if (ssrtEnabled) {
-      m_ScreenProbeGI.RecordTrace(cmd, m_TraceContext, m_TraceContext.GetEntityCount(), traceMode, m_FrameIndex);
-      m_ScreenProbeGI.RecordTemporal(cmd);
-      m_ScreenProbeGI.RecordGather(cmd
-#ifndef NDEBUG
-        , cameraCopy.debugViewMode
-#endif
-      );
+      m_ScreenTrace.RecordTrace(cmd, cameraCopy, cameraPositionWorld, m_WorldProbes.GetGridOriginWorld(), m_FrameIndex);
+    } else {
+      VkClearColorValue blackClear{};
+      blackClear.float32[0] = 0.0f;
+      blackClear.float32[1] = 0.0f;
+      blackClear.float32[2] = 0.0f;
+      blackClear.float32[3] = 0.0f;
+      VulkanUtils::ClearComputeImageToGeneral(cmd, m_ScreenTrace.GetOutputImage(), blackClear);
     }
   }
 
@@ -1252,7 +1256,7 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
 #ifndef NDEBUG
   bool worldProbesEnabled = m_DebugWorldProbesEnabled;
 #else
-  bool worldProbesEnabled = false;
+  bool worldProbesEnabled = true;
 #endif
   if (worldProbesEnabled) {
     m_WorldProbes.RecordUpdate(cmd, cameraFrameInfo.position, m_TraceContext, traceMode);
@@ -1281,12 +1285,35 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
   // (COMPUTE_SHADER/STORAGE_WRITE -> COMPUTE_SHADER/SHADER_SAMPLED_READ) for [14]'s blit read.
   // =========================================================================================
 #ifndef NDEBUG
-  bool applyDenoise = (cameraCopy.debugViewMode == DEBUG_VIEW_NORMAL);
+  bool applyDenoise = (cameraCopy.debugViewMode == DEBUG_VIEW_NORMAL || cameraCopy.debugViewMode == DEBUG_VIEW_LUMEN);
 #else
   bool applyDenoise = true;
 #endif
   if (applyDenoise) {
     m_Denoiser.RecordDenoise(cmd);
+  }
+
+  // =========================================================================================
+  // [12e] GI Composite: blends direct lit color/reflections with denoised indirect GI.
+  // =========================================================================================
+  m_GIComposite.RecordComposite(cmd
+#ifndef NDEBUG
+      , cameraCopy, cameraPositionWorld, m_WorldProbes.GetGridOriginWorld()
+#endif
+  );
+
+  // Barrier from GIComposite compute writes to TAA/TSR sampled reads
+  {
+    VkMemoryBarrier2 barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    barrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    barrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+    barrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    barrier.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+
+    VkDependencyInfo depInfo{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    depInfo.memoryBarrierCount = 1;
+    depInfo.pMemoryBarriers = &barrier;
+    vkCmdPipelineBarrier2(cmd, &depInfo);
   }
 
   // =========================================================================================
@@ -1338,8 +1365,8 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
   // this run. Must run before the debug overlay below so the HUD stays on top of everything.
   // =========================================================================================
   {
-    VkImage transparentTargetImage = applyDenoise ? m_Denoiser.GetOutputImage() : m_Resolve.GetOutputColorImage();
-    VkImageView transparentTargetView = applyDenoise ? m_Denoiser.GetOutputView() : m_Resolve.GetOutputColorView();
+    VkImage transparentTargetImage = m_GIComposite.GetOutputImage();
+    VkImageView transparentTargetView = m_GIComposite.GetOutputView();
     m_TransparentForward.RecordDraw(cmd, transparentTargetImage, transparentTargetView, m_DepthImageView,
         m_RenderExtent, cameraCopy.view, cameraCopy.proj, m_Decompression.GetDecompressedIndexPoolBuffer(),
         m_SceneLights.sun.direction);
@@ -1357,7 +1384,7 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
       float passJitterX = taatsrEnabled ? jitterX : 0.0f;
       float passJitterY = taatsrEnabled ? jitterY : 0.0f;
 
-      VkImageView currentLowResColorView = applyDenoise ? m_Denoiser.GetOutputView() : m_Resolve.GetOutputColorView();
+      VkImageView currentLowResColorView = m_GIComposite.GetOutputView();
       m_TAATSR.UpdateDescriptorSets(currentLowResColorView, m_Resolve.GetOutputDepthView());
 
       m_TAATSR.RecordPass(cmd, viewProj, prevViewProjForTAA, invViewProj, passJitterX, passJitterY, m_FrameIndex, resetHistory);
@@ -1416,10 +1443,12 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
     VkImage blitSourceImage = m_TAATSR.GetOutputImage();
 #ifndef NDEBUG
     if (cameraCopy.debugViewMode != DEBUG_VIEW_NORMAL && cameraCopy.debugViewMode != DEBUG_VIEW_MOTION_VECTORS) {
-        if (cameraCopy.debugViewMode == DEBUG_VIEW_LUMEN || cameraCopy.debugViewMode == DEBUG_VIEW_GLOBAL_SDF) {
+        if (cameraCopy.debugViewMode == DEBUG_VIEW_LUMEN || cameraCopy.debugViewMode == DEBUG_VIEW_SPATIAL_PROBES) {
+            blitSourceImage = m_GIComposite.GetOutputImage();
+        } else if (cameraCopy.debugViewMode == DEBUG_VIEW_GLOBAL_SDF) {
             blitSourceImage = m_SDFRayMarch.GetOutputImage();
         } else {
-            blitSourceImage = applyDenoise ? m_Denoiser.GetOutputImage() : m_Resolve.GetOutputColorImage();
+            blitSourceImage = m_Resolve.GetOutputColorImage();
         }
     }
 #endif
@@ -1438,8 +1467,8 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
         overlayExtent = m_RenderExtent;
     }
 #endif
-    else if (blitSourceImage == m_Denoiser.GetOutputImage()) {
-        overlayTargetView = m_Denoiser.GetOutputView();
+    else if (blitSourceImage == m_GIComposite.GetOutputImage()) {
+        overlayTargetView = m_GIComposite.GetOutputView();
         overlayExtent = m_RenderExtent;
     }
     else {
@@ -1474,10 +1503,12 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
   VkImage blitSourceImage = m_TAATSR.GetOutputImage();
 #ifndef NDEBUG
   if (cameraCopy.debugViewMode != DEBUG_VIEW_NORMAL && cameraCopy.debugViewMode != DEBUG_VIEW_MOTION_VECTORS) {
-      if (cameraCopy.debugViewMode == DEBUG_VIEW_LUMEN || cameraCopy.debugViewMode == DEBUG_VIEW_GLOBAL_SDF) {
+      if (cameraCopy.debugViewMode == DEBUG_VIEW_LUMEN || cameraCopy.debugViewMode == DEBUG_VIEW_SPATIAL_PROBES) {
+          blitSourceImage = m_GIComposite.GetOutputImage();
+      } else if (cameraCopy.debugViewMode == DEBUG_VIEW_GLOBAL_SDF) {
           blitSourceImage = m_SDFRayMarch.GetOutputImage();
       } else {
-          blitSourceImage = applyDenoise ? m_Denoiser.GetOutputImage() : m_Resolve.GetOutputColorImage();
+          blitSourceImage = m_Resolve.GetOutputColorImage();
       }
   }
 #endif

@@ -31,6 +31,7 @@ namespace renderer {
 
     class VirtualTextureManager {
         friend class VirtualTextureTests;
+        friend class VirtualTextureRenderPassTests; // Same device-less bookkeeping-only test bypass.
     public:
         VirtualTextureManager() = default;
         ~VirtualTextureManager();
@@ -58,6 +59,17 @@ namespace renderer {
         // Touches a page at (x, y, mip) to mark it as most recently used (LRU tracking) without modifying residency.
         void TouchPage(uint32_t x, uint32_t y, uint32_t mip);
 
+        // True if (x, y, mip) is resident at EXACTLY that mip (not merely inheriting a coarser
+        // ancestor's fallback mapping via PropagatePageTable). Lets a caller such as
+        // renderer::VirtualTextureRenderPass distinguish "still visible, already rendered" from
+        // "genuinely needs a (re)render" before calling RequestPageResidency, so a page that is
+        // re-requested every frame simply because it remains on screen is not redundantly redrawn.
+        bool IsPageResident(uint32_t x, uint32_t y, uint32_t mip) const {
+            uint32_t index = GetPageTableIndex(x, y, mip);
+            return m_PageTableEntries[index].residentMip == mip
+                && m_PageTableEntries[index].physicalPageIndex != kInvalidPhysicalPageIndex;
+        }
+
         // Uploads raw tile data from a staging buffer into a specific physical pool slice
         void UploadTileData(VkCommandBuffer cmd, uint32_t physicalPageIndex, VkBuffer srcStagingBuffer,
                             VkDeviceSize srcOffset, uint32_t poolIndex = 0);
@@ -77,6 +89,16 @@ namespace renderer {
         VkImage GetPhysicalPoolImage(uint32_t poolIndex = 0) const { return m_PhysicalPoolImages[poolIndex].Image(); }
         VkImageView GetPhysicalPoolImageView(uint32_t poolIndex = 0) const { return m_PhysicalPoolViews[poolIndex]; }
         VkSampler GetPhysicalPoolSampler() const { return m_PhysicalPoolSampler; }
+        VkFormat GetPhysicalPoolFormat(uint32_t poolIndex = 0) const { return m_PhysicalPoolFormats[poolIndex]; }
+
+        // Single-layer VK_IMAGE_VIEW_TYPE_2D view of one physical page slot in one pool, for use as
+        // a VkRenderingAttachmentInfo color attachment target (renderer::VirtualTextureRenderPass) --
+        // distinct from GetPhysicalPoolImageView()'s VK_IMAGE_VIEW_TYPE_2D_ARRAY view (spanning every
+        // layer, for a shader's sampler2DArray read). Created for every layer at Init() time, exactly
+        // mirroring renderer::VirtualShadowMapPool::GetPhysicalLayerView's own render/sample view split.
+        VkImageView GetPhysicalPoolLayerView(uint32_t poolIndex, uint32_t physicalPageIndex) const {
+            return m_PhysicalPoolLayerViews[poolIndex][physicalPageIndex];
+        }
 
         uint32_t GetPhysicalPageCapacity() const { return m_Config.physicalPageCapacity; }
         uint32_t GetTileSizeWithBorder() const { return m_Config.tileSize + 2 * m_Config.borderSize; }
@@ -128,6 +150,10 @@ namespace renderer {
         GpuImage m_PageTableImage;
         std::vector<GpuImage> m_PhysicalPoolImages;
         std::vector<VkImageView> m_PhysicalPoolViews;
+        std::vector<VkFormat> m_PhysicalPoolFormats;
+        // [poolIndex][physicalPageIndex] -- single-layer render-target views, see
+        // GetPhysicalPoolLayerView's own comment.
+        std::vector<std::vector<VkImageView>> m_PhysicalPoolLayerViews;
         VkSampler m_PageTableSampler = VK_NULL_HANDLE;
         VkSampler m_PhysicalPoolSampler = VK_NULL_HANDLE;
 

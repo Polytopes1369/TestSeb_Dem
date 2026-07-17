@@ -1080,6 +1080,7 @@ void VulkanContext::CreatePipelinesAndDescriptors() {
       {"shaders/geom_pyramide.comp.spv", &m_PyramidPipeline},
       {"shaders/geom_TorusKnot.comp.spv", &m_TorusKnotPipeline},
       {"shaders/geom_chamferBox.comp.spv", &m_ChamferBoxPipeline},
+      {"shaders/autosmooth.comp.spv", &m_AutosmoothPipeline},
   };
   for (const auto &desc : simplePrimitives) {
     auto code = VulkanPipeline::ReadShaderFile(desc.shaderFile);
@@ -2066,6 +2067,25 @@ void VulkanContext::GenerateGeometry() {
   m_TotalVertexCount = runningVertexOffset;
   m_TotalIndexCount = runningIndexOffset;
 
+  // -------------------------------------------------------------------------
+  // AUTOSMOOTH POST-PASS (autosmooth at 45.0 degrees)
+  // -------------------------------------------------------------------------
+  if (m_AutosmoothPipeline != VK_NULL_HANDLE) {
+    struct AutosmoothParams {
+      uint32_t totalVertexCount;
+      uint32_t totalIndexCount;
+    } params;
+    params.totalVertexCount = m_TotalVertexCount;
+    params.totalIndexCount = m_TotalIndexCount;
+
+    constexpr uint32_t kLocalSizeX = 64u;
+    uint32_t groupCount = (m_TotalVertexCount + kLocalSizeX - 1u) / kLocalSizeX;
+
+    DispatchGeometryCompute(m_AutosmoothPipeline, m_ComputePipelineLayout,
+                            &params, sizeof(params), nullptr, 0,
+                            groupCount, 1, 1);
+  }
+
   const VkDeviceSize vertexBytesUsed =
       static_cast<VkDeviceSize>(m_TotalVertexCount) * sizeof(renderer::Vertex);
   const VkDeviceSize indexBytesUsed =
@@ -2337,7 +2357,8 @@ void VulkanContext::Shutdown() {
   for (VkPipeline pipeline :
        {m_ConePipeline, m_IcospherePipeline, m_PlanePipeline, m_SpherePipeline,
         m_TorusPipeline, m_TubePipeline, m_CapsulePipeline, m_CylinderPipeline,
-        m_PyramidPipeline, m_TorusKnotPipeline, m_ChamferBoxPipeline}) {
+        m_PyramidPipeline, m_TorusKnotPipeline, m_ChamferBoxPipeline,
+        m_AutosmoothPipeline}) {
     if (pipeline != VK_NULL_HANDLE) {
       vkDestroyPipeline(m_Device, pipeline, nullptr);
     }
