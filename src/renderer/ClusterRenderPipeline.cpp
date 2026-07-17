@@ -1362,6 +1362,8 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
     uint32_t hwTriangleCount = 0;
     uint32_t swTriangleCount = 0;
     m_TriangleStats.ReadStats(hwTriangleCount, swTriangleCount);
+    m_LastHWTriangleCount = hwTriangleCount;
+    m_LastSWTriangleCount = swTriangleCount;
 
     m_TriangleStats.RecordClear(cmd);
     m_TriangleStats.RecordCompute(cmd);

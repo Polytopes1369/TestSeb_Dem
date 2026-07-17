@@ -43,6 +43,32 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     Vulkan::Vulkan
 )
 
+# --- Git commit hash, Debug-only report metadata ---
+# Consumed only by src/core/debug/DebugTestPipeline.cpp (entirely #ifndef NDEBUG-guarded) to stamp
+# the automated test-pipeline report with the exact commit it validated. Gated to the Debug config
+# via the generator expression below so the raw string never exists in a Release object file,
+# matching CLAUDE.md's "zero overhead strings in Release" rule. Resolved once at CMake configure
+# time -- re-run cmake (or just rebuild, which CONFIGURE_DEPENDS triggers on most source changes)
+# to refresh it after committing.
+find_package(Git QUIET)
+set(GIT_COMMIT_HASH "unknown")
+if(Git_FOUND)
+    execute_process(
+        COMMAND ${GIT_EXECUTABLE} rev-parse --short HEAD
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+        OUTPUT_VARIABLE GIT_COMMIT_HASH_RESULT
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+        RESULT_VARIABLE GIT_COMMIT_HASH_STATUS
+    )
+    if(GIT_COMMIT_HASH_STATUS EQUAL 0 AND GIT_COMMIT_HASH_RESULT)
+        set(GIT_COMMIT_HASH ${GIT_COMMIT_HASH_RESULT})
+    endif()
+endif()
+target_compile_definitions(${PROJECT_NAME} PRIVATE
+    $<$<CONFIG:Debug>:DEBUG_PIPELINE_GIT_COMMIT_HASH="${GIT_COMMIT_HASH}">
+)
+
 # ==============================================================================
 # UNIT TESTS (native C++, no external framework, no Vulkan/GLFW dependency)
 # ==============================================================================

@@ -7,6 +7,7 @@
 #include "renderer/RenderTypes.h"
 #include "renderer/vulkan/RayTracingFunctions.h"
 #include "renderer/vulkan/VulkanUtils.h"
+#include "core/debug/ValidationMessageSink.h"
 #include <algorithm>
 #include <cassert>
 #include <cmath>
@@ -299,6 +300,11 @@ DebugCallback(VkDebugUtilsMessageSeverityFlagBitsEXT messageSeverity,
   // debugger being attached, so a plain console launch now logs the error and
   // keeps going instead of dying on an int3 the user can never see.
   LOG(level, pCallbackData->pMessage);
+
+  // Also feed DebugTestPipeline's capture buffer (see ValidationMessageSink's own class comment):
+  // a plain observer, changes nothing about the logging/break behavior above.
+  debugpipeline::ValidationMessageSink::Push(static_cast<uint32_t>(messageSeverity),
+                                              pCallbackData->pMessage);
 
   if (messageSeverity >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT &&
       IsDebuggerPresent()) {
@@ -864,8 +870,14 @@ void VulkanContext::CreateSwapchain(GLFWwindow *window) {
   createInfo.imageColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
   createInfo.imageExtent = m_SwapchainExtent;
   createInfo.imageArrayLayers = 1;
-  createInfo.imageUsage =
-      VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+  // TRANSFER_SRC_BIT (in addition to the pre-existing DST_BIT used by RecordFrame's own final
+  // blit) lets debugpipeline::ScreenshotCapture vkCmdCopyImageToBuffer directly out of a presented
+  // swapchain image -- Debug-only consumer, but the bit itself must be requested here since
+  // swapchain image usage is fixed at creation time. Universally supported alongside
+  // COLOR_ATTACHMENT_BIT/TRANSFER_DST_BIT on every desktop Vulkan present engine.
+  createInfo.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                           VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                           VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
   createInfo.imageSharingMode =
       VK_SHARING_MODE_EXCLUSIVE; // Fixed incorrect enum value
   createInfo.preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;

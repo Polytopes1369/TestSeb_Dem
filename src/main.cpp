@@ -10,6 +10,11 @@
 #include "geometry/VirtualGeometryCacheTest.h"
 #include <exception>
 #include <format>
+#include <cstring>
+
+#ifndef NDEBUG
+#include "core/debug/DebugTestPipeline.h"
+#endif
 
 #ifndef NDEBUG
 struct DebugState {
@@ -157,7 +162,21 @@ static void KeyCallback(GLFWwindow* window, int key, int scancode, int action, i
 }
 #endif
 
-int main() {
+int main(int argc, char** argv) {
+#ifndef NDEBUG
+    // --test-pipeline: replaces the interactive loop below with DebugTestPipeline::RunAll (see
+    // that class's own comment) -- Debug-only, matching every other automated-validation feature
+    // in this codebase. Release's main() never parses argv at all (no debug-tooling strings/code
+    // survive into that binary, per CLAUDE.md's build-separation rule).
+    bool runTestPipeline = false;
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--test-pipeline") == 0) {
+            runTestPipeline = true;
+            break;
+        }
+    }
+#endif
+
     LOG_INIT("demo_log.txt");
     LOG_INFO("Starting DemoScene Engine...");
 
@@ -270,6 +289,26 @@ int main() {
     VK_CHECK(vkCreateFence(vkContext.GetDevice(), &fenceInfo, nullptr, &frameFence));
 
     LOG_INFO("Entering main loop.");
+
+#ifndef NDEBUG
+    // --test-pipeline short-circuits straight to the automated feature validation pass, entirely
+    // replacing the interactive loop below -- see DebugTestPipeline::RunAll's own comment. The
+    // fail count it returns becomes this process's exit code (0 = every feature passed), so
+    // run_debug_pipeline.bat can tell success from failure without parsing the report itself.
+    if (runTestPipeline) {
+        uint32_t failCount = debugpipeline::DebugTestPipeline::RunAll(window, vkContext, clusterPipeline, frameFence);
+
+        vkDeviceWaitIdle(vkContext.GetDevice());
+        vkDestroyFence(vkContext.GetDevice(), frameFence, nullptr);
+        clusterPipeline.Shutdown();
+        vkContext.Shutdown();
+        glfwDestroyWindow(window);
+        glfwTerminate();
+        LOG_SHUTDOWN();
+
+        return static_cast<int>(failCount);
+    }
+#endif
 
     // Instantiate the camera looking at the origin; CameraOrbit() below repositions it every
     // frame, so the initial position/target here only seed the pitch/yaw derivation.

@@ -252,6 +252,15 @@ namespace renderer {
                 m_DebugDAGCutGapsDumpState = 0;
             }
         }
+
+        // Last HW/SW rasterizer triangle split read by RecordFrame()'s own [13b] stat-overlay
+        // block (m_TriangleStats.ReadStats(), always one frame behind -- see that block's own
+        // comment). Exposed for DebugTestPipeline's feature tests, which have no other way to
+        // observe m_TriangleStats (private, overlay-only otherwise).
+        void GetDebugTriangleStats(uint32_t& outHwTriangleCount, uint32_t& outSwTriangleCount) const {
+            outHwTriangleCount = m_LastHWTriangleCount;
+            outSwTriangleCount = m_LastSWTriangleCount;
+        }
 #endif
 
     private:
@@ -452,6 +461,9 @@ namespace renderer {
         // derived) and GeometryStreamingCoordinator::GetTotalBytesCompleted()'s running total.
         float m_LastStatsSampleTime = 0.0f;
         uint64_t m_LastStatsSampleBytes = 0;
+        // See GetDebugTriangleStats()'s own comment.
+        uint32_t m_LastHWTriangleCount = 0;
+        uint32_t m_LastSWTriangleCount = 0;
 
         // Two-tier SDF ray march DEBUG VISUALIZATION (see renderer::SDFRayMarchPass's own class
         // comment: its whole output is "a full-screen debug-visualization image", never consumed

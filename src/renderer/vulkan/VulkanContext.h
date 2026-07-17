@@ -25,6 +25,7 @@ public:
     VkPhysicalDevice GetPhysicalDevice() const { return m_PhysicalDevice; }
     VkSwapchainKHR GetSwapchain() const { return m_Swapchain; }
     VkExtent2D GetSwapchainExtent() const { return m_SwapchainExtent; }
+    VkFormat GetSwapchainImageFormat() const { return m_SwapchainImageFormat; }
     const std::vector<VkImage>& GetSwapchainImages() const { return m_SwapchainImages; }
     const std::vector<VkImageView>& GetSwapchainImageViews() const { return m_SwapchainImageViews; }
     VkImageView GetDepthImageView() const { return m_DepthImageView; }
