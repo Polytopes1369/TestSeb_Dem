@@ -263,70 +263,30 @@ namespace geometry {
             buildHalf(midCount, triCount, outB);
         }
 
-        // ----------------------------------------------------------------------------------
-        // Clamps `mesh` to at most `maxVerts` vertices and `maxIndices` indices in-place.
-        // Strategy: sort vertices by first-reference order (already the case after QEM compaction),
-        // drop any triangle that references a vertex index >= maxVerts, then re-compact so only
-        // surviving triangles' vertices remain. This always terminates and cannot increase counts.
-        // The locked array is remapped consistently so downstream use remains valid.
-        // ----------------------------------------------------------------------------------
-        void ClampMeshToCapacity(SimplifiableMesh& mesh, uint32_t maxVerts, uint32_t maxIndices) {
-            const uint32_t origVerts = static_cast<uint32_t>(mesh.positions.size());
-            if (origVerts <= maxVerts && mesh.triangles.size() <= maxIndices) {
-                return; // Already fits; nothing to do.
-            }
-
-            // Keep only triangles whose three vertex indices are all < maxVerts and whose
-            // running index count (3 per kept triangle) would not exceed maxIndices.
-            std::vector<uint32_t> keptTriangles;
-            keptTriangles.reserve(mesh.triangles.size());
-            uint32_t keptIndexCount = 0;
-            for (size_t t = 0; t + 2 < mesh.triangles.size(); t += 3) {
-                uint32_t v0 = mesh.triangles[t + 0];
-                uint32_t v1 = mesh.triangles[t + 1];
-                uint32_t v2 = mesh.triangles[t + 2];
-                if (v0 < maxVerts && v1 < maxVerts && v2 < maxVerts
-                    && keptIndexCount + 3 <= maxIndices) {
-                    keptTriangles.push_back(v0);
-                    keptTriangles.push_back(v1);
-                    keptTriangles.push_back(v2);
-                    keptIndexCount += 3;
-                }
-            }
-
-            // Re-compact: only keep vertices actually referenced by a surviving triangle.
-            constexpr uint32_t kNone = 0xFFFFFFFFu;
-            std::vector<uint32_t> remap(origVerts, kNone);
-            std::vector<maths::vec3> newPos;
-            std::vector<bool> newLocked;
-            std::vector<maths::vec2> newUVs;
-            std::vector<uint32_t> newTris;
-            newPos.reserve(maxVerts);
-            newTris.reserve(keptTriangles.size());
-
-            for (uint32_t idx : keptTriangles) {
-                if (remap[idx] == kNone) {
-                    remap[idx] = static_cast<uint32_t>(newPos.size());
-                    newPos.push_back(mesh.positions[idx]);
-                    newLocked.push_back(idx < mesh.locked.size() ? mesh.locked[idx] : false);
-                    newUVs.push_back(idx < mesh.uvs.size() ? mesh.uvs[idx] : maths::vec2{ 0.0f, 0.0f });
-                }
-                newTris.push_back(remap[idx]);
-            }
-
-            mesh.positions = std::move(newPos);
-            mesh.locked = std::move(newLocked);
-            mesh.uvs = std::move(newUVs);
-            mesh.triangles = std::move(newTris);
-        }
 
         // ----------------------------------------------------------------------------------
         // Simplifies `mesh` and emits one DAG parent node into `dag`. If QEM alone cannot
-        // reduce the vertex count to kMaxClusterVertices (locked-vertex saturation), the mesh
-        // is greedily clamped: triangles referencing vertices beyond the cap are dropped, then
-        // the remaining vertices are re-compacted. This is O(T) per node and restores the
-        // original ~4ms DAG build performance. The single-parent invariant is preserved because
-        // every child always goes to exactly this one parent.
+        // reduce the vertex count to kMaxClusterVertices (locked-vertex saturation -- common on
+        // hard-edged, multi-face-seam primitives like a box/cylinder/tube/pyramid/plane, whose
+        // many permanently-locked boundary vertices QEM can never collapse, vs. a smoothly-curved
+        // shape's much sparser locked set), this used to silently CLAMP the mesh: drop every
+        // triangle referencing a vertex beyond the cap and re-compact. That is a real, confirmed
+        // bug (2026-07-16 "some clusters just don't render" investigation) -- it punches an
+        // actual hole in the merged surface at that DAG level, and every level built on top of it
+        // inherits the hole.
+        //
+        // Fixed by making each of this group's children a ROOT right here instead of forcing them
+        // into one lossy merged parent -- NOT by re-wrapping them in a trivial pass-through parent
+        // and feeding them back into `nextLevel` (a first attempt at this fix that shipped
+        // briefly and was caught before merging: since a pass-through node is byte-for-byte the
+        // same mesh with the same locked vertices, the exact same 2-child merge fails again next
+        // level, and the level after that, forever -- observed running past level 300 with no
+        // convergence in testing). Diverting straight to `outEarlyRoots` instead guarantees
+        // `currentLevel.size()` strictly shrinks every time this fires, so BuildClusterDAG's
+        // `while (currentLevel.size() > 1)` loop is still guaranteed to terminate. Costs strictly
+        // less LOD compression for just this one problematic pair (each child becomes its own
+        // root one or more levels earlier than it would if it had been mergeable), never any lost
+        // geometry.
         // ----------------------------------------------------------------------------------
         void EmitSimplifiedNodes(
             SimplifiableMesh mesh,
@@ -334,15 +294,27 @@ namespace geometry {
             uint32_t originalTriangleCount,
             uint32_t level,
             ClusterDAG& dag,
-            std::vector<uint32_t>& nextLevel) {
+            std::vector<uint32_t>& nextLevel,
+            std::vector<uint32_t>& outEarlyRoots) {
 
             uint32_t targetTriangleCount = (originalTriangleCount + 1u) / 2u;
             float simplificationError = 0.0f;
             SimplifyMeshQEM(mesh, targetTriangleCount, kMaxClusterVertices, &simplificationError);
 
-            // If QEM could not reach the vertex cap (locked-vertex saturation), clamp the mesh
-            // by dropping triangles that overflow the arrays and re-compacting.
-            ClampMeshToCapacity(mesh, kMaxClusterVertices, kMaxClusterIndices);
+            if (mesh.positions.size() > kMaxClusterVertices || mesh.triangles.size() > kMaxClusterIndices) {
+                LOG_WARNING(std::format(
+                    "[ClusterDAG] Level {}: a {}-child merge still has {} vertices/{} triangles after "
+                    "simplification (cap: {} vertices/{} triangles) -- locked-vertex saturation. "
+                    "Each child becomes its own root here instead of merging, to avoid dropping geometry.",
+                    level, childDagIndices.size(), mesh.positions.size(), mesh.triangles.size() / 3,
+                    kMaxClusterVertices, kMaxClusterIndices / 3));
+                for (uint32_t childIdx : childDagIndices) {
+                    outEarlyRoots.push_back(childIdx); // dag.nodes[childIdx].parentIndex is already
+                                                        // kInvalidDAGNodeIndex (never touched) -- a
+                                                        // genuine root, not a dangling reference.
+                }
+                return;
+            }
 
             float childrenMaxError = 0.0f;
             for (uint32_t childIdx : childDagIndices) {
@@ -414,6 +386,12 @@ namespace geometry {
         uint32_t level = 1;
         bool isFirstPass = true;
 
+        // Nodes EmitSimplifiedNodes diverts straight to root status because their group's merge
+        // never fit within capacity even after simplification (see that function's own comment).
+        // Accumulated across every level and appended to dag.rootIndices at the end, alongside
+        // whatever's left in currentLevel once the main loop below terminates normally.
+        std::vector<uint32_t> earlyRoots;
+
         while (currentLevel.size() > 1) {
             std::vector<PendingGroup> pendingGroups;
 
@@ -476,11 +454,10 @@ namespace geometry {
                 }
             }
 
-            // --- Simplify each group and promote it into one or more coarser DAG nodes -----
-            // EmitSimplifiedNodes handles the case where QEM alone cannot reduce vertex count
-            // below kMaxClusterVertices (locked-vertex saturation): it recursively bisects the
-            // mesh and distributes the group's children between halves so every emitted node
-            // fits within the fixed-capacity on-disk ClusterData block.
+            // --- Simplify each group and promote it into one coarser DAG node, or (when QEM
+            // alone can't reduce vertex count below kMaxClusterVertices -- locked-vertex
+            // saturation) divert the group's children straight into `earlyRoots` instead of
+            // ever dropping geometry to force a fit -- see EmitSimplifiedNodes's own comment.
             std::vector<uint32_t> nextLevel;
             nextLevel.reserve(pendingGroups.size());
 
@@ -491,7 +468,8 @@ namespace geometry {
                     pg.originalTriangleCount,
                     level,
                     dag,
-                    nextLevel);
+                    nextLevel,
+                    earlyRoots);
             }
 
             LOG_INFO(std::format("[ClusterDAG] Level {} completed: {} nodes (total nodes: {}).", level, nextLevel.size(), dag.nodes.size()));
@@ -500,7 +478,8 @@ namespace geometry {
             ++level;
         }
 
-        dag.rootIndices = currentLevel;
+        dag.rootIndices = std::move(currentLevel);
+        dag.rootIndices.insert(dag.rootIndices.end(), earlyRoots.begin(), earlyRoots.end());
 
         std::vector<std::string> validationErrors;
         bool isValid = ValidateClusterDAG(dag, validationErrors);
