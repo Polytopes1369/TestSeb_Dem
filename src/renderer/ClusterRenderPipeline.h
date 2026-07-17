@@ -98,9 +98,9 @@
 #include "renderer/streaming/VirtualTextureStreamingCoordinator.h"
 #include "renderer/passes/WorldProbeGridPass.h"
 #include "renderer/passes/TAATSRPass.h"
+#include "renderer/passes/PostProcessPass.h"
 #include "renderer/passes/ScreenTracePass.h"
 #include "renderer/passes/GICompositePass.h"
-#include "renderer/passes/PostProcessPass.h"
 #ifndef NDEBUG
 #include "renderer/debug/ClusterTriangleStatsPass.h"
 #include "renderer/debug/DebugTextOverlay.h"

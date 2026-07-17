@@ -53,10 +53,15 @@ namespace renderer {
 
         static constexpr uint32_t kWorkgroupSize = 8; // Matches MegaLightsShade.comp/MegaLightsComposite.comp's local_size_x/y.
 
-        // RGBA8_UNORM, NOT rgba16f: must match renderer::ATrousDenoisePass::kFormat exactly (its
-        // ping-pong images and shader are hardcoded to this format -- see MegaLightsShade.comp's own
-        // header comment for why reusing that class forces this choice).
-        static constexpr VkFormat kRadianceFormat = VK_FORMAT_R8G8B8A8_UNORM;
+        // Must match renderer::ATrousDenoisePass::kFormat exactly (its ping-pong images and shader
+        // are hardcoded to this format -- see MegaLightsShade.comp's own header comment for why
+        // reusing that class forces this choice): R16G16B16A16_SFLOAT linear HDR, NOT rgba8 --
+        // MegaLightsShade.comp's own radiance is a physically-based, inverse-square-falloff point-
+        // light contribution with no upper bound near a light, so an 8-bit UNORM target would hard-
+        // clip it to [0,1] before it ever reaches renderer::TonemapPass, one of this codebase's own
+        // "burned" overexposure bug's root causes (see ClusterResolvePass::kOutputColorFormat's own
+        // comment, the image this pass' Composite stage additively read-modify-writes into).
+        static constexpr VkFormat kRadianceFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
 
         // `resolvePass`/`rtPass` must already be Init'd and outlive this pass -- borrowed,
         // unmodified, same convention as renderer::ReflectionPass::Init. `lightsData` is copied once
