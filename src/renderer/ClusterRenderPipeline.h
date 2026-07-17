@@ -86,6 +86,7 @@
 #include "renderer/LightingTypes.h"
 #include "renderer/passes/ProceduralMaskGenerator.h"
 #include "renderer/passes/ReflectionPass.h"
+#include "renderer/passes/ScreenSpaceEffectsPass.h"
 #include "renderer/passes/MegaLightsPass.h"
 #include "renderer/passes/ScreenProbeGIPass.h"
 #include "renderer/passes/SurfaceCacheGIInjectPass.h"
@@ -463,6 +464,13 @@ namespace renderer {
         // for the full pipeline and why its storage is raw RGBA16F radiance, not spherical harmonics
         // (physically incapable of a narrow specular lobe).
         ReflectionPass m_Reflection;
+
+        // Phase PP4 (post-process stack roadmap): GTAO (feeds m_GIComposite below) + Screen-Space
+        // Contact Shadows (multiplicative RMW on m_Resolve's output color, called right after [12]
+        // Resolve) + SSR Fallback (additive RMW on the same image, called after m_Reflection's own
+        // Trace/Temporal/Gather trio) -- see ScreenSpaceEffectsPass's own class comment for exactly
+        // why 3 independent Record*() call sites are needed instead of one.
+        ScreenSpaceEffectsPass m_ScreenSpaceEffects;
 
         // Phase A of the MegaLights native-port roadmap: RIS-weighted stochastic multi-point-light
         // direct lighting (up to kMaxMegaLights procedurally-authored point lights), one ray-traced

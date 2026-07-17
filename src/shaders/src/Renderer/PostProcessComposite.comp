@@ -28,11 +28,18 @@
 //     TAATSRPass's raw output directly -- DOF's physically-derived Circle-of-Confusion blur runs
 //     before this stage (and before renderer::BloomPass), see DepthOfField.comp's own comment for
 //     why that ordering matters (an out-of-focus highlight should itself bloom into a soft disc).
+//   Phase PP5: Panini Projection (wide-FOV lens-shape UV warp, applied FIRST -- every sample below
+//     reads through its output, exactly like Heat Distortion's own `distortedUV`) -> Local Contrast
+//     Enhancement/Sharpness (single-pass unsharp mask, pre-grade) -> Film Grain (animated,
+//     luminance-response-curved, applied LAST on the final display-encoded image). See each
+//     function's own header comment for why God Rays/Vignette deliberately stay on the true
+//     `screenUV` instead of Panini's warped `uv`.
 // Writes this pass' own owned rgba8 output image, which renderer::ClusterRenderPipeline's final
 // blit now sources from instead of renderer::TAATSRPass's raw HDR output directly.
 
 #include "include/color_grading.glsl"
 #include "include/aces_tonemap.glsl"
+#include "include/math_utils.glsl"
 
 layout(local_size_x = 8, local_size_y = 8) in;
 
@@ -104,6 +111,29 @@ layout(std140, set = 0, binding = 3) uniform PostProcessParamsUBO {
     float fogHeightOffset;   // World-space Y the fog's own reference density is measured at.
     float fogStartDistance;
     float fogMaxOpacity;
+
+    // Phase PP4: Volumetric Light Shafts / God Rays.
+    vec2 sunScreenUV;
+    float sunScreenValid;    // 0 = sun behind the camera this frame, no god rays.
+    float godRaysIntensity;
+    float godRaysDecay;
+    float godRaysDensity;
+    float godRaysWeight;
+    float _padGodRays;
+
+    // Phase PP5
+    float paniniD;
+    float paniniS;
+    float halfFovTanX;
+    float halfFovTanY;
+
+    float sharpenIntensity;
+    float sharpenRadiusPixels;
+    float filmGrainIntensity;
+    float filmGrainResponseMidpoint;
+
+    uint frameIndex;
+    float _padPP5a, _padPP5b, _padPP5c;
 } g_Params;
 
 layout(set = 0, binding = 4) uniform sampler2D g_Bloom;
@@ -218,6 +248,115 @@ vec3 ApplyHeightFog(vec3 color, vec3 worldPos, vec3 cameraPos) {
     return mix(color, g_Params.fogColor, fogFactor);
 }
 
+// Volumetric Light Shafts / God Rays (Crepuscular Rays) -- the classic NVIDIA GPU Gems "volumetric
+// light scattering" radial raymarch: accumulates decaying samples of this pass' own HDR input along
+// the line from `uv` toward the sun's screen-projected position, so any dark silhouette between the
+// shading point and the sun naturally streaks radially away from it (no separate occlusion pass
+// needed -- an occluded pixel's own low brightness IS the occlusion signal this technique reads).
+const int kGodRaysSamples = 24;
+
+vec3 ApplyGodRays(vec2 uv) {
+    if (g_Params.sunScreenValid < 0.5) {
+        return vec3(0.0);
+    }
+    vec2 deltaUV = (uv - g_Params.sunScreenUV) * (g_Params.godRaysDensity / float(kGodRaysSamples));
+    vec2 sampleUV = uv;
+    float illuminationDecay = 1.0;
+    vec3 godRaysColor = vec3(0.0);
+    for (int i = 0; i < kGodRaysSamples; ++i) {
+        sampleUV -= deltaUV;
+        vec3 sampleColor = texture(g_HDRColor, clamp(sampleUV, vec2(0.0), vec2(1.0))).rgb;
+        godRaysColor += sampleColor * illuminationDecay * g_Params.godRaysWeight;
+        illuminationDecay *= g_Params.godRaysDecay;
+    }
+    return godRaysColor * g_Params.godRaysIntensity;
+}
+
+// Panini Projection (Phase PP5): a wide-FOV lens-shape correction that keeps vertical lines
+// straight while compressing the screen periphery less aggressively than a standard rectilinear
+// (tan-based) perspective projection -- the well-known "wide FOV stretching" problem. `paniniD`
+// blends from rectilinear (0, identity) to full cylindrical Panini compression; `paniniS` blends
+// how much of that same compression additionally applies vertically (0 = horizontal-only,
+// 1 = fully spherical-like). This is the standard Panini projection formula (as popularized by
+// Marc Vanden Eynde/Tom Forsyth's public "Panini projection for wide-FOV rendering" writeups),
+// applied here as a POST-PROCESS screen-space UV warp -- this pipeline has already rasterized a
+// rectilinear image by the time this stage runs, so (like every real-time Panini implementation)
+// this warps the already-rendered image rather than re-projecting from world space.
+//
+// The forward mapping (rectilinear tangent-space ray -> Panini tangent position) has a simple
+// closed form; this shader needs the INVERSE (given an output pixel's target Panini position, find
+// which rectilinear position to sample). That inverse also has a closed algebraic form, but it
+// divides by (paniniD - 1) -- a removable-but-awkward singularity a user-facing knob can trivially
+// hit at D=1. Solved instead via a few Newton-Raphson iterations of the (smooth, monotonic)
+// forward function, which has no such singularity and converges to sub-pixel accuracy well within
+// the iteration budget below.
+vec2 PaniniForwardX(float x, float paniniD) {
+    float phi = atan(x);
+    float s = (paniniD + 1.0) / (paniniD + cos(phi));
+    return vec2(s * sin(phi), s);
+}
+
+vec2 PaniniProjectionInverse(vec2 targetTangent, float paniniD, float paniniS) {
+    float x = targetTangent.x; // Initial guess.
+    const float kStep = 1.0e-3;
+    for (int i = 0; i < 8; ++i) {
+        float f = PaniniForwardX(x, paniniD).x - targetTangent.x;
+        float fStep = PaniniForwardX(x + kStep, paniniD).x - targetTangent.x;
+        float df = (fStep - f) / kStep;
+        if (abs(df) < 1.0e-6) {
+            break;
+        }
+        x -= f / df;
+    }
+    float s = PaniniForwardX(x, paniniD).y;
+    float divisor = max(mix(1.0, s, paniniS), 1.0e-4);
+    return vec2(x, targetTangent.y / divisor);
+}
+
+vec2 ApplyPaniniProjection(vec2 uv) {
+    if (g_Params.paniniD <= 1.0e-4) {
+        return uv; // Identity -- the common default (matches UE5.8's own Panini D=0 "off" state).
+    }
+    vec2 halfFovTan = vec2(g_Params.halfFovTanX, g_Params.halfFovTanY);
+    vec2 targetTangent = (uv * 2.0 - 1.0) * halfFovTan;
+    vec2 sourceTangent = PaniniProjectionInverse(targetTangent, g_Params.paniniD, g_Params.paniniS);
+    vec2 sourceUV = (sourceTangent / halfFovTan) * 0.5 + 0.5;
+    return clamp(sourceUV, vec2(0.001), vec2(0.999));
+}
+
+// Local Contrast Enhancement / Sharpness (Phase PP5): a single-pass unsharp mask -- 4 extra taps
+// of this same pass' own HDR input at `radiusPixels` texel offsets approximate a small local blur,
+// then the center sample is pushed away from that local average. Matches UE5.8's own tonemapper
+// "Sharpen" setting's placement: operates on the linear HDR scene color, before White Balance/
+// Color Grading (not a post-tonemap sharpen, which would also amplify quantization/grain noise).
+vec3 ApplyLocalContrast(vec3 centerColor, vec2 uv, float intensity, float radiusPixels, ivec2 res) {
+    vec2 texelOffset = radiusPixels / vec2(res);
+    vec3 blurred = vec3(0.0);
+    blurred += texture(g_HDRColor, clamp(uv + vec2( texelOffset.x, 0.0), vec2(0.001), vec2(0.999))).rgb;
+    blurred += texture(g_HDRColor, clamp(uv + vec2(-texelOffset.x, 0.0), vec2(0.001), vec2(0.999))).rgb;
+    blurred += texture(g_HDRColor, clamp(uv + vec2(0.0,  texelOffset.y), vec2(0.001), vec2(0.999))).rgb;
+    blurred += texture(g_HDRColor, clamp(uv + vec2(0.0, -texelOffset.y), vec2(0.001), vec2(0.999))).rgb;
+    blurred *= 0.25;
+    return centerColor + (centerColor - blurred) * intensity;
+}
+
+// Film Grain (Phase PP5): animated per-pixel noise, luminance-response-curved the way UE5.8's own
+// Film Grain is -- most visible in shadows/midtones, fading out in bright highlights (mimicking
+// real film stock's own grain-vs-exposure characteristic, rather than a flat uniform-strength
+// noise overlay). Applied to the FINAL display-encoded [0,1] color (after Gamma Correction), the
+// same "sensor/print artifact, last in the chain" placement UE5.8 itself uses. `frameIndex`
+// decorrelates the noise pattern frame-to-frame (real film grain visibly animates) -- same
+// pixel+frame hashing convention as ReflectionTrace.comp's own GGX-VNDF sample decorrelation.
+vec3 ApplyFilmGrain(vec3 color, ivec2 pixel, uint frameIndex, float intensity, float responseMidpoint) {
+    uint64_t pixelSeed = uint64_t(uint(pixel.x)) | (uint64_t(uint(pixel.y)) << 32);
+    float noise = hashFloat(pixelSeed, uint64_t(frameIndex) * 0x9E3779B97F4A7C15UL + 0xBF58476D1CE4E5B9UL) * 2.0 - 1.0;
+
+    float luminance = dot(color, vec3(0.2126, 0.7152, 0.0722));
+    float response = 1.0 - smoothstep(0.0, max(responseMidpoint, 1.0e-4) * 2.0, luminance);
+
+    return clamp(color + noise * intensity * response, 0.0, 1.0);
+}
+
 void main() {
     ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
     ivec2 res = textureSize(g_HDRColor, 0);
@@ -225,7 +364,16 @@ void main() {
         return;
     }
 
-    vec2 uv = (vec2(pixel) + 0.5) / vec2(res);
+    // `screenUV` is the TRUE output pixel position -- kept separate from `uv` below so Vignette
+    // (an optical falloff property of the OUTPUT sensor/image, not the scene content) and God Rays
+    // (whose target `sunScreenUV` was projected CPU-side assuming a plain rectilinear camera, see
+    // PostProcessPass::RecordComposite's own comment) both stay correctly anchored to the real
+    // screen grid even when Panini Projection is warping every other sample position below.
+    vec2 screenUV = (vec2(pixel) + 0.5) / vec2(res);
+    // --- Panini Projection: the base sampling position every other effect below reads through,
+    // exactly like Heat Distortion's own `distortedUV` already does one stage further down -- see
+    // ApplyPaniniProjection's own comment. ---
+    vec2 uv = ApplyPaniniProjection(screenUV);
 
     // --- Heat Distortion & Refraction: distort the UV every subsequent sample reads through,
     // exactly like a real lens capturing light that already refracted through the heat-shimmer
@@ -259,6 +407,15 @@ void main() {
     // exposed scale as the rest of the scene color. ---
     color += texture(g_Bloom, distortedUV).rgb * exposureMultiplier * g_Params.bloomIntensity;
 
+    // --- Volumetric Light Shafts / God Rays: sampled from `screenUV` (the TRUE rectilinear screen
+    // position, NOT the Panini-warped `uv` -- its own raymarch target `sunScreenUV` was projected
+    // assuming a plain rectilinear camera, so both ends of that raymarch must share the same
+    // coordinate frame) at the same exposed scale as Bloom above. ---
+    color += ApplyGodRays(screenUV) * exposureMultiplier;
+
+    // --- Local Contrast Enhancement / Sharpness ---
+    color = ApplyLocalContrast(color, distortedUV, g_Params.sharpenIntensity, g_Params.sharpenRadiusPixels, res);
+
     // --- White Balance ---
     color = WhiteBalance(color, g_Params.whiteBalanceTempKelvin, g_Params.whiteBalanceTint);
 
@@ -272,14 +429,17 @@ void main() {
         color = ApplyHeightFog(color, worldPos, g_Params.cameraPositionWorld);
     }
 
-    // --- Vignette + Vignette Color Bleed ---
-    color = ApplyVignette(color, uv, g_Params.vignetteIntensity, g_Params.vignetteSmoothness, g_Params.vignetteColorBleed);
+    // --- Vignette + Vignette Color Bleed (screenUV -- see that variable's own comment) ---
+    color = ApplyVignette(color, screenUV, g_Params.vignetteIntensity, g_Params.vignetteSmoothness, g_Params.vignetteColorBleed);
 
     // --- Tone Mapping (ACES) ---
     color = ACESFilmicTonemap(color);
 
     // --- Gamma Correction (final display encode) ---
     color = GammaCorrection(color, g_Params.displayGamma);
+
+    // --- Film Grain (final display-encoded image, last in the chain) ---
+    color = ApplyFilmGrain(color, pixel, g_Params.frameIndex, g_Params.filmGrainIntensity, g_Params.filmGrainResponseMidpoint);
 
     imageStore(g_Output, pixel, vec4(clamp(color, 0.0, 1.0), 1.0));
 }

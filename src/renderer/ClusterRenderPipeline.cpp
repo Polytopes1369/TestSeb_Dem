@@ -468,6 +468,11 @@ bool ClusterRenderPipeline::Init(
     LOG_ERROR("[ClusterRenderPipeline] Failed to initialize ReflectionPass.");
     return false;
   }
+  // Phase PP4 (post-process stack roadmap): GTAO / Screen-Space Contact Shadows / SSR Fallback --
+  // needs m_Resolve's GBuffer (same as m_Reflection above) AND m_Reflection's own hit-mask (just
+  // Init'd), so must Init after both.
+  m_ScreenSpaceEffects.Init(createInfo.device, createInfo.allocator, createInfo.commandPool,
+                            createInfo.queue, createInfo.renderExtent, m_Resolve, m_Reflection);
   // Phase A of the MegaLights native-port roadmap: procedurally scatter kMaxMegaLights point
   // lights around the demo's 13-entity grid (see MegaLightsTypes.h's own GenerateProceduralLights
   // comment), then Init the pass -- needs m_Resolve's GBuffer (same as m_Reflection above) and
@@ -561,7 +566,7 @@ bool ClusterRenderPipeline::Init(
   // GI Composite: blends m_Resolve's direct lighting / reflections with the denoised indirect GI.
   m_GIComposite.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
       createInfo.renderExtent, m_Resolve.GetOutputColorView(), m_Denoiser.GetOutputView(),
-      m_Resolve.GetOutputDepthView(), m_WorldProbes);
+      m_ScreenSpaceEffects.GetAOView(), m_Resolve.GetOutputDepthView(), m_WorldProbes);
 
   m_TAATSR.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
       m_RenderExtent, m_DisplayExtent,
@@ -661,6 +666,7 @@ void ClusterRenderPipeline::Shutdown() {
   m_SDFRayMarch.Shutdown();
 #endif
   m_MegaLights.Shutdown();
+  m_ScreenSpaceEffects.Shutdown();
   m_Reflection.Shutdown();
   m_ScreenTrace.Shutdown();
   m_GIComposite.Shutdown();
@@ -1346,6 +1352,30 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
   m_Resolve.RecordResolveBinned(cmd, viewProj, m_SceneLights.sun, cameraPositionWorld, m_ShadingBin);
 #endif
 
+  // =========================================================================================
+  // [12a] Phase PP4 (post-process stack roadmap): GTAO + Screen-Space Contact Shadows.
+  // Contact Shadows MUST run here -- immediately after [12] Resolve, BEFORE [12b2]/[12b3]
+  // (Reflections/MegaLights) add anything -- see ScreenSpaceEffectsPass::RecordContactShadows'
+  // own comment for why that ordering is load-bearing. GTAO has no such ordering constraint (its
+  // own owned AO image is only consumed later by [12e] GIComposite) -- grouped here purely for
+  // locality, both read the exact same GBuffer this same point in the frame already has ready.
+  // =========================================================================================
+  {
+    ScreenSpaceEffectsPass::Settings ssfxSettings{};
+    ssfxSettings.aoRadiusWorld = config::postprocess::AO_RADIUS_WORLD;
+    ssfxSettings.aoIntensity = config::postprocess::AO_INTENSITY;
+    ssfxSettings.aoPower = config::postprocess::AO_POWER;
+    ssfxSettings.contactShadowLengthWorld = config::postprocess::CONTACT_SHADOW_LENGTH_WORLD;
+    ssfxSettings.contactShadowIntensity = config::postprocess::CONTACT_SHADOW_INTENSITY;
+    ssfxSettings.contactShadowThicknessWorld = config::postprocess::CONTACT_SHADOW_THICKNESS_WORLD;
+    ssfxSettings.ssrFallbackMaxDistanceWorld = config::postprocess::SSR_FALLBACK_MAX_DISTANCE_WORLD;
+    ssfxSettings.ssrFallbackThicknessWorld = config::postprocess::SSR_FALLBACK_THICKNESS_WORLD;
+    ssfxSettings.ssrFallbackIntensity = config::postprocess::SSR_FALLBACK_INTENSITY;
+
+    m_ScreenSpaceEffects.RecordAmbientOcclusion(cmd, viewProj, cameraPositionWorld, cameraFrameInfo.fovYRadians, ssfxSettings);
+    m_ScreenSpaceEffects.RecordContactShadows(cmd, viewProj, cameraPositionWorld, m_SceneLights.sun.direction, ssfxSettings);
+  }
+
   // Captures THIS frame's shadow-page miss reports (written by SurfaceCacheCapture.frag at [1z]
   // above and by whichever ClusterResolve.comp/ClusterResolveBinned.comp path just ran) for
   // VirtualShadowMapPass::RecordBeginFrame() to consume next frame -- see that class' own
@@ -1409,6 +1439,16 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
       m_Reflection.RecordTrace(cmd, m_TraceContext, m_TraceContext.GetEntityCount(), traceMode, m_FrameIndex);
       m_Reflection.RecordTemporal(cmd);
       m_Reflection.RecordGather(cmd);
+
+      // Phase PP4: SSR Fallback -- needs m_Reflection's own hit-mask, just written by RecordTrace()
+      // above this same frame, so gated under the same `reflectionsEnabled` toggle (a stale
+      // hit-mask from a prior frame would otherwise misdirect this pass when reflections are
+      // debug-disabled).
+      ScreenSpaceEffectsPass::Settings ssrFallbackSettings{};
+      ssrFallbackSettings.ssrFallbackMaxDistanceWorld = config::postprocess::SSR_FALLBACK_MAX_DISTANCE_WORLD;
+      ssrFallbackSettings.ssrFallbackThicknessWorld = config::postprocess::SSR_FALLBACK_THICKNESS_WORLD;
+      ssrFallbackSettings.ssrFallbackIntensity = config::postprocess::SSR_FALLBACK_INTENSITY;
+      m_ScreenSpaceEffects.RecordSSRFallback(cmd, viewProj, cameraPositionWorld, ssrFallbackSettings);
     }
   }
 
@@ -1711,12 +1751,24 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
       ppSettings.fogHeightOffset = config::postprocess::FOG_HEIGHT_OFFSET;
       ppSettings.fogStartDistance = config::postprocess::FOG_START_DISTANCE;
       ppSettings.fogMaxOpacity = config::postprocess::FOG_MAX_OPACITY;
+      ppSettings.godRaysIntensity = config::postprocess::GOD_RAYS_INTENSITY;
+      ppSettings.godRaysDecay = config::postprocess::GOD_RAYS_DECAY;
+      ppSettings.godRaysDensity = config::postprocess::GOD_RAYS_DENSITY;
+      ppSettings.godRaysWeight = config::postprocess::GOD_RAYS_WEIGHT;
+      ppSettings.paniniD = config::postprocess::PANINI_D;
+      ppSettings.paniniS = config::postprocess::PANINI_S;
+      ppSettings.sharpenIntensity = config::postprocess::SHARPEN_INTENSITY;
+      ppSettings.sharpenRadiusPixels = config::postprocess::SHARPEN_RADIUS_PIXELS;
+      ppSettings.filmGrainIntensity = config::postprocess::FILM_GRAIN_INTENSITY;
+      ppSettings.filmGrainResponseMidpoint = config::postprocess::FILM_GRAIN_RESPONSE_MIDPOINT;
 
       // Same prevViewProj-or-current-frame-fallback expression [13d]'s own TAA pass already
       // resolved into its own block-scoped prevViewProjForTAA (out of scope here) -- Motion Blur's
       // own per-pixel reprojection needs the identical semantics, recomputed inline.
       maths::mat4 prevViewProjForPostProcess = m_HasPrevViewProj ? m_PrevViewProj : viewProj;
-      m_PostProcess.RecordComposite(cmd, deltaTimeSeconds, ppSettings, invViewProj, prevViewProjForPostProcess, cameraPositionWorld);
+      m_PostProcess.RecordComposite(cmd, deltaTimeSeconds, ppSettings, invViewProj, prevViewProjForPostProcess, cameraPositionWorld,
+          viewProj, m_SceneLights.sun.direction,
+          cameraFrameInfo.fovYRadians, cameraFrameInfo.aspectRatio, m_FrameIndex);
   }
 
 #ifndef NDEBUG

@@ -56,6 +56,10 @@ namespace renderer {
             VulkanUtils::CreateStorageSampledImage2D(allocator, device, kNormalFormat, renderExtent, slot.normalImage, slot.normalAllocation, slot.normalView);
         }
 
+        // Phase PP4: single fixed hit-mask image (not part of the ping-pong slots above -- see
+        // GetHitMaskView()'s own comment for why).
+        VulkanUtils::CreateStorageSampledImage2D(allocator, device, kHitMaskFormat, renderExtent, m_HitMaskImage, m_HitMaskAllocation, m_HitMaskView);
+
         VkSamplerCreateInfo samplerInfo{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
         samplerInfo.magFilter = VK_FILTER_LINEAR;
         samplerInfo.minFilter = VK_FILTER_LINEAR;
@@ -86,6 +90,7 @@ namespace renderer {
                     VulkanUtils::ClearComputeImageToGeneral(cmd, entry.image, *entry.clear);
                 }
             }
+            VulkanUtils::ClearComputeImageToGeneral(cmd, m_HitMaskImage, zeroClear);
             });
 
         // =====================================================================================
@@ -93,8 +98,8 @@ namespace renderer {
         // trace scene) + set 2 (surface cache sampling), both shared unmodified from traceContext.
         // =====================================================================================
         {
-            VkDescriptorSetLayoutBinding bindings[11]{};
-            for (uint32_t b : { 0u, 1u, 2u, 3u, 9u, 10u }) {
+            VkDescriptorSetLayoutBinding bindings[12]{};
+            for (uint32_t b : { 0u, 1u, 2u, 3u, 9u, 10u, 11u }) {
                 bindings[b] = { b, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
             }
             bindings[4] = { 4, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
@@ -104,12 +109,12 @@ namespace renderer {
             bindings[8] = { 8, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
 
             VkDescriptorSetLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-            layoutInfo.bindingCount = 11;
+            layoutInfo.bindingCount = 12;
             layoutInfo.pBindings = bindings;
             VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &layoutInfo, nullptr, &m_TraceSetLayout));
 
             VkDescriptorPoolSize poolSizes[4] = {
-                { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 6 * 2 },
+                { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 7 * 2 },
                 { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1 * 2 },
                 { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3 * 2 },
                 { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 * 2 }
@@ -132,6 +137,7 @@ namespace renderer {
             VkDescriptorImageInfo gbufferNormalInfo{ VK_NULL_HANDLE, resolvePass.GetOutputNormalView(), VK_IMAGE_LAYOUT_GENERAL };
             VkDescriptorImageInfo gbufferDepthInfo{ VK_NULL_HANDLE, resolvePass.GetOutputDepthView(), VK_IMAGE_LAYOUT_GENERAL };
             VkDescriptorImageInfo gbufferRoughnessMetallicInfo{ VK_NULL_HANDLE, resolvePass.GetOutputRoughnessMetallicView(), VK_IMAGE_LAYOUT_GENERAL };
+            VkDescriptorImageInfo hitMaskInfo{ VK_NULL_HANDLE, m_HitMaskView, VK_IMAGE_LAYOUT_GENERAL };
 
             for (uint32_t slotIndex = 0; slotIndex < 2; ++slotIndex) {
                 const ReflectionSlot& slot = m_Slots[slotIndex];
@@ -139,7 +145,7 @@ namespace renderer {
                 VkDescriptorImageInfo worldPosInfo{ VK_NULL_HANDLE, slot.worldPosView, VK_IMAGE_LAYOUT_GENERAL };
                 VkDescriptorImageInfo normalInfo{ VK_NULL_HANDLE, slot.normalView, VK_IMAGE_LAYOUT_GENERAL };
 
-                VkWriteDescriptorSet writes[7]{};
+                VkWriteDescriptorSet writes[8]{};
                 writes[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_TraceSet[slotIndex], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &radianceInfo, nullptr, nullptr };
                 writes[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_TraceSet[slotIndex], 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &gbufferNormalInfo, nullptr, nullptr };
                 writes[2] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_TraceSet[slotIndex], 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &gbufferDepthInfo, nullptr, nullptr };
@@ -147,7 +153,8 @@ namespace renderer {
                 writes[4] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_TraceSet[slotIndex], 8, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &viewParamsInfo, nullptr };
                 writes[5] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_TraceSet[slotIndex], 9, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &worldPosInfo, nullptr, nullptr };
                 writes[6] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_TraceSet[slotIndex], 10, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &normalInfo, nullptr, nullptr };
-                vkUpdateDescriptorSets(m_Device, 7, writes, 0, nullptr);
+                writes[7] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_TraceSet[slotIndex], 11, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &hitMaskInfo, nullptr, nullptr };
+                vkUpdateDescriptorSets(m_Device, 8, writes, 0, nullptr);
 
                 VulkanUtils::WriteSharedGeometryBindings(m_Device, m_TraceSet[slotIndex], 4, tlasHandle,
                     surfaceCache.GetVertexBuffer(), surfaceCache.GetIndexBuffer(), rtPass.GetDrawRangeBuffer());
@@ -365,6 +372,7 @@ namespace renderer {
                 if (slot.worldPosView != VK_NULL_HANDLE) vkDestroyImageView(m_Device, slot.worldPosView, nullptr);
                 if (slot.normalView != VK_NULL_HANDLE) vkDestroyImageView(m_Device, slot.normalView, nullptr);
             }
+            if (m_HitMaskView != VK_NULL_HANDLE) vkDestroyImageView(m_Device, m_HitMaskView, nullptr);
         }
         if (m_Allocator != VK_NULL_HANDLE) {
             for (ReflectionSlot& slot : m_Slots) {
@@ -372,6 +380,7 @@ namespace renderer {
                 vmaDestroyImage(m_Allocator, slot.worldPosImage, slot.worldPosAllocation);
                 vmaDestroyImage(m_Allocator, slot.normalImage, slot.normalAllocation);
             }
+            vmaDestroyImage(m_Allocator, m_HitMaskImage, m_HitMaskAllocation);
         }
         m_ViewParamsBuffer.Destroy();
 
@@ -384,6 +393,7 @@ namespace renderer {
         m_ReflectionSampler = VK_NULL_HANDLE;
         m_Slots[0] = ReflectionSlot{};
         m_Slots[1] = ReflectionSlot{};
+        m_HitMaskImage = VK_NULL_HANDLE; m_HitMaskAllocation = VK_NULL_HANDLE; m_HitMaskView = VK_NULL_HANDLE;
         m_CurrentSlotIndex = 0;
         m_RenderExtent = { 0, 0 };
         m_Allocator = VK_NULL_HANDLE;
