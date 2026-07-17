@@ -803,6 +803,15 @@ void VulkanContext::CreateLogicalDevice() {
   // tracing / mesh shader requirements already supports it), so enabled unconditionally here,
   // matching geometryShader's/fragmentStoresAndAtomics' own enablement rigor above.
   deviceFeatures2.features.multiDrawIndirect = VK_TRUE;
+  // independentBlend (Phase PP3, post-process stack roadmap): renderer::TransparentForwardPass's
+  // own forward pipeline now has 2 color attachments with DIFFERENT blend states (color: alpha-
+  // blended "over" compositing; g_RefractionOffset: a plain overwrite, blendEnable=FALSE -- see
+  // that pass' own pipeline-creation comment) -- without this feature, the spec requires every
+  // element of VkPipelineColorBlendStateCreateInfo::pAttachments to be IDENTICAL
+  // (VUID-VkPipelineColorBlendStateCreateInfo-pAttachments-00605), which vkCreateGraphicsPipelines
+  // then rejects. A near-universally-supported core Vulkan 1.0 feature bit on desktop GPUs, so
+  // enabled unconditionally here, matching multiDrawIndirect's own enablement rigor above.
+  deviceFeatures2.features.independentBlend = VK_TRUE;
   // tessellationShader (Phase 7a, UE5.8 parity roadmap): core Vulkan 1.0 feature bit, no device
   // extension required -- gates VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT/_EVALUATION_BIT
   // (renderer::HeroTessellationPass, the hero Icosphere's own screen-space-adaptive

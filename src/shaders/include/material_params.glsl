@@ -25,7 +25,9 @@ struct MaterialParams {
     // own comment for why such materials never reach this struct's usual opaque consumers and are
     // shaded by TransparentForward.frag instead.
     float alpha;
-    float _pad0;
+    // Phase PP3: >0.0 = writes a procedural refraction offset into TransparentForward.frag's own
+    // second output attachment -- see renderer::MaterialParameters::heatDistortion's own comment.
+    float heatDistortion;
     // UE5.8 Lumen "Output Reflections" equivalent -- see renderer::MaterialParameters::
     // hasReflections' own comment (MaterialParameterTable.h). 0.0 = off, 1.0 = on.
     float hasReflections;
