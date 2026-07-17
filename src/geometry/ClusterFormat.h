@@ -42,6 +42,14 @@ namespace geometry {
     // this is a DAG root (no parent) or a leaf (no children).
     constexpr uint32_t kInvalidClusterID = 0xFFFFFFFFu;
 
+    // A DAG group's merged+simplified mesh is spatially re-split into at most this many next-
+    // level clusters when it doesn't fit one cluster's vertex/triangle cap in one piece -- see
+    // geometry::ClusterDAGGroup (ClusterDAG.h). Mirrored here (rather than included from
+    // ClusterDAG.h, which pulls in the CPU-only SimplifiableMesh/geometry-build headers this
+    // on-disk-format header must stay free of) so DAGNodeEntry::parentClusterID's fixed array size
+    // has one documented source of truth.
+    constexpr uint32_t kMaxGroupOutputClusters = 2u;
+
     // Maximum vertices/triangles a single cluster (meshlet) can hold. Chosen to match common GPU
     // mesh-shader meshlet limits (VK_EXT_mesh_shader) and to keep ClusterData a fixed size.
     constexpr uint32_t kMaxClusterVertices = config::nanite::MAX_CLUSTER_VERTICES;
@@ -62,7 +70,12 @@ namespace geometry {
     // -----------------------------------------------------------------------------------------
     struct CacheFileHeader {
         static constexpr uint32_t kMagic = 0x4F45474Cu;   // "LGEO" little-endian ("Local GEOmetry cache")
-        static constexpr uint32_t kVersion = 6u;           // Bumped: added ClusterIndexEntry::materialID.
+        static constexpr uint32_t kVersion = 7u;           // Bumped: DAGNodeEntry now supports up to
+                                                            // kMaxGroupOutputClusters (2) parents and
+                                                            // up to 4 children per cluster (Nanite-style
+                                                            // ~4-cluster groups, see ClusterDAG.h's
+                                                            // ClusterDAGGroup), and bakes parentSphereCenter
+                                                            // in-file instead of the reader deriving it.
 
         uint32_t magic;
         uint32_t version;
@@ -193,21 +206,40 @@ namespace geometry {
     // -----------------------------------------------------------------------------------------
     // DAGNodeEntry — one per cluster, in the DAG table, index-aligned with the cluster index
     // table (DAGNodeEntry[i] and ClusterIndexEntry[i] describe the same cluster).
+    //
+    // parentClusterID/childClusterID are sized for geometry::ClusterDAGGroup's group-based DAG
+    // (see ClusterDAG.h): a group of up to 4 same-level members can produce up to
+    // kMaxGroupOutputClusters (2) coarser output clusters that BOTH replace the same members, so a
+    // member can genuinely have 2 distinct parent clusters (this is what makes the structure a
+    // true DAG, not a strict tree) while a coarser node can have up to 4 children. Every member of
+    // one group shares an identical parentError/parentSphereCenter (baked from that group's
+    // groupError/groupSphereCenter, computed once from the group's merged+simplified mesh BEFORE
+    // any re-split -- see ClusterDAGGroup's own comment for why), so storing those two fields once
+    // per cluster (not once per parent slot) is sufficient even with 2 possible parents.
     // -----------------------------------------------------------------------------------------
     struct DAGNodeEntry {
-        uint32_t clusterID;         // Matches the same-index ClusterIndexEntry::clusterID.
-        uint32_t parentClusterID;   // kInvalidClusterID if this cluster is a DAG root.
-        uint32_t childClusterID[2]; // kInvalidClusterID for unused slots (a leaf has both unused).
-        uint32_t level;             // 0 = leaf (exact geometry); +1 per grouping/simplification pass above that.
+        uint32_t clusterID;                             // Matches the same-index ClusterIndexEntry::clusterID.
+        uint32_t parentClusterID[kMaxGroupOutputClusters]; // kInvalidClusterID for unused slot(s); every
+                                                            // slot invalid for a DAG root.
+        uint32_t childClusterID[4];                        // kInvalidClusterID for unused slots (a leaf has all unused).
+        uint32_t level;                                    // 0 = leaf (exact geometry); +1 per grouping/simplification pass above that.
 
         // e_local / e_parent (see ClusterDAG.h): the geometric error introduced by this cluster,
-        // and the error its own parent introduces. A runtime LOD cut compares a view-dependent
-        // threshold against these to pick the coarsest acceptable cluster along each DAG path.
-        // parentError is +infinity for a root; clusterError is exactly 0 for a leaf.
+        // and the error its own parent GROUP introduces. A runtime LOD cut compares a view-
+        // dependent threshold against these to pick the coarsest acceptable cluster along each DAG
+        // path. parentError is +infinity for a root; clusterError is exactly 0 for a leaf.
         float clusterError;
         float parentError;
+
+        // The parent group's own bounding-sphere center (geometry::ClusterDAGGroup::
+        // groupSphereCenter) -- baked once at cache-write time so every reader (GPU upload,
+        // renderer::ClusterLODSelectionPass::Init) gets an identical, unambiguous value regardless
+        // of which of the (up to 2) parentClusterID slots ends up actually selected/drawn at
+        // runtime. {0,0,0} for a root (parentError is +infinity there, so the position multiplying
+        // it is irrelevant, same convention as the GPU-side DAGNodePayload it feeds).
+        float parentSphereCenter[3];
     };
-    static_assert(sizeof(DAGNodeEntry) == 28, "DAGNodeEntry size drifted from the expected 28 bytes");
+    static_assert(sizeof(DAGNodeEntry) == 52, "DAGNodeEntry size drifted from the expected 52 bytes");
 
     // -----------------------------------------------------------------------------------------
     // ClusterData — quantized vertex attributes + local triangle list for one cluster. This is
