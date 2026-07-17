@@ -6,6 +6,7 @@
 #include <format>
 #include <stdexcept>
 
+#include "core/EngineConfig.h" // config::ENTITY_SELF_ROTATION_ENABLED
 #include "core/Logger.h"
 #include "geometry/CardGenerator.h" // geometry::kSurfaceCacheAtlasSize / kCardGutterTexels
 #include "io/CacheFileManager.h"
@@ -671,6 +672,19 @@ namespace renderer {
         card.uvMax[1] = static_cast<float>(card.atlasOffset[1] + card.atlasSize[1]) * invAtlasSize;
     }
 
+    void SurfaceCachePass::MarkAllRotatingEntityCardsDirty() {
+        for (size_t cardIndex = 0; cardIndex < m_CardStates.size(); ++cardIndex) {
+            CardRuntimeState& state = m_CardStates[cardIndex];
+            if (!state.resident) {
+                continue; // Not currently allocated an atlas page -- nothing to re-capture.
+            }
+            if (!state.dirty) {
+                state.dirty = true;
+                m_DirtyCardQueue.push_back(static_cast<uint32_t>(cardIndex));
+            }
+        }
+    }
+
     void SurfaceCachePass::EvictAllUnwantedCards() {
         for (size_t i = 0; i < m_CardStates.size(); ++i) {
             CardRuntimeState& state = m_CardStates[i];
@@ -840,6 +854,15 @@ namespace renderer {
     }
 
     void SurfaceCachePass::RecordCapture(VkCommandBuffer cmd) {
+        // Phase 4 integration (UE5.8 parity roadmap, dynamic scenes onto main): while entities
+        // rotate, every resident card's captured surface data goes stale every frame -- re-queue
+        // all of them here, gated by the SAME kill-switch that drives the rotation itself (see
+        // MarkAllRotatingEntityCardsDirty()'s own comment). A no-op call (and therefore zero
+        // behavior change from main's own pre-integration behavior) whenever the switch is off.
+        if (config::ENTITY_SELF_ROTATION_ENABLED) {
+            MarkAllRotatingEntityCardsDirty();
+        }
+
         if (m_DirtyCardQueue.empty()) {
             return;
         }

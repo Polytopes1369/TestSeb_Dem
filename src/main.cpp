@@ -782,7 +782,8 @@ int main(int argc, char** argv) {
         clusterPipeline.RecordFrame(vkContext.GetCommandBuffer(), camera.GetPushConstants(),
             camera.GetPosition(), camera.GetFrameInfo(aspect), static_cast<float>(glfwGetTime()),
             vkContext.GetSwapchainImages()[imageIndex],
-            vkContext.GetSwapchainImageViews()[imageIndex]);
+            vkContext.GetSwapchainImageViews()[imageIndex],
+            vkContext.GetEntityTransformsCPU());
 
         vkEndCommandBuffer(vkContext.GetCommandBuffer());
 

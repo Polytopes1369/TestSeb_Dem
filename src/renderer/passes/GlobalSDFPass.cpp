@@ -7,6 +7,7 @@
 #include <stdexcept>
 #include <thread>
 
+#include "core/EngineConfig.h" // config::ENTITY_SELF_ROTATION_ENABLED
 #include "core/Logger.h"
 #include "geometry/MeshSDFGenerator.h"
 #include "io/CacheFileManager.h"
@@ -32,8 +33,20 @@ namespace renderer {
             float farValue = 0;
             int32_t clipmapResolution = 0;
             int32_t _pad0 = 0;
+            // Phase 4 integration (UE5.8 parity roadmap, dynamic scenes onto main): object-space
+            // rotation support -- pivotCenter + the object's INVERSE rotation (CPU-computed via
+            // maths::mat4::Inverse(), see GlobalSDFPass::RecordUpdate's own call site), so
+            // GlobalSDFComposite.comp's mode==1 branch can un-rotate a world-space query point back
+            // to the entity's rest pose before sampling its (rest-pose-baked) Mesh SDF. Identity
+            // (invRot = I) whenever the entity is static or config::ENTITY_SELF_ROTATION_ENABLED is
+            // off -- see that call site's own comment for why identity makes pivotCenter's exact
+            // value irrelevant in that case.
+            float pivotCenterX = 0, pivotCenterY = 0, pivotCenterZ = 0;
+            float invRot00 = 1, invRot01 = 0, invRot02 = 0;
+            float invRot10 = 0, invRot11 = 1, invRot12 = 0;
+            float invRot20 = 0, invRot21 = 0, invRot22 = 1;
         };
-        static_assert(sizeof(GlobalSDFCompositePC) == 64,
+        static_assert(sizeof(GlobalSDFCompositePC) == 112,
             "GlobalSDFCompositePC must match GlobalSDFComposite.comp's push_constant block exactly");
 
         constexpr uint32_t kWorkgroupSize = 4; // Matches GlobalSDFComposite.comp's local_size_x/y/z.
@@ -565,7 +578,32 @@ namespace renderer {
         clipmap.snappedCenterVoxel[2] = newCenter[2];
     }
 
-    void GlobalSDFPass::RecordSlab(VkCommandBuffer cmd, const DirtySlab& slab) {
+    void GlobalSDFPass::EnqueueDirtyRegionsForEntity(uint32_t entityID, const maths::vec3& centerWorld, float boundingRadius) {
+        (void)entityID; // Not needed here -- RecordSlab's own existing per-entity overlap test
+                         // (against slabWorldMin/Max, see that function's own comment) already
+                         // resolves which entity/entities a drained slab actually composites;
+                         // this method only needs to know WHERE to mark dirty, not which entity.
+        // Unlike EnqueueDirtyRegionsForLevel (which enqueues a coarse, window-sized slab sized to
+        // whatever axis-aligned slice of the level's own covered window moved), this enqueues a
+        // TIGHT slab per level, sized to just this entity's own bounding sphere converted to that
+        // level's voxel grid -- much cheaper than a full-window refill, and correctly proportioned
+        // (fewer voxels at coarser levels, since voxelSize scales up with level).
+        for (uint32_t level = 0; level < kLevelCount; ++level) {
+            const float voxelSize = GetLevelVoxelSize(level);
+
+            DirtySlab slab{};
+            slab.level = level;
+            const float worldMin[3] = { centerWorld.x - boundingRadius, centerWorld.y - boundingRadius, centerWorld.z - boundingRadius };
+            const float worldMax[3] = { centerWorld.x + boundingRadius, centerWorld.y + boundingRadius, centerWorld.z + boundingRadius };
+            for (int axis = 0; axis < 3; ++axis) {
+                slab.voxelMin[axis] = static_cast<int32_t>(std::floor(worldMin[axis] / voxelSize));
+                slab.voxelMax[axis] = static_cast<int32_t>(std::ceil(worldMax[axis] / voxelSize));
+            }
+            m_PendingSlabs.push_back(slab);
+        }
+    }
+
+    void GlobalSDFPass::RecordSlab(VkCommandBuffer cmd, const DirtySlab& slab, const core::EntityTransformCPU* entityTransformsCPU) {
         const ClipmapLevel& clipmap = m_Levels[slab.level];
         const float voxelSize = GetLevelVoxelSize(slab.level);
         const int32_t res = static_cast<int32_t>(kClipmapResolution);
@@ -652,6 +690,24 @@ namespace renderer {
                         pc.objectVoxelSize = entitySdf.voxelSize;
                         pc.objectResolution = static_cast<int32_t>(entitySdf.resolution);
 
+                        // Phase 4 integration: object-space rotation. Identity (pc's own default
+                        // member initializers) whenever the switch is off OR entityTransformsCPU
+                        // wasn't supplied -- pivotCenter's exact value is then irrelevant, since
+                        // invRot=I makes GlobalSDFComposite.comp's `pivotCenter + invRot*(worldPos
+                        // - pivotCenter)` reduce to exactly worldPos regardless of pivotCenter.
+                        if (config::ENTITY_SELF_ROTATION_ENABLED && entityTransformsCPU != nullptr) {
+                            const core::EntityTransformCPU& xform = entityTransformsCPU[entitySdf.entityID];
+                            maths::mat4 invRot = xform.rotation.Inverse();
+                            pc.pivotCenterX = xform.center.x;
+                            pc.pivotCenterY = xform.center.y;
+                            pc.pivotCenterZ = xform.center.z;
+                            // Column-major maths::mat4 storage (m[row + col*4], see Maths.h) --
+                            // invRotXY below names row X, column Y of the 3x3 rotation block.
+                            pc.invRot00 = invRot.m[0]; pc.invRot01 = invRot.m[4]; pc.invRot02 = invRot.m[8];
+                            pc.invRot10 = invRot.m[1]; pc.invRot11 = invRot.m[5]; pc.invRot12 = invRot.m[9];
+                            pc.invRot20 = invRot.m[2]; pc.invRot21 = invRot.m[6]; pc.invRot22 = invRot.m[10];
+                        }
+
                         VkDescriptorSet compositeSets[2] = { clipmap.descriptorSet, entitySdf.descriptorSet };
                         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_PipelineLayout, 0, 2, compositeSets, 0, nullptr);
                         vkCmdPushConstants(cmd, m_PipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
@@ -663,21 +719,37 @@ namespace renderer {
         }
     }
 
-    void GlobalSDFPass::DrainAndRecordSlabs(VkCommandBuffer cmd) {
+    void GlobalSDFPass::DrainAndRecordSlabs(VkCommandBuffer cmd, const core::EntityTransformCPU* entityTransformsCPU) {
         uint32_t processed = 0;
         while (processed < kMaxDirtySlabsPerCall && !m_PendingSlabs.empty()) {
             DirtySlab slab = m_PendingSlabs.front();
             m_PendingSlabs.pop_front();
-            RecordSlab(cmd, slab);
+            RecordSlab(cmd, slab, entityTransformsCPU);
             ++processed;
         }
     }
 
-    void GlobalSDFPass::RecordUpdate(VkCommandBuffer cmd, const maths::vec3& cameraPositionWorld) {
+    void GlobalSDFPass::RecordUpdate(VkCommandBuffer cmd, const maths::vec3& cameraPositionWorld,
+        const core::EntityTransformCPU* entityTransformsCPU) {
         for (uint32_t level = 0; level < kLevelCount; ++level) {
             EnqueueDirtyRegionsForLevel(level, cameraPositionWorld);
         }
-        DrainAndRecordSlabs(cmd);
+
+        // Phase 4 integration (UE5.8 parity roadmap, dynamic scenes onto main): while entities
+        // rotate, each one's baked-rest-pose Mesh SDF needs re-compositing (at its new orientation)
+        // every frame -- re-enqueue every rotating entity's own (fixed, translation-invariant)
+        // dirty region here, gated by the SAME kill-switch that drives the rotation itself. A
+        // no-op loop (and therefore zero behavior change from main's own pre-integration behavior)
+        // whenever the switch is off.
+        if (config::ENTITY_SELF_ROTATION_ENABLED && entityTransformsCPU != nullptr) {
+            for (const EntitySDF& entitySdf : m_Entities) {
+                float boundingRadius = entitySdf.voxelSize * static_cast<float>(entitySdf.resolution) * 0.5f;
+                maths::vec3 entityCenter = entitySdf.volumeMin + maths::vec3{ boundingRadius, boundingRadius, boundingRadius };
+                EnqueueDirtyRegionsForEntity(entitySdf.entityID, entityCenter, boundingRadius * 1.7321f); // sqrt(3) cube-diagonal margin -- a conservative sphere around the object's cubic AABB.
+            }
+        }
+
+        DrainAndRecordSlabs(cmd, entityTransformsCPU);
     }
 
 }

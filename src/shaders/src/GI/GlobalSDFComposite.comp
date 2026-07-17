@@ -29,6 +29,13 @@ layout(push_constant) uniform GlobalSDFCompositePC {
     float dispatchWorldMinX; float dispatchWorldMinY; float dispatchWorldMinZ; float clipmapVoxelSize;
     float objectVolumeMinX; float objectVolumeMinY; float objectVolumeMinZ; float objectVoxelSize;
     int objectResolution; float farValue; int clipmapResolution; int _pad0;
+    // Phase 4 integration (UE5.8 parity roadmap, dynamic scenes onto main): object-space rotation
+    // support -- see renderer::GlobalSDFPass.cpp's own GlobalSDFCompositePC comment for the full
+    // rationale. Identity (pivotCenter irrelevant, invRot = I) whenever the entity is static.
+    float pivotCenterX; float pivotCenterY; float pivotCenterZ;
+    float invRot00; float invRot01; float invRot02;
+    float invRot10; float invRot11; float invRot12;
+    float invRot20; float invRot21; float invRot22;
 } pc;
 
 void main() {
@@ -52,9 +59,22 @@ void main() {
     vec3 dispatchWorldMin = vec3(pc.dispatchWorldMinX, pc.dispatchWorldMinY, pc.dispatchWorldMinZ);
     vec3 worldPos = dispatchWorldMin + vec3(gl_GlobalInvocationID) * pc.clipmapVoxelSize;
 
+    // Phase 4 integration (UE5.8 parity roadmap, dynamic scenes onto main): un-rotate the
+    // world-space query point back to the entity's REST POSE before treating it as a local-space
+    // offset into the object's (rest-pose-baked, never re-baked) Mesh SDF volume -- exact inverse
+    // of the forward rigid transform cluster_entity_transform.glsl's own helpers apply elsewhere
+    // in this pipeline: restPoseWorldPos = pivotCenter + invRot * (worldPos - pivotCenter). At
+    // invRot = identity (static entity, or the rotation switch off) this is an exact no-op
+    // regardless of pivotCenter's value.
+    vec3 pivotCenter = vec3(pc.pivotCenterX, pc.pivotCenterY, pc.pivotCenterZ);
+    mat3 invRot = mat3(pc.invRot00, pc.invRot10, pc.invRot20,
+                        pc.invRot01, pc.invRot11, pc.invRot21,
+                        pc.invRot02, pc.invRot12, pc.invRot22);
+    vec3 restPoseWorldPos = pivotCenter + invRot * (worldPos - pivotCenter);
+
     vec3 objectVolumeMin = vec3(pc.objectVolumeMinX, pc.objectVolumeMinY, pc.objectVolumeMinZ);
     vec3 objectExtent = vec3(float(pc.objectResolution) * pc.objectVoxelSize);
-    vec3 localPos = worldPos - objectVolumeMin;
+    vec3 localPos = restPoseWorldPos - objectVolumeMin;
 
     // Outside this object's own SDF volume: leave the texel exactly as the clear pass (or an
     // earlier object's composite dispatch, this same slab update) already left it.

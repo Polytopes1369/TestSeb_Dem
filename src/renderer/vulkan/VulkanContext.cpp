@@ -2141,6 +2141,12 @@ void VulkanContext::UpdateEntityRotations(float timeSeconds) {
       xform.centerZ = slot.y;
       xform._pad0 = 0.0f;
     }
+
+    // Phase 4 integration (UE5.8 parity roadmap, dynamic scenes onto main): CPU-readable mirror of
+    // the SAME values just computed above for GPU upload -- zero extra computation, see
+    // GetEntityTransformsCPU()'s own comment on why this exists.
+    m_EntityTransformsCPU[meshID] = core::EntityTransformCPU{
+        xform.rotation, maths::vec3{xform.centerX, xform.centerY, xform.centerZ}};
   }
 
   void *mapped = nullptr;

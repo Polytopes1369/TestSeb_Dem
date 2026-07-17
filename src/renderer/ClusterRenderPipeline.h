@@ -31,9 +31,12 @@
 // ancestor walk, so a cut node whose page hasn't streamed in yet never reaches the raster worklist ->
 // ClusterLODCompact.comp's final candidate emission), upstream of m_OcclusionCulling with no change to
 // anything downstream -- see ClusterLODSelectionPass's own class comment for the full 3-dispatch
-// sequence. Entity self-rotation (EntityTransform) is still not applied by the clustered path --
-// clusters render the static geometry as captured into the cache; the camera orbit is the scene's
-// only motion for now (see main.cpp's own note on why UpdateEntityRotations() is no longer called).
+// sequence. Entity self-rotation (EntityTransform, cluster_entity_transform.glsl) IS applied by the
+// clustered path (culling/LOD/raster/resolve), gated by config::ENTITY_SELF_ROTATION_ENABLED --
+// VulkanContext::UpdateEntityRotations() is called every frame (main.cpp), before RecordFrame().
+// Phase 4 integration (dynamic scenes onto main) additionally threads that same per-frame rotation
+// into the ray-traced/GI side of this pipeline (TLAS refit, Surface Cache re-capture, Global SDF
+// object-space compositing -- see m_SurfaceCacheRT/m_SurfaceCache/m_GlobalSDF's own comments below).
 //
 // --- Per-frame GPU work (all recorded by RecordFrame() into ONE command buffer, submitted once:
 // no mid-frame vkQueueSubmit/vkQueueWaitIdle anywhere, the other half of the anti-stutter
@@ -63,6 +66,7 @@
 
 #include "core/Camera.h"
 #include "core/EngineConfig.h"
+#include "core/EntityData.h" // core::EntityTransformCPU
 #include "core/LoadingManager.h"
 #include "core/maths/Maths.h"
 #include "renderer/passes/ATrousDenoisePass.h"
@@ -182,10 +186,15 @@ namespace renderer {
         // World Position Offset sway function (wpo_deformation.glsl's ApplyWPODeformation, called
         // identically from ClusterRaster.vert and ClusterSoftwareRaster.comp) -- uploaded once per
         // frame into m_WPOGlobalsBuffer before either raster pass runs. The caller only
-        // begins/ends/submits the command buffer and presents.
+        // begins/ends/submits the command buffer and presents. `entityTransformsCPU` (Phase 4
+        // integration, UE5.8 parity roadmap, dynamic scenes onto main -- renderer::VulkanContext::
+        // GetEntityTransformsCPU(), index == meshID) drives this frame's TLAS refit
+        // (m_SurfaceCacheRT.RecordRefreshTLAS) and Global SDF object-space compositing
+        // (m_GlobalSDF.RecordUpdate) -- see those two call sites' own comments.
         void RecordFrame(VkCommandBuffer cmd, const CameraPushConstants& camera,
             const maths::vec3& cameraPositionWorld, const CameraFrameInfo& cameraFrameInfo,
-            float globalTimeSeconds, VkImage swapchainImage, VkImageView swapchainImageView);
+            float globalTimeSeconds, VkImage swapchainImage, VkImageView swapchainImageView,
+            const core::EntityTransformCPU* entityTransformsCPU);
 
         // Upper bound on this frame's actual candidate count (the DAG's total leaf count) -- NOT
         // this frame's real candidate count, which only ever exists on the GPU now that

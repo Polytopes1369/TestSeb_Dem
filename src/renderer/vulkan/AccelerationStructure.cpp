@@ -50,6 +50,21 @@ namespace renderer {
             return result;
         }
 
+        // Shared by CreateTlasRefitResources (build-size query) and BuildTLAS's own TLAS geometry
+        // setup below -- factored out so both stay byte-for-byte consistent (a size query built
+        // from a DIFFERENT geometry description than the actual build could under-size the scratch
+        // buffer, a real correctness hazard, not just a style nit).
+        VkAccelerationStructureGeometryKHR MakeTlasInstancesGeometry(VkDeviceAddress instanceBufferAddress) {
+            VkAccelerationStructureGeometryInstancesDataKHR instancesData{ VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR };
+            instancesData.arrayOfPointers = VK_FALSE;
+            instancesData.data.deviceAddress = instanceBufferAddress;
+
+            VkAccelerationStructureGeometryKHR geometry{ VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR };
+            geometry.geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR;
+            geometry.geometry.instances = instancesData;
+            return geometry;
+        }
+
         // Shared build sequence for both BLAS and TLAS: query build sizes, allocate the backing
         // storage buffer, create the VkAccelerationStructureKHR handle, allocate an aligned
         // scratch buffer, record + submit the build, fetch the resulting device address. The only
@@ -224,13 +239,7 @@ namespace renderer {
             std::memset(instanceBuffer.MappedData(), 0, static_cast<size_t>(instanceBytes));
         }
 
-        VkAccelerationStructureGeometryInstancesDataKHR instancesData{ VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR };
-        instancesData.arrayOfPointers = VK_FALSE;
-        instancesData.data.deviceAddress = GetBufferDeviceAddress(device, instanceBuffer.Handle());
-
-        VkAccelerationStructureGeometryKHR geometry{ VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR };
-        geometry.geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR;
-        geometry.geometry.instances = instancesData;
+        VkAccelerationStructureGeometryKHR geometry = MakeTlasInstancesGeometry(GetBufferDeviceAddress(device, instanceBuffer.Handle()));
 
         VkAccelerationStructureBuildRangeInfoKHR rangeInfo{};
         rangeInfo.primitiveCount = instanceCount;
@@ -243,6 +252,108 @@ namespace renderer {
         // free now that that call has returned.
         instanceBuffer.Destroy();
         return tlas;
+    }
+
+    TlasRefitResources CreateTlasRefitResources(VkPhysicalDevice physicalDevice, VkDevice device, VmaAllocator allocator, uint32_t instanceCount) {
+        TlasRefitResources result;
+
+        // Persistent instance buffer -- memcpy'd fresh every RecordRefitTLAS() call, never
+        // reallocated (instanceCount is fixed for this engine's static entity list).
+        const VkDeviceSize instanceBytes = static_cast<VkDeviceSize>(std::max<uint32_t>(instanceCount, 1)) * sizeof(VkAccelerationStructureInstanceKHR);
+        result.instanceBuffer.Create(allocator, instanceBytes,
+            VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+            VMA_MEMORY_USAGE_CPU_TO_GPU, /*mapped=*/true);
+
+        // Query the build sizes a MODE_BUILD rebuild targeting `instanceCount` instances will
+        // need, using the EXACT SAME geometry-description helper RecordRefitTLAS's own build uses
+        // (MakeTlasInstancesGeometry) -- a size query built from a mismatched geometry description
+        // would risk under-sizing the scratch buffer below.
+        VkAccelerationStructureGeometryKHR geometry = MakeTlasInstancesGeometry(GetBufferDeviceAddress(device, result.instanceBuffer.Handle()));
+
+        VkAccelerationStructureBuildGeometryInfoKHR buildInfo{ VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR };
+        buildInfo.type = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
+        buildInfo.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
+        buildInfo.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
+        buildInfo.geometryCount = 1;
+        buildInfo.pGeometries = &geometry;
+
+        VkAccelerationStructureBuildSizesInfoKHR sizeInfo{ VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR };
+        g_RTFunctions.vkGetAccelerationStructureBuildSizesKHR(device, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,
+            &buildInfo, &instanceCount, &sizeInfo);
+
+        const VkDeviceSize scratchAlignment = QueryMinScratchOffsetAlignment(physicalDevice);
+        AlignedScratchBuffer scratch = AllocateAlignedScratchBuffer(allocator, device, sizeInfo.buildScratchSize, scratchAlignment);
+        result.scratchBuffer = std::move(scratch.buffer);
+        result.scratchAddress = scratch.alignedAddress;
+
+        return result;
+    }
+
+    void RecordRefitTLAS(VkCommandBuffer cmd, VkDevice device, VkAccelerationStructureKHR dstTlas,
+        TlasRefitResources& resources, const std::vector<VkAccelerationStructureInstanceKHR>& instances) {
+
+        const uint32_t instanceCount = static_cast<uint32_t>(instances.size());
+        if (instanceCount == 0) {
+            return; // Nothing to refit -- matches BuildTLAS's own empty-scene tolerance.
+        }
+
+        // Fresh instance transforms this frame -- persistent host-visible buffer, no per-frame
+        // VMA allocation.
+        std::memcpy(resources.instanceBuffer.MappedData(), instances.data(),
+            static_cast<size_t>(instanceCount) * sizeof(VkAccelerationStructureInstanceKHR));
+
+        VkAccelerationStructureGeometryKHR geometry = MakeTlasInstancesGeometry(GetBufferDeviceAddress(device, resources.instanceBuffer.Handle()));
+
+        VkAccelerationStructureBuildGeometryInfoKHR buildInfo{ VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR };
+        buildInfo.type = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
+        buildInfo.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
+        // MODE_BUILD, never MODE_UPDATE -- see this function's own declaration comment
+        // (AccelerationStructure.h) for why: a full rebuild is cheap enough at this instance count
+        // (~a dozen) that ALLOW_UPDATE's extra bookkeeping (srcAccelerationStructure, a build
+        // originally flagged ALLOW_UPDATE) buys nothing here. A MODE_BUILD targeting an
+        // already-populated dstAccelerationStructure is well-defined per the spec -- the build
+        // does not read the structure's previous contents, only overwrite them.
+        buildInfo.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
+        buildInfo.geometryCount = 1;
+        buildInfo.pGeometries = &geometry;
+        buildInfo.dstAccelerationStructure = dstTlas;
+        buildInfo.scratchData.deviceAddress = resources.scratchAddress;
+
+        VkAccelerationStructureBuildRangeInfoKHR rangeInfo{};
+        rangeInfo.primitiveCount = instanceCount;
+        const VkAccelerationStructureBuildRangeInfoKHR* pRangeInfo = &rangeInfo;
+
+        // --- Pre-build barrier (WAR): the previous frame's HWRT consumers (rayQueryEXT reads
+        // against this same TLAS, e.g. Surface Cache radiosity injection) must have finished
+        // reading before this frame's build can start overwriting it. This engine records and
+        // submits exactly one command buffer per frame behind a single frameFence (see main.cpp),
+        // i.e. single-frame-in-flight -- by the time THIS frame's command buffer begins recording,
+        // the GPU has already fully retired the previous frame's work, so a same-command-buffer
+        // barrier (no extra cross-frame semaphore) correctly resolves this hazard, matching every
+        // other per-frame WAR pattern already established in this codebase.
+        // --- Post-build barrier (RAW): makes the freshly-rebuilt TLAS visible to every HWRT
+        // consumer THIS frame (radiosity injection and anything recorded after it). ---
+        VkMemoryBarrier2 preBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+        preBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
+        preBarrier.srcAccessMask = VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR;
+        preBarrier.dstStageMask = VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
+        preBarrier.dstAccessMask = VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
+        VkDependencyInfo preDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+        preDep.memoryBarrierCount = 1;
+        preDep.pMemoryBarriers = &preBarrier;
+        vkCmdPipelineBarrier2(cmd, &preDep);
+
+        g_RTFunctions.vkCmdBuildAccelerationStructuresKHR(cmd, 1, &buildInfo, &pRangeInfo);
+
+        VkMemoryBarrier2 postBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+        postBarrier.srcStageMask = VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
+        postBarrier.srcAccessMask = VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
+        postBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
+        postBarrier.dstAccessMask = VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR;
+        VkDependencyInfo postDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+        postDep.memoryBarrierCount = 1;
+        postDep.pMemoryBarriers = &postBarrier;
+        vkCmdPipelineBarrier2(cmd, &postDep);
     }
 
 }

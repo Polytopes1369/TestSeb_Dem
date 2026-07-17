@@ -31,11 +31,17 @@
 // this codebase's Lumen-style systems.
 //
 // --- Scope ---
-// Entities are static in this engine (see renderer::ClusterRenderPipeline's own class comment:
-// "Entity self-rotation... is not applied by the clustered path yet"), so a fixed entity list
-// built once at Init() (one Mesh SDF per entity, from that entity's Fallback Mesh) is sufficient --
-// dynamic object add/remove/move is future work, exactly like the rest of this Nanite/Lumen-style
-// pipeline's own documented staging of scope.
+// A fixed entity list, built once at Init() (one Mesh SDF per entity, from that entity's Fallback
+// Mesh), is sufficient -- dynamic object add/remove is still out of scope. Rigid ROTATION, however,
+// is handled (Phase 4 integration, UE5.8 parity roadmap, dynamic scenes onto main): when
+// config::ENTITY_SELF_ROTATION_ENABLED is on, RecordUpdate()'s mode==1 composite dispatch
+// inverse-rotates the world-space query point back to each entity's rest pose before sampling its
+// (rest-pose-baked, never re-baked) Mesh SDF -- see GlobalSDFComposite.comp's own comment. The
+// per-slab overlap test against a level's dirty region still uses each entity's STATIC rest-pose
+// AABB (no conservative refit under rotation) -- an accepted, documented limitation: a very
+// non-cube/sphere-shaped rotating object could theoretically sweep outside its own baked SDF
+// volume's margin at some angles, but this demo's roughly-cube/sphere-shaped primitives make the
+// practical risk low.
 
 #include <cstdint>
 #include <deque>
@@ -44,6 +50,7 @@
 #include <vulkan/vulkan.h>
 #include <vk_mem_alloc.h>
 
+#include "core/EntityData.h" // core::EntityTransformCPU
 #include "core/LoadingManager.h"
 #include "core/maths/Maths.h"
 
@@ -117,7 +124,16 @@ namespace renderer {
         // wrap-contiguous sub-dispatches each -- see the .cpp's SplitWrappedRange). Must be called
         // at most once per frame, with that frame's camera position, into an already-open,
         // caller-owned command buffer (never submits on its own).
-        void RecordUpdate(VkCommandBuffer cmd, const maths::vec3& cameraPositionWorld);
+        // `entityTransformsCPU` (Phase 4 integration, index == meshID, renderer::VulkanContext::
+        // GetEntityTransformsCPU()) drives two things when config::ENTITY_SELF_ROTATION_ENABLED is
+        // on: (1) the mode==1 composite dispatch's object-space inverse-rotation (see
+        // GlobalSDFComposite.comp), and (2) re-enqueuing every rotating entity's own (fixed,
+        // rotation-invariant) dirty region every call, since its baked-rest-pose Mesh SDF now needs
+        // recompositing at a different world orientation every frame. Ignored entirely (may be
+        // read but every entity resolves to an identity rotation) when the switch is off -- zero
+        // behavior change from main's own pre-integration behavior in that case.
+        void RecordUpdate(VkCommandBuffer cmd, const maths::vec3& cameraPositionWorld,
+            const core::EntityTransformCPU* entityTransformsCPU);
 
         // True once the dirty-slab FIFO is empty, i.e. every level's currently-covered window is
         // fully up to date -- lets a caller (e.g. a debug HUD) show streaming progress after a
@@ -212,8 +228,17 @@ namespace renderer {
         VkPipeline m_Pipeline = VK_NULL_HANDLE;
 
         void EnqueueDirtyRegionsForLevel(uint32_t level, const maths::vec3& cameraPositionWorld);
-        void DrainAndRecordSlabs(VkCommandBuffer cmd);
-        void RecordSlab(VkCommandBuffer cmd, const DirtySlab& slab);
+
+        // Phase 4 integration: mirrors EnqueueDirtyRegionsForLevel's own slab-enqueue logic but for
+        // a FIXED (rotation-only, translation-invariant) world region -- re-enqueued every frame
+        // while the entity rotates, no snap/delta tracking needed (unlike the camera-driven
+        // variant above, which only enqueues the newly-revealed slice of a MOVING window). Called
+        // internally from RecordUpdate(), once per entity, only while
+        // config::ENTITY_SELF_ROTATION_ENABLED is on.
+        void EnqueueDirtyRegionsForEntity(uint32_t entityID, const maths::vec3& centerWorld, float boundingRadius);
+
+        void DrainAndRecordSlabs(VkCommandBuffer cmd, const core::EntityTransformCPU* entityTransformsCPU);
+        void RecordSlab(VkCommandBuffer cmd, const DirtySlab& slab, const core::EntityTransformCPU* entityTransformsCPU);
     };
 
 }

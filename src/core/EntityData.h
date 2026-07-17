@@ -30,4 +30,17 @@ namespace core {
     inline bool GetFlag(uint32_t flags, EntityFlags f) {
         return (flags & f) != 0;
     }
+
+    // Phase 4 integration (UE5.8 parity roadmap, dynamic scenes onto main): CPU-readable mirror of
+    // one entity's current rigid transform, populated once per frame by
+    // VulkanContext::UpdateEntityRotations() alongside its GPU SSBO upload (same values, zero extra
+    // computation). Lives here (not in VulkanContext.h) so renderer:: code (e.g.
+    // SurfaceCacheRayTracingPass's per-frame TLAS refit, GlobalSDFPass's object-space compositing)
+    // can consume it without including VulkanContext.h -- the one-directional dependency boundary
+    // already established elsewhere in this codebase (renderer:: never depends on the concrete
+    // VulkanContext class, only on plain data/handles it exposes).
+    struct EntityTransformCPU {
+        maths::mat4 rotation;
+        maths::vec3 center;
+    };
 }

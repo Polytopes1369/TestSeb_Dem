@@ -84,6 +84,13 @@ public:
     const core::EntityData* GetEntityData() const { return m_EntityData.data(); }
     uint32_t GetEntityCount() const { return kEntityCount; }
     VkBuffer GetEntityTransformBuffer() const { return m_EntityTransformBuffer; }
+    // Phase 4 integration (UE5.8 parity roadmap, dynamic scenes onto main): CPU-readable mirror of
+    // this frame's per-entity rotation, refreshed every UpdateEntityRotations() call alongside its
+    // GPU SSBO upload. Consumed by renderer:: passes that need the ACTUAL rotation matrix (not just
+    // a GPU buffer handle to bind) -- currently only SurfaceCacheRayTracingPass's per-frame TLAS
+    // refit and GlobalSDFPass's object-space compositing (see core::EntityTransformCPU's own
+    // comment for why this lives in EntityData.h, not here).
+    const core::EntityTransformCPU* GetEntityTransformsCPU() const { return m_EntityTransformsCPU.data(); }
     VkBuffer GetEntityBuffer() const { return m_EntityBuffer; }
     const renderer::MaterialTable& GetMaterialTable() const { return m_MaterialTable; }
 
@@ -198,6 +205,11 @@ private:
     // core::IDManager) before GenerateGeometry() runs, then copied to m_EntityBuffer by
     // UploadEntityData(). One entry per primitive (box=0 .. chamferBox=11), see struct_custo.glsl.
     std::array<core::EntityData, kEntityCount> m_EntityData{};
+
+    // Phase 4 integration (UE5.8 parity roadmap, dynamic scenes onto main): CPU-readable mirror of
+    // m_EntityTransformBuffer's own per-frame contents -- see GetEntityTransformsCPU()'s own
+    // comment.
+    std::array<core::EntityTransformCPU, kEntityCount> m_EntityTransformsCPU{};
 
     // Randomly-generated PBR materials (renderer::GenerateRandomMaterialTable), one slot per
     // entity -- built once by BuildEntityData(), uploaded to the GPU by ClusterResolvePass::Init()

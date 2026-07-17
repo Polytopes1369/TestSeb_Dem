@@ -604,7 +604,8 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
                                         const CameraFrameInfo &cameraFrameInfo,
                                         float globalTimeSeconds,
                                         VkImage swapchainImage,
-                                        VkImageView swapchainImageView) {
+                                        VkImageView swapchainImageView,
+                                        const core::EntityTransformCPU *entityTransformsCPU) {
   assert(m_ClusterCount > 0 && "RecordFrame called before a successful Init");
 
   CameraPushConstants cameraCopy = camera;
@@ -674,6 +675,13 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
   // rather than sitting at the tail end.
   // =========================================================================================
   {
+    // 0. Phase 4 integration (UE5.8 parity roadmap, dynamic scenes onto main): per-frame TLAS
+    // refit so ray-traced GI/reflections see this frame's entity rotations -- must run before
+    // anything below traces against m_SurfaceCacheRT's TLAS (radiosity injection, step 4, and any
+    // later HWRT consumer this same frame). A no-op rebuild (identity transforms) whenever
+    // config::ENTITY_SELF_ROTATION_ENABLED is off -- see RecordRefreshTLAS's own comment.
+    m_SurfaceCacheRT.RecordRefreshTLAS(cmd, entityTransformsCPU);
+
     // Sun direction is fixed for now (m_SceneLights' own default, see LightingTypes.h) -- a
     // future day/night system would rotate it per frame instead.
     const maths::vec3 sunDirection = m_SceneLights.sun.direction;
@@ -695,7 +703,7 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
     m_SurfaceCache.RecordCapture(cmd);
 
     // 3. Global SDF clipmap streaming, from this frame's camera position.
-    m_GlobalSDF.RecordUpdate(cmd, cameraFrameInfo.position);
+    m_GlobalSDF.RecordUpdate(cmd, cameraFrameInfo.position, entityTransformsCPU);
 
     // 4. Secondary-bounce injection into m_SurfaceCache's own radiance atlas (budgeted, a handful
     // of cards per call -- see SurfaceCacheGIInjectPass::kCardsPerFrameBudget) via m_TraceContext's

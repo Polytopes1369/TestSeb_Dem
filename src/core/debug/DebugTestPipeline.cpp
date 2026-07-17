@@ -184,7 +184,8 @@ namespace debugpipeline {
 
                 clusterPipeline.RecordFrame(vkContext.GetCommandBuffer(), camera.GetPushConstants(),
                     camera.GetPosition(), camera.GetFrameInfo(aspect), static_cast<float>(glfwGetTime()),
-                    vkContext.GetSwapchainImages()[imageIndex], vkContext.GetSwapchainImageViews()[imageIndex]);
+                    vkContext.GetSwapchainImages()[imageIndex], vkContext.GetSwapchainImageViews()[imageIndex],
+                    vkContext.GetEntityTransformsCPU());
 
                 if (captureRequested && f == frameCount - 1) {
                     debugpipeline::ScreenshotCapture::RecordCapture(
