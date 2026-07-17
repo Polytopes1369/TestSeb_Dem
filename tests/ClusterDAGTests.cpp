@@ -39,11 +39,25 @@ namespace {
         return condition;
     }
 
+    // Computes and stamps boundsMin/boundsMax/sphereCenter/sphereRadius from `node.mesh.positions`
+    // -- required since ValidateClusterDAG's debug-only geometric sanity checks (added 2026-07-16,
+    // after this file's own nodes were originally hand-crafted with these left at their zero
+    // default) verify every vertex actually lies within its own node's cached bounds.
+    void StampBoundsFromMesh(geometry::ClusterDAGNode& node) {
+        maths::ResetAABB(node.boundsMin, node.boundsMax);
+        for (const maths::vec3& p : node.mesh.positions) {
+            maths::ExpandAABB(node.boundsMin, node.boundsMax, p);
+        }
+        node.sphereCenter = maths::AABBCenter(node.boundsMin, node.boundsMax);
+        node.sphereRadius = maths::AABBRadius(node.boundsMin, node.boundsMax);
+    }
+
     // -------------------------------------------------------------------------------------
     // A tiny, hand-crafted, already-valid 3-node DAG (2 leaves + 1 parent) used as a clean
-    // baseline for the tamper-and-detect scenarios below. Geometry content is irrelevant here
-    // (ValidateClusterDAG only inspects childIndices/parentIndex/clusterError/parentError), so
-    // each mesh is a single arbitrary triangle.
+    // baseline for the tamper-and-detect scenarios below. Triangle shapes are otherwise
+    // arbitrary (ValidateClusterDAG's structural/error-monotonicity checks don't care what they
+    // actually look like), but must be non-degenerate and have correctly-stamped bounds to
+    // satisfy the debug-only geometric sanity checks alongside those structural ones.
     // -------------------------------------------------------------------------------------
     geometry::ClusterDAG MakeTinyValidDAG() {
         geometry::ClusterDAG dag;
@@ -54,6 +68,7 @@ namespace {
         leaf0.mesh.positions = { maths::vec3{0,0,0}, maths::vec3{1,0,0}, maths::vec3{0,1,0} };
         leaf0.mesh.locked = { false, false, false };
         leaf0.mesh.triangles = { 0u, 1u, 2u };
+        StampBoundsFromMesh(leaf0);
         dag.nodes.push_back(leaf0); // index 0
 
         geometry::ClusterDAGNode leaf1;
@@ -62,6 +77,7 @@ namespace {
         leaf1.mesh.positions = { maths::vec3{1,0,0}, maths::vec3{1,1,0}, maths::vec3{0,1,0} };
         leaf1.mesh.locked = { false, false, false };
         leaf1.mesh.triangles = { 0u, 1u, 2u };
+        StampBoundsFromMesh(leaf1);
         dag.nodes.push_back(leaf1); // index 1
 
         geometry::ClusterDAGNode parent;
@@ -71,6 +87,7 @@ namespace {
         parent.mesh.positions = { maths::vec3{0,0,0}, maths::vec3{1,1,0}, maths::vec3{0,1,0} };
         parent.mesh.locked = { false, false, false };
         parent.mesh.triangles = { 0u, 1u, 2u };
+        StampBoundsFromMesh(parent);
         dag.nodes.push_back(parent); // index 2
 
         dag.nodes[0].parentIndex = 2u;
