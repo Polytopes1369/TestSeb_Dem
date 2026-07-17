@@ -9,6 +9,8 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # Static runtime for MSVC (Autonomous .exe)
 if(MSVC)
     set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    # Enable multi-processor compilation
+    add_compile_options(/MP)
 endif()
 
 # --- Dépendances ---

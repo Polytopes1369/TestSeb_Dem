@@ -8,6 +8,7 @@
 #include "geometry/FallbackMeshBuilder.h"
 #include "geometry/GeometryEncoding.h"
 #include "core/Logger.h"
+#include "core/EngineConfig.h"
 #include "renderer/RenderTypes.h"
 
 #include <algorithm>
@@ -15,6 +16,7 @@
 #include <cstring>
 #include <filesystem>
 #include <format>
+#include <fstream>
 #include <future>
 #include <limits>
 #include <string>
@@ -289,6 +291,57 @@ namespace geometry {
 
     } // namespace
 
+    bool IsCacheUpToDate(
+        uint32_t totalVertexCount,
+        uint32_t totalIndexCount,
+        uint32_t entityCount) {
+        std::ifstream cfgFile("scene.cache.cfg");
+        if (!cfgFile.is_open()) {
+            return false;
+        }
+        if (!std::filesystem::exists("scene.cache")) {
+            return false;
+        }
+        float spacing = 0.0f;
+        uint32_t vCount = 0;
+        uint32_t iCount = 0;
+        uint32_t eCount = 0;
+        std::string profileName;
+        if (!(cfgFile >> spacing >> vCount >> iCount >> eCount >> profileName)) {
+            return false;
+        }
+        if (std::abs(spacing - config::VERTEX_SPACING) > 1e-5f) {
+            return false;
+        }
+        if (vCount != totalVertexCount) {
+            return false;
+        }
+        if (iCount != totalIndexCount) {
+            return false;
+        }
+        if (eCount != entityCount) {
+            return false;
+        }
+        if (profileName != config::g_ActiveProfileName) {
+            return false;
+        }
+        return true;
+    }
+
+    void SaveCacheConfig(
+        uint32_t totalVertexCount,
+        uint32_t totalIndexCount,
+        uint32_t entityCount) {
+        std::ofstream cfgFile("scene.cache.cfg");
+        if (cfgFile.is_open()) {
+            cfgFile << config::VERTEX_SPACING << " "
+                    << totalVertexCount << " "
+                    << totalIndexCount << " "
+                    << entityCount << " "
+                    << config::g_ActiveProfileName << "\n";
+        }
+    }
+
     bool RunVirtualGeometryCacheTest(
         VkDevice device, VmaAllocator allocator, VkQueue graphicsQueue, VkCommandPool commandPool,
         VkBuffer vertexBuffer, VkBuffer indexBuffer,
@@ -306,12 +359,6 @@ namespace geometry {
         }
 
         // --- DIAGNOSTIC: per-meshID vertex/triangle histogram -------------------------------
-        // Temporary instrumentation to determine whether missing geometry (e.g. cone/torus
-        // knot reported as "produced zero clusters") is caused by vertices never landing in
-        // the readback with the expected meshID (a generation-side bug) or by vertices being
-        // present but not matched by ClusterPartitioner's index-triangle filter (a
-        // partitioning-side bug). Mirrors PartitionMeshIntoClusters's exact filter
-        // (allVertices[i0].meshID) so the triangle counts reproduce what it sees.
         {
             std::unordered_map<uint32_t, uint32_t> vertsByMeshID;
             for (const renderer::Vertex& v : allVertices) {
@@ -351,107 +398,157 @@ namespace geometry {
         bool allEntitiesOk = true;
         uint32_t entitiesWithGeometry = 0;
 
-        for (uint32_t entityIdx = 0; entityIdx < entityCount; ++entityIdx) {
-            uint32_t meshID = entityData[entityIdx].meshID;
-            EntityMaterialProperties materialProps = GetEntityMaterialProperties(entityData[entityIdx].materialID);
+        // We will process entities in parallel using std::async
+        struct EntityResult {
+            uint32_t meshID = 0;
+            ClusterDAG dag;
+            bool success = true;
+            std::vector<std::string> dagErrors;
+            FallbackMesh fallbackMesh;
+            bool hasFallback = false;
+            FallbackMeshData fallbackMeshData;
+            std::vector<SurfaceCacheCardEntry> entityCards;
+            std::vector<ClusterIndexEntry> localIndexEntries;
+            std::vector<DAGNodeEntry> localDagEntries;
+            std::vector<ClusterData> localClusterData;
+        };
 
-            ClusterDAG dag = BuildClusterDAG(meshID, allVertices, allIndices, materialProps.maskTextureIndex);
-            if (dag.nodes.empty()) {
+        std::vector<std::future<EntityResult>> futures;
+        futures.reserve(entityCount);
+
+        for (uint32_t entityIdx = 0; entityIdx < entityCount; ++entityIdx) {
+            futures.push_back(std::async(std::launch::async, [entityIdx, entityCount, &entityData, &allVertices, &allIndices]() -> EntityResult {
+                EntityResult res;
+                res.meshID = entityData[entityIdx].meshID;
+                EntityMaterialProperties materialProps = GetEntityMaterialProperties(entityData[entityIdx].materialID);
+
+                res.dag = BuildClusterDAG(res.meshID, allVertices, allIndices, materialProps.maskTextureIndex);
+                if (res.dag.nodes.empty()) {
+                    return res; // Empty DAG, success remains true
+                }
+
+                if (!ValidateClusterDAG(res.dag, res.dagErrors)) {
+                    res.success = false;
+                    return res;
+                }
+
+                res.fallbackMesh = BuildFallbackMesh(res.dag);
+                if (!res.fallbackMesh.triangles.empty()) {
+                    res.hasFallback = true;
+                    res.fallbackMeshData = BuildFallbackMeshData(res.meshID, res.fallbackMesh);
+
+                    // Surface-cache cards
+                    const FallbackMeshIndexEntry& fbEntry = res.fallbackMeshData.indexEntry;
+                    res.entityCards = GenerateEntityCards(res.meshID,
+                        maths::vec3{ fbEntry.boundsMin[0], fbEntry.boundsMin[1], fbEntry.boundsMin[2] },
+                        maths::vec3{ fbEntry.boundsMax[0], fbEntry.boundsMax[1], fbEntry.boundsMax[2] });
+                }
+
+                res.localIndexEntries.reserve(res.dag.nodes.size());
+                res.localDagEntries.reserve(res.dag.nodes.size());
+                res.localClusterData.reserve(res.dag.nodes.size());
+
+                for (size_t i = 0; i < res.dag.nodes.size(); ++i) {
+                    const ClusterDAGNode& node = res.dag.nodes[i];
+
+                    ClusterData data{};
+                    if (!EncodeClusterData(node, data)) {
+                        res.success = false;
+                    }
+                    res.localClusterData.push_back(data);
+
+                    res.localIndexEntries.push_back(BuildIndexEntry(0, res.meshID, node, materialProps.maxWPOAmplitude,
+                        node.isMasked ? materialProps.maskTextureIndex : kInvalidMaskTextureIndex,
+                        entityData[entityIdx].materialID));
+
+                    DAGNodeEntry dagEntry{};
+                    dagEntry.clusterID = static_cast<uint32_t>(i);
+                    dagEntry.parentClusterID = node.parentIndex;
+                    dagEntry.childClusterID[0] = (node.childIndices.size() > 0) ? node.childIndices[0] : kInvalidClusterID;
+                    dagEntry.childClusterID[1] = (node.childIndices.size() > 1) ? node.childIndices[1] : kInvalidClusterID;
+                    dagEntry.level = node.level;
+                    dagEntry.clusterError = node.clusterError;
+                    dagEntry.parentError = node.parentError;
+                    res.localDagEntries.push_back(dagEntry);
+                }
+
+                return res;
+            }));
+        }
+
+        // Wait for all futures and gather results
+        std::vector<EntityResult> results;
+        results.reserve(entityCount);
+        for (auto& f : futures) {
+            results.push_back(f.get());
+        }
+
+        // Stitch everything sequentially
+        for (const auto& res : results) {
+            if (res.dag.nodes.empty()) {
                 LOG_WARNING(std::format(
-                    "[GeometryCacheTest] Entity meshID={} produced zero clusters (no matching triangles); skipping.", meshID));
+                    "[GeometryCacheTest] Entity meshID={} produced zero clusters (no matching triangles); skipping.", res.meshID));
                 continue;
             }
             ++entitiesWithGeometry;
 
-            // Validate the in-memory DAG *before* persisting it, so a builder bug is caught here
-            // rather than silently baked into the .cache file.
-            std::vector<std::string> dagErrors;
-            if (!ValidateClusterDAG(dag, dagErrors)) {
-                for (const std::string& err : dagErrors) {
-                    LOG_ERROR(std::format("[GeometryCacheTest] entity meshID={} DAG: {}", meshID, err));
+            if (!res.success || !res.dagErrors.empty()) {
+                for (const std::string& err : res.dagErrors) {
+                    LOG_ERROR(std::format("[GeometryCacheTest] entity meshID={} DAG: {}", res.meshID, err));
                 }
                 allEntitiesOk = false;
                 continue;
             }
 
-            // Fallback Mesh: one coarse BVH proxy for this entity, built by continuing DAG-root
-            // simplification with every vertex unlocked (see FallbackMeshBuilder.h). Deliberately
-            // independent of the opaque/masked cluster split above -- it is a ray tracing
-            // acceleration-structure input, not a rasterization path.
-            FallbackMesh fallbackMesh = BuildFallbackMesh(dag);
-            if (!fallbackMesh.triangles.empty()) {
-                fallbackMeshes.push_back(BuildFallbackMeshData(meshID, fallbackMesh));
+            if (res.hasFallback) {
+                fallbackMeshes.push_back(res.fallbackMeshData);
+                cardEntries.insert(cardEntries.end(), res.entityCards.begin(), res.entityCards.end());
 
-                // Surface-cache cards: up to 6 orthographic box-face projections of this entity,
-                // sized from the SAME AABB the fallback mesh's index entry carries -- the capture
-                // pass rasterizes exactly that mesh through these cards, so using its bounds (not
-                // the leaf geometry's) guarantees the projection volume encloses everything the
-                // capture will ever draw. Atlas placement is deferred to the global pack below.
-                const FallbackMeshIndexEntry& fbEntry = fallbackMeshes.back().indexEntry;
-                std::vector<SurfaceCacheCardEntry> entityCards = GenerateEntityCards(meshID,
-                    maths::vec3{ fbEntry.boundsMin[0], fbEntry.boundsMin[1], fbEntry.boundsMin[2] },
-                    maths::vec3{ fbEntry.boundsMax[0], fbEntry.boundsMax[1], fbEntry.boundsMax[2] });
-                cardEntries.insert(cardEntries.end(), entityCards.begin(), entityCards.end());
                 LOG_INFO(std::format(
                     "[GeometryCacheTest] entity meshID={}: {} surface-cache card(s) generated.",
-                    meshID, entityCards.size()));
+                    res.meshID, res.entityCards.size()));
 
                 size_t leafTriangleCount = 0;
-                for (const ClusterDAGNode& n : dag.nodes) {
+                for (const ClusterDAGNode& n : res.dag.nodes) {
                     if (n.level == 0u) {
                         leafTriangleCount += n.mesh.triangles.size() / 3u;
                     }
                 }
-                size_t fallbackTriangleCount = fallbackMesh.triangles.size() / 3u;
+                size_t fallbackTriangleCount = res.fallbackMesh.triangles.size() / 3u;
                 LOG_INFO(std::format(
                     "[GeometryCacheTest] entity meshID={}: fallback mesh {} triangle(s) ({:.2f}% of {} leaf triangle(s)).",
-                    meshID, fallbackTriangleCount,
+                    res.meshID, fallbackTriangleCount,
                     100.0f * static_cast<float>(fallbackTriangleCount) / static_cast<float>(std::max<size_t>(1, leafTriangleCount)),
                     leafTriangleCount));
             }
 
             uint32_t baseGlobalID = static_cast<uint32_t>(indexEntries.size());
-            std::vector<uint32_t> localToGlobal(dag.nodes.size());
-            for (size_t i = 0; i < dag.nodes.size(); ++i) {
-                localToGlobal[i] = baseGlobalID + static_cast<uint32_t>(i);
-            }
 
-            for (size_t i = 0; i < dag.nodes.size(); ++i) {
-                const ClusterDAGNode& node = dag.nodes[i];
-                uint32_t globalID = localToGlobal[i];
+            // Append cluster data
+            clusterData.insert(clusterData.end(), res.localClusterData.begin(), res.localClusterData.end());
 
-                ClusterData data{};
-                if (!EncodeClusterData(node, data)) {
-                    allEntitiesOk = false; // Logged inside EncodeClusterData; keep bookkeeping aligned below.
-                }
-                clusterData.push_back(data);
-                // Per-cluster, not per-entity: a cluster only carries the entity's real mask slot
-                // if BuildClusterDAG's opacity split actually classified it as masked (node.isMasked)
-                // -- an opaque cluster gets kInvalidMaskTextureIndex even if its owning entity has a
-                // cutout material, which is exactly what lets the (Part 2) opaque rasterizer path
-                // route it with zero mask-sampling overhead.
-                indexEntries.push_back(BuildIndexEntry(globalID, meshID, node, materialProps.maxWPOAmplitude,
-                    node.isMasked ? materialProps.maskTextureIndex : kInvalidMaskTextureIndex,
-                    entityData[entityIdx].materialID));
+            // Build/patch global index entries and DAG entries
+            for (size_t i = 0; i < res.dag.nodes.size(); ++i) {
+                uint32_t globalID = baseGlobalID + static_cast<uint32_t>(i);
+                
+                ClusterIndexEntry idxEntry = res.localIndexEntries[i];
+                idxEntry.clusterID = globalID;
+                indexEntries.push_back(idxEntry);
 
-                DAGNodeEntry dagEntry{};
-                dagEntry.clusterID = globalID;
-                dagEntry.parentClusterID = (node.parentIndex == kInvalidDAGNodeIndex) ? kInvalidClusterID : localToGlobal[node.parentIndex];
-                dagEntry.childClusterID[0] = (node.childIndices.size() > 0) ? localToGlobal[node.childIndices[0]] : kInvalidClusterID;
-                dagEntry.childClusterID[1] = (node.childIndices.size() > 1) ? localToGlobal[node.childIndices[1]] : kInvalidClusterID;
-                dagEntry.level = node.level;
-                dagEntry.clusterError = node.clusterError;
-                dagEntry.parentError = node.parentError;
-                dagEntries.push_back(dagEntry);
+                const DAGNodeEntry& localDag = res.localDagEntries[i];
+                DAGNodeEntry globalDag{};
+                globalDag.clusterID = globalID;
+                globalDag.parentClusterID = (localDag.parentClusterID == kInvalidDAGNodeIndex) ? kInvalidClusterID : baseGlobalID + localDag.parentClusterID;
+                globalDag.childClusterID[0] = (localDag.childClusterID[0] == kInvalidClusterID) ? kInvalidClusterID : baseGlobalID + localDag.childClusterID[0];
+                globalDag.childClusterID[1] = (localDag.childClusterID[1] == kInvalidClusterID) ? kInvalidClusterID : baseGlobalID + localDag.childClusterID[1];
+                globalDag.level = localDag.level;
+                globalDag.clusterError = localDag.clusterError;
+                globalDag.parentError = localDag.parentError;
+                dagEntries.push_back(globalDag);
             }
         }
 
         // --- DIAGNOSTIC: per-entity coneCutoff range (sanity check for the backface-cone fix) ----
-        // coneCutoff close to +1.0 means a very narrow/aggressive cone (culls unless the camera is
-        // almost perfectly aligned with the axis); close to -1.0 means a near-omnidirectional cone
-        // (rarely culls). High-curvature/twisted meshes (torus knot) and hard-edged tips (cone)
-        // should show low (wide) cutoffs -- a value hovering near 1.0 for those would indicate the
-        // per-cluster normal cone is still too narrow and would over-cull.
         {
             std::unordered_map<uint32_t, float> minCutoffByEntity;
             std::unordered_map<uint32_t, float> maxCutoffByEntity;

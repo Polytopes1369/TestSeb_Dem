@@ -278,11 +278,20 @@ int main(int argc, char** argv) {
     // cluster/DAG tables + 4 KB-page-aligned geometry blocks, and validates the round trip. Since
     // the clustered render pipeline below streams its geometry FROM this file, a failure here is
     // now fatal (there is nothing to render without it), no longer merely diagnostic.
-    bool geometryCacheTestPassed = geometry::RunVirtualGeometryCacheTest(
-        vkContext.GetDevice(), vkContext.GetAllocator(), vkContext.GetGraphicsQueue(), vkContext.GetCommandPool(),
-        vkContext.GetVertexBuffer(), vkContext.GetIndexBuffer(),
-        vkContext.GetTotalVertexCount(), vkContext.GetTotalIndexCount(),
-        vkContext.GetEntityData(), vkContext.GetEntityCount());
+    bool geometryCacheTestPassed = true;
+    if (geometry::IsCacheUpToDate(vkContext.GetTotalVertexCount(), vkContext.GetTotalIndexCount(), vkContext.GetEntityCount())) {
+        LOG_INFO("[Main] scene.cache is up to date with current parameters. Skipping geometry cache build.");
+    } else {
+        LOG_INFO("[Main] scene.cache is missing or out of date. Rebuilding geometry cache...");
+        geometryCacheTestPassed = geometry::RunVirtualGeometryCacheTest(
+            vkContext.GetDevice(), vkContext.GetAllocator(), vkContext.GetGraphicsQueue(), vkContext.GetCommandPool(),
+            vkContext.GetVertexBuffer(), vkContext.GetIndexBuffer(),
+            vkContext.GetTotalVertexCount(), vkContext.GetTotalIndexCount(),
+            vkContext.GetEntityData(), vkContext.GetEntityCount());
+        if (geometryCacheTestPassed) {
+            geometry::SaveCacheConfig(vkContext.GetTotalVertexCount(), vkContext.GetTotalIndexCount(), vkContext.GetEntityCount());
+        }
+    }
     if (!geometryCacheTestPassed) {
         LOG_CRITICAL("[Main] Virtual geometry cache build FAILED — the clustered pipeline cannot run without scene.cache.");
         vkContext.Shutdown();
