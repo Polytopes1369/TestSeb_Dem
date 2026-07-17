@@ -793,6 +793,15 @@ void VulkanContext::CreateLogicalDevice() {
   // ray tracing / Int64 image atomics requirements already supports it), so enabled
   // unconditionally here, matching geometryShader's own enablement rigor above.
   deviceFeatures2.features.fragmentStoresAndAtomics = VK_TRUE;
+  // multiDrawIndirect: renderer::TransparentForwardPass::RecordDraw() issues ONE
+  // vkCmdDrawIndexedIndirect covering every static transparent leaf cluster in a single call
+  // (drawCount = cluster count, e.g. 712 in this demo's scene -- see that class' own class
+  // comment). Without this feature, the spec caps drawCount at 1
+  // (VUID-vkCmdDrawIndexedIndirect-drawCount-02718) -- a near-universally-supported core Vulkan
+  // 1.0 feature bit on desktop GPUs (every GPU capable of this project's own mandatory ray
+  // tracing / mesh shader requirements already supports it), so enabled unconditionally here,
+  // matching geometryShader's/fragmentStoresAndAtomics' own enablement rigor above.
+  deviceFeatures2.features.multiDrawIndirect = VK_TRUE;
 
   VkDeviceCreateInfo createInfo{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
   createInfo.pNext = &deviceFeatures2;

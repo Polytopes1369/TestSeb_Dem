@@ -47,7 +47,14 @@ namespace renderer {
         imageInfo.arrayLayers = 1;
         imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
         imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
-        imageInfo.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        // TRANSFER_DST_BIT: RecordFrame()'s ssrtEnabled==false debug path (main.cpp's 'F' key)
+        // clears this image via VulkanUtils::ClearComputeImageToGeneral, which issues a real
+        // vkCmdClearColorImage (transfer-stage clear through VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        // not a compute imageStore despite the helper's name) -- without this flag that call is a
+        // validation-layer error (missing VK_IMAGE_USAGE_TRANSFER_DST_BIT), exactly as every other
+        // caller of that same helper (ReflectionPass/ScreenProbeGIPass, via
+        // VulkanUtils::CreateStorageSampledImage2D) already includes it for.
+        imageInfo.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
         imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
         imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
@@ -124,7 +131,15 @@ namespace renderer {
         VK_CHECK(vkAllocateDescriptorSets(m_Device, &setAllocInfo, &m_Set));
 
         VkDescriptorImageInfo outputInfo{ VK_NULL_HANDLE, m_OutputView, VK_IMAGE_LAYOUT_GENERAL };
-        VkDescriptorImageInfo depthInfo{ m_NearestSampler, depthView, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL };
+        // GENERAL, not DEPTH_STENCIL_READ_ONLY_OPTIMAL: `depthView` is renderer::
+        // ClusterResolvePass::GetOutputDepthView(), a plain COLOR-aspect R32_SFLOAT GBuffer image
+        // (the winning hw-vs-sw arbitrated NDC depth, not a real depth-attachment image), kept in
+        // VK_IMAGE_LAYOUT_GENERAL for its entire lifetime -- same convention every other consumer of
+        // this exact image already follows (renderer::ATrousDenoisePass, renderer::ReflectionPass,
+        // renderer::ScreenProbeGIPass, renderer::MegaLightsPass, renderer::GICompositePass -- see
+        // that class' own identical fix). Same VUID-VkDescriptorImageInfo-imageLayout-09426
+        // validation error (plus its downstream vkCmdDispatch cascade) as GICompositePass had.
+        VkDescriptorImageInfo depthInfo{ m_NearestSampler, depthView, VK_IMAGE_LAYOUT_GENERAL };
         VkDescriptorImageInfo normalInfo{ m_NearestSampler, normalView, VK_IMAGE_LAYOUT_GENERAL };
         VkDescriptorImageInfo directColorInfo{ m_NearestSampler, directColorView, VK_IMAGE_LAYOUT_GENERAL };
         VkDescriptorBufferInfo viewParamsInfo{ m_ViewParamsBuffer.Handle(), 0, m_ViewParamsBuffer.Size() };

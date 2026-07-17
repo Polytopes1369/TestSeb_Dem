@@ -16,6 +16,7 @@
 #endif
 #include "geometry/ClusterFormat.h"
 #include "io/CacheFileManager.h"
+#include "renderer/MegaLightsTypes.h"
 #include "renderer/vulkan/GpuBuffer.h"
 #include "renderer/vulkan/VulkanUtils.h"
 
@@ -390,16 +391,11 @@ bool ClusterRenderPipeline::Init(
   m_Resolve.SetVirtualTexture(m_VTManager, m_VTBounds.worldMinXZ, m_VTBounds.worldMaxXZ,
                               m_VTStreaming.GetFeedbackDeviceBuffer());
 
-  // Forward-rendered translucent/transparent materials (see TransparentForwardPass's own class
-  // comment) -- reuses the SAME indexEntries/dagEntries this function loaded above for
-  // m_LODSelection.Init(), and the SAME page pool/compressed pool/entity/WPO buffer handles every
-  // opaque pass already borrows.
-  m_TransparentForward.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
-                            m_PagePool.GetPageTableBuffer(), m_PagePool.GetPhysicalPoolBuffer(),
-                            createInfo.entityTransformBuffer, createInfo.entityDataBuffer, m_WPOGlobalsBuffer.Handle(),
-                            createInfo.materialTable.params, indexEntries, dagEntries,
-                            ClusterResolvePass::kOutputColorFormat, createInfo.depthFormat);
-  m_TransparentForward.SetVirtualShadowMap(m_VirtualShadowMap);
+  // NOTE: renderer::TransparentForwardPass::Init() is deliberately NOT called here anymore -- see
+  // the call site further below (after m_SurfaceCacheRT/m_MegaLights are both Init'd), moved there
+  // specifically so its own MegaLights Phase A follow-up bindings (TLAS + light SSBO) can be bound
+  // immediately at Init() time instead of needing a 3rd deferred-binding call alongside
+  // SetVirtualShadowMap().
 
   // Sun orientation: Toronto (lat 43.6532N, lon 79.3832W), July 16, 16:30 local (EDT, UTC-4) --
   // a standard NOAA solar-position computation (equation of time + hour angle + declination for
@@ -468,6 +464,34 @@ bool ClusterRenderPipeline::Init(
     LOG_ERROR("[ClusterRenderPipeline] Failed to initialize ReflectionPass.");
     return false;
   }
+  // Phase A of the MegaLights native-port roadmap: procedurally scatter kMaxMegaLights point
+  // lights around the demo's 13-entity grid (see MegaLightsTypes.h's own GenerateProceduralLights
+  // comment), then Init the pass -- needs m_Resolve's GBuffer (same as m_Reflection above) and
+  // m_SurfaceCacheRT's TLAS for its own shadow-visibility ray.
+  {
+    MegaLightsData megaLightsData = GenerateProceduralLights(4242u);
+    if (!m_MegaLights.Init(createInfo.device, createInfo.allocator, createInfo.commandPool,
+                           createInfo.queue, createInfo.renderExtent, m_Resolve,
+                           m_SurfaceCacheRT, megaLightsData)) {
+      LOG_ERROR("[ClusterRenderPipeline] Failed to initialize MegaLightsPass.");
+      return false;
+    }
+  }
+  // Forward-rendered translucent/transparent materials (see TransparentForwardPass's own class
+  // comment) -- reuses the SAME indexEntries/dagEntries this function loaded above for
+  // m_LODSelection.Init(), and the SAME page pool/compressed pool/entity/WPO buffer handles every
+  // opaque pass already borrows. Deliberately placed here (after m_SurfaceCacheRT and m_MegaLights,
+  // not right after m_LODSelection where it used to sit) so its own MegaLights Phase A follow-up
+  // bindings (TLAS + light SSBO, bindings 11/12) can be bound immediately at Init() time -- see
+  // TransparentForwardPass::Init()'s own parameter comment.
+  m_TransparentForward.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
+                            m_PagePool.GetPageTableBuffer(), m_PagePool.GetPhysicalPoolBuffer(),
+                            createInfo.entityTransformBuffer, createInfo.entityDataBuffer, m_WPOGlobalsBuffer.Handle(),
+                            createInfo.materialTable.params, indexEntries, dagEntries,
+                            ClusterResolvePass::kOutputColorFormat, createInfo.depthFormat,
+                            m_SurfaceCacheRT.GetTLASHandle(), m_MegaLights.GetLightBufferHandle(),
+                            m_MegaLights.GetLightBufferSize());
+  m_TransparentForward.SetVirtualShadowMap(m_VirtualShadowMap);
   // World Probe grid (Lumen "Translucency Volume") -- reuses the same shared trace-scene sets and
   // HWRT/BLAS/TLAS as every other GI consumer above; see ClusterRenderPipeline.h's own comment on
   // its live consumers (m_ScreenTrace's fallback, GICompositePass's debug visualization).
@@ -558,6 +582,7 @@ void ClusterRenderPipeline::Shutdown() {
   m_LastStatsSampleBytes = 0;
   m_SDFRayMarch.Shutdown();
 #endif
+  m_MegaLights.Shutdown();
   m_Reflection.Shutdown();
   m_ScreenTrace.Shutdown();
   m_GIComposite.Shutdown();
@@ -1301,6 +1326,34 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
   }
 
   // =========================================================================================
+  // [12b3] Phase A of the MegaLights native-port roadmap: RIS-weighted stochastic multi-point-
+  // light direct lighting + 1 ray-traced shadow-visibility ray per pixel, additively read-modify-
+  // writing m_Resolve's own output color image -- same additive-RMW convention as [12b2] above.
+  // Grouped right after [12b2] since both read the same GBuffer and compose into the same color
+  // image. UNLIKE [12b2] reflections, this pass owns its OWN dedicated À-Trous denoiser instance
+  // (m_MegaLights internally denoises its raw 1-sample-per-pixel Monte Carlo noise before
+  // compositing) rather than relying on [12d]'s shared m_Denoiser -- that shared instance denoises
+  // m_ScreenTrace's own Screen Trace GI output specifically (see GICompositePass's own header
+  // comment), not the composited direct+reflections color the way it did before renderer::
+  // ScreenTracePass/GICompositePass were wired up. See MegaLightsPass's own class comment for the
+  // full "discovered mid-implementation" explanation.
+  //
+  // `megaLightsEnabled` (debug-only toggle, main.cpp's 'X' key) gates the call entirely, same
+  // Release-always-on convention as `reflectionsEnabled` above (a real live consumer from frame
+  // one).
+  // =========================================================================================
+  {
+#ifndef NDEBUG
+    bool megaLightsEnabled = m_DebugMegaLightsEnabled;
+#else
+    bool megaLightsEnabled = true;
+#endif
+    if (megaLightsEnabled) {
+      m_MegaLights.RecordShade(cmd, viewProj, m_FrameIndex);
+    }
+  }
+
+  // =========================================================================================
   // [12c] World Probe grid: fully rebuilt every frame from the Surface Cache radiance atlas
   // [1z] already re-injected into this frame ("Propagate Surface Cache lighting directly
   // into this 3D grid at each frame") -- INTENDED as what dynamic/off-screen objects would
@@ -1435,7 +1488,7 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
     VkImageView transparentTargetView = m_GIComposite.GetOutputView();
     m_TransparentForward.RecordDraw(cmd, transparentTargetImage, transparentTargetView, m_DepthImageView,
         m_RenderExtent, cameraCopy.view, cameraCopy.proj, m_Decompression.GetDecompressedIndexPoolBuffer(),
-        m_SceneLights.sun.direction);
+        m_SceneLights.sun.direction, m_FrameIndex);
   }
 
   // =========================================================================================
@@ -1522,10 +1575,18 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
     VkImage overlayTargetImage = blitSourceImage;
     VkImageView overlayTargetView = VK_NULL_HANDLE;
     VkExtent2D overlayExtent = m_RenderExtent;
+    // renderer::debug::DebugTextOverlay owns 2 pipeline variants (see its own Init()/RecordDraw()
+    // comments) -- every branch below must report the ACTUAL format of whatever view it selects,
+    // not assume the primary (RGBA8) one. m_TAATSR's own output is the sole HDR-format candidate
+    // (renderer::debug::DebugTextOverlay::kHdrTargetFormat, matching renderer::TAATSRPass::
+    // kHistoryFormat) -- every other candidate here (m_SDFRayMarch/m_GIComposite/m_Resolve) is
+    // RGBA8_UNORM.
+    VkFormat overlayTargetFormat = ClusterResolvePass::kOutputColorFormat;
 
     if (blitSourceImage == m_TAATSR.GetOutputImage()) {
         overlayTargetView = m_TAATSR.GetOutputView();
         overlayExtent = m_DisplayExtent;
+        overlayTargetFormat = debug::DebugTextOverlay::kHdrTargetFormat;
     }
 #ifndef NDEBUG
     else if (blitSourceImage == m_SDFRayMarch.GetOutputImage()) {
@@ -1542,7 +1603,7 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
         overlayExtent = m_RenderExtent;
     }
 
-    m_DebugOverlay.RecordDraw(cmd, overlayTargetImage, overlayTargetView, overlayExtent);
+    m_DebugOverlay.RecordDraw(cmd, overlayTargetImage, overlayTargetView, overlayExtent, overlayTargetFormat);
   }
 #endif
 

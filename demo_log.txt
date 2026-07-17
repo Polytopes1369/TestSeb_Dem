@@ -1,1 +1,12 @@
-[2026-07-16 12:48:47.026] [INFO] main.cpp:129 - Starting DemoScene Engine...
+[2026-07-16 23:55:29.796] [INFO] main.cpp:186 - Starting DemoScene Engine...
+[2026-07-16 23:55:29.808] [INFO] main.cpp:191 - [Main] No saved GPU profile cache found. A GPU scan will run during Vulkan device setup.
+[2026-07-16 23:55:29.987] [INFO] VulkanContext.cpp:630 - [VulkanContext] Detected physical device: NVIDIA GeForce RTX 5080 Laptop GPU
+[2026-07-16 23:55:29.987] [INFO] EngineConfig.h:598 - [EngineConfig] Scan complete. Selected profile based on GPU: Extrem
+[2026-07-16 23:55:29.988] [INFO] EngineConfig.h:506 - [EngineConfig] Saved profile 'Extrem' locally to gpu_profile.cfg
+[2026-07-16 23:55:30.183] [INFO] VulkanContext.cpp:357 - [VulkanContext] VMA Allocator initialized successfully.
+[2026-07-16 23:55:30.186] [INFO] VulkanContext.cpp:375 - [VulkanContext] Allocated entity buffer (10000 elements).
+[2026-07-16 23:55:30.200] [INFO] VulkanContext.cpp:396 - [VulkanContext] Allocated vertex SSBO: size=2048 MB.
+[2026-07-16 23:55:30.208] [INFO] VulkanContext.cpp:409 - [VulkanContext] Allocated index SSBO: size=1024 MB.
+[2026-07-16 23:55:30.209] [INFO] VulkanContext.cpp:419 - [VulkanContext] Allocated params uniform buffer (256 bytes).
+[2026-07-16 23:55:30.217] [ERROR] VulkanContext.cpp:302 - vkCreateSwapchainKHR(): pCreateInfo->imageExtent (width = 3840, height = 2160), which is outside the bounds returned by vkGetPhysicalDeviceSurfaceCapabilitiesKHR(): currentExtent = (width = 2564, height = 1570), minImageExtent = (width = 2564, height = 1570), maxImageExtent = (width = 2564, height = 1570).
+The Vulkan spec states: If a VkSwapchainPresentScalingCreateInfoKHR structure was not included in the pNext chain, or it is included and VkSwapchainPresentScalingCreateInfoKHR::scalingBehavior is zero then imageExtent must be between minImageExtent and maxImageExtent, inclusive, where minImageExtent and maxImageExtent are members of the VkSurfaceCapabilitiesKHR structure returned by vkGetPhysicalDeviceSurfaceCapabilitiesKHR for the surface (https://docs.vulkan.org/spec/latest/chapters/VK_KHR_surface/wsi.html#VUID-VkSwapchainCreateInfoKHR-pNext-07781)
