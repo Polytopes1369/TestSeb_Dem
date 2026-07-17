@@ -7,7 +7,8 @@ namespace core {
         uint32_t meshID;
         uint32_t materialID;
         uint32_t cellID;
-        uint32_t flags; // Bit 0: CastShadows, Bit 1: IsInteractive, Bit 2: IsDynamic, Bit 3: UseCustomFog, Bit 4: IsTransparent
+        uint32_t flags; // Bit 0: CastShadows, Bit 1: IsInteractive, Bit 2: IsDynamic, Bit 3: UseCustomFog,
+                         // Bit 4: IsTransparent, Bit 5: HasEnhancedDisplacement, Bit 6: HasSplineDeformation
     };
 
     enum EntityFlags : uint32_t {
@@ -19,7 +20,14 @@ namespace core {
         // (renderer::MaterialParameterTable.h) -- diverts its clusters at ClusterLODCompact.comp
         // into the transparent candidate buffer instead of the opaque one, so they're shaded by
         // TransparentForwardPass instead of the opaque Nanite VisBuffer pipeline.
-        IsTransparent = 1 << 4
+        IsTransparent = 1 << 4,
+        // Phase 1 (Nanite advanced): multi-octave procedural noise displacement on top of WPO sway
+        // (include/enhanced_displacement.glsl), gated per-entity so only the demo entity pays the
+        // extra ALU cost and only its cluster cull bounds get the extra conservative inflation.
+        HasEnhancedDisplacement = 1 << 5,
+        // Phase 1 (Nanite advanced): runtime Hermite-spline bend of this entity's rest-pose local
+        // geometry, applied before the rigid per-entity rotation (include/spline_deformation.glsl).
+        HasSplineDeformation = 1 << 6
     };
 
     inline void SetFlag(uint32_t& flags, EntityFlags f, bool value) {

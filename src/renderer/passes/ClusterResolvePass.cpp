@@ -75,7 +75,8 @@ namespace renderer {
         VkImageView hwClusterIDView, VkImageView hwTriangleIDView, VkImageView hwDepthView,
         VkImageView swVisBufferAtomicView, const std::vector<VkDescriptorImageInfo>& maskImageInfos,
         VkBuffer wpoGlobalsBuffer, VkBuffer entityTransformBuffer, VkBuffer entityDataBuffer,
-        const std::array<MaterialParameters, kMaxMaterials>& materialTable) {
+        const std::array<MaterialParameters, kMaxMaterials>& materialTable,
+        VkBuffer splineControlPointsBuffer) {
         Shutdown();
 
         m_Device = device;
@@ -90,6 +91,7 @@ namespace renderer {
         m_WPOGlobalsBuffer = wpoGlobalsBuffer;
         m_EntityTransformBuffer = entityTransformBuffer;
         m_EntityDataBuffer = entityDataBuffer;
+        m_SplineControlPointsBuffer = splineControlPointsBuffer;
         m_MaskImageInfos = maskImageInfos;
 
         // --- Output color image: RGBA8 storage image, sized to the render target. ---
@@ -224,15 +226,16 @@ namespace renderer {
         m_VTVolumeUBO.Create(allocator, sizeof(VTVolumeParams),
             VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, VMA_MEMORY_USAGE_CPU_TO_GPU, /*mapped=*/true);
 
-        // --- Descriptor set layout: 25 bindings, matching ClusterResolve.comp's set = 0 bindings
-        // 0..24 exactly (9..11 are the GBuffer outputs, 12 is the WPOGlobalsUBO this shader needs
+        // --- Descriptor set layout: 27 bindings, matching ClusterResolve.comp's set = 0 bindings
+        // 0..26 exactly (9..11 are the GBuffer outputs, 12 is the WPOGlobalsUBO this shader needs
         // to reapply the same sway deformation the rasterizers already applied, 13 is the material
         // parameter table SSBO, 14 is the roughness/metallic GBuffer output, 15-18 are Phase 3's
         // renderer::VirtualShadowMapPass resources -- see SetVirtualShadowMap()'s own comment -- 19
         // and 20 are the per-entity rotation buffers also consumed by both rasterizers, 21-24 are
         // Step 4's renderer::VirtualTextureManager resources -- see SetVirtualTexture()'s own
-        // comment). ---
-        VkDescriptorSetLayoutBinding bindings[26]{};
+        // comment, 25 is Substrate's g_OutputMaterialID, 26 is Phase 1 Nanite advanced's
+        // SplineControlPointsSSBO). ---
+        VkDescriptorSetLayoutBinding bindings[27]{};
         bindings[0] = { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };         // ClusterCullMetadataSSBO
         bindings[1] = { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };         // CompressedClusterPoolSSBO
         bindings[2] = { 2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };          // g_HWClusterIDImage (r32ui)
@@ -259,14 +262,18 @@ namespace renderer {
         bindings[23] = { 23, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };       // g_VTFeedback
         bindings[24] = { 24, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };       // VirtualTextureVolumeUBO
         bindings[25] = { 25, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };        // g_OutputMaterialID (r16ui, Substrate integration)
+        // Phase 1 (Nanite advanced): binding 26 -- the first free slot past this shader's full
+        // 0-25 range (0-24 original + 25 Substrate's g_OutputMaterialID). See ClusterResolve.comp's
+        // own identical binding comment.
+        bindings[26] = { 26, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };       // SplineControlPointsSSBO
 
         VkDescriptorSetLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-        layoutInfo.bindingCount = 26;
+        layoutInfo.bindingCount = 27;
         layoutInfo.pBindings = bindings;
         VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &layoutInfo, nullptr, &m_SetLayout));
 
         VkDescriptorPoolSize poolSizes[4]{};
-        poolSizes[0] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8 };  // + material params, shadow page table, shadow feedback, entity transform, entity data, VT feedback.
+        poolSizes[0] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 9 };  // + material params, shadow page table, shadow feedback, entity transform, entity data, VT feedback, spline control points.
         poolSizes[1] = { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 9 };   // + g_OutputMaterialID (Substrate integration).
         poolSizes[2] = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3 + maskTextureCount + kMaxPhysicalPools }; // + g_ShadowPhysicalAtlas, g_PageTable, g_PhysicalPools[].
         poolSizes[3] = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 4 };  // + g_ShadowSunLevels, VirtualTextureVolumeUBO.
@@ -341,7 +348,10 @@ namespace renderer {
         outputMaterialIDInfo.imageView = m_OutputMaterialIDView;
         outputMaterialIDInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
-        VkWriteDescriptorSet writes[18]{};
+        // Phase 1 (Nanite advanced): binding 26 -- see this shader's own binding comment above.
+        VkDescriptorBufferInfo splineControlPointsInfo{ splineControlPointsBuffer, 0, VK_WHOLE_SIZE };
+
+        VkWriteDescriptorSet writes[19]{};
         writes[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_DescriptorSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &clusterMetadataInfo, nullptr };
         writes[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_DescriptorSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &compressedPoolInfo, nullptr };
         writes[2] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_DescriptorSet, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &hwClusterIDInfo, nullptr, nullptr };
@@ -366,7 +376,8 @@ namespace renderer {
         writes[15] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_DescriptorSet, 19, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &entityTransformInfo, nullptr };
         writes[16] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_DescriptorSet, 20, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &entityDataInfo, nullptr };
         writes[17] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_DescriptorSet, 25, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &outputMaterialIDInfo, nullptr, nullptr };
-        vkUpdateDescriptorSets(m_Device, 18, writes, 0, nullptr);
+        writes[18] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_DescriptorSet, 26, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &splineControlPointsInfo, nullptr };
+        vkUpdateDescriptorSets(m_Device, 19, writes, 0, nullptr);
 
         // --- Pipeline layout + pipeline ---
         VkPipelineLayoutCreateInfo pipelineLayoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
@@ -526,8 +537,8 @@ namespace renderer {
         (void)queue; // Reserved for parity with every other Init()-shaped method; no one-time submit needed here.
         uint32_t maskTextureCount = static_cast<uint32_t>(m_MaskImageInfos.size());
 
-        // --- Descriptor set layout: 24 bindings, matching ClusterResolveBinned.comp's set = 0
-        // bindings 0..23 exactly. Bindings 2-4 (VisBuffer/HW-depth/SW-atomic) from the original
+        // --- Descriptor set layout: 26 bindings, matching ClusterResolveBinned.comp's set = 0
+        // bindings 0..25 exactly. Bindings 2-4 (VisBuffer/HW-depth/SW-atomic) from the original
         // 15-binding layout are absent here -- visibility is already fully resolved by
         // `shadingBinPass` before this pipeline ever runs -- replaced by bindings 2-4 for the
         // sorted-pixel-list/bin-offsets/bin-histogram buffers that carry that resolved visibility
@@ -537,8 +548,9 @@ namespace renderer {
         // needs them for the exact same reason ClusterResolve.comp's own full-screen path does
         // (reapplying entity self-rotation before re-deriving barycentrics), appended past the
         // shadow bindings rather than renumbering them. Bindings 20-23 are Step 4's renderer::
-        // VirtualTextureManager resources -- see SetVirtualTexture()'s own comment. ---
-        std::array<VkDescriptorSetLayoutBinding, 25> bindings{};
+        // VirtualTextureManager resources -- see SetVirtualTexture()'s own comment. Binding 24 is
+        // Substrate's g_OutputMaterialID, 25 is Phase 1 Nanite advanced's SplineControlPointsSSBO. ---
+        std::array<VkDescriptorSetLayoutBinding, 26> bindings{};
         bindings[0] = { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };  // ClusterCullMetadataSSBO
         bindings[1] = { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };  // CompressedClusterPoolSSBO
         bindings[2] = { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };  // g_SortedPixelList
@@ -564,6 +576,10 @@ namespace renderer {
         bindings[22] = { 22, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // g_VTFeedback
         bindings[23] = { 23, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // VirtualTextureVolumeUBO
         bindings[24] = { 24, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };  // g_OutputMaterialID (r16ui, Substrate integration)
+        // Phase 1 (Nanite advanced): binding 25 -- the first free slot past this shader's full
+        // 0-24 range (0-23 original + 24 Substrate's g_OutputMaterialID). See ClusterResolveBinned.
+        // comp's own identical binding comment.
+        bindings[25] = { 25, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // SplineControlPointsSSBO
 
         VkDescriptorSetLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
         layoutInfo.bindingCount = static_cast<uint32_t>(bindings.size());
@@ -571,7 +587,7 @@ namespace renderer {
         VK_CHECK(vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &m_ResolveBinnedSetLayout));
 
         std::array<VkDescriptorPoolSize, 4> poolSizes{};
-        poolSizes[0] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 11 }; // cluster metadata, compressed pool, sorted list, offsets, histogram, material params, shadow page table, shadow feedback, entity transform, entity data, VT feedback
+        poolSizes[0] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 12 }; // cluster metadata, compressed pool, sorted list, offsets, histogram, material params, shadow page table, shadow feedback, entity transform, entity data, VT feedback, spline control points
         poolSizes[1] = { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 6 };   // color, normal, depth, albedo, roughness-metallic, materialID
         poolSizes[2] = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 4 };  // view params, WPO globals, shadow sun levels, VT volume
         poolSizes[3] = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, maskTextureCount + 2 + kMaxPhysicalPools }; // + shadow physical atlas, g_PageTable, g_PhysicalPools[]
@@ -604,8 +620,9 @@ namespace renderer {
         VkDescriptorImageInfo outputMaterialIDInfo{ VK_NULL_HANDLE, m_OutputMaterialIDView, VK_IMAGE_LAYOUT_GENERAL };
         VkDescriptorBufferInfo entityTransformInfo{ m_EntityTransformBuffer, 0, VK_WHOLE_SIZE };
         VkDescriptorBufferInfo entityDataInfo{ m_EntityDataBuffer, 0, VK_WHOLE_SIZE };
+        VkDescriptorBufferInfo splineControlPointsInfo{ m_SplineControlPointsBuffer, 0, VK_WHOLE_SIZE };
 
-        std::array<VkWriteDescriptorSet, 17> writes{};
+        std::array<VkWriteDescriptorSet, 18> writes{};
         writes[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ResolveBinnedSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &clusterMetaInfo, nullptr };
         writes[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ResolveBinnedSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &compressedPoolInfo, nullptr };
         writes[2] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ResolveBinnedSet, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &sortedListInfo, nullptr };
@@ -627,6 +644,7 @@ namespace renderer {
         writes[14] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ResolveBinnedSet, 18, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &entityTransformInfo, nullptr };
         writes[15] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ResolveBinnedSet, 19, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &entityDataInfo, nullptr };
         writes[16] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ResolveBinnedSet, 24, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &outputMaterialIDInfo, nullptr, nullptr };
+        writes[17] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ResolveBinnedSet, 25, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &splineControlPointsInfo, nullptr };
         vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
 
         VkPushConstantRange pushRange{ VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(uint32_t) }; // binIndex

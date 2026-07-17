@@ -111,12 +111,20 @@ namespace renderer {
         // `materialTable` is renderer::GenerateShowcaseMaterialTable()'s result (see
         // ClusterRenderPipelineCreateInfo::materialTable) -- copied once into the GPU SSBO here,
         // not retained by reference (the caller's own copy may not outlive this call).
+        // `splineControlPointsBuffer` is renderer::ClusterRenderPipeline's own
+        // m_SplineControlPointsBuffer (see ClusterHardwareRasterPass::Init's identical parameter
+        // comment) -- bound read-only at binding 26 (the first free slot past this shader's full
+        // 0-25 range, 0-24 original + 25 Substrate's g_OutputMaterialID) so ClusterResolve.comp can
+        // re-derive the same spline-bent triangle both rasterizers already drew (Phase 1, Nanite
+        // advanced). Retained (like entityDataBuffer) so InitBinnedResolve() below needs no
+        // duplicate parameter for it.
         void Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue, VkExtent2D renderExtent,
             VkBuffer clusterMetadataBuffer, VkBuffer compressedPhysicalPoolBuffer,
             VkImageView hwClusterIDView, VkImageView hwTriangleIDView, VkImageView hwDepthView,
             VkImageView swVisBufferAtomicView, const std::vector<VkDescriptorImageInfo>& maskImageInfos,
             VkBuffer wpoGlobalsBuffer, VkBuffer entityTransformBuffer, VkBuffer entityDataBuffer,
-            const std::array<MaterialParameters, kMaxMaterials>& materialTable);
+            const std::array<MaterialParameters, kMaxMaterials>& materialTable,
+            VkBuffer splineControlPointsBuffer);
 
         void Shutdown();
 
@@ -273,6 +281,7 @@ namespace renderer {
         VkBuffer m_WPOGlobalsBuffer = VK_NULL_HANDLE;      // Borrowed, same handle Init() received.
         VkBuffer m_EntityTransformBuffer = VK_NULL_HANDLE; // Borrowed, same handle Init() received.
         VkBuffer m_EntityDataBuffer = VK_NULL_HANDLE;      // Borrowed, same handle Init() received.
+        VkBuffer m_SplineControlPointsBuffer = VK_NULL_HANDLE; // Borrowed, same handle Init() received (Phase 1, Nanite advanced).
         std::vector<VkDescriptorImageInfo> m_MaskImageInfos; // Copy of Init()'s own `maskImageInfos` parameter.
 
         VkDescriptorSetLayout m_ResolveBinnedSetLayout = VK_NULL_HANDLE;

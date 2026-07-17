@@ -16,6 +16,8 @@ const uint ENTITY_FLAG_IS_INTERACTIVE = 1u << 1; // 0x02
 const uint ENTITY_FLAG_IS_DYNAMIC     = 1u << 2; // 0x04
 const uint ENTITY_FLAG_USE_CUSTOM_FOG = 1u << 3; // 0x08
 const uint ENTITY_FLAG_IS_TRANSPARENT = 1u << 4; // 0x10 -- see core::EntityFlags::IsTransparent (EntityData.h).
+const uint ENTITY_FLAG_HAS_ENHANCED_DISPLACEMENT = 1u << 5; // 0x20 -- see core::EntityFlags::HasEnhancedDisplacement.
+const uint ENTITY_FLAG_HAS_SPLINE_DEFORMATION    = 1u << 6; // 0x40 -- see core::EntityFlags::HasSplineDeformation.
 
 // Helper to test flags easily in GLSL
 bool GetFlag(uint flags, uint f) {

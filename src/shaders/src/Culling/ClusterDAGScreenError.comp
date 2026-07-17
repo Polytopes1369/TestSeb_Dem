@@ -2,6 +2,9 @@
 #extension GL_GOOGLE_include_directive : enable
 
 #include "include/cluster_entity_transform.glsl"
+#include "include/enhanced_displacement.glsl"
+#include "include/spline_deformation.glsl"
+#include "include/displacement_bounds.glsl"
 
 // GPU-side DAG LOD cut evaluation for cluster-level screen-space error. The shader consumes a
 // compact per-node payload that mirrors the runtime DAG semantics already used by the CPU-side
@@ -130,6 +133,15 @@ layout(std430, set = 0, binding = 5) readonly buffer EntityTransformBuffer {
     EntityTransform entityTransforms[];
 };
 
+// Phase 1 (Nanite advanced): binding 6, the first free slot past this shader's existing 0-5
+// range -- renderer::ClusterLODSelectionPass::Init() already receives this same entityDataBuffer
+// handle for ClusterLODCompact.comp's own set (transparent-entity exclusion); this wires the SAME
+// handle into a second descriptor set so this shader can inflate its projected-error bound for
+// entities with enhanced-displacement/spline-deformation flags set (see main()'s own comment).
+layout(std430, set = 0, binding = 6) readonly buffer EntityDataBuffer {
+    EntityData entityData[];
+};
+
 layout(local_size_x = 64) in;
 
 float ProjectedErrorToPixels(float geometricError, vec3 worldPosition) {
@@ -151,13 +163,20 @@ void main() {
 
     DAGNodePayload node = g_DAGNodes.nodes[index];
 
+    // Phase 1 (Nanite advanced): further inflate the WPO bound by this node's owning entity's
+    // enhanced-displacement/spline-deformation worst-case amplitudes -- see displacement_bounds.glsl's
+    // own header comment for why this same inflated value is later reversed (GetOriginalWPOAmplitude)
+    // before being used as an actual sway amplitude at the raster/resolve call sites.
+    uint entityFlags = entityData[node.entityID].flags;
+    float displacementBound = InflateDisplacementBound(node.maxWPOAmplitude, entityFlags);
+
     // Inflate both error terms by the same amount before projection: this preserves the required
     // strict parentError > clusterError ordering (ClusterDAG.cpp's ValidateClusterDAG invariant --
     // adding the same constant to both sides of a strict inequality cannot flip it) while
     // conservatively biasing the cut toward finer detail for a swaying cluster, exactly mirroring
     // cluster_culling_tests.glsl's InflateBoundsForWPO used by the occlusion/frustum culling pass.
-    float clusterError = node.clusterError + node.maxWPOAmplitude;
-    float parentError = node.parentError + node.maxWPOAmplitude;
+    float clusterError = node.clusterError + displacementBound;
+    float parentError = node.parentError + displacementBound;
 
     // Rotate the rest-pose sphere centers into their current world positions before projecting: a
     // rotating entity's clusters would otherwise have their on-screen size estimated from a stale

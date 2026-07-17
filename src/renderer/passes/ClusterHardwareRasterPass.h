@@ -89,10 +89,15 @@ namespace renderer {
         // (mask_sampling.glsl). `visBufferColorFormats` must match VulkanContext::kVisBufferFormat x2
         // (ClusterID, TriangleID) and `depthFormat` the depth image's format, so this pipeline is
         // attachment-compatible with the render targets RecordDraw() will be called against.
+        // `splineControlPointsBuffer` is renderer::ClusterRenderPipeline's own
+        // m_SplineControlPointsBuffer (128 bytes, 4x SplineControlPoint, std430) -- bound read-only
+        // at binding 6 (vertex-stage-only, the first free slot past bindings 0/1/2/4/5 above and the
+        // fragment-only binding 3) so ClusterRaster.vert can evaluate ApplySplineDeformation() for
+        // entities with core::EntityFlags::HasSplineDeformation set (Phase 1, Nanite advanced).
         void Init(VkDevice device, VkBuffer clusterMetadataBuffer, VkBuffer compressedPhysicalPoolBuffer,
             VkBuffer wpoGlobalsBuffer, const std::vector<VkDescriptorImageInfo>& maskImageInfos,
             const std::array<VkFormat, 2>& visBufferColorFormats, VkFormat depthFormat,
-            VkBuffer entityTransformBuffer, VkBuffer entityDataBuffer);
+            VkBuffer entityTransformBuffer, VkBuffer entityDataBuffer, VkBuffer splineControlPointsBuffer);
 
         void Shutdown();
 

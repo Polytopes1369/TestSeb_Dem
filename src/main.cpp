@@ -87,6 +87,20 @@ struct DebugState {
     bool dumpDAGCutGapsRequested = false;
     // Toggles TAA + TSR on / off (Key 'A')
     bool taatsrEnabled = config::temporal::ENABLED_BY_DEFAULT;
+    // Phase 1 (Nanite advanced): renderer::ClusterRenderPipeline::SetDebugEnhancedDisplacementEnabled
+    // -- gates the multi-octave procedural noise displacement on entity 2 (Icosphere, see
+    // enhanced_displacement.glsl). Key 'J' -- moved off 'B' (this branch's original key) during the
+    // Substrate integration merge: 'B' was independently claimed there for the DEBUG_VIEW_SUBSTRATE_SLABS
+    // view-mode toggle (see that case's own comment), a genuine concurrent-development key collision,
+    // not a duplicate. NOTE: entity 2 is ALSO now VulkanContext::kHeroEntityIndex (Phase 7a hero
+    // tessellation), which routes it through HeroTessellationPass instead of the Nanite VisBuffer path
+    // this flag gates -- see VulkanContext::BuildEntityData()'s own "KNOWN COLLISION" comment. This key
+    // currently has no visible effect until that separate collision is resolved.
+    bool enhancedDisplacementEnabled = true;
+    // Phase 1 (Nanite advanced): renderer::ClusterRenderPipeline::SetDebugSplineDeformationEnabled
+    // -- gates the runtime Hermite-spline bend on entity 6 (Tube, see spline_deformation.glsl).
+    // Key 'U'.
+    bool splineDeformationEnabled = true;
 };
 static DebugState g_DebugState;
 
@@ -174,6 +188,21 @@ static void KeyCallback(GLFWwindow* window, int key, int scancode, int action, i
     case GLFW_KEY_R:
         g_DebugState.reflectionsEnabled = !g_DebugState.reflectionsEnabled;
         LOG_INFO(std::format("[Debug] Specular Reflections: {}", g_DebugState.reflectionsEnabled ? "ON" : "OFF"));
+        break;
+    case GLFW_KEY_J:
+        // Phase 1 (Nanite advanced): multi-octave enhanced procedural displacement, originally on
+        // entity 2 (Icosphere) but reassigned to entity 10 (TorusKnot, "Nanite B") after Phase 7a's
+        // hero-asset tessellation independently claimed entity 2 for itself -- see
+        // VulkanContext::BuildEntityData()'s own comment. Moved off 'B' during the Substrate merge --
+        // see g_DebugState.enhancedDisplacementEnabled's own doc comment for why.
+        g_DebugState.enhancedDisplacementEnabled = !g_DebugState.enhancedDisplacementEnabled;
+        LOG_INFO(std::format("[Debug] Enhanced Displacement (TorusKnot): {}", g_DebugState.enhancedDisplacementEnabled ? "ON" : "OFF"));
+        break;
+    case GLFW_KEY_U:
+        // Phase 1 (Nanite advanced): runtime Hermite-spline bend on entity 6 (Tube, see
+        // spline_deformation.glsl).
+        g_DebugState.splineDeformationEnabled = !g_DebugState.splineDeformationEnabled;
+        LOG_INFO(std::format("[Debug] Spline Deformation (Tube): {}", g_DebugState.splineDeformationEnabled ? "ON" : "OFF"));
         break;
     case GLFW_KEY_X:
         // Phase A of the MegaLights native-port roadmap (see the approved plan): RIS-weighted
@@ -838,6 +867,8 @@ int main(int argc, char** argv) {
         clusterPipeline.SetDebugReflectionsEnabled(g_DebugState.reflectionsEnabled);
         clusterPipeline.SetDebugMegaLightsEnabled(g_DebugState.megaLightsEnabled);
         clusterPipeline.SetDebugTAATSREnabled(g_DebugState.taatsrEnabled);
+        clusterPipeline.SetDebugEnhancedDisplacementEnabled(g_DebugState.enhancedDisplacementEnabled);
+        clusterPipeline.SetDebugSplineDeformationEnabled(g_DebugState.splineDeformationEnabled);
         if (g_DebugState.dumpDAGCutGapsRequested) {
             clusterPipeline.RequestDebugDAGCutGapsDump();
             g_DebugState.dumpDAGCutGapsRequested = false;

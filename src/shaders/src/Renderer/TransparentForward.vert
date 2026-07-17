@@ -19,6 +19,9 @@
 #define COMPRESSED_POOL_BINDING 1
 #include "include/cluster_vertex_decode.glsl"
 #include "include/wpo_deformation.glsl"
+#include "include/enhanced_displacement.glsl"
+#include "include/spline_deformation.glsl"
+#include "include/displacement_bounds.glsl"
 
 // Mirrors renderer::TransparentClusterEntry (TransparentForwardPass.h) field-for-field.
 struct TransparentClusterEntry {
@@ -50,8 +53,8 @@ layout(std430, set = 0, binding = 3) readonly buffer EntityDataBuffer {
 
 layout(std140, set = 0, binding = 4) uniform WPOGlobalsUBO {
     float globalTime;
-    float _pad0;
-    float _pad1;
+    float enhancedDisplacementDebugMultiplier;
+    float splineDeformationDebugMultiplier;
     float _pad2;
 } g_WPOGlobals;
 
@@ -61,6 +64,14 @@ layout(std140, set = 0, binding = 5) uniform TransparentViewParamsUBO {
     vec3 sunDirection; // Unused here (fragment-stage only) -- see TransparentForward.frag.
     float _pad0;
 } g_ViewParams;
+
+// Phase 1 (Nanite advanced): see ClusterRaster.vert's identical binding comment. Binding 18 --
+// the first free slot past this pass's full 0-17 range (TransparentForward.frag's own Phase 3/
+// MegaLights/World-Probe/reflection-trace bindings occupy 6-17, see TransparentForwardPass::Init's
+// own binding layout).
+layout(std430, set = 0, binding = 18) readonly buffer SplineControlPointsSSBO {
+    SplineControlPoint splineControlPoints[SPLINE_CONTROL_POINT_COUNT];
+};
 
 layout(location = 0) out vec3 outWorldPos;
 layout(location = 1) out vec3 outNormal;
@@ -84,10 +95,25 @@ void main() {
     EntityData ed = entityData[entry.entityID];
     EntityTransform xform = entityTransforms[ed.meshID];
     mat3 rotation = mat3(xform.rotation);
-    worldPos = xform.center + rotation * (worldPos - xform.center);
+    vec3 localPos = worldPos - xform.center;
+
+    // Phase 1 (Nanite advanced): spline bend, applied in LOCAL space BEFORE the per-entity rigid
+    // rotation -- see ClusterRaster.vert's identical comment.
+    if (GetFlag(ed.flags, ENTITY_FLAG_HAS_SPLINE_DEFORMATION)) {
+        localPos = mix(localPos, ApplySplineDeformation(localPos, splineControlPoints), g_WPOGlobals.splineDeformationDebugMultiplier);
+    }
+
+    worldPos = xform.center + rotation * localPos;
     normal = rotation * normal;
 
-    worldPos = ApplyWPODeformation(worldPos, entry.clusterID, entry.maxWPOAmplitude, g_WPOGlobals.globalTime);
+    worldPos = ApplyWPODeformation(worldPos, entry.clusterID, GetOriginalWPOAmplitude(entry.maxWPOAmplitude, ed.flags), g_WPOGlobals.globalTime);
+
+    // Phase 1 (Nanite advanced): multi-octave enhanced displacement, applied ADDITIVELY right after
+    // WPO sway -- see ClusterRaster.vert's identical comment.
+    if (GetFlag(ed.flags, ENTITY_FLAG_HAS_ENHANCED_DISPLACEMENT)) {
+        vec3 displaced = ApplyEnhancedDisplacement(worldPos, xform.center, entry.clusterID, g_WPOGlobals.globalTime);
+        worldPos = worldPos + (displaced - worldPos) * g_WPOGlobals.enhancedDisplacementDebugMultiplier;
+    }
 
     outWorldPos = worldPos;
     outNormal = normal;

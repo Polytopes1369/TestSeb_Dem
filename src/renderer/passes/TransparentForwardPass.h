@@ -147,6 +147,14 @@ namespace renderer {
         // leaf-cluster walk's own possible zero-cluster early-return, since renderer::PostProcessPass
         // needs a valid view to sample every frame regardless of whether any transparent geometry
         // exists this run (see GetRefractionOffsetView()'s own comment).
+        //
+        // `splineControlPointsBuffer` is renderer::ClusterRenderPipeline's own
+        // m_SplineControlPointsBuffer (see ClusterHardwareRasterPass::Init's identical parameter
+        // comment) -- bound read-only, vertex-stage-only, at the first free slot past this pass's
+        // full pre-existing binding range (see m_ForwardSetLayout's own binding-layout comment in
+        // the .cpp for the exact number, which may have shifted due to the Substrate/PP3 merge) so
+        // TransparentForward.vert can evaluate ApplySplineDeformation() for entities with
+        // core::EntityFlags::HasSplineDeformation set (Phase 1, Nanite advanced).
         void Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
             VkExtent2D renderExtent,
             VkBuffer pageTableBuffer, VkBuffer compressedPhysicalPoolBuffer,
@@ -157,7 +165,8 @@ namespace renderer {
             VkFormat colorFormat, VkFormat depthFormat,
             const WorldProbeGridPass& worldProbes, const SurfaceCacheTraceContext& traceContext,
             VkAccelerationStructureKHR tlas, VkBuffer lightBuffer, VkDeviceSize lightBufferSize,
-            VkBuffer fallbackVertexBuffer, VkBuffer fallbackIndexBuffer, VkBuffer drawRangeBuffer);
+            VkBuffer fallbackVertexBuffer, VkBuffer fallbackIndexBuffer, VkBuffer drawRangeBuffer,
+            VkBuffer splineControlPointsBuffer);
 
         void Shutdown();
 

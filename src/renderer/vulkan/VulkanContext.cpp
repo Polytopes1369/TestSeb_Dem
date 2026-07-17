@@ -1475,6 +1475,27 @@ void VulkanContext::BuildEntityData() {
       isTransparent = true;
     }
     core::SetFlag(entity.flags, core::EntityFlags::IsTransparent, isTransparent);
+
+    // Phase 1 (Nanite advanced): entity 6 (Tube) demos runtime Hermite-spline bending, always
+    // opaque (GenerateShowcaseMaterialTable() already curates slot 6 with alpha == 1.0, see that
+    // function's own comment) and unaffected by the hero-tessellation override above (kHeroEntityIndex
+    // == 2, not 6), so it stays on the normal Nanite VisBuffer/ClusterResolve path where
+    // ApplySplineDeformation() runs.
+    //
+    // Enhanced procedural displacement was originally authored on entity 2 (Icosphere), but Phase 7a's
+    // concurrently-developed hero-asset tessellation independently claimed the same entity
+    // (kHeroEntityIndex == 2) and routes it exclusively through renderer::HeroTessellationPass, which
+    // never reaches ClusterRaster.vert/cluster_software_raster_core.glsl/ClusterResolve*.comp -- the
+    // only places ApplyEnhancedDisplacement() is ever called. Rather than ship an EntityFlags bit that
+    // is silently a no-op, reassigned to entity 10 (TorusKnot), the zone layout's own "Nanite B" pairing
+    // to entity 2's "Nanite A" (see kLayout above) -- a normal opaque entity untouched by any other
+    // concurrent feature's override, so ApplyEnhancedDisplacement() actually runs for it.
+    if (i == 10u) {
+      core::SetFlag(entity.flags, core::EntityFlags::HasEnhancedDisplacement, true);
+    }
+    if (i == 6u) {
+      core::SetFlag(entity.flags, core::EntityFlags::HasSplineDeformation, true);
+    }
   }
 }
 

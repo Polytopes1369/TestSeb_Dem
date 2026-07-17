@@ -31,6 +31,9 @@
 #define COMPRESSED_POOL_BINDING 1
 #include "include/cluster_vertex_decode.glsl"
 #include "include/wpo_deformation.glsl"
+#include "include/enhanced_displacement.glsl"
+#include "include/spline_deformation.glsl"
+#include "include/displacement_bounds.glsl"
 
 layout(std430, set = 0, binding = 0) readonly buffer ClusterCullMetadataSSBO {
     ClusterCullMetadata clusters[];
@@ -49,10 +52,19 @@ layout(std430, set = 0, binding = 5) readonly buffer EntityDataBuffer {
 // the owning C++ WPOGlobalsUBO struct's explicit 16-byte size; std140 does not require it here.
 layout(std140, set = 0, binding = 2) uniform WPOGlobalsUBO {
     float globalTime;
-    float _pad0;
-    float _pad1;
+    // Phase 1 (Nanite advanced) debug toggles -- see ClusterRenderPipeline::WPOGlobalsUBO's own
+    // comment: 1.0 = full effect, 0.0 = fully off (Release always uploads 1.0, no toggle exists).
+    float enhancedDisplacementDebugMultiplier;
+    float splineDeformationDebugMultiplier;
     float _pad2;
 } g_WPOGlobals;
+
+// Phase 1 (Nanite advanced): this entity's authored Hermite bend curve (renderer::
+// ClusterRenderPipeline's m_SplineControlPointsBuffer, uploaded once at Init) -- see
+// spline_deformation.glsl's own header comment for the local-space-before-rotation contract.
+layout(std430, set = 0, binding = 6) readonly buffer SplineControlPointsSSBO {
+    SplineControlPoint splineControlPoints[SPLINE_CONTROL_POINT_COUNT];
+};
 
 // Camera matrices via Push Constants -- same layout as draw.vert's CameraPushConstants.
 layout(push_constant) uniform CameraPushConstants {
@@ -99,9 +111,28 @@ void main() {
     EntityTransform xform = entityTransforms[ed.meshID];
     mat3 rotation = mat3(xform.rotation);
     vec3 localPos = worldPos - xform.center;
+
+    // Phase 1 (Nanite advanced): spline bend, applied in LOCAL space BEFORE the per-entity rigid
+    // rotation -- see spline_deformation.glsl's own header comment for why this ordering is
+    // required (a spline bend is an intrinsic mesh-shape property, not a world-space effect).
+    // Mixed toward the undeformed local position by the debug multiplier rather than scaled
+    // directly (scaling a position would collapse it toward the origin, not toward "undeformed").
+    if (GetFlag(ed.flags, ENTITY_FLAG_HAS_SPLINE_DEFORMATION)) {
+        localPos = mix(localPos, ApplySplineDeformation(localPos, splineControlPoints), g_WPOGlobals.splineDeformationDebugMultiplier);
+    }
+
     worldPos = xform.center + rotation * localPos;
 
-    worldPos = ApplyWPODeformation(worldPos, cluster.clusterID, cluster.maxWPOAmplitude, g_WPOGlobals.globalTime);
+    worldPos = ApplyWPODeformation(worldPos, cluster.clusterID, GetOriginalWPOAmplitude(cluster.maxWPOAmplitude, ed.flags), g_WPOGlobals.globalTime);
+
+    // Phase 1 (Nanite advanced): multi-octave enhanced displacement, applied ADDITIVELY right after
+    // the existing WPO sway -- see enhanced_displacement.glsl's own header comment. The debug
+    // multiplier scales the DELTA (not the absolute position) toward zero, since
+    // ApplyEnhancedDisplacement returns an absolute position, not an offset.
+    if (GetFlag(ed.flags, ENTITY_FLAG_HAS_ENHANCED_DISPLACEMENT)) {
+        vec3 displaced = ApplyEnhancedDisplacement(worldPos, xform.center, cluster.clusterID, g_WPOGlobals.globalTime);
+        worldPos = worldPos + (displaced - worldPos) * g_WPOGlobals.enhancedDisplacementDebugMultiplier;
+    }
 
     outClusterID = uint(gl_InstanceIndex);
     outUV = DecodeClusterUV(pageByteBase, localVertexIndex);
