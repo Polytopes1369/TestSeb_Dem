@@ -386,7 +386,7 @@ bool ClusterRenderPipeline::Init(
 
   // Shared trace-scene descriptor sets (mesh SDF trace scene + Surface Cache sampling), built
   // once from m_GlobalSDF's per-entity SDF images and m_SurfaceCache's card table/atlases (both
-  // already Init'd above) -- reused unmodified by m_SurfaceCacheRT/m_GIInject/m_ScreenProbeGI.
+  // already Init'd above) -- reused unmodified by m_SurfaceCacheRT/m_GIInject/m_WorldProbes.
   if (!m_TraceContext.Init(createInfo.device, createInfo.allocator, createInfo.commandPool,
                            createInfo.queue, m_GlobalSDF, m_SurfaceCache)) {
     LOG_ERROR("[ClusterRenderPipeline] Failed to initialize SurfaceCacheTraceContext.");
@@ -401,23 +401,15 @@ bool ClusterRenderPipeline::Init(
     return false;
   }
   // Per-card secondary-bounce injection into m_SurfaceCache's own radiance atlas -- makes that
-  // atlas genuinely multi-bounce over time, which m_ScreenProbeGI's single-hit-sample final
-  // gather then benefits from directly.
+  // atlas genuinely multi-bounce over time, which every downstream GI consumer (m_WorldProbes'
+  // trace pass, m_ScreenTrace's near-field hit samples below) then benefits from directly.
   if (!m_GIInject.Init(createInfo.device, createInfo.allocator, m_TraceContext, m_SurfaceCache, m_SurfaceCacheRT)) {
     LOG_ERROR("[ClusterRenderPipeline] Failed to initialize SurfaceCacheGIInjectPass.");
     return false;
   }
-  // Screen Space Probe GI -- needs m_Resolve's GBuffer (already Init'd, STEP 6 above) for the
-  // probe placement/gather passes, and m_TraceContext/m_SurfaceCacheRT for its own trace pass.
-  if (!m_ScreenProbeGI.Init(createInfo.device, createInfo.allocator, createInfo.commandPool,
-                            createInfo.queue, createInfo.renderExtent, m_TraceContext, m_SurfaceCache,
-                            m_SurfaceCacheRT, m_Resolve)) {
-    LOG_ERROR("[ClusterRenderPipeline] Failed to initialize ScreenProbeGIPass.");
-    return false;
-  }
-  // Phase 2 (UE5.8 parity roadmap): specular reflections -- same dependencies as m_ScreenProbeGI
-  // above (needs m_Resolve's GBuffer, including its Phase 1a roughness/metallic channel, plus
-  // m_TraceContext/m_SurfaceCacheRT for its own trace pass).
+  // Phase 2 (UE5.8 parity roadmap): specular reflections -- needs m_Resolve's GBuffer (already
+  // Init'd, STEP 6 above), including its Phase 1a roughness/metallic channel, plus
+  // m_TraceContext/m_SurfaceCacheRT for its own trace pass.
   if (!m_Reflection.Init(createInfo.device, createInfo.allocator, createInfo.commandPool,
                          createInfo.queue, createInfo.renderExtent, m_TraceContext, m_SurfaceCache,
                          m_SurfaceCacheRT, m_Resolve)) {
@@ -426,7 +418,7 @@ bool ClusterRenderPipeline::Init(
   }
   // World Probe grid (Lumen "Translucency Volume") -- reuses the same shared trace-scene sets and
   // HWRT/BLAS/TLAS as every other GI consumer above; see ClusterRenderPipeline.h's own comment on
-  // why this is a separate system from m_ScreenProbeGI, not a duplicate of it.
+  // its live consumers (m_ScreenTrace's fallback, GICompositePass's debug visualization).
   if (!m_WorldProbes.Init(createInfo.device, createInfo.allocator, createInfo.commandPool,
                           createInfo.queue, m_TraceContext, m_SurfaceCache, m_SurfaceCacheRT)) {
     LOG_ERROR("[ClusterRenderPipeline] Failed to initialize WorldProbeGridPass.");
@@ -515,7 +507,6 @@ void ClusterRenderPipeline::Shutdown() {
   m_SDFRayMarch.Shutdown();
 #endif
   m_Reflection.Shutdown();
-  m_ScreenProbeGI.Shutdown();
   m_ScreenTrace.Shutdown();
   m_GIComposite.Shutdown();
   m_Denoiser.Shutdown();
@@ -659,9 +650,9 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
   float projScaleY = std::abs(cameraCopy.proj.m[5]);
 
 
-  // SWRT/HWRT back-end shared by m_GIInject ([1z] below) and m_ScreenProbeGI ([12b] below) --
-  // debug-only toggle (main.cpp's 'T' key via SetDebugTraceMode), Release always uses HWRT (no
-  // debug toggle to switch back to SWRT).
+  // SWRT/HWRT back-end shared by m_GIInject ([1z] below) and m_WorldProbes' own trace pass ([12c]
+  // below) -- debug-only toggle (main.cpp's 'T' key via SetDebugTraceMode), Release always uses
+  // HWRT (no debug toggle to switch back to SWRT).
 #ifndef NDEBUG
   uint32_t traceMode = m_DebugTraceMode;
 #else
@@ -743,8 +734,8 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
         // barrier -- its read-modify-write of the radiance atlas (imageLoad/imageStore, STORAGE
         // access) must be made visible here, explicitly, before the NEXT bounce's own RecordInject
         // call samples that same atlas (surface_cache_sampling.glsl's g_SurfaceCacheRadiance) --
-        // and, after the loop's final iteration, before m_ScreenProbeGI's own trace pass does the
-        // same later this frame.
+        // and, after the loop's final iteration, before m_ScreenTrace's own near-field hit samples
+        // and m_WorldProbes' own trace pass do the same later this frame.
         VkMemoryBarrier2 giInjectBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
         giInjectBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
         giInjectBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
@@ -775,13 +766,13 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
     vkCmdPipelineBarrier2(cmd, &globalSDFToSampledDep);
 
     // 4. Two-tier SDF ray march DEBUG VISUALIZATION -- only its OUTPUT IMAGE is ever displayed
-    // (via the DEBUG_VIEW_LUMEN/DEBUG_VIEW_GLOBAL_SDF blit-swap below), but it is always recorded
-    // so either debug view shows this frame's state the instant it's selected, with no one-frame
-    // lag. `coarseOnly` picks which of the two views this frame's single recording serves: DEBUG_
-    // VIEW_GLOBAL_SDF wants ONLY the coarse clipmap trace (see SDFRayMarch.comp's own comment on
-    // why that's a distinct, useful signal from DEBUG_VIEW_LUMEN's full two-tier result); any other
-    // view mode (including DEBUG_VIEW_LUMEN itself) gets the normal full march, since only one of
-    // the two blit-swaps can be selected at a time anyway.
+    // (via the DEBUG_VIEW_GLOBAL_SDF blit-swap below; DEBUG_VIEW_LUMEN sources m_GIComposite's own
+    // output instead, see the blit-swap's own comment), but it is always recorded so that view
+    // shows this frame's state the instant it's selected, with no one-frame lag. `coarseOnly`
+    // selects DEBUG_VIEW_GLOBAL_SDF's own coarse-clipmap-only trace (see SDFRayMarch.comp's own
+    // comment on why that's a distinct, useful signal from the full two-tier march); any other view
+    // mode gets the normal full march, which costs nothing extra since this dispatch runs either
+    // way.
     m_SDFRayMarch.RecordRayMarch(cmd, m_GlobalSDF, cameraFrameInfo.position, cameraFrameInfo.forward,
                                  maths::vec3{0.0f, 1.0f, 0.0f}, cameraFrameInfo.fovYRadians,
                                  cameraFrameInfo.aspectRatio, cameraFrameInfo.nearZ, cameraFrameInfo.farZ,
@@ -1240,8 +1231,9 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
   // [12c] World Probe grid: fully rebuilt every frame from the Surface Cache radiance atlas
   // [1z] already re-injected into this frame ("Propagate Surface Cache lighting directly
   // into this 3D grid at each frame") -- INTENDED as what dynamic/off-screen objects would
-  // sample for indirect light (world_probe_sampling.glsl's SampleWorldProbeGrid), since
-  // m_ScreenProbeGI's screen-space probes only exist for on-screen pixels. Independent GPU work
+  // sample for indirect light (world_probe_sampling.glsl's SampleWorldProbeGrid) -- also the
+  // fallback m_ScreenTrace itself samples on a screen-space march miss, since a screen-space march
+  // only ever sees on-screen pixels. Independent GPU work
   // from [12b] above (no data dependency either way), just recorded after it for locality with
   // the rest of this frame's GI additions.
   //
@@ -1276,13 +1268,14 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
 
   // =========================================================================================
   // [12d] Final spatial denoiser (À-Trous wavelet): only in the normal (non-debug-visualization)
-  // view path -- DEBUG_VIEW_LUMEN substitutes a completely different image at the blit ([14]
-  // below) and DEBUG_VIEW_SPATIAL_PROBES's own gridline overlay (drawn directly into m_Resolve's
-  // color image by [12b] above) would be blurred by an edge-aware filter whose depth/normal
-  // guides know nothing about that artificial overlay -- so denoising either would only degrade
-  // an existing debug tool for no benefit. m_Resolve's own G-buffer normal/depth (already visible
-  // from [11]/[12]'s own trailing barriers) guide the filter; ends with its own trailing barrier
-  // (COMPUTE_SHADER/STORAGE_WRITE -> COMPUTE_SHADER/SHADER_SAMPLED_READ) for [14]'s blit read.
+  // view path, plus DEBUG_VIEW_LUMEN (which wants to inspect the actual denoised GI term
+  // GICompositePass substitutes for the whole final image, see [12e] below and the blit-swap's
+  // own comment) -- DEBUG_VIEW_SPATIAL_PROBES is excluded because GICompositePass's own world-
+  // probe visualization for that mode does not read m_Denoiser's output at all (see
+  // GIComposite.comp's viewMode==14 branch), so denoising here would be pure wasted GPU work for
+  // that view. m_Resolve's own G-buffer normal/depth (already visible from [11]/[12]'s own
+  // trailing barriers) guide the filter; ends with its own trailing barrier (COMPUTE_SHADER/
+  // STORAGE_WRITE -> COMPUTE_SHADER/SHADER_SAMPLED_READ) for [12e]'s read.
   // =========================================================================================
 #ifndef NDEBUG
   bool applyDenoise = (cameraCopy.debugViewMode == DEBUG_VIEW_NORMAL || cameraCopy.debugViewMode == DEBUG_VIEW_LUMEN);
@@ -1357,12 +1350,12 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
   }
 
   // =========================================================================================
-  // [13c] Forward-rendered translucent/transparent materials -- drawn onto whichever image [14]'s
-  // blit will actually read (m_Denoiser's output when [12d] applied it, m_Resolve's own color
-  // image otherwise -- same `applyDenoise` condition the debug overlay below and the blit itself
-  // both use), so transparency composites on top of the fully-lit (GI/reflections included) opaque
-  // scene. No-op internally if TransparentForwardPass::Init() found zero transparent leaf clusters
-  // this run. Must run before the debug overlay below so the HUD stays on top of everything.
+  // [13c] Forward-rendered translucent/transparent materials -- drawn directly onto
+  // m_GIComposite's own output image (unconditionally the [14] blit's normal-view-mode source,
+  // see the blit-swap's own comment below), so transparency composites on top of the fully-lit
+  // (GI/reflections included) opaque scene. No-op internally if TransparentForwardPass::Init()
+  // found zero transparent leaf clusters this run. Must run before the debug overlay below so the
+  // HUD stays on top of everything.
   // =========================================================================================
   {
     VkImage transparentTargetImage = m_GIComposite.GetOutputImage();
@@ -1481,25 +1474,29 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
 #endif
 
   // =========================================================================================
-  // [14] Blit the final image (m_Denoiser's own denoised output, when [12d] applied it; otherwise
-  // m_Resolve's own color image directly -- see `applyDenoise`/`blitSourceImage` above) to the
-  // swapchain image and hand it to present. Every candidate image stays in GENERAL (valid blit
-  // source layout); each one's own trailing barrier already targeted the BLIT stage, but is
-  // re-stated here explicitly for the same reason every other cross-pass barrier in this function
-  // is: the dependency must not silently vanish if an intermediate pass's barriers change.
+  // [14] Blit the final image (m_TAATSR's own upscaled output in the normal view path -- itself
+  // always sourced from m_GIComposite's output, see [13d] above -- or one of the debug-view
+  // substitutes below) to the swapchain image and hand it to present. Every candidate image stays
+  // in GENERAL (valid blit source layout); each one's own trailing barrier already targeted the
+  // BLIT stage, but is re-stated here explicitly for the same reason every other cross-pass
+  // barrier in this function is: the dependency must not silently vanish if an intermediate pass's
+  // barriers change.
   // =========================================================================================
-  // DEBUG_VIEW_LUMEN and DEBUG_VIEW_GLOBAL_SDF both swap the blit SOURCE to m_SDFRayMarch's own
-  // debug-visualization image instead of m_Resolve's normal lit output -- see ClusterRenderPipeline
-  // .h's own comment on why this (not sampling it from within ClusterResolve.comp) is the chosen
-  // mechanism. Both share the exact same output image (this frame's single RecordRayMarch() call
-  // above already picked which of the two variants -- full two-tier vs. coarse-only -- filled it,
-  // via `coarseOnly`); the image's format (VK_FORMAT_R8G8B8A8_UNORM) and permanent layout (GENERAL)
-  // match m_Resolve's own output either way, so the SAME barrier below (targeting COMPUTE_SHADER_
-  // BIT/SHADER_STORAGE_WRITE_BIT -> BLIT_BIT/TRANSFER_READ_BIT) covers either choice with no changes
+  // DEBUG_VIEW_LUMEN and DEBUG_VIEW_SPATIAL_PROBES both swap the blit SOURCE to m_GIComposite's
+  // own output image instead of m_TAATSR's upscaled one -- GIComposite.comp's own viewMode 13/14
+  // branches (see that shader's own comment) already picked which visualization filled it this
+  // frame, so no separate per-mode image is needed here. DEBUG_VIEW_GLOBAL_SDF instead swaps to
+  // m_SDFRayMarch's own debug-visualization image -- see ClusterRenderPipeline.h's own comment on
+  // why this (not sampling it from within ClusterResolve.comp) is the chosen mechanism. Every
+  // candidate image's format (VK_FORMAT_R8G8B8A8_UNORM for m_GIComposite/m_SDFRayMarch) and
+  // permanent layout (GENERAL) match, so the SAME barrier below (targeting COMPUTE_SHADER_BIT/
+  // SHADER_STORAGE_WRITE_BIT -> BLIT_BIT/TRANSFER_READ_BIT) covers any choice with no changes
   // needed -- only which VkImage is actually blitted differs.
   // Denoised (see [12d] above) unless a debug view substitutes a different image entirely
-  // (DEBUG_VIEW_LUMEN/DEBUG_VIEW_GLOBAL_SDF) or would have its own overlay blurred by the filter
-  // (DEBUG_VIEW_SPATIAL_PROBES) -- applyDenoise (computed at [12d]) tracks exactly the same condition.
+  // (DEBUG_VIEW_LUMEN/DEBUG_VIEW_SPATIAL_PROBES/DEBUG_VIEW_GLOBAL_SDF all route through
+  // m_GIComposite or m_SDFRayMarch instead of m_TAATSR's upscaled output) -- applyDenoise
+  // (computed at [12d]) tracks exactly the same DEBUG_VIEW_LUMEN condition for whether m_Denoiser
+  // itself ran this frame.
   VkImage blitSourceImage = m_TAATSR.GetOutputImage();
 #ifndef NDEBUG
   if (cameraCopy.debugViewMode != DEBUG_VIEW_NORMAL && cameraCopy.debugViewMode != DEBUG_VIEW_MOTION_VECTORS) {
@@ -1640,8 +1637,8 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
 #endif
 
   // Recorded last, after every consumer of "the previous frame's" viewProj above (m_Resolve's own
-  // motion-vector debug view, m_ScreenProbeGI's temporal reprojection) has already read it --
-  // this frame's own matrix becomes "the previous frame's" for the NEXT RecordFrame() call.
+  // motion-vector debug view) has already read it -- this frame's own matrix becomes "the previous
+  // frame's" for the NEXT RecordFrame() call.
   m_PrevViewProj = viewProj;
   m_HasPrevViewProj = true;
   ++m_FrameIndex;

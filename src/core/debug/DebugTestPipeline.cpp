@@ -22,8 +22,8 @@
 //      renderer::SurfaceCacheRayTracingPass)
 //   7. Virtual Shadow Maps cascade view (renderer::VirtualShadowMapPass)
 //   8. Specular reflections on/off (renderer::ReflectionPass)
-//   9. Radiosity multi-bounce GI + Screen-Space Probe GI on/off (renderer::SurfaceCacheGIInjectPass
-//      radiosity loop / renderer::ScreenProbeGIPass)
+//   9. Radiosity multi-bounce GI + Screen Trace GI on/off (renderer::SurfaceCacheGIInjectPass
+//      radiosity loop / renderer::ScreenTracePass)
 //  10. TAA/TSR temporal anti-aliasing/upscaling on/off (renderer::TAATSRPass)
 #ifndef NDEBUG
 
@@ -429,9 +429,9 @@ namespace debugpipeline {
                 };
             });
 
-        // === 9. Radiosity multi-bounce GI + Screen-Space Probe GI (SSRT) on/off ===============
-        runTest("Radiosity Multi-Bounce GI + Screen-Space Probe GI (On/Off)",
-            "src/renderer/passes/SurfaceCacheGIInjectPass.cpp, src/renderer/passes/ScreenProbeGIPass.cpp",
+        // === 9. Radiosity multi-bounce GI + Screen Trace GI (SSRT) on/off =====================
+        runTest("Radiosity Multi-Bounce GI + Screen Trace GI (On/Off)",
+            "src/renderer/passes/SurfaceCacheGIInjectPass.cpp, src/renderer/passes/ScreenTracePass.cpp",
             [&]() -> TestOutcome {
                 camera.SetDebugViewMode(DEBUG_VIEW_NORMAL);
 
@@ -445,9 +445,10 @@ namespace debugpipeline {
 
                 return TestOutcome{
                     TestStatus::Pass, 8,
-                    "Both the disabled and enabled states of the radiosity bounce loop and SSRT trio render "
-                    "without a validation-layer message (screenshot captured in the enabled state, matching "
-                    "Release's own always-on default for both).",
+                    "Both the disabled and enabled states of the radiosity bounce loop and the Screen Trace "
+                    "GI pass (linear screen-space march + World Probe grid fallback) render without a "
+                    "validation-layer message (screenshot captured in the enabled state, matching Release's "
+                    "own always-on default for both).",
                     "OFF: 3 frames OK. ON: 5 frames OK.",
                     shot
                 };
