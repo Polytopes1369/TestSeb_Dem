@@ -20,13 +20,13 @@
 
 layout(local_size_x = 8, local_size_y = 8) in;
 
-// RGBA8_UNORM, NOT rgba16f: renderer::MegaLightsPass reuses renderer::ATrousDenoisePass as-is for
-// its spatial cleanup (see this file's own header comment), and that class' ping-pong images -- and
-// therefore its shader's own fixed image-format layout qualifier -- are hardcoded RGBA8_UNORM
-// (ATrousDenoisePass::kFormat), the same non-HDR convention renderer::ClusterResolvePass's own
-// output color image already uses throughout this direct-lighting pipeline. Values are saturated
-// before imageStore below.
-layout(rgba8, set = 0, binding = 0) uniform writeonly image2D g_ShadeRadiance;
+// rgba16f, matching renderer::MegaLightsPass::kRadianceFormat / renderer::ATrousDenoisePass::
+// kFormat (that class' ping-pong images and shader's own fixed image-format layout qualifier --
+// see this file's own header comment on why reusing it forces this pass to match): linear HDR, not
+// rgba8 -- this radiance is a physically-based, inverse-square point-light contribution with no
+// upper bound near a light, so it must survive unclipped until renderer::PostProcessPass's own curve
+// runs at the very end of the frame (see ClusterResolvePass::kOutputColorFormat's own comment).
+layout(rgba16f, set = 0, binding = 0) uniform writeonly image2D g_ShadeRadiance;
 
 layout(rg16f, set = 0, binding = 1) uniform readonly image2D g_GBufferNormal;
 layout(r32f, set = 0, binding = 2) uniform readonly image2D g_GBufferDepth;
@@ -117,5 +117,8 @@ void main() {
     // Full shading contribution of the selected light, times the RIS unbiased-estimator factor --
     // see megalights_ris.glsl's own SelectLightRIS comment for the derivation.
     vec3 radiance = diffuseAlbedo * light.color * light.intensity * NdotL / distSq * window * visibility * invPdf;
-    imageStore(g_ShadeRadiance, pixel, vec4(saturate(radiance), 1.0));
+    // No saturate(): g_ShadeRadiance is now linear HDR (rgba16f) -- clamping here would defeat the
+    // whole point of widening the format, re-introducing the hard-clip renderer::PostProcessPass exists
+    // to replace with a soft display-referred curve.
+    imageStore(g_ShadeRadiance, pixel, vec4(radiance, 1.0));
 }

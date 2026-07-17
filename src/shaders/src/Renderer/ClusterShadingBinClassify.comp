@@ -37,7 +37,7 @@ layout(std430, set = 0, binding = 7) buffer PixelScratchSSBO {
 // Background-pixel direct outputs -- the SAME 5 images renderer::ClusterResolvePass owns and
 // ClusterResolveBinned.comp (stage D) will also write to for foreground pixels; disjoint pixel
 // coverage between this pass and stage D, no image is ever written twice for the same pixel.
-layout(rgba8, set = 0, binding = 8) uniform writeonly image2D g_OutputColor;
+layout(rgba16f, set = 0, binding = 8) uniform writeonly image2D g_OutputColor; // rgba16f: linear HDR, matches ClusterResolvePass::kOutputColorFormat.
 layout(rg16f, set = 0, binding = 9) uniform writeonly image2D g_OutputNormal;
 layout(r32f, set = 0, binding = 10) uniform writeonly image2D g_OutputDepth;
 layout(rgba8, set = 0, binding = 11) uniform writeonly image2D g_OutputAlbedo;

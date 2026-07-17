@@ -150,7 +150,15 @@ inline uint32_t _REFRACTION_QUALITY = 3;
 inline float EXPOSURE_APERTURE = 4.0f;             // f-stop.
 inline float EXPOSURE_SHUTTER_SPEED_SECONDS = 1.0f / 60.0f;
 inline float EXPOSURE_ISO = 100.0f;
-inline bool EXPOSURE_USE_AUTO = true;               // false = Manual metering (instant, no eye-adaptation).
+// Manual (not Auto) for now: renderer::MegaLightsPass (Phase A) has no temporal reservoir reuse
+// yet (per-frame RIS re-samples a different light, spatially but not temporally denoised -- see
+// that class' own header comment, "Phase B" is the planned fix) -- Auto Exposure's histogram
+// directly measures that per-frame luminance noise and reacts to it every frame, amplifying an
+// otherwise-subtle spatial grain into a visible global brightness flicker. Manual metering (a
+// fixed EV100 snapped instantly every frame, see AutoExposureAdapt.comp's own Auto/Manual branch)
+// removes that reactive amplification entirely; MegaLights' own residual per-pixel grain is a
+// separate, much smaller-magnitude cosmetic issue tracked against the Phase B temporal-reuse work.
+inline bool EXPOSURE_USE_AUTO = false;
 inline float EXPOSURE_COMPENSATION_EV = 0.0f;
 inline float EXPOSURE_ADAPTATION_SPEED_UP_EV_PER_SEC = 3.0f;   // Scene darkened -> exposure rising.
 inline float EXPOSURE_ADAPTATION_SPEED_DOWN_EV_PER_SEC = 1.0f; // Scene brightened -> exposure falling.

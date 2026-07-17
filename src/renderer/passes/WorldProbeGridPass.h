@@ -18,16 +18,32 @@
 // renderer::ClusterRenderPipeline::SetDebugWorldProbesEnabled() (main.cpp's 'H' key) purely for
 // A/B cost comparison, not because the grid is unconsumed.
 //
-// --- Why a full rebuild every frame, not incremental/toroidal streaming ---
-// renderer::GlobalSDFPass's clipmap levels stream incrementally (only newly-revealed slabs are
-// recomposited each frame) because a level can be kClipmapResolution=32 voxels of a MUCH larger,
-// multi-level clipmap hierarchy, expensive enough per voxel (compositing every overlapping
-// entity's Mesh SDF) that a full rebuild every frame would be wasteful. This grid is a single
-// level, kGridResolution^3 = 32768 probes, each one cheap (kProbeSampleDirections fixed-direction
-// traces, not per-entity SDF compositing) -- a full rebuild every frame is both affordable at this
-// scale and literally what was asked ("Propagate Surface Cache lighting directly into
-// this 3D grid at each frame"), so this class does not reproduce GlobalSDFPass's incremental-
-// streaming machinery at all.
+// --- Incremental toroidal streaming (Phase 6, UE5.8 parity roadmap: adaptive/importance-sampled
+// probes) ---
+// Pre-Phase-6, this grid was fully rebuilt every single RecordUpdate() call regardless of camera
+// motion (~459K rays/frame, kGridResolution^3 probes x kProbeSampleDirections rays, unconditionally)
+// -- affordable at this scale, but wasteful: a probe whose surroundings haven't changed does not
+// need re-tracing every frame. This class now mirrors renderer::GlobalSDFPass's own incremental
+// clipmap-streaming technique (see that class' own header comment for the general rationale): a
+// single FIXED, infinite lattice of probe indices in world space, addressed physically via
+// `(index mod kGridResolution)` per axis (a toroidal wrap) -- what moves is only which
+// kGridResolution^3 WINDOW of that lattice is considered "covered" (recentered on the camera,
+// snapped to whole-probe steps for temporal coherence, exactly like GlobalSDFPass's own snapping).
+// When the window shifts, only the newly-revealed probes (a thin per-axis slab, mirroring
+// GlobalSDFPass::EnqueueDirtyRegionsForLevel's own per-axis decomposition) are queued dirty and
+// re-traced over the next few calls (kMaxDirtySlabsPerCall budget) -- probes still within the
+// window that were NOT just revealed simply keep their last-traced irradiance, valid indefinitely
+// for a probe grid this coarse/low-frequency (the same assumption GlobalSDFPass already relies on
+// for its own SDF clipmap). Unlike GlobalSDFPass, there is only ONE level here (no multi-resolution
+// clipmap hierarchy) and no per-entity composite-min accumulation (WorldProbeInject.comp computes
+// each probe's irradiance in one self-contained dispatch, not a multi-source min-blend), so
+// kMaxDirtySlabsPerCall only needs to cover "at most 3 axes shifted this frame" (3), not
+// GlobalSDFPass's "4 levels x up to 3 dynamic entities" backlog (16) -- see that member's own
+// comment. world_probe_sampling.glsl's SampleWorldProbeGrid() was updated in lockstep (manual
+// 8-corner trilinear blend via texelFetch against the wrapped addressing, replacing hardware
+// trilinear filtering, which would incorrectly blend across the wrap seam -- the same reasoning
+// renderer::SDFRayMarchPass's own NEAREST-at-voxel-center sampling already relies on for
+// GlobalSDFPass's own clipmaps).
 //
 // --- Why no per-texel hemisphere importance sampling (unlike SurfaceCacheGIInjectPass) ---
 // A Surface Cache texel's re-injected bounce needs to look correct at close range, under a
@@ -40,6 +56,7 @@
 // probe.
 
 #include <cstdint>
+#include <deque>
 #include <vulkan/vulkan.h>
 #include <vk_mem_alloc.h>
 
@@ -100,28 +117,43 @@ namespace renderer {
 
         void Shutdown();
 
-        // Recenters the grid (snapped to kProbeSpacing-sized steps, so it does not re-derive a
-        // different origin -- and thus lose temporal coherence for a probe that didn't actually
-        // move -- on every single frame of continuous camera motion) around `cameraPositionWorld`,
-        // then dispatches ONE full-grid compute pass (kGridResolution/kWorkgroupSize groups per
-        // axis) that traces every probe's kProbeSampleDirections rays (SWRT or HWRT per `traceMode`,
-        // matching renderer::SurfaceCacheGIInjectPass::RecordInject's own traceMode convention) and
-        // writes the averaged hit radiance into that probe's texel. Caller owns every
-        // synchronization barrier before (Surface Cache radiance atlas + TLAS visible) and after
-        // (grid writes visible to a later sampled read, e.g. renderer::ScreenTracePass) this call --
-        // same discipline as SurfaceCacheGIInjectPass::RecordInject.
+        // Phase 6 (UE5.8 parity roadmap): recenters the grid's covered WINDOW (snapped to whole-
+        // probe steps, so a probe that hasn't left the window keeps its own stable physical texel
+        // address across frames -- see the class comment's toroidal-streaming rationale) around
+        // `cameraPositionWorld`, enqueues any newly-revealed probes as dirty slabs, then drains up
+        // to kMaxDirtySlabsPerCall of them (bounded per-call GPU cost -- a large camera jump may
+        // take a few extra calls to fully catch up, exactly like GlobalSDFPass's own backlog
+        // draining). Each drained slab's probes are traced (SWRT or HWRT per `traceMode`, matching
+        // renderer::SurfaceCacheGIInjectPass::RecordInject's own traceMode convention) and written
+        // into their wrapped texel address. Caller owns every synchronization barrier before
+        // (Surface Cache radiance atlas + TLAS visible) and after (grid writes visible to a later
+        // sampled read, e.g. renderer::ScreenTracePass) this call -- same discipline as
+        // SurfaceCacheGIInjectPass::RecordInject.
         void RecordUpdate(VkCommandBuffer cmd, const maths::vec3& cameraPositionWorld,
             const SurfaceCacheTraceContext& traceContext, uint32_t traceMode);
 
         VkImageView GetGridView() const { return m_GridView; }
         VkSampler GetGridSampler() const { return m_GridSampler; }
-        // World-space position of the grid's own texel (0,0,0) corner (NOT its center) as of the
-        // MOST RECENT RecordUpdate() call -- world_probe_sampling.glsl's SampleWorldProbeGrid needs
-        // this (plus kProbeSpacing/kGridResolution) to convert a world position into the grid's
-        // own normalized [0,1]^3 sampling coordinate.
+        // Phase 6: the world-space MINIMUM corner of the grid's CURRENTLY COVERED WINDOW (i.e.
+        // `snappedCenterProbe * kProbeSpacing - halfExtent`), as of the most recent RecordUpdate()
+        // call -- NOT necessarily where texel (0,0,0) physically lives anymore (that texel's
+        // CONTENT is whichever world-probe-index currently wraps to it, `index mod
+        // kGridResolution`, which shifts as the window moves -- see the class comment). Still
+        // exactly what world_probe_sampling.glsl's SampleWorldProbeGrid needs (plus
+        // kProbeSpacing/kGridResolution) to convert a world position into the grid's own probe-
+        // index space before wrapping.
         const maths::vec3& GetGridOriginWorld() const { return m_GridOriginWorld; }
 
     private:
+        // One axis-aligned "newly revealed" region, in absolute world-probe-index space -- NOT yet
+        // split into wrap-contiguous pieces (that split happens when the slab is actually drained,
+        // exactly like GlobalSDFPass::DirtySlab's own comment explains). No `level` field (unlike
+        // GlobalSDFPass::DirtySlab) -- this grid has only one.
+        struct DirtySlab {
+            int32_t probeMin[3] = { 0, 0, 0 };
+            int32_t probeMax[3] = { 0, 0, 0 }; // Exclusive.
+        };
+
         VkDevice m_Device = VK_NULL_HANDLE;
         VmaAllocator m_Allocator = VK_NULL_HANDLE;
 
@@ -140,6 +172,28 @@ namespace renderer {
         VkPipeline m_Pipeline = VK_NULL_HANDLE;
 
         uint32_t m_FrameIndex = 0; // Halton sequence temporal offset, advanced every RecordUpdate() call.
+
+        // Phase 6: which world-probe-index currently sits at the window's center, per axis -- the
+        // toroidal-streaming analog of GlobalSDFPass::ClipmapLevel::snappedCenterVoxel (one grid,
+        // so no per-level array). `m_HasValidWindow` is false until the first RecordUpdate() call,
+        // mirroring ClipmapLevel::hasValidWindow exactly (forces one full-volume dirty slab).
+        int32_t m_SnappedCenterProbe[3] = { 0, 0, 0 };
+        bool m_HasValidWindow = false;
+
+        std::deque<DirtySlab> m_PendingSlabs;
+
+        // Bounded per-RecordUpdate() drain budget. A single grid (not GlobalSDFPass's 4 clipmap
+        // levels) with no per-entity composite step needs to cover at most 3 newly-dirtied slabs
+        // per call (one per axis, the maximum a single camera-motion step can shift) -- so, unlike
+        // GlobalSDFPass::kMaxDirtySlabsPerCall (16, sized for 4 levels x multiple dynamic entities'
+        // worth of backlog), 3 drains everything in one call under ordinary continuous motion; only
+        // an exceptionally large single-frame camera jump would ever leave a residual backlog for
+        // a later call to finish.
+        static constexpr uint32_t kMaxDirtySlabsPerCall = 3;
+
+        void EnqueueDirtyRegionsForGrid(const maths::vec3& cameraPositionWorld);
+        void DrainAndRecordSlabs(VkCommandBuffer cmd, const SurfaceCacheTraceContext& traceContext, uint32_t traceMode);
+        void RecordSlab(VkCommandBuffer cmd, const DirtySlab& slab, const SurfaceCacheTraceContext& traceContext, uint32_t traceMode);
     };
 
 }
