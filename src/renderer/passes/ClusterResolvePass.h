@@ -107,7 +107,7 @@ namespace renderer {
         // deformation (wpo_deformation.glsl's ApplyWPODeformation) that both rasterizers already
         // applied to the vertices they actually drew, so its own re-projection for barycentric
         // reconstruction operates on the same deformed triangle, not the rest-pose one.
-        // `materialTable` is renderer::GenerateRandomMaterialTable()'s result (see
+        // `materialTable` is renderer::GenerateShowcaseMaterialTable()'s result (see
         // ClusterRenderPipelineCreateInfo::materialTable) -- copied once into the GPU SSBO here,
         // not retained by reference (the caller's own copy may not outlive this call).
         void Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue, VkExtent2D renderExtent,

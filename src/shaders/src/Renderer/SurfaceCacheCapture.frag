@@ -82,7 +82,7 @@ layout(std430, set = 0, binding = 6) readonly buffer EntityDataBuffer {
     EntityData entityData[];
 };
 
-// renderer::GenerateRandomMaterialTable()'s result, the SAME SSBO ClusterResolve.comp's own
+// renderer::GenerateShowcaseMaterialTable()'s result, the SAME SSBO ClusterResolve.comp's own
 // g_MaterialParams reads (renderer::ClusterResolvePass::GetMaterialParamsBuffer()) -- see
 // material_params.glsl's own comment.
 layout(std430, set = 0, binding = 7) readonly buffer MaterialParamsSSBO {

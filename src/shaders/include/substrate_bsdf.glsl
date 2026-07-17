@@ -71,7 +71,7 @@ void BuildProceduralTangentBasis(vec3 N, out vec3 T, out vec3 B) {
 // sssAmount/sssRadius (the Subsurface approximation -- see SubstrateSlab's own header comment for
 // why this is analytic rather than a screen-space diffusion pass). No metallic energy-conservation
 // multiply here -- unlike the old metallic-workflow shading, a Substrate Slab's diffuseAlbedo is
-// authored directly (renderer::GenerateRandomMaterialTable bakes a metal's diffuseAlbedo to zero at
+// authored directly (renderer::GenerateShowcaseMaterialTable bakes a metal's diffuseAlbedo to zero at
 // generation time -- see that function's own comment), matching how a real Substrate material is
 // authored: a metal's color lives entirely in F0, never in diffuseAlbedo.
 vec3 EvaluateSlabDiffuse(SubstrateSlab slab, vec3 N, vec3 L) {

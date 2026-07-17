@@ -57,7 +57,7 @@ layout(std140, set = 0, binding = 7) uniform MegaLightsViewParamsUBO {
 // growing a field per Substrate parameter -- see ClusterResolve.comp's own g_OutputMaterialID
 // binding comment.
 layout(r16ui, set = 0, binding = 8) uniform readonly uimage2D g_GBufferMaterialID;
-// renderer::GenerateRandomMaterialTable()'s result, the SAME SSBO handle renderer::
+// renderer::GenerateShowcaseMaterialTable()'s result, the SAME SSBO handle renderer::
 // ClusterResolvePass already uploaded at its own Init() -- see material_params.glsl's own comment.
 layout(std430, set = 0, binding = 9) readonly buffer MaterialParamsSSBO {
     MaterialParams params[];

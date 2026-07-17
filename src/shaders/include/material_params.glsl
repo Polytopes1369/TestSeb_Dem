@@ -35,8 +35,8 @@ struct SubstrateSlab {
 // (src/renderer/MaterialParameterTable.h) -- 208 bytes: two SubstrateSlab blocks (base + optional
 // top) plus a trailing 16-byte block, matching Substrate's own "vertical layering" model -- the
 // C++ mirror's own static_assert verifies the match field-for-field. Populated once at
-// renderer::ClusterResolvePass::Init() from renderer::GenerateRandomMaterialTable() (a seeded,
-// runtime-generated table -- no on-disk .cache section: materialID is per-entity, not
+// renderer::ClusterResolvePass::Init() from renderer::GenerateShowcaseMaterialTable() (a fully
+// deterministic, hand-authored table -- no on-disk .cache section: materialID is per-entity, not
 // per-triangle, so this table is small and fully built once at startup). Consumed by
 // ClusterResolve.comp/ClusterResolveBinned.comp/TransparentForward.frag/ReflectionGather.comp/
 // MegaLightsShade.comp/the Surface Cache capture shader via a plain fixed-size SSBO array, matching
@@ -53,16 +53,12 @@ struct MaterialParams {
     // own comment for why such materials never reach this struct's usual opaque consumers and are
     // shaded by TransparentForward.frag instead.
     float alpha;
-<<<<<<< HEAD
-=======
     // Phase PP3: >0.0 = writes a procedural refraction offset into TransparentForward.frag's own
     // second output attachment -- see renderer::MaterialParameters::heatDistortion's own comment.
     float heatDistortion;
->>>>>>> main
     // UE5.8 Lumen "Output Reflections" equivalent -- see renderer::MaterialParameters::
     // hasReflections' own comment (MaterialParameterTable.h). 0.0 = off, 1.0 = on.
     float hasReflections;
-    float _pad0;
 };
 
 #endif // MATERIAL_PARAMS_GLSL

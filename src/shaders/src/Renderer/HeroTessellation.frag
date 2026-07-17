@@ -18,6 +18,7 @@
 #include "include/material_params.glsl"
 #include "include/math_utils.glsl"
 #include "include/ggx_brdf.glsl"
+#include "include/substrate_bsdf.glsl"
 
 #define SHADOW_ATLAS_SET 0
 #define SHADOW_ATLAS_BINDING 1
@@ -95,19 +96,6 @@ layout(push_constant) uniform HeroTessellationConstants {
 
 layout(location = 0) out vec4 outColor;
 
-// Sun-only direct lighting (shadowed via SampleSunShadowVSM) -- point lights are MegaLights' job
-// (see this file's own header comment) -- identical formula to TransparentForward.frag's own
-// ComputeDirectLighting, reading g_Lighting instead of that shader's TransparentViewParamsUBO.
-vec3 ComputeDirectLighting(vec3 worldPos, vec3 n) {
-    vec3 sunDir = normalize(-g_Lighting.sunDirectionAndIntensity.xyz);
-    float sunNdotL = max(dot(n, sunDir), 0.0);
-    if (sunNdotL <= 0.0) {
-        return vec3(0.0);
-    }
-    float visibility = SampleSunShadowVSM(worldPos);
-    return g_Lighting.sunColor.rgb * g_Lighting.sunDirectionAndIntensity.w * sunNdotL * visibility;
-}
-
 vec3 FetchPosition(uint globalVertexIndex) {
     FallbackVertexGpu v = g_Vertices[globalVertexIndex];
     return vec3(v.posX, v.posY, v.posZ);
@@ -164,16 +152,22 @@ bool TraceShadowRay(vec3 origin, vec3 dir, float tMax) {
 void main() {
     vec3 n = normalize(inWorldNormal);
     MaterialParams mat = g_MaterialParams.mat;
+    vec3 cameraPositionWorld = vec3(pc.cameraPositionWorldX, pc.cameraPositionWorldY, pc.cameraPositionWorldZ);
+    vec3 viewDir = normalize(cameraPositionWorld - inWorldPos);
 
-    // --- Sun-direct + indirect diffuse (always computed -- cheap, one 3D texture sample). ---
-    vec3 directLighting = ComputeDirectLighting(inWorldPos, n);
+    // --- Sun-direct (Substrate full Slab BSDF response, incl. this recipe's Clear Coat Top slab --
+    // see renderer::GenerateShowcaseMaterialTable's own kHeroMaterialID comment) + indirect diffuse
+    // (always computed -- cheap, one 3D texture sample). ---
+    vec3 sunDir = normalize(-g_Lighting.sunDirectionAndIntensity.xyz);
+    float sunNdotL = max(dot(n, sunDir), 0.0);
+    float sunVisibility = (sunNdotL > 0.0) ? SampleSunShadowVSM(inWorldPos) : 1.0;
+    vec3 sunRadiance = g_Lighting.sunColor.rgb * g_Lighting.sunDirectionAndIntensity.w * sunVisibility;
+    vec3 sunResponse = EvaluateSubstrateMaterial(mat, n, viewDir, sunDir) * sunRadiance;
     vec3 indirectLighting = SampleWorldProbeGrid(inWorldPos);
-    vec3 diffuseAlbedo = mat.baseColor * (1.0 - mat.metallic);
-    vec3 diffuseLight = diffuseAlbedo * (directLighting + indirectLighting);
 
     // Fully opaque -- no blend stage involved (blendEnable = false, see
     // renderer::HeroTessellationPass's own class comment), so no alpha-weighting concern here.
-    vec3 outRGB = diffuseLight + mat.emissive;
+    vec3 outRGB = sunResponse + indirectLighting * mat.base.diffuseAlbedo + EvaluateSubstrateEmissive(mat);
 
     // --- MegaLights: RIS-selected point light + 1 shadow-visibility ray, exactly
     // MegaLightsShade.comp's own algorithm -- see this file's own header comment. ---
@@ -197,18 +191,19 @@ void main() {
         float windowSq = 1.0 - nd2 * nd2;
         float window = saturate(windowSq * windowSq);
 
-        outRGB += diffuseAlbedo * light.color * light.intensity * megaNdotL / distSq * window * visibility * invPdf;
+        // Substrate: EvaluateSubstrateMaterial already applies its own NdotL internally -- megaNdotL
+        // is kept only for the occlusion early-out check above, no longer multiplied in here.
+        outRGB += EvaluateSubstrateMaterial(mat, n, viewDir, megaLightDir) * light.color * light.intensity / distSq * window * visibility * invPdf;
     }
 
     // --- Optional front-layer specular reflection (Lumen-style, single GGX-VNDF sample) -- gated
     // per-material via mat.hasReflections (kHeroMaterialID's own recipe has it on, showcasing the
     // same technique TransparentForwardPass's "Transparent: clear/glass-like" category uses). ---
     if (mat.hasReflections > 0.5) {
-        vec3 cameraPositionWorld = vec3(pc.cameraPositionWorldX, pc.cameraPositionWorldY, pc.cameraPositionWorldZ);
-        vec3 viewDir = normalize(cameraPositionWorld - inWorldPos);
-        float NdotV = max(dot(n, viewDir), 0.0);
-        vec3 F0 = mix(vec3(0.04), mat.baseColor, mat.metallic);
-        vec3 fresnel = F_Schlick(F0, NdotV);
+        // Substrate: Fresnel-only "Lumen Performance mode" reflection weight, generalized to
+        // Substrate's vertical layering -- see substrate_bsdf.glsl's own
+        // EvaluateSubstrateReflectionWeight comment. viewDir already computed above.
+        vec3 fresnel = EvaluateSubstrateReflectionWeight(mat, n, viewDir);
 
         vec3 tangent, bitangent;
         BuildTangentBasis(n, tangent, bitangent);
@@ -221,7 +216,7 @@ void main() {
             hashFloat(pixelSeed64, uint64_t(pc.frameIndex) * 0x9E3779B97F4A7C15UL + 0x517CC1B7UL),
             hashFloat(pixelSeed64, uint64_t(pc.frameIndex) * 0x9E3779B97F4A7C15UL + 0xBF58476D1CE4E5B9UL));
 
-        vec3 halfVectorTangentSpace = SampleGGXVNDF(xi, viewDirTangentSpace, mat.roughness);
+        vec3 halfVectorTangentSpace = SampleGGXVNDF(xi, viewDirTangentSpace, mat.base.roughness);
         vec3 halfVectorWorld = normalize(
             tangent * halfVectorTangentSpace.x + bitangent * halfVectorTangentSpace.y + n * halfVectorTangentSpace.z);
         vec3 rayDir = reflect(-viewDir, halfVectorWorld);

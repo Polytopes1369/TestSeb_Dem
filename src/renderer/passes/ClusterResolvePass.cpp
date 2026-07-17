@@ -183,7 +183,7 @@ namespace renderer {
             depInfo.pImageMemoryBarriers = barriers;
             vkCmdPipelineBarrier2(cmd, &depInfo);
 
-            // --- Material parameter table: renderer::GenerateRandomMaterialTable()'s result
+            // --- Material parameter table: renderer::GenerateShowcaseMaterialTable()'s result
             // (passed in via `materialTable`, generated once by VulkanContext -- see this method's
             // own doc comment), not a per-frame value -- filled once, here, in the same one-time
             // command buffer as the image transitions above (no ordering dependency between them,

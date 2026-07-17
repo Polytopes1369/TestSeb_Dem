@@ -155,7 +155,7 @@ layout(std140, set = 0, binding = 12) uniform WPOGlobalsUBO {
     float _pad2;
 } g_WPOGlobals;
 
-// renderer::GenerateRandomMaterialTable()'s result (renderer/MaterialParameterTable.h), filled
+// renderer::GenerateShowcaseMaterialTable()'s result (renderer/MaterialParameterTable.h), filled
 // once at renderer::ClusterResolvePass::Init() -- see material_params.glsl's own comment.
 layout(std430, set = 0, binding = 13) readonly buffer MaterialParamsSSBO {
     MaterialParams params[];
@@ -559,7 +559,7 @@ void main() {
             // the dielectric ~0.04 baseline, no fuzz), orange-tinted = Fuzz/Cloth (top.fuzzAmount >
             // 0.0) -- brightness scaled by topWeight (coverage) so a barely-there coat reads dim and
             // a heavy coat reads bright. Distinguishes the two ONLY by fuzzAmount since both
-            // categories GenerateRandomMaterialTable emits share the same dielectric top.f0 (see
+            // categories GenerateShowcaseMaterialTable emits share the same dielectric top.f0 (see
             // that function's own Clear Coat / Fuzz branches) -- fuzzAmount is the one field that
             // actually differs between them.
             if (mat.topWeight <= 0.0) {
