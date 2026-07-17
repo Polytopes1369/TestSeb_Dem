@@ -236,6 +236,34 @@ inline float FOG_MAX_OPACITY = 0.85f;
 // Heat Distortion & Refraction (global scale on renderer::TransparentForwardPass's own per-
 // material g_RefractionOffset -- see MaterialParameters::heatDistortion's own comment).
 inline float HEAT_DISTORTION_INTENSITY = 1.0f;
+
+// --- Phase PP4 (post-process stack roadmap): GTAO / Screen-Space Contact Shadows / SSR Fallback /
+// Volumetric Light Shafts (God Rays). Same convention as PP1/PP2/PP3 above: artistic, not
+// hardware-tiered, so not wired into ApplyProfile().
+
+// GTAO (Ground Truth Ambient Occlusion, horizon-based -- see GTAO.comp's own comment).
+inline float AO_RADIUS_WORLD = 1.0f;
+inline float AO_INTENSITY = 1.0f;
+inline float AO_POWER = 1.5f;
+
+// Screen-Space Contact Shadows (short depth-buffer raymarch toward the sun -- see
+// ContactShadows.comp's own comment).
+inline float CONTACT_SHADOW_LENGTH_WORLD = 1.0f;
+inline float CONTACT_SHADOW_INTENSITY = 0.8f;
+inline float CONTACT_SHADOW_THICKNESS_WORLD = 0.3f;
+
+// SSR Fallback (screen-space raymarch, used only where renderer::ReflectionPass's own ray-traced
+// reflection found no real hit -- see SSRFallback.comp's own comment).
+inline float SSR_FALLBACK_MAX_DISTANCE_WORLD = 20.0f;
+inline float SSR_FALLBACK_THICKNESS_WORLD = 0.5f;
+inline float SSR_FALLBACK_INTENSITY = 1.0f;
+
+// Volumetric Light Shafts / God Rays (radial screen-space raymarch toward the sun's projected
+// screen position -- see PostProcessComposite.comp's own ApplyGodRays comment).
+inline float GOD_RAYS_INTENSITY = 0.5f;
+inline float GOD_RAYS_DECAY = 0.95f;
+inline float GOD_RAYS_DENSITY = 1.0f;
+inline float GOD_RAYS_WEIGHT = 0.25f;
 } // namespace postprocess
 
 namespace volumetrics {
