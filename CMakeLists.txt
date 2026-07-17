@@ -175,6 +175,24 @@ add_executable(StreamingManagerTests
 target_include_directories(StreamingManagerTests PRIVATE src ${Vulkan_INCLUDE_DIRS})
 add_test(NAME StreamingManagerTests COMMAND StreamingManagerTests)
 
+add_executable(BlockCodecTests
+    src/io/BlockCodec.cpp
+    tests/BlockCodecTests.cpp
+)
+target_include_directories(BlockCodecTests PRIVATE src ${Vulkan_INCLUDE_DIRS})
+add_test(NAME BlockCodecTests COMMAND BlockCodecTests)
+
+add_executable(AsyncDecompressingLoaderTests
+    src/io/AsyncFileStreamer.cpp
+    src/io/BlockCodec.cpp
+    src/io/AsyncDecompressingLoader.cpp
+    src/core/LoadingManager.cpp
+    src/core/Logger.cpp
+    tests/AsyncDecompressingLoaderTests.cpp
+)
+target_include_directories(AsyncDecompressingLoaderTests PRIVATE src ${Vulkan_INCLUDE_DIRS})
+add_test(NAME AsyncDecompressingLoaderTests COMMAND AsyncDecompressingLoaderTests)
+
 add_executable(VirtualTextureTests
     src/renderer/streaming/VirtualTextureManager.cpp
     src/renderer/vulkan/GpuBuffer.cpp
