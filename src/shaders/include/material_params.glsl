@@ -26,7 +26,9 @@ struct MaterialParams {
     // shaded by TransparentForward.frag instead.
     float alpha;
     float _pad0;
-    float _pad1;
+    // UE5.8 Lumen "Output Reflections" equivalent -- see renderer::MaterialParameters::
+    // hasReflections' own comment (MaterialParameterTable.h). 0.0 = off, 1.0 = on.
+    float hasReflections;
     float _pad2;
 };
 
