@@ -560,6 +560,30 @@ namespace geometry {
                 const SimplifiableMesh& mesh = node.mesh;
                 const uint32_t triangleCount = static_cast<uint32_t>(mesh.triangles.size() / 3);
 
+                // 0. Every position must be finite. A NaN/Inf vertex (e.g. from a pathological QEM
+                // edge collapse -- a singular/near-singular quadric solve, or a UV/position blend
+                // that divides by a degenerate weight) would silently PASS every other check below:
+                // any comparison against NaN is false in IEEE-754, so the degenerate-area check
+                // (#2) and the bounds-enclosure check (#3) both simply skip a NaN vertex instead of
+                // flagging it. At render time, quantizing a NaN t via std::lround(t * 65535.0f) is
+                // undefined behavior that typically yields a garbage-but-representable uint16_t,
+                // decoding to a position essentially arbitrary within (or unrelated to) the
+                // cluster's own AABB -- a small number of triangles shooting off into a
+                // disconnected "shard", exactly the still-open "persistent cluster holes /
+                // shattered geometry" symptom (see project memory) this check exists to confirm or
+                // rule out.
+                uint32_t nonFiniteCount = 0;
+                for (const maths::vec3& p : mesh.positions) {
+                    if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) {
+                        ++nonFiniteCount;
+                    }
+                }
+                if (nonFiniteCount > 0) {
+                    MarkFailure(outErrors, label + " (level " + std::to_string(node.level) + ") has " +
+                        std::to_string(nonFiniteCount) + " non-finite (NaN/Inf) vertex position(s) out of " +
+                        std::to_string(mesh.positions.size()));
+                }
+
                 // 1. Every triangle vertex index must stay within this node's own positions array.
                 uint32_t outOfRangeIndexCount = 0;
                 for (uint32_t idx : mesh.triangles) {
