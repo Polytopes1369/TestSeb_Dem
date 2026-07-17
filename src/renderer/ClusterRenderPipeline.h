@@ -82,6 +82,7 @@
 #include "renderer/vulkan/GpuBuffer.h"
 #include "renderer/streaming/GpuGeometryPagePool.h"
 #include "renderer/passes/HeroTessellationPass.h"
+#include "renderer/passes/WaterForwardPass.h"
 #include "renderer/passes/HZBPass.h"
 #include "renderer/LightingTypes.h"
 #include "renderer/passes/ProceduralMaskGenerator.h"
@@ -391,6 +392,17 @@ namespace renderer {
         // surface, see HeroTessellationPass's own class comment for the resulting barrier-scope
         // consequence.
         HeroTessellationPass m_HeroTessellation;
+
+        // Phase 7c (UE5.8 parity roadmap, water/erosion): forward-rendered water plane (materialID
+        // kWaterMaterialID, culled out of the opaque Nanite path via core::EntityFlags::
+        // IsTransparent, same mechanism as m_HeroTessellation above -- see VulkanContext::
+        // BuildEntityData()'s own comment). Recorded LAST among the forward passes (after
+        // m_TransparentForward) -- see WaterForwardPass's own class comment for why: it blits the
+        // ALREADY fully-composited frame (opaque + GI + glass + hero) into its own private
+        // background-snapshot image for its refraction term, so anything drawn after it would be
+        // invisible to that refraction (and anything drawn before it that skipped this ordering
+        // would show through unrealistically, since water is meant to be the top-most surface).
+        WaterForwardPass m_WaterForward;
 
         // Lumen-style GI infrastructure -- unlike the debug-only stats/overlay block below, these
         // are real (if not yet light-transport-consuming) systems, not visualization tools, so

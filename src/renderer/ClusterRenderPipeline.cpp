@@ -545,6 +545,35 @@ bool ClusterRenderPipeline::Init(
     }
   }
 
+  // Phase 7c (UE5.8 parity roadmap, water/erosion): forward-rendered water plane -- see
+  // ClusterRenderPipeline.h's own comment on m_WaterForward. Same borrowed-resource contract as
+  // m_HeroTessellation above, resolved for the water entity; `waterMaterial` is the caller's own
+  // materialTable.params[renderer::kWaterMaterialID] slot (populated by
+  // GenerateShowcaseMaterialTable()'s own water-recipe override, see that function's own comment).
+  {
+    // Matches VulkanContext::kWaterEntityIndex exactly (the water plane, generated last -- see
+    // that class' own comment) -- a plain literal here rather than a cross-file constant
+    // reference, same convention kHeroEntityID above already establishes.
+    constexpr uint32_t kWaterEntityID = 15u;
+    const auto& entityRanges = m_SurfaceCache.GetEntityRanges();
+    const auto waterRangeIt = entityRanges.find(kWaterEntityID);
+    if (waterRangeIt == entityRanges.end()) {
+      LOG_ERROR("[ClusterRenderPipeline] Water entity (meshID=15) has no Fallback Mesh draw range -- cannot initialize WaterForwardPass.");
+      return false;
+    }
+    if (!m_WaterForward.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
+                            GICompositePass::kOutputFormat, createInfo.depthFormat,
+                            createInfo.entityTransformBuffer,
+                            createInfo.materialTable.params[kWaterMaterialID],
+                            m_SurfaceCache.GetVertexBuffer(), m_SurfaceCache.GetIndexBuffer(),
+                            waterRangeIt->second, kWaterEntityID,
+                            m_SurfaceCacheRT.GetTLASHandle(), m_SurfaceCacheRT.GetDrawRangeBuffer(),
+                            m_TraceContext, createInfo.renderExtent)) {
+      LOG_ERROR("[ClusterRenderPipeline] Failed to initialize WaterForwardPass.");
+      return false;
+    }
+  }
+
   // Screen Trace GI -- linear screen-space depth raymarching falling back to the World Probe grid.
   m_ScreenTrace.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
                      createInfo.renderExtent, m_Resolve.GetOutputDepthView(), m_Resolve.GetOutputNormalView(),
@@ -702,6 +731,7 @@ void ClusterRenderPipeline::Shutdown() {
 #endif
 
   m_HeroTessellation.Shutdown();
+  m_WaterForward.Shutdown();
   m_TransparentForward.Shutdown();
   m_ShadingBin.Shutdown();
   m_Resolve.Shutdown();
@@ -1584,6 +1614,14 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
     m_TransparentForward.RecordDraw(cmd, transparentTargetImage, transparentTargetView, m_DepthImageView,
         m_RenderExtent, cameraCopy.view, cameraCopy.proj, m_Decompression.GetDecompressedIndexPoolBuffer(),
         cameraFrameInfo.position, m_SceneLights, globalTimeSeconds, m_TraceContext, traceMode, m_FrameIndex);
+
+    // Phase 7c (UE5.8 parity roadmap, water/erosion): recorded LAST among the forward passes --
+    // see ClusterRenderPipeline.h's own comment on m_WaterForward for why (it snapshots the
+    // already fully-composited frame, including the glass/translucent draw just above, for its
+    // own refraction term).
+    m_WaterForward.RecordDraw(cmd, viewProj, cameraFrameInfo.position,
+        transparentTargetImage, transparentTargetView, m_DepthImage, m_DepthImageView,
+        m_RenderExtent, traceMode, m_FrameIndex, globalTimeSeconds, m_TraceContext);
   }
 
   // =========================================================================================

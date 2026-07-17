@@ -1465,6 +1465,15 @@ void VulkanContext::BuildEntityData() {
     if (i == kFloorEntityIndex) {
       entity.materialID = renderer::kTerrainMaterialID;
     }
+    // Phase 7c (UE5.8 parity roadmap, water/erosion): the water entity -- same exclusion mechanism
+    // as the hero entity's own override above (forced IsTransparent so ClusterLODCompact.comp
+    // never routes its clusters into the opaque candidate list; TransparentForwardPass itself stays
+    // unaffected since materialTable.isTransparent[kWaterMaterialID] correctly stays false, see
+    // that constant's own comment) -- water is rendered ONLY by renderer::WaterForwardPass.
+    if (i == kWaterEntityIndex) {
+      entity.materialID = renderer::kWaterMaterialID;
+      isTransparent = true;
+    }
     core::SetFlag(entity.flags, core::EntityFlags::IsTransparent, isTransparent);
   }
 }
@@ -1980,6 +1989,42 @@ void VulkanContext::GenerateTerrain(
   runningIndexOffset += 6u * (params.widthSegments - 1u) * (params.lengthSegments - 1u);
 }
 
+void VulkanContext::GenerateWaterPlane(
+    float Width, float Length, uint32_t WidthSegments, uint32_t LengthSegments,
+    uint32_t meshID, maths::vec2 slot, float worldOffsetY,
+    uint32_t& runningVertexOffset, uint32_t& runningIndexOffset) {
+  // Validate dimensions and segments are positive and non-zero
+  assert(Width > 0.0f);
+  assert(Length > 0.0f);
+  assert(WidthSegments > 0u);
+  assert(LengthSegments > 0u);
+
+  // geom_plane.comp's Params UBO -- reused directly, PlaneParams already declared above.
+  PlaneParams params{};
+  params.width = Width;
+  params.length_ = Length;
+  params.widthSegments = WidthSegments;
+  params.lengthSegments = LengthSegments;
+  params.meshID = meshID;
+  params.materialID = 0.0f; // See GenerateTerrain()'s own identical comment on this field.
+  params.vertexOffset = runningVertexOffset;
+  params.indexOffset = runningIndexOffset;
+  params.worldOffsetX = slot.x;
+  params.worldOffsetY = worldOffsetY; // Fixed water level -- NOT added to a sampled height.
+  params.worldOffsetZ = slot.y;
+
+  uint32_t totalVerts = params.widthSegments * params.lengthSegments;
+  constexpr uint32_t kLocalSizeXY = 8u; // geom_plane.comp local_size = (8, 8, 1)
+  uint32_t groupCountX = (params.widthSegments + kLocalSizeXY - 1u) / kLocalSizeXY;
+  uint32_t groupCountY = (params.lengthSegments + kLocalSizeXY - 1u) / kLocalSizeXY;
+
+  DispatchGeometryCompute(m_PlanePipeline, m_ComputePipelineLayout, &params,
+                          sizeof(params), nullptr, 0, groupCountX, groupCountY, 1);
+
+  runningVertexOffset += totalVerts;
+  runningIndexOffset += 6u * (params.widthSegments - 1u) * (params.lengthSegments - 1u);
+}
+
 void VulkanContext::GenerateCapsule(
     float Radius, float Height,
     uint32_t meshID, maths::vec2 slot,
@@ -2357,6 +2402,23 @@ void VulkanContext::GenerateGeometry() {
                   kTerrainVertexSpacing);
   }
 
+  // -------------------------------------------------------------------------
+  // WATER (slot 15) -- Phase 7c (UE5.8 parity roadmap, water/erosion): 16th entity, a flat plane
+  // sized to the showcase zone-grid's own footprint (not the full 300x300 terrain -- the depth
+  // test against the already-rasterized terrain naturally clips this flat quad to whatever low-
+  // lying basin actually falls within it, so an oversized water plane would just waste fragment-
+  // shader work on pixels the terrain always occludes). 2x2 segments (a single quad): wave
+  // perturbation is per-fragment (WaterForward.frag), not per-vertex, so more segments would add
+  // nothing -- see GenerateWaterPlane()'s own comment.
+  // -------------------------------------------------------------------------
+  {
+    maths::vec2 slot = {0.0f, 0.0f}; // centered at the world origin, same as the terrain itself
+    constexpr float kWaterPlaneSpan = 24.0f; // Mirrors the zone-grid's own ~16-unit extent with margin.
+    constexpr float kWaterLevel = -1.0f; // Mirrors water_params.glsl's kWaterLevel -- keep in sync.
+    GenerateWaterPlane(kWaterPlaneSpan, kWaterPlaneSpan, 2u, 2u, m_EntityData[kWaterEntityIndex].meshID, slot,
+                       kWaterLevel, runningVertexOffset, runningIndexOffset);
+  }
+
   m_TotalVertexCount = runningVertexOffset;
   m_TotalIndexCount = runningIndexOffset;
 
@@ -2453,6 +2515,17 @@ void VulkanContext::UpdateEntityRotations(float timeSeconds) {
       xform.centerX = 0.0f;
       xform.centerY = kWallCenterY;
       xform.centerZ = -1.8f;
+      xform._pad0 = 0.0f;
+    } else if (meshID == kWaterEntityIndex) {
+      // Phase 7c (UE5.8 parity roadmap, water/erosion): water plane, static at Y = kWaterLevel
+      // (must match GenerateGeometry()'s own water block) -- wave motion is per-fragment shading
+      // only (WaterForward.frag), not a vertex-level rotation/animation, see that shader's own
+      // header comment.
+      constexpr float kWaterLevel = -1.0f;
+      xform.rotation = maths::mat4{};
+      xform.centerX = 0.0f;
+      xform.centerY = kWaterLevel;
+      xform.centerZ = 0.0f;
       xform._pad0 = 0.0f;
     } else {
       float phase = static_cast<float>(meshID) * kPhaseStep;
