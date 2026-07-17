@@ -1753,13 +1753,20 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
       ppSettings.godRaysDecay = config::postprocess::GOD_RAYS_DECAY;
       ppSettings.godRaysDensity = config::postprocess::GOD_RAYS_DENSITY;
       ppSettings.godRaysWeight = config::postprocess::GOD_RAYS_WEIGHT;
+      ppSettings.paniniD = config::postprocess::PANINI_D;
+      ppSettings.paniniS = config::postprocess::PANINI_S;
+      ppSettings.sharpenIntensity = config::postprocess::SHARPEN_INTENSITY;
+      ppSettings.sharpenRadiusPixels = config::postprocess::SHARPEN_RADIUS_PIXELS;
+      ppSettings.filmGrainIntensity = config::postprocess::FILM_GRAIN_INTENSITY;
+      ppSettings.filmGrainResponseMidpoint = config::postprocess::FILM_GRAIN_RESPONSE_MIDPOINT;
 
       // Same prevViewProj-or-current-frame-fallback expression [13d]'s own TAA pass already
       // resolved into its own block-scoped prevViewProjForTAA (out of scope here) -- Motion Blur's
       // own per-pixel reprojection needs the identical semantics, recomputed inline.
       maths::mat4 prevViewProjForPostProcess = m_HasPrevViewProj ? m_PrevViewProj : viewProj;
       m_PostProcess.RecordComposite(cmd, deltaTimeSeconds, ppSettings, invViewProj, prevViewProjForPostProcess, cameraPositionWorld,
-          viewProj, m_SceneLights.sun.direction);
+          viewProj, m_SceneLights.sun.direction,
+          cameraFrameInfo.fovYRadians, cameraFrameInfo.aspectRatio, m_FrameIndex);
   }
 
 #ifndef NDEBUG

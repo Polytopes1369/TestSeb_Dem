@@ -329,7 +329,8 @@ namespace renderer {
 
     void PostProcessPass::RecordComposite(VkCommandBuffer cmd, float deltaTimeSeconds, const Settings& settings,
         const maths::mat4& invViewProj, const maths::mat4& prevViewProj, const maths::vec3& cameraPositionWorld,
-        const maths::mat4& viewProj, const maths::vec3& sunDirection) {
+        const maths::mat4& viewProj, const maths::vec3& sunDirection,
+        float fovYRadians, float aspectRatio, uint32_t frameIndex) {
         // --- Upload this frame's params UBO ---
         PostProcessParamsUBO params{};
         params.aperture = settings.aperture;
@@ -394,6 +395,22 @@ namespace renderer {
         params.godRaysDecay = settings.godRaysDecay;
         params.godRaysDensity = settings.godRaysDensity;
         params.godRaysWeight = settings.godRaysWeight;
+
+        // Phase PP5: Panini Projection -- half-FOV tangents drive the tangent-space UV remap (see
+        // PostProcessComposite.comp's own ApplyPaniniProjection comment). Matches maths::mat4::
+        // PerspectiveVulkan's own g=1/tan(fovY/2), m[0]=g/aspect relationship: tan(halfFovY) =
+        // 1/g, tan(halfFovX) = aspect * tan(halfFovY).
+        float halfFovTanY = std::tan(fovYRadians * 0.5f);
+        params.paniniD = settings.paniniD;
+        params.paniniS = settings.paniniS;
+        params.halfFovTanX = halfFovTanY * aspectRatio;
+        params.halfFovTanY = halfFovTanY;
+
+        params.sharpenIntensity = settings.sharpenIntensity;
+        params.sharpenRadiusPixels = settings.sharpenRadiusPixels;
+        params.filmGrainIntensity = settings.filmGrainIntensity;
+        params.filmGrainResponseMidpoint = settings.filmGrainResponseMidpoint;
+        params.frameIndex = frameIndex;
 
         vkCmdUpdateBuffer(cmd, m_ParamsBuffer.Handle(), 0, sizeof(PostProcessParamsUBO), &params);
 

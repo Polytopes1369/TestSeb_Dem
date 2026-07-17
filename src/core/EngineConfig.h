@@ -264,6 +264,23 @@ inline float GOD_RAYS_INTENSITY = 0.5f;
 inline float GOD_RAYS_DECAY = 0.95f;
 inline float GOD_RAYS_DENSITY = 1.0f;
 inline float GOD_RAYS_WEIGHT = 0.25f;
+
+// --- Phase PP5 (post-process stack roadmap, final phase): Panini Projection / Local Contrast
+// Enhancement (Sharpness) / Film Grain. Same convention as PP1-PP4 above: artistic, not
+// hardware-tiered, so not wired into ApplyProfile().
+
+// Panini Projection (wide-FOV lens-shape UV warp -- see PostProcessComposite.comp's own
+// ApplyPaniniProjection comment). 0 = rectilinear/off (UE5.8's own default).
+inline float PANINI_D = 0.0f;
+inline float PANINI_S = 0.0f;
+
+// Local Contrast Enhancement / Sharpness (single-pass unsharp mask).
+inline float SHARPEN_INTENSITY = 0.0f;
+inline float SHARPEN_RADIUS_PIXELS = 1.0f;
+
+// Film Grain (animated, luminance-response-curved).
+inline float FILM_GRAIN_INTENSITY = 0.0f;
+inline float FILM_GRAIN_RESPONSE_MIDPOINT = 0.5f;
 } // namespace postprocess
 
 namespace volumetrics {

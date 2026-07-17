@@ -123,6 +123,20 @@ namespace renderer {
             float godRaysDecay = 0.95f;
             float godRaysDensity = 1.0f;
             float godRaysWeight = 0.25f;
+
+            // Phase PP5: Panini Projection -- 0 = rectilinear (identity, off). See
+            // PostProcessComposite.comp's own ApplyPaniniProjection comment for the algorithm.
+            float paniniD = 0.0f;
+            float paniniS = 0.0f;
+
+            // Phase PP5: Local Contrast Enhancement / Sharpness (single-pass unsharp mask).
+            float sharpenIntensity = 0.0f;
+            float sharpenRadiusPixels = 1.0f;
+
+            // Phase PP5: Film Grain -- animated, luminance-response-curved (more visible in
+            // shadows/midtones, fades in highlights, matching real film stock).
+            float filmGrainIntensity = 0.0f;
+            float filmGrainResponseMidpoint = 0.5f;
         };
 
         // `bloomView` (renderer::BloomPass::GetOutputView(), its own upsample-chain mip 0) is
@@ -161,9 +175,15 @@ namespace renderer {
         // Rays -- `sunDirection` points FROM the light TOWARD the scene (same convention as
         // renderer::ClusterResolvePass::RecordResolve's own sunDirection parameter), so the sun
         // itself sits along -sunDirection from the camera.
+        // `fovYRadians`/`aspectRatio` (Phase PP5, renderer::CameraFrameInfo's own fields): drive
+        // Panini Projection's tangent-space conversion (PostProcessComposite.comp's own
+        // `halfFovTanX`/`halfFovTanY`). `frameIndex` (Phase PP5): seeds Film Grain's own per-frame
+        // animated noise hash (same pixel+frame hashing convention as ReflectionTrace.comp's own
+        // GGX-VNDF sample decorrelation).
         void RecordComposite(VkCommandBuffer cmd, float deltaTimeSeconds, const Settings& settings,
             const maths::mat4& invViewProj, const maths::mat4& prevViewProj, const maths::vec3& cameraPositionWorld,
-            const maths::mat4& viewProj, const maths::vec3& sunDirection);
+            const maths::mat4& viewProj, const maths::vec3& sunDirection,
+            float fovYRadians, float aspectRatio, uint32_t frameIndex);
 
         VkImage GetOutputImage() const { return m_OutputImage; }
         VkImageView GetOutputView() const { return m_OutputView; }
@@ -232,8 +252,22 @@ namespace renderer {
             float godRaysDensity = 1.0f;
             float godRaysWeight = 0.25f;
             float _padGodRays = 0.0f;
+
+            // Phase PP5
+            float paniniD = 0.0f;
+            float paniniS = 0.0f;
+            float halfFovTanX = 1.0f;
+            float halfFovTanY = 1.0f;
+
+            float sharpenIntensity = 0.0f;
+            float sharpenRadiusPixels = 1.0f;
+            float filmGrainIntensity = 0.0f;
+            float filmGrainResponseMidpoint = 0.5f;
+
+            uint32_t frameIndex = 0u;
+            float _padPP5a = 0.0f, _padPP5b = 0.0f, _padPP5c = 0.0f;
         };
-        static_assert(sizeof(PostProcessParamsUBO) == 368,
+        static_assert(sizeof(PostProcessParamsUBO) == 416,
             "PostProcessParamsUBO must match PostProcessComposite.comp's PostProcessParamsUBO exactly (std140 layout)");
 
         // Byte-for-byte mirror of AutoExposureAdapt.comp's push_constant block.
