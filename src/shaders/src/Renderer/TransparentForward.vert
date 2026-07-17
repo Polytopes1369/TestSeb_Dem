@@ -21,6 +21,7 @@
 #include "include/wpo_deformation.glsl"
 #include "include/enhanced_displacement.glsl"
 #include "include/spline_deformation.glsl"
+#include "include/displacement_bounds.glsl"
 
 // Mirrors renderer::TransparentClusterEntry (TransparentForwardPass.h) field-for-field.
 struct TransparentClusterEntry {
@@ -105,7 +106,7 @@ void main() {
     worldPos = xform.center + rotation * localPos;
     normal = rotation * normal;
 
-    worldPos = ApplyWPODeformation(worldPos, entry.clusterID, entry.maxWPOAmplitude, g_WPOGlobals.globalTime);
+    worldPos = ApplyWPODeformation(worldPos, entry.clusterID, GetOriginalWPOAmplitude(entry.maxWPOAmplitude, ed.flags), g_WPOGlobals.globalTime);
 
     // Phase 1 (Nanite advanced): multi-octave enhanced displacement, applied ADDITIVELY right after
     // WPO sway -- see ClusterRaster.vert's identical comment.

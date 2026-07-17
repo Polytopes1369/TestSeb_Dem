@@ -53,6 +53,7 @@
 #include "include/wpo_deformation.glsl"
 #include "include/enhanced_displacement.glsl"
 #include "include/spline_deformation.glsl"
+#include "include/displacement_bounds.glsl"
 #include "include/material_params.glsl"
 #include "include/visbuffer_arbitration.glsl"
 
@@ -305,9 +306,10 @@ void main() {
         // any swaying cluster's re-projected screen-space triangle here disagrees with the one that
         // determined pixel coverage, corrupting the reconstructed barycentric weights (and, at a
         // swaying cluster's own silhouette/boundary, contributing to depth/position mismatches).
-        p0 = ApplyWPODeformation(p0, cluster.clusterID, cluster.maxWPOAmplitude, g_WPOGlobals.globalTime);
-        p1 = ApplyWPODeformation(p1, cluster.clusterID, cluster.maxWPOAmplitude, g_WPOGlobals.globalTime);
-        p2 = ApplyWPODeformation(p2, cluster.clusterID, cluster.maxWPOAmplitude, g_WPOGlobals.globalTime);
+        float originalWPOAmplitude = GetOriginalWPOAmplitude(cluster.maxWPOAmplitude, ed.flags);
+        p0 = ApplyWPODeformation(p0, cluster.clusterID, originalWPOAmplitude, g_WPOGlobals.globalTime);
+        p1 = ApplyWPODeformation(p1, cluster.clusterID, originalWPOAmplitude, g_WPOGlobals.globalTime);
+        p2 = ApplyWPODeformation(p2, cluster.clusterID, originalWPOAmplitude, g_WPOGlobals.globalTime);
 
         // Phase 1 (Nanite advanced): multi-octave enhanced displacement, applied ADDITIVELY right
         // after WPO sway -- see ClusterRaster.vert's identical comment. Must exactly reproduce the

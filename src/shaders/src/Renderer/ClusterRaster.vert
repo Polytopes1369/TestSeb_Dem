@@ -33,6 +33,7 @@
 #include "include/wpo_deformation.glsl"
 #include "include/enhanced_displacement.glsl"
 #include "include/spline_deformation.glsl"
+#include "include/displacement_bounds.glsl"
 
 layout(std430, set = 0, binding = 0) readonly buffer ClusterCullMetadataSSBO {
     ClusterCullMetadata clusters[];
@@ -122,7 +123,7 @@ void main() {
 
     worldPos = xform.center + rotation * localPos;
 
-    worldPos = ApplyWPODeformation(worldPos, cluster.clusterID, cluster.maxWPOAmplitude, g_WPOGlobals.globalTime);
+    worldPos = ApplyWPODeformation(worldPos, cluster.clusterID, GetOriginalWPOAmplitude(cluster.maxWPOAmplitude, ed.flags), g_WPOGlobals.globalTime);
 
     // Phase 1 (Nanite advanced): multi-octave enhanced displacement, applied ADDITIVELY right after
     // the existing WPO sway -- see enhanced_displacement.glsl's own header comment. The debug

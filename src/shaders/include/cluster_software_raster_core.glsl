@@ -15,7 +15,8 @@
 // declared (before this include): ClusterCullMetadata (cluster_culling_common.glsl),
 // DecodeClusterPosition/DecodeClusterUV (cluster_vertex_decode.glsl), EdgeFunction
 // (half_space_raster.glsl), ApplyWPODeformation (wpo_deformation.glsl), ApplyEnhancedDisplacement
-// (enhanced_displacement.glsl), ApplySplineDeformation (spline_deformation.glsl), SampleMaskAlpha
+// (enhanced_displacement.glsl), ApplySplineDeformation (spline_deformation.glsl),
+// GetOriginalWPOAmplitude (displacement_bounds.glsl), SampleMaskAlpha
 // (mask_sampling.glsl, only when HAS_MASK_SUPPORT == 1), and the g_ViewParams/g_WPOGlobals/
 // g_VisBufferAtomic/entityData/entityTransforms/splineControlPoints bindings this function
 // reads/writes.
@@ -73,9 +74,10 @@ void RasterizeClusterTriangle(ClusterCullMetadata cluster, uint clusterSlotIndex
 
     // Applied identically to all 3 vertices, exactly like ClusterRaster.vert, so the half-space
     // test below operates on the same deformed triangle the hardware path would have rasterized.
-    p0World = ApplyWPODeformation(p0World, cluster.clusterID, cluster.maxWPOAmplitude, g_WPOGlobals.globalTime);
-    p1World = ApplyWPODeformation(p1World, cluster.clusterID, cluster.maxWPOAmplitude, g_WPOGlobals.globalTime);
-    p2World = ApplyWPODeformation(p2World, cluster.clusterID, cluster.maxWPOAmplitude, g_WPOGlobals.globalTime);
+    float originalWPOAmplitude = GetOriginalWPOAmplitude(cluster.maxWPOAmplitude, ed.flags);
+    p0World = ApplyWPODeformation(p0World, cluster.clusterID, originalWPOAmplitude, g_WPOGlobals.globalTime);
+    p1World = ApplyWPODeformation(p1World, cluster.clusterID, originalWPOAmplitude, g_WPOGlobals.globalTime);
+    p2World = ApplyWPODeformation(p2World, cluster.clusterID, originalWPOAmplitude, g_WPOGlobals.globalTime);
 
     // Phase 1 (Nanite advanced): multi-octave enhanced displacement, applied ADDITIVELY right after
     // WPO sway -- see ClusterRaster.vert's identical comment for the debug-multiplier rationale.

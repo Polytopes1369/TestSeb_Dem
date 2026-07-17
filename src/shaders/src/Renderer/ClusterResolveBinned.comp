@@ -24,6 +24,7 @@
 #include "include/wpo_deformation.glsl"
 #include "include/enhanced_displacement.glsl"
 #include "include/spline_deformation.glsl"
+#include "include/displacement_bounds.glsl"
 #include "include/material_params.glsl"
 #include "include/shading_bin_common.glsl"
 
@@ -204,9 +205,10 @@ void main() {
 
     // Reapply the exact same WPO sway both rasterizers already applied -- see
     // ClusterResolve.comp's own comment for why this must happen before re-deriving barycentrics.
-    p0 = ApplyWPODeformation(p0, cluster.clusterID, cluster.maxWPOAmplitude, g_WPOGlobals.globalTime);
-    p1 = ApplyWPODeformation(p1, cluster.clusterID, cluster.maxWPOAmplitude, g_WPOGlobals.globalTime);
-    p2 = ApplyWPODeformation(p2, cluster.clusterID, cluster.maxWPOAmplitude, g_WPOGlobals.globalTime);
+    float originalWPOAmplitude = GetOriginalWPOAmplitude(cluster.maxWPOAmplitude, ed.flags);
+    p0 = ApplyWPODeformation(p0, cluster.clusterID, originalWPOAmplitude, g_WPOGlobals.globalTime);
+    p1 = ApplyWPODeformation(p1, cluster.clusterID, originalWPOAmplitude, g_WPOGlobals.globalTime);
+    p2 = ApplyWPODeformation(p2, cluster.clusterID, originalWPOAmplitude, g_WPOGlobals.globalTime);
 
     // Phase 1 (Nanite advanced): multi-octave enhanced displacement, applied ADDITIVELY right
     // after WPO sway -- see ClusterRaster.vert's identical comment.

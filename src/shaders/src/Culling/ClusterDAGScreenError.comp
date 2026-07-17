@@ -4,6 +4,7 @@
 #include "include/cluster_entity_transform.glsl"
 #include "include/enhanced_displacement.glsl"
 #include "include/spline_deformation.glsl"
+#include "include/displacement_bounds.glsl"
 
 // GPU-side DAG LOD cut evaluation for cluster-level screen-space error. The shader consumes a
 // compact per-node payload that mirrors the runtime DAG semantics already used by the CPU-side
@@ -145,19 +146,11 @@ void main() {
     DAGNodePayload node = g_DAGNodes.nodes[index];
 
     // Phase 1 (Nanite advanced): further inflate the WPO bound by this node's owning entity's
-    // enhanced-displacement/spline-deformation worst-case amplitudes (see enhanced_displacement
-    // .glsl / spline_deformation.glsl's own header comments for why each constant is a provable
-    // bound) -- both features displace vertices on top of, not instead of, the existing WPO sway,
-    // so their contributions accumulate additively into one conservative displacement bound, 0 for
-    // any entity with neither flag set (an exact no-op, identical to the pre-Phase-1 behavior).
-    float displacementBound = node.maxWPOAmplitude;
+    // enhanced-displacement/spline-deformation worst-case amplitudes -- see displacement_bounds.glsl's
+    // own header comment for why this same inflated value is later reversed (GetOriginalWPOAmplitude)
+    // before being used as an actual sway amplitude at the raster/resolve call sites.
     uint entityFlags = entityData[node.entityID].flags;
-    if (GetFlag(entityFlags, ENTITY_FLAG_HAS_ENHANCED_DISPLACEMENT)) {
-        displacementBound += ENHANCED_DISPLACEMENT_MAX_AMPLITUDE;
-    }
-    if (GetFlag(entityFlags, ENTITY_FLAG_HAS_SPLINE_DEFORMATION)) {
-        displacementBound += SPLINE_MAX_DEVIATION;
-    }
+    float displacementBound = InflateDisplacementBound(node.maxWPOAmplitude, entityFlags);
 
     // Inflate both error terms by the same amount before projection: this preserves the required
     // strict parentError > clusterError ordering (ClusterDAG.cpp's ValidateClusterDAG invariant --

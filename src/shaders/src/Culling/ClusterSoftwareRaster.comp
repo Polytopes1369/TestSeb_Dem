@@ -51,6 +51,7 @@
 #include "include/wpo_deformation.glsl"
 #include "include/enhanced_displacement.glsl"
 #include "include/spline_deformation.glsl"
+#include "include/displacement_bounds.glsl"
 
 #define MASK_ARRAY_SET 0
 #define MASK_ARRAY_BINDING 6

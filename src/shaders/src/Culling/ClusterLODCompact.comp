@@ -13,6 +13,7 @@
 #include "include/struct_custo.glsl"
 #include "include/enhanced_displacement.glsl"
 #include "include/spline_deformation.glsl"
+#include "include/displacement_bounds.glsl"
 
 #define PAGE_TABLE_SET 0
 #define PAGE_TABLE_BINDING 2
@@ -82,15 +83,10 @@ void main() {
         return; // Shaded by TransparentForwardPass instead -- see EntityDataBuffer's own comment.
     }
 
-    // Phase 1 (Nanite advanced): see ClusterDAGScreenError.comp's identical comment for why these
-    // two bounds accumulate additively on top of the existing WPO amplitude.
-    float displacementBound = node.maxWPOAmplitude;
-    if (GetFlag(entityFlags, ENTITY_FLAG_HAS_ENHANCED_DISPLACEMENT)) {
-        displacementBound += ENHANCED_DISPLACEMENT_MAX_AMPLITUDE;
-    }
-    if (GetFlag(entityFlags, ENTITY_FLAG_HAS_SPLINE_DEFORMATION)) {
-        displacementBound += SPLINE_MAX_DEVIATION;
-    }
+    // Phase 1 (Nanite advanced): see displacement_bounds.glsl's own header comment for why this
+    // inflated bound is later reversed (GetOriginalWPOAmplitude) at every ApplyWPODeformation call
+    // site before being used as an actual sway amplitude.
+    float displacementBound = InflateDisplacementBound(node.maxWPOAmplitude, entityFlags);
 
     uint physicalPageIndex = g_GeometryPageTable.physicalPageIndex[node.logicalPageID];
 
