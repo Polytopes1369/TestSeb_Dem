@@ -27,22 +27,25 @@ struct DebugState {
     bool disableOcclusionCulling = false;
     uint32_t naniteSubMode = 1; // 1 to 7 for Nanite modes
     // renderer::ClusterRenderPipeline::SetDebugTraceMode -- 0 = SWRT (mesh SDF sphere tracing),
-    // 1 = HWRT (inline rayQueryEXT). Shared by SurfaceCacheGIInjectPass and ScreenProbeGIPass so
-    // both ray tracing back-ends stay exercised. Defaults to HWRT, matching Release's own fixed
-    // choice (see ClusterRenderPipeline::RecordFrame's own comment). Set by two explicit keys
-    // ('T'/'Y' below) rather than a single flip-toggle, matching how UE5.8 Lumen itself exposes
-    // this as one explicit project-wide back-end choice, never simultaneous dual-tracing.
+    // 1 = HWRT (inline rayQueryEXT). Shared by SurfaceCacheGIInjectPass and WorldProbeGridPass's
+    // own trace pass so both ray tracing back-ends stay exercised. Defaults to HWRT, matching
+    // Release's own fixed choice (see ClusterRenderPipeline::RecordFrame's own comment). Set by two
+    // explicit keys ('T'/'Y' below) rather than a single flip-toggle, matching how UE5.8 Lumen
+    // itself exposes this as one explicit project-wide back-end choice, never simultaneous
+    // dual-tracing.
     uint32_t traceMode = 1;
     // renderer::ClusterRenderPipeline::SetDebugRadiosityEnabled -- gates the intra-frame
     // multi-bounce radiosity loop ([1z] in RecordFrame) so its cost/contribution can be A/B'd.
     bool radiosityEnabled = true;
-    // renderer::ClusterRenderPipeline::SetDebugSSRTEnabled -- gates the Screen Space Probe GI
-    // trace/temporal/gather trio ([12b] in RecordFrame) so its cost/contribution can be A/B'd.
+    // renderer::ClusterRenderPipeline::SetDebugSSRTEnabled -- gates the Screen Trace GI pass
+    // ([12b] in RecordFrame, Lumen-style linear screen-space march) so its cost/contribution can
+    // be A/B'd.
     bool ssrtEnabled = true;
     // renderer::ClusterRenderPipeline::SetDebugWorldProbesEnabled -- gates the World Probe grid
-    // update ([12c] in RecordFrame). Unlike radiosityEnabled/ssrtEnabled above, this system has no
-    // live consumer yet (see that setter's own comment), so it defaults to true here only to keep
-    // it exercisable in Debug -- Release hardcodes it off regardless of this default.
+    // update ([12c] in RecordFrame). This grid has live consumers every frame (ScreenTracePass's
+    // own miss fallback, GICompositePass's DEBUG_VIEW_SPATIAL_PROBES visualization -- see that
+    // setter's own comment), so Release always runs the update; this Debug-only toggle exists
+    // purely for A/B cost comparison.
     bool worldProbesEnabled = true;
     // renderer::ClusterRenderPipeline::SetDebugReflectionsEnabled -- gates the Phase 2 (UE5.8
     // parity roadmap) specular reflections trace/temporal/gather trio ([12b2] in RecordFrame) so
@@ -129,15 +132,15 @@ static void KeyCallback(GLFWwindow* window, int key, int scancode, int action, i
         break;
     case GLFW_KEY_F:
         g_DebugState.ssrtEnabled = !g_DebugState.ssrtEnabled;
-        LOG_INFO(std::format("[Debug] Screen Space Probe GI (SSRT): {}", g_DebugState.ssrtEnabled ? "ON" : "OFF"));
+        LOG_INFO(std::format("[Debug] Screen Trace GI (SSRT): {}", g_DebugState.ssrtEnabled ? "ON" : "OFF"));
         break;
     case GLFW_KEY_H:
         // Toggles WorldProbeGridPass::RecordUpdate -- see ClusterRenderPipeline::
-        // SetDebugWorldProbesEnabled's own comment: unlike 'G'/'F' above, this pass has no live
-        // consumer in the render path yet (computed for inspection only), so this key exists to
-        // A/B its GPU cost while it's being built out, not to compare a real visual contribution.
+        // SetDebugWorldProbesEnabled's own comment: this pass now has live consumers (ScreenTracePass's
+        // miss fallback, GICompositePass's DEBUG_VIEW_SPATIAL_PROBES visualization), so this key
+        // exists purely to A/B its GPU cost, same as 'G'/'F' above.
         g_DebugState.worldProbesEnabled = !g_DebugState.worldProbesEnabled;
-        LOG_INFO(std::format("[Debug] World Probe Grid (not yet sampled by shading): {}", g_DebugState.worldProbesEnabled ? "ON" : "OFF"));
+        LOG_INFO(std::format("[Debug] World Probe Grid (sampled by Screen Trace GI fallback): {}", g_DebugState.worldProbesEnabled ? "ON" : "OFF"));
         break;
     case GLFW_KEY_R:
         g_DebugState.reflectionsEnabled = !g_DebugState.reflectionsEnabled;

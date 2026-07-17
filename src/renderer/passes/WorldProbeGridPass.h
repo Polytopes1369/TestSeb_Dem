@@ -8,14 +8,15 @@
 // characters, anything without a Surface Cache Card of its own -- would sample for indirect
 // light, via world_probe_sampling.glsl's SampleWorldProbeGrid(), instead of tracing their own rays.
 //
-// --- Current status (2026-07-16 UE5.8-parity audit) ---
-// SampleWorldProbeGrid() has no live caller today -- it is referenced only by the dead
-// ScreenTracePass/GICompositePass (both exist as compilable files but neither is instantiated by
-// renderer::ClusterRenderPipeline). This pass's own RecordUpdate() runs correctly and writes real
-// data into GetGridView() every frame it's called, but nothing downstream reads that view yet.
-// renderer::ClusterRenderPipeline::SetDebugWorldProbesEnabled() gates the RecordUpdate() call
-// itself for exactly this reason (Release skips it rather than paying for an unconsumed result) --
-// see that method's own comment for the plan to re-enable it once a real consumer is wired in.
+// --- Live consumers (since the ScreenTracePass/GICompositePass integration, 2026-07-16) ---
+// SampleWorldProbeGrid() is sampled every frame by renderer::ScreenTracePass (its own screen-space
+// march's miss fallback -- see ScreenTrace.comp's own comment) and, Debug-only, by
+// renderer::GICompositePass's DEBUG_VIEW_SPATIAL_PROBES visualization. This pass's own
+// RecordUpdate() runs unconditionally in Release (renderer::ClusterRenderPipeline::RecordFrame()
+// hardcodes `worldProbesEnabled = true` there) since the real GPU cost is now paying for a real
+// visual contribution; Debug still gates it behind
+// renderer::ClusterRenderPipeline::SetDebugWorldProbesEnabled() (main.cpp's 'H' key) purely for
+// A/B cost comparison, not because the grid is unconsumed.
 //
 // --- Why a full rebuild every frame, not incremental/toroidal streaming ---
 // renderer::GlobalSDFPass's clipmap levels stream incrementally (only newly-revealed slabs are

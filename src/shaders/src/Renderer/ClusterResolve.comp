@@ -443,9 +443,10 @@ void main() {
             finalColor = vec3(motionVector * 0.05 + 0.5, 0.5);
         } else if (pc.viewMode == 14) {
             // DEBUG_VIEW_SPATIAL_PROBES: leave finalColor as normally shaded here --
-            // renderer::ScreenProbeGIPass's gather pass (ScreenProbeGather.comp) overwrites this
-            // pixel with a probe-grid visualization when this view mode is active; this branch
-            // only exists to opt out of the "unhandled view mode" magenta placeholder below.
+            // renderer::GICompositePass's own compute pass (GIComposite.comp) overwrites the final
+            // image with a World Probe grid visualization when this view mode is active (see that
+            // shader's own viewMode==14 branch); this branch only exists to opt out of the
+            // "unhandled view mode" magenta placeholder below.
         } else if (pc.viewMode == 15) { // DEBUG_VIEW_SHADOW_CASCADES
             // Color-codes which sun clipmap level (renderer::VirtualShadowMapPass, Phase 3) covers
             // this pixel's world position -- red=level 0 (finest), green=level 1, blue=level 2

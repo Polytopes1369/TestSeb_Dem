@@ -81,7 +81,6 @@
 #include "renderer/LightingTypes.h"
 #include "renderer/passes/ProceduralMaskGenerator.h"
 #include "renderer/passes/ReflectionPass.h"
-#include "renderer/passes/ScreenProbeGIPass.h"
 #include "renderer/passes/SurfaceCacheGIInjectPass.h"
 #include "renderer/passes/SurfaceCachePass.h"
 #include "renderer/passes/SurfaceCacheRayTracingPass.h"
@@ -195,10 +194,12 @@ namespace renderer {
         uint32_t GetClusterCount() const { return m_ClusterCount; }
 
 #ifndef NDEBUG
-        // SWRT/HWRT back-end toggle shared by m_GIInject and m_ScreenProbeGI (0 = SWRT mesh-SDF
-        // sphere tracing, 1 = HWRT inline rayQueryEXT against m_SurfaceCacheRT's TLAS) -- debug-only
-        // (main.cpp's 'T'/'Y' explicit-set keys) so both back-ends stay exercised; Release always
-        // uses HWRT (see RecordFrame()'s own use of this member).
+        // SWRT/HWRT back-end toggle shared by m_GIInject and m_WorldProbes' own trace pass (0 = SWRT
+        // mesh-SDF sphere tracing, 1 = HWRT inline rayQueryEXT against m_SurfaceCacheRT's TLAS) --
+        // debug-only (main.cpp's 'T'/'Y' explicit-set keys) so both back-ends stay exercised; Release
+        // always uses HWRT (see RecordFrame()'s own use of this member). m_ScreenTrace does not use
+        // this toggle at all -- its own march is a plain screen-space depth march, not an SWRT/HWRT
+        // trace (see ScreenTracePass's own class comment).
         void SetDebugTraceMode(uint32_t traceMode) { m_DebugTraceMode = traceMode; }
 
         // Independently gates RecordFrame()'s [1z] intra-frame radiosity bounce loop
@@ -207,32 +208,29 @@ namespace renderer {
         // main.cpp's 'G' key. Defaults to true (Release has no toggle and always runs the loop).
         void SetDebugRadiosityEnabled(bool enabled) { m_DebugRadiosityEnabled = enabled; }
 
-        // Independently gates RecordFrame()'s [12b] m_ScreenProbeGI RecordTrace/RecordTemporal/
-        // RecordGather trio entirely -- skipped means zero screen-space probe indirect contribution
-        // this frame, so its cost/contribution is directly A/B-able the same way -- see main.cpp's
-        // 'F' key. Defaults to true (Release has no toggle and always runs the trio).
+        // Independently gates RecordFrame()'s [12b] m_ScreenTrace.RecordTrace call (Lumen-style
+        // Screen Trace: linear screen-space depth march, falling back to m_WorldProbes on a miss --
+        // see ScreenTracePass's own class comment) entirely -- skipped means m_ScreenTrace's output
+        // image is cleared to zero instead of traced this frame, so its cost/contribution is
+        // directly A/B-able -- see main.cpp's 'F' key. Defaults to true (Release has no toggle and
+        // always runs the trace).
         void SetDebugSSRTEnabled(bool enabled) { m_DebugSSRTEnabled = enabled; }
 
         // Gates RecordFrame()'s [12c] m_WorldProbes.RecordUpdate() dispatch -- see main.cpp's 'H'
-        // key. UNLIKE SetDebugRadiosityEnabled/SetDebugSSRTEnabled above, this is NOT a real
-        // production GI term yet: world_probe_sampling.glsl's SampleWorldProbeGrid() is referenced
-        // only by the dead ScreenTracePass/GICompositePass (never instantiated by this class, see
-        // m_WorldProbes' own member comment) -- so the grid is fully computed every frame but
-        // sampled by nothing in the live pipeline. Release therefore hardcodes this OFF
-        // (RecordFrame() skips the dispatch entirely, unlike radiosity/SSRT's Release-always-on),
-        // so a real GPU cost is not paid for zero visual effect. Debug defaults to true so the pass
-        // stays exercised/inspectable while a real consumer is built. Flip Release's hardcoded
-        // default to true once a live consumer samples this grid (e.g. dynamic or off-screen
-        // objects with no Surface Cache Card of their own).
+        // key. This grid now has real live consumers every frame: m_ScreenTrace's own miss fallback
+        // and GICompositePass's DEBUG_VIEW_SPATIAL_PROBES visualization (both wired in by the
+        // ScreenTracePass/GICompositePass integration -- see m_WorldProbes' own member comment), so
+        // Release hardcodes this ON (RecordFrame() always dispatches the update), matching
+        // SetDebugRadiosityEnabled/SetDebugSSRTEnabled's own Release-always-on convention. Debug
+        // defaults to true too, purely for A/B cost comparison via this toggle.
         void SetDebugWorldProbesEnabled(bool enabled) { m_DebugWorldProbesEnabled = enabled; }
 
         // Independently gates RecordFrame()'s [12b2] m_Reflection RecordTrace/RecordTemporal/
-        // RecordGather trio -- see main.cpp's 'R' key. UNLIKE SetDebugWorldProbesEnabled above,
-        // this pass has a real live consumer from its very first frame (m_Resolve's own output
-        // color image, via the same direct-RMW convention as m_ScreenProbeGI), so it defaults to
-        // true here AND Release hardcodes it permanently on (no toggle exists in Release, matching
-        // SetDebugSSRTEnabled/SetDebugRadiosityEnabled's own Release-always-on convention, not
-        // SetDebugWorldProbesEnabled's Release-always-off one).
+        // RecordGather trio -- see main.cpp's 'R' key. Like SetDebugWorldProbesEnabled above, this
+        // pass has a real live consumer from its very first frame (m_Resolve's own output color
+        // image, via a direct-RMW convention), so it defaults to true here AND Release hardcodes it
+        // permanently on (no toggle exists in Release, matching SetDebugSSRTEnabled/
+        // SetDebugRadiosityEnabled/SetDebugWorldProbesEnabled's own Release-always-on convention).
         void SetDebugReflectionsEnabled(bool enabled) { m_DebugReflectionsEnabled = enabled; }
         void SetDebugTAATSREnabled(bool enabled) { m_DebugTAATSREnabled = enabled; }
 
@@ -369,63 +367,64 @@ namespace renderer {
 
         // Shared trace-scene descriptor sets (mesh SDF trace + Surface Cache sampling, see
         // SurfaceCacheTraceContext's own class comment) built once from m_GlobalSDF + m_SurfaceCache,
-        // reused unmodified by m_SurfaceCacheRT, m_GIInject, m_ScreenProbeGI's own trace pass, and
-        // m_WorldProbes' own trace pass.
+        // reused unmodified by m_SurfaceCacheRT, m_GIInject, and m_WorldProbes' own trace pass.
         SurfaceCacheTraceContext m_TraceContext;
         // HWRT back-end: one BLAS per traced entity + one TLAS, built once (static scene) against
         // m_SurfaceCache's own Fallback Mesh vertex/index buffers.
         SurfaceCacheRayTracingPass m_SurfaceCacheRT;
         // Per-card hemisphere-sampled secondary-bounce injection into m_SurfaceCache's own radiance
-        // atlas -- makes that atlas genuinely multi-bounce over time, which is what
-        // m_ScreenProbeGI's single-hit-sample final gather then benefits from.
+        // atlas -- makes that atlas genuinely multi-bounce over time, which every downstream GI
+        // consumer (m_WorldProbes' own trace pass, m_ScreenTrace's near-field hit samples) then
+        // benefits from.
         SurfaceCacheGIInjectPass m_GIInject;
 
-        // Screen Space Probe GI (Lumen "Screen Probe Gather"): traces Fibonacci-sphere rays per
-        // 8x8-pixel probe (sampling m_SurfaceCache's radiance atlas at each hit via m_TraceContext/
-        // m_SurfaceCacheRT), temporally accumulates, and gathers the result back into m_Resolve's
-        // output color image -- see ScreenProbeGIPass's own class comment.
-        ScreenProbeGIPass m_ScreenProbeGI;
+        // NOTE: this class previously also owned a ScreenProbeGIPass ("Screen Space Probe GI" /
+        // Lumen "Screen Probe Gather") here -- a per-8x8-tile SH probe grid, temporally accumulated,
+        // gathered back into m_Resolve's output color image via read-modify-write. The
+        // ScreenTracePass/GICompositePass integration below replaced it as this codebase's near-
+        // field screen-space GI term (a plain per-pixel screen-space march instead of a per-tile
+        // probe grid); the instantiation was removed here to stop paying for its ~10 full-resolution
+        // images/3 pipelines every run. ScreenProbeGIPass.h/.cpp and its 3 shaders (ScreenProbeTrace/
+        // Temporal/Gather.comp) remain in the repo (file deletion blocked, see memory
+        // feedback_file_deletion_blocked) but are no longer instantiated here -- same convention as
+        // ShadowMapPass.h/.cpp above.
 
         // Phase 2 (UE5.8 parity roadmap): specular reflections / GI -- traces ONE GGX-VNDF-
-        // importance-sampled ray per pixel per frame (full resolution, unlike m_ScreenProbeGI's
-        // coarser 8x8-tile probes -- a sharp reflection cannot survive that coarseness), sampling
-        // the same m_SurfaceCache radiance atlas at each hit, and Fresnel-weighted read-modify-
-        // writes the result into m_Resolve's own output color image -- see ReflectionPass's own
-        // class comment for the full pipeline and why its storage is raw RGBA16F radiance, not
-        // m_ScreenProbeGI's spherical harmonics (physically incapable of a narrow specular lobe).
+        // importance-sampled ray per pixel per frame (full resolution), sampling the same
+        // m_SurfaceCache radiance atlas at each hit, and Fresnel-weighted read-modify-writes the
+        // result into m_Resolve's own output color image -- see ReflectionPass's own class comment
+        // for the full pipeline and why its storage is raw RGBA16F radiance, not spherical harmonics
+        // (physically incapable of a narrow specular lobe).
         ReflectionPass m_Reflection;
 
         // World Probe grid (Lumen "Translucency Volume" / global illumination volume): a low-
         // resolution, camera-centered 3D grid of ambient irradiance probes, fully rebuilt every
-        // frame from m_SurfaceCache's radiance atlas -- INTENDED as what dynamic/off-screen objects
-        // (particle systems, animated characters, anything m_ScreenProbeGI's screen-space probes
-        // cannot cover because they have no on-screen presence of their own) would sample for
-        // indirect light, via world_probe_sampling.glsl's SampleWorldProbeGrid(). See
-        // WorldProbeGridPass's own class comment for why this is a SEPARATE system from
-        // m_ScreenProbeGI, not a duplicate of it.
-        //
-        // CURRENT STATUS (as of the 2026-07-16 UE5.8-parity audit): SampleWorldProbeGrid() has no
-        // live caller -- it is referenced only by the dead ScreenTracePass/GICompositePass, neither
-        // ever instantiated by this class. The grid is computed correctly every frame but consumed
-        // by nothing yet. See SetDebugWorldProbesEnabled()'s own comment: Release does not pay for
-        // this dispatch until a real consumer exists (planned once entity movement/dynamic objects
-        // are supported).
+        // frame from m_SurfaceCache's radiance atlas, sampled via world_probe_sampling.glsl's
+        // SampleWorldProbeGrid(). Live consumers: m_ScreenTrace's own miss fallback (every frame)
+        // and GICompositePass's DEBUG_VIEW_SPATIAL_PROBES visualization (Debug only) -- see
+        // WorldProbeGridPass's own class comment.
         WorldProbeGridPass m_WorldProbes;
+        // Screen Trace GI (Lumen-style "Screen Trace"): per-pixel linear screen-space depth march,
+        // near-field hit samples m_Resolve's own direct-lit color, miss falls back to m_WorldProbes
+        // -- see ScreenTracePass's own class comment.
         ScreenTracePass m_ScreenTrace;
+        // Final GI composite: direct-lit color + m_Denoiser's denoised indirect term, and (Debug
+        // only) the DEBUG_VIEW_LUMEN/DEBUG_VIEW_SPATIAL_PROBES visualizations -- see
+        // GICompositePass's own class comment.
         GICompositePass m_GIComposite;
 
         // Final spatial denoiser (À-Trous wavelet, edge-guided by m_Resolve's own G-buffer normal/
-        // depth): a spatial cleanup pass over the fully composited frame (direct light +
-        // m_ScreenProbeGI's own temporally-accumulated indirect term), applied only in the normal
-        // (non-debug-visualization) view path -- see RecordFrame()'s own comment for exactly why.
+        // depth): a spatial cleanup pass over m_ScreenTrace's own noisy combined (near-field +
+        // World Probe fallback) indirect term, applied only in the normal (non-debug-visualization)
+        // view path -- see RecordFrame()'s own comment for exactly why.
         ATrousDenoisePass m_Denoiser;
         TAATSRPass m_TAATSR;
 
-        // Previous frame's combined view-projection matrix -- ScreenProbeGIPass's temporal pass
-        // (and ClusterResolve.comp's DEBUG_VIEW_MOTION_VECTORS) reprojects a probe's/pixel's
-        // (static, see this class' own "Entity self-rotation" scope note) world position with this
-        // matrix to find its screen position last frame. Updated at the very end of RecordFrame(),
-        // after every consumer of "the previous frame's" value has run.
+        // Previous frame's combined view-projection matrix -- ClusterResolve.comp's own
+        // DEBUG_VIEW_MOTION_VECTORS reprojects a pixel's (static, see this class' own "Entity self-
+        // rotation" scope note) world position with this matrix to find its screen position last
+        // frame. Updated at the very end of RecordFrame(), after every consumer of "the previous
+        // frame's" value has run.
         maths::mat4 m_PrevViewProj{};
         bool m_HasPrevViewProj = false;
 
