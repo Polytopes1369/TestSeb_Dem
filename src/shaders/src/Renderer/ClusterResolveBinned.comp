@@ -27,6 +27,7 @@
 #include "include/displacement_bounds.glsl"
 #include "include/material_params.glsl"
 #include "include/substrate_bsdf.glsl"
+#include "include/terrain_shading.glsl" // Phase 7b (UE5.8 parity roadmap, terrain heightfield)
 #include "include/shading_bin_common.glsl"
 
 #define MASK_ARRAY_SET 0
@@ -283,6 +284,12 @@ void main() {
     vec3 viewDir = normalize(g_ViewParams.cameraPositionWorld - worldPos);
 
     MaterialParams mat = g_MaterialParams.params[pc.binIndex];
+    // Phase 7b (UE5.8 parity roadmap, terrain heightfield): pc.binIndex IS this dispatch's
+    // materialSlot already, so this is a UNIFORM branch (zero warp divergence) -- every thread in
+    // a terrain-bin dispatch takes it, every thread in any other bin's dispatch skips it entirely.
+    if (pc.binIndex == MATERIAL_ID_TERRAIN) {
+        mat.base.diffuseAlbedo = ComputeTerrainAlbedo(worldPos, normal, mat.base.diffuseAlbedo);
+    }
 
     // Step 4: Runtime Virtual Texture detail multiply -- see ClusterResolve.comp's own identical
     // comment for the full rationale (safe no-op multiply until real tile content exists).

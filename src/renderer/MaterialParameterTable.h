@@ -121,10 +121,20 @@ namespace renderer {
     // 0..14 each get materialID == their own index, see that function's own zone-layout comment)
     // -- so this reserved slot can never collide with a real entity's own showcase material (in
     // particular slot 13, the green Cornell-box wall -- an earlier revision of this constant
-    // mistakenly reused that exact slot and silently clobbered it; see [[feedback_clean_merge_not_correct]]).
+    // mistakenly reused that exact slot and silently clobbered it).
     // Assigned explicitly to exactly one entity (the Icosphere, VulkanContext::kHeroEntityIndex) in
     // VulkanContext::BuildEntityData(), never reached via the per-entity assignment loop.
     inline constexpr uint32_t kHeroMaterialID = 15u;
+
+    // Phase 7b (UE5.8 parity roadmap, terrain heightfield): the procedural terrain entity's
+    // fallback material. Reserved one past kHeroMaterialID, same "never collides with a real
+    // entity's showcase material" convention. Unlike glass/hero, this recipe's baseColor is only a
+    // FALLBACK: ClusterResolve.comp/ClusterResolveBinned.comp override it per-pixel with a
+    // height/slope biome blend (grass/rock/snow, see terrain_shading.glsl) for any cluster tagged
+    // with this materialID -- the terrain still renders through the normal opaque Nanite path (no
+    // ClusterLODCompact.comp exclusion needed, unlike the hero entity: terrain is fully opaque and
+    // has no runtime-displaced/tessellated representation to protect).
+    inline constexpr uint32_t kTerrainMaterialID = 16u;
 
     // One generated table: the PBR parameters themselves, plus a parallel convenience flag so
     // callers (VulkanContext::BuildEntityData, deciding each entity's core::EntityFlags::
@@ -287,6 +297,15 @@ namespace renderer {
         table.params[kHeroMaterialID].topWeight = 0.35f;
         table.params[kHeroMaterialID].top.roughness = 0.10f;
         table.params[kHeroMaterialID].top.f0 = maths::vec3(0.04f, 0.04f, 0.04f);
+
+        // Phase 7b (UE5.8 parity roadmap, terrain heightfield): terrain fallback -- grass-green,
+        // high roughness, dielectric. Overridden per-pixel by ComputeTerrainAlbedo()'s height/slope
+        // blend wherever the terrain material is shaded (writes mat.base.diffuseAlbedo directly, see
+        // ClusterResolve.comp/ClusterResolveBinned.comp's own Step 3 comment); this diffuseAlbedo
+        // only matters where that blend degenerates (e.g. flat low ground -> grass anyway).
+        // kTerrainMaterialID (16) likewise sits past every hand-authored slot, untouched by the
+        // isTransparent loop above.
+        table.params[kTerrainMaterialID].base = MakeBaseSlab(maths::vec3(0.24f, 0.42f, 0.15f), 0.88f, maths::vec3(0.0f, 0.0f, 0.0f), 0.0f);
 
         return table;
     }

@@ -45,10 +45,31 @@ namespace geometry {
                     }
                 }
 
+                // Diagnostic bounds check (2026-07-17 investigation: a heap-corrupting crash was
+                // traced to this exact read -- src.triangles[t+X] indexing srcToMerged, sized to
+                // src.positions.size() -- during Phase 7b's own cold-cache-rebuild verification,
+                // reproducible single-threaded so NOT a race condition. Root cause is presumably an
+                // upstream ClusterDAG.cpp bug (a root node's own mesh carrying a triangle index past
+                // its own positions array), not yet isolated further. Skipping the offending triangle
+                // and logging it converts a silent out-of-bounds write (undefined behavior, observed
+                // to corrupt the heap and crash an unrelated later allocation) into a clean,
+                // diagnosable error instead.
+                const uint32_t srcVertexCount = static_cast<uint32_t>(src.positions.size());
                 for (size_t t = 0; t + 2 < src.triangles.size(); t += 3) {
-                    merged.triangles.push_back(srcToMerged[src.triangles[t + 0]]);
-                    merged.triangles.push_back(srcToMerged[src.triangles[t + 1]]);
-                    merged.triangles.push_back(srcToMerged[src.triangles[t + 2]]);
+                    uint32_t i0 = src.triangles[t + 0];
+                    uint32_t i1 = src.triangles[t + 1];
+                    uint32_t i2 = src.triangles[t + 2];
+                    if (i0 >= srcVertexCount || i1 >= srcVertexCount || i2 >= srcVertexCount) {
+                        LOG_ERROR(std::format(
+                            "[FallbackMeshBuilder] Root node {} (level {}) triangle at offset {} references "
+                            "out-of-range vertex index/indices ({}, {}, {}) against its own mesh's {} "
+                            "position(s) -- skipping this triangle (see this loop's own comment).",
+                            rootIdx, dag.nodes[rootIdx].level, t, i0, i1, i2, srcVertexCount));
+                        continue;
+                    }
+                    merged.triangles.push_back(srcToMerged[i0]);
+                    merged.triangles.push_back(srcToMerged[i1]);
+                    merged.triangles.push_back(srcToMerged[i2]);
                 }
             }
 
