@@ -198,6 +198,69 @@ target_link_libraries(VirtualTextureRenderPassTests PRIVATE Vulkan::Vulkan)
 add_test(NAME VirtualTextureRenderPassTests COMMAND VirtualTextureRenderPassTests)
 
 # ==============================================================================
+# WORLD PARTITION OFFLINE TOOLSET (tools/WorldPartition/)
+# ==============================================================================
+# Offline editor/cook-time tooling (OFPA actor serialization, scene index, spatial hash grid,
+# HLOD generation pipeline): deliberately lives under tools/, NOT src/, so it is never picked up
+# by ALL_SOURCES's `file(GLOB_RECURSE ... "src/*.cpp")` above and never links into the shipping
+# DemoSceneVK executable -- matching CLAUDE.md's "no data/tooling weight in the .exe" rule. It is
+# only ever built here, as its own standalone, framework-free test executables (same pattern as
+# every other tests/*.cpp target above).
+
+# Optional meshoptimizer-backed simplification backend (HlodPipeline.h's
+# MeshOptimizerSimplificationBackend) -- OFF by default so the default build stays
+# dependency-free. To enable: vendor zeux/meshoptimizer under vendor/meshoptimizer (its own
+# CMakeLists.txt provides the `meshoptimizer` target), then configure with
+# -DWITH_MESHOPTIMIZER=ON.
+option(WITH_MESHOPTIMIZER "Enable HlodPipeline's meshoptimizer-backed simplification backend" OFF)
+if(WITH_MESHOPTIMIZER AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/vendor/meshoptimizer/CMakeLists.txt")
+    add_subdirectory(vendor/meshoptimizer)
+    set(WORLDPARTITION_MESHOPT_DEFINE "WORLDPARTITION_WITH_MESHOPTIMIZER")
+    set(WORLDPARTITION_MESHOPT_LIB meshoptimizer)
+elseif(WITH_MESHOPTIMIZER)
+    message(WARNING "WITH_MESHOPTIMIZER is ON but vendor/meshoptimizer/CMakeLists.txt was not found -- building without it.")
+endif()
+
+set(WORLDPARTITION_OFPA_SOURCES
+    tools/WorldPartition/Uuid.cpp
+    tools/WorldPartition/OfpaActor.cpp
+    tools/WorldPartition/SceneIndex.cpp
+)
+set(WORLDPARTITION_HLOD_SOURCES
+    tools/WorldPartition/Uuid.cpp
+    tools/WorldPartition/SpatialHashGrid.cpp
+    tools/WorldPartition/HlodPipeline.cpp
+    src/geometry/MeshSimplifier.cpp
+    src/core/Logger.cpp
+)
+
+add_executable(OfpaSerializationTests
+    ${WORLDPARTITION_OFPA_SOURCES}
+    tests/OfpaSerializationTests.cpp
+)
+target_include_directories(OfpaSerializationTests PRIVATE src tools ${Vulkan_INCLUDE_DIRS})
+add_test(NAME OfpaSerializationTests COMMAND OfpaSerializationTests)
+
+add_executable(SpatialHashGridTests
+    tools/WorldPartition/Uuid.cpp
+    tools/WorldPartition/SpatialHashGrid.cpp
+    tests/SpatialHashGridTests.cpp
+)
+target_include_directories(SpatialHashGridTests PRIVATE src tools ${Vulkan_INCLUDE_DIRS})
+add_test(NAME SpatialHashGridTests COMMAND SpatialHashGridTests)
+
+add_executable(HlodPipelineTests
+    ${WORLDPARTITION_HLOD_SOURCES}
+    tests/HlodPipelineTests.cpp
+)
+target_include_directories(HlodPipelineTests PRIVATE src tools ${Vulkan_INCLUDE_DIRS})
+if(WORLDPARTITION_MESHOPT_DEFINE)
+    target_compile_definitions(HlodPipelineTests PRIVATE ${WORLDPARTITION_MESHOPT_DEFINE})
+    target_link_libraries(HlodPipelineTests PRIVATE ${WORLDPARTITION_MESHOPT_LIB})
+endif()
+add_test(NAME HlodPipelineTests COMMAND HlodPipelineTests)
+
+# ==============================================================================
 # AUTOMATIZED SHADER COMPILATION & POST-BUILD COPY
 # ==============================================================================
 
