@@ -24,6 +24,7 @@ inline constexpr std::string_view FORCED_PROFILE_NAME =
 // Window size is 1920x1080 across all profiles
 inline uint32_t WINDOW_WIDTH = 1920;
 inline uint32_t WINDOW_HEIGHT = 1080;
+inline uint32_t TARGET_FPS = 60;
 inline float VERTEX_SPACING = 0.05f;
 inline float FLOOR_VERTEX_SPACING = 1.0f;
 
@@ -140,6 +141,9 @@ inline std::string g_ActiveProfileName = "High"; // Default to High properties
 
 inline void ApplyProfile(std::string_view profileName) {
   if (profileName == "Extrem") {
+    WINDOW_WIDTH = config_extrem::WINDOW_WIDTH;
+    WINDOW_HEIGHT = config_extrem::WINDOW_HEIGHT;
+    TARGET_FPS = config_extrem::TARGET_FPS;
     VERTEX_SPACING = config_extrem::VERTEX_SPACING;
     _VIEW_DISTANCE_QUALITY = config_extrem::VIEW_DISTANCE_QUALITY;
     nanite::SOFTWARE_RASTER_THRESHOLD_PIXELS =
@@ -228,6 +232,9 @@ inline void ApplyProfile(std::string_view profileName) {
     volumetrics::_VOLUMETRIC_CLOUD_VIEW_RAY_SAMPLE_COUNT_SCALE = config_extrem::
         volumetrics::VOLUMETRIC_CLOUD_VIEW_RAY_SAMPLE_COUNT_SCALE;
   } else if (profileName == "High") {
+    WINDOW_WIDTH = config_high::WINDOW_WIDTH;
+    WINDOW_HEIGHT = config_high::WINDOW_HEIGHT;
+    TARGET_FPS = config_high::TARGET_FPS;
     VERTEX_SPACING = config_high::VERTEX_SPACING;
     _VIEW_DISTANCE_QUALITY = config_high::VIEW_DISTANCE_QUALITY;
     nanite::SOFTWARE_RASTER_THRESHOLD_PIXELS =
@@ -312,6 +319,9 @@ inline void ApplyProfile(std::string_view profileName) {
     volumetrics::_VOLUMETRIC_CLOUD_VIEW_RAY_SAMPLE_COUNT_SCALE =
         config_high::volumetrics::VOLUMETRIC_CLOUD_VIEW_RAY_SAMPLE_COUNT_SCALE;
   } else if (profileName == "Medium") {
+    WINDOW_WIDTH = config_medium::WINDOW_WIDTH;
+    WINDOW_HEIGHT = config_medium::WINDOW_HEIGHT;
+    TARGET_FPS = config_medium::TARGET_FPS;
     VERTEX_SPACING = config_medium::VERTEX_SPACING;
     _VIEW_DISTANCE_QUALITY = config_medium::VIEW_DISTANCE_QUALITY;
     nanite::SOFTWARE_RASTER_THRESHOLD_PIXELS =
@@ -400,6 +410,9 @@ inline void ApplyProfile(std::string_view profileName) {
     volumetrics::_VOLUMETRIC_CLOUD_VIEW_RAY_SAMPLE_COUNT_SCALE = config_medium::
         volumetrics::VOLUMETRIC_CLOUD_VIEW_RAY_SAMPLE_COUNT_SCALE;
   } else if (profileName == "Low") {
+    WINDOW_WIDTH = config_low::WINDOW_WIDTH;
+    WINDOW_HEIGHT = config_low::WINDOW_HEIGHT;
+    TARGET_FPS = config_low::TARGET_FPS;
     VERTEX_SPACING = config_low::VERTEX_SPACING;
     _VIEW_DISTANCE_QUALITY = config_low::VIEW_DISTANCE_QUALITY;
     nanite::SOFTWARE_RASTER_THRESHOLD_PIXELS =
@@ -550,28 +563,35 @@ inline void InitializeProfileFromGPU(std::string_view deviceName) {
     deviceUpper += std::toupper(static_cast<unsigned char>(c));
   }
 
+  // Tier 1: Extrem (RTX 5080, RTX 4090, RTX 5090)
   if (deviceUpper.find("5090") != std::string::npos ||
-      deviceUpper.find("4090") != std::string::npos) {
+      deviceUpper.find("4090") != std::string::npos ||
+      deviceUpper.find("5080") != std::string::npos ||
+      deviceUpper.find("BLACKWELL") != std::string::npos) {
     profile = "Extrem";
-  } else if (deviceUpper.find("5080") != std::string::npos ||
-             deviceUpper.find("4080") != std::string::npos ||
-             deviceUpper.find("BLACKWELL") != std::string::npos) {
+  }
+  // Tier 2: High (RTX 4080, RTX 4070 Ti, RTX 4070)
+  else if (deviceUpper.find("4080") != std::string::npos ||
+           deviceUpper.find("4070") != std::string::npos ||
+           deviceUpper.find("3090") != std::string::npos ||
+           deviceUpper.find("3080") != std::string::npos) {
     profile = "High";
-  } else if (deviceUpper.find("4070") != std::string::npos ||
-             deviceUpper.find("7800") != std::string::npos ||
-             deviceUpper.find("4060") != std::string::npos ||
-             deviceUpper.find("ADA LOVELACE") != std::string::npos) {
+  }
+  // Tier 3: Medium (RTX 4060)
+  else if (deviceUpper.find("4060") != std::string::npos ||
+           deviceUpper.find("7600") != std::string::npos ||
+           deviceUpper.find("ADA LOVELACE") != std::string::npos) {
     profile = "Medium";
-  } else if (deviceUpper.find("3090") != std::string::npos ||
-             deviceUpper.find("3080") != std::string::npos ||
-             deviceUpper.find("3070") != std::string::npos ||
-             deviceUpper.find("3060") != std::string::npos ||
-             deviceUpper.find("2080") != std::string::npos ||
-             deviceUpper.find("2070") != std::string::npos ||
-             deviceUpper.find("2060") != std::string::npos ||
-             deviceUpper.find("AMPERE") != std::string::npos ||
-             deviceUpper.find("TURING") != std::string::npos ||
-             deviceUpper.find("6700") != std::string::npos) {
+  }
+  // Tier 4: Low (RTX 3060 / Older architectures)
+  else if (deviceUpper.find("3070") != std::string::npos ||
+           deviceUpper.find("3060") != std::string::npos ||
+           deviceUpper.find("2080") != std::string::npos ||
+           deviceUpper.find("2070") != std::string::npos ||
+           deviceUpper.find("2060") != std::string::npos ||
+           deviceUpper.find("AMPERE") != std::string::npos ||
+           deviceUpper.find("TURING") != std::string::npos ||
+           deviceUpper.find("6700") != std::string::npos) {
     profile = "Low";
   }
 

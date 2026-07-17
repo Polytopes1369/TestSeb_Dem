@@ -307,12 +307,14 @@ DebugCallback(VkDebugUtilsMessageSeverityFlagBitsEXT messageSeverity,
   return VK_FALSE;
 }
 #endif // NDEBUG
-
 void VulkanContext::Init(std::string_view appName, GLFWwindow *window) {
   CreateInstance(appName);
   SetupDebugMessenger();
   CreateSurface(window);
   PickPhysicalDevice();
+
+  // Resize GLFW window to match the loaded/detected profile dimensions
+  glfwSetWindowSize(window, config::WINDOW_WIDTH, config::WINDOW_HEIGHT);
 
   m_VertexBufferBytes = config::nanite::VERTEX_BUFFER_BYTES;
   m_IndexBufferBytes = config::nanite::INDEX_BUFFER_BYTES;

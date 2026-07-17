@@ -23,6 +23,9 @@ public:
     // VkPhysicalDeviceRayTracingPipelinePropertiesKHR (Shader Binding Table alignment) -- the one
     // consumer in this codebase that needs the physical device handle outside VulkanContext itself.
     VkPhysicalDevice GetPhysicalDevice() const { return m_PhysicalDevice; }
+    VkInstance GetInstance() const { return m_Instance; }
+    uint32_t GetGraphicsQueueFamilyIndex() const { return m_GraphicsQueueFamilyIndex; }
+    VkFormat GetSwapchainImageFormat() const { return m_SwapchainImageFormat; }
     VkSwapchainKHR GetSwapchain() const { return m_Swapchain; }
     VkExtent2D GetSwapchainExtent() const { return m_SwapchainExtent; }
     const std::vector<VkImage>& GetSwapchainImages() const { return m_SwapchainImages; }

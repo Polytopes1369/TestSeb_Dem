@@ -4,7 +4,8 @@
 namespace config_medium {
 constexpr uint32_t WINDOW_WIDTH = 1920;
 constexpr uint32_t WINDOW_HEIGHT = 1080;
-// High: 0.10f spacing balances high geometric detail with excellent compute throughput on Ada Lovelace.
+constexpr uint32_t TARGET_FPS = 60;
+// Medium: 0.10f spacing balances high geometric detail with Ada Lovelace compute throughput.
 constexpr float VERTEX_SPACING = 0.10f;
 constexpr float FLOOR_VERTEX_SPACING = 1.0f;
 
@@ -32,13 +33,13 @@ constexpr float MAX_PIXELS_PER_EDGE = 2.0f;
 } // namespace nanite
 
 namespace streaming {
-// UE 5.8: r.Streaming.PoolSize=3000 (Safe 3GB cap to prevent "Out of Video Memory" crashes on the 8GB RTX 4060)
+// UE 5.8: r.Streaming.PoolSize=3000 (Safe 3GB cap to prevent OOM crashes on the 8GB RTX 4060)
 constexpr uint32_t POOL_SIZE_MB = 3000;
 } // namespace streaming
 
 namespace temporal {
-// Native 1080p target resolution
-constexpr float RENDER_SCALE = 1.000f;
+// Internal render scale (720p internally, reconstructed to 1080p via TSR)
+constexpr float RENDER_SCALE = 0.667f;
 constexpr float BLEND_ALPHA = 0.08f;
 constexpr float BLEND_ALPHA_STATIC = 0.20f;
 constexpr float VARIANCE_CLAMP_FACTOR = 1.5f;
@@ -102,7 +103,7 @@ constexpr bool REFLECTIONS_ALLOW = true;
 // No downsampling for cleaner hardware reflection tracing
 constexpr uint32_t REFLECTIONS_DOWNSAMPLE_FACTOR = 1;
 
-constexpr bool HARDWARE_RAYTRACING_NANITE_MODE = false; // Kept off on High to save performance
+constexpr bool HARDWARE_RAYTRACING_NANITE_MODE = false; // Kept off on Medium to save performance
 constexpr bool MEGALIGHTS_ENABLE = false;
 } // namespace lumen
 

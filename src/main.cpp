@@ -10,6 +10,13 @@
 #include "geometry/VirtualGeometryCacheTest.h"
 #include <exception>
 #include <format>
+#include <thread>
+#include <chrono>
+#ifndef NDEBUG
+#include "imgui.h"
+#include "backends/imgui_impl_glfw.h"
+#include "backends/imgui_impl_vulkan.h"
+#endif
 
 #ifndef NDEBUG
 struct DebugState {
@@ -189,6 +196,66 @@ int main() {
     VulkanContext vkContext;
     vkContext.Init("DemoScene", window);
 
+#ifndef NDEBUG
+    // Setup Dear ImGui context
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO(); (void)io;
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;     // Enable Keyboard Controls
+
+    // Setup Dear ImGui style
+    ImGui::StyleColorsDark();
+
+    // Create Descriptor Pool for ImGui
+    VkDescriptorPoolSize pool_sizes[] =
+    {
+        { VK_DESCRIPTOR_TYPE_SAMPLER, 1000 },
+        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1000 },
+        { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1000 },
+        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1000 },
+        { VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 1000 },
+        { VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, 1000 },
+        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1000 },
+        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1000 },
+        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1000 },
+        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, 1000 },
+        { VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, 1000 }
+    };
+    VkDescriptorPoolCreateInfo pool_info = {};
+    pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    pool_info.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+    pool_info.maxSets = 1000 * IM_ARRAYSIZE(pool_sizes);
+    pool_info.poolSizeCount = (uint32_t)IM_ARRAYSIZE(pool_sizes);
+    pool_info.pPoolSizes = pool_sizes;
+    VkDescriptorPool imguiPool = VK_NULL_HANDLE;
+    VK_CHECK(vkCreateDescriptorPool(vkContext.GetDevice(), &pool_info, nullptr, &imguiPool));
+
+    // Setup Platform/Renderer backends
+    ImGui_ImplGlfw_InitForVulkan(window, true);
+
+    ImGui_ImplVulkan_InitInfo init_info = {};
+    init_info.Instance = vkContext.GetInstance();
+    init_info.PhysicalDevice = vkContext.GetPhysicalDevice();
+    init_info.Device = vkContext.GetDevice();
+    init_info.QueueFamily = vkContext.GetGraphicsQueueFamilyIndex();
+    init_info.Queue = vkContext.GetGraphicsQueue();
+    init_info.PipelineCache = VK_NULL_HANDLE;
+    init_info.DescriptorPool = imguiPool;
+    init_info.MinImageCount = 2;
+    init_info.ImageCount = static_cast<uint32_t>(vkContext.GetSwapchainImages().size());
+    init_info.Allocator = nullptr;
+    init_info.CheckVkResultFn = nullptr;
+    init_info.UseDynamicRendering = true;
+    init_info.PipelineInfoMain.PipelineRenderingCreateInfo = {};
+    init_info.PipelineInfoMain.PipelineRenderingCreateInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO_KHR;
+    init_info.PipelineInfoMain.PipelineRenderingCreateInfo.colorAttachmentCount = 1;
+    static const VkFormat format = vkContext.GetSwapchainImageFormat();
+    init_info.PipelineInfoMain.PipelineRenderingCreateInfo.pColorAttachmentFormats = &format;
+    init_info.PipelineInfoMain.PipelineRenderingCreateInfo.depthAttachmentFormat = VK_FORMAT_UNDEFINED;
+
+    ImGui_ImplVulkan_Init(&init_info);
+#endif
+
     // Builds the consolidated virtual geometry .cache file (scene.cache): reads back the spawned
     // entities' live procedural geometry from the GPU, builds the cluster DAGs, writes header +
     // cluster/DAG tables + 4 KB-page-aligned geometry blocks, and validates the round trip. Since
@@ -277,6 +344,283 @@ int main() {
 
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
+#ifndef NDEBUG
+        // ImGui Frame starts
+        ImGui_ImplVulkan_NewFrame();
+        ImGui_ImplGlfw_NewFrame();
+        ImGui::NewFrame();
+
+        struct StartupConfig {
+            float VERTEX_SPACING = config::VERTEX_SPACING;
+            uint64_t VERTEX_BUFFER_BYTES = config::nanite::VERTEX_BUFFER_BYTES;
+            uint64_t INDEX_BUFFER_BYTES = config::nanite::INDEX_BUFFER_BYTES;
+            uint32_t POOL_SIZE_MB = config::streaming::_POOL_SIZE_MB;
+            float RENDER_SCALE = config::temporal::RENDER_SCALE;
+            uint32_t SHADOW_MAX_RESOLUTION = config::shadows::_MAX_RESOLUTION;
+            uint32_t PROBE_GRID_RESOLUTION = config::lumen::PROBE_GRID_RESOLUTION;
+            uint32_t VSM_PHYSICAL_PAGE_CAPACITY = config::lumen::VSM_PHYSICAL_PAGE_CAPACITY;
+            uint32_t TRANSLUCENCY_LIGHTING_VOLUME_DIM = config::postprocess::_TRANSLUCENCY_LIGHTING_VOLUME_DIM;
+            uint32_t VOLUMETRIC_FOG_GRID_PIXEL_SIZE = config::volumetrics::_VOLUMETRIC_FOG_GRID_PIXEL_SIZE;
+            std::string profileName = config::g_ActiveProfileName;
+        };
+        static StartupConfig startup;
+        static bool startupCaptured = false;
+        if (!startupCaptured) {
+            startup = {
+                config::VERTEX_SPACING,
+                config::nanite::VERTEX_BUFFER_BYTES,
+                config::nanite::INDEX_BUFFER_BYTES,
+                config::streaming::_POOL_SIZE_MB,
+                config::temporal::RENDER_SCALE,
+                config::shadows::_MAX_RESOLUTION,
+                config::lumen::PROBE_GRID_RESOLUTION,
+                config::lumen::VSM_PHYSICAL_PAGE_CAPACITY,
+                config::postprocess::_TRANSLUCENCY_LIGHTING_VOLUME_DIM,
+                config::volumetrics::_VOLUMETRIC_FOG_GRID_PIXEL_SIZE,
+                config::g_ActiveProfileName
+            };
+            startupCaptured = true;
+        }
+
+        // Keep track of whether reload is needed
+        bool needsReload = false;
+        std::string reloadReason = "";
+        if (config::VERTEX_SPACING != startup.VERTEX_SPACING) { needsReload = true; reloadReason += "Vertex Spacing; "; }
+        if (config::nanite::VERTEX_BUFFER_BYTES != startup.VERTEX_BUFFER_BYTES) { needsReload = true; reloadReason += "Vertex Buffer Size; "; }
+        if (config::nanite::INDEX_BUFFER_BYTES != startup.INDEX_BUFFER_BYTES) { needsReload = true; reloadReason += "Index Buffer Size; "; }
+        if (config::streaming::_POOL_SIZE_MB != startup.POOL_SIZE_MB) { needsReload = true; reloadReason += "Streaming Pool Size; "; }
+        if (config::temporal::RENDER_SCALE != startup.RENDER_SCALE) { needsReload = true; reloadReason += "Render Scale; "; }
+        if (config::shadows::_MAX_RESOLUTION != startup.SHADOW_MAX_RESOLUTION) { needsReload = true; reloadReason += "VSM Max Resolution; "; }
+        if (config::lumen::PROBE_GRID_RESOLUTION != startup.PROBE_GRID_RESOLUTION) { needsReload = true; reloadReason += "Probe Grid Resolution; "; }
+        if (config::lumen::VSM_PHYSICAL_PAGE_CAPACITY != startup.VSM_PHYSICAL_PAGE_CAPACITY) { needsReload = true; reloadReason += "VSM Page Capacity; "; }
+        if (config::postprocess::_TRANSLUCENCY_LIGHTING_VOLUME_DIM != startup.TRANSLUCENCY_LIGHTING_VOLUME_DIM) { needsReload = true; reloadReason += "Translucency Volume Dim; "; }
+        if (config::volumetrics::_VOLUMETRIC_FOG_GRID_PIXEL_SIZE != startup.VOLUMETRIC_FOG_GRID_PIXEL_SIZE) { needsReload = true; reloadReason += "Volumetric Fog Grid Pixel Size; "; }
+        if (config::g_ActiveProfileName != startup.profileName) { needsReload = true; reloadReason += "Profile Preset (changed to " + config::g_ActiveProfileName + "); "; }
+
+        // UI Panel
+        ImGui::Begin("Engine Configuration Panel");
+        
+        // Active Profile Selection
+        const char* profiles[] = { "Low", "Medium", "High", "Extrem" };
+        int currentProfileIdx = 0;
+        if (config::g_ActiveProfileName == "Low") currentProfileIdx = 0;
+        else if (config::g_ActiveProfileName == "Medium") currentProfileIdx = 1;
+        else if (config::g_ActiveProfileName == "High") currentProfileIdx = 2;
+        else if (config::g_ActiveProfileName == "Extrem") currentProfileIdx = 3;
+
+        if (ImGui::Combo("Active Profile", &currentProfileIdx, profiles, IM_ARRAYSIZE(profiles))) {
+            std::string selectedProfile = profiles[currentProfileIdx];
+            if (selectedProfile != config::g_ActiveProfileName) {
+                config::ApplyProfile(selectedProfile);
+                config::g_ActiveProfileName = selectedProfile;
+                config::SaveProfileLocal(selectedProfile);
+            }
+        }
+
+        if (needsReload) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.3f, 0.3f, 1.0f));
+            ImGui::TextWrapped("WARNING: Engine restart/reload required to apply changes to: %s", reloadReason.c_str());
+            ImGui::PopStyleColor();
+        }
+
+        if (ImGui::BeginTabBar("ConfigTabs")) {
+            // --- Tab Nanite ---
+            if (ImGui::BeginTabItem("Nanite")) {
+                ImGui::DragFloat("Vertex Spacing", &config::VERTEX_SPACING, 0.005f, 0.01f, 1.0f);
+                ImGui::DragFloat("Floor Vertex Spacing", &config::FLOOR_VERTEX_SPACING, 0.05f, 0.1f, 10.0f);
+                ImGui::DragFloat("Software Raster Threshold", &config::nanite::SOFTWARE_RASTER_THRESHOLD_PIXELS, 0.1f, 0.0f, 64.0f);
+                ImGui::DragFloat("LOD Pixel Error Threshold", &config::nanite::LOD_PIXEL_ERROR_THRESHOLD, 0.05f, 0.01f, 10.0f);
+                ImGui::DragFloat("Max Pixels Per Edge", &config::nanite::_MAX_PIXELS_PER_EDGE, 0.05f, 0.1f, 10.0f);
+                
+                int64_t vBytes = config::nanite::VERTEX_BUFFER_BYTES;
+                int vMB = static_cast<int>(vBytes / (1024 * 1024));
+                if (ImGui::DragInt("Vertex Buffer (MB)", &vMB, 64, 128, 4096)) {
+                    config::nanite::VERTEX_BUFFER_BYTES = static_cast<uint64_t>(vMB) * 1024 * 1024;
+                }
+
+                int64_t iBytes = config::nanite::INDEX_BUFFER_BYTES;
+                int iMB = static_cast<int>(iBytes / (1024 * 1024));
+                if (ImGui::DragInt("Index Buffer (MB)", &iMB, 32, 64, 2048)) {
+                    config::nanite::INDEX_BUFFER_BYTES = static_cast<uint64_t>(iMB) * 1024 * 1024;
+                }
+
+                ImGui::EndTabItem();
+            }
+
+            // --- Tab Streaming ---
+            if (ImGui::BeginTabItem("Streaming")) {
+                int poolMB = static_cast<int>(config::streaming::_POOL_SIZE_MB);
+                if (ImGui::DragInt("Texture Pool Size (MB)", &poolMB, 128, 512, 32000)) {
+                    config::streaming::_POOL_SIZE_MB = static_cast<uint32_t>(poolMB);
+                }
+                ImGui::EndTabItem();
+            }
+
+            // --- Tab Temporal ---
+            if (ImGui::BeginTabItem("Temporal")) {
+                ImGui::DragFloat("Render Scale", &config::temporal::RENDER_SCALE, 0.01f, 0.25f, 2.00f);
+                ImGui::DragFloat("Blend Alpha", &config::temporal::BLEND_ALPHA, 0.005f, 0.001f, 1.0f);
+                ImGui::DragFloat("Blend Alpha Static", &config::temporal::BLEND_ALPHA_STATIC, 0.005f, 0.001f, 1.0f);
+                ImGui::DragFloat("Variance Clamp Factor", &config::temporal::VARIANCE_CLAMP_FACTOR, 0.05f, 0.1f, 10.0f);
+                int jitterCount = static_cast<int>(config::temporal::JITTER_FRAME_COUNT);
+                if (ImGui::DragInt("Jitter Frame Count", &jitterCount, 1, 2, 64)) {
+                    config::temporal::JITTER_FRAME_COUNT = static_cast<uint32_t>(jitterCount);
+                }
+                ImGui::Checkbox("Enabled By Default", &config::temporal::ENABLED_BY_DEFAULT);
+                int aaQual = static_cast<int>(config::temporal::_ANTI_ALIASING_QUALITY);
+                if (ImGui::DragInt("Anti-Aliasing Quality", &aaQual, 1, 1, 5)) {
+                    config::temporal::_ANTI_ALIASING_QUALITY = static_cast<uint32_t>(aaQual);
+                }
+                int aaMethod = static_cast<int>(config::temporal::_ANTI_ALIASING_METHOD);
+                if (ImGui::DragInt("Anti-Aliasing Method", &aaMethod, 1, 0, 5)) {
+                    config::temporal::_ANTI_ALIASING_METHOD = static_cast<uint32_t>(aaMethod);
+                }
+                ImGui::DragFloat("Screen Percentage", &config::temporal::_SCREEN_PERCENTAGE, 1.0f, 10.0f, 200.0f);
+                int upscaler = static_cast<int>(config::temporal::_TEMPORAL_AA_UPSCALER);
+                if (ImGui::DragInt("Temporal AA Upscaler", &upscaler, 1, 0, 5)) {
+                    config::temporal::_TEMPORAL_AA_UPSCALER = static_cast<uint32_t>(upscaler);
+                }
+                ImGui::EndTabItem();
+            }
+
+            // --- Tab Shadow ---
+            if (ImGui::BeginTabItem("Shadow")) {
+                int shadQual = static_cast<int>(config::shadows::_QUALITY);
+                if (ImGui::DragInt("Shadow Quality", &shadQual, 1, 1, 5)) {
+                    config::shadows::_QUALITY = static_cast<uint32_t>(shadQual);
+                }
+                ImGui::Checkbox("Virtual Shadow Maps", &config::shadows::_VIRTUAL_ENABLE);
+                int maxRes = static_cast<int>(config::shadows::_MAX_RESOLUTION);
+                if (ImGui::DragInt("VSM Max Resolution", &maxRes, 512, 512, 16384)) {
+                    config::shadows::_MAX_RESOLUTION = static_cast<uint32_t>(maxRes);
+                }
+                int cascades = static_cast<int>(config::shadows::_CSM_MAX_CASCADES);
+                if (ImGui::DragInt("CSM Max Cascades", &cascades, 1, 1, 8)) {
+                    config::shadows::_CSM_MAX_CASCADES = static_cast<uint32_t>(cascades);
+                }
+                ImGui::DragFloat("CSM Distance Scale", &config::shadows::_DISTANCE_SCALE, 0.05f, 0.1f, 10.0f);
+                ImGui::EndTabItem();
+            }
+
+            // --- Tab Lumen ---
+            if (ImGui::BeginTabItem("Lumen")) {
+                int budget = static_cast<int>(config::lumen::CARDS_PER_FRAME_BUDGET);
+                if (ImGui::DragInt("Cards Frame Budget", &budget, 1, 1, 128)) {
+                    config::lumen::CARDS_PER_FRAME_BUDGET = static_cast<uint32_t>(budget);
+                }
+                int delay = static_cast<int>(config::lumen::EVICTION_FRAME_DELAY);
+                if (ImGui::DragInt("Eviction Frame Delay", &delay, 10, 60, 2400)) {
+                    config::lumen::EVICTION_FRAME_DELAY = static_cast<uint32_t>(delay);
+                }
+                int probeRes = static_cast<int>(config::lumen::PROBE_GRID_RESOLUTION);
+                if (ImGui::DragInt("Probe Grid Resolution", &probeRes, 8, 8, 128)) {
+                    config::lumen::PROBE_GRID_RESOLUTION = static_cast<uint32_t>(probeRes);
+                }
+                ImGui::DragFloat("Probe Spacing", &config::lumen::PROBE_SPACING, 0.05f, 0.1f, 5.0f);
+                int sampleDirs = static_cast<int>(config::lumen::PROBE_SAMPLE_DIRECTIONS);
+                if (ImGui::DragInt("Probe Sample Directions", &sampleDirs, 1, 2, 64)) {
+                    config::lumen::PROBE_SAMPLE_DIRECTIONS = static_cast<uint32_t>(sampleDirs);
+                }
+                int maxTraced = static_cast<int>(config::lumen::MAX_TRACED_ENTITIES);
+                if (ImGui::DragInt("Max Traced Entities", &maxTraced, 4, 4, 1024)) {
+                    config::lumen::MAX_TRACED_ENTITIES = static_cast<uint32_t>(maxTraced);
+                }
+                int bounces = static_cast<int>(config::lumen::RADIOSITY_BOUNCE_COUNT);
+                if (ImGui::DragInt("Radiosity Bounces", &bounces, 1, 0, 16)) {
+                    config::lumen::RADIOSITY_BOUNCE_COUNT = static_cast<uint32_t>(bounces);
+                }
+                int samples = static_cast<int>(config::lumen::SURFACE_CACHE_GI_SAMPLE_COUNT);
+                if (ImGui::DragInt("Surface Cache GI Samples", &samples, 4, 4, 256)) {
+                    config::lumen::SURFACE_CACHE_GI_SAMPLE_COUNT = static_cast<uint32_t>(samples);
+                }
+                int tileSize = static_cast<int>(config::lumen::SCREEN_PROBE_TILE_SIZE);
+                if (ImGui::DragInt("Screen Probe Tile Size", &tileSize, 2, 2, 32)) {
+                    config::lumen::SCREEN_PROBE_TILE_SIZE = static_cast<uint32_t>(tileSize);
+                }
+                int rayCount = static_cast<int>(config::lumen::SCREEN_PROBE_RAY_COUNT);
+                if (ImGui::DragInt("Screen Probe Ray Count", &rayCount, 8, 8, 256)) {
+                    config::lumen::SCREEN_PROBE_RAY_COUNT = static_cast<uint32_t>(rayCount);
+                }
+                ImGui::DragFloat("Screen Probe Temporal Alpha", &config::lumen::SCREEN_PROBE_TEMPORAL_ALPHA, 0.005f, 0.001f, 1.0f);
+                ImGui::Checkbox("Build Shadows", &config::lumen::BUILD_SHADOWS);
+                ImGui::DragFloat("VSM Sun Base Radius", &config::lumen::VSM_SUN_BASE_RADIUS, 0.1f, 0.1f, 10.0f);
+                int pageCap = static_cast<int>(config::lumen::VSM_PHYSICAL_PAGE_CAPACITY);
+                if (ImGui::DragInt("VSM Page Capacity", &pageCap, 256, 256, 16384)) {
+                    config::lumen::VSM_PHYSICAL_PAGE_CAPACITY = static_cast<uint32_t>(pageCap);
+                }
+                int giQual = static_cast<int>(config::lumen::_GI_QUALITY);
+                if (ImGui::DragInt("GI Quality", &giQual, 1, 1, 5)) {
+                    config::lumen::_GI_QUALITY = static_cast<uint32_t>(giQual);
+                }
+                ImGui::Checkbox("Hardware Ray Tracing", &config::lumen::_HARDWARE_RAYTRACING);
+                ImGui::Checkbox("Trace Mesh SDF", &config::lumen::_TRACE_MESH_SDF);
+                ImGui::Checkbox("Screen Space Probe Occlusion", &config::lumen::_SCREEN_SPACE_PROBE_OCCLUSION);
+                ImGui::Checkbox("Reflections Allow", &config::lumen::_REFLECTIONS_ALLOW);
+                ImGui::Checkbox("HWRT Nanite Mode", &config::lumen::_HARDWARE_RAYTRACING_NANITE_MODE);
+                ImGui::Checkbox("Megalights Enable", &config::lumen::_MEGALIGHTS_ENABLE);
+                ImGui::EndTabItem();
+            }
+
+            // --- Tab Reflection ---
+            if (ImGui::BeginTabItem("Reflection")) {
+                int refQual = static_cast<int>(config::reflections::_QUALITY);
+                if (ImGui::DragInt("Reflection Quality", &refQual, 1, 1, 5)) {
+                    config::reflections::_QUALITY = static_cast<uint32_t>(refQual);
+                }
+                int refMethod = static_cast<int>(config::reflections::_METHOD);
+                if (ImGui::DragInt("Reflection Method", &refMethod, 1, 0, 5)) {
+                    config::reflections::_METHOD = static_cast<uint32_t>(refMethod);
+                }
+                ImGui::Checkbox("Screen Space Reflections", &config::reflections::_SCREEN_SPACE_REFLECTIONS);
+                ImGui::EndTabItem();
+            }
+
+            // --- Tab Postprocess ---
+            if (ImGui::BeginTabItem("Postprocess")) {
+                int ppQual = static_cast<int>(config::postprocess::_QUALITY);
+                if (ImGui::DragInt("Postprocess Quality", &ppQual, 1, 1, 5)) {
+                    config::postprocess::_QUALITY = static_cast<uint32_t>(ppQual);
+                }
+                int fxQual = static_cast<int>(config::postprocess::_EFFECTS_QUALITY);
+                if (ImGui::DragInt("Effects Quality", &fxQual, 1, 1, 5)) {
+                    config::postprocess::_EFFECTS_QUALITY = static_cast<uint32_t>(fxQual);
+                }
+                int dim = static_cast<int>(config::postprocess::_TRANSLUCENCY_LIGHTING_VOLUME_DIM);
+                if (ImGui::DragInt("Translucency Volume Dim", &dim, 8, 8, 256)) {
+                    config::postprocess::_TRANSLUCENCY_LIGHTING_VOLUME_DIM = static_cast<uint32_t>(dim);
+                }
+                int refrQual = static_cast<int>(config::postprocess::_REFRACTION_QUALITY);
+                if (ImGui::DragInt("Refraction Quality", &refrQual, 1, 1, 5)) {
+                    config::postprocess::_REFRACTION_QUALITY = static_cast<uint32_t>(refrQual);
+                }
+                ImGui::EndTabItem();
+            }
+
+            // --- Tab Volumetric ---
+            if (ImGui::BeginTabItem("Volumetric")) {
+                int texQual = static_cast<int>(config::volumetrics::_TEXTURE_QUALITY);
+                if (ImGui::DragInt("Texture Quality", &texQual, 1, 1, 5)) {
+                    config::volumetrics::_TEXTURE_QUALITY = static_cast<uint32_t>(texQual);
+                }
+                int skyQual = static_cast<int>(config::volumetrics::_SKY_ATMOSPHERE_QUALITY);
+                if (ImGui::DragInt("Sky Atmosphere Quality", &skyQual, 1, 1, 5)) {
+                    config::volumetrics::_SKY_ATMOSPHERE_QUALITY = static_cast<uint32_t>(skyQual);
+                }
+                ImGui::Checkbox("Volumetric Fog", &config::volumetrics::_VOLUMETRIC_FOG_ENABLE);
+                int fogGrid = static_cast<int>(config::volumetrics::_VOLUMETRIC_FOG_GRID_PIXEL_SIZE);
+                if (ImGui::DragInt("Fog Grid Pixel Size", &fogGrid, 2, 2, 32)) {
+                    config::volumetrics::_VOLUMETRIC_FOG_GRID_PIXEL_SIZE = static_cast<uint32_t>(fogGrid);
+                }
+                ImGui::DragFloat("Cloud Ray Sample Scale", &config::volumetrics::_VOLUMETRIC_CLOUD_VIEW_RAY_SAMPLE_COUNT_SCALE, 0.05f, 0.1f, 10.0f);
+                ImGui::EndTabItem();
+            }
+
+            ImGui::EndTabBar();
+        }
+
+        ImGui::End();
+        ImGui::Render();
+#endif
 
         if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS) {
             glfwSetWindowShouldClose(window, GLFW_TRUE);
@@ -392,7 +736,8 @@ int main() {
 
         clusterPipeline.RecordFrame(vkContext.GetCommandBuffer(), camera.GetPushConstants(),
             camera.GetPosition(), camera.GetFrameInfo(aspect), static_cast<float>(glfwGetTime()),
-            vkContext.GetSwapchainImages()[imageIndex]);
+            vkContext.GetSwapchainImages()[imageIndex],
+            vkContext.GetSwapchainImageViews()[imageIndex]);
 
         vkEndCommandBuffer(vkContext.GetCommandBuffer());
 
@@ -421,6 +766,17 @@ int main() {
         presentInfo.pImageIndices = &imageIndex;
 
         vkQueuePresentKHR(vkContext.GetGraphicsQueue(), &presentInfo);
+
+        // High-precision frame rate capper to enforce TARGET_FPS
+        static double lastFrameTime = glfwGetTime();
+        double targetFrameTime = 1.0 / static_cast<double>(config::TARGET_FPS);
+        while (glfwGetTime() - lastFrameTime < targetFrameTime) {
+            double remaining = targetFrameTime - (glfwGetTime() - lastFrameTime);
+            if (remaining > 0.002) {
+                std::this_thread::sleep_for(std::chrono::microseconds(static_cast<int64_t>((remaining - 0.001) * 1000000.0)));
+            }
+        }
+        lastFrameTime = glfwGetTime();
     }
 
     LOG_INFO("Shutting down engine...");
@@ -428,6 +784,14 @@ int main() {
     // Drain the GPU before destroying anything the last in-flight frame may still be using --
     // the per-frame loop deliberately never device-idles, so this is the one place that does.
     vkDeviceWaitIdle(vkContext.GetDevice());
+
+#ifndef NDEBUG
+    ImGui_ImplVulkan_Shutdown();
+    ImGui_ImplGlfw_Shutdown();
+    ImGui::DestroyContext();
+    vkDestroyDescriptorPool(vkContext.GetDevice(), imguiPool, nullptr);
+#endif
+
     vkDestroyFence(vkContext.GetDevice(), frameFence, nullptr);
 
     // Ensure all Vulkan resources are completely destroyed before destroying the OS window --
