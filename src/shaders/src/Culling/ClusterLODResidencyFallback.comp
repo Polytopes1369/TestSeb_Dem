@@ -6,10 +6,15 @@
 // per-node DRAW/SUBDIVIDE/SKIP decision (left untouched by this shader) and applies this engine's
 // chosen parent-fallback residency policy: a node whose fine geometry isn't resident yet must not
 // simply vanish from the rendered frame -- its nearest already-resident ancestor is marked to draw
-// in its place instead, via a bounded upward walk of parentClusterID. DAG depth is small (a
+// in its place instead, via a bounded upward walk of parentClusterID0/1. A node can have up to
+// kMaxGroupOutputClusters (2) parents (one of a group's up to 2 re-split output siblings, see
+// geometry::ClusterDAGGroup / ClusterDAG.h), so this is a small bounded stack-based search
+// branching over both parent slots at every step, not a single linear walk -- MAX_ANCESTOR_VISITS
+// below bounds total nodes visited (not "depth", since a branching walk's node count can exceed
+// its depth), exactly like the pre-grouping single-path walk's own step cap. DAG depth is small (a
 // handful of levels for any realistically sized cluster hierarchy, since each level roughly halves
-// the cluster count), so this bounded per-node walk is not the unbounded tree traversal the
-// single-pass screen-error test elsewhere in this pipeline deliberately avoids.
+// the cluster count), so even this branching walk stays cheap -- nowhere near the unbounded tree
+// traversal the single-pass screen-error test elsewhere in this pipeline deliberately avoids.
 //
 // A node with a DRAW decision that IS already resident needs no action here at all --
 // ClusterLODCompact.comp picks it up directly via its own decision==DRAW check. This shader only
@@ -66,9 +71,14 @@ layout(std430, set = 0, binding = 5) buffer LODFallbackStatsSSBO {
 // (renderer::GpuGeometryPagePool::TouchPages) can mark it most-recently-used before this frame's
 // eviction pass runs, instead of only ever learning about non-resident misses.
 
-// Bounds the ancestor walk below: comfortably above any realistic DAG depth (this engine's own
-// grouping roughly halves the cluster count per level).
-#define MAX_ANCESTOR_WALK 24u
+// Bounds the ancestor search below, both as the local stack's fixed capacity and as the total
+// number of ancestors popped/tested: comfortably above any realistic DAG depth (this engine's own
+// grouping roughly quarters the cluster count per level) times the up-to-2 branching factor a
+// node's 2 possible parents introduce (see this file's own header comment). A search that runs off
+// either bound simply stops early -- see the "walked off the root" comment below for what that
+// means in practice.
+#define ANCESTOR_STACK_CAPACITY 32u
+#define MAX_ANCESTOR_VISITS 32u
 
 layout(local_size_x = 64) in;
 
@@ -96,8 +106,24 @@ void main() {
     // covers is never simply missing.
     RequestClusterResidency(node.clusterID);
 
-    uint ancestor = node.parentClusterID;
-    for (uint step = 0u; step < MAX_ANCESTOR_WALK && ancestor != 0xFFFFFFFFu; ++step) {
+    // Small fixed-capacity stack-based DFS over both possible parent slots at every step (a node
+    // can have up to kMaxGroupOutputClusters == 2 parents -- see this file's own header comment).
+    // A push beyond ANCESTOR_STACK_CAPACITY is simply dropped rather than growing the search --
+    // this can only make the search find a resident ancestor LESS often (never incorrectly), which
+    // degrades to the same "region absent this one frame, already requested above" outcome as
+    // exhausting MAX_ANCESTOR_VISITS below.
+    uint stack[ANCESTOR_STACK_CAPACITY];
+    uint stackSize = 0u;
+    if (node.parentClusterID0 != 0xFFFFFFFFu) {
+        stack[stackSize++] = node.parentClusterID0;
+    }
+    if (node.parentClusterID1 != 0xFFFFFFFFu && stackSize < ANCESTOR_STACK_CAPACITY) {
+        stack[stackSize++] = node.parentClusterID1;
+    }
+
+    bool foundResidentAncestor = false;
+    for (uint visited = 0u; visited < MAX_ANCESTOR_VISITS && stackSize > 0u; ++visited) {
+        uint ancestor = stack[--stackSize];
         LODNodeMetadata ancestorNode = g_LODNodes.nodes[ancestor];
         if (IsClusterResident(ancestorNode.logicalPageID)) {
             // Idempotent under races: every child of this ancestor that independently reaches this
@@ -107,14 +133,23 @@ void main() {
 #ifdef _DEBUG
             atomicAdd(g_LODFallbackStats.forceDrawSubstitutions, 1u);
 #endif
-            return;
+            foundResidentAncestor = true;
+            break;
         }
-        ancestor = ancestorNode.parentClusterID;
+        if (ancestorNode.parentClusterID0 != 0xFFFFFFFFu && stackSize < ANCESTOR_STACK_CAPACITY) {
+            stack[stackSize++] = ancestorNode.parentClusterID0;
+        }
+        if (ancestorNode.parentClusterID1 != 0xFFFFFFFFu && stackSize < ANCESTOR_STACK_CAPACITY) {
+            stack[stackSize++] = ancestorNode.parentClusterID1;
+        }
     }
-    // Walked off the root (or exceeded MAX_ANCESTOR_WALK) without finding a resident ancestor --
-    // exceptionally rare (would require the DAG's own root to be non-resident) -- this node's
-    // region is simply absent for this one frame; already requested above, so it resolves once
-    // streaming catches up.
+    if (foundResidentAncestor) {
+        return;
+    }
+    // Walked off every root reachable within the bounds above without finding a resident ancestor
+    // -- exceptionally rare (would require the DAG's own root(s) to be non-resident) -- this
+    // node's region is simply absent for this one frame; already requested above, so it resolves
+    // once streaming catches up.
 #ifdef _DEBUG
     atomicAdd(g_LODFallbackStats.ancestorWalkExhausted, 1u);
 #endif

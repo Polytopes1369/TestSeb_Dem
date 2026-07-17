@@ -18,8 +18,11 @@ namespace renderer {
             maths::mat4 invViewProj;
             float viewportWidth = 0.0f, viewportHeight = 0.0f;
             float _pad0 = 0.0f, _pad1 = 0.0f;
+            // Substrate integration: see MegaLightsShade.comp's own MegaLightsViewParamsUBO.
+            // cameraPositionWorld comment.
+            float cameraPositionWorldX = 0.0f, cameraPositionWorldY = 0.0f, cameraPositionWorldZ = 0.0f, _pad2 = 0.0f;
         };
-        static_assert(sizeof(MegaLightsViewParamsUBO) == 80,
+        static_assert(sizeof(MegaLightsViewParamsUBO) == 96,
             "MegaLightsViewParamsUBO must match MegaLightsShade.comp's own UBO exactly (std140 layout)");
 
     } // namespace
@@ -68,27 +71,31 @@ namespace renderer {
             VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
 
         // =====================================================================================
-        // STEP 3 -- Shade pipeline: set 0 (8 bindings, single set -- no ping-pong, Phase A has no
-        // temporal state).
+        // STEP 3 -- Shade pipeline: set 0 (10 bindings, single set -- no ping-pong, Phase A has no
+        // temporal state). Bindings 8/9 (Substrate integration): this pixel's materialID GBuffer
+        // image + the material params SSBO renderer::ClusterResolvePass already filled -- see
+        // MegaLightsShade.comp's own binding comments.
         // =====================================================================================
         {
-            VkDescriptorSetLayoutBinding bindings[8]{};
+            VkDescriptorSetLayoutBinding bindings[10]{};
             for (uint32_t b : { 0u, 1u, 2u, 3u, 4u }) {
                 bindings[b] = { b, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
             }
             bindings[5] = { 5, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
             bindings[6] = { 6, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
             bindings[7] = { 7, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+            bindings[8] = { 8, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+            bindings[9] = { 9, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
 
             VkDescriptorSetLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-            layoutInfo.bindingCount = 8;
+            layoutInfo.bindingCount = 10;
             layoutInfo.pBindings = bindings;
             VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &layoutInfo, nullptr, &m_ShadeSetLayout));
 
             VkDescriptorPoolSize poolSizes[4] = {
-                { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 5 },
+                { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 6 },
                 { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1 },
-                { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1 },
+                { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 },
                 { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 }
             };
             VkDescriptorPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
@@ -110,15 +117,19 @@ namespace renderer {
             VkDescriptorImageInfo gbufferRoughnessMetallicInfo{ VK_NULL_HANDLE, resolvePass.GetOutputRoughnessMetallicView(), VK_IMAGE_LAYOUT_GENERAL };
             VkDescriptorBufferInfo lightBufferInfo{ m_LightBuffer.Handle(), 0, m_LightBuffer.Size() };
             VkDescriptorBufferInfo viewParamsInfo{ m_ViewParamsBuffer.Handle(), 0, m_ViewParamsBuffer.Size() };
+            VkDescriptorImageInfo gbufferMaterialIDInfo{ VK_NULL_HANDLE, resolvePass.GetOutputMaterialIDView(), VK_IMAGE_LAYOUT_GENERAL };
+            VkDescriptorBufferInfo materialParamsInfo{ resolvePass.GetMaterialParamsBuffer(), 0, VK_WHOLE_SIZE };
 
             VkDescriptorImageInfo* storageInfos[5] = { &shadeRadianceInfo, &gbufferNormalInfo, &gbufferDepthInfo, &gbufferAlbedoInfo, &gbufferRoughnessMetallicInfo };
-            VkWriteDescriptorSet writes[7]{};
+            VkWriteDescriptorSet writes[9]{};
             for (uint32_t b = 0; b < 5; ++b) {
                 writes[b] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ShadeSet, b, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, storageInfos[b], nullptr, nullptr };
             }
             writes[5] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ShadeSet, 6, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &lightBufferInfo, nullptr };
             writes[6] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ShadeSet, 7, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &viewParamsInfo, nullptr };
-            vkUpdateDescriptorSets(m_Device, 7, writes, 0, nullptr);
+            writes[7] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ShadeSet, 8, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &gbufferMaterialIDInfo, nullptr, nullptr };
+            writes[8] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ShadeSet, 9, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &materialParamsInfo, nullptr };
+            vkUpdateDescriptorSets(m_Device, 9, writes, 0, nullptr);
 
             // Binding 5 (acceleration structure) written separately -- VkWriteDescriptorSetAccelerationStructureKHR
             // needs its own pNext chain, same pattern VulkanUtils::WriteSharedGeometryBindings uses
@@ -247,11 +258,14 @@ namespace renderer {
         m_Device = VK_NULL_HANDLE;
     }
 
-    void MegaLightsPass::RecordShade(VkCommandBuffer cmd, const maths::mat4& viewProj, uint32_t frameIndex) {
+    void MegaLightsPass::RecordShade(VkCommandBuffer cmd, const maths::mat4& viewProj, const maths::vec3& cameraPositionWorld, uint32_t frameIndex) {
         MegaLightsViewParamsUBO ubo{};
         ubo.invViewProj = viewProj.Inverse();
         ubo.viewportWidth = static_cast<float>(m_RenderExtent.width);
         ubo.viewportHeight = static_cast<float>(m_RenderExtent.height);
+        ubo.cameraPositionWorldX = cameraPositionWorld.x;
+        ubo.cameraPositionWorldY = cameraPositionWorld.y;
+        ubo.cameraPositionWorldZ = cameraPositionWorld.z;
         vkCmdUpdateBuffer(cmd, m_ViewParamsBuffer.Handle(), 0, sizeof(ubo), &ubo);
 
         VulkanUtils::RecordMemoryBarrier(cmd,

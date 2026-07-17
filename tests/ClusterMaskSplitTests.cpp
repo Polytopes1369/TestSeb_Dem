@@ -294,15 +294,21 @@ namespace {
         parent.level = 1;
         parent.clusterError = 0.5f;
         parent.isMasked = false; // Matches leaf0, but not leaf1 -- the tamper.
-        parent.childIndices = { 0u, 1u };
+        parent.sourceGroupIndex = 0u;
         parent.mesh.positions = { maths::vec3{0,0,0}, maths::vec3{1,1,0}, maths::vec3{0,1,0} };
         parent.mesh.locked = { false, false, false };
         parent.mesh.triangles = { 0u, 1u, 2u };
         dag.nodes.push_back(parent); // index 2
 
-        dag.nodes[0].parentIndex = 2u;
+        geometry::ClusterDAGGroup group;
+        group.memberClusterIndices = { 0u, 1u };
+        group.outputClusterIndices = { 2u };
+        group.groupError = 0.5f;
+        dag.groups.push_back(group); // index 0
+
+        dag.nodes[0].parentGroupIndex = 0u;
         dag.nodes[0].parentError = 0.5f;
-        dag.nodes[1].parentIndex = 2u;
+        dag.nodes[1].parentGroupIndex = 0u;
         dag.nodes[1].parentError = 0.5f;
         dag.rootIndices = { 2u };
 

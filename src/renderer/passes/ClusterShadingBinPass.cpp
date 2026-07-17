@@ -35,7 +35,8 @@ namespace renderer {
         VkExtent2D renderExtent, VkBuffer clusterMetadataBuffer,
         VkImageView hwClusterIDView, VkImageView hwTriangleIDView, VkImageView hwDepthView,
         VkImageView swVisBufferAtomicView, VkImageView outputColorView, VkImageView outputNormalView,
-        VkImageView outputDepthView, VkImageView outputAlbedoView, VkImageView outputRoughnessMetallicView) {
+        VkImageView outputDepthView, VkImageView outputAlbedoView, VkImageView outputRoughnessMetallicView,
+        VkImageView outputMaterialIDView) {
         Shutdown();
 
         m_Device = device;
@@ -70,7 +71,7 @@ namespace renderer {
         // --- Descriptor pool: sized for the union of all 3 sets' bindings (one pool, one alloc). ---
         std::array<VkDescriptorPoolSize, 3> poolSizes{};
         poolSizes[0] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 10 }; // Classify:3 + PrefixSum:4 + Scatter:3
-        poolSizes[1] = { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 8 };   // Classify only: 3 VisBuffer/atomic + 5 output images
+        poolSizes[1] = { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 9 };   // Classify only: 3 VisBuffer/atomic + 6 output images (Substrate: + g_OutputMaterialID)
         poolSizes[2] = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1 }; // Classify only: HW depth
 
         VkDescriptorPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
@@ -83,7 +84,7 @@ namespace renderer {
         // Stage A: Classify
         // =====================================================================================
         {
-            std::array<VkDescriptorSetLayoutBinding, 12> bindings{};
+            std::array<VkDescriptorSetLayoutBinding, 13> bindings{};
             bindings[0] = { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };  // ClusterCullMetadataSSBO
             bindings[1] = { 2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };   // g_HWClusterIDImage
             bindings[2] = { 3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };   // g_HWTriangleIDImage
@@ -96,6 +97,7 @@ namespace renderer {
             bindings[9] = { 10, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };  // g_OutputDepth
             bindings[10] = { 11, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // g_OutputAlbedo
             bindings[11] = { 12, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // g_OutputRoughnessMetallic
+            bindings[12] = { 13, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // g_OutputMaterialID (r16ui, Substrate integration)
 
             VkDescriptorSetLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
             layoutInfo.bindingCount = static_cast<uint32_t>(bindings.size());
@@ -120,8 +122,9 @@ namespace renderer {
             VkDescriptorImageInfo outputDepthInfo{ VK_NULL_HANDLE, outputDepthView, VK_IMAGE_LAYOUT_GENERAL };
             VkDescriptorImageInfo outputAlbedoInfo{ VK_NULL_HANDLE, outputAlbedoView, VK_IMAGE_LAYOUT_GENERAL };
             VkDescriptorImageInfo outputRMInfo{ VK_NULL_HANDLE, outputRoughnessMetallicView, VK_IMAGE_LAYOUT_GENERAL };
+            VkDescriptorImageInfo outputMaterialIDInfo{ VK_NULL_HANDLE, outputMaterialIDView, VK_IMAGE_LAYOUT_GENERAL };
 
-            std::array<VkWriteDescriptorSet, 12> writes{};
+            std::array<VkWriteDescriptorSet, 13> writes{};
             writes[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ClassifySet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &clusterMetaInfo, nullptr };
             writes[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ClassifySet, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &hwClusterInfo, nullptr, nullptr };
             writes[2] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ClassifySet, 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &hwTriangleInfo, nullptr, nullptr };
@@ -134,6 +137,7 @@ namespace renderer {
             writes[9] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ClassifySet, 10, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &outputDepthInfo, nullptr, nullptr };
             writes[10] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ClassifySet, 11, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &outputAlbedoInfo, nullptr, nullptr };
             writes[11] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ClassifySet, 12, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &outputRMInfo, nullptr, nullptr };
+            writes[12] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ClassifySet, 13, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &outputMaterialIDInfo, nullptr, nullptr };
             vkUpdateDescriptorSets(m_Device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
 
             VkPushConstantRange pushRange{ VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(ViewportSizePC) };

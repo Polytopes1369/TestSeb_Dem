@@ -1,0 +1,92 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+
+// Phase 7b (UE5.8 parity roadmap, terrain heightfield): near-literal mirror of geom_plane.comp
+// (same dispatch shape, same Vertex/index layout, same Params UBO -- byte-identical to
+// VulkanContext.cpp's own PlaneParams, reused directly for this dispatch, no new struct), with two
+// differences: the vertex Y coordinate comes from terrain_noise.glsl's fbm instead of a flat 0.0,
+// and the normal is recomputed via analytic finite differences instead of a hardcoded (0,1,0) -- a
+// heightfield's base normal is always vertical, so the world X/Z axes already serve as tangents
+// directly (unlike displacement_noise.glsl's ComputeDisplacedNormal, which needs a general ONB
+// because a hero asset's base normal can point in any direction).
+
+#include "include/struct_custo.glsl"
+#include "include/terrain_noise.glsl"
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(std430, binding = 0) writeonly buffer VertexBuffer { Vertex vertices[]; };
+layout(std430, binding = 1) writeonly buffer IndexBuffer  { uint indices[]; };
+
+layout(std140, binding = 2) uniform Params
+{
+    float width;
+    float length_;
+    uint  widthSegments;
+    uint  lengthSegments;
+    uint  meshID;
+    float materialID;
+    uint  vertexOffset;
+    uint  indexOffset;
+    float worldOffsetX;
+    float worldOffsetY;
+    float worldOffsetZ;
+};
+
+void main()
+{
+    // Strict validation assertions: interdict negative or null values
+    if (width <= 0.0 || length_ <= 0.0 || widthSegments == 0 || lengthSegments == 0)
+    {
+        return;
+    }
+
+    uint x = gl_GlobalInvocationID.x;
+    uint z = gl_GlobalInvocationID.y;
+    if (x >= widthSegments || z >= lengthSegments) return;
+
+    // Local (pre-offset) grid coordinates -- same convention as geom_plane.comp, sampled here so
+    // that a future entity could subtract its own worldOffsetX/Z before calling SampleTerrainHeight
+    // to recover the height at the correct world point.
+    float xPos = (float(x) / float(widthSegments - 1u) - 0.5) * width;
+    float zPos = (float(z) / float(lengthSegments - 1u) - 0.5) * length_;
+
+    uint vIdx = x + z * widthSegments;
+
+    Vertex v;
+    v.position   = vec3(xPos, SampleTerrainHeight(vec2(xPos, zPos)), zPos);
+
+    // Analytic central-difference normal: one grid cell's world-space width as the epsilon, tangents
+    // along local X/Z (valid since a heightfield's base normal is always +Y).
+    float eps = width / float(widthSegments);
+    float hL = SampleTerrainHeight(vec2(xPos - eps, zPos));
+    float hR = SampleTerrainHeight(vec2(xPos + eps, zPos));
+    float hD = SampleTerrainHeight(vec2(xPos, zPos - eps));
+    float hU = SampleTerrainHeight(vec2(xPos, zPos + eps));
+    vec3 tangentX = vec3(2.0 * eps, hR - hL, 0.0);
+    vec3 tangentZ = vec3(0.0, hU - hD, 2.0 * eps);
+    v.normal     = normalize(cross(tangentZ, tangentX));
+
+    v.uv         = vec2(float(x) / float(widthSegments - 1u), float(z) / float(lengthSegments - 1u));
+    v.uv2        = v.uv;
+    v.meshID     = meshID;
+    v.materialID = materialID;
+
+    // Translate the generated vertex to its grid slot in world space before writing it out.
+    v.position += vec3(worldOffsetX, worldOffsetY, worldOffsetZ);
+    vertices[vertexOffset + vIdx] = v;
+
+    if (x < widthSegments - 1u && z < lengthSegments - 1u)
+    {
+        uint i = vIdx; // lower-left corner of the quad
+        uint t = indexOffset + (z * (widthSegments - 1u) + x) * 6u;
+
+        indices[t + 0u] = vertexOffset + i + widthSegments;
+        indices[t + 1u] = vertexOffset + i + 1u;
+        indices[t + 2u] = vertexOffset + i;
+
+        indices[t + 3u] = vertexOffset + i + widthSegments;
+        indices[t + 4u] = vertexOffset + i + widthSegments + 1u;
+        indices[t + 5u] = vertexOffset + i + 1u;
+    }
+}

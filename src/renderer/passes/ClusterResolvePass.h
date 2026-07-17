@@ -81,6 +81,10 @@ namespace renderer {
         // future reader should not have to guess whether "1.0" there means "opaque" or "unset").
         // This is the channel Phase 2 (Lumen-style reflections) will read.
         static constexpr VkFormat kOutputRoughnessMetallicFormat = VK_FORMAT_R8G8_UNORM;
+        // Substrate integration (Phase S3): this pixel's clamped materialID, 0xFFFF sentinel for
+        // background -- see ClusterResolve.comp's own g_OutputMaterialID binding comment. R16_UINT
+        // (not R8_UINT): kMaxMaterials is 32 today but this headroom costs nothing extra.
+        static constexpr VkFormat kOutputMaterialIDFormat = VK_FORMAT_R16_UINT;
 
         // Allocates the output color image (sized to `renderExtent`, transitioned once to
         // VK_IMAGE_LAYOUT_GENERAL via a blocking one-time submit, mirroring HZBPass::Init /
@@ -104,7 +108,7 @@ namespace renderer {
         // deformation (wpo_deformation.glsl's ApplyWPODeformation) that both rasterizers already
         // applied to the vertices they actually drew, so its own re-projection for barycentric
         // reconstruction operates on the same deformed triangle, not the rest-pose one.
-        // `materialTable` is renderer::GenerateRandomMaterialTable()'s result (see
+        // `materialTable` is renderer::GenerateShowcaseMaterialTable()'s result (see
         // ClusterRenderPipelineCreateInfo::materialTable) -- copied once into the GPU SSBO here,
         // not retained by reference (the caller's own copy may not outlive this call).
         void Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue, VkExtent2D renderExtent,
@@ -129,9 +133,12 @@ namespace renderer {
         // comment) feeds the direct-lighting term's physically-based Lambertian evaluation AND its
         // shadow lookup (see ClusterResolve.comp's own Step 3 comment) -- `sun.direction` must be
         // the SAME direction renderer::VirtualShadowMapPass::RecordBeginFrame() was called with
-        // this frame.
+        // this frame. `cameraPositionWorld` (Substrate integration): feeds EvaluateSubstrateMaterial's
+        // specular/Fresnel view-direction term -- the pre-Substrate shader had no view-dependent term
+        // at all, so this is new; same value renderer::ClusterRenderPipeline already threads into
+        // ReflectionPass/TransparentForwardPass's own view-params UBOs.
         void RecordResolve(VkCommandBuffer cmd, const maths::mat4& viewProj, const maths::mat4& prevViewProj,
-            const DirectionalLight& sun, uint32_t debugViewMode = 0);
+            const DirectionalLight& sun, const maths::vec3& cameraPositionWorld, uint32_t debugViewMode = 0);
 
         // --- Phase 1b: binned resolve path (renderer::ClusterShadingBinPass) ---
         // Second-phase init, called once after BOTH Init() above AND `shadingBinPass.Init()` have
@@ -158,9 +165,10 @@ namespace renderer {
         // the exact per-frame ordering (this path replaces RecordResolve() entirely whenever
         // `camera.debugViewMode == 0`; Release always takes this path, see that field's own
         // Debug-only gating in core/Camera.h). Ends with the identical trailing barrier
-        // RecordResolve() itself ends with. `sun` -- see RecordResolve()'s own comment.
+        // RecordResolve() itself ends with. `sun`/`cameraPositionWorld` -- see RecordResolve()'s own
+        // comment.
         void RecordResolveBinned(VkCommandBuffer cmd, const maths::mat4& viewProj,
-            const DirectionalLight& sun, const ClusterShadingBinPass& shadingBinPass);
+            const DirectionalLight& sun, const maths::vec3& cameraPositionWorld, const ClusterShadingBinPass& shadingBinPass);
 
         // Binds Phase 3's renderer::VirtualShadowMapPass resources (physical page atlas + sampler,
         // page table, feedback buffer, sun clipmap levels UBO) into BOTH this pass's descriptor
@@ -200,6 +208,15 @@ namespace renderer {
         VkImageView GetOutputDepthView() const { return m_OutputDepthView; }
         VkImageView GetOutputAlbedoView() const { return m_OutputAlbedoView; }
         VkImageView GetOutputRoughnessMetallicView() const { return m_OutputRoughnessMetallicView; }
+        // Substrate integration (Phase S3): lets ReflectionPass/MegaLightsPass re-fetch the full
+        // Slab data straight from g_MaterialParams instead of the GBuffer growing a field per
+        // Substrate parameter -- see ClusterResolve.comp's own g_OutputMaterialID binding comment.
+        VkImageView GetOutputMaterialIDView() const { return m_OutputMaterialIDView; }
+        // Substrate integration (Phase S3): the SAME SSBO handle this pass already uploaded
+        // Init()'s materialTable into -- ReflectionPass/MegaLightsPass bind this directly rather
+        // than each owning a redundant duplicate upload (TransparentForwardPass's own separate copy
+        // predates this getter and is left as-is, see that class's own m_MaterialParamsBuffer).
+        VkBuffer GetMaterialParamsBuffer() const { return m_MaterialParamsBuffer.Handle(); }
 
     private:
         static constexpr uint32_t kWorkgroupSize = 8; // Matches ClusterResolve.comp's local_size_x/y.
@@ -223,6 +240,11 @@ namespace renderer {
         VkImage m_OutputRoughnessMetallicImage = VK_NULL_HANDLE;
         VmaAllocation m_OutputRoughnessMetallicAllocation = VK_NULL_HANDLE;
         VkImageView m_OutputRoughnessMetallicView = VK_NULL_HANDLE;
+        // Substrate integration (Phase S3): r16ui, this pixel's clamped materialID (0xFFFF = no
+        // geometry) -- see ClusterResolve.comp's own g_OutputMaterialID binding comment.
+        VkImage m_OutputMaterialIDImage = VK_NULL_HANDLE;
+        VmaAllocation m_OutputMaterialIDAllocation = VK_NULL_HANDLE;
+        VkImageView m_OutputMaterialIDView = VK_NULL_HANDLE;
 
         VkSampler m_DepthSampler = VK_NULL_HANDLE; // Nearest filtering, matching HZBPass's own depth-sampling convention.
 

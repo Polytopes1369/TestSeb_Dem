@@ -41,6 +41,7 @@
 #include "include/material_params.glsl"
 #include "include/math_utils.glsl"
 #include "include/ggx_brdf.glsl"
+#include "include/substrate_bsdf.glsl"
 
 #define SHADOW_ATLAS_SET 0
 #define SHADOW_ATLAS_BINDING 7
@@ -74,7 +75,9 @@ layout(std140, set = 0, binding = 5) uniform TransparentViewParamsUBO {
     mat4 view; // Unused here (vertex-stage only) -- see TransparentForward.vert.
     mat4 proj;
     vec3 cameraPositionWorld;
-    float _pad0;
+    // Phase PP3: repurposes what used to be pure std140 padding -- feeds the animated procedural
+    // refraction-offset noise at the end of main() below.
+    float globalTime;
     vec4 sunDirectionAndIntensity; // xyz = direction (points FROM the light TOWARD the scene), w = intensity.
     vec4 sunColor;                 // rgb = color, a unused.
 } g_ViewParams;
@@ -106,21 +109,28 @@ layout(push_constant) uniform TransparentPushConstants {
 } pc;
 
 layout(location = 0) out vec4 outColor;
+// Phase PP3 (post-process stack roadmap): per-material procedural refraction offset -- see
+// renderer::MaterialParameters::heatDistortion's own comment and this file's end-of-main() comment.
+layout(location = 1) out vec2 outRefractionOffset;
 
 // Direct lighting for this fragment: the sun only now (shadowed via SampleSunShadowVSM) -- point
 // lights are MegaLights' job (see this file's own header comment) -- ported from
 // SurfaceCacheCapture.frag's own identically-named function's sun term, reading g_ViewParams
 // instead of that shader's SurfaceCacheLightingUBO (same sun-field layout).
-vec3 ComputeDirectLighting(vec3 worldPos, vec3 n) {
-    // g_ViewParams.sunDirectionAndIntensity.xyz points FROM the light TOWARD the scene -- negate
-    // for the surface-to-light direction Lambertian shading needs.
-    vec3 sunDir = normalize(-g_ViewParams.sunDirectionAndIntensity.xyz);
+//
+// Substrate integration: returns just the shadowed sun RADIANCE (color * intensity * visibility),
+// WITHOUT the NdotL or material multiply the pre-Substrate version applied -- EvaluateSubstrateMaterial
+// (substrate_bsdf.glsl) already applies its own NdotL internally per BSDF lobe (diffuse/specular/
+// fuzz), so a caller-side NdotL multiply here would double-count it. The sunNdotL<=0 early-out is
+// kept purely as a cheap skip of the shadow-map sample when the sun is entirely below the surface's
+// horizon (EvaluateSubstrateMaterial would itself return ~0 for every lobe in that case anyway).
+vec3 ComputeSunRadiance(vec3 worldPos, vec3 n, vec3 sunDir) {
     float sunNdotL = max(dot(n, sunDir), 0.0);
     if (sunNdotL <= 0.0) {
         return vec3(0.0);
     }
     float visibility = SampleSunShadowVSM(worldPos);
-    return g_ViewParams.sunColor.rgb * g_ViewParams.sunDirectionAndIntensity.w * sunNdotL * visibility;
+    return g_ViewParams.sunColor.rgb * g_ViewParams.sunDirectionAndIntensity.w * visibility;
 }
 
 vec3 FetchPosition(uint globalVertexIndex) {
@@ -180,23 +190,23 @@ void main() {
     MaterialParams mat = g_MaterialParams.params[materialSlot];
 
     vec3 n = normalize(inNormal);
+    // Substrate integration: the view direction EvaluateSubstrateMaterial's/
+    // EvaluateSubstrateReflectionWeight's specular/Fresnel terms need -- see
+    // TransparentViewParamsUBO's own cameraPositionWorld field comment above.
+    vec3 viewDir = normalize(g_ViewParams.cameraPositionWorld - inWorldPos);
 
-    // --- Sun-direct + indirect diffuse (always computed -- cheap, applies to every transparent
-    // material regardless of hasReflections, see this file's own header comment). ---
-    vec3 directLighting = ComputeDirectLighting(inWorldPos, n);
+    // --- Sun-direct (Substrate full Slab BSDF response) + indirect diffuse (always computed --
+    // cheap, applies to every transparent material regardless of hasReflections, see this file's
+    // own header comment). ---
+    // g_ViewParams.sunDirectionAndIntensity.xyz points FROM the light TOWARD the scene -- negate
+    // for the surface-to-light direction the BSDF needs.
+    vec3 sunDir = normalize(-g_ViewParams.sunDirectionAndIntensity.xyz);
+    vec3 sunRadiance = ComputeSunRadiance(inWorldPos, n, sunDir);
+    vec3 sunResponse = EvaluateSubstrateMaterial(mat, n, viewDir, sunDir) * sunRadiance;
+    // Indirect stays a simple ambient multiply by the base slab's diffuse albedo only (no BRDF --
+    // it has no single light direction), matching ClusterResolve.comp's own identical simplification
+    // for its 0.15 ambient/fill term.
     vec3 indirectLighting = SampleWorldProbeGrid(inWorldPos);
-    // Metallic energy conservation -- see the pre-Phase-5 shader's identical comment (kept for
-    // consistency with the opaque shaders' formula; metallic is always 0.0 for every transparent
-    // category GenerateRandomMaterialTable produces).
-    vec3 diffuseAlbedo = mat.baseColor * (1.0 - mat.metallic);
-    // Physically-based Lambertian normalization -- see ClusterResolve.comp's own identical
-    // recalibration comment (2026-07-17): directLighting is real illuminance in LUX (g_ViewParams.
-    // sunDirectionAndIntensity.w, same convention as renderer::DirectionalLight), so outgoing
-    // radiance needs the standard `illuminance * albedo / PI`. indirectLighting (SampleWorldProbeGrid)
-    // is folded into the same normalization -- both terms are irradiance-like quantities on this
-    // surface, so they share one Lambertian BRDF divide.
-    const float kPI = 3.14159265359;
-    vec3 diffuseLight = (diffuseAlbedo / kPI) * (directLighting + indirectLighting);
 
     // NOT weighted by mat.alpha here -- this pipeline's fixed-function blend (srcColorBlendFactor =
     // VK_BLEND_FACTOR_SRC_ALPHA) already multiplies the WHOLE outRGB by outAlpha; an explicit
@@ -206,7 +216,7 @@ void main() {
     // recalibration): converts this codebase's small artist-authored emissive multiplier onto the
     // same real radiance scale the lit terms above now use.
     const float kEmissiveScale = 1500.0;
-    vec3 outRGB = diffuseLight + mat.emissive * kEmissiveScale;
+    vec3 outRGB = sunResponse + indirectLighting * mat.base.diffuseAlbedo + EvaluateSubstrateEmissive(mat) * kEmissiveScale;
     float outAlpha = mat.alpha;
 
     // --- MegaLights Phase A follow-up: RIS-selected point light + 1 shadow-visibility ray, exactly
@@ -232,23 +242,24 @@ void main() {
         float windowSq = 1.0 - nd2 * nd2;
         float window = saturate(windowSq * windowSq);
 
-        // light.intensity is real luminous intensity in CANDELA (renderer::MegaLight's own comment,
-        // 2026-07-17 recalibration) -- `intensity / distSq` is the standard inverse-square
-        // illuminance-at-a-point formula, and outgoing radiance needs the same Lambertian /PI this
-        // file's own diffuseLight term above already applies.
-        outRGB += (diffuseAlbedo / kPI) * light.color * light.intensity * megaNdotL / distSq * window * visibility * invPdf;
+        // Substrate: EvaluateSubstrateMaterial already applies its own NdotL internally (see
+        // ComputeSunRadiance's own comment above) -- megaNdotL is kept only for the occlusion
+        // early-out check above, no longer multiplied into the final radiance here. light.intensity
+        // is real luminous intensity in CANDELA (renderer::MegaLight's own comment, 2026-07-17
+        // recalibration) -- `intensity / distSq` is the standard inverse-square illuminance-at-a-
+        // point formula; EvaluateSubstrateMaterial's own contract already bakes in the /PI
+        // Lambertian normalization, so no extra factor is needed here.
+        outRGB += EvaluateSubstrateMaterial(mat, n, viewDir, megaLightDir) * light.color * light.intensity / distSq * window * visibility * invPdf;
     }
 
     // --- Optional front-layer specular reflection (Lumen-style, single GGX-VNDF sample) -- gated
     // per-material, see this file's own header comment. ---
     if (mat.hasReflections > 0.5) {
-        vec3 viewDir = normalize(g_ViewParams.cameraPositionWorld - inWorldPos);
-        float NdotV = max(dot(n, viewDir), 0.0);
-        // Dielectric: F0 = 0.04 (standard non-metal baseline) -- the "Transparent: clear/glass-like"
-        // category (the only one with hasReflections set) never sets metallic (see
-        // MaterialParameterTable.h's own category).
-        vec3 F0 = vec3(0.04);
-        vec3 fresnel = F_Schlick(F0, NdotV);
+        // Substrate integration: Fresnel-only "Lumen Performance mode" reflection weight,
+        // generalized to Substrate's vertical layering (base+top slabs) -- see
+        // substrate_bsdf.glsl's own EvaluateSubstrateReflectionWeight comment. viewDir already
+        // computed above (shared with the sun/MegaLights BSDF terms).
+        vec3 fresnel = EvaluateSubstrateReflectionWeight(mat, n, viewDir);
 
         vec3 tangent, bitangent;
         BuildTangentBasis(n, tangent, bitangent);
@@ -261,7 +272,7 @@ void main() {
             hashFloat(pixelSeed64, uint64_t(pc.frameIndex) * 0x9E3779B97F4A7C15UL + 0x517CC1B7UL),
             hashFloat(pixelSeed64, uint64_t(pc.frameIndex) * 0x9E3779B97F4A7C15UL + 0xBF58476D1CE4E5B9UL));
 
-        vec3 halfVectorTangentSpace = SampleGGXVNDF(xi, viewDirTangentSpace, mat.roughness);
+        vec3 halfVectorTangentSpace = SampleGGXVNDF(xi, viewDirTangentSpace, mat.base.roughness);
         vec3 halfVectorWorld = normalize(
             tangent * halfVectorTangentSpace.x + bitangent * halfVectorTangentSpace.y + n * halfVectorTangentSpace.z);
         vec3 rayDir = reflect(-viewDir, halfVectorWorld);
@@ -296,4 +307,23 @@ void main() {
     }
 
     outColor = vec4(outRGB, outAlpha);
+
+    // --- Phase PP3: procedural, animated refraction offset (Heat Distortion & Refraction) --
+    // UE5.8-parity material-authored mechanism: this fragment writes a per-pixel screen-space UV
+    // offset into g_RefractionOffset (this pass' own second color attachment), which renderer::
+    // PostProcessPass's composite shader later samples and uses to distort the UV it reads the HDR
+    // scene color through -- exactly like a real UE5.8 translucent material's "Refraction" input,
+    // not a single global post-process knob. Two independently-scrolling value-noise fields (world-
+    // space XZ, offset by g_ViewParams.globalTime) drive the X/Y offset components -- cheap, no
+    // texture asset, reads as a believable rising-heat shimmer for any material with
+    // MaterialParams.heatDistortion > 0 (see MaterialParameterTable.h's own category comment for
+    // which materials roll one).
+    if (mat.heatDistortion > 0.0) {
+        vec2 flowUV = inWorldPos.xz * 0.35 + vec2(0.0, g_ViewParams.globalTime * 0.6);
+        float noiseX = Hash(flowUV) - 0.5;
+        float noiseY = Hash(flowUV * 1.7 + vec2(19.3, 7.1) + g_ViewParams.globalTime * 0.4) - 0.5;
+        outRefractionOffset = vec2(noiseX, noiseY) * mat.heatDistortion * 0.015;
+    } else {
+        outRefractionOffset = vec2(0.0);
+    }
 }

@@ -17,6 +17,8 @@
 
 #include "include/math_utils.glsl"
 #include "include/octahedral.glsl"
+#include "include/material_params.glsl"
+#include "include/substrate_bsdf.glsl"
 
 layout(local_size_x = 8, local_size_y = 8) in;
 
@@ -43,7 +45,23 @@ layout(std140, set = 0, binding = 7) uniform MegaLightsViewParamsUBO {
     mat4 invViewProj;
     vec2 viewportSize;
     vec2 _pad0;
+    // Substrate integration: the view direction EvaluateSubstrateMaterial's specular/Fresnel terms
+    // need -- this shader had no view-dependent term at all before (see ClusterResolve.comp's own
+    // ResolveViewParamsUBO.cameraPositionWorld comment for the identical addition pattern there).
+    vec3 cameraPositionWorld;
+    float _pad2;
 } g_ViewParams;
+
+// Substrate integration: this pixel's clamped materialID (0xFFFF = background), letting this
+// shader re-fetch the full Slab data straight from g_MaterialParams instead of the GBuffer
+// growing a field per Substrate parameter -- see ClusterResolve.comp's own g_OutputMaterialID
+// binding comment.
+layout(r16ui, set = 0, binding = 8) uniform readonly uimage2D g_GBufferMaterialID;
+// renderer::GenerateShowcaseMaterialTable()'s result, the SAME SSBO handle renderer::
+// ClusterResolvePass already uploaded at its own Init() -- see material_params.glsl's own comment.
+layout(std430, set = 0, binding = 9) readonly buffer MaterialParamsSSBO {
+    MaterialParams params[];
+} g_MaterialParams;
 
 layout(push_constant) uniform MegaLightsPushConstants {
     uint frameIndex;
@@ -108,20 +126,26 @@ void main() {
     float windowSq = 1.0 - nd2 * nd2;
     float window = saturate(windowSq * windowSq);
 
-    // Metallic energy conservation -- same convention as ClusterResolve.comp's own diffuseAlbedo
-    // fix (a pure metal has no diffuse response); no GGX specular MegaLights term in Phase A.
-    vec4 albedoSample = imageLoad(g_GBufferAlbedo, pixel);
-    vec2 roughMetal = imageLoad(g_GBufferRoughnessMetallic, pixel).rg;
-    vec3 diffuseAlbedo = albedoSample.rgb * (1.0 - roughMetal.g);
+    // Substrate integration: real per-pixel Slab BSDF response (diffuse + anisotropic specular +
+    // second lobe/Haze + fuzz, vertically layered with the Top slab if any) replaces the old
+    // diffuse-only, metallic-energy-conservation-only term -- closes this shader's own documented
+    // "no GGX specular MegaLights term" Phase-A gap. g_GBufferAlbedo/g_GBufferRoughnessMetallic
+    // above are now unused here but left declared/bound -- see this shader's own Substrate
+    // integration comment for why removing them isn't worth the binding renumbering.
+    vec3 viewDir = normalize(g_ViewParams.cameraPositionWorld - worldPos);
+    uint materialSlot = min(imageLoad(g_GBufferMaterialID, pixel).r, MATERIAL_TABLE_SIZE - 1u);
+    MaterialParams mat = g_MaterialParams.params[materialSlot];
 
     // Full shading contribution of the selected light, times the RIS unbiased-estimator factor --
-    // see megalights_ris.glsl's own SelectLightRIS comment for the derivation. light.intensity is
-    // real luminous intensity in CANDELA (renderer::MegaLight's own comment, 2026-07-17
-    // recalibration) -- `intensity / distSq` is the standard inverse-square illuminance-at-a-point
-    // formula, and outgoing radiance needs the standard Lambertian `illuminance * albedo / PI`
-    // (same convention as ClusterResolve.comp's own recalibration).
-    const float kPI = 3.14159265359;
-    vec3 radiance = (diffuseAlbedo / kPI) * light.color * light.intensity * NdotL / distSq * window * visibility * invPdf;
+    // see megalights_ris.glsl's own SelectLightRIS comment for the derivation. EvaluateSubstrateMaterial
+    // already applies its own NdotL internally per BSDF lobe -- no separate NdotL multiply here (that
+    // would double-count it; NdotL above is still used for the shadow-ray early-out check).
+    // light.intensity is real luminous intensity in CANDELA (renderer::MegaLight's own comment,
+    // 2026-07-17 recalibration) -- `intensity / distSq` is the standard inverse-square illuminance-
+    // at-a-point formula; EvaluateSubstrateMaterial's own contract ("caller multiplies by the
+    // light's real color/intensity", its diffuse lobe already bakes in the /PI Lambertian
+    // normalization) means no extra factor is needed here.
+    vec3 radiance = EvaluateSubstrateMaterial(mat, normal, viewDir, lightDir) * light.color * light.intensity / distSq * window * visibility * invPdf;
     // No saturate(): g_ShadeRadiance is now linear HDR (rgba16f) -- clamping here would defeat the
     // whole point of widening the format, re-introducing the hard-clip renderer::PostProcessPass exists
     // to replace with a soft display-referred curve.

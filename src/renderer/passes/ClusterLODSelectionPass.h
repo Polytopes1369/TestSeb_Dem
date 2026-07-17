@@ -45,16 +45,24 @@ namespace renderer {
 
     // GLSL-friendly, std430-compatible mirror of DAGNodePayload in ClusterDAGScreenError.comp.
     // Field order matches that struct exactly (sphereCenter first so every following scalar packs
-    // tightly with zero implicit padding -- see that shader's own comment). entityID's trailing
-    // 3x uint32 pad rounds the struct up to 64 bytes, its actual std430 array stride.
+    // tightly with zero implicit padding -- see that shader's own comment). A group of up to 4
+    // members can produce up to geometry::kMaxGroupOutputClusters (2) coarser output clusters that
+    // both replace the same members (see geometry::ClusterDAGGroup, ClusterDAG.h), so a node can
+    // have up to 2 distinct parents and up to 4 children -- parentClusterID0/1 and
+    // childClusterID0-3 below replace what used to be a single parentClusterID and 2
+    // childClusterID slots, exactly filling what used to be entityID's 3x uint32 trailing pad (the
+    // struct's total size is unchanged: still 80 bytes, its actual std430 array stride).
     struct DAGNodePayload {
         maths::vec3 sphereCenter;
         float sphereRadius = 0.0f;
 
         uint32_t clusterID = 0;
-        uint32_t parentClusterID = 0xFFFFFFFFu;
+        uint32_t parentClusterID0 = 0xFFFFFFFFu;
+        uint32_t parentClusterID1 = 0xFFFFFFFFu;
         uint32_t childClusterID0 = 0xFFFFFFFFu;
         uint32_t childClusterID1 = 0xFFFFFFFFu;
+        uint32_t childClusterID2 = 0xFFFFFFFFu;
+        uint32_t childClusterID3 = 0xFFFFFFFFu;
         uint32_t level = 0;
 
         float clusterError = 0.0f;
@@ -66,25 +74,30 @@ namespace renderer {
         // (not rest-pose) world positions before projecting error to pixels. See
         // cluster_entity_transform.glsl.
         uint32_t entityID = 0;
-        uint32_t _pad0 = 0;
-        uint32_t _pad1 = 0;
-        uint32_t _pad2 = 0;
 
-        // The DIRECT PARENT's own sphereCenter -- see ClusterDAGScreenError.comp's own comment on
-        // this field for why parentError must be projected from the parent's actual position
-        // rather than this node's (the bug behind the 2026-07-16 "persistent holes" investigation,
-        // project_persistent_cluster_holes_open_bug.md). {0,0,0} for a root node (parentError is
-        // +infinity there, so the position multiplying it is irrelevant).
+        // The shared PARENT GROUP's own bounding-sphere center (geometry::ClusterDAGGroup::
+        // groupSphereCenter, baked into geometry::DAGNodeEntry::parentSphereCenter at cache-write
+        // time) -- see ClusterDAGScreenError.comp's own comment on this field for why parentError
+        // must be projected from the parent group's actual position rather than this node's (the
+        // bug behind the 2026-07-16 "persistent holes" investigation,
+        // project_persistent_cluster_holes_open_bug.md), and why it must be ONE shared value
+        // rather than depending on which of parentClusterID0/1 a runtime LOD cut actually selects.
+        // {0,0,0} for a root node (parentError is +infinity there, so the position multiplying it
+        // is irrelevant).
         maths::vec3 parentSphereCenter{};
-        float _pad3 = 0.0f;
+        float _pad0 = 0.0f;
     };
     static_assert(sizeof(DAGNodePayload) == 80,
         "DAGNodePayload must match DAGNodePayload in ClusterDAGScreenError.comp exactly (std430 layout)");
 
     // GLSL-friendly, std430-compatible mirror of LODNodeMetadata in cluster_lod_node_metadata.glsl.
-    // See that file's comment for the field-ordering rationale; the trailing 4-byte pad below
-    // rounds this struct up to its actual 96-byte std430 array stride (GLSL infers this
-    // automatically for its own copy, but the C++ mirror must declare it explicitly).
+    // See that file's comment for the field-ordering rationale. parentClusterID0/1 (a node can
+    // have up to geometry::kMaxGroupOutputClusters == 2 parents, see DAGNodePayload's own comment
+    // above) replaces what used to be a single parentClusterID, growing this struct's trailing
+    // (post-vec4-block) span from 32 to 36 bytes -- rounded up to the next 16-byte multiple (48),
+    // for a new total of 112 bytes (was 96), its actual std430 array stride. The trailing 3x
+    // uint32 pad below is that rounding, made explicit (GLSL infers it automatically for its own
+    // copy, but the C++ mirror must declare it).
     struct LODNodeMetadata {
         maths::vec3 boundsMin; float _padBoundsMin = 0.0f;
         maths::vec3 boundsMax; float _padBoundsMax = 0.0f;
@@ -93,7 +106,8 @@ namespace renderer {
 
         uint32_t indexCount = 0;
         uint32_t clusterID = 0;
-        uint32_t parentClusterID = 0xFFFFFFFFu;
+        uint32_t parentClusterID0 = 0xFFFFFFFFu;
+        uint32_t parentClusterID1 = 0xFFFFFFFFu;
         uint32_t logicalPageID = 0;
         uint32_t maskTextureIndex = 0xFFFFFFFFu;
         float maxWPOAmplitude = 0.0f;
@@ -104,11 +118,12 @@ namespace renderer {
         // geometry::ClusterIndexEntry::materialID, carried through the LOD cut the same way as
         // entityID above so ClusterLODCompact.comp can copy it verbatim into
         // ClusterCullMetadata::materialID for ClusterResolve.comp's real PBR material lookup.
-        // Occupies what used to be this struct's trailing padding float -- same 96-byte std430
-        // stride, no size change.
         uint32_t materialID = 0;
+        uint32_t _pad0 = 0;
+        uint32_t _pad1 = 0;
+        uint32_t _pad2 = 0;
     };
-    static_assert(sizeof(LODNodeMetadata) == 96,
+    static_assert(sizeof(LODNodeMetadata) == 112,
         "LODNodeMetadata must match LODNodeMetadata in cluster_lod_node_metadata.glsl exactly (std430 layout)");
 
     class ClusterLODSelectionPass {

@@ -803,6 +803,22 @@ void VulkanContext::CreateLogicalDevice() {
   // tracing / mesh shader requirements already supports it), so enabled unconditionally here,
   // matching geometryShader's/fragmentStoresAndAtomics' own enablement rigor above.
   deviceFeatures2.features.multiDrawIndirect = VK_TRUE;
+  // independentBlend (Phase PP3, post-process stack roadmap): renderer::TransparentForwardPass's
+  // own forward pipeline now has 2 color attachments with DIFFERENT blend states (color: alpha-
+  // blended "over" compositing; g_RefractionOffset: a plain overwrite, blendEnable=FALSE -- see
+  // that pass' own pipeline-creation comment) -- without this feature, the spec requires every
+  // element of VkPipelineColorBlendStateCreateInfo::pAttachments to be IDENTICAL
+  // (VUID-VkPipelineColorBlendStateCreateInfo-pAttachments-00605), which vkCreateGraphicsPipelines
+  // then rejects. A near-universally-supported core Vulkan 1.0 feature bit on desktop GPUs, so
+  // enabled unconditionally here, matching multiDrawIndirect's own enablement rigor above.
+  deviceFeatures2.features.independentBlend = VK_TRUE;
+  // tessellationShader (Phase 7a, UE5.8 parity roadmap): core Vulkan 1.0 feature bit, no device
+  // extension required -- gates VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT/_EVALUATION_BIT
+  // (renderer::HeroTessellationPass, the hero Icosphere's own screen-space-adaptive
+  // displacement-mapped pipeline). A near-universally-supported core feature on desktop GPUs
+  // (same rigor as geometryShader/fragmentStoresAndAtomics/multiDrawIndirect above), enabled
+  // unconditionally here.
+  deviceFeatures2.features.tessellationShader = VK_TRUE;
 
   VkDeviceCreateInfo createInfo{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
   createInfo.pNext = &deviceFeatures2;
@@ -1199,6 +1215,7 @@ void VulkanContext::CreatePipelinesAndDescriptors() {
       {"shaders/geom_pyramide.comp.spv", &m_PyramidPipeline},
       {"shaders/geom_TorusKnot.comp.spv", &m_TorusKnotPipeline},
       {"shaders/geom_chamferBox.comp.spv", &m_ChamferBoxPipeline},
+      {"shaders/geom_terrain.comp.spv", &m_TerrainPipeline},
       {"shaders/autosmooth.comp.spv", &m_AutosmoothPipeline},
   };
   for (const auto &desc : simplePrimitives) {
@@ -1419,7 +1436,36 @@ void VulkanContext::BuildEntityData() {
     entity.cellID = 0u;
     entity.flags = 0u;
     core::SetFlag(entity.flags, core::EntityFlags::CastShadows, true);
-    core::SetFlag(entity.flags, core::EntityFlags::IsTransparent, m_MaterialTable.isTransparent[i]);
+
+    bool isTransparent = m_MaterialTable.isTransparent[i];
+    // Phase 7a (UE5.8 parity roadmap, hero asset tessellation): the Icosphere (kHeroEntityIndex)
+    // is the single tessellated/displaced hero asset, rendered ONLY by
+    // renderer::HeroTessellationPass -- never by the opaque Nanite VisBuffer pipeline (no
+    // representation for runtime-displaced geometry there) nor by TransparentForwardPass.
+    // Overrides its materialID to the reserved renderer::kHeroMaterialID slot (see that
+    // constant's own comment) and forces its entity IsTransparent flag true -- NOT because it's
+    // actually alpha-blended (kHeroMaterialID's own alpha is 1.0, fully opaque), but because
+    // ClusterLODCompact.comp's existing per-entity IsTransparent exclusion (see that shader's own
+    // EntityDataBuffer comment) is the exact "never enters the opaque candidate list" mechanism
+    // this entity also needs. TransparentForwardPass itself stays unaffected: it filters by
+    // materialTable.isTransparent[materialID], which correctly stays false for kHeroMaterialID
+    // (GenerateShowcaseMaterialTable() never sets it true -- see that function's own hero-recipe
+    // comment), so the hero entity's clusters never enter ITS candidate list either.
+    if (i == kHeroEntityIndex) {
+      entity.materialID = renderer::kHeroMaterialID;
+      isTransparent = true;
+    }
+    // Phase 7b (UE5.8 parity roadmap, terrain heightfield): the floor entity is now a procedural
+    // terrain heightfield (see GenerateGeometry()'s own terrain block), not a flat plane -- override
+    // its materialID to the reserved renderer::kTerrainMaterialID slot so ClusterResolve.comp/
+    // ClusterResolveBinned.comp's height/slope biome blend (terrain_shading.glsl) applies to it.
+    // Unlike the hero entity, the terrain stays fully opaque and needs no IsTransparent exclusion --
+    // it renders through the normal opaque Nanite path unmodified (see kTerrainMaterialID's own
+    // comment).
+    if (i == kFloorEntityIndex) {
+      entity.materialID = renderer::kTerrainMaterialID;
+    }
+    core::SetFlag(entity.flags, core::EntityFlags::IsTransparent, isTransparent);
   }
 }
 
@@ -1891,6 +1937,49 @@ void VulkanContext::GeneratePlane(
   runningIndexOffset += 6u * (params.widthSegments - 1u) * (params.lengthSegments - 1u);
 }
 
+void VulkanContext::GenerateTerrain(
+    float Length, float Width,
+    uint32_t meshID, maths::vec2 slot,
+    uint32_t& runningVertexOffset, uint32_t& runningIndexOffset,
+    float worldOffsetY, float spacing) {
+  // Validate dimensions are positive and non-zero
+  assert(Length > 0.0f);
+  assert(Width > 0.0f);
+
+  uint32_t LengthSegments = std::max(2u, static_cast<uint32_t>(std::round(Length / spacing)));
+  uint32_t WidthSegments = std::max(2u, static_cast<uint32_t>(std::round(Width / spacing)));
+
+  // geom_terrain.comp's Params UBO is byte-identical to PlaneParams (see that struct's own
+  // comment) -- reused directly rather than duplicating an identical struct.
+  PlaneParams params{};
+  params.width = Width;
+  params.length_ = Length;
+  params.widthSegments = WidthSegments;
+  params.lengthSegments = LengthSegments;
+  params.meshID = meshID;
+  // Matches every other Generate*() call: the vertex-baked materialID field is not what drives
+  // runtime shading (see geometry::ClusterIndexEntry::materialID's own comment -- that's stamped
+  // from core::EntityData::materialID at cook time instead). The real terrain materialID override
+  // is set in BuildEntityData(), not here.
+  params.materialID = 0.0f;
+  params.vertexOffset = runningVertexOffset;
+  params.indexOffset = runningIndexOffset;
+  params.worldOffsetX = slot.x;
+  params.worldOffsetY = worldOffsetY;
+  params.worldOffsetZ = slot.y;
+
+  uint32_t totalVerts = params.widthSegments * params.lengthSegments;
+  constexpr uint32_t kLocalSizeXY = 8u; // geom_terrain.comp local_size = (8, 8, 1)
+  uint32_t groupCountX = (params.widthSegments + kLocalSizeXY - 1u) / kLocalSizeXY;
+  uint32_t groupCountY = (params.lengthSegments + kLocalSizeXY - 1u) / kLocalSizeXY;
+
+  DispatchGeometryCompute(m_TerrainPipeline, m_ComputePipelineLayout, &params,
+                          sizeof(params), nullptr, 0, groupCountX, groupCountY, 1);
+
+  runningVertexOffset += totalVerts;
+  runningIndexOffset += 6u * (params.widthSegments - 1u) * (params.lengthSegments - 1u);
+}
+
 void VulkanContext::GenerateCapsule(
     float Radius, float Height,
     uint32_t meshID, maths::vec2 slot,
@@ -2240,16 +2329,32 @@ void VulkanContext::GenerateGeometry() {
   }
 
   // -------------------------------------------------------------------------
-  // FLOOR PLANE (slot 14) — large 300m x 300m plane acting as the floor
+  // TERRAIN HEIGHTFIELD (slot 14) — Phase 7b (UE5.8 parity roadmap): 300m x 300m procedural
+  // terrain replacing what used to be a flat floor plane, at the same world footprint -- see
+  // GenerateTerrain()'s own comment and terrain_noise.glsl's kTerrainAmplitude comment for why its
+  // height variation stays small (this gallery floats every zone primitive at a fixed clearance
+  // above the ground rather than deriving per-entity placement from it).
   // -------------------------------------------------------------------------
   {
     maths::vec2 slot = {0.0f, 0.0f}; // centered at the world origin
-    // Coarse spacing: geom_plane.comp emits a flat, unlit-detail surface (constant
-    // up-normal, no displacement), so the hero-primitive VERTEX_SPACING (0.1m) would
-    // waste 9M vertices on a 300m span for zero visual gain -- see FLOOR_VERTEX_SPACING.
-    GeneratePlane(300.0f, 300.0f, m_EntityData[kFloorEntityIndex].meshID, slot,
+    // Deliberately coarser than FLOOR_VERTEX_SPACING (1.0): unlike the flat floor it replaces
+    // (near-zero curvature everywhere, so ClusterDAG's simplifier folds its 90000 vertices into a
+    // handful of DAG nodes almost for free), a genuinely undulating heightfield has real curvature
+    // at every vertex, forcing real partitioning into hundreds/thousands of small clusters. At
+    // FLOOR_VERTEX_SPACING (90000 vertices) this pushed the scene's total concurrent DAG-build
+    // load (LoadingManager's parallel per-mesh workers, see core::LoadingManager) far past what
+    // every other primitive's mesh needs, and reproducibly crashed partway through cold-cache
+    // rebuild during Phase 7b's own verification -- a pre-existing concurrency issue in the DAG-
+    // build pipeline that was never triggered before because no primitive's mesh had ever
+    // combined this vertex count with this much genuine local curvature. Rather than chase that
+    // pipeline bug (out of Phase 7b's own scope -- see the geometry-only feature this phase is
+    // meant to add), staying at a lower vertex/cluster budget comparable to every other primitive's
+    // own mesh sidesteps it entirely: 4x coarser (75x75 = 5625 vertices) still reads as a genuine
+    // rolling backdrop at this terrain's own small kTerrainAmplitude.
+    constexpr float kTerrainVertexSpacing = 4.0f;
+    GenerateTerrain(300.0f, 300.0f, m_EntityData[kFloorEntityIndex].meshID, slot,
                   runningVertexOffset, runningIndexOffset, -0.8f,
-                  config::FLOOR_VERTEX_SPACING);
+                  kTerrainVertexSpacing);
   }
 
   m_TotalVertexCount = runningVertexOffset;
@@ -2578,7 +2683,7 @@ void VulkanContext::Shutdown() {
        {m_ConePipeline, m_IcospherePipeline, m_PlanePipeline, m_SpherePipeline,
         m_TorusPipeline, m_TubePipeline, m_CapsulePipeline, m_CylinderPipeline,
         m_PyramidPipeline, m_TorusKnotPipeline, m_ChamferBoxPipeline,
-        m_AutosmoothPipeline}) {
+        m_TerrainPipeline, m_AutosmoothPipeline}) {
     if (pipeline != VK_NULL_HANDLE) {
       vkDestroyPipeline(m_Device, pipeline, nullptr);
     }

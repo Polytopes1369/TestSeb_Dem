@@ -37,6 +37,7 @@
 #include <future>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -225,9 +226,33 @@ int main() {
 
             geometry::DAGNodeEntry dagEntry{};
             dagEntry.clusterID = globalID;
-            dagEntry.parentClusterID = (node.parentIndex == geometry::kInvalidDAGNodeIndex) ? geometry::kInvalidClusterID : localToGlobal[node.parentIndex];
-            dagEntry.childClusterID[0] = (node.childIndices.size() > 0) ? localToGlobal[node.childIndices[0]] : geometry::kInvalidClusterID;
-            dagEntry.childClusterID[1] = (node.childIndices.size() > 1) ? localToGlobal[node.childIndices[1]] : geometry::kInvalidClusterID;
+
+            for (uint32_t& parentID : dagEntry.parentClusterID) {
+                parentID = geometry::kInvalidClusterID;
+            }
+            dagEntry.parentSphereCenter[0] = 0.0f;
+            dagEntry.parentSphereCenter[1] = 0.0f;
+            dagEntry.parentSphereCenter[2] = 0.0f;
+            if (node.parentGroupIndex != geometry::kInvalidDAGGroupIndex) {
+                const geometry::ClusterDAGGroup& parentGroup = dag.groups[node.parentGroupIndex];
+                for (size_t p = 0; p < parentGroup.outputClusterIndices.size() && p < geometry::kMaxGroupOutputClusters; ++p) {
+                    dagEntry.parentClusterID[p] = localToGlobal[parentGroup.outputClusterIndices[p]];
+                }
+                dagEntry.parentSphereCenter[0] = parentGroup.groupSphereCenter.x;
+                dagEntry.parentSphereCenter[1] = parentGroup.groupSphereCenter.y;
+                dagEntry.parentSphereCenter[2] = parentGroup.groupSphereCenter.z;
+            }
+
+            for (uint32_t& childID : dagEntry.childClusterID) {
+                childID = geometry::kInvalidClusterID;
+            }
+            if (node.sourceGroupIndex != geometry::kInvalidDAGGroupIndex) {
+                const auto& members = dag.groups[node.sourceGroupIndex].memberClusterIndices;
+                for (size_t c = 0; c < members.size() && c < 4; ++c) {
+                    dagEntry.childClusterID[c] = localToGlobal[members[c]];
+                }
+            }
+
             dagEntry.level = node.level;
             dagEntry.clusterError = node.clusterError;
             dagEntry.parentError = node.parentError;
@@ -354,20 +379,60 @@ int main() {
     Check(dagOk, "DAG table must round-trip byte-exact");
 
     if (dagOk) {
+        // No separate on-disk group table (see ClusterFormat.h's DAGNodeEntry comment): one
+        // ClusterDAGGroup per distinct source group is re-derived here by canonicalizing on its
+        // (sorted) child-index set, exactly like geometry::VirtualGeometryCacheTest.cpp's own
+        // ReconstructDAGFromTable.
         geometry::ClusterDAG reconstructed;
         reconstructed.nodes.resize(readDagEntries.size());
+
+        std::map<std::vector<uint32_t>, uint32_t> childSetToGroupIndex;
+
         for (size_t i = 0; i < readDagEntries.size(); ++i) {
             const geometry::DAGNodeEntry& e = readDagEntries[i];
             geometry::ClusterDAGNode& n = reconstructed.nodes[i];
             n.level = e.level;
             n.clusterError = e.clusterError;
             n.parentError = e.parentError;
-            n.parentIndex = (e.parentClusterID == geometry::kInvalidClusterID) ? geometry::kInvalidDAGNodeIndex : e.parentClusterID;
-            for (uint32_t c : e.childClusterID) {
-                if (c != geometry::kInvalidClusterID) n.childIndices.push_back(c);
+
+            bool isRoot = true;
+            for (uint32_t parentID : e.parentClusterID) {
+                if (parentID != geometry::kInvalidClusterID) { isRoot = false; break; }
             }
-            if (n.parentIndex == geometry::kInvalidDAGNodeIndex) {
+            if (isRoot) {
                 reconstructed.rootIndices.push_back(static_cast<uint32_t>(i));
+            }
+
+            std::vector<uint32_t> children;
+            for (uint32_t c : e.childClusterID) {
+                if (c != geometry::kInvalidClusterID) children.push_back(c);
+            }
+            if (children.empty()) {
+                continue;
+            }
+            std::sort(children.begin(), children.end());
+
+            auto it = childSetToGroupIndex.find(children);
+            uint32_t groupIndex;
+            if (it != childSetToGroupIndex.end()) {
+                groupIndex = it->second;
+            }
+            else {
+                const geometry::DAGNodeEntry& firstMember = readDagEntries[children[0]];
+                groupIndex = static_cast<uint32_t>(reconstructed.groups.size());
+                geometry::ClusterDAGGroup group;
+                group.memberClusterIndices = children;
+                group.groupError = firstMember.parentError;
+                group.groupSphereCenter = maths::vec3{
+                    firstMember.parentSphereCenter[0], firstMember.parentSphereCenter[1], firstMember.parentSphereCenter[2] };
+                reconstructed.groups.push_back(std::move(group));
+                childSetToGroupIndex.emplace(children, groupIndex);
+            }
+
+            n.sourceGroupIndex = groupIndex;
+            reconstructed.groups[groupIndex].outputClusterIndices.push_back(static_cast<uint32_t>(i));
+            for (uint32_t childID : children) {
+                reconstructed.nodes[childID].parentGroupIndex = groupIndex;
             }
         }
         std::vector<std::string> reErrors;

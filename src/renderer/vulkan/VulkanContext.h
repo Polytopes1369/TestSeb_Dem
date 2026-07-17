@@ -197,6 +197,10 @@ private:
     VkPipeline m_TorusKnotPipeline = VK_NULL_HANDLE;
     VkPipeline m_ChamferBoxPipeline = VK_NULL_HANDLE;
     VkPipeline m_AutosmoothPipeline = VK_NULL_HANDLE;
+    // Phase 7b (UE5.8 parity roadmap, terrain heightfield): geom_terrain.comp -- same shared
+    // Params UBO / DispatchGeometryCompute path as every other non-box primitive above (in fact
+    // byte-identical to PlaneParams, see GenerateTerrain()'s own comment).
+    VkPipeline m_TerrainPipeline = VK_NULL_HANDLE;
 
     // The box is generated via 6 dispatches (one per cube face) of the same geom_box.comp
     // module, each specialized with a different VkSpecializationInfo (axis mapping / winding)
@@ -231,6 +235,12 @@ private:
     static constexpr uint32_t kWallEntityIndexB = kEntityCount - 2;
     // The floor plane is always generated last (see GenerateGeometry()'s own GeneratePlane() call).
     static constexpr uint32_t kFloorEntityIndex = kEntityCount - 1;
+    // Phase 7a (UE5.8 parity roadmap, hero asset tessellation): the Icosphere -- generated FIRST
+    // (see GenerateGeometry()'s own "Icosphere-first" comment, `m_EntityData[2].meshID` used
+    // directly), the single tessellated/displaced hero asset, rendered by
+    // renderer::HeroTessellationPass instead of the opaque Nanite path -- see BuildEntityData()'s
+    // own kHeroMaterialID override.
+    static constexpr uint32_t kHeroEntityIndex = 2;
 
     // CPU-authoritative entity records: built once by BuildEntityData() (meshID assigned via
     // core::IDManager) before GenerateGeometry() runs, then copied to m_EntityBuffer by
@@ -314,6 +324,16 @@ private:
         uint32_t meshID, maths::vec2 slot,
         uint32_t& runningVertexOffset, uint32_t& runningIndexOffset,
         float worldOffsetY = 0.0f, float spacing = config::VERTEX_SPACING);
+
+    // Phase 7b (UE5.8 parity roadmap, terrain heightfield): dispatches geom_terrain.comp. Same
+    // signature shape as GeneratePlane (reuses its own PlaneParams struct -- geom_terrain.comp's
+    // Params UBO is byte-identical) since the terrain entity replaces what used to be a flat
+    // GeneratePlane() call at the floor slot -- see GenerateGeometry()'s own floor block.
+    void GenerateTerrain(
+        float Length, float Width,
+        uint32_t meshID, maths::vec2 slot,
+        uint32_t& runningVertexOffset, uint32_t& runningIndexOffset,
+        float worldOffsetY, float spacing);
 
     void GenerateCapsule(
         float Radius, float Height,
