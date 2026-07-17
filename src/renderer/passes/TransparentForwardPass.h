@@ -125,6 +125,20 @@ namespace renderer {
         // 2) -- fixed at pipeline-layout-creation time here, same convention as renderer::
         // ReflectionPass::Init()'s own identical 3-set pipeline layout; the actual VkDescriptorSets
         // are re-bound every RecordDraw() call, not stored.
+        //
+        // MegaLights Phase A follow-up (reconciled with the above -- see class comment): `tlas` is
+        // the SAME renderer::SurfaceCacheRayTracingPass::GetTLASHandle() already listed above, bound
+        // ONCE at binding 11 and used by BOTH the reflection trace's TraceHWRT and MegaLights' own
+        // TraceShadowRay -- no second TLAS binding. `lightBuffer`/`lightBufferSize` are renderer::
+        // MegaLightsPass::GetLightBufferHandle()/GetLightBufferSize(), bound at binding 12,
+        // consumed by TransparentForward.frag's inlined RIS point-light selection (megalights_ris
+        // .glsl's SelectLightRIS -- translucent surfaces have no GBuffer entry for MegaLightsPass's
+        // own compute-pass composite to reach, so this mirrors that composite's algorithm inline
+        // instead). Both must already exist by the time this is called -- the caller must Init()
+        // renderer::SurfaceCacheRayTracingPass and renderer::MegaLightsPass first (see renderer::
+        // ClusterRenderPipeline::Init()'s own ordering comment). Per-entity point-light shadowing
+        // (VSM cube faces) is deliberately NOT bound here any more -- MegaLights' own traced shadow
+        // ray supersedes it for this pass, see TransparentForward.frag's own header comment.
         void Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
             VkBuffer pageTableBuffer, VkBuffer compressedPhysicalPoolBuffer,
             VkBuffer entityTransformBuffer, VkBuffer entityDataBuffer, VkBuffer wpoGlobalsBuffer,
@@ -133,8 +147,8 @@ namespace renderer {
             const std::vector<geometry::DAGNodeEntry>& dagEntries,
             VkFormat colorFormat, VkFormat depthFormat,
             const WorldProbeGridPass& worldProbes, const SurfaceCacheTraceContext& traceContext,
-            VkAccelerationStructureKHR tlas, VkBuffer fallbackVertexBuffer,
-            VkBuffer fallbackIndexBuffer, VkBuffer drawRangeBuffer);
+            VkAccelerationStructureKHR tlas, VkBuffer lightBuffer, VkDeviceSize lightBufferSize,
+            VkBuffer fallbackVertexBuffer, VkBuffer fallbackIndexBuffer, VkBuffer drawRangeBuffer);
 
         void Shutdown();
 
@@ -164,14 +178,15 @@ namespace renderer {
         // change as pages stream in/out, matching ClusterHardwareRasterPass::RecordDraw()'s own
         // convention. `cameraPositionWorld` -- feeds the optional reflection trace's view-direction
         // reconstruction (fragment stage; `view`/`proj` are vertex-stage only, see TransparentForward
-        // .vert). `sceneLights` -- full lighting (Phase 5: was just the sun direction), packed into
+        // .vert). `sceneLights` -- only `.sun` is read now (MegaLights' own traced shadow ray
+        // supersedes this pass's own point-light shadowing, see class comment); packed into
         // TransparentViewParamsUBO every call, consumed by the fragment stage's ComputeDirectLighting
         // (see TransparentForward.frag's own comment). `traceContext` -- the SAME instance passed to
         // Init() (fixed set LAYOUTS there; here, its current VkDescriptorSets are bound, since the
         // two never change after that context's own one-time build). `traceMode` (0 = SWRT, 1 = HWRT)
-        // / `frameIndex` -- pushed as push-constants, consumed by the optional per-material
-        // reflection trace, same convention as renderer::ReflectionPass::RecordTrace's identical
-        // parameters.
+        // / `frameIndex` -- pushed as push-constants, consumed by both the optional per-material
+        // reflection trace (renderer::ReflectionPass::RecordTrace's identical convention) and
+        // MegaLights' own RIS candidate decorrelation (megalights_ris.glsl's SelectLightRIS).
         void RecordDraw(VkCommandBuffer cmd, VkImage colorImage, VkImageView colorView, VkImageView depthView,
             VkExtent2D renderExtent, const maths::mat4& view, const maths::mat4& proj,
             VkBuffer decompressedIndexPoolBuffer, const maths::vec3& cameraPositionWorld,

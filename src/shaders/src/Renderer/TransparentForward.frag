@@ -3,9 +3,8 @@
 #extension GL_EXT_ray_query : require
 
 // renderer::TransparentForwardPass's fragment stage. Phase 5 (UE5.8 parity roadmap, translucency):
-// upgraded from flat sun-only Lambertian to direct lighting (sun + point lights, both shadowed --
-// ComputeDirectLighting below, ported from SurfaceCacheCapture.frag's own identically-named
-// function) plus indirect diffuse sampled from the World Probe Grid (applied to every transparent
+// upgraded from flat sun-only Lambertian to direct sun lighting (shadowed, ComputeDirectLighting
+// below) plus indirect diffuse sampled from the World Probe Grid (applied to every transparent
 // material -- one 3D texture sample, cheap enough not to gate). A traced front-layer specular
 // reflection (Lumen-style: single GGX-VNDF sample, HWRT/SWRT, ported from the old standalone
 // TranslucentForwardPass this phase supersedes) is gated PER-MATERIAL by MaterialParams.
@@ -13,19 +12,31 @@
 // glass/water-like materials, not applied to every alpha-blended surface uniformly; see
 // renderer::MaterialParameters::hasReflections' own comment for the exact category split).
 //
+// MegaLights Phase A follow-up (reconciled with the above -- `main` landed this concurrently):
+// point-light shading for this pass is MegaLights' own RIS-weighted stochastic light selection + 1
+// ray-traced shadow-visibility ray, exactly MegaLightsShade.comp's own algorithm, inlined directly
+// here since translucent surfaces have no GBuffer entry for that compute pass to reach -- via the
+// shared megalights_ris.glsl (pure weighting/reservoir math) plus this shader's own TraceShadowRay
+// copy (ray-tracing code is deliberately NOT shared across shaders in this codebase, see
+// megalights_ris.glsl's own header comment). This SUPERSEDES this pass's own earlier per-entity
+// VSM-shadowed point-light loop -- no shadow_point_sampling.glsl here any more, MegaLights' own
+// traced shadow ray covers point lights now.
+//
 // --- Compositing ---
-// diffuseLight (direct+indirect, tinted by albedo) is always weighted by the material's own alpha,
-// same as before Phase 5. When hasReflections is set, the reflection term is NOT alpha-weighted
-// (real glass's reflected light isn't attenuated by the pane's own transmission) and the output
-// alpha is boosted by the Fresnel term at grazing angles (alpha = max(materialAlpha,
-// fresnelReflectance)) -- the standard real-time glass technique: a pane viewed edge-on should
-// look almost fully reflective/opaque even at low base alpha. Blended via this pipeline's existing
-// fixed-function "over" blend (srcAlpha, oneMinusSrcAlpha) against the color attachment, unchanged.
+// diffuseLight (sun-direct + indirect, tinted by albedo) and the MegaLights point-light term are
+// both weighted by the material's own alpha via this pipeline's fixed-function "over" blend
+// (srcAlpha, oneMinusSrcAlpha against the color attachment) -- NOT an explicit in-shader multiply
+// (that would double-attenuate on top of the blend stage's own srcAlpha factor). When hasReflections
+// is set, the reflection term is added AFTER the blend-implied weighting is accounted for and is
+// NOT alpha-weighted at all (real glass's reflected light isn't attenuated by the pane's own
+// transmission); the output alpha is instead boosted by the Fresnel term at grazing angles (alpha =
+// max(materialAlpha, fresnelReflectance)) -- the standard real-time glass technique: a pane viewed
+// edge-on should look almost fully reflective/opaque even at low base alpha.
 //
 // No temporal accumulation exists here (unlike ReflectionPass' ping-pong history) -- a forward-
-// shaded surface has no persistent per-pixel buffer to accumulate into, so the reflection is
-// visibly noisier than the opaque path's own reflections; an accepted, documented simplification
-// (matches the superseded TranslucentForwardPass's own same call).
+// shaded surface has no persistent per-pixel buffer to accumulate into, so both the reflection and
+// the MegaLights term are visibly noisier than their opaque-path counterparts; an accepted,
+// documented simplification (matches the superseded TranslucentForwardPass's own same call).
 
 #include "include/material_params.glsl"
 #include "include/math_utils.glsl"
@@ -39,26 +50,26 @@
 #define SHADOW_FEEDBACK_BINDING 9
 #define SHADOW_SUN_LEVELS_SET 0
 #define SHADOW_SUN_LEVELS_BINDING 10
-#define SHADOW_POINT_FACES_SET 0
-#define SHADOW_POINT_FACES_BINDING 11
 #include "include/shadow_page_table.glsl"
 #include "include/shadow_feedback.glsl"
 #include "include/shadow_atlas_sampling.glsl"
 #include "include/shadow_sun_sampling.glsl"
-#include "include/shadow_point_sampling.glsl"
 
-// std140-exact mirror of a point light's GPU layout (2 naturally-aligned vec4 blocks, no padding
-// needed) -- same field shape as SurfaceCacheCapture.frag's own PointLightGPU.
-struct PointLightGPU {
-    vec4 positionAndRadius; // xyz = world position, w = radius (attenuation reaches ~0 here).
-    vec4 colorAndIntensity; // rgb = color, a = intensity.
-};
+#define MEGALIGHTS_LIGHTS_SET 0
+#define MEGALIGHTS_LIGHTS_BINDING 12
+#include "include/megalights_ris.glsl"
+
+// Shared by MegaLights' own TraceShadowRay AND the optional per-material reflection trace's
+// TraceHWRT below -- ONE g_TLAS binding for both (renderer::SurfaceCacheRayTracingPass::
+// GetTLASHandle(), see renderer::TransparentForwardPass.h's own comment).
+layout(set = 0, binding = 11) uniform accelerationStructureEXT g_TLAS;
 
 // Mirrors renderer::TransparentForwardPass.cpp's own TransparentViewParams field-for-field (std140).
 // Phase 5: grew from a bare sunDirection to a camera position (feeds the reflection trace's view-
-// direction reconstruction) plus the full renderer::SceneLights shape, matching
-// SurfaceCacheLightingUBO's own layout (SurfaceCacheCapture.frag) for the lighting portion so
-// ComputeDirectLighting below is a straight port, not a re-derivation.
+// direction reconstruction) plus sun color/intensity, matching SurfaceCacheLightingUBO's own sun
+// fields (SurfaceCacheCapture.frag) so ComputeDirectLighting below is a straight port, not a
+// re-derivation. No point-light fields (MegaLights supersedes them, see this file's own header
+// comment) and no frameIndex (already carried by the TransparentPushConstants block below).
 layout(std140, set = 0, binding = 5) uniform TransparentViewParamsUBO {
     mat4 view; // Unused here (vertex-stage only) -- see TransparentForward.vert.
     mat4 proj;
@@ -66,9 +77,6 @@ layout(std140, set = 0, binding = 5) uniform TransparentViewParamsUBO {
     float _pad0;
     vec4 sunDirectionAndIntensity; // xyz = direction (points FROM the light TOWARD the scene), w = intensity.
     vec4 sunColor;                 // rgb = color, a unused.
-    uint pointLightCount;
-    uvec3 _pad1;
-    PointLightGPU pointLights[8]; // Must match renderer::kMaxPointLights.
 } g_ViewParams;
 
 layout(std430, set = 0, binding = 6) readonly buffer MaterialParamsSSBO {
@@ -76,15 +84,9 @@ layout(std430, set = 0, binding = 6) readonly buffer MaterialParamsSSBO {
 } g_MaterialParams;
 
 #define WORLD_PROBE_GRID_SET 0
-#define WORLD_PROBE_GRID_BINDING 13
-#define WORLD_PROBE_GRID_PARAMS_BINDING 12
+#define WORLD_PROBE_GRID_BINDING 14
+#define WORLD_PROBE_GRID_PARAMS_BINDING 13
 #include "include/world_probe_sampling.glsl"
-
-// HWRT resources: own binding 14, NOT part of SurfaceCacheTraceContext's set 1/2 -- mirrors
-// renderer::ReflectionTrace.comp's own set-0 TLAS binding exactly (SurfaceCacheTraceContext only
-// covers the SWRT mesh-SDF-trace set (1) and the Surface Cache sampling set (2), never the
-// TLAS/Fallback-Mesh buffers a HWRT consumer needs).
-layout(set = 0, binding = 14) uniform accelerationStructureEXT g_TLAS;
 
 #define FALLBACK_GEOMETRY_SET 0
 #define FALLBACK_GEOMETRY_BASE_BINDING 15
@@ -100,54 +102,25 @@ layout(location = 2) flat in uint inMaterialID;
 layout(push_constant) uniform TransparentPushConstants {
     uint entityCount; // Dynamically uniform -- see mesh_sdf_trace.glsl's own requirement.
     uint traceMode;   // 0 = SWRT (TraceMeshSDFScene), 1 = HWRT (TraceHWRT, inline ray query).
-    uint frameIndex;
+    uint frameIndex;  // Also feeds MegaLights' own RIS candidate decorrelation (SelectLightRIS).
 } pc;
 
 layout(location = 0) out vec4 outColor;
 
-// Direct lighting for this fragment: the sun (shadowed via SampleSunShadowVSM) plus every active
-// point light (also shadowed, via SamplePointShadowVSM) -- ported verbatim from
-// SurfaceCacheCapture.frag's own identically-named function, reading g_ViewParams instead of that
-// shader's SurfaceCacheLightingUBO (same layout, see this file's own header comment).
+// Direct lighting for this fragment: the sun only now (shadowed via SampleSunShadowVSM) -- point
+// lights are MegaLights' job (see this file's own header comment) -- ported from
+// SurfaceCacheCapture.frag's own identically-named function's sun term, reading g_ViewParams
+// instead of that shader's SurfaceCacheLightingUBO (same sun-field layout).
 vec3 ComputeDirectLighting(vec3 worldPos, vec3 n) {
-    vec3 lighting = vec3(0.0);
-
     // g_ViewParams.sunDirectionAndIntensity.xyz points FROM the light TOWARD the scene -- negate
     // for the surface-to-light direction Lambertian shading needs.
     vec3 sunDir = normalize(-g_ViewParams.sunDirectionAndIntensity.xyz);
     float sunNdotL = max(dot(n, sunDir), 0.0);
-    if (sunNdotL > 0.0) {
-        float visibility = SampleSunShadowVSM(worldPos);
-        lighting += g_ViewParams.sunColor.rgb * g_ViewParams.sunDirectionAndIntensity.w * sunNdotL * visibility;
+    if (sunNdotL <= 0.0) {
+        return vec3(0.0);
     }
-
-    for (uint i = 0u; i < g_ViewParams.pointLightCount; ++i) {
-        vec3 lightPos = g_ViewParams.pointLights[i].positionAndRadius.xyz;
-        float radius = max(g_ViewParams.pointLights[i].positionAndRadius.w, 1.0e-3);
-
-        vec3 toLight = lightPos - worldPos;
-        float distSq = dot(toLight, toLight);
-        float dist = sqrt(distSq);
-        vec3 lightDir = toLight / max(dist, 1.0e-5);
-
-        float ndotl = max(dot(n, lightDir), 0.0);
-        if (ndotl <= 0.0) {
-            continue;
-        }
-
-        // Smooth windowed inverse-square falloff (Karis/Frostbite-style): exactly zero at
-        // dist >= radius, while still behaving like a physical inverse-square falloff well inside.
-        float windowed = clamp(1.0 - (distSq * distSq) / (radius * radius * radius * radius), 0.0, 1.0);
-        float atten = (windowed * windowed) / max(distSq, 1.0e-4);
-
-        float visibility = SamplePointShadowVSM(i, lightPos, worldPos);
-
-        vec3 lightColor = g_ViewParams.pointLights[i].colorAndIntensity.rgb;
-        float intensity = g_ViewParams.pointLights[i].colorAndIntensity.a;
-        lighting += lightColor * intensity * ndotl * atten * visibility;
-    }
-
-    return lighting;
+    float visibility = SampleSunShadowVSM(worldPos);
+    return g_ViewParams.sunColor.rgb * g_ViewParams.sunDirectionAndIntensity.w * sunNdotL * visibility;
 }
 
 vec3 FetchPosition(uint globalVertexIndex) {
@@ -158,7 +131,9 @@ vec3 FetchPosition(uint globalVertexIndex) {
 // Nth copy of this codebase's established inline-rayQuery HWRT trace (ReflectionTrace.comp,
 // ScreenProbeTrace.comp, SurfaceCacheGIInject.comp, WorldProbeInject.comp each carry their own
 // identical copy -- see ReflectionTrace.comp's own header comment on why a further copy here
-// follows the existing convention rather than refactoring already-working files).
+// follows the existing convention rather than refactoring already-working files). Used only by the
+// optional per-material reflection trace below -- MegaLights' own TraceShadowRay (right after this
+// function) is a separate, cheaper any-hit-style query against the SAME g_TLAS.
 bool TraceHWRT(vec3 rayOrigin, vec3 rayDir, float tMax, out uint outEntityIndex, out vec3 outLocalPos, out vec3 outLocalNormal) {
     rayQueryEXT rq;
     rayQueryInitializeEXT(rq, g_TLAS, gl_RayFlagsOpaqueEXT, 0xFF, rayOrigin, 1.0e-3, rayDir, tMax);
@@ -188,13 +163,25 @@ bool TraceHWRT(vec3 rayOrigin, vec3 rayDir, float tMax, out uint outEntityIndex,
     return true;
 }
 
+// Identical to MegaLightsShade.comp's own TraceShadowRay (a boolean any-hit-style occlusion query,
+// not a full hit-surface reconstruction) -- duplicated per this codebase's established per-shader
+// trace-code convention, see megalights_ris.glsl's own header comment.
+bool TraceShadowRay(vec3 origin, vec3 dir, float tMax) {
+    rayQueryEXT rq;
+    rayQueryInitializeEXT(rq, g_TLAS, gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT, 0xFF, origin, 1.0e-3, dir, tMax);
+    while (rayQueryProceedEXT(rq)) {
+        // Every BLAS triangle is unconditionally opaque -- nothing to confirm/reject manually.
+    }
+    return rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT;
+}
+
 void main() {
     uint materialSlot = min(inMaterialID, MATERIAL_TABLE_SIZE - 1u);
     MaterialParams mat = g_MaterialParams.params[materialSlot];
 
     vec3 n = normalize(inNormal);
 
-    // --- Direct + indirect diffuse (always computed -- cheap, applies to every transparent
+    // --- Sun-direct + indirect diffuse (always computed -- cheap, applies to every transparent
     // material regardless of hasReflections, see this file's own header comment). ---
     vec3 directLighting = ComputeDirectLighting(inWorldPos, n);
     vec3 indirectLighting = SampleWorldProbeGrid(inWorldPos);
@@ -204,8 +191,38 @@ void main() {
     vec3 diffuseAlbedo = mat.baseColor * (1.0 - mat.metallic);
     vec3 diffuseLight = diffuseAlbedo * (directLighting + indirectLighting);
 
-    vec3 outRGB = diffuseLight * mat.alpha + mat.emissive;
+    // NOT weighted by mat.alpha here -- this pipeline's fixed-function blend (srcColorBlendFactor =
+    // VK_BLEND_FACTOR_SRC_ALPHA) already multiplies the WHOLE outRGB by outAlpha; an explicit
+    // in-shader multiply would double-attenuate (a bug in this shader's first Phase 5 draft, fixed
+    // during the MegaLights reconciliation -- see this file's own header comment).
+    vec3 outRGB = diffuseLight + mat.emissive;
     float outAlpha = mat.alpha;
+
+    // --- MegaLights Phase A follow-up: RIS-selected point light + 1 shadow-visibility ray, exactly
+    // MegaLightsShade.comp's own algorithm -- see this file's own header comment. Also not
+    // alpha-weighted in-shader for the same reason as diffuseLight above. ---
+    uint pixelSeed = uint(gl_FragCoord.y) * 65536u + uint(gl_FragCoord.x);
+    uint selectedIndex;
+    float invPdf;
+    if (SelectLightRIS(inWorldPos, n, pixelSeed, pc.frameIndex, selectedIndex, invPdf)) {
+        MegaLight light = g_Lights.lights[selectedIndex];
+        vec3 toLight = light.position - inWorldPos;
+        float dist = length(toLight);
+        vec3 megaLightDir = toLight / max(dist, 1.0e-4);
+        float megaNdotL = saturate(dot(n, megaLightDir));
+
+        vec3 biasedOrigin = inWorldPos + n * 1.0e-2;
+        bool occluded = (megaNdotL > 0.0) ? TraceShadowRay(biasedOrigin, megaLightDir, max(dist - 2.0e-2, 1.0e-3)) : true;
+        float visibility = occluded ? 0.0 : 1.0;
+
+        float distSq = max(dist * dist, 1.0e-4);
+        float normalizedDist = saturate(dist / max(light.radius, 1.0e-4));
+        float nd2 = normalizedDist * normalizedDist;
+        float windowSq = 1.0 - nd2 * nd2;
+        float window = saturate(windowSq * windowSq);
+
+        outRGB += diffuseAlbedo * light.color * light.intensity * megaNdotL / distSq * window * visibility * invPdf;
+    }
 
     // --- Optional front-layer specular reflection (Lumen-style, single GGX-VNDF sample) -- gated
     // per-material, see this file's own header comment. ---
@@ -224,10 +241,10 @@ void main() {
 
         // Per-pixel-per-frame decorrelated jitter (gl_FragCoord takes the place of
         // ReflectionTrace.comp's gl_GlobalInvocationID -- same hashFloat construction).
-        uint64_t pixelSeed = uint64_t(uint(gl_FragCoord.x)) | (uint64_t(uint(gl_FragCoord.y)) << 32);
+        uint64_t pixelSeed64 = uint64_t(uint(gl_FragCoord.x)) | (uint64_t(uint(gl_FragCoord.y)) << 32);
         vec2 xi = vec2(
-            hashFloat(pixelSeed, uint64_t(pc.frameIndex) * 0x9E3779B97F4A7C15UL + 0x517CC1B7UL),
-            hashFloat(pixelSeed, uint64_t(pc.frameIndex) * 0x9E3779B97F4A7C15UL + 0xBF58476D1CE4E5B9UL));
+            hashFloat(pixelSeed64, uint64_t(pc.frameIndex) * 0x9E3779B97F4A7C15UL + 0x517CC1B7UL),
+            hashFloat(pixelSeed64, uint64_t(pc.frameIndex) * 0x9E3779B97F4A7C15UL + 0xBF58476D1CE4E5B9UL));
 
         vec3 halfVectorTangentSpace = SampleGGXVNDF(xi, viewDirTangentSpace, mat.roughness);
         vec3 halfVectorWorld = normalize(

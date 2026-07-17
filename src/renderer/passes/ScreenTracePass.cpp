@@ -131,7 +131,15 @@ namespace renderer {
         VK_CHECK(vkAllocateDescriptorSets(m_Device, &setAllocInfo, &m_Set));
 
         VkDescriptorImageInfo outputInfo{ VK_NULL_HANDLE, m_OutputView, VK_IMAGE_LAYOUT_GENERAL };
-        VkDescriptorImageInfo depthInfo{ m_NearestSampler, depthView, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL };
+        // GENERAL, not DEPTH_STENCIL_READ_ONLY_OPTIMAL: `depthView` is renderer::
+        // ClusterResolvePass::GetOutputDepthView(), a plain COLOR-aspect R32_SFLOAT GBuffer image
+        // (the winning hw-vs-sw arbitrated NDC depth, not a real depth-attachment image), kept in
+        // VK_IMAGE_LAYOUT_GENERAL for its entire lifetime -- same convention every other consumer of
+        // this exact image already follows (renderer::ATrousDenoisePass, renderer::ReflectionPass,
+        // renderer::ScreenProbeGIPass, renderer::MegaLightsPass, renderer::GICompositePass -- see
+        // that class' own identical fix). Same VUID-VkDescriptorImageInfo-imageLayout-09426
+        // validation error (plus its downstream vkCmdDispatch cascade) as GICompositePass had.
+        VkDescriptorImageInfo depthInfo{ m_NearestSampler, depthView, VK_IMAGE_LAYOUT_GENERAL };
         VkDescriptorImageInfo normalInfo{ m_NearestSampler, normalView, VK_IMAGE_LAYOUT_GENERAL };
         VkDescriptorImageInfo directColorInfo{ m_NearestSampler, directColorView, VK_IMAGE_LAYOUT_GENERAL };
         VkDescriptorBufferInfo viewParamsInfo{ m_ViewParamsBuffer.Handle(), 0, m_ViewParamsBuffer.Size() };

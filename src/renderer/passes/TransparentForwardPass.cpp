@@ -14,34 +14,24 @@ namespace renderer {
 
     namespace {
 
-        // Byte-for-byte mirror of PointLightGPU in TransparentForward.frag (std140, 32 bytes --
-        // two naturally-aligned vec4 blocks, no padding needed) -- same field layout as
-        // SurfaceCacheCapture.frag's own PointLightGPU (positionAndRadius/colorAndIntensity).
-        struct PointLightGPU {
-            float posX = 0.0f, posY = 0.0f, posZ = 0.0f, radius = 0.0f;
-            float colorR = 0.0f, colorG = 0.0f, colorB = 0.0f, intensity = 0.0f;
-        };
-        static_assert(sizeof(PointLightGPU) == 32, "PointLightGPU must match TransparentForward.frag's own mirror exactly (std140 layout)");
-
         // Byte-for-byte mirror of TransparentViewParamsUBO in TransparentForward.vert/.frag
         // (std140): mat4 (64) + mat4 (64) + cameraPositionWorld vec3+pad (16) + sunDirectionAndIntensity
-        // vec4 (16) + sunColor vec4 (16, only .rgb used) + pointLightCount+pad uvec4 (16) +
-        // pointLights[8] (256) = 448 bytes. Phase 5: grew from a bare sunDirection to the full
-        // renderer::SceneLights (sun + point lights) plus a camera position (feeds the optional
-        // reflection trace's view-direction reconstruction, fragment-stage-only) -- matching
-        // SurfaceCacheLightingUBO's own shape (SurfaceCacheCapture.frag) for the lighting portion so
-        // TransparentForward.frag's ported ComputeDirectLighting reads the identical layout.
+        // vec4 (16) + sunColor vec4 (16, only .rgb used) = 176 bytes. Phase 5: grew from a bare
+        // sunDirection to a camera position (feeds the optional reflection trace's view-direction
+        // reconstruction) plus sun color/intensity, matching SurfaceCacheLightingUBO's own sun
+        // fields (SurfaceCacheCapture.frag) so TransparentForward.frag's ported ComputeDirectLighting
+        // reads the identical layout. No point-light fields here (unlike the first Phase 5 draft) --
+        // MegaLights' own RIS-selected point light + traced shadow ray (megalights_ris.glsl) is the
+        // point-light path for this pass now, reconciled after `main` landed MegaLights Phase A
+        // concurrently; see TransparentForward.frag's own header comment.
         struct TransparentViewParams {
             maths::mat4 view;
             maths::mat4 proj;
             float cameraPosX = 0.0f, cameraPosY = 0.0f, cameraPosZ = 0.0f, _cameraPad = 0.0f;
             float sunDirX = 0.0f, sunDirY = 0.0f, sunDirZ = 0.0f, sunIntensity = 0.0f;
             float sunColorR = 0.0f, sunColorG = 0.0f, sunColorB = 0.0f, _sunColorPad = 0.0f;
-            uint32_t pointLightCount = 0;
-            uint32_t _pad0 = 0, _pad1 = 0, _pad2 = 0;
-            std::array<PointLightGPU, kMaxPointLights> pointLights{};
         };
-        static_assert(sizeof(TransparentViewParams) == 448,
+        static_assert(sizeof(TransparentViewParams) == 176,
             "TransparentViewParams must match TransparentViewParamsUBO in TransparentForward.vert/.frag exactly (std140 layout)");
 
         // renderer::WorldProbeGridParams (WorldProbeGridPass.h) is reused as-is here -- already the
@@ -50,7 +40,9 @@ namespace renderer {
 
         // Fragment-stage-only push constants for the optional per-material reflection trace (see
         // TransparentForward.frag's own comment) -- same field set as renderer::ReflectionPass's
-        // own TracePushConstants (ReflectionTrace.comp).
+        // own TracePushConstants (ReflectionTrace.comp). MegaLights' own RIS candidate decorrelation
+        // reuses this same frameIndex field (see TransparentForward.frag's own comment) rather than
+        // a second UBO/push-constant copy.
         struct TransparentPushConstants {
             uint32_t entityCount = 0;
             uint32_t traceMode = 0;
@@ -59,6 +51,10 @@ namespace renderer {
 
     } // namespace
 
+    // `tlas` is renderer::SurfaceCacheRayTracingPass::GetTLASHandle() -- ONE handle, bound once at
+    // binding 11, shared by both the optional per-material reflection trace's TraceHWRT and
+    // MegaLights' own TraceShadowRay (see class comment). `lightBuffer`/`lightBufferSize` are
+    // renderer::MegaLightsPass::GetLightBufferHandle()/GetLightBufferSize(), bound at binding 12.
     void TransparentForwardPass::Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
         VkBuffer pageTableBuffer, VkBuffer compressedPhysicalPoolBuffer,
         VkBuffer entityTransformBuffer, VkBuffer entityDataBuffer, VkBuffer wpoGlobalsBuffer,
@@ -67,8 +63,8 @@ namespace renderer {
         const std::vector<geometry::DAGNodeEntry>& dagEntries,
         VkFormat colorFormat, VkFormat depthFormat,
         const WorldProbeGridPass& worldProbes, const SurfaceCacheTraceContext& traceContext,
-        VkAccelerationStructureKHR tlas, VkBuffer fallbackVertexBuffer,
-        VkBuffer fallbackIndexBuffer, VkBuffer drawRangeBuffer) {
+        VkAccelerationStructureKHR tlas, VkBuffer lightBuffer, VkDeviceSize lightBufferSize,
+        VkBuffer fallbackVertexBuffer, VkBuffer fallbackIndexBuffer, VkBuffer drawRangeBuffer) {
         Shutdown();
 
         m_Device = device;
@@ -138,17 +134,18 @@ namespace renderer {
         // =====================================================================================
         // Descriptor pool, shared by both descriptor sets below.
         // =====================================================================================
-        // Phase 5: grew for the new Forward bindings 11-17 (see class comment) -- point light shadow
-        // faces UBO (wired in by SetVirtualShadowMap, like g_ShadowSunLevels already was), World
-        // Probe Grid params UBO + sampler, and the Fallback Mesh TLAS/vertex/index/drawRange
-        // quadruplet (see project_sun_shadow_random_materials.md's own documented lesson: this is
+        // Phase 5 + MegaLights Phase A follow-up, reconciled (see class comment): Forward bindings
+        // 11-17 -- shared TLAS (reflection trace + MegaLights shadow ray), MegaLights light SSBO,
+        // World Probe Grid params UBO + sampler, and the Fallback Mesh vertex/index/drawRange trio.
+        // No point-light-shadow-faces UBO any more (MegaLights supersedes this pass's own point-
+        // light loop). See project_sun_shadow_random_materials.md's own documented lesson: this is
         // exactly the class of bug -- a pool undercounted for bindings written after Init()'s own
-        // first pass -- to not repeat here).
+        // first pass -- to not repeat here.
         VkDescriptorPoolSize poolSizes[4]{};
-        poolSizes[0] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 11 };           // Compact(3) + Forward(8: entries, pool, entityXform, entityData, materialParams, fallbackVertex, fallbackIndex, drawRange).
-        poolSizes[1] = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 5 };            // Forward: WPOGlobals, ViewParams, g_ShadowSunLevels, g_ShadowPointFaces, WorldProbeGridParams.
+        poolSizes[0] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 12 };           // Compact(3) + Forward(9: entries, pool, entityXform, entityData, materialParams, MegaLights g_Lights, fallbackVertex, fallbackIndex, drawRange).
+        poolSizes[1] = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 4 };            // Forward: WPOGlobals, ViewParams, g_ShadowSunLevels, WorldProbeGridParams.
         poolSizes[2] = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2 };    // Forward: shadow physical atlas, World Probe Grid sampler.
-        poolSizes[3] = { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1 }; // Forward: g_TLAS (optional per-material reflection trace).
+        poolSizes[3] = { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1 }; // Forward: shared g_TLAS.
 
         VkDescriptorPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
         poolInfo.maxSets = 2;
@@ -198,9 +195,9 @@ namespace renderer {
 
         // =====================================================================================
         // Set/Pipeline 2: TransparentForward.vert/.frag -- bindings 0..6, 11..17 written here;
-        // 7..10 (Phase 3's renderer::VirtualShadowMapPass resources) + 11's point-light companion
-        // left for SetVirtualShadowMap(). Phase 5: bindings 11-17 are new (indirect diffuse +
-        // point-light shadows + optional per-material reflection trace, see class comment).
+        // 7..10 (Phase 3's renderer::VirtualShadowMapPass resources) left for SetVirtualShadowMap().
+        // Bindings 11-17 are new (indirect diffuse GI + optional per-material reflection trace +
+        // MegaLights point-light shading, see class comment).
         // =====================================================================================
         {
             VkDescriptorSetLayoutBinding bindings[18]{};
@@ -215,10 +212,17 @@ namespace renderer {
             bindings[8] = { 8, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr }; // g_ShadowPageTable
             bindings[9] = { 9, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr }; // g_ShadowFeedback
             bindings[10] = { 10, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr }; // g_ShadowSunLevels
-            bindings[11] = { 11, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr }; // g_ShadowPointFaces
-            bindings[12] = { 12, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr }; // WorldProbeGridParamsUBO
-            bindings[13] = { 13, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr }; // g_WorldProbeGrid
-            bindings[14] = { 14, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr }; // g_TLAS
+            // Bindings 11/12 (MegaLights Phase A follow-up + Phase 5 reflection trace, reconciled):
+            // unlike 7-10 above (deferred to SetVirtualShadowMap()), the TLAS/light SSBO ARE already
+            // available here -- renderer::ClusterRenderPipeline::Init() Init()s renderer::
+            // SurfaceCacheRayTracingPass and renderer::MegaLightsPass before this pass specifically
+            // so both can be written immediately below, not deferred. `g_TLAS` (11) is shared by
+            // MegaLights' own TraceShadowRay AND this pass's own optional reflection TraceHWRT --
+            // only ONE acceleration-structure binding for both.
+            bindings[11] = { 11, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr }; // g_TLAS (shared)
+            bindings[12] = { 12, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr }; // MegaLightsSSBO (g_Lights)
+            bindings[13] = { 13, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr }; // WorldProbeGridParamsUBO
+            bindings[14] = { 14, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr }; // g_WorldProbeGrid
             bindings[15] = { 15, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr }; // FallbackVertexBuffer
             bindings[16] = { 16, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr }; // FallbackIndexBuffer
             bindings[17] = { 17, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr }; // EntityDrawRangeBuffer
@@ -254,13 +258,16 @@ namespace renderer {
             });
             VkDescriptorBufferInfo materialParamsInfo{ m_MaterialParamsBuffer.Handle(), 0, m_MaterialParamsBuffer.Size() };
 
-            // World Probe Grid sampler + params (bindings 13, 12) -- static addressing/image handle,
+            // World Probe Grid sampler + params (bindings 14, 13) -- static addressing/image handle,
             // written once here like every other Init()-time binding (only the grid's own texel
             // CONTENTS change frame to frame, sampled directly through this same view/sampler).
             VkDescriptorImageInfo worldProbeGridInfo{ worldProbes.GetGridSampler(), worldProbes.GetGridView(), VK_IMAGE_LAYOUT_GENERAL };
             VkDescriptorBufferInfo worldProbeGridParamsInfo{ m_WorldProbeGridParamsBuffer.Handle(), 0, m_WorldProbeGridParamsBuffer.Size() };
 
-            VkWriteDescriptorSet writes[9]{};
+            // MegaLights light SSBO (binding 12).
+            VkDescriptorBufferInfo lightBufferInfo{ lightBuffer, 0, lightBufferSize };
+
+            VkWriteDescriptorSet writes[10]{};
             writes[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ForwardDescriptorSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &entriesInfo, nullptr };
             writes[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ForwardDescriptorSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &compressedPoolInfo, nullptr };
             writes[2] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ForwardDescriptorSet, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &entityTransformInfo, nullptr };
@@ -268,25 +275,45 @@ namespace renderer {
             writes[4] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ForwardDescriptorSet, 4, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &wpoGlobalsInfo, nullptr };
             writes[5] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ForwardDescriptorSet, 5, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &viewParamsInfo, nullptr };
             writes[6] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ForwardDescriptorSet, 6, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &materialParamsInfo, nullptr };
-            writes[7] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ForwardDescriptorSet, 12, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &worldProbeGridParamsInfo, nullptr };
-            writes[8] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ForwardDescriptorSet, 13, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &worldProbeGridInfo, nullptr, nullptr };
-            vkUpdateDescriptorSets(m_Device, 9, writes, 0, nullptr);
-            // Bindings 7-11 (Phase 3's renderer::VirtualShadowMapPass resources, including the new
-            // g_ShadowPointFaces) are intentionally left unwritten here -- SetVirtualShadowMap()
-            // writes them once the caller has a VirtualShadowMapPass to bind, same convention as
-            // renderer::ClusterResolvePass's own.
+            writes[7] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ForwardDescriptorSet, 12, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &lightBufferInfo, nullptr };
+            writes[8] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ForwardDescriptorSet, 13, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &worldProbeGridParamsInfo, nullptr };
+            writes[9] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ForwardDescriptorSet, 14, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &worldProbeGridInfo, nullptr, nullptr };
+            vkUpdateDescriptorSets(m_Device, 10, writes, 0, nullptr);
+            // Bindings 7-10 (Phase 3's renderer::VirtualShadowMapPass resources) are intentionally
+            // left unwritten here -- SetVirtualShadowMap() writes them once the caller has a
+            // VirtualShadowMapPass to bind, same convention as renderer::ClusterResolvePass's own.
 
-            // Bindings 14-17 (g_TLAS + Fallback Mesh vertex/index/drawRange, see class comment) --
-            // same shared write helper renderer::ReflectionTrace.comp's own C++ pass side uses.
-            VulkanUtils::WriteSharedGeometryBindings(m_Device, m_ForwardDescriptorSet, 14,
-                tlas, fallbackVertexBuffer, fallbackIndexBuffer, drawRangeBuffer);
+            // Binding 11 (shared g_TLAS) -- needs its own pNext chain, issued as a separate
+            // vkUpdateDescriptorSets call, same pattern renderer::MegaLightsPass::Init() already uses.
+            VkWriteDescriptorSetAccelerationStructureKHR accelWrite{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR };
+            accelWrite.accelerationStructureCount = 1;
+            accelWrite.pAccelerationStructures = &tlas;
+            VkWriteDescriptorSet accelDescriptorWrite{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+            accelDescriptorWrite.pNext = &accelWrite;
+            accelDescriptorWrite.dstSet = m_ForwardDescriptorSet;
+            accelDescriptorWrite.dstBinding = 11;
+            accelDescriptorWrite.descriptorCount = 1;
+            accelDescriptorWrite.descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+            vkUpdateDescriptorSets(m_Device, 1, &accelDescriptorWrite, 0, nullptr);
+
+            // Bindings 15-17 (Fallback Mesh vertex/index/drawRange, for the optional reflection
+            // trace's HWRT path) -- written manually (not via VulkanUtils::WriteSharedGeometryBindings,
+            // which assumes 4 CONSECUTIVE bindings starting with its own TLAS write; binding 11's
+            // TLAS is shared/already written above and these 3 aren't adjacent to it here).
+            VkDescriptorBufferInfo fallbackVertexInfo{ fallbackVertexBuffer, 0, VK_WHOLE_SIZE };
+            VkDescriptorBufferInfo fallbackIndexInfo{ fallbackIndexBuffer, 0, VK_WHOLE_SIZE };
+            VkDescriptorBufferInfo drawRangeInfo{ drawRangeBuffer, 0, VK_WHOLE_SIZE };
+            VkWriteDescriptorSet fallbackWrites[3]{};
+            fallbackWrites[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ForwardDescriptorSet, 15, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &fallbackVertexInfo, nullptr };
+            fallbackWrites[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ForwardDescriptorSet, 16, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &fallbackIndexInfo, nullptr };
+            fallbackWrites[2] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ForwardDescriptorSet, 17, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &drawRangeInfo, nullptr };
+            vkUpdateDescriptorSets(m_Device, 3, fallbackWrites, 0, nullptr);
 
             // 3-set pipeline layout: this pass's own set 0 + traceContext's mesh_sdf_trace (set 1) /
             // surface_cache_sampling (set 2) layouts, fixed here -- same shape as renderer::
             // ReflectionPass::Init()'s own identical 3-set layout (see class comment). A fragment-
-            // stage push constant range carries entityCount/traceMode/frameIndex for the optional
-            // per-material reflection trace (TransparentForward.frag's own TraceMeshSDFScene/
-            // TraceHWRT call, gated by hasReflections).
+            // stage push constant range carries entityCount/traceMode/frameIndex, consumed by both
+            // the optional per-material reflection trace and MegaLights' own RIS decorrelation.
             VkDescriptorSetLayout forwardSetLayouts[3] = {
                 m_ForwardSetLayout, traceContext.GetMeshSdfTraceSetLayout(), traceContext.GetSurfaceCacheSamplingSetLayout()
             };
@@ -445,17 +472,13 @@ namespace renderer {
         VkDescriptorBufferInfo pageTableInfo{ vsm.GetPageTableBuffer(), 0, VK_WHOLE_SIZE };
         VkDescriptorBufferInfo feedbackInfo{ vsm.GetFeedbackDeviceBuffer(), 0, VK_WHOLE_SIZE };
         VkDescriptorBufferInfo sunLevelsInfo{ vsm.GetSunLevelsBuffer(), 0, VK_WHOLE_SIZE };
-        // Phase 5: point-light shadow faces (see class comment) -- same VirtualShadowMapPass
-        // instance, same "written by SetVirtualShadowMap(), not Init()" convention as the 4 above.
-        VkDescriptorBufferInfo pointFacesInfo{ vsm.GetPointFacesBuffer(), 0, VK_WHOLE_SIZE };
 
-        VkWriteDescriptorSet writes[5]{};
+        VkWriteDescriptorSet writes[4]{};
         writes[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ForwardDescriptorSet, 7, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &atlasImageInfo, nullptr, nullptr };
         writes[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ForwardDescriptorSet, 8, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &pageTableInfo, nullptr };
         writes[2] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ForwardDescriptorSet, 9, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &feedbackInfo, nullptr };
         writes[3] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ForwardDescriptorSet, 10, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &sunLevelsInfo, nullptr };
-        writes[4] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ForwardDescriptorSet, 11, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &pointFacesInfo, nullptr };
-        vkUpdateDescriptorSets(m_Device, 5, writes, 0, nullptr);
+        vkUpdateDescriptorSets(m_Device, 4, writes, 0, nullptr);
     }
 
     void TransparentForwardPass::RecordDraw(VkCommandBuffer cmd, VkImage colorImage, VkImageView colorView, VkImageView depthView,
@@ -467,8 +490,8 @@ namespace renderer {
             return;
         }
 
-        // --- Upload this frame's view/proj/camera position/full lighting (Phase 5: was just
-        // sunDirection). ---
+        // --- Upload this frame's view/proj/camera position/sun lighting (Phase 5: was just
+        // sunDirection; point lights removed -- MegaLights handles those now, see class comment). ---
         TransparentViewParams viewParams{};
         viewParams.view = view;
         viewParams.proj = proj;
@@ -482,19 +505,6 @@ namespace renderer {
         viewParams.sunColorR = sceneLights.sun.color.x;
         viewParams.sunColorG = sceneLights.sun.color.y;
         viewParams.sunColorB = sceneLights.sun.color.z;
-        viewParams.pointLightCount = sceneLights.pointLightCount;
-        for (uint32_t i = 0; i < kMaxPointLights; ++i) {
-            const PointLight& src = sceneLights.pointLights[i];
-            PointLightGPU& dst = viewParams.pointLights[i];
-            dst.posX = src.position.x;
-            dst.posY = src.position.y;
-            dst.posZ = src.position.z;
-            dst.radius = src.radius;
-            dst.colorR = src.color.x;
-            dst.colorG = src.color.y;
-            dst.colorB = src.color.z;
-            dst.intensity = src.intensity;
-        }
         vkCmdUpdateBuffer(cmd, m_ViewParamsBuffer.Handle(), 0, sizeof(TransparentViewParams), &viewParams);
 
         VkMemoryBarrier2 uboBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };

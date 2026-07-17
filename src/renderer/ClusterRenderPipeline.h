@@ -85,6 +85,8 @@
 #include "renderer/LightingTypes.h"
 #include "renderer/passes/ProceduralMaskGenerator.h"
 #include "renderer/passes/ReflectionPass.h"
+#include "renderer/passes/MegaLightsPass.h"
+#include "renderer/passes/ScreenProbeGIPass.h"
 #include "renderer/passes/SurfaceCacheGIInjectPass.h"
 #include "renderer/passes/SurfaceCachePass.h"
 #include "renderer/passes/SurfaceCacheRayTracingPass.h"
@@ -245,6 +247,12 @@ namespace renderer {
         // SetDebugRadiosityEnabled/SetDebugWorldProbesEnabled's own Release-always-on convention).
         void SetDebugReflectionsEnabled(bool enabled) { m_DebugReflectionsEnabled = enabled; }
         void SetDebugTAATSREnabled(bool enabled) { m_DebugTAATSREnabled = enabled; }
+
+        // Phase A of the MegaLights native-port roadmap: gates RecordFrame()'s [12b3]
+        // m_MegaLights.RecordShade() call -- see main.cpp's 'X' key. Same Release-always-on
+        // convention as SetDebugReflectionsEnabled above (a real live consumer from frame one, via
+        // the same additive-RMW-into-m_Resolve's-color-image convention reflections already use).
+        void SetDebugMegaLightsEnabled(bool enabled) { m_DebugMegaLightsEnabled = enabled; }
 
         // Investigating the 2026-07-16 "persistent holes" bug (see project memory
         // project_persistent_cluster_holes_open_bug.md / ClusterLODSelectionPass::
@@ -427,6 +435,14 @@ namespace renderer {
         // (physically incapable of a narrow specular lobe).
         ReflectionPass m_Reflection;
 
+        // Phase A of the MegaLights native-port roadmap: RIS-weighted stochastic multi-point-light
+        // direct lighting (up to kMaxMegaLights procedurally-authored point lights), one ray-traced
+        // shadow-visibility ray per pixel, additively read-modify-writing m_Resolve's own output
+        // color image -- see MegaLightsPass's own class comment for the full pipeline (Shade ->
+        // owned À-Trous denoise -> Composite) and why it owns a DEDICATED ATrousDenoisePass instance
+        // rather than inheriting m_Denoiser below.
+        MegaLightsPass m_MegaLights;
+
         // World Probe grid (Lumen "Translucency Volume" / global illumination volume): a low-
         // resolution, camera-centered 3D grid of ambient irradiance probes, fully rebuilt every
         // frame from m_SurfaceCache's radiance atlas, sampled via world_probe_sampling.glsl's
@@ -473,6 +489,9 @@ namespace renderer {
         // Release hardcodes the equivalent local to true (matching m_DebugSSRTEnabled's own
         // Release-always-on convention), since this pass has a real live consumer already.
         bool m_DebugReflectionsEnabled = true;
+        // See SetDebugMegaLightsEnabled()'s own comment: same Release-always-on convention as
+        // m_DebugReflectionsEnabled above.
+        bool m_DebugMegaLightsEnabled = true;
         bool m_DebugTAATSREnabled = config::temporal::ENABLED_BY_DEFAULT;
 
         // See RequestDebugDAGCutGapsDump()'s own comment: 0 = idle, 1 = "record the readback this
