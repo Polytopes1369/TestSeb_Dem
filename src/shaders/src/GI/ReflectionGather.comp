@@ -19,6 +19,8 @@
 
 #include "include/octahedral.glsl"
 #include "include/ggx_brdf.glsl"
+#include "include/material_params.glsl"
+#include "include/substrate_bsdf.glsl"
 
 layout(local_size_x = 8, local_size_y = 8) in;
 
@@ -32,6 +34,17 @@ layout(rgba16f, set = 0, binding = 5) uniform image2D g_OutputColor; // Read-mod
 #define REFLECTION_VIEW_PARAMS_SET 0
 #define REFLECTION_VIEW_PARAMS_BINDING 6
 #include "include/reflection_view_params.glsl"
+
+// Substrate integration: this pixel's clamped materialID (0xFFFF = background), letting this
+// shader re-fetch the full Slab data straight from g_MaterialParams instead of the GBuffer
+// growing a field per Substrate parameter -- see ClusterResolve.comp's own g_OutputMaterialID
+// binding comment.
+layout(r16ui, set = 0, binding = 7) uniform readonly uimage2D g_GBufferMaterialID;
+// renderer::GenerateShowcaseMaterialTable()'s result, the SAME SSBO handle renderer::
+// ClusterResolvePass already uploaded at its own Init() -- see material_params.glsl's own comment.
+layout(std430, set = 0, binding = 8) readonly buffer MaterialParamsSSBO {
+    MaterialParams params[];
+} g_MaterialParams;
 
 void main() {
     ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
@@ -50,18 +63,18 @@ void main() {
     }
 
     vec3 normal = OctDecode(imageLoad(g_GBufferNormal, pixel).rg);
-    vec3 albedo = imageLoad(g_GBufferAlbedo, pixel).rgb;
-    vec2 roughnessMetallic = imageLoad(g_GBufferRoughnessMetallic, pixel).rg;
-    float metallic = roughnessMetallic.g;
 
     vec2 ndcXY = ((vec2(pixel) + 0.5) / g_ViewParams.viewportSize) * 2.0 - 1.0;
     vec4 worldPos4 = g_ViewParams.invViewProj * vec4(ndcXY, depth, 1.0);
     vec3 worldPos = worldPos4.xyz / worldPos4.w;
     vec3 viewDir = normalize(g_ViewParams.cameraPositionWorld - worldPos);
-    float NdotV = max(dot(normal, viewDir), 0.0);
 
-    vec3 F0 = mix(vec3(0.04), albedo, metallic);
-    vec3 fresnel = F_Schlick(F0, NdotV);
+    // Substrate integration: real per-pixel Slab Fresnel reflectance weight (base+top vertically
+    // layered) replaces the old plain metallic-workflow Schlick Fresnel (F0 = mix(0.04, albedo,
+    // metallic)) -- see substrate_bsdf.glsl's own EvaluateSubstrateReflectionWeight comment.
+    uint materialSlot = min(imageLoad(g_GBufferMaterialID, pixel).r, MATERIAL_TABLE_SIZE - 1u);
+    MaterialParams mat = g_MaterialParams.params[materialSlot];
+    vec3 fresnel = EvaluateSubstrateReflectionWeight(mat, normal, viewDir);
 
     vec4 baseColor = imageLoad(g_OutputColor, pixel);
     vec3 finalColor = baseColor.rgb + fresnel * reflection.rgb;

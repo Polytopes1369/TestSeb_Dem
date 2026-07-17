@@ -5,11 +5,15 @@
 // emissive/direct-lighting/radiance/world-position for one texel of the global surface-cache
 // atlas, at whatever position within the currently-bound Card's exclusive rect this invocation's
 // pixel maps to (the render area/viewport/scissor are all set to exactly that rect by
-// RecordCapture(), so gl_FragCoord never needs to be consulted here). This codebase has no
-// texture/material-binding system (see ClusterResolve.comp's own comment) -- this reuses the
-// exact same procedural-material approach every other shading pass already uses
-// (procedural_material.glsl's HashID/HsvToRgb, keyed by entityID) plus a small triplanar
-// value-noise modulation so a captured card is not perfectly flat-shaded.
+// RecordCapture(), so gl_FragCoord never needs to be consulted here).
+//
+// --- Material ---
+// Samples the same Substrate material table every other shading pass in this codebase reads
+// (material_params.glsl / substrate_bsdf.glsl -- see ClusterResolve.comp's own Step 3 comment):
+// this texel's owning entity's real materialID is looked up via EntityDataBuffer (binding 6) and
+// used to index g_MaterialParams (binding 7, the SAME SSBO renderer::ClusterResolvePass::Init()
+// already fills), plus a small triplanar value-noise modulation on top of the real albedo so a
+// captured card is not perfectly flat-shaded.
 //
 // --- Direct lighting ---
 // outDirectLighting accumulates the sun (shadowed via renderer::VirtualShadowMapPass's 3-level
@@ -34,6 +38,9 @@
 #include "include/procedural_material.glsl"
 #include "include/math_utils.glsl"
 #include "include/octahedral.glsl"
+#include "include/struct_custo.glsl"
+#include "include/material_params.glsl"
+#include "include/substrate_bsdf.glsl"
 
 #define SHADOW_ATLAS_SET 0
 #define SHADOW_ATLAS_BINDING 1
@@ -68,6 +75,19 @@ layout(set = 0, binding = 0, std140) uniform SurfaceCacheLightingUBO {
     uvec3 _pad0;
     PointLightGPU pointLights[8]; // Must match renderer::kMaxPointLights.
 } uLighting;
+
+// Substrate integration: this texel's owning entity's real materialID (EntityData.materialID),
+// looked up by pc.entityID -- see this shader's own "Material" header comment.
+layout(std430, set = 0, binding = 6) readonly buffer EntityDataBuffer {
+    EntityData entityData[];
+};
+
+// renderer::GenerateShowcaseMaterialTable()'s result, the SAME SSBO ClusterResolve.comp's own
+// g_MaterialParams reads (renderer::ClusterResolvePass::GetMaterialParamsBuffer()) -- see
+// material_params.glsl's own comment.
+layout(std430, set = 0, binding = 7) readonly buffer MaterialParamsSSBO {
+    MaterialParams params[];
+} g_MaterialParams;
 
 layout(location = 0) in vec3 inWorldPos;
 layout(location = 1) in vec3 inWorldNormal;
@@ -134,28 +154,29 @@ vec3 ComputeDirectLighting(vec3 worldPos, vec3 n) {
 void main() {
     vec3 n = normalize(inWorldNormal);
 
-    // Stable per-entity hue (matches ClusterResolve.comp / draw.frag's own procedural look), plus
-    // a small triplanar value-noise modulation from world position so a card is not perfectly
-    // flat-colored.
-    float hue = float(HashID(pc.entityID) & 0xFFFFu) / 65536.0;
-    vec3 baseColor = HsvToRgb(vec3(hue, 0.55, 0.85));
+    // Real material lookup (see this shader's own "Material" header comment): this entity's
+    // authoritative materialID, not entityID itself (do not assume the two coincide).
+    EntityData ed = entityData[pc.entityID];
+    uint materialSlot = min(ed.materialID, MATERIAL_TABLE_SIZE - 1u);
+    MaterialParams mat = g_MaterialParams.params[materialSlot];
 
+    // Small triplanar value-noise modulation from world position on top of the real albedo, so a
+    // captured card is not perfectly flat-shaded (a legitimate "captured surface isn't flat"
+    // detail, kept as-is).
     vec3 blend = abs(n);
     blend /= (blend.x + blend.y + blend.z + 1e-5);
     float noise =
         Hash(inWorldPos.yz) * blend.x +
         Hash(inWorldPos.xz) * blend.y +
         Hash(inWorldPos.xy) * blend.z;
-    vec3 albedo = baseColor * mix(0.85, 1.15, noise);
+    vec3 albedo = mat.base.diffuseAlbedo * mix(0.85, 1.15, noise);
 
     outAlbedo = vec4(clamp(albedo, 0.0, 1.0), 1.0);
     outNormal = vec4(OctEncode(n), 0.0, 1.0);
 
-    // Subtle procedural emissive tint, distinct per entity, so the channel is exercised
-    // end-to-end rather than always writing zero -- no material system flags entities as
-    // emissive/non-emissive yet (geometry::EntityMaterialProperties only carries WPO/mask data),
-    // so every card gets the same small glow rather than an arbitrary on/off split.
-    vec3 emissive = baseColor * 0.04;
+    // Real per-material emissive value (base.emissive + top.emissive*topWeight), see
+    // substrate_bsdf.glsl's EvaluateSubstrateEmissive.
+    vec3 emissive = EvaluateSubstrateEmissive(mat);
     outEmissive = vec4(emissive, 1.0);
 
     vec3 directLighting = ComputeDirectLighting(inWorldPos, n);

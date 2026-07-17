@@ -151,7 +151,7 @@ namespace renderer {
         VkBuffer entityDataBuffer = VK_NULL_HANDLE;
 
         // Randomly-generated PBR materials (renderer::VulkanContext::GetMaterialTable(), itself
-        // built by renderer::GenerateRandomMaterialTable) -- uploaded once into ClusterResolvePass's
+        // built by renderer::GenerateShowcaseMaterialTable) -- uploaded once into ClusterResolvePass's
         // GPU SSBO and TransparentForwardPass's own descriptor set.
         MaterialTable materialTable{};
     };
