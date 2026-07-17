@@ -139,6 +139,20 @@ add_executable(LoadingManagerTests
 target_include_directories(LoadingManagerTests PRIVATE src ${Vulkan_INCLUDE_DIRS})
 add_test(NAME LoadingManagerTests COMMAND LoadingManagerTests)
 
+add_executable(VirtualTextureTests
+    src/renderer/streaming/VirtualTextureManager.cpp
+    src/renderer/vulkan/GpuBuffer.cpp
+    src/renderer/vulkan/GpuImage.cpp
+    src/renderer/vulkan/VmaUsage.cpp
+    src/renderer/vulkan/VulkanUtils.cpp
+    src/renderer/vulkan/VulkanPipeline.cpp
+    src/core/Logger.cpp
+    tests/VirtualTextureTests.cpp
+)
+target_include_directories(VirtualTextureTests PRIVATE src ${Vulkan_INCLUDE_DIRS} vendor/vma)
+target_link_libraries(VirtualTextureTests PRIVATE Vulkan::Vulkan)
+add_test(NAME VirtualTextureTests COMMAND VirtualTextureTests)
+
 # ==============================================================================
 # AUTOMATIZED SHADER COMPILATION & POST-BUILD COPY
 # ==============================================================================
