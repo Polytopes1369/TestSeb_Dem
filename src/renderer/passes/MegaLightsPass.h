@@ -58,7 +58,7 @@ namespace renderer {
         // reusing that class forces this choice): R16G16B16A16_SFLOAT linear HDR, NOT rgba8 --
         // MegaLightsShade.comp's own radiance is a physically-based, inverse-square-falloff point-
         // light contribution with no upper bound near a light, so an 8-bit UNORM target would hard-
-        // clip it to [0,1] before it ever reaches renderer::TonemapPass, one of this codebase's own
+        // clip it to [0,1] before it ever reaches renderer::PostProcessPass, one of this codebase's own
         // "burned" overexposure bug's root causes (see ClusterResolvePass::kOutputColorFormat's own
         // comment, the image this pass' Composite stage additively read-modify-writes into).
         static constexpr VkFormat kRadianceFormat = VK_FORMAT_R16G16B16A16_SFLOAT;

@@ -2,7 +2,7 @@
 // Final GI composite: blends renderer::ClusterResolvePass's direct-lit color with
 // renderer::ATrousDenoisePass's denoised indirect-diffuse term into one owned rgba16f (linear HDR)
 // output image -- the image renderer::ClusterRenderPipeline's own final blit now sources from
-// (via renderer::TAATSRPass then renderer::TonemapPass) instead of ClusterResolvePass's output
+// (via renderer::TAATSRPass then renderer::PostProcessPass) instead of ClusterResolvePass's output
 // directly.
 //
 // --- Debug view modes 13 (LUMEN) / 14 (SPATIAL PROBES) ---
@@ -46,7 +46,7 @@ namespace renderer {
         // the full chain). renderer::TransparentForwardPass draws directly onto this image (its own
         // pipeline's color attachment format must match -- see that pass' Init() call site) and
         // renderer::TAATSRPass samples it as its low-res HDR input; the actual display-referred
-        // tonemap curve lives downstream of TAA, in renderer::TonemapPass.
+        // tonemap curve lives downstream of TAA, in renderer::PostProcessPass.
         static constexpr VkFormat kOutputFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
 
         // `directColorView` (renderer::ClusterResolvePass::GetOutputColorView()) and

@@ -52,7 +52,7 @@ layout(set = 0, binding = 9) uniform sampler2D g_ProbeCoarseNormal;
 layout(rg16f, set = 0, binding = 10) uniform readonly image2D g_GBufferNormal;
 layout(r32f, set = 0, binding = 11) uniform readonly image2D g_GBufferDepth;
 layout(rgba8, set = 0, binding = 12) uniform readonly image2D g_GBufferAlbedo;
-layout(rgba8, set = 0, binding = 13) uniform image2D g_OutputColor; // Read-modify-write.
+layout(rgba16f, set = 0, binding = 13) uniform image2D g_OutputColor; // Read-modify-write. rgba16f: linear HDR, matches ClusterResolvePass::kOutputColorFormat (dead code, never instantiated, but keep the declared format consistent with its own live sibling ReflectionGather.comp's identical binding).
 
 #define SCREEN_PROBE_VIEW_PARAMS_SET 0
 #define SCREEN_PROBE_VIEW_PARAMS_BINDING 14
