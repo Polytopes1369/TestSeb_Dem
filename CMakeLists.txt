@@ -167,6 +167,14 @@ add_executable(LoadingManagerTests
 target_include_directories(LoadingManagerTests PRIVATE src ${Vulkan_INCLUDE_DIRS})
 add_test(NAME LoadingManagerTests COMMAND LoadingManagerTests)
 
+add_executable(StreamingManagerTests
+    src/core/LoadingManager.cpp
+    src/world/StreamingManager.cpp
+    tests/StreamingManagerTests.cpp
+)
+target_include_directories(StreamingManagerTests PRIVATE src ${Vulkan_INCLUDE_DIRS})
+add_test(NAME StreamingManagerTests COMMAND StreamingManagerTests)
+
 add_executable(VirtualTextureTests
     src/renderer/streaming/VirtualTextureManager.cpp
     src/renderer/vulkan/GpuBuffer.cpp
