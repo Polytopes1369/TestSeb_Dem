@@ -384,16 +384,11 @@ bool ClusterRenderPipeline::Init(
   m_Resolve.SetVirtualTexture(m_VTManager, m_VTBounds.worldMinXZ, m_VTBounds.worldMaxXZ,
                               m_VTStreaming.GetFeedbackDeviceBuffer());
 
-  // Forward-rendered translucent/transparent materials (see TransparentForwardPass's own class
-  // comment) -- reuses the SAME indexEntries/dagEntries this function loaded above for
-  // m_LODSelection.Init(), and the SAME page pool/compressed pool/entity/WPO buffer handles every
-  // opaque pass already borrows.
-  m_TransparentForward.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
-                            m_PagePool.GetPageTableBuffer(), m_PagePool.GetPhysicalPoolBuffer(),
-                            createInfo.entityTransformBuffer, createInfo.entityDataBuffer, m_WPOGlobalsBuffer.Handle(),
-                            createInfo.materialTable.params, indexEntries, dagEntries,
-                            ClusterResolvePass::kOutputColorFormat, createInfo.depthFormat);
-  m_TransparentForward.SetVirtualShadowMap(m_VirtualShadowMap);
+  // NOTE: renderer::TransparentForwardPass::Init() is deliberately NOT called here anymore -- see
+  // the call site further below (after m_SurfaceCacheRT/m_MegaLights are both Init'd), moved there
+  // specifically so its own MegaLights Phase A follow-up bindings (TLAS + light SSBO) can be bound
+  // immediately at Init() time instead of needing a 3rd deferred-binding call alongside
+  // SetVirtualShadowMap().
 
   // Sun orientation: Toronto (lat 43.6532N, lon 79.3832W), July 16, 16:30 local (EDT, UTC-4) --
   // a standard NOAA solar-position computation (equation of time + hour angle + declination for
@@ -475,6 +470,21 @@ bool ClusterRenderPipeline::Init(
       return false;
     }
   }
+  // Forward-rendered translucent/transparent materials (see TransparentForwardPass's own class
+  // comment) -- reuses the SAME indexEntries/dagEntries this function loaded above for
+  // m_LODSelection.Init(), and the SAME page pool/compressed pool/entity/WPO buffer handles every
+  // opaque pass already borrows. Deliberately placed here (after m_SurfaceCacheRT and m_MegaLights,
+  // not right after m_LODSelection where it used to sit) so its own MegaLights Phase A follow-up
+  // bindings (TLAS + light SSBO, bindings 11/12) can be bound immediately at Init() time -- see
+  // TransparentForwardPass::Init()'s own parameter comment.
+  m_TransparentForward.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
+                            m_PagePool.GetPageTableBuffer(), m_PagePool.GetPhysicalPoolBuffer(),
+                            createInfo.entityTransformBuffer, createInfo.entityDataBuffer, m_WPOGlobalsBuffer.Handle(),
+                            createInfo.materialTable.params, indexEntries, dagEntries,
+                            ClusterResolvePass::kOutputColorFormat, createInfo.depthFormat,
+                            m_SurfaceCacheRT.GetTLASHandle(), m_MegaLights.GetLightBufferHandle(),
+                            m_MegaLights.GetLightBufferSize());
+  m_TransparentForward.SetVirtualShadowMap(m_VirtualShadowMap);
   // World Probe grid (Lumen "Translucency Volume") -- reuses the same shared trace-scene sets and
   // HWRT/BLAS/TLAS as every other GI consumer above; see ClusterRenderPipeline.h's own comment on
   // its live consumers (m_ScreenTrace's fallback, GICompositePass's debug visualization).
@@ -1470,7 +1480,7 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
     VkImageView transparentTargetView = m_GIComposite.GetOutputView();
     m_TransparentForward.RecordDraw(cmd, transparentTargetImage, transparentTargetView, m_DepthImageView,
         m_RenderExtent, cameraCopy.view, cameraCopy.proj, m_Decompression.GetDecompressedIndexPoolBuffer(),
-        m_SceneLights.sun.direction);
+        m_SceneLights.sun.direction, m_FrameIndex);
   }
 
   // =========================================================================================

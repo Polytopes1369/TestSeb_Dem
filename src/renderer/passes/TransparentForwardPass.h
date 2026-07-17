@@ -100,14 +100,23 @@ namespace renderer {
         // `entityTransformBuffer`/`entityDataBuffer`/`wpoGlobalsBuffer` mirror ClusterRaster.vert's
         // own identically-purposed bindings. `colorFormat`/`depthFormat` must match whatever image
         // RecordDraw() will later target (renderer::ClusterResolvePass::kOutputColorFormat and the
-        // shared hardware depth image's format, respectively).
+        // shared hardware depth image's format, respectively). `tlas`/`lightBuffer`/
+        // `lightBufferSize` (MegaLights Phase A follow-up) are renderer::SurfaceCacheRayTracingPass
+        // ::GetTLASHandle() and renderer::MegaLightsPass::GetLightBufferHandle()/GetLightBufferSize()
+        // -- both must already exist by the time this is called (the caller must Init() those two
+        // passes first, see renderer::ClusterRenderPipeline::Init()'s own ordering comment), bound
+        // once here at bindings 11/12 for TransparentForward.frag's own inline RIS shadow-ray shading
+        // (megalights_ris.glsl's SelectLightRIS, same algorithm renderer::MegaLightsPass's opaque
+        // path uses -- see that shader's own header comment for why this is inlined rather than a
+        // separate compute pass: translucent surfaces have no GBuffer entry for one to read from).
         void Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
             VkBuffer pageTableBuffer, VkBuffer compressedPhysicalPoolBuffer,
             VkBuffer entityTransformBuffer, VkBuffer entityDataBuffer, VkBuffer wpoGlobalsBuffer,
             const std::array<MaterialParameters, kMaxMaterials>& materialTable,
             const std::vector<geometry::ClusterIndexEntry>& indexEntries,
             const std::vector<geometry::DAGNodeEntry>& dagEntries,
-            VkFormat colorFormat, VkFormat depthFormat);
+            VkFormat colorFormat, VkFormat depthFormat,
+            VkAccelerationStructureKHR tlas, VkBuffer lightBuffer, VkDeviceSize lightBufferSize);
 
         void Shutdown();
 
@@ -134,10 +143,12 @@ namespace renderer {
         // GetDecompressedIndexPoolBuffer() -- rebound every call since which buffer is current can
         // change as pages stream in/out, matching ClusterHardwareRasterPass::RecordDraw()'s own
         // convention. `sunDirection` -- see renderer::ClusterResolvePass::RecordResolve's identical
-        // parameter comment (points FROM the light TOWARD the scene).
+        // parameter comment (points FROM the light TOWARD the scene). `frameIndex` feeds the same
+        // Halton-indexed RIS candidate decorrelation renderer::MegaLightsPass's opaque path uses
+        // (megalights_ris.glsl's SelectLightRIS).
         void RecordDraw(VkCommandBuffer cmd, VkImage colorImage, VkImageView colorView, VkImageView depthView,
             VkExtent2D renderExtent, const maths::mat4& view, const maths::mat4& proj,
-            VkBuffer decompressedIndexPoolBuffer, const maths::vec3& sunDirection);
+            VkBuffer decompressedIndexPoolBuffer, const maths::vec3& sunDirection, uint32_t frameIndex);
 
         uint32_t GetTransparentClusterCount() const { return m_ClusterCount; }
 
