@@ -49,6 +49,11 @@ struct DebugState {
     // its cost/contribution can be A/B'd, same as ssrtEnabled above (this pass has a real live
     // consumer from its first frame, unlike worldProbesEnabled).
     bool reflectionsEnabled = true;
+    // renderer::ClusterRenderPipeline::SetDebugMegaLightsEnabled -- Phase A of the MegaLights
+    // native-port roadmap: gates the RIS-weighted stochastic multi-point-light direct lighting +
+    // shadow-ray pass ([12b3] in RecordFrame), same Release-always-on convention as
+    // reflectionsEnabled above (a real live consumer from its first frame).
+    bool megaLightsEnabled = true;
     // Set by the 'K' key, consumed (and reset) once per frame by the main loop, which calls
     // renderer::ClusterRenderPipeline::RequestDebugDAGCutGapsDump() -- see that method's own
     // comment for the investigation this is part of.
@@ -142,6 +147,12 @@ static void KeyCallback(GLFWwindow* window, int key, int scancode, int action, i
     case GLFW_KEY_R:
         g_DebugState.reflectionsEnabled = !g_DebugState.reflectionsEnabled;
         LOG_INFO(std::format("[Debug] Specular Reflections: {}", g_DebugState.reflectionsEnabled ? "ON" : "OFF"));
+        break;
+    case GLFW_KEY_X:
+        // Phase A of the MegaLights native-port roadmap (see the approved plan): RIS-weighted
+        // stochastic multi-point-light direct lighting + 1 ray-traced shadow-visibility ray/pixel.
+        g_DebugState.megaLightsEnabled = !g_DebugState.megaLightsEnabled;
+        LOG_INFO(std::format("[Debug] MegaLights (stochastic multi-point-light direct + shadow ray): {}", g_DebugState.megaLightsEnabled ? "ON" : "OFF"));
         break;
     case GLFW_KEY_M:
         // Phase 3 (UE5.8 parity roadmap): every NUMPAD key is already claimed by an existing view
@@ -704,6 +715,7 @@ int main(int argc, char** argv) {
         clusterPipeline.SetDebugSSRTEnabled(g_DebugState.ssrtEnabled);
         clusterPipeline.SetDebugWorldProbesEnabled(g_DebugState.worldProbesEnabled);
         clusterPipeline.SetDebugReflectionsEnabled(g_DebugState.reflectionsEnabled);
+        clusterPipeline.SetDebugMegaLightsEnabled(g_DebugState.megaLightsEnabled);
         clusterPipeline.SetDebugTAATSREnabled(g_DebugState.taatsrEnabled);
         if (g_DebugState.dumpDAGCutGapsRequested) {
             clusterPipeline.RequestDebugDAGCutGapsDump();
