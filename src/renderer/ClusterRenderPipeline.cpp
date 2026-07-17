@@ -34,7 +34,24 @@ namespace renderer {
         static_assert(sizeof(WPOGlobalsUBO) == 16,
             "WPOGlobalsUBO must match the WPOGlobalsUBO block in ClusterRaster.vert / ClusterSoftwareRaster.comp exactly (std140 layout)");
 
+        float RadicalInverse(uint32_t index, uint32_t base) {
+            float result = 0.0f;
+            float f = 1.0f / static_cast<float>(base);
+            uint32_t i = index;
+            while (i > 0) {
+                result += f * static_cast<float>(i % base);
+                i /= base;
+                f /= static_cast<float>(base);
+            }
+            return result;
+        }
+
+        maths::vec2 Halton23(uint32_t index) {
+            return { RadicalInverse(index, 2), RadicalInverse(index, 3) };
+        }
+
     } // namespace
+
 
 bool ClusterRenderPipeline::Init(
     const ClusterRenderPipelineCreateInfo &createInfo) {
@@ -42,6 +59,7 @@ bool ClusterRenderPipeline::Init(
 
   m_Device = createInfo.device;
   m_RenderExtent = createInfo.renderExtent;
+  m_DisplayExtent = createInfo.displayExtent;
   m_VisBufferClusterIDImage = createInfo.visBufferClusterIDImage;
   m_VisBufferClusterIDView = createInfo.visBufferClusterIDView;
   m_VisBufferTriangleIDImage = createInfo.visBufferTriangleIDImage;
@@ -413,6 +431,10 @@ bool ClusterRenderPipeline::Init(
       createInfo.renderExtent, m_Resolve.GetOutputColorView(), m_Resolve.GetOutputDepthView(),
       m_Resolve.GetOutputNormalView());
 
+  m_TAATSR.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
+      m_RenderExtent, m_DisplayExtent,
+      m_Denoiser.GetOutputView(), m_Resolve.GetOutputDepthView());
+
 #ifndef NDEBUG
   // Two-tier SDF ray march DEBUG VISUALIZATION (see ClusterRenderPipeline.h's own comment on
   // m_SDFRayMarch) -- output sized to match the render extent so its debug image is a 1:1
@@ -477,6 +499,7 @@ void ClusterRenderPipeline::Shutdown() {
   m_Reflection.Shutdown();
   m_ScreenProbeGI.Shutdown();
   m_Denoiser.Shutdown();
+  m_TAATSR.Shutdown();
   m_WorldProbes.Shutdown();
   m_GIInject.Shutdown();
   m_SurfaceCacheRT.Shutdown();
@@ -575,10 +598,34 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
                                         VkImage swapchainImage) {
   assert(m_ClusterCount > 0 && "RecordFrame called before a successful Init");
 
+  CameraPushConstants cameraCopy = camera;
+  float jitterX = 0.0f;
+  float jitterY = 0.0f;
+
+  bool taatsrEnabled = true;
+#ifndef NDEBUG
+  taatsrEnabled = m_DebugTAATSREnabled;
+#endif
+
+  // Only apply camera jitter if TAA/TSR is enabled
+  if (taatsrEnabled) {
+      // 16-frame Halton jitter sequence centered around 0 in pixel space [-0.5, 0.5]
+      maths::vec2 rawJitter = Halton23(m_FrameIndex % 16u);
+      jitterX = rawJitter.x - 0.5f;
+      jitterY = rawJitter.y - 0.5f;
+
+      // Apply subpixel jitter to projection matrix (row 0, col 2 and row 1, col 2 in column-major)
+      float deltaX = (jitterX * 2.0f) / static_cast<float>(m_RenderExtent.width);
+      float deltaY = (jitterY * 2.0f) / static_cast<float>(m_RenderExtent.height);
+      cameraCopy.proj.m[8] += deltaX;
+      cameraCopy.proj.m[9] += deltaY;
+  }
+
   // Every stage of this frame consumes the SAME combined matrix -- this is what
   // makes the resolve pass's screen-space triangle re-projection bit-identical
   // to the rasterizers'.
-  maths::mat4 viewProj = camera.proj * camera.view;
+  maths::mat4 viewProj = cameraCopy.proj * cameraCopy.view;
+  maths::mat4 invViewProj = viewProj.Inverse();
 
   ClusterCullViewParams viewParams{};
   viewParams.frustumPlanes = ExtractFrustumPlanes(viewProj);
@@ -586,7 +633,8 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
 
   // abs(proj.m[5]): PerspectiveVulkan stores -1/tan(fovY/2) there (Y flip), and
   // the screen size classification needs the positive scale.
-  float projScaleY = std::abs(camera.proj.m[5]);
+  float projScaleY = std::abs(cameraCopy.proj.m[5]);
+
 
   // SWRT/HWRT back-end shared by m_GIInject ([1z] below) and m_ScreenProbeGI ([12b] below) --
   // debug-only toggle (main.cpp's 'T' key via SetDebugTraceMode), Release always uses HWRT (no
@@ -707,7 +755,7 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
     m_SDFRayMarch.RecordRayMarch(cmd, m_GlobalSDF, cameraFrameInfo.position, cameraFrameInfo.forward,
                                  maths::vec3{0.0f, 1.0f, 0.0f}, cameraFrameInfo.fovYRadians,
                                  cameraFrameInfo.aspectRatio, cameraFrameInfo.nearZ, cameraFrameInfo.farZ,
-                                 camera.debugViewMode == DEBUG_VIEW_GLOBAL_SDF);
+                                 cameraCopy.debugViewMode == DEBUG_VIEW_GLOBAL_SDF);
 #endif
   }
 
@@ -731,13 +779,13 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
   // =========================================================================================
   {
     ClusterLODSelectionPass::ViewParams lodViewParams{};
-    lodViewParams.view = camera.view;
-    lodViewParams.proj = camera.proj;
+    lodViewParams.view = cameraCopy.view;
+    lodViewParams.proj = cameraCopy.proj;
     lodViewParams.pixelErrorThreshold = kLODPixelErrorThreshold;
     // 2*atan(1/projScaleY) recovers fovYRadians from the projection matrix's own Y-scale term
     // (see projScaleY's own comment below) -- computed here, ahead of projScaleY's declaration,
     // since ExtractFrustumPlanes/viewProj aren't needed for this derivation.
-    float earlyProjScaleY = std::abs(camera.proj.m[5]);
+    float earlyProjScaleY = std::abs(cameraCopy.proj.m[5]);
     lodViewParams.fovYRadians = 2.0f * std::atan(1.0f / earlyProjScaleY);
     lodViewParams.viewportHeight = static_cast<float>(m_RenderExtent.height);
     lodViewParams.aspectRatio = static_cast<float>(m_RenderExtent.width) / static_cast<float>(m_RenderExtent.height);
@@ -797,7 +845,7 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
                                      m_LODSelection.GetEarlyDispatchArgsBuffer(),
                                      kSoftwareRasterThresholdPixels
 #ifndef NDEBUG
-                                     , camera.disableOcclusionCulling
+                                     , cameraCopy.disableOcclusionCulling
 #endif
                                      );
 
@@ -935,7 +983,7 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
   m_OcclusionCulling.RecordBuildLateDispatchArgs(cmd);
   m_OcclusionCulling.RecordLatePass(cmd
 #ifndef NDEBUG
-    , camera.disableOcclusionCulling
+    , cameraCopy.disableOcclusionCulling
 #endif
   );
   {
@@ -1086,12 +1134,12 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
   // COMPUTE barrier).
   // =========================================================================================
 #ifndef NDEBUG
-  if (camera.debugViewMode == DEBUG_VIEW_NORMAL) {
+  if (cameraCopy.debugViewMode == DEBUG_VIEW_NORMAL) {
     m_ShadingBin.RecordClassifyAndSort(cmd, m_RenderExtent);
     m_Resolve.RecordResolveBinned(cmd, viewProj, m_SceneLights.sun.direction, m_ShadingBin);
   } else {
     maths::mat4 prevViewProjForResolve = m_HasPrevViewProj ? m_PrevViewProj : viewProj;
-    m_Resolve.RecordResolve(cmd, viewProj, prevViewProjForResolve, m_SceneLights.sun.direction, camera.debugViewMode);
+    m_Resolve.RecordResolve(cmd, viewProj, prevViewProjForResolve, m_SceneLights.sun.direction, cameraCopy.debugViewMode);
   }
 #else
   m_ShadingBin.RecordClassifyAndSort(cmd, m_RenderExtent);
@@ -1129,7 +1177,7 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
       m_ScreenProbeGI.RecordTemporal(cmd);
       m_ScreenProbeGI.RecordGather(cmd
 #ifndef NDEBUG
-        , camera.debugViewMode
+        , cameraCopy.debugViewMode
 #endif
       );
     }
@@ -1215,7 +1263,7 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
   // (COMPUTE_SHADER/STORAGE_WRITE -> COMPUTE_SHADER/SHADER_SAMPLED_READ) for [14]'s blit read.
   // =========================================================================================
 #ifndef NDEBUG
-  bool applyDenoise = (camera.debugViewMode == DEBUG_VIEW_NORMAL);
+  bool applyDenoise = (cameraCopy.debugViewMode == DEBUG_VIEW_NORMAL);
 #else
   bool applyDenoise = true;
 #endif
@@ -1275,8 +1323,26 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
     VkImage transparentTargetImage = applyDenoise ? m_Denoiser.GetOutputImage() : m_Resolve.GetOutputColorImage();
     VkImageView transparentTargetView = applyDenoise ? m_Denoiser.GetOutputView() : m_Resolve.GetOutputColorView();
     m_TransparentForward.RecordDraw(cmd, transparentTargetImage, transparentTargetView, m_DepthImageView,
-        m_RenderExtent, camera.view, camera.proj, m_Decompression.GetDecompressedIndexPoolBuffer(),
+        m_RenderExtent, cameraCopy.view, cameraCopy.proj, m_Decompression.GetDecompressedIndexPoolBuffer(),
         m_SceneLights.sun.direction);
+  }
+
+  // =========================================================================================
+  // [13d] TAA & TSR pass (Temporal Anti-Aliasing and Temporal Super Resolution):
+  // Takes the low-resolution color (with transparent materials already composited) and resolved
+  // depth, performs subpixel reprojection, history clamping, and temporal blending, producing
+  // a high-quality upscaled output at native display resolution.
+  // =========================================================================================
+  {
+      maths::mat4 prevViewProjForTAA = m_HasPrevViewProj ? m_PrevViewProj : viewProj;
+      bool resetHistory = !m_HasPrevViewProj || !taatsrEnabled;
+      float passJitterX = taatsrEnabled ? jitterX : 0.0f;
+      float passJitterY = taatsrEnabled ? jitterY : 0.0f;
+
+      VkImageView currentLowResColorView = applyDenoise ? m_Denoiser.GetOutputView() : m_Resolve.GetOutputColorView();
+      m_TAATSR.UpdateDescriptorSets(currentLowResColorView, m_Resolve.GetOutputDepthView());
+
+      m_TAATSR.RecordPass(cmd, viewProj, prevViewProjForTAA, invViewProj, passJitterX, passJitterY, m_FrameIndex, resetHistory);
   }
 
 #ifndef NDEBUG
@@ -1325,12 +1391,43 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
     m_DebugOverlay.BuildFrameText(gpuMemUsedMB, pendingPageLoads, bytesPerSecond, hwTriangleCount, swTriangleCount,
         fps, static_cast<float>(m_RenderExtent.width), m_DebugRadiosityEnabled, m_DebugSSRTEnabled, traceMode,
         m_DebugWorldProbesEnabled);
-    // Drawn onto whichever image [14]'s blit will actually read below (m_Denoiser's output when
-    // [12d] applied it, m_Resolve's own color image otherwise -- same `applyDenoise` condition) --
-    // the overlay text must land on the real final image, not on a buffer already bypassed.
-    VkImage overlayTargetImage = applyDenoise ? m_Denoiser.GetOutputImage() : m_Resolve.GetOutputColorImage();
-    VkImageView overlayTargetView = applyDenoise ? m_Denoiser.GetOutputView() : m_Resolve.GetOutputColorView();
-    m_DebugOverlay.RecordDraw(cmd, overlayTargetImage, overlayTargetView, m_RenderExtent);
+
+    // Determine blitSourceImage early to draw HUD directly onto it
+    VkImage blitSourceImage = m_TAATSR.GetOutputImage();
+#ifndef NDEBUG
+    if (cameraCopy.debugViewMode != DEBUG_VIEW_NORMAL && cameraCopy.debugViewMode != DEBUG_VIEW_MOTION_VECTORS) {
+        if (cameraCopy.debugViewMode == DEBUG_VIEW_LUMEN || cameraCopy.debugViewMode == DEBUG_VIEW_GLOBAL_SDF) {
+            blitSourceImage = m_SDFRayMarch.GetOutputImage();
+        } else {
+            blitSourceImage = applyDenoise ? m_Denoiser.GetOutputImage() : m_Resolve.GetOutputColorImage();
+        }
+    }
+#endif
+
+    VkImage overlayTargetImage = blitSourceImage;
+    VkImageView overlayTargetView = VK_NULL_HANDLE;
+    VkExtent2D overlayExtent = m_RenderExtent;
+
+    if (blitSourceImage == m_TAATSR.GetOutputImage()) {
+        overlayTargetView = m_TAATSR.GetOutputView();
+        overlayExtent = m_DisplayExtent;
+    }
+#ifndef NDEBUG
+    else if (blitSourceImage == m_SDFRayMarch.GetOutputImage()) {
+        overlayTargetView = m_SDFRayMarch.GetOutputView();
+        overlayExtent = m_RenderExtent;
+    }
+#endif
+    else if (blitSourceImage == m_Denoiser.GetOutputImage()) {
+        overlayTargetView = m_Denoiser.GetOutputView();
+        overlayExtent = m_RenderExtent;
+    }
+    else {
+        overlayTargetView = m_Resolve.GetOutputColorView();
+        overlayExtent = m_RenderExtent;
+    }
+
+    m_DebugOverlay.RecordDraw(cmd, overlayTargetImage, overlayTargetView, overlayExtent);
   }
 #endif
 
@@ -1354,12 +1451,22 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
   // Denoised (see [12d] above) unless a debug view substitutes a different image entirely
   // (DEBUG_VIEW_LUMEN/DEBUG_VIEW_GLOBAL_SDF) or would have its own overlay blurred by the filter
   // (DEBUG_VIEW_SPATIAL_PROBES) -- applyDenoise (computed at [12d]) tracks exactly the same condition.
-  VkImage blitSourceImage = applyDenoise ? m_Denoiser.GetOutputImage() : m_Resolve.GetOutputColorImage();
+  VkImage blitSourceImage = m_TAATSR.GetOutputImage();
 #ifndef NDEBUG
-  if (camera.debugViewMode == DEBUG_VIEW_LUMEN || camera.debugViewMode == DEBUG_VIEW_GLOBAL_SDF) {
-    blitSourceImage = m_SDFRayMarch.GetOutputImage();
+  if (cameraCopy.debugViewMode != DEBUG_VIEW_NORMAL && cameraCopy.debugViewMode != DEBUG_VIEW_MOTION_VECTORS) {
+      if (cameraCopy.debugViewMode == DEBUG_VIEW_LUMEN || cameraCopy.debugViewMode == DEBUG_VIEW_GLOBAL_SDF) {
+          blitSourceImage = m_SDFRayMarch.GetOutputImage();
+      } else {
+          blitSourceImage = applyDenoise ? m_Denoiser.GetOutputImage() : m_Resolve.GetOutputColorImage();
+      }
   }
 #endif
+
+  VkExtent2D blitSrcExtent = m_RenderExtent;
+  if (blitSourceImage == m_TAATSR.GetOutputImage()) {
+      blitSrcExtent = m_DisplayExtent;
+  }
+
   {
     VkMemoryBarrier2 resolveToBlitBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
     resolveToBlitBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
@@ -1391,16 +1498,17 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
 
   VkImageBlit blitRegion{};
   blitRegion.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-  blitRegion.srcOffsets[1] = {static_cast<int32_t>(m_RenderExtent.width),
-                              static_cast<int32_t>(m_RenderExtent.height), 1};
+  blitRegion.srcOffsets[1] = {static_cast<int32_t>(blitSrcExtent.width),
+                              static_cast<int32_t>(blitSrcExtent.height), 1};
   blitRegion.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-  blitRegion.dstOffsets[1] = {static_cast<int32_t>(m_RenderExtent.width),
-                              static_cast<int32_t>(m_RenderExtent.height), 1};
+  blitRegion.dstOffsets[1] = {static_cast<int32_t>(m_DisplayExtent.width),
+                              static_cast<int32_t>(m_DisplayExtent.height), 1};
   // Same extent both sides -- the "blit" is a 1:1 copy that also performs the
   // RGBA8 -> B8G8R8A8 component reordering the swapchain format requires.
   vkCmdBlitImage(cmd, blitSourceImage, VK_IMAGE_LAYOUT_GENERAL,
                  swapchainImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
                  &blitRegion, VK_FILTER_NEAREST);
+
 
   {
     VkImageMemoryBarrier2 presentBarrier{

@@ -43,6 +43,8 @@ struct DebugState {
     // renderer::ClusterRenderPipeline::RequestDebugDAGCutGapsDump() -- see that method's own
     // comment for the investigation this is part of.
     bool dumpDAGCutGapsRequested = false;
+    // Toggles TAA + TSR on / off (Key 'A')
+    bool taatsrEnabled = config::temporal::ENABLED_BY_DEFAULT;
 };
 static DebugState g_DebugState;
 
@@ -145,6 +147,10 @@ static void KeyCallback(GLFWwindow* window, int key, int scancode, int action, i
         g_DebugState.dumpDAGCutGapsRequested = true;
         LOG_INFO("[Debug] Requested DAG-cut gap dump (logged via LOG_WARNING/LOG_INFO in ~2 frames).");
         break;
+    case GLFW_KEY_A:
+        g_DebugState.taatsrEnabled = !g_DebugState.taatsrEnabled;
+        LOG_INFO(std::format("[Debug] TAA + TSR Temporal Anti-Aliasing: {}", g_DebugState.taatsrEnabled ? "ON" : "OFF"));
+        break;
     default:
         break;
     }
@@ -205,7 +211,15 @@ int main() {
     pipelineInfo.allocator = vkContext.GetAllocator();
     pipelineInfo.commandPool = vkContext.GetCommandPool();
     pipelineInfo.queue = vkContext.GetGraphicsQueue();
-    pipelineInfo.renderExtent = vkContext.GetSwapchainExtent();
+    VkExtent2D swapchainExtent = vkContext.GetSwapchainExtent();
+    VkExtent2D renderExtent = swapchainExtent;
+    renderExtent.width = static_cast<uint32_t>(static_cast<float>(swapchainExtent.width) * config::temporal::RENDER_SCALE);
+    renderExtent.height = static_cast<uint32_t>(static_cast<float>(swapchainExtent.height) * config::temporal::RENDER_SCALE);
+    renderExtent.width = (renderExtent.width + 7) & ~7;
+    renderExtent.height = (renderExtent.height + 7) & ~7;
+
+    pipelineInfo.renderExtent = renderExtent;
+    pipelineInfo.displayExtent = swapchainExtent;
     pipelineInfo.visBufferClusterIDImage = vkContext.GetVisBufferClusterIDImage();
     pipelineInfo.visBufferClusterIDView = vkContext.GetVisBufferClusterIDView();
     pipelineInfo.visBufferTriangleIDImage = vkContext.GetVisBufferTriangleIDImage();
@@ -286,6 +300,7 @@ int main() {
         clusterPipeline.SetDebugSSRTEnabled(g_DebugState.ssrtEnabled);
         clusterPipeline.SetDebugWorldProbesEnabled(g_DebugState.worldProbesEnabled);
         clusterPipeline.SetDebugReflectionsEnabled(g_DebugState.reflectionsEnabled);
+        clusterPipeline.SetDebugTAATSREnabled(g_DebugState.taatsrEnabled);
         if (g_DebugState.dumpDAGCutGapsRequested) {
             clusterPipeline.RequestDebugDAGCutGapsDump();
             g_DebugState.dumpDAGCutGapsRequested = false;

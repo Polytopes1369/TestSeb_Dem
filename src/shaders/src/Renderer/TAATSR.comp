@@ -1,0 +1,207 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D g_LowResColor;
+layout(set = 0, binding = 1) uniform sampler2D g_LowResDepth;
+layout(set = 0, binding = 2) uniform sampler2D g_HistoryInput;
+layout(set = 0, binding = 3, rgba16f) uniform writeonly image2D g_HistoryOutput;
+
+layout(std140, set = 0, binding = 4) uniform TAATSRViewParamsUBO {
+    mat4 viewProj;
+    mat4 prevViewProj;
+    mat4 invViewProj;
+    vec2 renderExtent;  // Low-res width/height
+    vec2 displayExtent; // High-res width/height
+    vec2 jitterOffset;  // Subpixel jitter (jitterX, jitterY in pixels)
+    uint frameIndex;
+    uint resetHistory;
+} ubo;
+
+// Convert RGB to YCoCg space for better variance clamping
+vec3 RGBToYCoCg(vec3 rgb) {
+    float y = dot(rgb, vec3(0.25, 0.5, 0.25));
+    float co = dot(rgb, vec3(0.5, 0.0, -0.5));
+    float cg = dot(rgb, vec3(-0.25, 0.5, -0.25));
+    return vec3(y, co, cg);
+}
+
+// Convert YCoCg space back to RGB
+vec3 YCoCgToRGB(vec3 ycocg) {
+    float y = ycocg.x;
+    float co = ycocg.y;
+    float cg = ycocg.z;
+    float r = y + co - cg;
+    float g = y + cg;
+    float b = y - co - cg;
+    return vec3(r, g, b);
+}
+
+// 9-tap Catmull-Rom filter to reconstruct high-quality upscaled source pixels
+vec3 SampleLowResColorCatmullRom(vec2 uv) {
+    vec2 texSize = ubo.renderExtent;
+    vec2 samplePos = uv * texSize;
+    vec2 texelPos1 = floor(samplePos - 0.5) + 0.5;
+    vec2 f = samplePos - texelPos1;
+    
+    vec2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
+    vec2 w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
+    vec2 w2 = f * (0.5 + f * (2.0 - 1.5 * f));
+    vec2 w3 = f * f * (-0.5 + 0.5 * f);
+    
+    vec2 w12 = w1 + w2;
+    vec2 tc12 = (texelPos1 + w2 / w12) / texSize;
+    vec2 tc0 = (texelPos1 - 1.0) / texSize;
+    vec2 tc3 = (texelPos1 + 2.0) / texSize;
+    
+    vec3 c0 = textureLod(g_LowResColor, vec2(tc12.x, tc0.y), 0.0).rgb * w12.x * w0.y;
+    vec3 c1 = textureLod(g_LowResColor, vec2(tc0.x, tc12.y), 0.0).rgb * w0.x * w12.y;
+    vec3 c2 = textureLod(g_LowResColor, vec2(tc12.x, tc12.y), 0.0).rgb * w12.x * w12.y;
+    vec3 c3 = textureLod(g_LowResColor, vec2(tc3.x, tc12.y), 0.0).rgb * w3.x * w12.y;
+    vec3 c4 = textureLod(g_LowResColor, vec2(tc12.x, tc3.y), 0.0).rgb * w12.x * w3.y;
+    
+    vec3 c5 = textureLod(g_LowResColor, vec2(tc0.x, tc0.y), 0.0).rgb * w0.x * w0.y;
+    vec3 c6 = textureLod(g_LowResColor, vec2(tc3.x, tc0.y), 0.0).rgb * w3.x * w0.y;
+    vec3 c7 = textureLod(g_LowResColor, vec2(tc0.x, tc3.y), 0.0).rgb * w0.x * w3.y;
+    vec3 c8 = textureLod(g_LowResColor, vec2(tc3.x, tc3.y), 0.0).rgb * w3.x * w3.y;
+    
+    return c0 + c1 + c2 + c3 + c4 + c5 + c6 + c7 + c8;
+}
+
+// Clip history color towards local AABB center in YCoCg color space
+vec3 ClipToAABB(vec3 color, vec3 boxMin, vec3 boxMax) {
+    vec3 center = 0.5 * (boxMax + boxMin);
+    vec3 extents = 0.5 * (boxMax - boxMin) + 0.0001;
+    
+    vec3 dir = color - center;
+    vec3 absDir = abs(dir);
+    
+    float max_t = 0.0;
+    if (absDir.x > extents.x) max_t = max(max_t, (absDir.x - extents.x) / absDir.x);
+    if (absDir.y > extents.y) max_t = max(max_t, (absDir.y - extents.y) / absDir.y);
+    if (absDir.z > extents.z) max_t = max(max_t, (absDir.z - extents.z) / absDir.z);
+    
+    return color - max_t * dir;
+}
+
+void main() {
+    ivec2 displayCoords = ivec2(gl_GlobalInvocationID.xy);
+    if (displayCoords.x >= int(ubo.displayExtent.x) || displayCoords.y >= int(ubo.displayExtent.y)) {
+        return;
+    }
+    
+    // Normalized coordinates in display space
+    vec2 displayUV = (vec2(displayCoords) + 0.5) / ubo.displayExtent;
+    
+    // 1. High-quality upscale of low-res color input to display resolution
+    vec3 currentColorRGB = SampleLowResColorCatmullRom(displayUV);
+    
+    // Sample depth at current display coordinate (mapped to low-res)
+    float depth = textureLod(g_LowResDepth, displayUV, 0.0).r;
+    
+    // 2. Reconstruct motion vector to project coordinate back to previous frame
+    vec2 historyUV = displayUV;
+    bool hasHistory = true;
+    
+    // Reconstruct world position using winning depth and camera inverse viewProj
+    // Reversed-Z: depth = 0.0 represents the far plane. Depth > 0 is geometry.
+    if (depth > 0.0) {
+        vec2 ndcXY = displayUV * 2.0 - 1.0;
+        vec4 clipPos = vec4(ndcXY, depth, 1.0);
+        vec4 worldPos4 = ubo.invViewProj * clipPos;
+        vec3 worldPos = worldPos4.xyz / worldPos4.w;
+        
+        // Project into the previous frame
+        vec4 prevClip = ubo.prevViewProj * vec4(worldPos, 1.0);
+        if (prevClip.w > 0.0) {
+            vec2 prevNDC = prevClip.xy / prevClip.w;
+            historyUV = prevNDC * 0.5 + 0.5;
+        } else {
+            hasHistory = false;
+        }
+    } else {
+        // Far plane reprojection (e.g. skybox or empty space)
+        vec2 ndcXY = displayUV * 2.0 - 1.0;
+        vec4 clipPos = vec4(ndcXY, 0.0, 1.0);
+        vec4 worldPos4 = ubo.invViewProj * clipPos;
+        vec3 worldPos = worldPos4.xyz / worldPos4.w;
+        
+        vec4 prevClip = ubo.prevViewProj * vec4(worldPos, 1.0);
+        if (prevClip.w > 0.0) {
+            vec2 prevNDC = prevClip.xy / prevClip.w;
+            historyUV = prevNDC * 0.5 + 0.5;
+        } else {
+            hasHistory = false;
+        }
+    }
+    
+    // Out of bounds checks
+    if (historyUV.x < 0.0 || historyUV.x > 1.0 || historyUV.y < 0.0 || historyUV.y > 1.0) {
+        hasHistory = false;
+    }
+    
+    // 3. Compute 3x3 neighborhood statistics in YCoCg color space
+    vec3 currentColorYCoCg = RGBToYCoCg(currentColorRGB);
+    vec3 boxMin = currentColorYCoCg;
+    vec3 boxMax = currentColorYCoCg;
+    vec3 m1 = currentColorYCoCg;
+    vec3 m2 = currentColorYCoCg * currentColorYCoCg;
+    
+    vec2 lowResTexelSize = 1.0 / ubo.renderExtent;
+    
+    for (int y = -1; y <= 1; ++y) {
+        for (int x = -1; x <= 1; ++x) {
+            if (x == 0 && y == 0) continue;
+            vec2 sampleUV = displayUV + vec2(x, y) * lowResTexelSize;
+            sampleUV = clamp(sampleUV, 0.0, 1.0);
+            
+            vec3 neighborRGB = textureLod(g_LowResColor, sampleUV, 0.0).rgb;
+            vec3 neighborYCoCg = RGBToYCoCg(neighborRGB);
+            
+            boxMin = min(boxMin, neighborYCoCg);
+            boxMax = max(boxMax, neighborYCoCg);
+            
+            m1 += neighborYCoCg;
+            m2 += neighborYCoCg * neighborYCoCg;
+        }
+    }
+    
+    // Variance-based bounding box calculation
+    vec3 mean = m1 / 9.0;
+    vec3 stdDev = sqrt(max(vec3(0.0), (m2 / 9.0) - (mean * mean)));
+    
+    // Variance clipping scale: 1.5 gives a good balance of sharpness and ghosting prevention
+    vec3 varianceMin = mean - 1.5 * stdDev;
+    vec3 varianceMax = mean + 1.5 * stdDev;
+    
+    boxMin = max(boxMin, varianceMin);
+    boxMax = min(boxMax, varianceMax);
+    
+    // 4. Sample and blend history
+    vec3 resolvedColorRGB;
+    
+    if (hasHistory && ubo.resetHistory == 0) {
+        vec3 historyColorRGB = textureLod(g_HistoryInput, historyUV, 0.0).rgb;
+        vec3 historyColorYCoCg = RGBToYCoCg(historyColorRGB);
+        
+        // Clip history color to the AABB box
+        vec3 clampedHistoryYCoCg = ClipToAABB(historyColorYCoCg, boxMin, boxMax);
+        vec3 clampedHistoryRGB = YCoCgToRGB(clampedHistoryYCoCg);
+        
+        // Blend current frame and clamped history
+        float alpha = ubo.jitterOffset == vec2(0.0) ? 0.20 : 0.08;
+        
+        // Adaptively reduce history contribution if the difference is very large
+        float colorDiff = length(currentColorYCoCg - clampedHistoryYCoCg);
+        alpha = mix(alpha, 1.0, clamp(colorDiff * 2.0, 0.0, 1.0));
+        
+        resolvedColorRGB = mix(clampedHistoryRGB, currentColorRGB, alpha);
+    } else {
+        // No history or reset triggered: output Catmull-Rom upscale directly
+        resolvedColorRGB = currentColorRGB;
+    }
+    
+    // Store resolved color in the history output
+    imageStore(g_HistoryOutput, displayCoords, vec4(resolvedColorRGB, 1.0));
+}

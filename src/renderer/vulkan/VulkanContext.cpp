@@ -428,12 +428,18 @@ void VulkanContext::Init(std::string_view appName, GLFWwindow *window) {
   CreateSwapchain(window);
   CreateImageViews();
 
+  // Compute scaled rendering resolution for TAA / TSR
+  VkExtent2D renderExtent = m_SwapchainExtent;
+  renderExtent.width = static_cast<uint32_t>(static_cast<float>(m_SwapchainExtent.width) * config::temporal::RENDER_SCALE);
+  renderExtent.height = static_cast<uint32_t>(static_cast<float>(m_SwapchainExtent.height) * config::temporal::RENDER_SCALE);
+  renderExtent.width = (renderExtent.width + 7) & ~7;
+  renderExtent.height = (renderExtent.height + 7) & ~7;
+
   // Create Depth Image
   VkImageCreateInfo depthImageInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
   depthImageInfo.imageType = VK_IMAGE_TYPE_2D;
   depthImageInfo.format = m_DepthFormat;
-  depthImageInfo.extent = {m_SwapchainExtent.width, m_SwapchainExtent.height,
-                           1};
+  depthImageInfo.extent = {renderExtent.width, renderExtent.height, 1};
   depthImageInfo.mipLevels = 1;
   depthImageInfo.arrayLayers = 1;
   depthImageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
@@ -451,8 +457,8 @@ void VulkanContext::Init(std::string_view appName, GLFWwindow *window) {
   depthAllocInfo.usage = VMA_MEMORY_USAGE_GPU_ONLY;
 
   if (vmaCreateImage(m_Allocator, &depthImageInfo, &depthAllocInfo,
-                     &m_DepthImage, &m_DepthAllocation,
-                     nullptr) != VK_SUCCESS) {
+                      &m_DepthImage, &m_DepthAllocation,
+                      nullptr) != VK_SUCCESS) {
     throw std::runtime_error("Failed to create depth image!");
   }
 
@@ -476,23 +482,15 @@ void VulkanContext::Init(std::string_view appName, GLFWwindow *window) {
   // VulkanContext.h's
   // GetVisBufferClusterIDImage()/GetVisBufferTriangleIDImage() comment). Two
   // separate single-channel R32_UINT images rather than one 2-channel image,
-  // sized to the swapchain extent exactly like the depth image above (no
-  // runtime resize support in this engine, see CreateSwapchain()'s
-  // non-resizable GLFW window). STORAGE_BIT is required because
-  // renderer::ClusterResolvePass binds both images as plain storage images
-  // (imageLoad, not a sampler read -- see ClusterResolve.comp's
-  // g_HWClusterIDImage/g_HWTriangleIDImage) once
-  // renderer::ClusterRenderPipeline transitions them to VK_IMAGE_LAYOUT_GENERAL
-  // after the hybrid raster passes; SAMPLED_BIT is kept alongside for any
-  // future pass that prefers a filtered/ sampler-based read instead.
+  // sized to the rendering extent.
   auto createVisBufferImage = [&](VkImage &outImage,
                                   VmaAllocation &outAllocation,
                                   VkImageView &outView, const char *debugName) {
     VkImageCreateInfo visBufferImageInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     visBufferImageInfo.imageType = VK_IMAGE_TYPE_2D;
     visBufferImageInfo.format = kVisBufferFormat;
-    visBufferImageInfo.extent = {m_SwapchainExtent.width,
-                                 m_SwapchainExtent.height, 1};
+    visBufferImageInfo.extent = {renderExtent.width,
+                                 renderExtent.height, 1};
     visBufferImageInfo.mipLevels = 1;
     visBufferImageInfo.arrayLayers = 1;
     visBufferImageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
@@ -504,6 +502,7 @@ void VulkanContext::Init(std::string_view appName, GLFWwindow *window) {
 
     VmaAllocationCreateInfo visBufferAllocInfo{};
     visBufferAllocInfo.usage = VMA_MEMORY_USAGE_GPU_ONLY;
+
 
     if (vmaCreateImage(m_Allocator, &visBufferImageInfo, &visBufferAllocInfo,
                        &outImage, &outAllocation, nullptr) != VK_SUCCESS) {

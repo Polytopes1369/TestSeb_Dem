@@ -59,6 +59,7 @@ public:
                    float elevationDegrees);
   void SetOrientation(float pitchDegrees, float yawDegrees);
   void CameraRotate(float deltaYawDegrees, float deltaPitchDegrees);
+  void SetJitter(float jitterX, float jitterY, float renderWidth, float renderHeight);
 
 #ifndef NDEBUG
   void SetDebugViewMode(uint32_t mode) { m_PushConstants.debugViewMode = mode; }

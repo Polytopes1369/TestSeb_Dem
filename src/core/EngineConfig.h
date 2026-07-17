@@ -75,4 +75,13 @@ constexpr float VSM_SUN_BASE_RADIUS = 2.0f;
 constexpr uint32_t VSM_PHYSICAL_PAGE_CAPACITY = 4096u; // Large page capacity (4096 * 128^2 * 4B = 256 MB) to prevent any eviction.
 constexpr uint32_t VSM_MAX_PAGES_RENDERED_PER_FRAME = 512u;
 } // namespace lumen
+
+namespace temporal {
+// Resolution scale for rendering. Set to 1.0f for native resolution TAA, and < 1.0f (e.g., 0.7f) for TSR upscaling.
+constexpr float RENDER_SCALE = 0.7f;
+// Exponential moving average blend factor (lower value = more temporal history/stability, higher = faster response to motion)
+constexpr float BLEND_ALPHA = 0.08f;
+// Whether camera subpixel jitter and temporal accumulation are enabled by default
+constexpr bool ENABLED_BY_DEFAULT = true;
+} // namespace temporal
 } // namespace config

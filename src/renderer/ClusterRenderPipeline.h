@@ -89,6 +89,7 @@
 #include "renderer/passes/TransparentForwardPass.h"
 #include "renderer/passes/VirtualShadowMapPass.h"
 #include "renderer/passes/WorldProbeGridPass.h"
+#include "renderer/passes/TAATSRPass.h"
 #ifndef NDEBUG
 #include "renderer/debug/ClusterTriangleStatsPass.h"
 #include "renderer/debug/DebugTextOverlay.h"
@@ -108,6 +109,7 @@ namespace renderer {
         VkCommandPool commandPool = VK_NULL_HANDLE;
         VkQueue queue = VK_NULL_HANDLE;
         VkExtent2D renderExtent{ 0, 0 };
+        VkExtent2D displayExtent{ 0, 0 };
 
         // Hardware-path Visibility Buffer attachments + depth (VulkanContext's images).
         VkImage visBufferClusterIDImage = VK_NULL_HANDLE;
@@ -230,6 +232,7 @@ namespace renderer {
         // SetDebugSSRTEnabled/SetDebugRadiosityEnabled's own Release-always-on convention, not
         // SetDebugWorldProbesEnabled's Release-always-off one).
         void SetDebugReflectionsEnabled(bool enabled) { m_DebugReflectionsEnabled = enabled; }
+        void SetDebugTAATSREnabled(bool enabled) { m_DebugTAATSREnabled = enabled; }
 
         // Investigating the 2026-07-16 "persistent holes" bug (see project memory
         // project_persistent_cluster_holes_open_bug.md / ClusterLODSelectionPass::
@@ -259,6 +262,7 @@ namespace renderer {
 
         VkDevice m_Device = VK_NULL_HANDLE;
         VkExtent2D m_RenderExtent{ 0, 0 };
+        VkExtent2D m_DisplayExtent{ 0, 0 };
 
         // Borrowed attachment handles (owned by VulkanContext).
         VkImage m_VisBufferClusterIDImage = VK_NULL_HANDLE;
@@ -402,6 +406,7 @@ namespace renderer {
         // m_ScreenProbeGI's own temporally-accumulated indirect term), applied only in the normal
         // (non-debug-visualization) view path -- see RecordFrame()'s own comment for exactly why.
         ATrousDenoisePass m_Denoiser;
+        TAATSRPass m_TAATSR;
 
         // Previous frame's combined view-projection matrix -- ScreenProbeGIPass's temporal pass
         // (and ClusterResolve.comp's DEBUG_VIEW_MOTION_VECTORS) reprojects a probe's/pixel's
@@ -426,6 +431,7 @@ namespace renderer {
         // Release hardcodes the equivalent local to true (matching m_DebugSSRTEnabled's own
         // Release-always-on convention), since this pass has a real live consumer already.
         bool m_DebugReflectionsEnabled = true;
+        bool m_DebugTAATSREnabled = config::temporal::ENABLED_BY_DEFAULT;
 
         // See RequestDebugDAGCutGapsDump()'s own comment: 0 = idle, 1 = "record the readback this
         // frame" (set by main.cpp's 'K' key), 2 = "readback landed, safe to log now" (set by

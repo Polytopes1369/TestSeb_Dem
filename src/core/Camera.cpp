@@ -104,3 +104,12 @@ void Camera::CameraRotate(float deltaYawDegrees, float deltaPitchDegrees) {
     while (m_YawDegrees > 360.0f) m_YawDegrees -= 360.0f;
     while (m_YawDegrees < 0.0f) m_YawDegrees += 360.0f;
 }
+
+void Camera::SetJitter(float jitterX, float jitterY, float renderWidth, float renderHeight) {
+    // Offset the projection matrix (row 0, col 2 and row 1, col 2 for translation shift in NDC)
+    float deltaX = (jitterX * 2.0f) / renderWidth;
+    float deltaY = (jitterY * 2.0f) / renderHeight;
+    m_PushConstants.proj.m[8] += deltaX;
+    m_PushConstants.proj.m[9] += deltaY;
+}
+
