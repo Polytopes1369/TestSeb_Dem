@@ -10,6 +10,10 @@
 #include <string>
 
 #include "core/Logger.h"
+#ifndef NDEBUG
+#include "imgui.h"
+#include "imgui_impl_vulkan.h"
+#endif
 #include "geometry/ClusterFormat.h"
 #include "io/CacheFileManager.h"
 #include "renderer/vulkan/GpuBuffer.h"
@@ -599,7 +603,8 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
                                         const maths::vec3 &cameraPositionWorld,
                                         const CameraFrameInfo &cameraFrameInfo,
                                         float globalTimeSeconds,
-                                        VkImage swapchainImage) {
+                                        VkImage swapchainImage,
+                                        VkImageView swapchainImageView) {
   assert(m_ClusterCount > 0 && "RecordFrame called before a successful Init");
 
   CameraPushConstants cameraCopy = camera;
@@ -1517,6 +1522,63 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
                  &blitRegion, VK_FILTER_NEAREST);
 
 
+#ifndef NDEBUG
+  {
+    VkImageMemoryBarrier2 attachmentBarrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+    attachmentBarrier.srcStageMask = VK_PIPELINE_STAGE_2_BLIT_BIT;
+    attachmentBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    attachmentBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+    attachmentBarrier.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+    attachmentBarrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    attachmentBarrier.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    attachmentBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    attachmentBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    attachmentBarrier.image = swapchainImage;
+    attachmentBarrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+
+    VkDependencyInfo depInfo{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    depInfo.imageMemoryBarrierCount = 1;
+    depInfo.pImageMemoryBarriers = &attachmentBarrier;
+    vkCmdPipelineBarrier2(cmd, &depInfo);
+  }
+
+  // Draw ImGui onto the swapchain image attachment
+  VkRenderingAttachmentInfo colorAttachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+  colorAttachment.imageView = swapchainImageView;
+  colorAttachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+  colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD; // Load the blitted content
+  colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+
+  VkRenderingInfo renderingInfo{VK_STRUCTURE_TYPE_RENDERING_INFO};
+  renderingInfo.renderArea = {{0, 0}, m_DisplayExtent};
+  renderingInfo.layerCount = 1;
+  renderingInfo.colorAttachmentCount = 1;
+  renderingInfo.pColorAttachments = &colorAttachment;
+
+  vkCmdBeginRendering(cmd, &renderingInfo);
+  ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), cmd);
+  vkCmdEndRendering(cmd);
+
+  {
+    VkImageMemoryBarrier2 presentBarrier{
+        VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+    presentBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+    presentBarrier.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+    presentBarrier.dstStageMask = VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT;
+    presentBarrier.dstAccessMask = 0;
+    presentBarrier.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    presentBarrier.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    presentBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    presentBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    presentBarrier.image = swapchainImage;
+    presentBarrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+
+    VkDependencyInfo depInfo{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    depInfo.imageMemoryBarrierCount = 1;
+    depInfo.pImageMemoryBarriers = &presentBarrier;
+    vkCmdPipelineBarrier2(cmd, &depInfo);
+  }
+#else
   {
     VkImageMemoryBarrier2 presentBarrier{
         VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
@@ -1536,6 +1598,7 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
     depInfo.pImageMemoryBarriers = &presentBarrier;
     vkCmdPipelineBarrier2(cmd, &depInfo);
   }
+#endif
 
   // Recorded last, after every consumer of "the previous frame's" viewProj above (m_Resolve's own
   // motion-vector debug view, m_ScreenProbeGI's temporal reprojection) has already read it --

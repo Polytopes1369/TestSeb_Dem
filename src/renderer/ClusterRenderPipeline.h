@@ -185,7 +185,7 @@ namespace renderer {
         // begins/ends/submits the command buffer and presents.
         void RecordFrame(VkCommandBuffer cmd, const CameraPushConstants& camera,
             const maths::vec3& cameraPositionWorld, const CameraFrameInfo& cameraFrameInfo,
-            float globalTimeSeconds, VkImage swapchainImage);
+            float globalTimeSeconds, VkImage swapchainImage, VkImageView swapchainImageView);
 
         // Upper bound on this frame's actual candidate count (the DAG's total leaf count) -- NOT
         // this frame's real candidate count, which only ever exists on the GPU now that

@@ -27,14 +27,35 @@ add_subdirectory(vendor/glfw)
 file(GLOB_RECURSE ALL_SOURCES CONFIGURE_DEPENDS "src/*.cpp")
 file(GLOB_RECURSE ALL_HEADERS CONFIGURE_DEPENDS "src/*.h" "src/*.hpp")
 
+# --- Configuration ImGui (Vulkan + GLFW) ---
+set(IMGUI_DIR "${CMAKE_CURRENT_SOURCE_DIR}/vendor/imgui")
+set(IMGUI_SOURCES
+    ${IMGUI_DIR}/imgui.cpp
+    ${IMGUI_DIR}/imgui_demo.cpp
+    ${IMGUI_DIR}/imgui_draw.cpp
+    ${IMGUI_DIR}/imgui_tables.cpp
+    ${IMGUI_DIR}/imgui_widgets.cpp
+    ${IMGUI_DIR}/backends/imgui_impl_glfw.cpp
+    ${IMGUI_DIR}/backends/imgui_impl_vulkan.cpp
+)
+
 # --- Création de l'exécutable ---
-add_executable(${PROJECT_NAME} ${ALL_SOURCES} ${ALL_HEADERS})
+add_executable(${PROJECT_NAME} 
+    ${ALL_SOURCES} 
+    ${ALL_HEADERS} 
+)
+
+target_sources(${PROJECT_NAME} PRIVATE
+    $<$<CONFIG:Debug>:${IMGUI_SOURCES}>
+)
 
 # --- Includes ---
 target_include_directories(${PROJECT_NAME} PRIVATE 
     src
     ${Vulkan_INCLUDE_DIRS}
     vendor/vma
+    $<$<CONFIG:Debug>:${IMGUI_DIR}>
+    $<$<CONFIG:Debug>:${IMGUI_DIR}/backends>
 )
 
 # --- Linking ---

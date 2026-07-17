@@ -2,10 +2,10 @@
 #include <cstdint>
 
 namespace config_low {
-constexpr uint32_t WINDOW_WIDTH = 1920;
-constexpr uint32_t WINDOW_HEIGHT = 1080;
-// Medium: 0.15f spacing to reduce vertex overhead on the RTX 3060 compute
-// pipeline.
+constexpr uint32_t WINDOW_WIDTH = 1280;
+constexpr uint32_t WINDOW_HEIGHT = 720;
+constexpr uint32_t TARGET_FPS = 30;
+// Low: Spacing relaxed to reduce vertex density on the RTX 3060 compute queue.
 constexpr float VERTEX_SPACING = 0.15f;
 constexpr float FLOOR_VERTEX_SPACING = 1.0f;
 
@@ -17,7 +17,7 @@ constexpr bool ENTITY_SELF_ROTATION_ENABLED = false;
 constexpr uint32_t VIEW_DISTANCE_QUALITY = 2;
 
 namespace nanite {
-// Lower threshold shifts more tiny triangles to the software rasterizer.
+// Higher threshold shifts more tiny triangles to the software rasterizer to relieve pipeline stress.
 constexpr float SOFTWARE_RASTER_THRESHOLD_PIXELS = 16.0f;
 // Balanced LOD error threshold.
 constexpr float LOD_PIXEL_ERROR_THRESHOLD = 2.0f;
@@ -26,7 +26,7 @@ constexpr uint32_t MAX_CLUSTER_VERTICES = 64u;
 constexpr uint32_t MAX_CLUSTER_TRIANGLES = 128u;
 constexpr uint32_t PAGE_SIZE_BYTES = 4096u;
 
-// Allocated standard buffers to store dynamic virtual geometries.
+// Lower memory allocation for vertex buffers
 constexpr uint64_t VERTEX_BUFFER_BYTES = 512 * 1024 * 1024;
 constexpr uint64_t INDEX_BUFFER_BYTES = 256 * 1024 * 1024;
 
@@ -35,13 +35,12 @@ constexpr float MAX_PIXELS_PER_EDGE = 4.0f;
 } // namespace nanite
 
 namespace streaming {
-// UE 5.8: r.Streaming.PoolSize=4500 (Allocating 4.5GB leveraging the 12GB VRAM
-// on the RTX 3060)
+// UE 5.8: r.Streaming.PoolSize=4500 (Allocating 4.5GB leveraging the 12GB VRAM on the RTX 3060)
 constexpr uint32_t POOL_SIZE_MB = 4500;
 } // namespace streaming
 
 namespace temporal {
-// Internal render scale (720p internally, reconstructed to 1080p)
+// Internal render scale (720p internally, reconstructed to 1080p via TSR)
 constexpr float RENDER_SCALE = 0.667f;
 constexpr float BLEND_ALPHA = 0.08f;
 constexpr float BLEND_ALPHA_STATIC = 0.20f;
@@ -62,16 +61,13 @@ constexpr uint32_t TSR_VELOCITY_HEADING_CONVECTIVE = 1;
 } // namespace temporal
 
 namespace shadows {
-// UE 5.8 Shadows settings (Classic Shadow Maps fallback to save GPU cycles)
+// UE 5.8 Shadows settings (Classic Cascaded Shadow Maps fallback to save GPU cycles)
 // sg.ShadowQuality=1
 constexpr uint32_t QUALITY = 1;
 // r.Shadow.Virtual.Enable=0 (VSM disabled, too heavy for this architecture)
 constexpr bool VIRTUAL_ENABLE = false;
-// r.Shadow.MaxResolution=1024
 constexpr uint32_t MAX_RESOLUTION = 1024;
-// r.Shadow.CSM.MaxCascades=2
 constexpr uint32_t CSM_MAX_CASCADES = 2;
-// r.Shadow.DistanceScale=0.85
 constexpr float DISTANCE_SCALE = 0.85f;
 } // namespace shadows
 
@@ -88,8 +84,7 @@ constexpr uint32_t MAX_TRACED_ENTITIES = 64u;
 constexpr uint32_t RADIOSITY_BOUNCE_COUNT = 2u;
 constexpr uint32_t SURFACE_CACHE_GI_SAMPLE_COUNT = 24u;
 
-constexpr uint32_t SCREEN_PROBE_TILE_SIZE =
-    16u; // Larger tiles = fewer probes traced
+constexpr uint32_t SCREEN_PROBE_TILE_SIZE = 16u; // Larger tiles = fewer probes traced
 constexpr uint32_t SCREEN_PROBE_RAY_COUNT = 32u; // Reduced ray budget
 constexpr float SCREEN_PROBE_TEMPORAL_ALPHA = 0.10f;
 
@@ -112,7 +107,7 @@ constexpr bool REFLECTIONS_ALLOW = true;
 // Downsampled reflections to protect framerate
 constexpr uint32_t REFLECTIONS_DOWNSAMPLE_FACTOR = 2;
 
-// UE 5.8 specific feature switches disabled on Medium
+// UE 5.8 specific feature switches disabled on Low
 constexpr bool HARDWARE_RAYTRACING_NANITE_MODE = false;
 constexpr bool MEGALIGHTS_ENABLE = false;
 } // namespace lumen

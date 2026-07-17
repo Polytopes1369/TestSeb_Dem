@@ -36,6 +36,9 @@
 #include "core/Camera.h"
 #include "core/EngineConfig.h"
 #include "core/Logger.h"
+#include "imgui.h"
+#include "backends/imgui_impl_glfw.h"
+#include "backends/imgui_impl_vulkan.h"
 
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
@@ -165,13 +168,23 @@ namespace debugpipeline {
                 VkSemaphore imgAvailable = vkContext.GetImageAvailableSemaphore();
                 VkSemaphore rndFinished = vkContext.GetRenderFinishedSemaphore(imageIndex);
 
+                // ClusterRenderPipeline::RecordFrame() unconditionally composites ImGui::GetDrawData()
+                // onto the swapchain image in every Debug build (see its own [ImGui] block) -- a
+                // NewFrame()/Render() pair is required every frame regardless of whether this
+                // pipeline draws any widgets itself, otherwise GetDrawData() returns stale/invalid
+                // data. No UI content is built here (empty frame is valid ImGui usage).
+                ImGui_ImplVulkan_NewFrame();
+                ImGui_ImplGlfw_NewFrame();
+                ImGui::NewFrame();
+                ImGui::Render();
+
                 vkResetCommandBuffer(vkContext.GetCommandBuffer(), 0);
                 VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
                 vkBeginCommandBuffer(vkContext.GetCommandBuffer(), &beginInfo);
 
                 clusterPipeline.RecordFrame(vkContext.GetCommandBuffer(), camera.GetPushConstants(),
                     camera.GetPosition(), camera.GetFrameInfo(aspect), static_cast<float>(glfwGetTime()),
-                    vkContext.GetSwapchainImages()[imageIndex]);
+                    vkContext.GetSwapchainImages()[imageIndex], vkContext.GetSwapchainImageViews()[imageIndex]);
 
                 if (captureRequested && f == frameCount - 1) {
                     debugpipeline::ScreenshotCapture::RecordCapture(

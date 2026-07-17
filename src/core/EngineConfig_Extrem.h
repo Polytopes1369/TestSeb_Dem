@@ -2,9 +2,10 @@
 #include <cstdint>
 
 namespace config_extrem {
-constexpr uint32_t WINDOW_WIDTH = 1920;
-constexpr uint32_t WINDOW_HEIGHT = 1080;
-// Extrem: 0.02f for ultra-dense raw procedural geometry on high-end GPUs.
+constexpr uint32_t WINDOW_WIDTH = 3840;
+constexpr uint32_t WINDOW_HEIGHT = 2160;
+constexpr uint32_t TARGET_FPS = 60;
+// Extrem: 0.02f for ultra-dense raw procedural geometry on Blackwell architectures.
 constexpr float VERTEX_SPACING = 0.02f;
 constexpr float FLOOR_VERTEX_SPACING = 1.0f;
 
@@ -12,7 +13,7 @@ constexpr float FLOOR_VERTEX_SPACING = 1.0f;
 constexpr bool ENTITY_SELF_ROTATION_ENABLED = false;
 
 // --- VIEW DISTANCE ---
-// sg.ViewDistanceQuality=5 (Extreme view distance, maximum asset LOD caching)
+// sg.ViewDistanceQuality=5 (Extreme cinematic view distance, maximum asset LOD caching)
 constexpr uint32_t VIEW_DISTANCE_QUALITY = 5;
 
 namespace nanite {
@@ -33,13 +34,13 @@ constexpr float MAX_PIXELS_PER_EDGE = 0.5f;
 } // namespace nanite
 
 namespace streaming {
-// UE 5.8: r.Streaming.PoolSize=16000 (Massive 16GB allocation budget for extreme high-res textures)
-constexpr uint32_t POOL_SIZE_MB = 16000;
+// UE 5.8: r.Streaming.PoolSize=12000 (Generous 12GB allocation budget for extreme high-res textures)
+constexpr uint32_t POOL_SIZE_MB = 12000;
 } // namespace streaming
 
 namespace temporal {
-// Render Scale 1.5x (Super-sampled/super-resolution 4K rendering)
-constexpr float RENDER_SCALE = 1.500f;
+// Internal render scale (1440p internally, reconstructed to 4K via TSR)
+constexpr float RENDER_SCALE = 0.667f;
 constexpr float BLEND_ALPHA = 0.08f;
 constexpr float BLEND_ALPHA_STATIC = 0.20f;
 constexpr float VARIANCE_CLAMP_FACTOR = 1.5f;
@@ -56,7 +57,7 @@ constexpr uint32_t TSR_VELOCITY_HEADING_CONVECTIVE = 1;
 } // namespace temporal
 
 namespace shadows {
-// sg.ShadowQuality=5 (Extreme)
+// sg.ShadowQuality=5 (Extreme Cinematic)
 constexpr uint32_t QUALITY = 5;
 constexpr bool VIRTUAL_ENABLE = true;
 // Crisp shadows with high-resolution map cache allocations
@@ -90,7 +91,7 @@ constexpr float VSM_SUN_BASE_RADIUS = 2.0f;
 constexpr uint32_t VSM_PHYSICAL_PAGE_CAPACITY = 8192u;
 constexpr uint32_t VSM_MAX_PAGES_RENDERED_PER_FRAME = 1024u;
 
-// sg.GlobalIlluminationQuality=5 (Extreme)
+// sg.GlobalIlluminationQuality=5 (Extreme Cinematic)
 constexpr uint32_t GI_QUALITY = 5;
 constexpr bool HARDWARE_RAYTRACING = true;
 constexpr bool TRACE_MESH_SDF = true;
@@ -99,18 +100,18 @@ constexpr bool REFLECTIONS_ALLOW = true;
 constexpr uint32_t REFLECTIONS_DOWNSAMPLE_FACTOR = 1;
 
 constexpr bool HARDWARE_RAYTRACING_NANITE_MODE = true;
-constexpr bool MEGALIGHTS_ENABLE = true;
+constexpr bool MEGALIGHTS_ENABLE = true; // Enabled to handle thousands of physics-based dynamic lights
 } // namespace lumen
 
 namespace reflections {
-// sg.ReflectionsQuality=5 (Extreme)
+// sg.ReflectionsQuality=5 (Extreme Cinematic)
 constexpr uint32_t QUALITY = 5;
 constexpr uint32_t METHOD = 2;
 constexpr bool SCREEN_SPACE_REFLECTIONS = true;
 } // namespace reflections
 
 namespace postprocess {
-// sg.PostProcessQuality=5 (Extreme)
+// sg.PostProcessQuality=5 (Extreme Cinematic)
 constexpr uint32_t QUALITY = 5;
 constexpr uint32_t EFFECTS_QUALITY = 5;
 constexpr uint32_t TRANSLUCENCY_LIGHTING_VOLUME_DIM = 128;
