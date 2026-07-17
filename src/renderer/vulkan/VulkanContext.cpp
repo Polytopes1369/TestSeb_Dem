@@ -2099,9 +2099,15 @@ void VulkanContext::UpdateEntityRotations(float timeSeconds) {
     } else {
       float phase = static_cast<float>(meshID) * kPhaseStep;
 
-      maths::mat4 rotation = maths::mat4::RotateY(timeSeconds * kSpeedY + phase) *
-                             maths::mat4::RotateX(timeSeconds * kSpeedX + phase) *
-                             maths::mat4::RotateZ(timeSeconds * kSpeedZ + phase);
+      // config::ENTITY_SELF_ROTATION_ENABLED kill-switch (see its own comment in EngineConfig.h):
+      // identity rotation when disabled -- every consumer (cluster_entity_transform.glsl's
+      // helpers, ClusterRaster.vert's per-vertex transform) already degrades correctly to a no-op
+      // for an identity matrix, so no shader-side change is needed to fully disable rotation.
+      maths::mat4 rotation = config::ENTITY_SELF_ROTATION_ENABLED
+          ? maths::mat4::RotateY(timeSeconds * kSpeedY + phase) *
+            maths::mat4::RotateX(timeSeconds * kSpeedX + phase) *
+            maths::mat4::RotateZ(timeSeconds * kSpeedZ + phase)
+          : maths::mat4{};
 
       // Every primitive's baked world-space center coincides exactly with its
       // grid slot position at Y=0: each geom_*.comp shader either generates a

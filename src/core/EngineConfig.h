@@ -8,6 +8,16 @@ constexpr uint32_t WINDOW_HEIGHT = 1080;
 constexpr float VERTEX_SPACING = 0.05f;
 constexpr float FLOOR_VERTEX_SPACING = 1.0f;
 
+// Temporary kill-switch: when false, VulkanContext::UpdateEntityRotations gives every non-floor
+// entity an identity rotation (its rest pose) instead of the real-time tumbling animation, while
+// still updating each entity's center every frame. Added 2026-07-16 to isolate whether the
+// still-open "clusters render as disconnected floating shards" bug (see project memory
+// project_persistent_cluster_holes_open_bug.md) is caused or triggered by per-entity rotation --
+// every rotation-consuming shader (cluster_entity_transform.glsl's helpers, ClusterRaster.vert's
+// per-vertex transform) degrades to a no-op rotation when this is false, so this is a safe,
+// reversible way to A/B the whole rotation feature without touching any shader code.
+constexpr bool ENTITY_SELF_ROTATION_ENABLED = false;
+
 namespace nanite {
 // Lower threshold shifts more tiny triangles to the software rasterizer.
 constexpr float SOFTWARE_RASTER_THRESHOLD_PIXELS = 8.0f;
