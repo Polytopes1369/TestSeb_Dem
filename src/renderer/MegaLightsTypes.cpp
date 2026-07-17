@@ -1,5 +1,6 @@
 #include "renderer/MegaLightsTypes.h"
 
+#include <array>
 #include <cmath>
 #include <random>
 
@@ -8,15 +9,38 @@ namespace renderer {
     namespace {
 
         // Duplicated from VulkanContext::GridSlot() -- see this file's header comment on why (the
-        // one-directional renderer/VulkanContext boundary). Must be kept in sync if the demo's grid
-        // layout ever changes; kPlacementEntityCount mirrors VulkanContext::kEntityCount.
-        constexpr uint32_t kPlacementEntityCount = 13u;
-        constexpr float kGridSpacing = 3.0f;
+        // one-directional renderer/VulkanContext boundary). Must be kept in sync if the gallery
+        // layout ever changes; kPlacementEntityCount mirrors the 12 primitive zones only (indices
+        // 0..11 of VulkanContext::GridSlot's domain) -- the floor and the 2 static Lumen walls
+        // (VulkanContext::kEntityCount == 15) never receive MegaLights lights, see this file's own
+        // header comment.
+        constexpr uint32_t kPlacementEntityCount = 12u;
+        constexpr float kZonePitch = 4.0f;
+        constexpr float kPairOffset = 1.0f;
+
+        struct ZoneEntry { float col, row, pairOffset; };
+        constexpr std::array<ZoneEntry, kPlacementEntityCount> kLayout = {{
+            /* 0  Box (metal A, chrome)      */ {  1.0f, -1.0f, -kPairOffset },
+            /* 1  Cone (WPO/displacement)    */ {  0.0f, -1.0f,  0.0f },
+            /* 2  Icosphere (Nanite A)       */ { -1.0f, -1.0f, -kPairOffset },
+            /* 3  Plane (dielectric A)       */ { -1.0f,  0.0f, -kPairOffset },
+            /* 4  Sphere (glass/transparent) */ {  1.0f,  0.0f,  0.0f },
+            /* 5  Torus (translucent)        */ { -1.0f,  1.0f,  0.0f },
+            /* 6  Tube (emissive)            */ {  0.0f,  1.0f,  0.0f },
+            /* 7  Capsule (metal B, gold)    */ {  1.0f, -1.0f,  kPairOffset },
+            /* 8  Cylinder (MegaLights hero) */ {  1.0f,  1.0f,  0.0f },
+            /* 9  Pyramid (dielectric B)     */ { -1.0f,  0.0f,  kPairOffset },
+            /* 10 TorusKnot (Nanite B)       */ { -1.0f, -1.0f,  kPairOffset },
+            /* 11 ChamferBox (Lumen/GI hero) */ {  0.0f,  0.0f,  0.0f },
+        }};
+
+        // MegaLights showcase zone -- see this file's own header comment for why this one zone
+        // gets the large majority of the light budget.
+        constexpr uint32_t kMegaLightsZoneIndex = 8u;
 
         maths::vec3 EntityGridPosition(uint32_t entityIndex) {
-            int col = static_cast<int>(entityIndex) % 3;
-            int row = static_cast<int>(entityIndex) / 3;
-            return maths::vec3{ (col - 1) * kGridSpacing, 0.0f, (row - 1) * kGridSpacing };
+            const ZoneEntry& z = kLayout[entityIndex];
+            return maths::vec3{ z.col * kZonePitch + z.pairOffset, 0.0f, z.row * kZonePitch };
         }
 
         // Same HSV -> RGB formula as MaterialParameterTable.h's own local lambda (duplicated rather
@@ -45,12 +69,26 @@ namespace renderer {
         std::mt19937 rng(seed);
         std::uniform_real_distribution<float> unit(0.0f, 1.0f);
 
-        uint32_t baseCountPerEntity = kMaxMegaLights / kPlacementEntityCount;
-        uint32_t remainder = kMaxMegaLights % kPlacementEntityCount; // Distributed one-extra-each across the first `remainder` entities.
+        // MegaLights showcase zone (the Cylinder, slot 8) gets the large majority of the light
+        // budget so the feature reads as its own distinct, densely-lit area; the remaining 11
+        // primitive zones share a sparse accent count each -- enough for a specular highlight on
+        // the metal/glass zones without competing visually with the MegaLights zone itself.
+        constexpr uint32_t kMegaLightsZoneCount = 200u;
+        constexpr uint32_t kAccentEntityCount = kPlacementEntityCount - 1u; // Every zone except MegaLights.
+        uint32_t accentBudget = kMaxMegaLights - kMegaLightsZoneCount;
+        uint32_t baseCountPerEntity = accentBudget / kAccentEntityCount;
+        uint32_t remainder = accentBudget % kAccentEntityCount; // Distributed one-extra-each across the first `remainder` accent entities.
 
         uint32_t writeIndex = 0;
+        uint32_t accentEntitiesSeen = 0;
         for (uint32_t entityIndex = 0; entityIndex < kPlacementEntityCount; ++entityIndex) {
-            uint32_t countThisEntity = baseCountPerEntity + (entityIndex < remainder ? 1u : 0u);
+            uint32_t countThisEntity;
+            if (entityIndex == kMegaLightsZoneIndex) {
+                countThisEntity = kMegaLightsZoneCount;
+            } else {
+                countThisEntity = baseCountPerEntity + (accentEntitiesSeen < remainder ? 1u : 0u);
+                ++accentEntitiesSeen;
+            }
             maths::vec3 base = EntityGridPosition(entityIndex);
 
             for (uint32_t i = 0; i < countThisEntity && writeIndex < kMaxMegaLights; ++i) {
