@@ -72,7 +72,12 @@ namespace renderer {
 
         void Shutdown();
 
-        void RecordShade(VkCommandBuffer cmd, const maths::mat4& viewProj, uint32_t frameIndex);
+        // `cameraPositionWorld` (Substrate integration): feeds EvaluateSubstrateMaterial's specular/
+        // Fresnel view-direction term in MegaLightsShade.comp -- the pre-Substrate shader had no
+        // view-dependent term at all, so this is new; same value renderer::ClusterRenderPipeline
+        // already threads into ReflectionPass/TransparentForwardPass/ClusterResolvePass's own
+        // view-params UBOs.
+        void RecordShade(VkCommandBuffer cmd, const maths::mat4& viewProj, const maths::vec3& cameraPositionWorld, uint32_t frameIndex);
 
         // Exposes the light SSBO's raw handle/size so other passes needing the same light
         // population (e.g. renderer::TransparentForwardPass's own inline RIS shading, which has no

@@ -188,6 +188,12 @@ static void KeyCallback(GLFWwindow* window, int key, int scancode, int action, i
         g_DebugState.viewMode = DEBUG_VIEW_SHADOW_CASCADES;
         LOG_INFO("[Debug] View Mode: SHADOW CASCADES");
         break;
+    case GLFW_KEY_B:
+        // Substrate integration: 'B' for "suBstrate" -- same "plain letter key, every numpad slot
+        // already claimed" situation as 'M' above.
+        g_DebugState.viewMode = DEBUG_VIEW_SUBSTRATE_SLABS;
+        LOG_INFO("[Debug] View Mode: SUBSTRATE SLABS");
+        break;
     case GLFW_KEY_K:
         // See renderer::ClusterRenderPipeline::RequestDebugDAGCutGapsDump()'s own comment: this
         // one-shot dump walks every leaf's ancestor chain looking for DAG-cut regions with zero
