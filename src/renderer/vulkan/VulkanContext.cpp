@@ -803,6 +803,22 @@ void VulkanContext::CreateLogicalDevice() {
   // tracing / mesh shader requirements already supports it), so enabled unconditionally here,
   // matching geometryShader's/fragmentStoresAndAtomics' own enablement rigor above.
   deviceFeatures2.features.multiDrawIndirect = VK_TRUE;
+  // independentBlend (Phase PP3, post-process stack roadmap): renderer::TransparentForwardPass's
+  // own forward pipeline now has 2 color attachments with DIFFERENT blend states (color: alpha-
+  // blended "over" compositing; g_RefractionOffset: a plain overwrite, blendEnable=FALSE -- see
+  // that pass' own pipeline-creation comment) -- without this feature, the spec requires every
+  // element of VkPipelineColorBlendStateCreateInfo::pAttachments to be IDENTICAL
+  // (VUID-VkPipelineColorBlendStateCreateInfo-pAttachments-00605), which vkCreateGraphicsPipelines
+  // then rejects. A near-universally-supported core Vulkan 1.0 feature bit on desktop GPUs, so
+  // enabled unconditionally here, matching multiDrawIndirect's own enablement rigor above.
+  deviceFeatures2.features.independentBlend = VK_TRUE;
+  // tessellationShader (Phase 7a, UE5.8 parity roadmap): core Vulkan 1.0 feature bit, no device
+  // extension required -- gates VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT/_EVALUATION_BIT
+  // (renderer::HeroTessellationPass, the hero Icosphere's own screen-space-adaptive
+  // displacement-mapped pipeline). A near-universally-supported core feature on desktop GPUs
+  // (same rigor as geometryShader/fragmentStoresAndAtomics/multiDrawIndirect above), enabled
+  // unconditionally here.
+  deviceFeatures2.features.tessellationShader = VK_TRUE;
 
   VkDeviceCreateInfo createInfo{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
   createInfo.pNext = &deviceFeatures2;
@@ -1419,16 +1435,44 @@ void VulkanContext::BuildEntityData() {
     entity.cellID = 0u;
     entity.flags = 0u;
     core::SetFlag(entity.flags, core::EntityFlags::CastShadows, true);
-    core::SetFlag(entity.flags, core::EntityFlags::IsTransparent, m_MaterialTable.isTransparent[i]);
 
-    // Phase 1 (Nanite advanced): entity 2 (Icosphere) demos multi-octave enhanced procedural
-    // displacement, entity 6 (Tube) demos runtime Hermite-spline bending. Both need to stay opaque
-    // so the deformation is never obscured/complicated by alpha blending -- unlike the old
-    // GenerateRandomMaterialTable()-era code (which force-opaqued these plus kFloorEntityIndex),
-    // GenerateShowcaseMaterialTable() above is a fixed, hand-authored, deterministic table (see its
-    // own comment) that already curates slot 2 (Nanite A) and slot 6 (Emissive) with alpha == 1.0,
-    // so no runtime override is needed here anymore; this is intentionally NOT re-added as
-    // dead-weight defensive code.
+    bool isTransparent = m_MaterialTable.isTransparent[i];
+    // Phase 7a (UE5.8 parity roadmap, hero asset tessellation): the Icosphere (kHeroEntityIndex)
+    // is the single tessellated/displaced hero asset, rendered ONLY by
+    // renderer::HeroTessellationPass -- never by the opaque Nanite VisBuffer pipeline (no
+    // representation for runtime-displaced geometry there) nor by TransparentForwardPass.
+    // Overrides its materialID to the reserved renderer::kHeroMaterialID slot (see that
+    // constant's own comment) and forces its entity IsTransparent flag true -- NOT because it's
+    // actually alpha-blended (kHeroMaterialID's own alpha is 1.0, fully opaque), but because
+    // ClusterLODCompact.comp's existing per-entity IsTransparent exclusion (see that shader's own
+    // EntityDataBuffer comment) is the exact "never enters the opaque candidate list" mechanism
+    // this entity also needs. TransparentForwardPass itself stays unaffected: it filters by
+    // materialTable.isTransparent[materialID], which correctly stays false for kHeroMaterialID
+    // (GenerateShowcaseMaterialTable() never sets it true -- see that function's own hero-recipe
+    // comment), so the hero entity's clusters never enter ITS candidate list either.
+    if (i == kHeroEntityIndex) {
+      entity.materialID = renderer::kHeroMaterialID;
+      isTransparent = true;
+    }
+    core::SetFlag(entity.flags, core::EntityFlags::IsTransparent, isTransparent);
+
+    // Phase 1 (Nanite advanced): entity 6 (Tube) demos runtime Hermite-spline bending, always
+    // opaque (GenerateShowcaseMaterialTable() already curates slot 6 with alpha == 1.0, see that
+    // function's own comment) and unaffected by the hero-tessellation override above (kHeroEntityIndex
+    // == 2, not 6), so it stays on the normal Nanite VisBuffer/ClusterResolve path where
+    // ApplySplineDeformation() runs.
+    //
+    // KNOWN COLLISION (flagged, not silently resolved): entity 2's flag below (HasEnhancedDisplacement,
+    // this branch's Phase 1 "enhanced procedural displacement" demo, originally authored on the
+    // Icosphere) is set here for data-fidelity / documentation purposes, but is now EFFECTIVELY INERT
+    // post-merge -- kHeroEntityIndex == 2 means entity 2's clusters never reach ClusterRaster.vert /
+    // cluster_software_raster_core.glsl / ClusterResolve.comp / ClusterResolveBinned.comp /
+    // TransparentForward.vert any more (see HeroTessellationPass.h's own class comment: "this
+    // entity's clusters never reach any opaque raster list"), so ApplyEnhancedDisplacement() is never
+    // invoked for it. The two Phase 1/Phase 7a features picked the same flagship entity independently
+    // under concurrent development; reconciling which one keeps entity 2 (or moving enhanced
+    // displacement to a different opaque entity) is a product decision left to the user, not made
+    // unilaterally by this merge.
     if (i == 2u) {
       core::SetFlag(entity.flags, core::EntityFlags::HasEnhancedDisplacement, true);
     }

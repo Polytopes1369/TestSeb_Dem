@@ -26,6 +26,7 @@
 #include "include/spline_deformation.glsl"
 #include "include/displacement_bounds.glsl"
 #include "include/material_params.glsl"
+#include "include/substrate_bsdf.glsl"
 #include "include/shading_bin_common.glsl"
 
 #define MASK_ARRAY_SET 0
@@ -104,6 +105,10 @@ layout(std140, set = 0, binding = 6) uniform ResolveViewParamsUBO {
     // Phase 3: sun direction -- see ClusterResolve.comp's own identical field comment.
     vec3 sunDirection;
     float _pad2;
+    // Substrate integration: the view direction Substrate's specular/Fresnel terms need -- see
+    // ClusterResolve.comp's own identical ResolveViewParamsUBO.cameraPositionWorld comment.
+    vec3 cameraPositionWorld;
+    float _pad3;
 } g_ViewParams;
 
 // binding 7 == g_MaskTextures[], declared by mask_sampling.glsl.
@@ -135,9 +140,17 @@ layout(std430, set = 0, binding = 19) readonly buffer EntityDataBuffer {
     EntityData entityData[];
 };
 
-// Phase 1 (Nanite advanced): binding 24 -- the first free slot past this shader's full 0-23
-// range. See ClusterRaster.vert's identical binding comment.
-layout(std430, set = 0, binding = 24) readonly buffer SplineControlPointsSSBO {
+// Substrate integration: this pixel's materialID (pc.binIndex, already a valid materialSlot by
+// construction -- see this shader's own Step 3 comment below) -- same GBuffer channel
+// ClusterResolve.comp's own binding 25 writes, letting ReflectionGather.comp/MegaLightsShade.comp
+// (Phase S3) re-fetch the FULL Slab data straight from g_MaterialParams. Next free binding number
+// in this file's set (0-23 already used, see this file's own header comment on VT bindings 20-23).
+layout(r16ui, set = 0, binding = 24) uniform writeonly uimage2D g_OutputMaterialID;
+
+// Phase 1 (Nanite advanced): binding 25 -- the first free slot past this shader's full 0-24
+// range (0-23 original + 24 Substrate's g_OutputMaterialID). See ClusterRaster.vert's identical
+// binding comment.
+layout(std430, set = 0, binding = 25) readonly buffer SplineControlPointsSSBO {
     SplineControlPoint splineControlPoints[SPLINE_CONTROL_POINT_COUNT];
 };
 
@@ -265,9 +278,11 @@ void main() {
     float diff = max(dot(normal, lightDir), 0.0);
     // Phase 3: shadow visibility -- see ClusterResolve.comp's own identical comment.
     float sunVisibility = (diff > 0.0) ? SampleSunShadowVSM(worldPos) : 1.0;
+    // Substrate integration: the view direction EvaluateSubstrateMaterial's specular/Fresnel
+    // terms need -- see this file's own ResolveViewParamsUBO.cameraPositionWorld comment.
+    vec3 viewDir = normalize(g_ViewParams.cameraPositionWorld - worldPos);
 
     MaterialParams mat = g_MaterialParams.params[pc.binIndex];
-    vec3 albedo = mat.baseColor;
 
     // Step 4: Runtime Virtual Texture detail multiply -- see ClusterResolve.comp's own identical
     // comment for the full rationale (safe no-op multiply until real tile content exists).
@@ -287,12 +302,14 @@ void main() {
     float vtLod = log2(max(perspNorm, 0.01) / kVTReferenceDistance);
     vec2 vtUV = (worldPos.xz - g_VTVolume.worldMinXZ) / (g_VTVolume.worldMaxXZ - g_VTVolume.worldMinXZ);
     vec3 vtAlbedo = SampleVirtualTextureLOD(0u, vtUV, vtLod, g_VTVolume.virtualTextureSize, g_VTVolume.tileSize, g_VTVolume.borderSize).rgb;
-    albedo *= vtAlbedo;
-    // Metallic workflow energy conservation (Phase 2) -- see ClusterResolve.comp's identical fix
-    // for the full rationale (a pure metal has zero diffuse response; without this, metals would
-    // double-count energy against ReflectionGather.comp's specular RMW).
-    vec3 diffuseAlbedo = albedo * (1.0 - mat.metallic);
-    vec3 finalColor = diffuseAlbedo * 0.15 + diffuseAlbedo * diff * sunVisibility + mat.emissive;
+    mat.base.diffuseAlbedo *= vtAlbedo;
+
+    // Substrate: full Slab BSDF response to the sun's direction, shadowed by sunVisibility -- see
+    // ClusterResolve.comp's own identical Step 3 comment for the full rationale. The flat 0.15
+    // ambient/fill term stays a plain albedo tint, matching ClusterResolve.comp's own
+    // simplification (no single light direction for a BRDF to respond to).
+    vec3 directResponse = EvaluateSubstrateMaterial(mat, normal, viewDir, lightDir);
+    vec3 finalColor = mat.base.diffuseAlbedo * 0.15 + directResponse * sunVisibility + EvaluateSubstrateEmissive(mat);
 
     // Opacity-mask soft edge feathering -- see ClusterResolve.comp's own comment.
     if (cluster.maskTextureIndex != 0xFFFFFFFFu) {
@@ -303,7 +320,11 @@ void main() {
 
     imageStore(g_OutputNormal, pixel, vec4(OctEncode(normal), 0.0, 0.0));
     imageStore(g_OutputDepth, pixel, vec4(entry.winningDepth, 0.0, 0.0, 0.0));
-    imageStore(g_OutputAlbedo, pixel, vec4(albedo, 1.0));
-    imageStore(g_OutputRoughnessMetallic, pixel, vec4(mat.roughness, mat.metallic, 0.0, 0.0));
+    imageStore(g_OutputAlbedo, pixel, vec4(mat.base.diffuseAlbedo, 1.0));
+    // G channel: F0 luminance -- see ClusterResolve.comp's own identical gbufferRoughnessMetallic comment.
+    imageStore(g_OutputRoughnessMetallic, pixel, vec4(mat.base.roughness, dot(mat.base.f0, vec3(0.2126, 0.7152, 0.0722)), 0.0, 0.0));
+    // pc.binIndex is already a valid materialSlot by construction (see this shader's own header
+    // comment) -- no clamp needed, unlike ClusterResolve.comp's per-pixel cluster.materialID lookup.
+    imageStore(g_OutputMaterialID, pixel, uvec4(pc.binIndex, 0u, 0u, 0u));
     imageStore(g_OutputColor, pixel, vec4(finalColor, 1.0));
 }

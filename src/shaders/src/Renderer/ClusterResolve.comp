@@ -55,6 +55,7 @@
 #include "include/spline_deformation.glsl"
 #include "include/displacement_bounds.glsl"
 #include "include/material_params.glsl"
+#include "include/substrate_bsdf.glsl"
 #include "include/visbuffer_arbitration.glsl"
 
 #define MASK_ARRAY_SET 0
@@ -130,6 +131,12 @@ layout(std140, set = 0, binding = 7) uniform ResolveViewParamsUBO {
     // misaligned the lit/unlit transition against the shadow itself).
     vec3 sunDirection;
     float _pad2;
+    // Substrate integration: the view direction Substrate's specular/Fresnel terms need (mirrors
+    // ReflectionViewParamsUBO's/TransparentViewParamsUBO's own cameraPositionWorld field -- see
+    // reflection_view_params.glsl) -- not previously threaded into this shader, since the
+    // pre-Substrate shading here was pure Lambertian (no view-dependent term at all).
+    vec3 cameraPositionWorld;
+    float _pad3;
 } g_ViewParams;
 
 // Minimal GBuffer (renderer::ClusterResolvePass -- see its own class comment): written alongside
@@ -151,16 +158,22 @@ layout(std140, set = 0, binding = 12) uniform WPOGlobalsUBO {
     float _pad2;
 } g_WPOGlobals;
 
-// renderer::GenerateRandomMaterialTable()'s result (renderer/MaterialParameterTable.h), filled
+// renderer::GenerateShowcaseMaterialTable()'s result (renderer/MaterialParameterTable.h), filled
 // once at renderer::ClusterResolvePass::Init() -- see material_params.glsl's own comment.
 layout(std430, set = 0, binding = 13) readonly buffer MaterialParamsSSBO {
     MaterialParams params[];
 } g_MaterialParams;
 
-// R=roughness, G=metallic (renderer::ClusterResolvePass's own comment on why this is a separate
-// image from g_OutputAlbedo rather than reusing that image's unused alpha channel). This is the
-// channel a future Lumen-style reflection pass reads.
+// R=roughness, G=F0 luminance (renderer::ClusterResolvePass's own comment on why this is a separate
+// image from g_OutputAlbedo rather than reusing that image's unused alpha channel). Read by
+// ReflectionTrace.comp's VNDF importance sampling (R only).
 layout(rg8, set = 0, binding = 14) uniform writeonly image2D g_OutputRoughnessMetallic;
+
+// Substrate integration: this pixel's clamped materialID (0xFFFF sentinel = background/no
+// geometry), letting ReflectionGather.comp/MegaLightsShade.comp (Phase S3) re-fetch the FULL Slab
+// data straight from g_MaterialParams instead of this codebase growing the GBuffer with a field per
+// Substrate parameter -- see the Substrate integration plan's own S2 rationale.
+layout(r16ui, set = 0, binding = 25) uniform writeonly uimage2D g_OutputMaterialID;
 
 // Per-entity self-rotation (dynamic primitive spin, added independently of the Phase 3 shadow
 // bindings above) -- appended at 19/20 rather than renumbering the already-wired
@@ -173,9 +186,10 @@ layout(std430, set = 0, binding = 20) readonly buffer EntityDataBuffer {
     EntityData entityData[];
 };
 
-// Phase 1 (Nanite advanced): binding 25 -- the first free slot past this shader's full 0-24
-// range (see ClusterRaster.vert's identical binding comment for the buffer's own contents/upload).
-layout(std430, set = 0, binding = 25) readonly buffer SplineControlPointsSSBO {
+// Phase 1 (Nanite advanced): binding 26 -- the first free slot past this shader's full 0-25
+// range (0-24 original + 25 Substrate's g_OutputMaterialID above) -- see ClusterRaster.vert's
+// identical binding comment for the buffer's own contents/upload.
+layout(std430, set = 0, binding = 26) readonly buffer SplineControlPointsSSBO {
     SplineControlPoint splineControlPoints[SPLINE_CONTROL_POINT_COUNT];
 };
 
@@ -257,6 +271,10 @@ void main() {
     vec3 gbufferNormal = vec3(0.0, 1.0, 0.0);
     vec3 gbufferAlbedo = vec3(0.0);
     vec2 gbufferRoughnessMetallic = vec2(0.0, 0.0);
+    // Substrate integration: sentinel materialID for a background pixel -- lets ReflectionGather.comp
+    // / MegaLightsShade.comp (Phase S3) tell "no material here" apart from a real slot 0 lookup
+    // without a second depth check duplicated in every consumer.
+    uint gbufferMaterialID = 0xFFFFu;
 
     if (hasAnyData) {
         // --- Step 2: re-fetch the winning triangle's 3 vertices and reconstruct barycentrics ---
@@ -378,6 +396,9 @@ void main() {
         // 3-level clipmap -- only the direct `diff` term is shadowed, not the ambient/fill term
         // below (a flat 0.15 ambient approximation has no directional occluder to speak of).
         float sunVisibility = (diff > 0.0) ? SampleSunShadowVSM(worldPos) : 1.0;
+        // Substrate integration: the view direction EvaluateSubstrateMaterial's specular/Fresnel
+        // terms need -- see this file's own ResolveViewParamsUBO.cameraPositionWorld comment.
+        vec3 viewDir = normalize(g_ViewParams.cameraPositionWorld - worldPos);
 
         // Hash by cluster.clusterID (the DAG's own dense, per-file-unique numbering, assigned once
         // at cache-build time -- see geometry::ClusterIndexEntry::clusterID), NOT clusterSlotIndex:
@@ -392,12 +413,12 @@ void main() {
         uint hashed = HashID(cluster.clusterID);
         float hue = float(hashed) / 4294967295.0;
 
-        // Real PBR material lookup (see this file's Step 3 class comment) -- clamped against
+        // Real Substrate material lookup (see this file's Step 3 class comment) -- clamped against
         // MATERIAL_TABLE_SIZE (material_params.glsl) so an out-of-range materialID safely falls
         // back to the table's last slot instead of indexing past g_MaterialParams' real allocation.
         uint materialSlot = min(cluster.materialID, MATERIAL_TABLE_SIZE - 1u);
         MaterialParams mat = g_MaterialParams.params[materialSlot];
-        vec3 albedo = mat.baseColor;
+        gbufferMaterialID = materialSlot;
 
         // Step 4: Runtime Virtual Texture detail multiply -- worldPos.xz mapped into the VT volume's
         // [0,1]^2 UV space, sampled through the page table (miss-detection + coarse-mip fallback
@@ -421,21 +442,29 @@ void main() {
         float vtLod = log2(max(perspNorm, 0.01) / kVTReferenceDistance);
         vec2 vtUV = (worldPos.xz - g_VTVolume.worldMinXZ) / (g_VTVolume.worldMaxXZ - g_VTVolume.worldMinXZ);
         vec3 vtAlbedo = SampleVirtualTextureLOD(0u, vtUV, vtLod, g_VTVolume.virtualTextureSize, g_VTVolume.tileSize, g_VTVolume.borderSize).rgb;
-        albedo *= vtAlbedo;
-        // Metallic workflow energy conservation (Phase 2): a pure metal has zero diffuse response
-        // -- all incident light either reflects specularly or is absorbed, none scatters diffusely.
-        // Without this, a metallic surface would show BOTH a full Lambertian response here AND a
-        // full GGX specular response from ReflectionGather.comp's own RMW, double-counting energy.
-        vec3 diffuseAlbedo = albedo * (1.0 - mat.metallic);
-        finalColor = diffuseAlbedo * 0.15 + diffuseAlbedo * diff * sunVisibility + mat.emissive;
+        mat.base.diffuseAlbedo *= vtAlbedo;
+
+        // Substrate: full Slab BSDF response (diffuse + anisotropic specular + second lobe/Haze +
+        // fuzz, vertically layered with the Top slab if any -- see substrate_bsdf.glsl's own
+        // EvaluateSubstrateMaterial comment) to the sun's direction, shadowed by sunVisibility. The
+        // flat 0.15 ambient/fill term (unchanged from the pre-Substrate shader) stays a plain
+        // albedo tint -- it has no single light direction for a BRDF to respond to, exactly like the
+        // pre-Substrate code's own identical simplification.
+        vec3 directResponse = EvaluateSubstrateMaterial(mat, normal, viewDir, lightDir);
+        finalColor = mat.base.diffuseAlbedo * 0.15 + directResponse * sunVisibility + EvaluateSubstrateEmissive(mat);
 
         // GBuffer capture (renderer::ClusterResolvePass's new outputs -- see this file's own
         // binding comment): the same winning (hw-vs-sw arbitrated) depth already used to pick
         // clusterSlotIndex/triangleOrdinal above, plus the reconstructed normal/albedo/material.
         gbufferDepth = hwWins ? hwDepth : swDepth;
         gbufferNormal = normal;
-        gbufferAlbedo = albedo;
-        gbufferRoughnessMetallic = vec2(mat.roughness, mat.metallic);
+        gbufferAlbedo = mat.base.diffuseAlbedo;
+        // G channel: F0 luminance (generalizes the old plain "metallic" scalar -- a metal's F0 IS
+        // its albedo so this reads high for metals and ~0.04 for dielectrics, same shape the old
+        // channel had) -- kept only for ReflectionTrace.comp's roughness read (R channel) and any
+        // future debug consumer; Phase S3's Substrate-aware passes read the real Slab data straight
+        // from g_MaterialParams via gbufferMaterialID instead of this approximation.
+        gbufferRoughnessMetallic = vec2(mat.base.roughness, dot(mat.base.f0, vec3(0.2126, 0.7152, 0.0722)));
 
         // Opacity-mask soft edge feathering: the hard cutout already happened upstream
         // (ClusterRaster.frag's discard / ClusterSoftwareRaster.comp's skipped atomic write), so
@@ -561,6 +590,22 @@ void main() {
                 finalColor = kLevelColors[level] * (dbgResident ? 1.0 : 0.35);
                 break;
             }
+        } else if (pc.viewMode == 16) { // DEBUG_VIEW_SUBSTRATE_SLABS
+            // Color-codes this pixel's Top slab (Substrate vertical layering): grey = no top slab
+            // (mat.topWeight == 0.0, the common case), blue-tinted = Clear Coat (top.f0 clamped to
+            // the dielectric ~0.04 baseline, no fuzz), orange-tinted = Fuzz/Cloth (top.fuzzAmount >
+            // 0.0) -- brightness scaled by topWeight (coverage) so a barely-there coat reads dim and
+            // a heavy coat reads bright. Distinguishes the two ONLY by fuzzAmount since both
+            // categories GenerateShowcaseMaterialTable emits share the same dielectric top.f0 (see
+            // that function's own Clear Coat / Fuzz branches) -- fuzzAmount is the one field that
+            // actually differs between them.
+            if (mat.topWeight <= 0.0) {
+                finalColor = vec3(0.4, 0.4, 0.4);
+            } else if (mat.top.fuzzAmount > 0.0) {
+                finalColor = vec3(0.9, 0.55, 0.1) * mat.topWeight;
+            } else {
+                finalColor = vec3(0.15, 0.45, 0.95) * mat.topWeight;
+            }
         } else if (pc.viewMode != 0 && pc.viewMode != 9 && pc.viewMode != 13) {
             // Placeholders (Global SDF / Lumen visualizations not implemented by this shader).
             finalColor = vec3(1.0, 0.0, 1.0);
@@ -577,8 +622,8 @@ void main() {
         } else if (pc.viewMode == 15) {
             // DEBUG_VIEW_SHADOW_CASCADES: no world position exists for a background pixel -- leave
             // finalColor at the plain background color, matching MOTION_VECTORS/SPATIAL_PROBES above.
-        } else if (pc.viewMode == 3 || pc.viewMode == 4 || pc.viewMode == 5 || pc.viewMode == 6 || pc.viewMode == 7) {
-            // NANITE_INSTANCES/PRIMITIVES/SHADING_BINS/RASTER_BINS/WPO: all per-cluster
+        } else if (pc.viewMode == 3 || pc.viewMode == 4 || pc.viewMode == 5 || pc.viewMode == 6 || pc.viewMode == 7 || pc.viewMode == 16) {
+            // NANITE_INSTANCES/PRIMITIVES/SHADING_BINS/RASTER_BINS/WPO/SUBSTRATE_SLABS: all per-cluster
             // visualizations with nothing meaningful to show on a no-geometry pixel -- leave
             // finalColor at the plain background color, matching NANITE_TRIANGLES/CLUSTERS above.
         } else if (pc.viewMode != 0 && pc.viewMode != 1 && pc.viewMode != 2 && pc.viewMode != 8 && pc.viewMode != 11) {
@@ -592,6 +637,7 @@ void main() {
     imageStore(g_OutputDepth, pixel, vec4(gbufferDepth, 0.0, 0.0, 0.0));
     imageStore(g_OutputAlbedo, pixel, vec4(gbufferAlbedo, 1.0));
     imageStore(g_OutputRoughnessMetallic, pixel, vec4(gbufferRoughnessMetallic, 0.0, 0.0));
+    imageStore(g_OutputMaterialID, pixel, uvec4(gbufferMaterialID, 0u, 0u, 0u));
 
 #ifdef _DEBUG
     ivec2 uiPixel = pixel / 2;
@@ -631,6 +677,8 @@ void main() {
         chars[0]=83; chars[1]=80; chars[2]=65; chars[3]=84; chars[4]=73; chars[5]=65; chars[6]=76; chars[7]=32; chars[8]=80; chars[9]=82; chars[10]=79; chars[11]=66; chars[12]=69; chars[13]=83; len=14;
     } else if (pc.viewMode == 15) { // "SHADOW CASCADES"
         chars[0]=83; chars[1]=72; chars[2]=65; chars[3]=68; chars[4]=79; chars[5]=87; chars[6]=32; chars[7]=67; chars[8]=65; chars[9]=83; chars[10]=67; chars[11]=65; chars[12]=68; chars[13]=69; chars[14]=83; len=15;
+    } else if (pc.viewMode == 16) { // "SUBSTRATE SLABS"
+        chars[0]=83; chars[1]=85; chars[2]=66; chars[3]=83; chars[4]=84; chars[5]=82; chars[6]=65; chars[7]=84; chars[8]=69; chars[9]=32; chars[10]=83; chars[11]=76; chars[12]=65; chars[13]=66; chars[14]=83; len=15;
     }
 
     if (len > 0) {

@@ -60,15 +60,18 @@ namespace renderer {
         // reads); `hwClusterIDView`/`hwTriangleIDView`/`hwDepthView`/`swVisBufferAtomicView` are
         // this frame's VisBuffer/depth sources (same 4 views ClusterResolvePass::Init() takes, same
         // imageLayout contract -- see that class's own Init() doc comment); `outputColorView`/
-        // `outputNormalView`/`outputDepthView`/`outputAlbedoView`/`outputRoughnessMetallicView` are
-        // renderer::ClusterResolvePass's own 5 output images (borrowed) -- stage A (Classify)
-        // writes background pixels directly into them, so this class needs write access to the
-        // exact same images ClusterResolvePass owns, not copies.
+        // `outputNormalView`/`outputDepthView`/`outputAlbedoView`/`outputRoughnessMetallicView`/
+        // `outputMaterialIDView` are renderer::ClusterResolvePass's own 6 output images (borrowed)
+        // -- stage A (Classify) writes background pixels directly into them, so this class needs
+        // write access to the exact same images ClusterResolvePass owns, not copies.
+        // `outputMaterialIDView` (Substrate integration): background pixels get the same 0xFFFF
+        // sentinel ClusterResolve.comp's own background branch writes.
         void Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
             VkExtent2D renderExtent, VkBuffer clusterMetadataBuffer,
             VkImageView hwClusterIDView, VkImageView hwTriangleIDView, VkImageView hwDepthView,
             VkImageView swVisBufferAtomicView, VkImageView outputColorView, VkImageView outputNormalView,
-            VkImageView outputDepthView, VkImageView outputAlbedoView, VkImageView outputRoughnessMetallicView);
+            VkImageView outputDepthView, VkImageView outputAlbedoView, VkImageView outputRoughnessMetallicView,
+            VkImageView outputMaterialIDView);
 
         void Shutdown();
 

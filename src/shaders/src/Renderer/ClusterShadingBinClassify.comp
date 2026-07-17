@@ -42,6 +42,10 @@ layout(rg16f, set = 0, binding = 9) uniform writeonly image2D g_OutputNormal;
 layout(r32f, set = 0, binding = 10) uniform writeonly image2D g_OutputDepth;
 layout(rgba8, set = 0, binding = 11) uniform writeonly image2D g_OutputAlbedo;
 layout(rg8, set = 0, binding = 12) uniform writeonly image2D g_OutputRoughnessMetallic;
+// Substrate integration: this pixel's materialID GBuffer channel -- see ClusterResolve.comp's own
+// identical binding comment. Background pixels get the same 0xFFFF sentinel that shader's own
+// background branch writes.
+layout(r16ui, set = 0, binding = 13) uniform writeonly uimage2D g_OutputMaterialID;
 
 layout(push_constant) uniform ViewportSizePC {
     uvec2 viewportSize;
@@ -67,6 +71,7 @@ void main() {
         imageStore(g_OutputDepth, pixel, vec4(0.0, 0.0, 0.0, 0.0));
         imageStore(g_OutputAlbedo, pixel, vec4(0.0, 0.0, 0.0, 1.0));
         imageStore(g_OutputRoughnessMetallic, pixel, vec4(0.0, 0.0, 0.0, 0.0));
+        imageStore(g_OutputMaterialID, pixel, uvec4(0xFFFFu, 0u, 0u, 0u));
 
         g_PixelScratch.entries[pixelLinearIndex].materialSlot = SHADING_BIN_BACKGROUND_SENTINEL;
         g_PixelScratch.entries[pixelLinearIndex].packedVisID = 0u;

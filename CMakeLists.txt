@@ -304,6 +304,8 @@ if(Vulkan_GLSLC_EXECUTABLE)
         "src/shaders/*.mesh"
         "src/shaders/*.frag"
         "src/shaders/*.vert"
+        "src/shaders/*.tesc"
+        "src/shaders/*.tese"
         "src/shaders/*.rgen"
         "src/shaders/*.rchit"
         "src/shaders/*.rmiss"
@@ -332,14 +334,17 @@ if(Vulkan_GLSLC_EXECUTABLE)
         # MegaLightsShade.comp -- Phase A of the MegaLights native-port roadmap's own inline-HWRT
         # shadow-visibility ray, see that shader's own TraceShadowRay comment; TransparentForward.frag
         # -- the same Phase A follow-up's inlined shadow-ray shading for the translucent/glass path,
-        # see that shader's own TraceShadowRay comment).
+        # see that shader's own TraceShadowRay comment; HeroTessellation.frag -- Phase 7a's own copy
+        # of the same inlined MegaLights shadow-ray + optional reflection trace, see that shader's
+        # own TraceShadowRay/TraceHWRT comments).
         # Every other shader stage keeps glslc's default target-env/target-spv untouched.
         get_filename_component(SHADER_EXT ${SHADER_SRC} EXT)
         set(GLSLC_EXTRA_FLAGS "")
         if(SHADER_EXT STREQUAL ".rgen" OR SHADER_EXT STREQUAL ".rchit" OR SHADER_EXT STREQUAL ".rmiss"
                 OR SHADER_NAME STREQUAL "SurfaceCacheGIInject.comp" OR SHADER_NAME STREQUAL "ScreenProbeTrace.comp"
                 OR SHADER_NAME STREQUAL "WorldProbeInject.comp" OR SHADER_NAME STREQUAL "ReflectionTrace.comp"
-                OR SHADER_NAME STREQUAL "MegaLightsShade.comp" OR SHADER_NAME STREQUAL "TransparentForward.frag")
+                OR SHADER_NAME STREQUAL "MegaLightsShade.comp" OR SHADER_NAME STREQUAL "TransparentForward.frag"
+                OR SHADER_NAME STREQUAL "HeroTessellation.frag")
             set(GLSLC_EXTRA_FLAGS --target-env=vulkan1.3 --target-spv=spv1.4)
         endif()
 

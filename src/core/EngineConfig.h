@@ -210,6 +210,32 @@ inline float CHROMATIC_ABERRATION_INTENSITY = 0.0015f;
 inline float VIGNETTE_INTENSITY = 0.35f;
 inline float VIGNETTE_SMOOTHNESS = 0.55f;
 inline float VIGNETTE_COLOR_BLEED = 0.4f;
+
+// --- Phase PP3 (post-process stack roadmap): Depth of Field / Motion Blur / Screen Space-
+// Volumetric Height Fog / Heat Distortion & Refraction. Same convention as PP1/PP2 above:
+// artistic, not hardware-tiered, so not wired into ApplyProfile().
+
+// Depth of Field (physically-derived Circle of Confusion -- see DepthOfField.comp's own comment;
+// EXPOSURE_APERTURE above doubles as this effect's own f-stop, matching a real physical camera).
+inline float DOF_FOCAL_LENGTH_MM = 50.0f;
+inline float DOF_FOCUS_DISTANCE_WORLD_UNITS = 10.0f;
+inline float DOF_MAX_COC_RADIUS_PIXELS = 24.0f;
+
+// Motion Blur (per-pixel velocity reconstructed from depth + view matrices, no stored velocity buffer)
+inline float MOTION_BLUR_INTENSITY = 0.5f;
+inline float MOTION_BLUR_MAX_VELOCITY_UV = 0.05f;
+
+// Screen Space / Volumetric Height Fog (UE5.8's own analytic "Exponential Height Fog")
+inline float FOG_COLOR_R = 0.55f, FOG_COLOR_G = 0.60f, FOG_COLOR_B = 0.68f;
+inline float FOG_DENSITY = 0.02f;
+inline float FOG_HEIGHT_FALLOFF = 0.15f;
+inline float FOG_HEIGHT_OFFSET = 0.0f;
+inline float FOG_START_DISTANCE = 5.0f;
+inline float FOG_MAX_OPACITY = 0.85f;
+
+// Heat Distortion & Refraction (global scale on renderer::TransparentForwardPass's own per-
+// material g_RefractionOffset -- see MaterialParameters::heatDistortion's own comment).
+inline float HEAT_DISTORTION_INTENSITY = 1.0f;
 } // namespace postprocess
 
 namespace volumetrics {

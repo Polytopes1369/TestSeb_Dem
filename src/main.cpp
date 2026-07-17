@@ -89,7 +89,13 @@ struct DebugState {
     bool taatsrEnabled = config::temporal::ENABLED_BY_DEFAULT;
     // Phase 1 (Nanite advanced): renderer::ClusterRenderPipeline::SetDebugEnhancedDisplacementEnabled
     // -- gates the multi-octave procedural noise displacement on entity 2 (Icosphere, see
-    // enhanced_displacement.glsl). Key 'B'.
+    // enhanced_displacement.glsl). Key 'J' -- moved off 'B' (this branch's original key) during the
+    // Substrate integration merge: 'B' was independently claimed there for the DEBUG_VIEW_SUBSTRATE_SLABS
+    // view-mode toggle (see that case's own comment), a genuine concurrent-development key collision,
+    // not a duplicate. NOTE: entity 2 is ALSO now VulkanContext::kHeroEntityIndex (Phase 7a hero
+    // tessellation), which routes it through HeroTessellationPass instead of the Nanite VisBuffer path
+    // this flag gates -- see VulkanContext::BuildEntityData()'s own "KNOWN COLLISION" comment. This key
+    // currently has no visible effect until that separate collision is resolved.
     bool enhancedDisplacementEnabled = true;
     // Phase 1 (Nanite advanced): renderer::ClusterRenderPipeline::SetDebugSplineDeformationEnabled
     // -- gates the runtime Hermite-spline bend on entity 6 (Tube, see spline_deformation.glsl).
@@ -183,9 +189,10 @@ static void KeyCallback(GLFWwindow* window, int key, int scancode, int action, i
         g_DebugState.reflectionsEnabled = !g_DebugState.reflectionsEnabled;
         LOG_INFO(std::format("[Debug] Specular Reflections: {}", g_DebugState.reflectionsEnabled ? "ON" : "OFF"));
         break;
-    case GLFW_KEY_B:
+    case GLFW_KEY_J:
         // Phase 1 (Nanite advanced): multi-octave enhanced procedural displacement on entity 2
-        // (Icosphere, see enhanced_displacement.glsl).
+        // (Icosphere, see enhanced_displacement.glsl). Moved off 'B' during the Substrate merge --
+        // see g_DebugState.enhancedDisplacementEnabled's own doc comment for why.
         g_DebugState.enhancedDisplacementEnabled = !g_DebugState.enhancedDisplacementEnabled;
         LOG_INFO(std::format("[Debug] Enhanced Displacement (Icosphere): {}", g_DebugState.enhancedDisplacementEnabled ? "ON" : "OFF"));
         break;
@@ -207,6 +214,12 @@ static void KeyCallback(GLFWwindow* window, int key, int scancode, int action, i
         // instead -- 'M' for shadow "Map" cascades.
         g_DebugState.viewMode = DEBUG_VIEW_SHADOW_CASCADES;
         LOG_INFO("[Debug] View Mode: SHADOW CASCADES");
+        break;
+    case GLFW_KEY_B:
+        // Substrate integration: 'B' for "suBstrate" -- same "plain letter key, every numpad slot
+        // already claimed" situation as 'M' above.
+        g_DebugState.viewMode = DEBUG_VIEW_SUBSTRATE_SLABS;
+        LOG_INFO("[Debug] View Mode: SUBSTRATE SLABS");
         break;
     case GLFW_KEY_K:
         // See renderer::ClusterRenderPipeline::RequestDebugDAGCutGapsDump()'s own comment: this
