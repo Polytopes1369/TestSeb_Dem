@@ -463,8 +463,10 @@ int main(int argc, char** argv) {
 #endif
 
     // Instantiate the camera at the same vantage point the old auto-orbit used to start from
-    // (distance 14, azimuth 0, elevation 28 around the origin) so the 7-primitive grid is framed
-    // identically on frame 0; from here on the player drives the camera directly (see the
+    // (distance 14, azimuth 0, elevation 28 around the origin). The feature-gallery base scene
+    // (VulkanContext::GridSlot's 9 zones, kZonePitch = 4) keeps roughly the same ~7-unit max
+    // radius from the origin as the old 12-primitive grid did, so this same framing still covers
+    // the whole gallery on frame 0; from here on the player drives the camera directly (see the
     // Unreal-editor-style fly controller in the main loop below).
     Camera camera({ 12.3613f, 6.5726f, 0.0f }, { 0.0f, 0.0f, 0.0f });
 

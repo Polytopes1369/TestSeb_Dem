@@ -37,14 +37,17 @@ namespace renderer {
         uint32_t count = 0;
     };
 
-    // Procedurally scatters `kMaxMegaLights` point lights clustered around the demo's 13-entity
-    // grid (VulkanContext::GridSlot/kEntityCount -- duplicated here as a small local constant/
-    // formula rather than including VulkanContext.h, matching this codebase's existing
-    // renderer/VulkanContext one-directional-boundary convention, e.g. core::EntityTransformCPU's
-    // own duplicated rotation math) instead of uniformly over the mostly-empty 300x300 floor, which
-    // would just read as random noise in open space rather than as scene lighting. Deterministic,
-    // fixed-seed (never std::random_device) -- matches GenerateRandomMaterialTable's own "a demo
-    // must look identical every playback" rationale.
+    // Procedurally scatters `kMaxMegaLights` point lights, the large majority concentrated on the
+    // dedicated "MegaLights" showcase zone (VulkanContext::GridSlot slot 8, the Cylinder) so
+    // MegaLights reads as its own distinct feature rather than a uniform ambient sprinkle across
+    // every zone -- the other 11 primitive zones (VulkanContext::GridSlot/kEntityCount --
+    // duplicated here as a small local lookup table rather than including VulkanContext.h,
+    // matching this codebase's existing renderer/VulkanContext one-directional-boundary
+    // convention, e.g. core::EntityTransformCPU's own duplicated rotation math) get only a sparse
+    // accent count each. The floor and the 2 static Lumen-corner walls intentionally get none --
+    // they're lit by the scene's own sun instead. Deterministic, fixed-seed (never
+    // std::random_device) -- matches GenerateShowcaseMaterialTable's own "a demo must look
+    // identical every playback" rationale.
     MegaLightsData GenerateProceduralLights(uint32_t seed);
 
 }
