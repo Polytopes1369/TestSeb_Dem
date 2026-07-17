@@ -61,6 +61,7 @@
 #include <vulkan/vulkan.h>
 #include <vk_mem_alloc.h>
 
+#include "core/EntityData.h" // core::EntityTransformCPU -- Phase 6's RecordCapture priority ordering.
 #include "core/maths/Maths.h"
 #include "core/EngineConfig.h"
 #include "geometry/CardGenerator.h" // geometry::kSurfaceCacheAtlasSize
@@ -180,7 +181,16 @@ namespace renderer {
         // fixed GENERAL layout contract (no caller-side transition needed, before or between
         // calls). Ends with a VkMemoryBarrier2 making every texel captured THIS call visible to a
         // later fragment/compute sampled read.
-        void RecordCapture(VkCommandBuffer cmd);
+        //
+        // Phase 6 (UE5.8 parity roadmap, adaptive/importance-sampled probes): `cameraPositionWorld`/
+        // `entityTransformsCPU` (the SAME per-frame data renderer::ClusterRenderPipeline::RecordFrame
+        // already has in scope for its own dynamic-entity loop, see that method's own parameters) are
+        // used ONLY when the dirty queue exceeds kCardsPerFrameBudget this call, to capture the
+        // closest/largest-on-screen cards first instead of strict FIFO order -- see
+        // ComputeCardPriority()'s own comment. `entityTransformsCPU` is indexed by entityID (== meshID),
+        // must have at least as many entries as the highest entityID any card references.
+        void RecordCapture(VkCommandBuffer cmd, const maths::vec3& cameraPositionWorld,
+            const core::EntityTransformCPU* entityTransformsCPU);
 
         uint32_t GetCardCount() const { return static_cast<uint32_t>(m_Cards.size()); }
         // NOTE: atlasOffset/uvMin/uvMax are now a DYNAMIC placement (see UpdateVisibility()), not
@@ -246,6 +256,22 @@ namespace renderer {
         // once every unwanted card is evicted and the atlas is fully repacked -- logged, not fatal
         // (see UpdateVisibility()'s class-comment note on graceful degradation).
         bool AllocateCardPage(uint32_t cardIndex, geometry::AtlasRect& outRect);
+
+        // Phase 6 (UE5.8 parity roadmap): a proxy for "how urgently this dirty card deserves
+        // re-capture before the others" -- entity-local bounding radius (a stand-in for on-screen
+        // size, since this codebase has no per-frame projected-size buffer to read) divided by
+        // distance from `cameraPositionWorld` to the card's CURRENT world-space center (rotated via
+        // `entityTransformsCPU[card.entityID]`, mirroring the exact TransformDirection() pattern
+        // renderer::SurfaceCacheRayTracingPass/GlobalSDFPass already use for this same operation --
+        // no new maths primitive needed). Higher = higher priority. Only the RELATIVE ORDER this
+        // produces matters (it feeds a sort key, not a physically exact angular size), so no
+        // FOV/aspect-ratio projection is needed. NOTE: SurfaceCacheCardEntry::localBoundsMin/Max is
+        // the owning ENTITY's full AABB, identical across all of that entity's cards (see that
+        // struct's own comment) -- every card of one entity therefore gets the exact same priority,
+        // which is expected (RecordCapture()'s std::stable_sort keeps their relative order
+        // deterministic) rather than a defect.
+        float ComputeCardPriority(uint32_t cardIndex, const maths::vec3& cameraPositionWorld,
+            const core::EntityTransformCPU* entityTransformsCPU) const;
 
         // Marks `cardIndex` resident at the given gutter-padded atlas rect, stamping the
         // corresponding unpadded atlasOffset/uvMin/uvMax into m_Cards[cardIndex] (the public,

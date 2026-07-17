@@ -150,7 +150,15 @@ inline uint32_t _REFRACTION_QUALITY = 3;
 inline float EXPOSURE_APERTURE = 4.0f;             // f-stop.
 inline float EXPOSURE_SHUTTER_SPEED_SECONDS = 1.0f / 60.0f;
 inline float EXPOSURE_ISO = 100.0f;
-inline bool EXPOSURE_USE_AUTO = true;               // false = Manual metering (instant, no eye-adaptation).
+// Manual (not Auto) for now: renderer::MegaLightsPass (Phase A) has no temporal reservoir reuse
+// yet (per-frame RIS re-samples a different light, spatially but not temporally denoised -- see
+// that class' own header comment, "Phase B" is the planned fix) -- Auto Exposure's histogram
+// directly measures that per-frame luminance noise and reacts to it every frame, amplifying an
+// otherwise-subtle spatial grain into a visible global brightness flicker. Manual metering (a
+// fixed EV100 snapped instantly every frame, see AutoExposureAdapt.comp's own Auto/Manual branch)
+// removes that reactive amplification entirely; MegaLights' own residual per-pixel grain is a
+// separate, much smaller-magnitude cosmetic issue tracked against the Phase B temporal-reuse work.
+inline bool EXPOSURE_USE_AUTO = false;
 inline float EXPOSURE_COMPENSATION_EV = 0.0f;
 inline float EXPOSURE_ADAPTATION_SPEED_UP_EV_PER_SEC = 3.0f;   // Scene darkened -> exposure rising.
 inline float EXPOSURE_ADAPTATION_SPEED_DOWN_EV_PER_SEC = 1.0f; // Scene brightened -> exposure falling.
@@ -170,6 +178,38 @@ inline float COLOR_CONTRAST = 1.0f;
 // this is load-bearing: the swapchain surface format is VK_FORMAT_B8G8R8A8_UNORM, not an _SRGB
 // format, so nothing else in the present path applies a display gamma encode).
 inline float DISPLAY_GAMMA = 2.2f;
+
+// --- Phase PP2 (post-process stack roadmap): Bloom / Lens Flare / Anamorphic Lens Flare / Lens
+// Dirt (all one dual-filter mip chain, see renderer::BloomPass's own class comment) / Chromatic
+// Aberration / Vignette + Vignette Color Bleed. Same convention as Phase PP1 above: artistic, not
+// hardware-tiered, so not wired into ApplyProfile().
+
+// Bloom
+inline float BLOOM_THRESHOLD = 1.0f;        // Bright-pass threshold, linear HDR luminance.
+inline float BLOOM_SOFT_KNEE = 0.5f;
+inline float BLOOM_INTENSITY = 1.0f;
+inline float BLOOM_UPSAMPLE_RADIUS = 1.0f;
+
+// Lens Flare (procedural radial ghosts, no texture asset)
+inline float LENS_FLARE_GHOST_INTENSITY = 0.3f;
+inline uint32_t LENS_FLARE_GHOST_COUNT = 4u;
+inline float LENS_FLARE_GHOST_SPACING = 1.0f;
+
+// Anamorphic Lens Flare (procedural horizontal streak, no texture asset)
+inline float ANAMORPHIC_FLARE_INTENSITY = 0.15f;
+inline float ANAMORPHIC_FLARE_STRETCH = 0.10f;
+
+// Lens Dirt (procedural value-noise mask, no texture asset)
+inline float LENS_DIRT_INTENSITY = 0.4f;
+inline float LENS_DIRT_SCALE = 6.0f;
+
+// Chromatic Aberration
+inline float CHROMATIC_ABERRATION_INTENSITY = 0.0015f;
+
+// Vignette + Vignette Color Bleed
+inline float VIGNETTE_INTENSITY = 0.35f;
+inline float VIGNETTE_SMOOTHNESS = 0.55f;
+inline float VIGNETTE_COLOR_BLEED = 0.4f;
 } // namespace postprocess
 
 namespace volumetrics {

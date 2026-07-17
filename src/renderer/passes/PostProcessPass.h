@@ -83,18 +83,33 @@ namespace renderer {
 
             // Gamma Correction (final display encode, see PostProcessComposite.comp's own comment)
             float displayGamma = 2.2f;
+
+            // Phase PP2: Bloom (renderer::BloomPass's own owned mip chain -- see that pass' own
+            // Settings for the threshold/ghost/anamorphic/dirt knobs that shape its content;
+            // `bloomIntensity` here only scales how much of it gets added into the scene color).
+            float bloomIntensity = 1.0f;
+
+            // Chromatic Aberration: UV-space max per-channel radial offset at the screen corner.
+            float chromaticAberrationIntensity = 0.0015f;
+
+            // Vignette + Vignette Color Bleed
+            float vignetteIntensity = 0.35f;
+            float vignetteSmoothness = 0.55f;
+            float vignetteColorBleed = 0.4f; // 0 = neutral gray falloff, 1 = strong chromatic falloff.
         };
 
+        // `bloomView` (renderer::BloomPass::GetOutputView(), its own upsample-chain mip 0) is
+        // sampled by PostProcessComposite.comp's g_Bloom binding -- Phase PP2.
         void Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
-            VkExtent2D displayExtent, VkImageView hdrColorView);
+            VkExtent2D displayExtent, VkImageView hdrColorView, VkImageView bloomView);
 
         void Shutdown();
 
-        // Recreates the descriptor bindings that reference `hdrColorView` -- called if
+        // Recreates the descriptor bindings that reference `hdrColorView`/`bloomView` -- called if
         // renderer::TAATSRPass's own output view identity ever changes (it currently doesn't
         // across a pass's lifetime, ping-ponging between two fixed views instead, but this mirrors
         // renderer::TAATSRPass::UpdateDescriptorSets' own convention for symmetry/future-proofing).
-        void UpdateDescriptorSets(VkImageView hdrColorView);
+        void UpdateDescriptorSets(VkImageView hdrColorView, VkImageView bloomView);
 
         // Records AutoExposureHistogram.comp -> AutoExposureAdapt.comp -> PostProcessComposite.comp,
         // with a VkMemoryBarrier2 between each (Histogram's global-atomic writes must land before
@@ -134,7 +149,15 @@ namespace renderer {
             float saturation = 1.0f;
             float contrast = 1.0f;
             float displayGamma = 2.2f;
-            float _pad3 = 0.0f;
+            float _pad3b = 0.0f;
+
+            float bloomIntensity = 1.0f;
+            float chromaticAberrationIntensity = 0.0015f;
+            float vignetteIntensity = 0.35f;
+            float vignetteSmoothness = 0.55f;
+
+            float vignetteColorBleed = 0.4f;
+            float _pad4 = 0.0f, _pad5 = 0.0f, _pad6 = 0.0f;
         };
 
         // Byte-for-byte mirror of AutoExposureAdapt.comp's push_constant block.

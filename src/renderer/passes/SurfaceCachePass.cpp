@@ -853,7 +853,35 @@ namespace renderer {
         }
     }
 
-    void SurfaceCachePass::RecordCapture(VkCommandBuffer cmd) {
+    float SurfaceCachePass::ComputeCardPriority(uint32_t cardIndex, const maths::vec3& cameraPositionWorld,
+        const core::EntityTransformCPU* entityTransformsCPU) const {
+        const geometry::SurfaceCacheCardEntry& card = m_Cards[cardIndex];
+        maths::vec3 boundsMin{ card.localBoundsMin[0], card.localBoundsMin[1], card.localBoundsMin[2] };
+        maths::vec3 boundsMax{ card.localBoundsMax[0], card.localBoundsMax[1], card.localBoundsMax[2] };
+        maths::vec3 restCenter = (boundsMin + boundsMax) * 0.5f;
+        float restRadius = (boundsMax - boundsMin).Length() * 0.5f;
+
+        const core::EntityTransformCPU& xform = entityTransformsCPU[card.entityID];
+        // Rotate restCenter's offset from the entity's own pivot (xform.center) by xform.rotation,
+        // then re-add the pivot -- same manual column-major (m[row + col*4]) application
+        // renderer::SurfaceCacheRayTracingPass::RecordRefreshTLAS's own instance-transform build
+        // already uses for this exact operation (no TransformDirection()-style helper exists on
+        // maths::mat4 in this codebase).
+        const maths::mat4& rot = xform.rotation;
+        maths::vec3 offset = restCenter - xform.center;
+        maths::vec3 rotatedOffset{
+            rot.m[0] * offset.x + rot.m[4] * offset.y + rot.m[8]  * offset.z,
+            rot.m[1] * offset.x + rot.m[5] * offset.y + rot.m[9]  * offset.z,
+            rot.m[2] * offset.x + rot.m[6] * offset.y + rot.m[10] * offset.z
+        };
+        maths::vec3 currentCenter = xform.center + rotatedOffset;
+        float distance = (currentCenter - cameraPositionWorld).Length();
+
+        return restRadius / std::max(distance, 0.01f);
+    }
+
+    void SurfaceCachePass::RecordCapture(VkCommandBuffer cmd, const maths::vec3& cameraPositionWorld,
+        const core::EntityTransformCPU* entityTransformsCPU) {
         // Phase 4 integration (UE5.8 parity roadmap, dynamic scenes onto main): while entities
         // rotate, every resident card's captured surface data goes stale every frame -- re-queue
         // all of them here, gated by the SAME kill-switch that drives the rotation itself (see
@@ -865,6 +893,30 @@ namespace renderer {
 
         if (m_DirtyCardQueue.empty()) {
             return;
+        }
+
+        // Phase 6 (UE5.8 parity roadmap): if more cards are dirty than this call's budget can
+        // capture, reorder the queue by priority (closest/largest-on-screen first) instead of
+        // draining strict FIFO order -- see ComputeCardPriority()'s own comment. Skipped entirely
+        // when everything dirty fits in this call's budget anyway (a free short-circuit: the drain
+        // loop below would capture the whole queue regardless of order in that case).
+        if (m_DirtyCardQueue.size() > kCardsPerFrameBudget) {
+            std::vector<std::pair<float, uint32_t>> scored;
+            scored.reserve(m_DirtyCardQueue.size());
+            for (uint32_t cardIndex : m_DirtyCardQueue) {
+                scored.emplace_back(ComputeCardPriority(cardIndex, cameraPositionWorld, entityTransformsCPU), cardIndex);
+            }
+            // stable_sort, not sort: every card of one entity shares the exact same priority score
+            // (see ComputeCardPriority()'s own comment) -- a deterministic tie-break (original queue
+            // order) is preferable to an unspecified one for otherwise-equal cards.
+            std::stable_sort(scored.begin(), scored.end(),
+                [](const std::pair<float, uint32_t>& a, const std::pair<float, uint32_t>& b) {
+                    return a.first > b.first;
+                });
+            m_DirtyCardQueue.clear();
+            for (const auto& [priority, cardIndex] : scored) {
+                m_DirtyCardQueue.push_back(cardIndex);
+            }
         }
 
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_Pipeline);

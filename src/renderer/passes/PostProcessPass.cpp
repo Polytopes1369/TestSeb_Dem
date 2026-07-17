@@ -30,7 +30,7 @@ namespace renderer {
     } // namespace
 
     void PostProcessPass::Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
-        VkExtent2D displayExtent, VkImageView hdrColorView) {
+        VkExtent2D displayExtent, VkImageView hdrColorView, VkImageView bloomView) {
         Shutdown();
         m_Device = device;
         m_Allocator = allocator;
@@ -77,9 +77,13 @@ namespace renderer {
             VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
 
+        // LINEAR, not NEAREST: Phase PP1's own g_HDRColor reads were all texelFetch (filter-mode-
+        // agnostic), but Phase PP2's Chromatic Aberration (fractional per-channel UV offsets) and
+        // Bloom (a half-res-and-smaller mip sampled back up) both need real bilinear filtering to
+        // look smooth instead of blocky -- see PostProcessComposite.comp's own texture() calls.
         VkSamplerCreateInfo samplerInfo{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
-        samplerInfo.magFilter = VK_FILTER_NEAREST;
-        samplerInfo.minFilter = VK_FILTER_NEAREST;
+        samplerInfo.magFilter = VK_FILTER_LINEAR;
+        samplerInfo.minFilter = VK_FILTER_LINEAR;
         samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
         samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
         samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
@@ -126,7 +130,7 @@ namespace renderer {
         // STORAGE_BUFFER count of 4: Histogram set uses 1 (HistogramSSBO), Adapt set uses 2
         // (HistogramSSBO + ExposureStateSSBO), Composite set uses 1 (ExposureStateSSBO read-only).
         std::array<VkDescriptorPoolSize, 4> poolSizes{ {
-            { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2 }, // Histogram + Composite HDR input.
+            { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3 }, // Histogram HDR input + Composite HDR input + Composite g_Bloom (PP2).
             { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1 },          // Composite output.
             { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4 },
             { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 },         // Composite params.
@@ -200,11 +204,12 @@ namespace renderer {
 
         // --- Stage 3: PostProcessComposite.comp ---
         {
-            std::array<VkDescriptorSetLayoutBinding, 4> bindings{ {
+            std::array<VkDescriptorSetLayoutBinding, 5> bindings{ {
                 { 0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // g_HDRColor
                 { 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },          // g_Output
                 { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },         // ExposureStateSSBO
                 { 3, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },         // PostProcessParamsUBO
+                { 4, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // g_Bloom (Phase PP2)
             } };
             VkDescriptorSetLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
             layoutInfo.bindingCount = static_cast<uint32_t>(bindings.size());
@@ -227,13 +232,14 @@ namespace renderer {
             vkDestroyShaderModule(m_Device, shader, nullptr);
         }
 
-        UpdateDescriptorSets(hdrColorView);
+        UpdateDescriptorSets(hdrColorView, bloomView);
 
-        LOG_INFO("[PostProcessPass] Initialized (Phase PP1: exposure/white-balance/color-correction/ACES/gamma).");
+        LOG_INFO("[PostProcessPass] Initialized (Phase PP1+PP2: exposure/white-balance/color-correction/ACES/gamma + bloom/chromatic-aberration/vignette).");
     }
 
-    void PostProcessPass::UpdateDescriptorSets(VkImageView hdrColorView) {
+    void PostProcessPass::UpdateDescriptorSets(VkImageView hdrColorView, VkImageView bloomView) {
         VkDescriptorImageInfo hdrInfo{ m_LinearSampler, hdrColorView, VK_IMAGE_LAYOUT_GENERAL };
+        VkDescriptorImageInfo bloomInfo{ m_LinearSampler, bloomView, VK_IMAGE_LAYOUT_GENERAL };
         VkDescriptorBufferInfo histogramInfo{ m_HistogramBuffer.Handle(), 0, m_HistogramBuffer.Size() };
         VkDescriptorBufferInfo exposureInfo{ m_ExposureStateBuffer.Handle(), 0, m_ExposureStateBuffer.Size() };
         VkDescriptorImageInfo outputInfo{ VK_NULL_HANDLE, m_OutputView, VK_IMAGE_LAYOUT_GENERAL };
@@ -251,11 +257,12 @@ namespace renderer {
         } };
         vkUpdateDescriptorSets(m_Device, static_cast<uint32_t>(adaptWrites.size()), adaptWrites.data(), 0, nullptr);
 
-        std::array<VkWriteDescriptorSet, 4> compositeWrites{ {
+        std::array<VkWriteDescriptorSet, 5> compositeWrites{ {
             { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_CompositeSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &hdrInfo, nullptr, nullptr },
             { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_CompositeSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &outputInfo, nullptr, nullptr },
             { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_CompositeSet, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &exposureInfo, nullptr },
             { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_CompositeSet, 3, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &paramsInfo, nullptr },
+            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_CompositeSet, 4, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &bloomInfo, nullptr, nullptr },
         } };
         vkUpdateDescriptorSets(m_Device, static_cast<uint32_t>(compositeWrites.size()), compositeWrites.data(), 0, nullptr);
     }
@@ -318,6 +325,11 @@ namespace renderer {
         params.saturation = settings.saturation;
         params.contrast = settings.contrast;
         params.displayGamma = settings.displayGamma;
+        params.bloomIntensity = settings.bloomIntensity;
+        params.chromaticAberrationIntensity = settings.chromaticAberrationIntensity;
+        params.vignetteIntensity = settings.vignetteIntensity;
+        params.vignetteSmoothness = settings.vignetteSmoothness;
+        params.vignetteColorBleed = settings.vignetteColorBleed;
         vkCmdUpdateBuffer(cmd, m_ParamsBuffer.Handle(), 0, sizeof(PostProcessParamsUBO), &params);
 
         VkMemoryBarrier2 uploadBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
