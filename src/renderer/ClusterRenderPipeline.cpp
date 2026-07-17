@@ -609,10 +609,11 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
 
   // Only apply camera jitter if TAA/TSR is enabled
   if (taatsrEnabled) {
-      // 16-frame Halton jitter sequence centered around 0 in pixel space [-0.5, 0.5]
-      maths::vec2 rawJitter = Halton23(m_FrameIndex % 16u);
+      // Halton jitter sequence centered around 0 in pixel space [-0.5, 0.5]
+      maths::vec2 rawJitter = Halton23(m_FrameIndex % config::temporal::JITTER_FRAME_COUNT);
       jitterX = rawJitter.x - 0.5f;
       jitterY = rawJitter.y - 0.5f;
+
 
       // Apply subpixel jitter to projection matrix (row 0, col 2 and row 1, col 2 in column-major)
       float deltaX = (jitterX * 2.0f) / static_cast<float>(m_RenderExtent.width);

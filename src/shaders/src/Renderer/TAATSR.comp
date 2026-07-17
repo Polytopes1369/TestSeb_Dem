@@ -17,6 +17,10 @@ layout(std140, set = 0, binding = 4) uniform TAATSRViewParamsUBO {
     vec2 jitterOffset;  // Subpixel jitter (jitterX, jitterY in pixels)
     uint frameIndex;
     uint resetHistory;
+    float blendAlpha;
+    float blendAlphaStatic;
+    float varianceClampFactor;
+    float _pad;
 } ubo;
 
 // Convert RGB to YCoCg space for better variance clamping
@@ -171,9 +175,9 @@ void main() {
     vec3 mean = m1 / 9.0;
     vec3 stdDev = sqrt(max(vec3(0.0), (m2 / 9.0) - (mean * mean)));
     
-    // Variance clipping scale: 1.5 gives a good balance of sharpness and ghosting prevention
-    vec3 varianceMin = mean - 1.5 * stdDev;
-    vec3 varianceMax = mean + 1.5 * stdDev;
+    // Variance clipping scale: dynamic factor from EngineConfig
+    vec3 varianceMin = mean - ubo.varianceClampFactor * stdDev;
+    vec3 varianceMax = mean + ubo.varianceClampFactor * stdDev;
     
     boxMin = max(boxMin, varianceMin);
     boxMax = min(boxMax, varianceMax);
@@ -190,7 +194,7 @@ void main() {
         vec3 clampedHistoryRGB = YCoCgToRGB(clampedHistoryYCoCg);
         
         // Blend current frame and clamped history
-        float alpha = ubo.jitterOffset == vec2(0.0) ? 0.20 : 0.08;
+        float alpha = ubo.jitterOffset == vec2(0.0) ? ubo.blendAlphaStatic : ubo.blendAlpha;
         
         // Adaptively reduce history contribution if the difference is very large
         float colorDiff = length(currentColorYCoCg - clampedHistoryYCoCg);

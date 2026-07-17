@@ -6,6 +6,7 @@
 
 #include <cstring>
 #include <format>
+#include "core/EngineConfig.h"
 
 namespace renderer {
 
@@ -235,6 +236,9 @@ namespace renderer {
         ubo.jitterOffset = { jitterX, jitterY };
         ubo.frameIndex = frameIndex;
         ubo.resetHistory = resetHistory ? 1u : 0u;
+        ubo.blendAlpha = config::temporal::BLEND_ALPHA;
+        ubo.blendAlphaStatic = config::temporal::BLEND_ALPHA_STATIC;
+        ubo.varianceClampFactor = config::temporal::VARIANCE_CLAMP_FACTOR;
         std::memcpy(m_ViewParamsBuffer.MappedData(), &ubo, sizeof(TAATSRViewParamsUBO));
 
         // Barrier for UBO upload

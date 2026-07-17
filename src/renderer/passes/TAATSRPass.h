@@ -55,6 +55,10 @@ namespace renderer {
             maths::vec2 jitterOffset;  // Camera subpixel offset in pixels
             uint32_t frameIndex;
             uint32_t resetHistory;
+            float blendAlpha;
+            float blendAlphaStatic;
+            float varianceClampFactor;
+            float _pad = 0.0f;
         };
 
         VkDevice m_Device = VK_NULL_HANDLE;

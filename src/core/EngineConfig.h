@@ -79,8 +79,14 @@ constexpr uint32_t VSM_MAX_PAGES_RENDERED_PER_FRAME = 512u;
 namespace temporal {
 // Resolution scale for rendering. Set to 1.0f for native resolution TAA, and < 1.0f (e.g., 0.7f) for TSR upscaling.
 constexpr float RENDER_SCALE = 0.7f;
-// Exponential moving average blend factor (lower value = more temporal history/stability, higher = faster response to motion)
+// Exponential moving average blend factor for moving cameras (lower value = more temporal history/stability, higher = faster response to motion)
 constexpr float BLEND_ALPHA = 0.08f;
+// Exponential moving average blend factor for static cameras (no jitter)
+constexpr float BLEND_ALPHA_STATIC = 0.20f;
+// Variance clamping multiplier factor (lower value = more ghosting prevention/clipping, higher value = less clipping/more temporal consistency)
+constexpr float VARIANCE_CLAMP_FACTOR = 1.5f;
+// Frame count for the low-discrepancy Halton subpixel jitter sequence
+constexpr uint32_t JITTER_FRAME_COUNT = 16u;
 // Whether camera subpixel jitter and temporal accumulation are enabled by default
 constexpr bool ENABLED_BY_DEFAULT = true;
 } // namespace temporal
