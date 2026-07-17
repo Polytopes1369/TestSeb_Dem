@@ -17,7 +17,8 @@ constexpr bool ENTITY_SELF_ROTATION_ENABLED = false;
 constexpr uint32_t VIEW_DISTANCE_QUALITY = 2;
 
 namespace nanite {
-// Higher threshold shifts more tiny triangles to the software rasterizer to relieve pipeline stress.
+// Higher threshold shifts more tiny triangles to the software rasterizer to
+// relieve pipeline stress.
 constexpr float SOFTWARE_RASTER_THRESHOLD_PIXELS = 16.0f;
 // Balanced LOD error threshold.
 constexpr float LOD_PIXEL_ERROR_THRESHOLD = 2.0f;
@@ -35,7 +36,8 @@ constexpr float MAX_PIXELS_PER_EDGE = 4.0f;
 } // namespace nanite
 
 namespace streaming {
-// UE 5.8: r.Streaming.PoolSize=4500 (Allocating 4.5GB leveraging the 12GB VRAM on the RTX 3060)
+// UE 5.8: r.Streaming.PoolSize=4500 (Allocating 4.5GB leveraging the 12GB VRAM
+// on the RTX 3060)
 constexpr uint32_t POOL_SIZE_MB = 4500;
 } // namespace streaming
 
@@ -61,8 +63,8 @@ constexpr uint32_t TSR_VELOCITY_HEADING_CONVECTIVE = 1;
 } // namespace temporal
 
 namespace shadows {
-// UE 5.8 Shadows settings (Classic Cascaded Shadow Maps fallback to save GPU cycles)
-// sg.ShadowQuality=1
+// UE 5.8 Shadows settings (Classic Cascaded Shadow Maps fallback to save GPU
+// cycles) sg.ShadowQuality=1
 constexpr uint32_t QUALITY = 1;
 // r.Shadow.Virtual.Enable=0 (VSM disabled, too heavy for this architecture)
 constexpr bool VIRTUAL_ENABLE = false;
@@ -84,7 +86,8 @@ constexpr uint32_t MAX_TRACED_ENTITIES = 64u;
 constexpr uint32_t RADIOSITY_BOUNCE_COUNT = 2u;
 constexpr uint32_t SURFACE_CACHE_GI_SAMPLE_COUNT = 24u;
 
-constexpr uint32_t SCREEN_PROBE_TILE_SIZE = 16u; // Larger tiles = fewer probes traced
+constexpr uint32_t SCREEN_PROBE_TILE_SIZE =
+    16u; // Larger tiles = fewer probes traced
 constexpr uint32_t SCREEN_PROBE_RAY_COUNT = 32u; // Reduced ray budget
 constexpr float SCREEN_PROBE_TEMPORAL_ALPHA = 0.10f;
 
