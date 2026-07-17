@@ -101,6 +101,10 @@ layout(std140, set = 0, binding = 6) uniform ResolveViewParamsUBO {
     // Phase 3: sun direction -- see ClusterResolve.comp's own identical field comment.
     vec3 sunDirection;
     float _pad2;
+    // Real photometric sun color/intensity (LUX) -- see ClusterResolve.comp's own identical field
+    // comment (2026-07-17 recalibration).
+    vec3 sunColor;
+    float sunIntensity;
 } g_ViewParams;
 
 // binding 7 == g_MaskTextures[], declared by mask_sampling.glsl.
@@ -259,7 +263,15 @@ void main() {
     // for the full rationale (a pure metal has zero diffuse response; without this, metals would
     // double-count energy against ReflectionGather.comp's specular RMW).
     vec3 diffuseAlbedo = albedo * (1.0 - mat.metallic);
-    vec3 finalColor = diffuseAlbedo * 0.15 + diffuseAlbedo * diff * sunVisibility + mat.emissive;
+
+    // Physically-based direct lighting -- see ClusterResolve.comp's own identical comment for the
+    // full derivation (2026-07-17 recalibration).
+    const float kPI = 3.14159265359;
+    const float kAmbientFraction = 0.05;
+    vec3 sunRadiance = g_ViewParams.sunColor * g_ViewParams.sunIntensity;
+    vec3 incidentIlluminance = sunRadiance * (diff * sunVisibility + kAmbientFraction);
+    const float kEmissiveScale = 1500.0;
+    vec3 finalColor = (diffuseAlbedo / kPI) * incidentIlluminance + mat.emissive * kEmissiveScale;
 
     // Opacity-mask soft edge feathering -- see ClusterResolve.comp's own comment.
     if (cluster.maskTextureIndex != 0xFFFFFFFFu) {

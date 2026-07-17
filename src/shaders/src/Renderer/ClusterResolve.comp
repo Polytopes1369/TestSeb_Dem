@@ -127,6 +127,11 @@ layout(std140, set = 0, binding = 7) uniform ResolveViewParamsUBO {
     // misaligned the lit/unlit transition against the shadow itself).
     vec3 sunDirection;
     float _pad2;
+    // Real photometric sun color/intensity (LUX, matching renderer::DirectionalLight's own
+    // comment -- 2026-07-17 recalibration): consumed by the physically-based Lambertian direct
+    // lighting term below instead of the old implicit "intensity = 1, no color" hardcode.
+    vec3 sunColor;
+    float sunIntensity;
 } g_ViewParams;
 
 // Minimal GBuffer (renderer::ClusterResolvePass -- see its own class comment): written alongside
@@ -340,7 +345,7 @@ void main() {
         float diff = max(dot(normal, lightDir), 0.0);
         // Phase 3: shadow visibility for the sun, sampled from renderer::VirtualShadowMapPass's
         // 3-level clipmap -- only the direct `diff` term is shadowed, not the ambient/fill term
-        // below (a flat 0.15 ambient approximation has no directional occluder to speak of).
+        // below (kAmbientFraction has no directional occluder to speak of).
         float sunVisibility = (diff > 0.0) ? SampleSunShadowVSM(worldPos) : 1.0;
 
         // Hash by cluster.clusterID (the DAG's own dense, per-file-unique numbering, assigned once
@@ -391,7 +396,28 @@ void main() {
         // Without this, a metallic surface would show BOTH a full Lambertian response here AND a
         // full GGX specular response from ReflectionGather.comp's own RMW, double-counting energy.
         vec3 diffuseAlbedo = albedo * (1.0 - mat.metallic);
-        finalColor = diffuseAlbedo * 0.15 + diffuseAlbedo * diff * sunVisibility + mat.emissive;
+
+        // Physically-based direct lighting (2026-07-17 recalibration, matching UE5.8's own
+        // Lambertian + physical-camera exposure model exactly -- see renderer::DirectionalLight's
+        // own comment for the full derivation): g_ViewParams.sunIntensity is real illuminance in
+        // LUX, so outgoing radiance is the standard `illuminance * albedo / PI`. kAmbientFraction
+        // is a flat hemispheric sky/ambient fill (this engine has no separate skylight system yet)
+        // expressed as a fraction of the sun's own illuminance, so it scales consistently with
+        // whatever sun intensity is configured instead of being a fixed, unscaled constant.
+        const float kPI = 3.14159265359;
+        const float kAmbientFraction = 0.05;
+        vec3 sunRadiance = g_ViewParams.sunColor * g_ViewParams.sunIntensity;
+        vec3 incidentIlluminance = sunRadiance * (diff * sunVisibility + kAmbientFraction);
+        // kEmissiveScale converts this codebase's existing artist-authored, unitless emissive
+        // multiplier (renderer::MaterialParameters::emissive, authored in a small ~0-3 range across
+        // every material -- see renderer::GenerateShowcaseMaterialTable) into the same real
+        // radiance scale the sun-lit term above now uses, so a glowing material still reads as
+        // clearly brighter than a merely sun-lit one instead of vanishing into near-black next to
+        // it. Chosen so an authored emissive of 1.0 lands comfortably above a fully-lit
+        // 0.85-albedo diffuse surface under this engine's default sun (~2842, see this file's own
+        // recalibration comment) -- i.e. still reads as "glowing", not just "well lit".
+        const float kEmissiveScale = 1500.0;
+        finalColor = (diffuseAlbedo / kPI) * incidentIlluminance + mat.emissive * kEmissiveScale;
 
         // GBuffer capture (renderer::ClusterResolvePass's new outputs -- see this file's own
         // binding comment): the same winning (hw-vs-sw arbitrated) depth already used to pick

@@ -189,13 +189,24 @@ void main() {
     // consistency with the opaque shaders' formula; metallic is always 0.0 for every transparent
     // category GenerateRandomMaterialTable produces).
     vec3 diffuseAlbedo = mat.baseColor * (1.0 - mat.metallic);
-    vec3 diffuseLight = diffuseAlbedo * (directLighting + indirectLighting);
+    // Physically-based Lambertian normalization -- see ClusterResolve.comp's own identical
+    // recalibration comment (2026-07-17): directLighting is real illuminance in LUX (g_ViewParams.
+    // sunDirectionAndIntensity.w, same convention as renderer::DirectionalLight), so outgoing
+    // radiance needs the standard `illuminance * albedo / PI`. indirectLighting (SampleWorldProbeGrid)
+    // is folded into the same normalization -- both terms are irradiance-like quantities on this
+    // surface, so they share one Lambertian BRDF divide.
+    const float kPI = 3.14159265359;
+    vec3 diffuseLight = (diffuseAlbedo / kPI) * (directLighting + indirectLighting);
 
     // NOT weighted by mat.alpha here -- this pipeline's fixed-function blend (srcColorBlendFactor =
     // VK_BLEND_FACTOR_SRC_ALPHA) already multiplies the WHOLE outRGB by outAlpha; an explicit
     // in-shader multiply would double-attenuate (a bug in this shader's first Phase 5 draft, fixed
     // during the MegaLights reconciliation -- see this file's own header comment).
-    vec3 outRGB = diffuseLight + mat.emissive;
+    // kEmissiveScale -- see ClusterResolve.comp's own identical constant/comment (2026-07-17
+    // recalibration): converts this codebase's small artist-authored emissive multiplier onto the
+    // same real radiance scale the lit terms above now use.
+    const float kEmissiveScale = 1500.0;
+    vec3 outRGB = diffuseLight + mat.emissive * kEmissiveScale;
     float outAlpha = mat.alpha;
 
     // --- MegaLights Phase A follow-up: RIS-selected point light + 1 shadow-visibility ray, exactly
@@ -221,7 +232,11 @@ void main() {
         float windowSq = 1.0 - nd2 * nd2;
         float window = saturate(windowSq * windowSq);
 
-        outRGB += diffuseAlbedo * light.color * light.intensity * megaNdotL / distSq * window * visibility * invPdf;
+        // light.intensity is real luminous intensity in CANDELA (renderer::MegaLight's own comment,
+        // 2026-07-17 recalibration) -- `intensity / distSq` is the standard inverse-square
+        // illuminance-at-a-point formula, and outgoing radiance needs the same Lambertian /PI this
+        // file's own diffuseLight term above already applies.
+        outRGB += (diffuseAlbedo / kPI) * light.color * light.intensity * megaNdotL / distSq * window * visibility * invPdf;
     }
 
     // --- Optional front-layer specular reflection (Lumen-style, single GGX-VNDF sample) -- gated

@@ -20,8 +20,10 @@ namespace renderer {
         // own reprojection) + vec2 (8 bytes) + 2 pad floats rounding up to a 16-byte boundary (144
         // bytes) + vec3 sunDirection (Phase 3 -- points FROM the light TOWARD the scene, same
         // convention as renderer::DirectionalLight, needed so this shader's direct-lighting term
-        // uses the SAME sun direction the shadow was rendered from) + 1 trailing pad float rounding
-        // back up to a 16-byte boundary (160 bytes total).
+        // uses the SAME sun direction the shadow was rendered from) + 1 pad float rounding back up
+        // to a 16-byte boundary (160 bytes) + vec3 sunColor + 1 float sunIntensity (real LUX, see
+        // renderer::DirectionalLight's own comment -- physically-based recalibration, 2026-07-17)
+        // rounding up to 176 bytes total.
         struct ResolveViewParams {
             maths::mat4 viewProj;
             maths::mat4 prevViewProj;
@@ -33,8 +35,12 @@ namespace renderer {
             float sunDirectionY = 0.0f;
             float sunDirectionZ = 0.0f;
             float _pad2 = 0.0f;
+            float sunColorR = 0.0f;
+            float sunColorG = 0.0f;
+            float sunColorB = 0.0f;
+            float sunIntensity = 0.0f;
         };
-        static_assert(sizeof(ResolveViewParams) == 160,
+        static_assert(sizeof(ResolveViewParams) == 176,
             "ResolveViewParams must match ResolveViewParamsUBO in ClusterResolve.comp exactly (std140 layout)");
 
         // Step 4: byte-for-byte mirror of VirtualTextureVolumeUBO in ClusterResolve.comp/
@@ -441,15 +447,19 @@ namespace renderer {
     }
 
     void ClusterResolvePass::RecordResolve(VkCommandBuffer cmd, const maths::mat4& viewProj, const maths::mat4& prevViewProj,
-        const maths::vec3& sunDirection, uint32_t debugViewMode) {
+        const DirectionalLight& sun, uint32_t debugViewMode) {
         ResolveViewParams viewParams{};
         viewParams.viewProj = viewProj;
         viewParams.prevViewProj = prevViewProj;
         viewParams.viewportWidth = static_cast<float>(m_RenderExtent.width);
         viewParams.viewportHeight = static_cast<float>(m_RenderExtent.height);
-        viewParams.sunDirectionX = sunDirection.x;
-        viewParams.sunDirectionY = sunDirection.y;
-        viewParams.sunDirectionZ = sunDirection.z;
+        viewParams.sunDirectionX = sun.direction.x;
+        viewParams.sunDirectionY = sun.direction.y;
+        viewParams.sunDirectionZ = sun.direction.z;
+        viewParams.sunColorR = sun.color.x;
+        viewParams.sunColorG = sun.color.y;
+        viewParams.sunColorB = sun.color.z;
+        viewParams.sunIntensity = sun.intensity;
         vkCmdUpdateBuffer(cmd, m_ViewParamsBuffer.Handle(), 0, sizeof(ResolveViewParams), &viewParams);
 
         VulkanUtils::RecordMemoryBarrier(cmd,
@@ -602,7 +612,7 @@ namespace renderer {
     }
 
     void ClusterResolvePass::RecordResolveBinned(VkCommandBuffer cmd, const maths::mat4& viewProj,
-        const maths::vec3& sunDirection, const ClusterShadingBinPass& shadingBinPass) {
+        const DirectionalLight& sun, const ClusterShadingBinPass& shadingBinPass) {
         // prevViewProj is never read by ClusterResolveBinned.comp (this path never serves
         // DEBUG_VIEW_MOTION_VECTORS) -- `viewProj` itself is reused as a harmless placeholder value
         // rather than introducing a separate identity-matrix concept for an otherwise-dead field.
@@ -611,9 +621,13 @@ namespace renderer {
         viewParams.prevViewProj = viewProj;
         viewParams.viewportWidth = static_cast<float>(m_RenderExtent.width);
         viewParams.viewportHeight = static_cast<float>(m_RenderExtent.height);
-        viewParams.sunDirectionX = sunDirection.x;
-        viewParams.sunDirectionY = sunDirection.y;
-        viewParams.sunDirectionZ = sunDirection.z;
+        viewParams.sunDirectionX = sun.direction.x;
+        viewParams.sunDirectionY = sun.direction.y;
+        viewParams.sunDirectionZ = sun.direction.z;
+        viewParams.sunColorR = sun.color.x;
+        viewParams.sunColorG = sun.color.y;
+        viewParams.sunColorB = sun.color.z;
+        viewParams.sunIntensity = sun.intensity;
         vkCmdUpdateBuffer(cmd, m_ViewParamsBuffer.Handle(), 0, sizeof(ResolveViewParams), &viewParams);
 
         VulkanUtils::RecordMemoryBarrier(cmd,

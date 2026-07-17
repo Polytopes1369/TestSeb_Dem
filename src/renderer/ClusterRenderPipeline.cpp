@@ -422,7 +422,9 @@ bool ClusterRenderPipeline::Init(
   // visibly toward a neighboring grid cell.
   m_SceneLights.pointLights[0].position = maths::vec3{ -3.0f, 2.5f, -1.5f };
   m_SceneLights.pointLights[0].color = maths::vec3{ 1.0f, 0.85f, 0.6f };
-  m_SceneLights.pointLights[0].intensity = 4.0f;
+  // Real photometric candela (renderer::PointLight's own comment, 2026-07-17 recalibration) --
+  // left at this class's own default (see LightingTypes.h) rather than a distinct override.
+  m_SceneLights.pointLights[0].intensity = renderer::PointLight{}.intensity;
   m_SceneLights.pointLights[0].radius = 8.0f;
   m_SceneLights.pointLightCount = 1;
 
@@ -1287,14 +1289,14 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
 #ifndef NDEBUG
   if (cameraCopy.debugViewMode == DEBUG_VIEW_NORMAL) {
     m_ShadingBin.RecordClassifyAndSort(cmd, m_RenderExtent);
-    m_Resolve.RecordResolveBinned(cmd, viewProj, m_SceneLights.sun.direction, m_ShadingBin);
+    m_Resolve.RecordResolveBinned(cmd, viewProj, m_SceneLights.sun, m_ShadingBin);
   } else {
     maths::mat4 prevViewProjForResolve = m_HasPrevViewProj ? m_PrevViewProj : viewProj;
-    m_Resolve.RecordResolve(cmd, viewProj, prevViewProjForResolve, m_SceneLights.sun.direction, cameraCopy.debugViewMode);
+    m_Resolve.RecordResolve(cmd, viewProj, prevViewProjForResolve, m_SceneLights.sun, cameraCopy.debugViewMode);
   }
 #else
   m_ShadingBin.RecordClassifyAndSort(cmd, m_RenderExtent);
-  m_Resolve.RecordResolveBinned(cmd, viewProj, m_SceneLights.sun.direction, m_ShadingBin);
+  m_Resolve.RecordResolveBinned(cmd, viewProj, m_SceneLights.sun, m_ShadingBin);
 #endif
 
   // Captures THIS frame's shadow-page miss reports (written by SurfaceCacheCapture.frag at [1z]

@@ -1,5 +1,6 @@
 #include "renderer/passes/TransparentForwardPass.h"
 
+#include <cstring>
 #include <format>
 
 #include "core/Logger.h"
@@ -124,12 +125,63 @@ namespace renderer {
         gridParams.gridOriginZ = worldProbes.GetGridOriginWorld().z;
         gridParams.probeSpacing = WorldProbeGridPass::kProbeSpacing;
         gridParams.gridResolution = static_cast<float>(WorldProbeGridPass::kGridResolution);
+        // m_ClusterEntriesBuffer's upload can NOT go through vkCmdUpdateBuffer like the two small
+        // ones below: that call is capped at 65536 bytes by the Vulkan spec (VUID-vkCmdUpdateBuffer
+        // -dataSize-00033), and sizeof(TransparentClusterEntry) * m_ClusterCount routinely exceeds
+        // it once a scene has more than 1024 transparent leaf clusters (e.g. this engine's own
+        // showcase gallery's glass Sphere + translucent Torus alone produce 2585, see
+        // project_showcase_scene_gallery memory) -- silently violating that limit produced a real
+        // validation ERROR every frame and, worse, is a genuine out-of-spec API call whose actual
+        // effect is driver-defined (observed: seemingly unrelated rendering corruption elsewhere,
+        // consistent with an oversized update corrupting adjacent GPU memory). Fixed by uploading
+        // through a temporary host-visible staging buffer + vkCmdCopyBuffer instead, exactly
+        // VulkanContext::UploadEntityData's own established pattern for this same size problem --
+        // vkCmdCopyBuffer has no such size cap.
+        VkDeviceSize entriesUploadSize = sizeof(TransparentClusterEntry) * m_ClusterCount;
+
+        VkBufferCreateInfo stagingInfo{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+        stagingInfo.size = entriesUploadSize;
+        stagingInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+
+        VmaAllocationCreateInfo stagingAllocInfo{};
+        stagingAllocInfo.usage = VMA_MEMORY_USAGE_CPU_ONLY;
+        stagingAllocInfo.flags = VMA_ALLOCATION_CREATE_MAPPED_BIT;
+
+        VkBuffer stagingBuffer = VK_NULL_HANDLE;
+        VmaAllocation stagingAllocation = VK_NULL_HANDLE;
+        VmaAllocationInfo stagingAllocResultInfo{};
+        if (vmaCreateBuffer(allocator, &stagingInfo, &stagingAllocInfo,
+                            &stagingBuffer, &stagingAllocation, &stagingAllocResultInfo) != VK_SUCCESS) {
+            throw std::runtime_error("Failed to allocate transparent cluster entries staging buffer!");
+        }
+        std::memcpy(stagingAllocResultInfo.pMappedData, hostEntries.data(),
+                    static_cast<size_t>(entriesUploadSize));
+
         VulkanUtils::ExecuteOneShotCommands(m_Device, commandPool, queue, [&](VkCommandBuffer cmd) {
-            vkCmdUpdateBuffer(cmd, m_ClusterEntriesBuffer.Handle(), 0,
-                sizeof(TransparentClusterEntry) * m_ClusterCount, hostEntries.data());
+            VkBufferCopy copyRegion{};
+            copyRegion.srcOffset = 0;
+            copyRegion.dstOffset = 0;
+            copyRegion.size = entriesUploadSize;
+            vkCmdCopyBuffer(cmd, stagingBuffer, m_ClusterEntriesBuffer.Handle(), 1, &copyRegion);
+
+            // The copy's writes must be visible to TransparentForward.vert's storage-buffer read
+            // (m_ClusterEntriesBuffer, binding -- see that shader's own comment) before any draw.
+            VkMemoryBarrier2 memBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+            memBarrier.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+            memBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+            memBarrier.dstStageMask = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT;
+            memBarrier.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
+
+            VkDependencyInfo depInfo{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+            depInfo.memoryBarrierCount = 1;
+            depInfo.pMemoryBarriers = &memBarrier;
+            vkCmdPipelineBarrier2(cmd, &depInfo);
+
             vkCmdUpdateBuffer(cmd, m_DrawCountBuffer.Handle(), 0, sizeof(uint32_t), &m_ClusterCount);
             vkCmdUpdateBuffer(cmd, m_WorldProbeGridParamsBuffer.Handle(), 0, sizeof(WorldProbeGridParams), &gridParams);
         });
+
+        vmaDestroyBuffer(allocator, stagingBuffer, stagingAllocation);
 
         // =====================================================================================
         // Descriptor pool, shared by both descriptor sets below.
