@@ -527,10 +527,16 @@ bool ClusterRenderPipeline::Init(
       m_RenderExtent, m_DisplayExtent,
       m_GIComposite.GetOutputView(), m_Resolve.GetOutputDepthView());
 
+  // Phase PP2 (post-process stack roadmap): Bloom/Lens Flare/Anamorphic Flare/Lens Dirt, reading
+  // the same HDR source m_PostProcess (below) does -- must Init before m_PostProcess so its own
+  // GetOutputView() already exists for m_PostProcess.Init's own g_Bloom binding.
+  m_Bloom.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
+      m_DisplayExtent, m_TAATSR.GetOutputView());
+
   // Phase PP1 (post-process stack roadmap): exposure/white-balance/color-correction/ACES/gamma,
   // reading m_TAATSR's own HDR (R16G16B16A16_SFLOAT) output at display resolution.
   m_PostProcess.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
-      m_DisplayExtent, m_TAATSR.GetOutputView());
+      m_DisplayExtent, m_TAATSR.GetOutputView(), m_Bloom.GetOutputView());
 
 #ifndef NDEBUG
   // Two-tier SDF ray march DEBUG VISUALIZATION (see ClusterRenderPipeline.h's own comment on
@@ -598,6 +604,13 @@ void ClusterRenderPipeline::Shutdown() {
   m_ScreenTrace.Shutdown();
   m_GIComposite.Shutdown();
   m_Denoiser.Shutdown();
+  // Phase PP1/PP2 (post-process stack roadmap): reverse Init() order (m_TAATSR -> m_Bloom ->
+  // m_PostProcess), so shut down m_PostProcess and m_Bloom before m_TAATSR below. This was missing
+  // for m_PostProcess ever since Phase PP1 (only self-shutdown via its own Init()'s defensive
+  // top-of-function Shutdown() call, never explicitly on a real pipeline teardown) -- fixed here
+  // alongside adding m_Bloom's own equivalent call.
+  m_PostProcess.Shutdown();
+  m_Bloom.Shutdown();
   m_TAATSR.Shutdown();
   m_WorldProbes.Shutdown();
   m_GIInject.Shutdown();
@@ -1521,14 +1534,16 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
   }
 
   // =========================================================================================
-  // [13e] Phase PP1 (post-process stack roadmap): exposure/white-balance/color-correction/ACES/
-  // gamma over m_TAATSR's own freshly-written HDR output -- see PostProcessPass's own class
-  // comment. m_TAATSR.GetOutputView() ping-pongs between 2 images every RecordPass() call (just
-  // above), so this pass' own descriptor set pointing at it must be re-written every frame too,
+  // [13e] Phase PP2 (post-process stack roadmap): Bloom/Lens Flare/Anamorphic Flare/Lens Dirt,
+  // then Phase PP1's exposure/white-balance/color-correction/ACES/gamma composite, both reading
+  // m_TAATSR's own freshly-written HDR output -- see BloomPass's and PostProcessPass's own class
+  // comments. m_TAATSR.GetOutputView() ping-pongs between 2 images every RecordPass() call (just
+  // above), so both passes' own descriptor sets pointing at it must be re-written every frame too,
   // exactly like m_TAATSR.UpdateDescriptorSets() itself is called every frame above.
   // =========================================================================================
   {
-      m_PostProcess.UpdateDescriptorSets(m_TAATSR.GetOutputView());
+      m_Bloom.UpdateSourceDescriptor(m_TAATSR.GetOutputView());
+      m_PostProcess.UpdateDescriptorSets(m_TAATSR.GetOutputView(), m_Bloom.GetOutputView());
 
       VkMemoryBarrier2 taatsrToPostProcessBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
       taatsrToPostProcessBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
@@ -1539,6 +1554,19 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
       taatsrToPostProcessDep.memoryBarrierCount = 1;
       taatsrToPostProcessDep.pMemoryBarriers = &taatsrToPostProcessBarrier;
       vkCmdPipelineBarrier2(cmd, &taatsrToPostProcessDep);
+
+      BloomPass::Settings bloomSettings{};
+      bloomSettings.threshold = config::postprocess::BLOOM_THRESHOLD;
+      bloomSettings.softKnee = config::postprocess::BLOOM_SOFT_KNEE;
+      bloomSettings.upsampleRadius = config::postprocess::BLOOM_UPSAMPLE_RADIUS;
+      bloomSettings.ghostIntensity = config::postprocess::LENS_FLARE_GHOST_INTENSITY;
+      bloomSettings.ghostCount = config::postprocess::LENS_FLARE_GHOST_COUNT;
+      bloomSettings.ghostSpacing = config::postprocess::LENS_FLARE_GHOST_SPACING;
+      bloomSettings.anamorphicIntensity = config::postprocess::ANAMORPHIC_FLARE_INTENSITY;
+      bloomSettings.anamorphicStretch = config::postprocess::ANAMORPHIC_FLARE_STRETCH;
+      bloomSettings.dirtIntensity = config::postprocess::LENS_DIRT_INTENSITY;
+      bloomSettings.dirtScale = config::postprocess::LENS_DIRT_SCALE;
+      m_Bloom.RecordGenerate(cmd, bloomSettings);
 
       float deltaTimeSeconds = m_HasLastFrameTime ? (globalTimeSeconds - m_LastFrameTimeSeconds) : (1.0f / 60.0f);
       deltaTimeSeconds = std::clamp(deltaTimeSeconds, 0.0f, 0.25f); // Guard against alt-tab/breakpoint stalls.
@@ -1561,6 +1589,11 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
       ppSettings.saturation = config::postprocess::COLOR_SATURATION;
       ppSettings.contrast = config::postprocess::COLOR_CONTRAST;
       ppSettings.displayGamma = config::postprocess::DISPLAY_GAMMA;
+      ppSettings.bloomIntensity = config::postprocess::BLOOM_INTENSITY;
+      ppSettings.chromaticAberrationIntensity = config::postprocess::CHROMATIC_ABERRATION_INTENSITY;
+      ppSettings.vignetteIntensity = config::postprocess::VIGNETTE_INTENSITY;
+      ppSettings.vignetteSmoothness = config::postprocess::VIGNETTE_SMOOTHNESS;
+      ppSettings.vignetteColorBleed = config::postprocess::VIGNETTE_COLOR_BLEED;
 
       m_PostProcess.RecordComposite(cmd, deltaTimeSeconds, ppSettings);
   }

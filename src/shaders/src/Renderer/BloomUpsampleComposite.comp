@@ -1,0 +1,146 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+
+// Stage 2/2 of renderer::BloomPass (Phase PP2, post-process stack roadmap): the "upsample +
+// combine" half of the dual-filter bloom -- see BloomDownsample.comp's own comment for the
+// technique this mirrors. Dispatched once per mip level from (mipCount - 2) down to 0 (mip
+// (mipCount - 1), the smallest, needs no upsample step of its own -- it IS the downsample chain's
+// smallest mip, sampled directly as this shader's `g_SmallerBlurred` input on its very first call).
+// Each call's own output = this mip's own sharp "detail" (renderer::BloomPass's downsample chain,
+// same mip index) + a 9-tap tent-filtered upsample of the smaller, already-blurred mip directly
+// below it (renderer::BloomPass's upsample chain, mip N+1, or the downsample chain's own smallest
+// mip on the first call) -- see renderer::BloomPass's own class comment for why this needs TWO
+// separate mip chains (an in-place read-modify-write of one chain would read neighboring texels of
+// the very same subresource this dispatch is writing, an unsynchronized hazard).
+//
+// The FINAL call (mip 0, `pc.isFinalMip != 0`) additionally generates this pipeline's Lens Flare,
+// Anamorphic Lens Flare, and Lens Dirt -- 100% procedural, no texture asset for any of the three
+// (per this project's own CLAUDE.md constraint) -- and adds them on top of the plain bloom blend
+// before writing the pipeline's final bloom+flare+dirt image, which renderer::PostProcessPass's
+// own composite shader (PostProcessComposite.comp) samples and adds to the HDR scene color.
+
+#include "include/math_utils.glsl"
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform sampler2D g_SmallerBlurred; // Upsample chain mip N+1 (or downsample chain's smallest mip on the first call).
+layout(set = 0, binding = 1) uniform sampler2D g_Detail;         // Downsample chain, same mip N as this dispatch's output.
+layout(set = 0, binding = 2) uniform sampler2D g_FlareSource;    // Downsample chain, a fixed small/blurred mip -- only sampled when isFinalMip.
+layout(rgba16f, set = 0, binding = 3) uniform writeonly image2D g_Output;
+
+layout(push_constant) uniform PC {
+    vec2 outputTexelSize;    // 1 / outputExtent, this dispatch's own mip.
+    vec2 smallerMipTexelSize; // 1 / (outputExtent / 2), g_SmallerBlurred's own texel size.
+    float upsampleRadius;    // Tent filter footprint scale, ~1.0 = exactly adjacent texels.
+    uint isFinalMip;         // Nonzero on the mip-0 call: also generate flare/dirt below.
+    // Lens Flare (radial ghosts) -- only meaningful when isFinalMip.
+    float ghostIntensity;
+    uint ghostCount;
+    float ghostSpacing;
+    // Anamorphic Lens Flare (horizontal streak) -- only meaningful when isFinalMip.
+    float anamorphicIntensity;
+    float anamorphicStretch; // UV-space half-width of the horizontal streak kernel.
+    // Lens Dirt (procedural, no texture asset) -- only meaningful when isFinalMip.
+    float dirtIntensity;
+    float dirtScale;
+} pc;
+
+vec3 UpsampleTent9(sampler2D tex, vec2 uv, vec2 texelSize, float radius) {
+    vec4 o = texelSize.xyxy * vec4(1.0, 1.0, -1.0, 0.0) * radius;
+    vec3 s  = textureLod(tex, uv - o.xy, 0.0).rgb;
+    s += textureLod(tex, uv - o.wy, 0.0).rgb * 2.0;
+    s += textureLod(tex, uv - o.zy, 0.0).rgb;
+    s += textureLod(tex, uv + o.zw, 0.0).rgb * 2.0;
+    s += textureLod(tex, uv, 0.0).rgb * 4.0;
+    s += textureLod(tex, uv + o.xw, 0.0).rgb * 2.0;
+    s += textureLod(tex, uv + o.zy, 0.0).rgb;
+    s += textureLod(tex, uv + o.wy, 0.0).rgb * 2.0;
+    s += textureLod(tex, uv + o.xy, 0.0).rgb;
+    return s * (1.0 / 16.0);
+}
+
+// Cheap procedural hue cycle for each ghost's tint -- no palette texture, just a 3-phase cosine
+// (Inigo Quilez's cosine-palette trick), producing a smooth rainbow-ish tint sweep across ghosts
+// exactly like real camera-lens chromatic ghosting (each internal reflection shifts color
+// slightly differently depending on coating/incidence angle).
+vec3 GhostTint(float t) {
+    return 0.5 + 0.5 * cos(6.28318 * (vec3(0.0, 0.33, 0.67) + t));
+}
+
+// 2-octave value noise (bilinear-interpolated Hash(vec2), from include/math_utils.glsl) used as a
+// procedural lens-dirt mask -- smudges/specks of varying size, entirely generated, no texture
+// asset, satisfying this project's "100% procedural, no texture input" constraint for Lens Dirt.
+float ValueNoise(vec2 p) {
+    vec2 i = floor(p);
+    vec2 f = fract(p);
+    float a = Hash(i);
+    float b = Hash(i + vec2(1.0, 0.0));
+    float c = Hash(i + vec2(0.0, 1.0));
+    float d = Hash(i + vec2(1.0, 1.0));
+    vec2 u = f * f * (3.0 - 2.0 * f);
+    return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}
+
+float LensDirtMask(vec2 uv, float scale) {
+    float n = ValueNoise(uv * scale) * 0.6 + ValueNoise(uv * scale * 3.17) * 0.3 + ValueNoise(uv * scale * 7.53) * 0.1;
+    // Sparse specks: only the upper tail of the noise distribution reads as a "dirt speck",
+    // everything else stays near-transparent (dirt is sparse in reality, not a uniform haze).
+    return smoothstep(0.55, 0.95, n);
+}
+
+vec3 SampleGhosts(vec2 uv) {
+    vec2 ghostVec = (vec2(0.5) - uv) * pc.ghostSpacing;
+    vec3 result = vec3(0.0);
+    for (uint i = 0u; i < pc.ghostCount; ++i) {
+        float t = float(i) / max(float(pc.ghostCount - 1u), 1.0);
+        vec2 ghostUV = fract(uv + ghostVec * t);
+        float weight = 1.0 - abs(t - 0.5) * 1.6; // Falls off toward both ends of the ghost chain.
+        weight = clamp(weight, 0.0, 1.0);
+        vec3 sampleColor = textureLod(g_FlareSource, ghostUV, 0.0).rgb;
+        result += sampleColor * GhostTint(t) * weight;
+    }
+    return result * pc.ghostIntensity;
+}
+
+vec3 SampleAnamorphicStreak(vec2 uv) {
+    const int kTaps = 12;
+    vec3 result = vec3(0.0);
+    float totalWeight = 0.0;
+    for (int i = -kTaps; i <= kTaps; ++i) {
+        float t = float(i) / float(kTaps);
+        float weight = 1.0 - abs(t);
+        vec2 sampleUV = uv + vec2(t * pc.anamorphicStretch, 0.0);
+        result += textureLod(g_FlareSource, sampleUV, 0.0).rgb * weight;
+        totalWeight += weight;
+    }
+    result /= max(totalWeight, 1e-5);
+    // Classic anamorphic-lens cyan/blue tint (horizontal cylindrical lens elements bias
+    // transmission toward blue) -- procedural constant tint, not sampled from any asset.
+    return result * vec3(0.6, 0.8, 1.4) * pc.anamorphicIntensity;
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 outputSize = ivec2(1.0 / pc.outputTexelSize.x, 1.0 / pc.outputTexelSize.y);
+    if (pixel.x >= outputSize.x || pixel.y >= outputSize.y) {
+        return;
+    }
+
+    vec2 uv = (vec2(pixel) + 0.5) * pc.outputTexelSize;
+
+    vec3 detail = textureLod(g_Detail, uv, 0.0).rgb;
+    vec3 blurred = UpsampleTent9(g_SmallerBlurred, uv, pc.smallerMipTexelSize, pc.upsampleRadius);
+    vec3 result = detail + blurred;
+
+    if (pc.isFinalMip != 0u) {
+        vec3 ghosts = SampleGhosts(uv);
+        vec3 streak = SampleAnamorphicStreak(uv);
+        float dirt = LensDirtMask(uv, pc.dirtScale);
+        // Lens Dirt only attenuates the flare/glare contribution (ghosts + anamorphic streak),
+        // never the base bloom bleed -- matches how real dirt/smudges on a lens element only
+        // scatter light that grazes that specific optical path, not the whole glow halo.
+        result += (ghosts + streak) * mix(1.0, dirt, pc.dirtIntensity);
+    }
+
+    imageStore(g_Output, pixel, vec4(max(result, vec3(0.0)), 1.0));
+}

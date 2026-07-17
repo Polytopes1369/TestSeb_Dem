@@ -1,17 +1,24 @@
 #version 460
 #extension GL_GOOGLE_include_directive : enable
 
-// Stage 3/3 of renderer::PostProcessPass (Phase PP1, post-process stack roadmap): the final HDR
-// -> LDR composite. Replaces renderer::ClusterRenderPipeline's previous naive blit (which relied
-// on vkCmdBlitImage's implicit float->UNORM8 clamp as its only "tonemap") with a real UE 5.8-
-// parity chain, in Unreal's own evaluation order: Physical Camera exposure (this frame's EV100,
-// already resolved by AutoExposureAdapt.comp into g_Exposure.currentEV100 -- see that shader's own
-// comment for Auto vs Manual metering) -> White Balance -> Color Correction (Contrast -> Lift/
-// Gamma/Gain -> Saturation) -> ACES Tone Mapping -> Gamma Correction (the pipeline's only display
-// encode -- see color_grading.glsl's own GammaCorrection() comment for why it's load-bearing, not
-// decorative). Writes this pass' own owned rgba8 output image, which
-// renderer::ClusterRenderPipeline's final blit now sources from instead of renderer::TAATSRPass's
-// raw HDR output directly.
+// Stage 3/3 of renderer::PostProcessPass: the final HDR -> LDR composite. Replaces renderer::
+// ClusterRenderPipeline's previous naive blit (which relied on vkCmdBlitImage's implicit
+// float->UNORM8 clamp as its only "tonemap") with a real UE 5.8-parity chain, in Unreal's own
+// evaluation order:
+//   Phase PP1: Physical Camera exposure (this frame's EV100, already resolved by
+//     AutoExposureAdapt.comp into g_Exposure.currentEV100) -> White Balance -> Color Correction
+//     (Contrast -> Lift/Gamma/Gain -> Saturation) -> ACES Tone Mapping -> Gamma Correction (the
+//     pipeline's only display encode -- see color_grading.glsl's own GammaCorrection() comment for
+//     why it's load-bearing, not decorative).
+//   Phase PP2: Chromatic Aberration (radial per-channel UV offset sampling the HDR scene color,
+//     BEFORE Bloom is added -- a lens aberration of the captured image, not of the glow it emits)
+//     -> Bloom (renderer::BloomPass's own dual-filter mip-chain output, added into the exposed-
+//     scale scene color) -> Vignette + Vignette Color Bleed (multiplicative radial darkening with a
+//     per-channel falloff rate, mimicking real lenses' chromatic vignetting -- red/green fall off
+//     faster than blue toward the edges -- applied AFTER Color Correction, BEFORE Tone Mapping so
+//     the vignette itself still gets filmic rolloff instead of a hard-clipped dark edge).
+// Writes this pass' own owned rgba8 output image, which renderer::ClusterRenderPipeline's final
+// blit now sources from instead of renderer::TAATSRPass's raw HDR output directly.
 
 #include "include/color_grading.glsl"
 #include "include/aces_tonemap.glsl"
@@ -56,8 +63,45 @@ layout(std140, set = 0, binding = 3) uniform PostProcessParamsUBO {
     float saturation;
     float contrast;
     float displayGamma;
-    float _pad3;
+    float _pad3b;
+
+    // Phase PP2: Bloom / Lens effects / Chromatic Aberration / Vignette
+    float bloomIntensity;
+    float chromaticAberrationIntensity; // UV-space max channel offset at the screen corner.
+    float vignetteIntensity;            // 0 = no vignette, 1 = fully black at kVignetteRadius.
+    float vignetteSmoothness;
+
+    float vignetteColorBleed;  // 0 = neutral (grayscale) vignette falloff, 1 = strong chromatic falloff.
+    float _pad4, _pad5, _pad6;
 } g_Params;
+
+layout(set = 0, binding = 4) uniform sampler2D g_Bloom;
+
+// Radial per-channel UV offset -- red sampled slightly closer to center, blue slightly further out
+// (the classic lateral chromatic aberration look), scaled by distance-from-center squared so the
+// screen center stays aberration-free and the effect only grows toward the edges/corners.
+vec3 SampleWithChromaticAberration(vec2 uv, float intensity) {
+    vec2 centerOffset = uv - vec2(0.5);
+    float distSq = dot(centerOffset, centerOffset);
+    vec2 offset = centerOffset * distSq * intensity;
+
+    float r = texture(g_HDRColor, uv - offset).r;
+    float g = texture(g_HDRColor, uv).g;
+    float b = texture(g_HDRColor, uv + offset).b;
+    return vec3(r, g, b);
+}
+
+// Multiplicative radial vignette with a chromatic falloff: the per-channel darkening rate differs
+// slightly (red/green attenuate faster than blue toward the edge), matching real camera lenses'
+// own natural chromatic vignetting instead of a flat gray falloff.
+vec3 ApplyVignette(vec3 color, vec2 uv, float intensity, float smoothness, float colorBleed) {
+    vec2 centerOffset = (uv - vec2(0.5)) * vec2(1.0, 1.0);
+    float dist = length(centerOffset) * 1.4142135; // Normalize so the corner reaches 1.0.
+
+    vec3 channelBias = vec3(1.05, 1.0, 0.9) * colorBleed + vec3(1.0) * (1.0 - colorBleed);
+    vec3 falloff = 1.0 - smoothstep(1.0 - smoothness - intensity, 1.0 - smoothness, dist * channelBias);
+    return color * mix(vec3(1.0), falloff, intensity);
+}
 
 void main() {
     ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
@@ -66,12 +110,20 @@ void main() {
         return;
     }
 
-    vec3 color = texelFetch(g_HDRColor, pixel, 0).rgb;
+    vec2 uv = (vec2(pixel) + 0.5) / vec2(res);
+
+    // --- Chromatic Aberration (operates on the raw HDR capture, before Bloom is layered on) ---
+    vec3 color = SampleWithChromaticAberration(uv, g_Params.chromaticAberrationIntensity);
 
     // --- Physical Camera / Auto Exposure: UE's own Iso100 photometric conversion, MaxLuminance =
     // 1.2 * 2^EV100, applied scene color scale = 1 / MaxLuminance.
     float exposureMultiplier = 1.0 / (1.2 * exp2(g_Exposure.currentEV100));
     color *= exposureMultiplier;
+
+    // --- Bloom (+ Lens Flare / Anamorphic Lens Flare / Lens Dirt, already baked into
+    // renderer::BloomPass's own output -- see that pass' own class comment) -- added at the same
+    // exposed scale as the rest of the scene color. ---
+    color += texture(g_Bloom, uv).rgb * exposureMultiplier * g_Params.bloomIntensity;
 
     // --- White Balance ---
     color = WhiteBalance(color, g_Params.whiteBalanceTempKelvin, g_Params.whiteBalanceTint);
@@ -80,6 +132,9 @@ void main() {
     color = ApplyContrast(color, g_Params.contrast);
     color = ColorCorrectLGG(color, g_Params.lift, g_Params.gamma, g_Params.gain);
     color = max(ApplySaturation(color, g_Params.saturation), vec3(0.0));
+
+    // --- Vignette + Vignette Color Bleed ---
+    color = ApplyVignette(color, uv, g_Params.vignetteIntensity, g_Params.vignetteSmoothness, g_Params.vignetteColorBleed);
 
     // --- Tone Mapping (ACES) ---
     color = ACESFilmicTonemap(color);
