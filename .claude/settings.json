@@ -1,5 +1,17 @@
 {
+  "permissions": {
+    "additionalDirectories": [
+      "d:\\DemoScene\\DemoScene_Vulkan2026_BaseArchi\\DemoScene_2026-vt-svt-streaming-worktree\\src\\renderer\\passes",
+      "d:\\DemoScene\\DemoScene_Vulkan2026_BaseArchi\\DemoScene_2026-vt-svt-streaming-worktree\\src\\renderer",
+      "d:\\DemoScene\\DemoScene_Vulkan2026_BaseArchi\\DemoScene_2026-megalights-phase-a-worktree\\src\\renderer",
+      "d:\\DemoScene\\DemoScene_Vulkan2026_BaseArchi\\DemoScene_2026-megalights-phase-a-worktree\\src\\shaders\\include",
+      "d:\\DemoScene\\DemoScene_Vulkan2026_BaseArchi\\DemoScene_2026-megalights-phase-a-worktree\\src\\shaders\\src\\Renderer",
+      "d:\\DemoScene\\DemoScene_Vulkan2026_BaseArchi\\DemoScene_2026-megalights-phase-a-worktree\\src\\renderer\\passes"
+    ]
+  },
   "autoApprove": true,
   "dangerouslyAllowAllCommands": true,
-  "approvedCommands": ["*"]
+  "approvedCommands": [
+    "*"
+  ]
 }

@@ -1,0 +1,254 @@
+CMake is re-running because D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/CMakeFiles/generate.stamp is out-of-date.
+  the file 'D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/CMakeLists.txt'
+  is newer than 'D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build/CMakeFiles/generate.stamp.depend'
+  result='-1'
+-- Selecting Windows SDK version 10.0.26100.0 to target Windows 10.0.26200.
+-- Including Win32 support
+-- Shader compiler found: C:/VulkanSDK/1.4.350.0/Bin/glslc.exe
+-- Configuring done (0.2s)
+-- Generating done (0.5s)
+-- Build files have been written to: D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/build
+MSBuild version 18.8.2+ce25c0108 for .NET Framework
+
+  Checking File Globs
+  1>Compiling shader: ClusterResolve.comp
+  4>Compiling shader: autosmooth.comp
+  3>Compiling shader: GlobalSDFComposite.comp
+  2>Compiling shader: ClusterResolveBinned.comp
+  Scanning sources for module dependencies...
+  Scanning sources for module dependencies...
+  Scanning sources for module dependencies...
+  Scanning sources for module dependencies...
+  Scanning sources for module dependencies...
+  ClusterSimplificationTests.cpp
+  ClusterPartitioner.cpp
+  Scanning sources for module dependencies...
+  Scanning sources for module dependencies...
+  glfw.vcxproj -> D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\vendor\glfw\src\Debug\glfw3.lib
+  ClusterPartitionerTests.cpp
+  ClusterPartitioner.cpp
+  Scanning sources for module dependencies...
+  ClusterDAG.cpp
+  CacheFileFormatTests.cpp
+  CardGenerator.cpp
+  ClusterPartitioner.cpp
+  MeshSDFTests.vcxproj -> D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\Debug\MeshSDFTests.exe
+  LoadingManagerTests.vcxproj -> D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\Debug\LoadingManagerTests.exe
+  Building Custom Rule D:/DemoScene/DemoScene_Vulkan2026_BaseArchi/DemoScene_2026/CMakeLists.txt
+  CacheFileManager.cpp
+  VirtualTextureTests.cpp
+  VirtualTextureManager.cpp
+  ClusterDAG.cpp
+  ClusterPartitioner.cpp
+  ClusterDAG.cpp
+  ClusterPartitioner.cpp
+  Compiling...
+  ClusterDAGTests.cpp
+  ClusterMaskSplitTests.cpp
+  Compiling...
+  Scanning sources for module dependencies...
+  ClusterSimplificationTests.cpp
+  Scanning sources for module dependencies...
+  ClusterPartitioner.cpp
+  ClusterPartitionerTests.cpp
+  ClusterPartitioner.cpp
+  VirtualTextureManager.cpp
+  Compiling...
+  Compiling...
+  Compiling...
+  VirtualTextureRenderPass.cpp
+  VmaUsage.cpp
+  VulkanUtils.cpp
+  GpuImage.cpp
+  StreamingRequestQueue.cpp
+  Compiling...
+  Camera.cpp
+  Logger.cpp
+  VirtualTextureRenderPassTests.cpp
+  LoadingManager.cpp
+  Logger.cpp
+  DebugTestPipeline.cpp
+  ValidationMessageSink.cpp
+  TestReport.cpp
+  GpuBuffer.cpp
+  VulkanPipeline.cpp
+  VirtualTextureManager.cpp
+  CardGenerator.cpp
+  ClusterDAG.cpp
+  ClusterPartitioner.cpp
+  ClusterPartitioner.cpp
+  VirtualTextureTests.cpp
+  ClusterPartitioner.cpp
+  ClusterPartitioner.cpp
+  ClusterDAGTests.cpp
+  ClusterMaskSplitTests.cpp
+  ClusterDAG.cpp
+  ClusterGrouping.cpp
+  CacheFileFormatTests.cpp
+  ClusterDAG.cpp
+  CardGenerator.cpp
+  FallbackMeshBuilder.cpp
+  CacheFileManager.cpp
+  GpuPageTable.cpp
+  MeshSDFGenerator.cpp
+  ClusterDAG.cpp
+  EntityBVH.cpp
+  VirtualGeometryCacheTest.cpp
+  AsyncFileStreamer.cpp
+  CacheFileManager.cpp
+  ObjExport.cpp
+  main.cpp
+  SurfaceCacheAtlasAllocator.cpp
+  ClusterRenderPipeline.cpp
+  MeshSimplifier.cpp
+  StreamingRequestQueue.cpp
+  VirtualTextureCacheFileManager.cpp
+  ClusterSoftwareRasterPass.cpp
+  ClusterHardwareRasterPass.cpp
+  DebugTextOverlay.cpp
+  ClusterCullingPass.cpp
+  ATrousDenoisePass.cpp
+  ClusterTriangleStatsPass.cpp
+  ClusterShadingBinPass.cpp
+  ClusterOcclusionCullingPass.cpp
+  ClusterLODSelectionPass.cpp
+  GICompositePass.cpp
+  ScreenshotCapture.cpp
+  ClusterResolvePass.cpp
+  GeometryDecompressionPass.cpp
+  GlobalSDFPass.cpp
+  ProceduralMaskGenerator.cpp
+  HZBPass.cpp
+  ReflectionPass.cpp
+  WorldProbeGridPass.cpp
+  SurfaceCacheTraceContext.cpp
+  TransparentForwardPass.cpp
+  SDFRayMarchPass.cpp
+  VirtualTextureRenderPass.cpp
+  ScreenProbeGIPass.cpp
+  ShadowMapPass.cpp
+  ScreenTracePass.cpp
+  GpuGeometryPagePool.cpp
+  TAATSRPass.cpp
+  VirtualShadowMapPool.cpp
+  GeometryStreamingCoordinator.cpp
+  SurfaceCacheRayTracingPass.cpp
+  VirtualShadowMapPass.cpp
+  FeedbackBuffer.cpp
+  SurfaceCacheSWRTPass.cpp
+  SurfaceCacheGIInjectPass.cpp
+  SurfaceCachePass.cpp
+  VirtualTextureStreamingCoordinator.cpp
+  VirtualTextureManager.cpp
+  GpuBuffer.cpp
+  GpuImage.cpp
+  AccelerationStructure.cpp
+  RayTracingFunctions.cpp
+  ClusterSimplificationTests.vcxproj -> D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\Debug\ClusterSimplificationTests.exe
+  Compiling...
+  VmaUsage.cpp
+  VulkanUtils.cpp
+  VulkanUtils.cpp
+  imgui_impl_glfw.cpp
+  VulkanContext.cpp
+  StreamingRequestQueue.cpp
+  GpuBuffer.cpp
+  VulkanPipeline.cpp
+  imgui_draw.cpp
+  imgui.cpp
+  imgui_widgets.cpp
+  imgui_demo.cpp
+  imgui_impl_vulkan.cpp
+  imgui_tables.cpp
+  VirtualTextureRenderPass.cpp
+  VirtualTextureManager.cpp
+  Logger.cpp
+  VirtualTextureRenderPassTests.cpp
+  VmaUsage.cpp
+  VulkanPipeline.cpp
+  VirtualTextureTests.vcxproj -> D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\Debug\VirtualTextureTests.exe
+  GpuImage.cpp
+  ClusterDAGTests.vcxproj -> D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\Debug\ClusterDAGTests.exe
+  ClusterMaskSplitTests.vcxproj -> D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\Debug\ClusterMaskSplitTests.exe
+  Compiling...
+  Camera.cpp
+  MeshSDFGenerator.cpp
+  EntityBVH.cpp
+  CardGenerator.cpp
+  ClusterDAG.cpp
+  Logger.cpp
+  ValidationMessageSink.cpp
+  CacheFileManager.cpp
+  ClusterPartitionerTests.vcxproj -> D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\Debug\ClusterPartitionerTests.exe
+  ClusterGrouping.cpp
+  ObjExport.cpp
+  ClusterPartitioner.cpp
+  main.cpp
+  SurfaceCacheAtlasAllocator.cpp
+  StreamingRequestQueue.cpp
+  FallbackMeshBuilder.cpp
+  MeshSimplifier.cpp
+  CacheFileFormatTests.vcxproj -> D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\Debug\CacheFileFormatTests.exe
+  VirtualTextureCacheFileManager.cpp
+  ClusterRenderPipeline.cpp
+  TestReport.cpp
+  VirtualGeometryCacheTest.cpp
+  GpuPageTable.cpp
+  AsyncFileStreamer.cpp
+  DebugTestPipeline.cpp
+  LoadingManager.cpp
+  VirtualTextureRenderPassTests.vcxproj -> D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\Debug\VirtualTextureRenderPassTests.exe
+  ClusterTriangleStatsPass.cpp
+  DebugTextOverlay.cpp
+  ScreenshotCapture.cpp
+  ClusterOcclusionCullingPass.cpp
+  ClusterCullingPass.cpp
+  ClusterResolvePass.cpp
+  ClusterShadingBinPass.cpp
+  ClusterLODSelectionPass.cpp
+  ClusterHardwareRasterPass.cpp
+  ATrousDenoisePass.cpp
+  ClusterSoftwareRasterPass.cpp
+  GICompositePass.cpp
+  GeometryDecompressionPass.cpp
+  SurfaceCacheRayTracingPass.cpp
+  HZBPass.cpp
+  ShadowMapPass.cpp
+  SurfaceCacheGIInjectPass.cpp
+  ScreenProbeGIPass.cpp
+  ProceduralMaskGenerator.cpp
+  ReflectionPass.cpp
+  SDFRayMarchPass.cpp
+  SurfaceCachePass.cpp
+  GlobalSDFPass.cpp
+  ScreenTracePass.cpp
+  SurfaceCacheSWRTPass.cpp
+  SurfaceCacheTraceContext.cpp
+  TAATSRPass.cpp
+  TransparentForwardPass.cpp
+  VirtualShadowMapPass.cpp
+  VirtualTextureRenderPass.cpp
+  GeometryStreamingCoordinator.cpp
+  WorldProbeGridPass.cpp
+  VirtualShadowMapPool.cpp
+  FeedbackBuffer.cpp
+  GpuGeometryPagePool.cpp
+  VirtualTextureManager.cpp
+  VirtualTextureStreamingCoordinator.cpp
+  GpuBuffer.cpp
+  GpuImage.cpp
+  AccelerationStructure.cpp
+  VmaUsage.cpp
+  RayTracingFunctions.cpp
+  VulkanContext.cpp
+  VulkanPipeline.cpp
+  VulkanUtils.cpp
+  imgui.cpp
+  imgui_demo.cpp
+  imgui_widgets.cpp
+  imgui_draw.cpp
+  imgui_tables.cpp
+  imgui_impl_glfw.cpp
+  imgui_impl_vulkan.cpp
+  DemoSceneVK.vcxproj -> D:\DemoScene\DemoScene_Vulkan2026_BaseArchi\DemoScene_2026\build\Debug\DemoSceneVK.exe
+  Deploying shader BuildDispatchIndirectArgs.comp.spv to executable directory	Deploying shader ClearVisBufferAtomic.comp.spv to executable directory	Deploying shader ClusterDAGScreenError.comp.spv to executable directory	Deploying shader ClusterFrustumCull.comp.spv to executable directory	Deploying shader ClusterHZBOcclusionCull.comp.spv to executable directory	Deploying shader ClusterLODCompact.comp.spv to executable directory	Deploying shader ClusterLODResidencyFallback.comp.spv to executable directory	Deploying shader ClusterResidencyCheck.comp.spv to executable directory	Deploying shader ClusterSoftwareRaster.comp.spv to executable directory	Deploying shader ClusterSoftwareRasterOpaque.comp.spv to executable directory	Deploying shader HZBBuildInit.comp.spv to executable directory	Deploying shader HZBReduce.comp.spv to executable directory	Deploying shader TransparentClusterCompact.comp.spv to executable directory	Deploying shader ComputeTriangleStats.comp.spv to executable directory	Deploying shader DebugText.frag.spv to executable directory	Deploying shader DebugText.vert.spv to executable directory	Deploying shader ATrousDenoise.comp.spv to executable directory	Deploying shader GIComposite.comp.spv to executable directory	Deploying shader GlobalSDFComposite.comp.spv to executable directory	Deploying shader ReflectionGather.comp.spv to executable directory	Deploying shader ReflectionTemporal.comp.spv to executable directory	Deploying shader ReflectionTrace.comp.spv to executable directory	Deploying shader SDFRayMarch.comp.spv to executable directory	Deploying shader ScreenProbeGather.comp.spv to executable directory	Deploying shader ScreenProbeTemporal.comp.spv to executable directory	Deploying shader ScreenProbeTrace.comp.spv to executable directory	Deploying shader ScreenTrace.comp.spv to executable directory	Deploying shader SurfaceCacheGIInject.comp.spv to executable directory	Deploying shader SurfaceCacheTraceSWRT.comp.spv to executable directory	Deploying shader WorldProbeInject.comp.spv to executable directory	Deploying shader autosmooth.comp.spv to executable directory	Deploying shader draw.comp.spv to executable directory	Deploying shader geom_TorusKnot.comp.spv to executable directory	Deploying shader geom_box.comp.spv to executable directory	Deploying shader geom_capsule.comp.spv to executable directory	Deploying shader geom_chamferBox.comp.spv to executable directory	Deploying shader geom_cone.comp.spv to executable directory	Deploying shader geom_cylinder.comp.spv to executable directory	Deploying shader geom_icosphere.comp.spv to executable directory	Deploying shader geom_plane.comp.spv to executable directory	Deploying shader geom_pyramide.comp.spv to executable directory	Deploying shader geom_sphere.comp.spv to executable directory	Deploying shader geom_torus.comp.spv to executable directory	Deploying shader geom_tube.comp.spv to executable directory	Deploying shader SurfaceCacheHWRT.rchit.spv to executable directory	Deploying shader SurfaceCacheHWRT.rgen.spv to executable directory	Deploying shader SurfaceCacheHWRT.rmiss.spv to executable directory	Deploying shader ClusterRaster.frag.spv to executable directory	Deploying shader ClusterRaster.vert.spv to executable directory	Deploying shader ClusterRasterOpaque.frag.spv to executable directory	Deploying shader ClusterResolve.comp.spv to executable directory	Deploying shader ClusterResolveBinned.comp.spv to executable directory	Deploying shader ClusterShadingBinClassify.comp.spv to executable directory	Deploying shader ClusterShadingBinPrefixSum.comp.spv to executable directory	Deploying shader ClusterShadingBinScatter.comp.spv to executable directory	Deploying shader ShadowMapCapture.vert.spv to executable directory	Deploying shader SurfaceCacheCapture.frag.spv to executable directory	Deploying shader SurfaceCacheCapture.vert.spv to executable directory	Deploying shader TAATSR.comp.spv to executable directory	Deploying shader TransparentForward.frag.spv to executable directory	Deploying shader TransparentForward.vert.spv to executable directory	Deploying shader draw.frag.spv to executable directory	Deploying shader draw.vert.spv to executable directory	Deploying shader DecompressClusterIndices.comp.spv to executable directory	Deploying shader DecompressClusterVertices.comp.spv to executable directory	Deploying shader ProceduralMaskGenerate.comp.spv to executable directory
