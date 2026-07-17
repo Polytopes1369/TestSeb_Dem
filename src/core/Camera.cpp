@@ -47,6 +47,17 @@ maths::vec3 Camera::GetTarget() const {
     return m_Position + GetForwardVector();
 }
 
+maths::vec3 Camera::GetRightVector() const {
+    // Right = forward x worldUp, matching mat4::LookAt's own s = f.Cross(up) convention so
+    // strafe movement stays consistent with the basis actually used to build the view matrix.
+    maths::vec3 worldUp{ 0.0f, 1.0f, 0.0f };
+    return GetForwardVector().Cross(worldUp).Normalize();
+}
+
+maths::vec3 Camera::GetUpVector() const {
+    return GetRightVector().Cross(GetForwardVector()).Normalize();
+}
+
 void Camera::Update(float aspectRatio) {
     maths::vec3 worldUp{ 0.0f, 1.0f, 0.0f };
     maths::vec3 forward = GetForwardVector();

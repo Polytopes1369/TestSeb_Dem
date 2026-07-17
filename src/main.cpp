@@ -13,6 +13,7 @@
 #include <cstring>
 #include <thread>
 #include <chrono>
+#include <algorithm>
 
 #ifndef NDEBUG
 #include "core/debug/DebugTestPipeline.h"
@@ -20,6 +21,29 @@
 #include "backends/imgui_impl_glfw.h"
 #include "backends/imgui_impl_vulkan.h"
 #endif
+
+// Unreal-editor style viewport navigation: hold the Right Mouse Button to enable FPS-style
+// mouselook (cursor hidden/locked) + WASD/QE flying, exactly like UE5's own viewport camera.
+// Compiled unconditionally (Debug and Release) since camera navigation is a core feature, not
+// a debug tool -- unlike DebugState below, which CLAUDE.md's build-separation rule keeps out of
+// Release entirely.
+struct CameraControlState {
+    bool rotating = false;
+    double lastMouseX = 0.0;
+    double lastMouseY = 0.0;
+    float moveSpeed = 5.0f; // meters/second, adjustable via mouse wheel while flying
+};
+static CameraControlState g_CameraControl;
+
+// Mouse wheel while flying (RMB held) adjusts fly speed, matching UE5's own viewport scroll
+// behavior. GLFW only exposes wheel deltas via callback (no polling equivalent), so this is the
+// one piece of camera input that can't live in the per-frame polling block below.
+static void ScrollCallback(GLFWwindow* window, double xoffset, double yoffset) {
+    (void)window; (void)xoffset;
+    if (yoffset > 0.0) g_CameraControl.moveSpeed *= 1.1f;
+    else if (yoffset < 0.0) g_CameraControl.moveSpeed *= 0.9f;
+    g_CameraControl.moveSpeed = std::clamp(g_CameraControl.moveSpeed, 0.5f, 100.0f);
+}
 
 #ifndef NDEBUG
 struct DebugState {
@@ -172,8 +196,13 @@ static void KeyCallback(GLFWwindow* window, int key, int scancode, int action, i
         LOG_INFO("[Debug] Requested DAG-cut gap dump (logged via LOG_WARNING/LOG_INFO in ~2 frames).");
         break;
     case GLFW_KEY_A:
-        g_DebugState.taatsrEnabled = !g_DebugState.taatsrEnabled;
-        LOG_INFO(std::format("[Debug] TAA + TSR Temporal Anti-Aliasing: {}", g_DebugState.taatsrEnabled ? "ON" : "OFF"));
+        // 'A' doubles as the fly-camera's strafe-left key (see CameraControlState below): only
+        // treat it as the TAA/TSR toggle when the RMB fly camera isn't actively capturing WASD,
+        // otherwise every strafe-left tap while flying would also flip TAA/TSR.
+        if (!g_CameraControl.rotating) {
+            g_DebugState.taatsrEnabled = !g_DebugState.taatsrEnabled;
+            LOG_INFO(std::format("[Debug] TAA + TSR Temporal Anti-Aliasing: {}", g_DebugState.taatsrEnabled ? "ON" : "OFF"));
+        }
         break;
     default:
         break;
@@ -223,6 +252,8 @@ int main(int argc, char** argv) {
 #ifndef NDEBUG
     glfwSetKeyCallback(window, KeyCallback);
 #endif
+    // Fly-camera wheel-speed adjustment: core navigation feature, wired in both Debug and Release.
+    glfwSetScrollCallback(window, ScrollCallback);
 
     VulkanContext vkContext;
     // Mirrors ClusterRenderPipeline::Init's own try/catch below: an exception escaping Init()
@@ -431,9 +462,11 @@ int main(int argc, char** argv) {
     }
 #endif
 
-    // Instantiate the camera looking at the origin; CameraOrbit() below repositions it every
-    // frame, so the initial position/target here only seed the pitch/yaw derivation.
-    Camera camera({ 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f });
+    // Instantiate the camera at the same vantage point the old auto-orbit used to start from
+    // (distance 14, azimuth 0, elevation 28 around the origin) so the 7-primitive grid is framed
+    // identically on frame 0; from here on the player drives the camera directly (see the
+    // Unreal-editor-style fly controller in the main loop below).
+    Camera camera({ 12.3613f, 6.5726f, 0.0f }, { 0.0f, 0.0f, 0.0f });
 
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
@@ -719,27 +752,69 @@ int main(int argc, char** argv) {
             glfwSetWindowShouldClose(window, GLFW_TRUE);
         }
 
-        // Orbit azimuth evolution -- scaled by wall-clock delta time (not a fixed per-FRAME step)
-        // so the camera's angular velocity stays constant regardless of frame-time variance (GPU
-        // stalls, load spikes): a fixed 0.05deg/frame step directly couples orbital speed to
-        // instantaneous frame time, which reads as camera judder/trembling whenever frame time
-        // isn't perfectly steady. 3.0 deg/sec matches the old 0.05 deg/frame step exactly at this
-        // engine's own 60fps config::TARGET_FPS default, so the demo's visual pacing is unchanged.
-        constexpr float kOrbitAngularSpeedDegPerSec = 3.0f;
-        static float azimuth = 0.0f;
-        static double s_LastOrbitUpdateTime = glfwGetTime();
-        double orbitNowTime = glfwGetTime();
-        float orbitDeltaTime = static_cast<float>(orbitNowTime - s_LastOrbitUpdateTime);
-        s_LastOrbitUpdateTime = orbitNowTime;
-        azimuth += kOrbitAngularSpeedDegPerSec * orbitDeltaTime;
-
         // Update entity rotations every frame so dynamic primitives spin
         vkContext.UpdateEntityRotations(static_cast<float>(glfwGetTime()));
-        // Orbit around 0,0,0 at a distance sized to keep the whole 7-primitive grid
-        // (roughly a 6m x 6m footprint centered on the origin) in view: bounding radius from
-        // the farthest grid corner (~4.3m) plus primitive half-extent (~0.8m) is ~5.1m, so a
-        // distance of 14m at a 45° FOV leaves a comfortable margin.
-        camera.CameraOrbit({ 0.0f, 0.0f, 0.0f }, 14.0f, azimuth, 28.0f);
+
+        // --- Unreal-editor style fly camera -----------------------------------------------
+        // Hold the Right Mouse Button to enable FPS-style mouselook (cursor hidden and locked
+        // to the window, like UE5's own viewport) plus WASD/QE flight; release RMB to get the
+        // cursor back for interacting with the ImGui panel. Mirrors UE5's viewport navigation
+        // exactly: RMB + WASD to fly, Q/E for down/up, Shift to sprint, mouse wheel to change
+        // fly speed (ScrollCallback above).
+        {
+            static double lastCameraTime = glfwGetTime();
+            double now = glfwGetTime();
+            float dt = static_cast<float>(now - lastCameraTime);
+            lastCameraTime = now;
+
+            bool rmbDown = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS;
+            if (rmbDown && !g_CameraControl.rotating) {
+                // Just started flying this frame: lock/hide the cursor and re-seed the last
+                // mouse position so the very first delta isn't a huge jump from wherever the
+                // cursor happened to be sitting before RMB was pressed.
+                glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+                glfwGetCursorPos(window, &g_CameraControl.lastMouseX, &g_CameraControl.lastMouseY);
+                g_CameraControl.rotating = true;
+            } else if (!rmbDown && g_CameraControl.rotating) {
+                glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+                g_CameraControl.rotating = false;
+            }
+
+            if (g_CameraControl.rotating) {
+                double mouseX, mouseY;
+                glfwGetCursorPos(window, &mouseX, &mouseY);
+                double deltaX = mouseX - g_CameraControl.lastMouseX;
+                double deltaY = mouseY - g_CameraControl.lastMouseY;
+                g_CameraControl.lastMouseX = mouseX;
+                g_CameraControl.lastMouseY = mouseY;
+
+                constexpr float mouseSensitivityDegPerPixel = 0.15f;
+                // Screen-space Y grows downward, so a positive deltaY (mouse moved down) must
+                // pitch the camera DOWN (negative pitch delta) to match player expectations.
+                camera.CameraRotate(static_cast<float>(deltaX) * mouseSensitivityDegPerPixel,
+                                     -static_cast<float>(deltaY) * mouseSensitivityDegPerPixel);
+
+                maths::vec3 forward = camera.GetForwardVector();
+                maths::vec3 right = camera.GetRightVector();
+                maths::vec3 worldUp{ 0.0f, 1.0f, 0.0f };
+                maths::vec3 moveDir{ 0.0f, 0.0f, 0.0f };
+
+                if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS) moveDir = moveDir + forward;
+                if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS) moveDir = moveDir - forward;
+                if (glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS) moveDir = moveDir + right;
+                if (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS) moveDir = moveDir - right;
+                if (glfwGetKey(window, GLFW_KEY_E) == GLFW_PRESS) moveDir = moveDir + worldUp;
+                if (glfwGetKey(window, GLFW_KEY_Q) == GLFW_PRESS) moveDir = moveDir - worldUp;
+
+                float moveLengthSq = moveDir.Dot(moveDir);
+                if (moveLengthSq > 0.0f) {
+                    moveDir = moveDir.Normalize();
+                    float speed = g_CameraControl.moveSpeed;
+                    if (glfwGetKey(window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS) speed *= 3.0f;
+                    camera.SetPosition(camera.GetPosition() + moveDir * (speed * dt));
+                }
+            }
+        }
 
         float aspect = static_cast<float>(vkContext.GetSwapchainExtent().width) /
             static_cast<float>(vkContext.GetSwapchainExtent().height);

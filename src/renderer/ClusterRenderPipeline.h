@@ -478,13 +478,12 @@ namespace renderer {
         // view path -- see RecordFrame()'s own comment for exactly why.
         ATrousDenoisePass m_Denoiser;
         TAATSRPass m_TAATSR;
-        // Final post-process stack (Phase PP1: Physical Camera auto-exposure -> White Balance ->
-        // Color Correction -> ACES Tone Mapping -> Gamma Correction), the normal-view-path blit
-        // source instead of m_TAATSR's own raw HDR output directly -- see PostProcessPass's own
-        // class comment for why this must be the very last compute step before the final blit.
+        // Phase PP1 (post-process stack roadmap): Physical Camera / Auto Exposure / White Balance /
+        // Color Correction / ACES Tone Mapping / Gamma Correction -- the normal-view-path blit
+        // source instead of m_TAATSR's own raw HDR output directly (see PostProcessPass's own class
+        // comment for the full 3-stage pipeline and why Gamma Correction here is the pipeline's
+        // only display encode, not decorative).
         PostProcessPass m_PostProcess;
-        PostProcessPass::Settings m_PostProcessSettings; // UE5.8 Post Process Volume defaults (see Settings' own comment).
-        float m_LastFrameTimeSeconds = 0.0f; // Wall-clock delta feeding m_PostProcess's own eye-adaptation speed.
 
         // Previous frame's combined view-projection matrix -- ClusterResolve.comp's own
         // DEBUG_VIEW_MOTION_VECTORS reprojects a pixel's (static, see this class' own "Entity self-
@@ -497,6 +496,14 @@ namespace renderer {
         // Advances once per RecordFrame() call -- ScreenProbeTrace.comp's own per-frame Fibonacci-
         // sphere jitter rotation (include/sh_probe.glsl's JitterDirection).
         uint32_t m_FrameIndex = 0;
+
+        // globalTimeSeconds (RecordFrame()'s own parameter) from the previous call -- differenced
+        // against this frame's own value to get a real per-frame delta time for m_PostProcess's
+        // Auto Exposure eye-adaptation (PostProcessPass::RecordComposite's own deltaTimeSeconds
+        // parameter). Not Debug-only (unlike the stat overlay's own m_LastStatsSampleTime below):
+        // exposure adaptation is a real Release-time effect, not debug tooling.
+        float m_LastFrameTimeSeconds = 0.0f;
+        bool m_HasLastFrameTime = false;
 
 #ifndef NDEBUG
         uint32_t m_DebugTraceMode = 0;

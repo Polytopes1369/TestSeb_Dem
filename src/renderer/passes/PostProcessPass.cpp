@@ -123,16 +123,14 @@ namespace renderer {
         });
 
         // --- Descriptor pool (shared by all 3 stages' sets) ---
+        // STORAGE_BUFFER count of 4: Histogram set uses 1 (HistogramSSBO), Adapt set uses 2
+        // (HistogramSSBO + ExposureStateSSBO), Composite set uses 1 (ExposureStateSSBO read-only).
         std::array<VkDescriptorPoolSize, 4> poolSizes{ {
             { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2 }, // Histogram + Composite HDR input.
             { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1 },          // Composite output.
-            { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3 },         // Histogram (x2 sets) + ExposureState (x2 sets), see counts below.
+            { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4 },
             { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 },         // Composite params.
         } };
-        // StorageBuffer count above undercounts on purpose-checked math: Histogram set uses 1
-        // (HistogramSSBO), Adapt set uses 2 (HistogramSSBO + ExposureStateSSBO), Composite set uses
-        // 1 (ExposureStateSSBO read-only) -- 4 total STORAGE_BUFFER descriptor writes across 3 sets.
-        poolSizes[2].descriptorCount = 4;
 
         VkDescriptorPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
         poolInfo.maxSets = 3;

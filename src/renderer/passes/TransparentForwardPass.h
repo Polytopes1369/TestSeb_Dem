@@ -49,6 +49,15 @@
 //
 // Exactly like every other piece of this Nanite-style pipeline, this class is a self-contained
 // building block -- Init()/Shutdown()/RecordDraw() only.
+//
+// --- Phase 5 integration (UE5.8 parity roadmap, translucency) ---
+// Shading upgraded from flat sun-only Lambertian to: direct lighting (sun + point lights, both
+// shadowed, matching SurfaceCacheCapture.frag's own ComputeDirectLighting), indirect diffuse from
+// the World Probe Grid (applied to every transparent material -- cheap, one 3D texture sample),
+// and a traced front-layer specular reflection (Lumen-style, HWRT/SWRT, GGX-VNDF single sample)
+// gated PER-MATERIAL by renderer::MaterialParameters::hasReflections -- matching real UE5.8's
+// "Output Reflections" material toggle, not applied to every transparent surface uniformly. See
+// TransparentForward.frag's own header comment for the exact composite formula.
 
 #include <array>
 #include <cstdint>
@@ -60,10 +69,13 @@
 #include "geometry/ClusterFormat.h"
 #include "renderer/vulkan/GpuBuffer.h"
 #include "renderer/MaterialParameterTable.h"
+#include "renderer/LightingTypes.h"
 
 namespace renderer {
 
     class VirtualShadowMapPass;
+    class WorldProbeGridPass;
+    class SurfaceCacheTraceContext;
 
     // CPU/GPU-shared, std430-compatible layout for this pass's own static candidate list --
     // deliberately NOT geometry::ClusterCullMetadata (no LOD/occlusion culling ever runs against
@@ -100,16 +112,34 @@ namespace renderer {
         // `entityTransformBuffer`/`entityDataBuffer`/`wpoGlobalsBuffer` mirror ClusterRaster.vert's
         // own identically-purposed bindings. `colorFormat`/`depthFormat` must match whatever image
         // RecordDraw() will later target -- renderer::GICompositePass::kOutputFormat (the image this
-        // pass actually draws onto, see RecordDraw()'s own call site) and the shared hardware depth
-        // image's format, respectively. `tlas`/`lightBuffer`/
-        // `lightBufferSize` (MegaLights Phase A follow-up) are renderer::SurfaceCacheRayTracingPass
-        // ::GetTLASHandle() and renderer::MegaLightsPass::GetLightBufferHandle()/GetLightBufferSize()
-        // -- both must already exist by the time this is called (the caller must Init() those two
-        // passes first, see renderer::ClusterRenderPipeline::Init()'s own ordering comment), bound
-        // once here at bindings 11/12 for TransparentForward.frag's own inline RIS shadow-ray shading
-        // (megalights_ris.glsl's SelectLightRIS, same algorithm renderer::MegaLightsPass's opaque
-        // path uses -- see that shader's own header comment for why this is inlined rather than a
-        // separate compute pass: translucent surfaces have no GBuffer entry for one to read from).
+        // pass actually draws onto, see RecordDraw()'s own call site, NOT renderer::ClusterResolvePass::
+        // kOutputColorFormat) and the shared hardware depth image's format, respectively.
+        //
+        // Phase 5 additions, all consumed by TransparentForward.frag's new shading (see class
+        // comment): `worldProbes` for indirect-diffuse sampling (GetGridView()/GetGridSampler()/
+        // GetGridOriginWorld()); `tlas`/`fallbackVertexBuffer`/`fallbackIndexBuffer`/
+        // `drawRangeBuffer` for the optional (per-material `hasReflections`) HWRT/SWRT reflection
+        // trace -- same buffers renderer::ReflectionTrace.comp's own HWRT path borrows (renderer::
+        // SurfaceCacheRayTracingPass::GetTLASHandle()/GetDrawRangeBuffer(), renderer::
+        // SurfaceCachePass::GetVertexBuffer()/GetIndexBuffer()); `traceContext` for its two
+        // ready-made SWRT descriptor-set LAYOUTS (mesh_sdf_trace set 1, surface_cache_sampling set
+        // 2) -- fixed at pipeline-layout-creation time here, same convention as renderer::
+        // ReflectionPass::Init()'s own identical 3-set pipeline layout; the actual VkDescriptorSets
+        // are re-bound every RecordDraw() call, not stored.
+        //
+        // MegaLights Phase A follow-up (reconciled with the above -- see class comment): `tlas` is
+        // the SAME renderer::SurfaceCacheRayTracingPass::GetTLASHandle() already listed above, bound
+        // ONCE at binding 11 and used by BOTH the reflection trace's TraceHWRT and MegaLights' own
+        // TraceShadowRay -- no second TLAS binding. `lightBuffer`/`lightBufferSize` are renderer::
+        // MegaLightsPass::GetLightBufferHandle()/GetLightBufferSize(), bound at binding 12,
+        // consumed by TransparentForward.frag's inlined RIS point-light selection (megalights_ris
+        // .glsl's SelectLightRIS -- translucent surfaces have no GBuffer entry for MegaLightsPass's
+        // own compute-pass composite to reach, so this mirrors that composite's algorithm inline
+        // instead). Both must already exist by the time this is called -- the caller must Init()
+        // renderer::SurfaceCacheRayTracingPass and renderer::MegaLightsPass first (see renderer::
+        // ClusterRenderPipeline::Init()'s own ordering comment). Per-entity point-light shadowing
+        // (VSM cube faces) is deliberately NOT bound here any more -- MegaLights' own traced shadow
+        // ray supersedes it for this pass, see TransparentForward.frag's own header comment.
         void Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
             VkBuffer pageTableBuffer, VkBuffer compressedPhysicalPoolBuffer,
             VkBuffer entityTransformBuffer, VkBuffer entityDataBuffer, VkBuffer wpoGlobalsBuffer,
@@ -117,7 +147,9 @@ namespace renderer {
             const std::vector<geometry::ClusterIndexEntry>& indexEntries,
             const std::vector<geometry::DAGNodeEntry>& dagEntries,
             VkFormat colorFormat, VkFormat depthFormat,
-            VkAccelerationStructureKHR tlas, VkBuffer lightBuffer, VkDeviceSize lightBufferSize);
+            const WorldProbeGridPass& worldProbes, const SurfaceCacheTraceContext& traceContext,
+            VkAccelerationStructureKHR tlas, VkBuffer lightBuffer, VkDeviceSize lightBufferSize,
+            VkBuffer fallbackVertexBuffer, VkBuffer fallbackIndexBuffer, VkBuffer drawRangeBuffer);
 
         void Shutdown();
 
@@ -134,22 +166,33 @@ namespace renderer {
         // transitions `colorImage` GENERAL -> COLOR_ATTACHMENT_OPTIMAL, begins rendering against it
         // (loadOp=LOAD, preserving the opaque scene already there) and `depthView` (loadOp=LOAD,
         // depthWriteEnable=FALSE -- read-only, must already be VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_
-        // ONLY_OPTIMAL), issues one vkCmdDrawIndexedIndirect covering every static entry (a
+        // ONLY_OPTIMAL), issues one vkCmdDrawIndexedIndirectCount covering every static entry (a
         // zero-indexCount command is a defined Vulkan no-op for any entry whose page isn't resident
-        // this frame), ends rendering, and transitions `colorImage` back to GENERAL. `colorImage`/
-        // `colorView` must be whichever image the caller is about to blit to the swapchain this
-        // frame (see class comment) -- must have VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT (both of this
-        // pipeline's candidate images already do, see renderer::ClusterResolvePass::Init()'s own
-        // comment on why). `decompressedIndexPoolBuffer` is renderer::GeometryDecompressionPass::
+        // this frame; *Count, not the plain indirect draw, since m_ClusterCount can exceed 1 and
+        // this device does not enable multiDrawIndirect -- see m_DrawCountBuffer's own comment),
+        // ends rendering, and transitions `colorImage` back to GENERAL. `colorImage`/`colorView`
+        // must be whichever image the caller is about to blit to the swapchain this frame (see
+        // class comment) -- must have VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT (both of this pipeline's
+        // candidate images already do, see renderer::ClusterResolvePass::Init()'s own comment on
+        // why). `decompressedIndexPoolBuffer` is renderer::GeometryDecompressionPass::
         // GetDecompressedIndexPoolBuffer() -- rebound every call since which buffer is current can
         // change as pages stream in/out, matching ClusterHardwareRasterPass::RecordDraw()'s own
-        // convention. `sunDirection` -- see renderer::ClusterResolvePass::RecordResolve's identical
-        // parameter comment (points FROM the light TOWARD the scene). `frameIndex` feeds the same
-        // Halton-indexed RIS candidate decorrelation renderer::MegaLightsPass's opaque path uses
-        // (megalights_ris.glsl's SelectLightRIS).
+        // convention. `cameraPositionWorld` -- feeds the optional reflection trace's view-direction
+        // reconstruction (fragment stage; `view`/`proj` are vertex-stage only, see TransparentForward
+        // .vert). `sceneLights` -- only `.sun` is read now (MegaLights' own traced shadow ray
+        // supersedes this pass's own point-light shadowing, see class comment); packed into
+        // TransparentViewParamsUBO every call, consumed by the fragment stage's ComputeDirectLighting
+        // (see TransparentForward.frag's own comment). `traceContext` -- the SAME instance passed to
+        // Init() (fixed set LAYOUTS there; here, its current VkDescriptorSets are bound, since the
+        // two never change after that context's own one-time build). `traceMode` (0 = SWRT, 1 = HWRT)
+        // / `frameIndex` -- pushed as push-constants, consumed by both the optional per-material
+        // reflection trace (renderer::ReflectionPass::RecordTrace's identical convention) and
+        // MegaLights' own RIS candidate decorrelation (megalights_ris.glsl's SelectLightRIS).
         void RecordDraw(VkCommandBuffer cmd, VkImage colorImage, VkImageView colorView, VkImageView depthView,
             VkExtent2D renderExtent, const maths::mat4& view, const maths::mat4& proj,
-            VkBuffer decompressedIndexPoolBuffer, const maths::vec3& sunDirection, uint32_t frameIndex);
+            VkBuffer decompressedIndexPoolBuffer, const maths::vec3& cameraPositionWorld,
+            const SceneLights& sceneLights,
+            const SurfaceCacheTraceContext& traceContext, uint32_t traceMode, uint32_t frameIndex);
 
         uint32_t GetTransparentClusterCount() const { return m_ClusterCount; }
 
@@ -162,11 +205,22 @@ namespace renderer {
 
         GpuBuffer m_ClusterEntriesBuffer;  // TransparentClusterEntry[m_ClusterCount], std430, GPU_ONLY. Written once at Init().
         GpuBuffer m_IndirectCommandsBuffer; // VkDrawIndexedIndirectCommand[m_ClusterCount], std430|INDIRECT, GPU_ONLY. Rewritten every frame.
-        GpuBuffer m_ViewParamsBuffer;       // TransparentViewParamsUBO (view, proj, sunDirection), std140, GPU_ONLY.
+        // Constant uint32_t = m_ClusterCount, written once at Init(). vkCmdDrawIndexedIndirectCount's
+        // required count SOURCE buffer -- m_ClusterCount is fixed after Init() (no per-frame LOD/
+        // culling ever changes it, see class comment), so this never needs rewriting, but the count
+        // must still come from a GPU buffer (there is no vkCmdDrawIndexedIndirect overload that takes
+        // a >1 host-known drawCount without the multiDrawIndirect feature, which this device does not
+        // enable -- RecordDraw() previously hit exactly that cap, see its own updated comment).
+        GpuBuffer m_DrawCountBuffer;
+        GpuBuffer m_ViewParamsBuffer;       // TransparentViewParamsUBO (view, proj, full SceneLights), std140, GPU_ONLY.
         // MaterialParameters[kMaxMaterials], this pass's own copy of Init()'s `materialTable`
         // parameter -- see Init()'s own comment on why this isn't shared with ClusterResolvePass's
         // identical-content SSBO.
         GpuBuffer m_MaterialParamsBuffer;
+        // World Probe Grid addressing (gridOrigin/probeSpacing/gridResolution), std140, GPU_ONLY --
+        // written once at Init() (the grid's own addressing is static; only its texel CONTENTS
+        // change frame to frame, sampled directly from renderer::WorldProbeGridPass's own image).
+        GpuBuffer m_WorldProbeGridParamsBuffer;
 
         // --- Pipeline 1: TransparentClusterCompact.comp (per-frame physical-page resolve + residency). ---
         VkDescriptorSetLayout m_CompactSetLayout = VK_NULL_HANDLE;
@@ -174,7 +228,10 @@ namespace renderer {
         VkPipelineLayout m_CompactPipelineLayout = VK_NULL_HANDLE;
         VkPipeline m_CompactPipeline = VK_NULL_HANDLE;
 
-        // --- Pipeline 2: TransparentForward.vert/.frag (the actual alpha-blended draw). ---
+        // --- Pipeline 2: TransparentForward.vert/.frag (the actual alpha-blended draw). Pipeline
+        // layout has 3 sets: this pass's own m_ForwardSetLayout (set 0) + the SurfaceCacheTraceContext
+        // instance passed to Init()'s own mesh_sdf_trace (set 1) / surface_cache_sampling (set 2)
+        // layouts -- same 3-set shape as renderer::ReflectionPass::Init()'s own pipeline layout. ---
         VkDescriptorSetLayout m_ForwardSetLayout = VK_NULL_HANDLE;
         VkDescriptorSet m_ForwardDescriptorSet = VK_NULL_HANDLE;
         VkPipelineLayout m_ForwardPipelineLayout = VK_NULL_HANDLE;
