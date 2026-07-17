@@ -22,7 +22,11 @@ namespace renderer {
             float sunDirectionX = 0.0f;
             float sunDirectionY = 0.0f;
             float sunDirectionZ = 0.0f;
-            float _pad0 = 0.0f;
+            // Was a pure pad float; repurposed to carry this frame's index for RIS candidate
+            // decorrelation (megalights_ris.glsl's SelectLightRIS) -- same 16-byte slot, zero size
+            // change, matches this codebase's existing "no unused padding once there's a real field
+            // to put there" pattern.
+            uint32_t frameIndex = 0;
         };
         static_assert(sizeof(TransparentViewParams) == 144,
             "TransparentViewParams must match TransparentViewParamsUBO in TransparentForward.vert/.frag exactly (std140 layout)");
@@ -35,7 +39,8 @@ namespace renderer {
         const std::array<MaterialParameters, kMaxMaterials>& materialTable,
         const std::vector<geometry::ClusterIndexEntry>& indexEntries,
         const std::vector<geometry::DAGNodeEntry>& dagEntries,
-        VkFormat colorFormat, VkFormat depthFormat) {
+        VkFormat colorFormat, VkFormat depthFormat,
+        VkAccelerationStructureKHR tlas, VkBuffer lightBuffer, VkDeviceSize lightBufferSize) {
         Shutdown();
 
         m_Device = device;
@@ -92,14 +97,15 @@ namespace renderer {
         // =====================================================================================
         // Descriptor pool, shared by both descriptor sets below.
         // =====================================================================================
-        VkDescriptorPoolSize poolSizes[3]{};
-        poolSizes[0] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8 };            // Compact(3) + Forward(5: entries, pool, entityXform, entityData, materialParams).
+        VkDescriptorPoolSize poolSizes[4]{};
+        poolSizes[0] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 9 };            // Compact(3) + Forward(6: entries, pool, entityXform, entityData, materialParams, MegaLights g_Lights).
         poolSizes[1] = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 3 };            // Forward: WPOGlobals, ViewParams, g_ShadowSunLevels (binding 10, wired in by SetVirtualShadowMap).
         poolSizes[2] = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1 };    // Forward: shadow physical atlas.
+        poolSizes[3] = { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1 }; // Forward: MegaLights shadow-ray TLAS.
 
         VkDescriptorPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
         poolInfo.maxSets = 2;
-        poolInfo.poolSizeCount = 3;
+        poolInfo.poolSizeCount = 4;
         poolInfo.pPoolSizes = poolSizes;
         VK_CHECK(vkCreateDescriptorPool(m_Device, &poolInfo, nullptr, &m_DescriptorPool));
 
@@ -148,7 +154,7 @@ namespace renderer {
         // (Phase 3's renderer::VirtualShadowMapPass resources) left for SetVirtualShadowMap().
         // =====================================================================================
         {
-            VkDescriptorSetLayoutBinding bindings[11]{};
+            VkDescriptorSetLayoutBinding bindings[13]{};
             bindings[0] = { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, nullptr };   // TransparentClusterEntriesSSBO
             bindings[1] = { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, nullptr };   // CompressedClusterPoolSSBO
             bindings[2] = { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, nullptr };   // EntityTransformBuffer
@@ -160,9 +166,16 @@ namespace renderer {
             bindings[8] = { 8, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr }; // g_ShadowPageTable
             bindings[9] = { 9, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr }; // g_ShadowFeedback
             bindings[10] = { 10, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr }; // g_ShadowSunLevels
+            // MegaLights Phase A follow-up: unlike bindings 7-10 above (deferred to
+            // SetVirtualShadowMap(), called after this Init()), the TLAS/light SSBO ARE already
+            // available here -- renderer::ClusterRenderPipeline::Init() Init()s renderer::
+            // SurfaceCacheRayTracingPass and renderer::MegaLightsPass before this pass specifically
+            // so these two can be written immediately below, not deferred.
+            bindings[11] = { 11, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr }; // g_TLAS
+            bindings[12] = { 12, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr }; // MegaLightsSSBO (g_Lights)
 
             VkDescriptorSetLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-            layoutInfo.bindingCount = 11;
+            layoutInfo.bindingCount = 13;
             layoutInfo.pBindings = bindings;
             VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &layoutInfo, nullptr, &m_ForwardSetLayout));
 
@@ -204,6 +217,28 @@ namespace renderer {
             // Bindings 7-10 (Phase 3's renderer::VirtualShadowMapPass resources) are intentionally
             // left unwritten here -- SetVirtualShadowMap() writes them once the caller has a
             // VirtualShadowMapPass to bind, same convention as renderer::ClusterResolvePass's own.
+
+            // Bindings 11/12 (MegaLights Phase A follow-up): written immediately, unlike 7-10 above,
+            // since both resources already exist by the time this Init() runs (see this Init()'s own
+            // parameter comment). The acceleration-structure write needs its own pNext chain, so it
+            // is issued as a separate vkUpdateDescriptorSets call -- same pattern renderer::
+            // MegaLightsPass::Init() already uses (not VulkanUtils::WriteSharedGeometryBindings,
+            // which also writes 3 unneeded vertex/index/draw-range bindings this shadow-ray-only
+            // query has no use for, see MegaLightsShade.comp's own TraceShadowRay comment).
+            VkDescriptorBufferInfo lightBufferInfo{ lightBuffer, 0, lightBufferSize };
+            VkWriteDescriptorSet lightBufferWrite{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ForwardDescriptorSet, 12, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &lightBufferInfo, nullptr };
+            vkUpdateDescriptorSets(m_Device, 1, &lightBufferWrite, 0, nullptr);
+
+            VkWriteDescriptorSetAccelerationStructureKHR accelWrite{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR };
+            accelWrite.accelerationStructureCount = 1;
+            accelWrite.pAccelerationStructures = &tlas;
+            VkWriteDescriptorSet accelDescriptorWrite{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+            accelDescriptorWrite.pNext = &accelWrite;
+            accelDescriptorWrite.dstSet = m_ForwardDescriptorSet;
+            accelDescriptorWrite.dstBinding = 11;
+            accelDescriptorWrite.descriptorCount = 1;
+            accelDescriptorWrite.descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+            vkUpdateDescriptorSets(m_Device, 1, &accelDescriptorWrite, 0, nullptr);
 
             VkPipelineLayoutCreateInfo pipelineLayoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
             pipelineLayoutInfo.setLayoutCount = 1;
@@ -362,18 +397,19 @@ namespace renderer {
 
     void TransparentForwardPass::RecordDraw(VkCommandBuffer cmd, VkImage colorImage, VkImageView colorView, VkImageView depthView,
         VkExtent2D renderExtent, const maths::mat4& view, const maths::mat4& proj,
-        VkBuffer decompressedIndexPoolBuffer, const maths::vec3& sunDirection) {
+        VkBuffer decompressedIndexPoolBuffer, const maths::vec3& sunDirection, uint32_t frameIndex) {
         if (m_ClusterCount == 0) {
             return;
         }
 
-        // --- Upload this frame's view/proj/sunDirection. ---
+        // --- Upload this frame's view/proj/sunDirection/frameIndex. ---
         TransparentViewParams viewParams{};
         viewParams.view = view;
         viewParams.proj = proj;
         viewParams.sunDirectionX = sunDirection.x;
         viewParams.sunDirectionY = sunDirection.y;
         viewParams.sunDirectionZ = sunDirection.z;
+        viewParams.frameIndex = frameIndex;
         vkCmdUpdateBuffer(cmd, m_ViewParamsBuffer.Handle(), 0, sizeof(TransparentViewParams), &viewParams);
 
         VkMemoryBarrier2 uboBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
