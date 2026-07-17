@@ -225,6 +225,12 @@ private:
     // stylized, and would be the single worst-case primitive for TransparentForwardPass's
     // unsorted-between-entities blending, being by far the largest on screen).
     static constexpr uint32_t kFloorEntityIndex = kEntityCount - 1;
+    // Phase 7a (UE5.8 parity roadmap, hero asset tessellation): the Icosphere -- generated FIRST
+    // (see GenerateGeometry()'s own "Icosphere-first" comment, `m_EntityData[2].meshID` used
+    // directly), the single tessellated/displaced hero asset, rendered by
+    // renderer::HeroTessellationPass instead of the opaque Nanite path -- see BuildEntityData()'s
+    // own kHeroMaterialID override.
+    static constexpr uint32_t kHeroEntityIndex = 2;
 
     // CPU-authoritative entity records: built once by BuildEntityData() (meshID assigned via
     // core::IDManager) before GenerateGeometry() runs, then copied to m_EntityBuffer by

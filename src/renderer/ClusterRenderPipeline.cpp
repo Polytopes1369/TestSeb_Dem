@@ -512,6 +512,37 @@ bool ClusterRenderPipeline::Init(
                             m_SurfaceCacheRT.GetDrawRangeBuffer());
   m_TransparentForward.SetVirtualShadowMap(m_VirtualShadowMap);
 
+  // Phase 7a (UE5.8 parity roadmap, hero asset tessellation): forward-rendered, tessellated/
+  // displaced hero Icosphere -- see ClusterRenderPipeline.h's own comment on m_HeroTessellation.
+  // Same borrowed-resource contract as m_TransparentForward above, resolved for the hero entity
+  // instead of every transparent entity; `heroMaterial` is the caller's own
+  // materialTable.params[renderer::kHeroMaterialID] slot (populated by
+  // GenerateRandomMaterialTable()'s own hero-recipe override, see that function's own comment).
+  {
+    // Matches VulkanContext::kHeroEntityIndex exactly (the Icosphere, generated first -- see that
+    // class' own comment) -- a plain literal here rather than a cross-file constant reference,
+    // since ClusterRenderPipeline.cpp does not otherwise depend on VulkanContext.h.
+    constexpr uint32_t kHeroEntityID = 2u;
+    const auto& entityRanges = m_SurfaceCache.GetEntityRanges();
+    const auto heroRangeIt = entityRanges.find(kHeroEntityID);
+    if (heroRangeIt == entityRanges.end()) {
+      LOG_ERROR("[ClusterRenderPipeline] Hero entity (meshID=2) has no Fallback Mesh draw range -- cannot initialize HeroTessellationPass.");
+      return false;
+    }
+    if (!m_HeroTessellation.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
+                            GICompositePass::kOutputFormat, createInfo.depthFormat,
+                            createInfo.entityTransformBuffer,
+                            createInfo.materialTable.params[kHeroMaterialID],
+                            m_SurfaceCache.GetVertexBuffer(), m_SurfaceCache.GetIndexBuffer(),
+                            heroRangeIt->second, kHeroEntityID,
+                            m_SurfaceCacheRT.GetTLASHandle(), m_SurfaceCacheRT.GetDrawRangeBuffer(),
+                            m_MegaLights.GetLightBufferHandle(), m_MegaLights.GetLightBufferSize(),
+                            m_VirtualShadowMap, m_WorldProbes, m_TraceContext)) {
+      LOG_ERROR("[ClusterRenderPipeline] Failed to initialize HeroTessellationPass.");
+      return false;
+    }
+  }
+
   // Screen Trace GI -- linear screen-space depth raymarching falling back to the World Probe grid.
   m_ScreenTrace.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
                      createInfo.renderExtent, m_Resolve.GetOutputDepthView(), m_Resolve.GetOutputNormalView(),
@@ -642,6 +673,7 @@ void ClusterRenderPipeline::Shutdown() {
   m_DebugTraceMode = 0;
 #endif
 
+  m_HeroTessellation.Shutdown();
   m_TransparentForward.Shutdown();
   m_ShadingBin.Shutdown();
   m_Resolve.Shutdown();
@@ -1511,6 +1543,16 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
   {
     VkImage transparentTargetImage = m_GIComposite.GetOutputImage();
     VkImageView transparentTargetView = m_GIComposite.GetOutputView();
+
+    // Phase 7a (UE5.8 parity roadmap, hero asset tessellation): recorded BEFORE the glass/
+    // translucent draw below, deliberately -- this pass WRITES real depth (unlike glass, which
+    // only reads it), so glass's own subsequent depth test correctly occludes against this
+    // entity's real (displaced) surface. See HeroTessellationPass's own class comment for the
+    // widened synchronization scope this write requires on exit.
+    m_HeroTessellation.RecordDraw(cmd, viewProj, cameraFrameInfo.position,
+        transparentTargetImage, transparentTargetView, m_DepthImage, m_DepthImageView,
+        m_RenderExtent, traceMode, m_FrameIndex, m_TraceContext, m_WorldProbes, m_SceneLights);
+
     m_TransparentForward.RecordDraw(cmd, transparentTargetImage, transparentTargetView, m_DepthImageView,
         m_RenderExtent, cameraCopy.view, cameraCopy.proj, m_Decompression.GetDecompressedIndexPoolBuffer(),
         cameraFrameInfo.position, m_SceneLights, m_TraceContext, traceMode, m_FrameIndex);

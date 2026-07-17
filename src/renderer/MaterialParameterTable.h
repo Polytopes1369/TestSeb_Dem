@@ -56,6 +56,15 @@ namespace renderer {
     // entity gets its own unique materialID today, see GenerateRandomMaterialTable's own comment).
     inline constexpr uint32_t kMaxMaterials = 32u;
 
+    // Phase 7a (UE5.8 parity roadmap, hero asset tessellation): the single tessellated/displaced
+    // hero material. Deliberately set to VulkanContext::kEntityCount (13) -- one past the highest
+    // entity-index-derived materialID GenerateRandomMaterialTable() ever assigns (entities 0..12
+    // each get materialID == their own index) -- so this reserved slot can never collide with an
+    // entity's own randomly-rolled material. Assigned explicitly to exactly one entity (the
+    // Icosphere, VulkanContext::kHeroEntityIndex) in VulkanContext::BuildEntityData(), never
+    // reached via the per-entity assignment loop.
+    inline constexpr uint32_t kHeroMaterialID = 13u;
+
     // One generated table: the PBR parameters themselves, plus a parallel convenience flag so
     // callers (VulkanContext::BuildEntityData, deciding each entity's core::EntityFlags::
     // IsTransparent bit) don't need to re-derive "alpha < 1.0" themselves.
@@ -160,6 +169,21 @@ namespace renderer {
 
             table.isTransparent[i] = (p.alpha < 1.0f);
         }
+
+        // Phase 7a (UE5.8 parity roadmap, hero asset tessellation): hero rocky/stone recipe --
+        // earthy brown-gray, high roughness (no sharp specular, matching a weathered rock
+        // surface), fully opaque, reflections ON (a subtle sheen, showcasing
+        // renderer::HeroTessellationPass's own GGX-VNDF reflection trace the same way the
+        // "Transparent: clear/glass-like" category above showcases it for
+        // TransparentForwardPass). Rendered ONLY by renderer::HeroTessellationPass; never reaches
+        // the opaque Nanite resolve shaders (its entity is unconditionally excluded from that path
+        // via core::EntityFlags::IsTransparent, see VulkanContext::BuildEntityData()'s own
+        // comment) nor TransparentForwardPass (table.isTransparent[kHeroMaterialID] stays false).
+        // kHeroMaterialID (13) sits past clampedCount (== usedSlotCount, 13 entities, slots 0-12),
+        // so the loop above never touches it -- still at this function's own top-of-array neutral
+        // default until overwritten here.
+        table.params[kHeroMaterialID] = MaterialParameters{
+            maths::vec3(0.40f, 0.33f, 0.27f), 0.92f, maths::vec3(0.0f, 0.0f, 0.0f), 0.0f, 1.0f, 0.0f, 1.0f, 0.0f };
 
         return table;
     }
