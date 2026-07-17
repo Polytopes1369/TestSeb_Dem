@@ -2,14 +2,17 @@
 #extension GL_GOOGLE_include_directive : enable
 #extension GL_EXT_ray_query : require
 
-// World Probe grid injection: one invocation per probe of renderer::WorldProbeGridPass's
-// kGridResolution^3 grid, fully rebuilt every RecordUpdate() call (see that class' own "why a full
-// rebuild" comment). For each probe: fires kProbeSampleDirections fixed, evenly-spread-over-the-
+// World Probe grid injection: one invocation per probe TEXEL dispatched this call --
+// renderer::WorldProbeGridPass::RecordSlab issues one dispatch per wrap-contiguous piece of a
+// dirty slab (Phase 6, UE5.8 parity roadmap: incremental toroidal streaming replaced the pre-
+// Phase-6 full-grid-every-frame rebuild -- see that class' own header comment for the full
+// rationale), so most calls only re-inject a thin newly-revealed slice of the grid, not every
+// probe. For each dispatched probe: fires kProbeSampleDirections fixed, evenly-spread-over-the-
 // sphere rays (SWRT sphere-tracing every entity's Mesh SDF, mesh_sdf_trace.glsl, or HWRT inline
 // rayQueryEXT against the shared Fallback Mesh TLAS, depending on pc.traceMode -- same two back-
 // ends and same TraceHWRT shape as SurfaceCacheGIInject.comp), samples the hit's Surface Cache
 // Card radiance (surface_cache_sampling.glsl) for every ray that lands on a surface, and writes
-// the averaged result as this probe's ambient irradiance.
+// the averaged result as this probe's ambient irradiance into its wrapped (toroidal) texel address.
 //
 // --- Why 14 fixed directions instead of importance-sampled hemisphere rays ---
 // A Surface Cache texel has a known surface normal to orient a cosine-weighted hemisphere around
@@ -17,8 +20,8 @@
 // open space with no normal at all, and needs to capture light arriving from EVERY direction, not
 // just one hemisphere -- so this shader instead samples a small, fixed, omnidirectional direction
 // set: the 6 axis directions plus the 8 cube-diagonal directions (all normalized), a standard
-// low-discrepancy spread over the full sphere cheap enough to fire from all 32768 probes every
-// single frame.
+// low-discrepancy spread over the full sphere -- cheap enough that even a full-grid dispatch (the
+// first-ever RecordUpdate() call, before any window has been established) stays affordable.
 
 #include "include/math_utils.glsl"
 #include "include/mesh_sdf_trace.glsl"        // set 1
@@ -36,12 +39,27 @@ layout(set = 0, binding = 1) uniform accelerationStructureEXT g_TLAS;
 #define FALLBACK_GEOMETRY_BASE_BINDING 2
 #include "include/fallback_geometry.glsl"
 
+// Phase 6 (UE5.8 parity roadmap): one dispatch now covers a single wrap-contiguous PIECE of a
+// dirty slab (renderer::WorldProbeGridPass::RecordSlab), not the whole grid -- `dispatchMinTexel`
+// is this piece's WRAPPED destination texel start (toroidal addressing, `index mod
+// kGridResolution` per axis) and `dispatchWorldMin` is the matching TRUE world position, mirroring
+// GlobalSDFComposite.comp's own identical split exactly (see that shader's own comment for why no
+// wrap arithmetic is needed here: the CPU already resolved it per-piece via SplitWrappedRange).
+// Flat scalar fields throughout (no vec3/ivec3 members) -- matches GlobalSDFCompositePC's own
+// established convention in this codebase for push-constant structs that must line up with the
+// C++ side's byte layout with zero ambiguity about std430-vs-plain packing/alignment rules for an
+// embedded vec3 (see that struct's own comment).
 layout(push_constant) uniform WorldProbeInjectPushConstants {
-    vec3 gridOrigin;   // World-space position of this grid's texel (0,0,0) corner (renderer::WorldProbeGridPass::GetGridOriginWorld()).
+    int dispatchMinTexelX; int dispatchMinTexelY; int dispatchMinTexelZ;
+    float dispatchWorldMinX; float dispatchWorldMinY; float dispatchWorldMinZ;
     float probeSpacing;
     uint entityCount;  // Dynamically uniform -- see mesh_sdf_trace.glsl's own requirement.
     uint frameIndex;   // Halton sequence temporal offset, advanced by the caller across calls.
     uint traceMode;    // 0 = SWRT (TraceMeshSDFScene), 1 = HWRT (TraceHWRT, inline ray query).
+    // gridResolution: unlike GlobalSDFComposite.comp's FIXED kClipmapResolution=32, renderer::
+    // WorldProbeGridPass::kGridResolution is runtime-configurable (config::lumen::
+    // PROBE_GRID_RESOLUTION) -- the bounds check below needs this value passed explicitly.
+    int gridResolution;
 } pc;
 
 const uint kProbeSampleDirections = 14u;
@@ -95,12 +113,26 @@ bool TraceHWRT(vec3 rayOrigin, vec3 rayDir, float tMax, out uint outEntityIndex,
 }
 
 void main() {
-    uvec3 probeCoord = gl_GlobalInvocationID.xyz;
-    if (probeCoord.x >= 32u || probeCoord.y >= 32u || probeCoord.z >= 32u) {
-        return; // Robustness only -- 32 / local_size(4) divides exactly, so this never actually trips.
+    // Phase 6: destination is now a WRAPPED texel (toroidal addressing) resolved from this
+    // dispatch's own piece start plus the invocation's local offset -- no wrap arithmetic needed
+    // here, mirroring GlobalSDFComposite.comp's own identical destTexel computation exactly (the
+    // CPU-side SplitWrappedRange already guarantees this piece never crosses the wrap boundary).
+    ivec3 dispatchMinTexel = ivec3(pc.dispatchMinTexelX, pc.dispatchMinTexelY, pc.dispatchMinTexelZ);
+    ivec3 destTexel = dispatchMinTexel + ivec3(gl_GlobalInvocationID);
+
+    // Defensive bounds check: a piece's texel count need not be a multiple of the 4x4x4 workgroup
+    // size, so the last workgroup along an axis can dispatch a few invocations past the piece's
+    // actual extent -- see GlobalSDFComposite.comp's own identical comment.
+    if (any(greaterThanEqual(destTexel, ivec3(pc.gridResolution))) || any(lessThan(destTexel, ivec3(0)))) {
+        return;
     }
 
-    vec3 probePos = pc.gridOrigin + (vec3(probeCoord) + 0.5) * pc.probeSpacing;
+    // True world position of this probe: dispatchWorldMin is the piece's own CORNER (world-probe-
+    // index * probeSpacing, see renderer::WorldProbeGridPass::RecordSlab's own comment), so +0.5
+    // centers the sample within its own probe cell -- preserves this shader's original per-probe
+    // sampling convention exactly (pre-Phase-6, this was `gridOrigin + (probeCoord+0.5)*spacing`).
+    vec3 dispatchWorldMin = vec3(pc.dispatchWorldMinX, pc.dispatchWorldMinY, pc.dispatchWorldMinZ);
+    vec3 probePos = dispatchWorldMin + (vec3(gl_GlobalInvocationID) + 0.5) * pc.probeSpacing;
 
     vec3 accumulated = vec3(0.0);
     for (uint s = 0u; s < kProbeSampleDirections; ++s) {
@@ -124,5 +156,5 @@ void main() {
     }
 
     vec3 irradiance = accumulated / float(kProbeSampleDirections);
-    imageStore(g_ProbeGrid, ivec3(probeCoord), vec4(irradiance, 1.0));
+    imageStore(g_ProbeGrid, destTexel, vec4(irradiance, 1.0));
 }

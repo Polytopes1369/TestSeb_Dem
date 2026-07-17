@@ -800,7 +800,7 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
                                     maths::vec3{0.0f, 1.0f, 0.0f}, cameraFrameInfo.fovYRadians,
                                     cameraFrameInfo.aspectRatio, cameraFrameInfo.nearZ,
                                     cameraFrameInfo.farZ);
-    m_SurfaceCache.RecordCapture(cmd);
+    m_SurfaceCache.RecordCapture(cmd, cameraFrameInfo.position, entityTransformsCPU);
 
     // 3. Global SDF clipmap streaming, from this frame's camera position.
     m_GlobalSDF.RecordUpdate(cmd, cameraFrameInfo.position, entityTransformsCPU);

@@ -12,16 +12,30 @@
 // pixel's own, so its weight collapses to ~0), evaluates each surviving probe's L1 SH irradiance
 // at this pixel's own normal, and additively read-modify-writes the result (modulated by this
 // pixel's albedo) into renderer::ClusterResolvePass's own output color image.
+//
+// --- Phase 6 (UE5.8 parity roadmap): 4-tier fallback (was 2) ---
+// renderer::ScreenProbeGIPass's fine grid is now only selectively traced/updated (see that class'
+// own header comment) -- a FINE probe can therefore be "not traced this frame" (stale-but-valid,
+// tier 1/2 below still use it, exactly as before) or "never yet traced at all" (invalid,
+// worldPos.a == 0). The fallback chain gained two new tiers reading the always-on COARSE grid:
+// (1) fine bilateral 4-tap [unchanged], (2) nearest single fine probe [unchanged], (3) NEW: coarse
+// bilateral 4-tap (mirrors tier 1's own logic against the coarse grid's coarser spacing), (4) NEW:
+// nearest single coarse probe (mirrors tier 2) -- the genuine last resort; unlike the old
+// standalone Phase 6 branch this was ported from, this codebase's renderer::ScreenProbeGIPass has
+// no renderer::WorldProbeGridPass coupling to fall back to beyond tier 4 (that grid is sampled
+// elsewhere, by renderer::ScreenTracePass/GICompositePass instead -- see WorldProbeGridPass.h's
+// own "Live consumers" comment).
 
 #include "include/octahedral.glsl"
 #include "include/sh_probe.glsl"
 
 layout(local_size_x = 8, local_size_y = 8) in;
 
-const uint kProbeTileSize = 8u;
+const uint kProbeTileSize = 8u;         // Fine grid tile size -- see ScreenProbeTrace.comp's own centerPixel derivation.
+const uint kCoarseProbeTileSize = 16u;  // Coarse grid tile size (Phase 6) -- always exactly 2x kProbeTileSize.
 // World-space falloff rate for the bilateral depth/position weight -- see this file's own header
 // comment; tuned against the same ~14m scene-scale assumption as ScreenProbeTemporal.comp's own
-// kDisocclusionDistanceThreshold.
+// kDisocclusionDistanceThreshold. Shared by both the fine and coarse bilateral taps.
 const float kBilateralDistanceFalloff = 2.0;
 
 layout(set = 0, binding = 0) uniform sampler2D g_ProbeSHR;
@@ -29,18 +43,26 @@ layout(set = 0, binding = 1) uniform sampler2D g_ProbeSHG;
 layout(set = 0, binding = 2) uniform sampler2D g_ProbeSHB;
 layout(set = 0, binding = 3) uniform sampler2D g_ProbeWorldPos;
 layout(set = 0, binding = 4) uniform sampler2D g_ProbeNormal;
-layout(rg16f, set = 0, binding = 5) uniform readonly image2D g_GBufferNormal;
-layout(r32f, set = 0, binding = 6) uniform readonly image2D g_GBufferDepth;
-layout(rgba8, set = 0, binding = 7) uniform readonly image2D g_GBufferAlbedo;
-layout(rgba8, set = 0, binding = 8) uniform image2D g_OutputColor; // Read-modify-write.
+// Phase 6: the always-on COARSE grid's own current-slot images -- tiers 3/4 below.
+layout(set = 0, binding = 5) uniform sampler2D g_ProbeCoarseSHR;
+layout(set = 0, binding = 6) uniform sampler2D g_ProbeCoarseSHG;
+layout(set = 0, binding = 7) uniform sampler2D g_ProbeCoarseSHB;
+layout(set = 0, binding = 8) uniform sampler2D g_ProbeCoarseWorldPos;
+layout(set = 0, binding = 9) uniform sampler2D g_ProbeCoarseNormal;
+layout(rg16f, set = 0, binding = 10) uniform readonly image2D g_GBufferNormal;
+layout(r32f, set = 0, binding = 11) uniform readonly image2D g_GBufferDepth;
+layout(rgba8, set = 0, binding = 12) uniform readonly image2D g_GBufferAlbedo;
+layout(rgba8, set = 0, binding = 13) uniform image2D g_OutputColor; // Read-modify-write.
 
 #define SCREEN_PROBE_VIEW_PARAMS_SET 0
-#define SCREEN_PROBE_VIEW_PARAMS_BINDING 9
+#define SCREEN_PROBE_VIEW_PARAMS_BINDING 14
 #include "include/screen_probe_view_params.glsl"
 
 layout(push_constant) uniform GatherPushConstants {
     uint probeCountX;
     uint probeCountY;
+    uint coarseProbeCountX; // Phase 6: the COARSE grid's own size -- g_ViewParams.probeGridSize only ever holds the fine grid's.
+    uint coarseProbeCountY;
 #ifdef _DEBUG
     uint debugViewMode;
 #endif
@@ -68,6 +90,78 @@ bool SampleProbeIrradiance(ivec2 probeTexel, float bilinearWeight, vec3 pixelWor
     vec4 shB = texelFetch(g_ProbeSHB, probeTexel, 0);
     outIrradiance = EvaluateIrradianceSH(shR, shG, shB, pixelNormal);
     return true;
+}
+
+// Phase 6: tier-3 fallback -- byte-for-byte mirror of SampleProbeIrradiance() above, against the
+// COARSE grid's own images instead.
+bool SampleCoarseProbeIrradiance(ivec2 probeTexel, float bilinearWeight, vec3 pixelWorldPos, vec3 pixelNormal,
+    out vec3 outIrradiance, out float outWeight) {
+    vec4 probeWorldPos = texelFetch(g_ProbeCoarseWorldPos, probeTexel, 0);
+    if (probeWorldPos.a < 0.5) {
+        return false;
+    }
+    vec3 probeNormal = OctDecode(texelFetch(g_ProbeCoarseNormal, probeTexel, 0).rg);
+
+    float distanceWeight = exp(-distance(probeWorldPos.xyz, pixelWorldPos) * kBilateralDistanceFalloff);
+    float normalWeight = max(0.0, dot(probeNormal, pixelNormal));
+    outWeight = bilinearWeight * distanceWeight * normalWeight;
+    if (outWeight <= 1.0e-5) {
+        return false;
+    }
+
+    vec4 shR = texelFetch(g_ProbeCoarseSHR, probeTexel, 0);
+    vec4 shG = texelFetch(g_ProbeCoarseSHG, probeTexel, 0);
+    vec4 shB = texelFetch(g_ProbeCoarseSHB, probeTexel, 0);
+    outIrradiance = EvaluateIrradianceSH(shR, shG, shB, pixelNormal);
+    return true;
+}
+
+// Tiers 3/4's own coarse-grid bilateral tap + nearest-fallback, mirroring the fine-grid logic in
+// main() below exactly (see that function's own tier-1/2 block) -- factored out since it is now
+// needed a second time (fine, inline in main()) plus this one (coarse). Returns false only if
+// EVERY coarse tap AND the coarse nearest-probe fallback both fail (i.e. this pixel gets zero
+// indirect light this frame -- see this file's own header comment on why there is no further tier).
+bool SampleCoarseTierIrradiance(vec2 probeSpace, vec3 worldPos, vec3 normal, out vec3 outIndirect) {
+    vec2 base = floor(probeSpace);
+    vec2 frac = fract(probeSpace);
+    ivec2 coarseGridMax = ivec2(pc.coarseProbeCountX, pc.coarseProbeCountY) - ivec2(1);
+    ivec2 taps[4] = ivec2[4](
+        clamp(ivec2(base), ivec2(0), coarseGridMax),
+        clamp(ivec2(base) + ivec2(1, 0), ivec2(0), coarseGridMax),
+        clamp(ivec2(base) + ivec2(0, 1), ivec2(0), coarseGridMax),
+        clamp(ivec2(base) + ivec2(1, 1), ivec2(0), coarseGridMax)
+    );
+    float bilinearWeights[4] = float[4](
+        (1.0 - frac.x) * (1.0 - frac.y), frac.x * (1.0 - frac.y),
+        (1.0 - frac.x) * frac.y, frac.x * frac.y
+    );
+
+    vec3 totalIrradiance = vec3(0.0);
+    float totalWeight = 0.0;
+    for (int i = 0; i < 4; ++i) {
+        vec3 irradiance; float weight;
+        if (SampleCoarseProbeIrradiance(taps[i], bilinearWeights[i], worldPos, normal, irradiance, weight)) {
+            totalIrradiance += irradiance * weight;
+            totalWeight += weight;
+        }
+    }
+
+    if (totalWeight > 1.0e-5) {
+        outIndirect = totalIrradiance / totalWeight;
+        return true;
+    }
+
+    ivec2 nearest = clamp(ivec2(round(probeSpace)), ivec2(0), coarseGridMax);
+    vec4 nearestWorldPos = texelFetch(g_ProbeCoarseWorldPos, nearest, 0);
+    if (nearestWorldPos.a >= 0.5) {
+        vec4 shR = texelFetch(g_ProbeCoarseSHR, nearest, 0);
+        vec4 shG = texelFetch(g_ProbeCoarseSHG, nearest, 0);
+        vec4 shB = texelFetch(g_ProbeCoarseSHB, nearest, 0);
+        outIndirect = EvaluateIrradianceSH(shR, shG, shB, normal);
+        return true;
+    }
+
+    return false;
 }
 
 void main() {
@@ -121,12 +215,13 @@ void main() {
 
     vec3 indirect;
     if (totalWeight > 1.0e-5) {
+        // Tier 1: fine bilateral 4-tap succeeded.
         indirect = totalIrradiance / totalWeight;
     } else {
-        // Every bilateral tap collapsed to ~0 (e.g. a thin foreground sliver whose 4 nearest
-        // probes all belong to background geometry behind it) -- fall back to the single nearest
-        // probe, ignoring the bilateral test entirely, rather than leave this pixel with zero
-        // indirect light (the standard light-leak-avoidance fallback).
+        // Every fine bilateral tap collapsed to ~0 (e.g. a thin foreground sliver whose 4 nearest
+        // fine probes all belong to background geometry behind it, or simply weren't traced this
+        // frame and never have been) -- fall back to the single nearest fine probe, ignoring the
+        // bilateral test entirely (tier 2), before dropping to the coarse grid at all.
         ivec2 nearest = clamp(ivec2(round(probeSpace)), ivec2(0), probeGridMax);
         vec4 nearestWorldPos = texelFetch(g_ProbeWorldPos, nearest, 0);
         if (nearestWorldPos.a >= 0.5) {
@@ -135,7 +230,15 @@ void main() {
             vec4 shB = texelFetch(g_ProbeSHB, nearest, 0);
             indirect = EvaluateIrradianceSH(shR, shG, shB, normal);
         } else {
-            indirect = vec3(0.0);
+            // Phase 6: tiers 3/4 -- the always-on COARSE grid's own bilateral tap + nearest-probe
+            // fallback (mirrors tiers 1/2 above exactly, see SampleCoarseTierIrradiance's own
+            // comment), computed at the COARSE grid's own tile spacing (NOT kProbeTileSize). If
+            // even this fails, the pixel gets zero indirect light this frame -- see this file's
+            // own header comment on why there is no further tier.
+            vec2 coarseProbeSpace = (vec2(pixel) - vec2(float(kCoarseProbeTileSize) * 0.5)) / float(kCoarseProbeTileSize);
+            if (!SampleCoarseTierIrradiance(coarseProbeSpace, worldPos, normal, indirect)) {
+                indirect = vec3(0.0);
+            }
         }
     }
 
