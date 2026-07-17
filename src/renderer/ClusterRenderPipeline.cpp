@@ -383,17 +383,6 @@ bool ClusterRenderPipeline::Init(
   m_Resolve.SetVirtualTexture(m_VTManager, m_VTBounds.worldMinXZ, m_VTBounds.worldMaxXZ,
                               m_VTStreaming.GetFeedbackDeviceBuffer());
 
-  // Forward-rendered translucent/transparent materials (see TransparentForwardPass's own class
-  // comment) -- reuses the SAME indexEntries/dagEntries this function loaded above for
-  // m_LODSelection.Init(), and the SAME page pool/compressed pool/entity/WPO buffer handles every
-  // opaque pass already borrows.
-  m_TransparentForward.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
-                            m_PagePool.GetPageTableBuffer(), m_PagePool.GetPhysicalPoolBuffer(),
-                            createInfo.entityTransformBuffer, createInfo.entityDataBuffer, m_WPOGlobalsBuffer.Handle(),
-                            createInfo.materialTable.params, indexEntries, dagEntries,
-                            ClusterResolvePass::kOutputColorFormat, createInfo.depthFormat);
-  m_TransparentForward.SetVirtualShadowMap(m_VirtualShadowMap);
-
   // Sun orientation: Toronto (lat 43.6532N, lon 79.3832W), July 16, 16:30 local (EDT, UTC-4) --
   // a standard NOAA solar-position computation (equation of time + hour angle + declination for
   // day-of-year 197) gives solar elevation ~45.5 degrees and azimuth ~255.3 degrees (measured
@@ -469,6 +458,22 @@ bool ClusterRenderPipeline::Init(
     LOG_ERROR("[ClusterRenderPipeline] Failed to initialize WorldProbeGridPass.");
     return false;
   }
+
+  // Forward-rendered translucent/transparent materials (see TransparentForwardPass's own class
+  // comment) -- reuses the SAME indexEntries/dagEntries this function loaded above for
+  // m_LODSelection.Init(), and the SAME page pool/compressed pool/entity/WPO buffer handles every
+  // opaque pass already borrows. Phase 5: moved here (was right after m_Resolve.SetVirtualTexture
+  // above) since its shading now needs m_WorldProbes/m_TraceContext/m_SurfaceCacheRT, all Init'd
+  // just above -- must run after every one of them.
+  m_TransparentForward.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
+                            m_PagePool.GetPageTableBuffer(), m_PagePool.GetPhysicalPoolBuffer(),
+                            createInfo.entityTransformBuffer, createInfo.entityDataBuffer, m_WPOGlobalsBuffer.Handle(),
+                            createInfo.materialTable.params, indexEntries, dagEntries,
+                            ClusterResolvePass::kOutputColorFormat, createInfo.depthFormat,
+                            m_WorldProbes, m_TraceContext, m_SurfaceCacheRT.GetTLASHandle(),
+                            m_SurfaceCache.GetVertexBuffer(), m_SurfaceCache.GetIndexBuffer(),
+                            m_SurfaceCacheRT.GetDrawRangeBuffer());
+  m_TransparentForward.SetVirtualShadowMap(m_VirtualShadowMap);
 
   // Screen Trace GI -- linear screen-space depth raymarching falling back to the World Probe grid.
   m_ScreenTrace.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
@@ -1427,7 +1432,7 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
     VkImageView transparentTargetView = m_GIComposite.GetOutputView();
     m_TransparentForward.RecordDraw(cmd, transparentTargetImage, transparentTargetView, m_DepthImageView,
         m_RenderExtent, cameraCopy.view, cameraCopy.proj, m_Decompression.GetDecompressedIndexPoolBuffer(),
-        m_SceneLights.sun.direction);
+        cameraFrameInfo.position, m_SceneLights, m_TraceContext, traceMode, m_FrameIndex);
   }
 
   // =========================================================================================

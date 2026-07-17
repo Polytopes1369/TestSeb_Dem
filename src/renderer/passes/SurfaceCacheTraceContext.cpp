@@ -194,15 +194,22 @@ namespace renderer {
         // allocated (STEP 2) buffer, so they remain valid across every future RefreshCardTable()
         // call (which only memcpy's new contents, never recreates the buffers).
         // =====================================================================================
+        // Phase 5: added VK_SHADER_STAGE_FRAGMENT_BIT to every binding below -- renderer::
+        // TransparentForwardPass's fragment shader is the first GRAPHICS-pipeline consumer of
+        // these two sets (every prior consumer -- ReflectionPass, SurfaceCacheGIInjectPass,
+        // WorldProbeGridPass -- traces from a compute or ray tracing pipeline only). Widening a
+        // descriptor set layout binding's stageFlags is additive and has no effect on any existing
+        // compute/ray-tracing consumer (Vulkan only checks that the ACTUAL accessing stage is
+        // included in the mask, never that it's the ONLY one).
         VkDescriptorSetLayoutBinding meshSdfBindings[2]{};
         meshSdfBindings[0].binding = 0;
         meshSdfBindings[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         meshSdfBindings[0].descriptorCount = 1;
-        meshSdfBindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR;
+        meshSdfBindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_FRAGMENT_BIT;
         meshSdfBindings[1].binding = 1;
         meshSdfBindings[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         meshSdfBindings[1].descriptorCount = kMaxTracedEntities;
-        meshSdfBindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR;
+        meshSdfBindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_FRAGMENT_BIT;
 
         VkDescriptorSetLayoutCreateInfo meshSdfLayoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
         meshSdfLayoutInfo.bindingCount = 2;
@@ -213,15 +220,15 @@ namespace renderer {
         samplingBindings[0].binding = 0;
         samplingBindings[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         samplingBindings[0].descriptorCount = 1;
-        samplingBindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR;
+        samplingBindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_FRAGMENT_BIT;
         samplingBindings[1].binding = 1;
         samplingBindings[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         samplingBindings[1].descriptorCount = 1;
-        samplingBindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR;
+        samplingBindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_FRAGMENT_BIT;
         samplingBindings[2].binding = 2;
         samplingBindings[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         samplingBindings[2].descriptorCount = 1;
-        samplingBindings[2].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR;
+        samplingBindings[2].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_FRAGMENT_BIT;
 
         VkDescriptorSetLayoutCreateInfo samplingLayoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
         samplingLayoutInfo.bindingCount = 3;

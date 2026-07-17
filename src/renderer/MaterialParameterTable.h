@@ -40,7 +40,12 @@ namespace renderer {
         // translucent materials always go through a distinct forward renderer.
         float alpha;
         float _pad0 = 0.0f; // Reserved (e.g. a future IOR/refraction parameter for glass-like transparents).
-        float _pad1 = 0.0f;
+        // UE5.8 Lumen "Output Reflections" equivalent: per-material opt-in for TransparentForward.
+        // frag's traced front-layer specular reflection (HWRT/SWRT, see that shader's own comment)
+        // -- NOT applied to every transparent material, only ones that need it (glass/water-like),
+        // matching real UE5.8 rather than paying the trace cost for every alpha-blended surface.
+        // 0.0 = off (default, matches every other category incl. "Translucent" below), 1.0 = on.
+        float hasReflections = 0.0f;
         float _pad2 = 0.0f;
     };
     static_assert(sizeof(MaterialParameters) == 48,
@@ -141,13 +146,16 @@ namespace renderer {
                 p.metallic = 0.0f;
                 p.emissive = maths::vec3(0.0f, 0.0f, 0.0f);
                 p.alpha = 0.35f + 0.35f * unit(rng); // [0.35, 0.70]
+                p.hasReflections = 0.0f; // Frosted/soft translucency -- no clear image to reflect.
             } else {
-                // Transparent: clear/glass-like -- low roughness, low alpha.
+                // Transparent: clear/glass-like -- low roughness, low alpha, traced reflections on
+                // (see MaterialParameters::hasReflections's own comment).
                 p.baseColor = hsvToRgb(hue, 0.20f + 0.40f * unit(rng), 0.55f + 0.45f * unit(rng));
                 p.roughness = 0.15f * unit(rng); // [0.0, 0.15]
                 p.metallic = 0.0f;
                 p.emissive = maths::vec3(0.0f, 0.0f, 0.0f);
                 p.alpha = 0.05f + 0.25f * unit(rng); // [0.05, 0.30]
+                p.hasReflections = 1.0f;
             }
 
             table.isTransparent[i] = (p.alpha < 1.0f);
