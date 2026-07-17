@@ -52,12 +52,20 @@ namespace renderer {
         ClusterResolvePass(const ClusterResolvePass&) = delete;
         ClusterResolvePass& operator=(const ClusterResolvePass&) = delete;
 
-        // RGBA8: this codebase's simplest, most broadly supported color-attachment-and-storage-
-        // capable format (mirrors why VulkanContext::kVisBufferFormat picks a mandatory-support
-        // format over an exotic one), sufficient for the procedural, non-HDR shading
-        // ClusterResolve.comp currently performs (see that shader's class comment on why no real
-        // material/texture system exists yet).
-        static constexpr VkFormat kOutputColorFormat = VK_FORMAT_R8G8B8A8_UNORM;
+        // R16G16B16A16_SFLOAT (linear HDR): this pass' shaded output is a genuine linear radiance
+        // value (sun diffuse term + renderer::MegaLightsPass's own additive RMW composite, whose
+        // inverse-square point-light contributions are physically unbounded near a light), not a
+        // display-ready [0,1] color -- an 8-bit UNORM target hard-clips (no soft rolloff) anything
+        // above 1.0, which is exactly what produced this codebase's "burned"/blown-out highlights
+        // bug once renderer::MegaLightsPass started compositing real point lights into this image
+        // (mirrors why renderer::ScreenTracePass::kOutputFormat is already this same HDR format for
+        // the analogous indirect-GI radiance). The actual display-referred tonemap curve now lives
+        // in renderer::TonemapPass, the final step after renderer::TAATSRPass's own temporal
+        // resolve -- correct order for both: TAA's variance clipping wants linear HDR input, and
+        // tonemapping HDR only once, at the very end, avoids compounding a non-linear curve through
+        // every additive compositing step this value still passes through (renderer::MegaLightsPass,
+        // renderer::GICompositePass, renderer::TransparentForwardPass) after this pass writes it.
+        static constexpr VkFormat kOutputColorFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
         // Minimal GBuffer, written alongside the shaded color above from the exact same per-pixel
         // normal/albedo/depth this shader already reconstructs in its Step 2/3 (previously computed
         // and discarded) -- consumed by renderer::ScreenProbeGIPass for probe placement/tracing,

@@ -1,8 +1,9 @@
 #pragma once
 // Final GI composite: blends renderer::ClusterResolvePass's direct-lit color with
-// renderer::ATrousDenoisePass's denoised indirect-diffuse term into one owned rgba8 output image
-// -- the image renderer::ClusterRenderPipeline's own final blit now sources from instead of
-// ClusterResolvePass's output directly.
+// renderer::ATrousDenoisePass's denoised indirect-diffuse term into one owned rgba16f (linear HDR)
+// output image -- the image renderer::ClusterRenderPipeline's own final blit now sources from
+// (via renderer::TAATSRPass then renderer::TonemapPass) instead of ClusterResolvePass's output
+// directly.
 //
 // --- Debug view modes 13 (LUMEN) / 14 (SPATIAL PROBES) ---
 // core/Camera.h already reserves DEBUG_VIEW_LUMEN=13 / DEBUG_VIEW_SPATIAL_PROBES=14 (previously
@@ -37,7 +38,16 @@ namespace renderer {
         GICompositePass& operator=(const GICompositePass&) = delete;
 
         static constexpr uint32_t kWorkgroupSize = 8;
-        static constexpr VkFormat kOutputFormat = VK_FORMAT_R8G8B8A8_UNORM;
+        // R16G16B16A16_SFLOAT (linear HDR): this pass sums two already-HDR terms (renderer::
+        // ClusterResolvePass::kOutputColorFormat's direct light + renderer::ATrousDenoisePass::
+        // kFormat's denoised indirect GI) -- an 8-bit UNORM output would hard-clip that sum to
+        // [0,1] right at the point they converge, which is exactly what fed this codebase's
+        // "burned" overexposure bug (see ClusterResolvePass::kOutputColorFormat's own comment for
+        // the full chain). renderer::TransparentForwardPass draws directly onto this image (its own
+        // pipeline's color attachment format must match -- see that pass' Init() call site) and
+        // renderer::TAATSRPass samples it as its low-res HDR input; the actual display-referred
+        // tonemap curve lives downstream of TAA, in renderer::TonemapPass.
+        static constexpr VkFormat kOutputFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
 
         // `directColorView` (renderer::ClusterResolvePass::GetOutputColorView()) and
         // `denoisedGIView` (renderer::ATrousDenoisePass::GetOutputView()) are always bound (set 0,
