@@ -222,19 +222,33 @@ private:
     uint32_t m_TotalVertexCount = 0;
     uint32_t m_TotalIndexCount = 0;
 
-    // One EntityTransform slot per entity (box=0 .. chamferBox=11, wallA=12, wallB=13, floor=14);
-    // see struct_custo.glsl. The base scene is a feature "gallery": 12 primitives laid out as 9
-    // widely-separated zones (see GridSlot()) each demonstrating one engine feature explicitly
-    // (Nanite density, WPO displacement, metal, dielectric, glass, translucent, emissive,
-    // MegaLights, Lumen GI), plus 2 static colored walls forming the Lumen GI corner and the floor.
-    static constexpr uint32_t kEntityCount = 15;
+    // One EntityTransform slot per entity (box=0 .. chamferBox=11, wallA=12, wallB=13, floor=14,
+    // water=15 since Phase 7c); see struct_custo.glsl. The base scene is a feature "gallery": 12
+    // primitives laid out as 9 widely-separated zones (see GridSlot()) each demonstrating one
+    // engine feature explicitly (Nanite density, WPO displacement, metal, dielectric, glass,
+    // translucent, emissive, MegaLights, Lumen GI), plus 2 static colored walls forming the Lumen
+    // GI corner, the floor (a Phase 7b procedural terrain heightfield, not a flat plane), and a
+    // Phase 7c water plane.
+    static constexpr uint32_t kEntityCount = 16;
     // The 2 static walls that form the Lumen/GI showcase corner (see GenerateGeometry()'s wall
     // blocks and UpdateEntityRotations()'s fixed-rotation branch for them) -- generated right
-    // before the floor, so kFloorEntityIndex below stays "last".
-    static constexpr uint32_t kWallEntityIndexA = kEntityCount - 3;
-    static constexpr uint32_t kWallEntityIndexB = kEntityCount - 2;
-    // The floor plane is always generated last (see GenerateGeometry()'s own GeneratePlane() call).
-    static constexpr uint32_t kFloorEntityIndex = kEntityCount - 1;
+    // before the floor. Deliberately offset from kEntityCount by 4/3 (not 3/2, as before Phase 7c)
+    // so adding the water plane as the new last entity does not shift these -- both must stay at
+    // their existing absolute indices (12/13), since GenerateShowcaseMaterialTable()'s own
+    // per-slot recipes and GridSlot()'s own zone layout are keyed by absolute index, not by
+    // "distance from the end".
+    static constexpr uint32_t kWallEntityIndexA = kEntityCount - 4;
+    static constexpr uint32_t kWallEntityIndexB = kEntityCount - 3;
+    // The floor (a Phase 7b terrain heightfield) is generated right before the water plane -- see
+    // this constant's own "kEntityCount - 4/3" sibling comment above for why this is offset by 2,
+    // not 1, now that water is the new last entity.
+    static constexpr uint32_t kFloorEntityIndex = kEntityCount - 2;
+    // Phase 7c (UE5.8 parity roadmap, water/erosion): the water plane, always generated last (see
+    // GenerateGeometry()'s own GenerateWaterPlane() call) -- rendered by renderer::
+    // WaterForwardPass instead of the opaque Nanite path, same core::EntityFlags::IsTransparent
+    // exclusion mechanism as the hero entity (see BuildEntityData()'s own kWaterMaterialID
+    // override).
+    static constexpr uint32_t kWaterEntityIndex = kEntityCount - 1;
     // Phase 7a (UE5.8 parity roadmap, hero asset tessellation): the Icosphere -- generated FIRST
     // (see GenerateGeometry()'s own "Icosphere-first" comment, `m_EntityData[2].meshID` used
     // directly), the single tessellated/displaced hero asset, rendered by
@@ -334,6 +348,15 @@ private:
         uint32_t meshID, maths::vec2 slot,
         uint32_t& runningVertexOffset, uint32_t& runningIndexOffset,
         float worldOffsetY, float spacing);
+
+    // Phase 7c (UE5.8 parity roadmap, water/erosion): dispatches m_PlanePipeline (geom_plane.comp),
+    // NOT m_TerrainPipeline -- unlike GenerateTerrain, worldOffsetY here is a FIXED water-level Y,
+    // not an addition on top of a sampled height. Zero new shader/pipeline: reuses the exact
+    // pipeline already created for GeneratePlane's own dielectric-plane entity.
+    void GenerateWaterPlane(
+        float Width, float Length, uint32_t WidthSegments, uint32_t LengthSegments,
+        uint32_t meshID, maths::vec2 slot, float worldOffsetY,
+        uint32_t& runningVertexOffset, uint32_t& runningIndexOffset);
 
     void GenerateCapsule(
         float Radius, float Height,

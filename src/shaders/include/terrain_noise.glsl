@@ -47,18 +47,37 @@ float RidgedNoiseOctave(vec3 p) {
     return 1.0 - abs(ValueNoise3D(p) * 2.0 - 1.0);
 }
 
+// Phase 7c (UE5.8 parity roadmap, water/erosion): domain warping -- perturbs the (x,z) sampling
+// point by a second, much-lower-frequency noise sample before the main fbm evaluates it, giving
+// the terrain a visibly eroded/warped look instead of a perfectly axis-aligned noise grid. Reuses
+// ValueNoise3D's own 3D domain: TerrainHeightFbm always samples the y=0 plane of that volume, so
+// this samples two OTHER decorrelated planes (y=7.0, y=13.0) for the X/Z offsets -- no second hash
+// mixer needed. Safe at this terrain's own coarse vertex spacing (unlike the ridged component
+// above): a LOW-frequency warp only distorts the macro shape's sampling coordinates, it adds no
+// local high-frequency curvature of its own, so it does not reproduce the DAG-build blowup
+// kTerrainRidgeWeight's own comment documents.
+const float kWarpFrequency = 0.06;
+const float kWarpAmplitude = 1.8;
+
+vec2 DomainWarpOffset(vec2 xz) {
+    float warpX = (ValueNoise3D(vec3(xz.x, 7.0,  xz.y) * kWarpFrequency) * 2.0 - 1.0) * kWarpAmplitude;
+    float warpZ = (ValueNoise3D(vec3(xz.x, 13.0, xz.y) * kWarpFrequency) * 2.0 - 1.0) * kWarpAmplitude;
+    return vec2(warpX, warpZ);
+}
+
 // Blends a smooth fbm (rolling base shape) with a ridged fbm (sharp mountain crests) so the result
 // reads as genuinely mountainous rather than a uniformly undulating plane. Both sums share the same
 // per-octave frequency/amplitude schedule (5 octaves, amplitude halves / frequency doubles), so
 // they stay coherent with each other at every scale.
 float TerrainHeightFbm(vec2 xz) {
+    vec2 warped = xz + DomainWarpOffset(xz);
     float frequency = kTerrainBaseFrequency;
     float amplitude = 0.5;
     float smoothSum = 0.0;
     float ridgedSum = 0.0;
     float maxAmplitude = 0.0;
     for (uint i = 0u; i < kTerrainOctaves; ++i) {
-        vec3 p = vec3(xz.x, 0.0, xz.y) * frequency;
+        vec3 p = vec3(warped.x, 0.0, warped.y) * frequency;
         smoothSum += (ValueNoise3D(p) * 2.0 - 1.0) * amplitude;
         ridgedSum += RidgedNoiseOctave(p) * amplitude;
         maxAmplitude += amplitude;

@@ -212,7 +212,11 @@ void main() {
     // VK_BLEND_FACTOR_SRC_ALPHA) already multiplies the WHOLE outRGB by outAlpha; an explicit
     // in-shader multiply would double-attenuate (a bug in this shader's first Phase 5 draft, fixed
     // during the MegaLights reconciliation -- see this file's own header comment).
-    vec3 outRGB = sunResponse + indirectLighting * mat.base.diffuseAlbedo + EvaluateSubstrateEmissive(mat);
+    // kEmissiveScale -- see ClusterResolve.comp's own identical constant/comment (2026-07-17
+    // recalibration): converts this codebase's small artist-authored emissive multiplier onto the
+    // same real radiance scale the lit terms above now use.
+    const float kEmissiveScale = 1500.0;
+    vec3 outRGB = sunResponse + indirectLighting * mat.base.diffuseAlbedo + EvaluateSubstrateEmissive(mat) * kEmissiveScale;
     float outAlpha = mat.alpha;
 
     // --- MegaLights Phase A follow-up: RIS-selected point light + 1 shadow-visibility ray, exactly
@@ -240,7 +244,11 @@ void main() {
 
         // Substrate: EvaluateSubstrateMaterial already applies its own NdotL internally (see
         // ComputeSunRadiance's own comment above) -- megaNdotL is kept only for the occlusion
-        // early-out check above, no longer multiplied into the final radiance here.
+        // early-out check above, no longer multiplied into the final radiance here. light.intensity
+        // is real luminous intensity in CANDELA (renderer::MegaLight's own comment, 2026-07-17
+        // recalibration) -- `intensity / distSq` is the standard inverse-square illuminance-at-a-
+        // point formula; EvaluateSubstrateMaterial's own contract already bakes in the /PI
+        // Lambertian normalization, so no extra factor is needed here.
         outRGB += EvaluateSubstrateMaterial(mat, n, viewDir, megaLightDir) * light.color * light.intensity / distSq * window * visibility * invPdf;
     }
 

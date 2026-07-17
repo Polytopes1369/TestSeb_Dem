@@ -83,16 +83,24 @@ namespace {
         geometry::ClusterDAGNode parent;
         parent.level = 1;
         parent.clusterError = 0.5f;
-        parent.childIndices = { 0u, 1u };
+        parent.sourceGroupIndex = 0u;
         parent.mesh.positions = { maths::vec3{0,0,0}, maths::vec3{1,1,0}, maths::vec3{0,1,0} };
         parent.mesh.locked = { false, false, false };
         parent.mesh.triangles = { 0u, 1u, 2u };
         StampBoundsFromMesh(parent);
         dag.nodes.push_back(parent); // index 2
 
-        dag.nodes[0].parentIndex = 2u;
+        geometry::ClusterDAGGroup group;
+        group.memberClusterIndices = { 0u, 1u };
+        group.outputClusterIndices = { 2u };
+        group.groupError = 0.5f;
+        group.groupSphereCenter = dag.nodes[2].sphereCenter;
+        group.groupSphereRadius = dag.nodes[2].sphereRadius;
+        dag.groups.push_back(group); // index 0
+
+        dag.nodes[0].parentGroupIndex = 0u;
         dag.nodes[0].parentError = 0.5f;
-        dag.nodes[1].parentIndex = 2u;
+        dag.nodes[1].parentGroupIndex = 0u;
         dag.nodes[1].parentError = 0.5f;
         dag.rootIndices = { 2u };
 
@@ -110,10 +118,12 @@ namespace {
             Check(errors.empty(), "MakeTinyValidDAG's baseline produced unexpected validation errors");
         }
 
-        // Scenario: self-referential cycle (a node lists itself as its own child).
+        // Scenario: self-referential cycle (a node's own source group lists it as one of its
+        // members, i.e. node 2 claims to be one of its own children).
         {
             geometry::ClusterDAG dag = MakeTinyValidDAG();
-            dag.nodes[2].childIndices.push_back(2u); // Parent claims itself as a third child.
+            dag.groups[0].memberClusterIndices.push_back(2u);
+            dag.nodes[2].parentGroupIndex = 0u; // Keep the reverse link consistent for a clean, single-cause cycle.
 
             std::vector<std::string> errors;
             bool valid = geometry::ValidateClusterDAG(dag, errors);
@@ -190,19 +200,24 @@ namespace {
             const std::string label = "dag node " + std::to_string(i);
             maxLevel = std::max(maxLevel, node.level);
 
+            std::vector<uint32_t> children;
+            if (node.sourceGroupIndex != geometry::kInvalidDAGGroupIndex && node.sourceGroupIndex < dag.groups.size()) {
+                children = dag.groups[node.sourceGroupIndex].memberClusterIndices;
+            }
+
             if (node.level == 0) {
                 ++leafCount;
-                Check(node.childIndices.empty(), label + ": a level-0 leaf must have no children");
+                Check(children.empty(), label + ": a level-0 leaf must have no children");
                 Check(node.clusterError == 0.0f, label + ": a level-0 leaf must have zero clusterError");
             }
             else {
                 ++internalCount;
-                Check(!node.childIndices.empty() && node.childIndices.size() <= 2,
-                    label + ": an internal node must have 1 or 2 children");
+                Check(!children.empty() && children.size() <= 4,
+                    label + ": an internal node must have 1 to 4 children (up to a 4-member group)");
 
                 uint32_t maxChildLevel = 0;
                 float maxChildError = 0.0f;
-                for (uint32_t childIdx : node.childIndices) {
+                for (uint32_t childIdx : children) {
                     Check(childIdx < dag.nodes.size(), label + ": child index out of range");
                     if (childIdx < dag.nodes.size()) {
                         maxChildLevel = std::max(maxChildLevel, dag.nodes[childIdx].level);
@@ -214,11 +229,11 @@ namespace {
                     label + ": clusterError must strictly exceed every child's clusterError");
             }
 
-            if (node.parentIndex == geometry::kInvalidDAGNodeIndex) {
+            if (node.parentGroupIndex == geometry::kInvalidDAGGroupIndex) {
                 Check(std::isinf(node.parentError), label + ": a root's parentError must be +infinity");
             }
             else {
-                Check(node.parentIndex < dag.nodes.size(), label + ": parentIndex out of range");
+                Check(node.parentGroupIndex < dag.groups.size(), label + ": parentGroupIndex out of range");
                 Check(node.parentError > node.clusterError, label + ": parentError must strictly exceed clusterError");
             }
         }

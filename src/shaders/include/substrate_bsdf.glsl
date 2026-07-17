@@ -74,6 +74,12 @@ void BuildProceduralTangentBasis(vec3 N, out vec3 T, out vec3 B) {
 // authored directly (renderer::GenerateShowcaseMaterialTable bakes a metal's diffuseAlbedo to zero at
 // generation time -- see that function's own comment), matching how a real Substrate material is
 // authored: a metal's color lives entirely in F0, never in diffuseAlbedo.
+// Real photometric light-unit recalibration (2026-07-17, see renderer::DirectionalLight's own
+// comment): a properly normalized Lambertian BRDF is `albedo / PI`, not bare `albedo` -- every
+// caller of EvaluateSubstrateMaterial now multiplies its result directly by the light's real
+// illuminance (lux/candela), so this term (and this term alone -- the specular/fuzz lobes below are
+// already correctly-normalized microfacet BRDFs with no such factor) needs the /PI baked in here to
+// stay physically consistent.
 vec3 EvaluateSlabDiffuse(SubstrateSlab slab, vec3 N, vec3 L) {
     float NdotL = dot(N, L);
     float lambert = max(NdotL, 0.0);
@@ -82,7 +88,7 @@ vec3 EvaluateSlabDiffuse(SubstrateSlab slab, vec3 N, vec3 L) {
         float wrapped = max((NdotL + wrap) / (1.0 + wrap), 0.0);
         lambert = mix(lambert, wrapped, clamp(slab.sssAmount, 0.0, 1.0));
     }
-    return slab.diffuseAlbedo * lambert;
+    return (slab.diffuseAlbedo / PI) * lambert;
 }
 
 // Substrate Slab specular term: anisotropic GGX (Smith height-correlated visibility, single

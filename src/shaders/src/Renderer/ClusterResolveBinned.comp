@@ -106,6 +106,10 @@ layout(std140, set = 0, binding = 6) uniform ResolveViewParamsUBO {
     // Phase 3: sun direction -- see ClusterResolve.comp's own identical field comment.
     vec3 sunDirection;
     float _pad2;
+    // Real photometric sun color/intensity (LUX) -- see ClusterResolve.comp's own identical field
+    // comment (2026-07-17 recalibration).
+    vec3 sunColor;
+    float sunIntensity;
     // Substrate integration: the view direction Substrate's specular/Fresnel terms need -- see
     // ClusterResolve.comp's own identical ResolveViewParamsUBO.cameraPositionWorld comment.
     vec3 cameraPositionWorld;
@@ -312,11 +316,19 @@ void main() {
     mat.base.diffuseAlbedo *= vtAlbedo;
 
     // Substrate: full Slab BSDF response to the sun's direction, shadowed by sunVisibility -- see
-    // ClusterResolve.comp's own identical Step 3 comment for the full rationale. The flat 0.15
-    // ambient/fill term stays a plain albedo tint, matching ClusterResolve.comp's own
-    // simplification (no single light direction for a BRDF to respond to).
+    // ClusterResolve.comp's own identical Step 3 comment for the full rationale, including the
+    // 2026-07-17 real-photometric-lighting recalibration (EvaluateSubstrateMaterial's own contract
+    // is "caller multiplies by the light's real color/intensity" -- its diffuse lobe already bakes
+    // in the /PI Lambertian normalization). kAmbientFraction stays a plain diffuseAlbedo tint,
+    // matching ClusterResolve.comp's own simplification (no single light direction for a BRDF to
+    // respond to).
+    const float kAmbientFraction = 0.05;
+    vec3 sunRadiance = g_ViewParams.sunColor * g_ViewParams.sunIntensity;
     vec3 directResponse = EvaluateSubstrateMaterial(mat, normal, viewDir, lightDir);
-    vec3 finalColor = mat.base.diffuseAlbedo * 0.15 + directResponse * sunVisibility + EvaluateSubstrateEmissive(mat);
+    const float kEmissiveScale = 1500.0;
+    vec3 finalColor = mat.base.diffuseAlbedo * kAmbientFraction * sunRadiance
+        + directResponse * sunRadiance * sunVisibility
+        + EvaluateSubstrateEmissive(mat) * kEmissiveScale;
 
     // Opacity-mask soft edge feathering -- see ClusterResolve.comp's own comment.
     if (cluster.maskTextureIndex != 0xFFFFFFFFu) {

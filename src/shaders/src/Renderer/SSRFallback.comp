@@ -1,0 +1,147 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+
+// Phase PP4 (post-process stack roadmap): Screen Space Reflections, used strictly as a FALLBACK --
+// per the approved plan's own "exactly like Unreal Engine 5.8" ruling, this is a REAL screen-space
+// raymarch, not a skip. Runs AFTER renderer::ReflectionPass's own Trace -> Temporal -> Gather trio
+// has already composited every pixel it found a real Surface Cache hit for (see ReflectionTrace.comp
+// -> g_ReflectionHitMask's own comment); this pass only touches pixels that trio marked as a MISS
+// (hit-mask == 0), tracing a classic linear screen-space raymarch against renderer::
+// ClusterResolvePass's own depth GBuffer instead, and additively read-modify-writing a Fresnel-
+// weighted contribution into the SAME output color image ReflectionGather.comp itself RMWs -- an
+// exact structural mirror of that shader's own compositing convention, just with a different source
+// of the reflected radiance (marched hit color instead of a traced Surface Cache sample).
+//
+// Reflects THIS frame's own partially-composited scene color (already has direct lighting +
+// whatever ReflectionPass/MegaLights added by the time this dispatch runs) -- the same "reflect the
+// current frame's own shaded buffer" approximation essentially every real-time SSR implementation
+// makes, since a genuinely previous-frame-independent reflection source does not exist in a
+// rasterized/hybrid pipeline without a full second scene render.
+
+#include "include/octahedral.glsl"
+#include "include/ggx_brdf.glsl"
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(rg16f, set = 0, binding = 0) uniform readonly image2D g_GBufferNormal;
+layout(r32f, set = 0, binding = 1) uniform readonly image2D g_GBufferDepth;
+layout(rg8, set = 0, binding = 2) uniform readonly image2D g_GBufferRoughnessMetallic;
+layout(rgba8, set = 0, binding = 3) uniform readonly image2D g_GBufferAlbedo;
+layout(r8, set = 0, binding = 4) uniform readonly image2D g_HitMask; // renderer::ReflectionPass::GetHitMaskView() -- 1.0 = Trace already found a real hit here.
+layout(rgba16f, set = 0, binding = 5) uniform image2D g_OutputColor; // Read-modify-write, matches ClusterResolvePass::kOutputColorFormat.
+
+layout(std140, set = 0, binding = 6) uniform SSRFallbackParamsUBO {
+    mat4 invViewProj;
+    mat4 viewProj;
+    vec3 cameraPositionWorld;
+    float maxDistanceWorld; // Max world-space raymarch length along the reflection ray.
+    vec2 viewportSize;
+    float thicknessWorld;   // Max world-space depth a hit surface may sit behind the march ray and still count.
+    float intensity;        // Global scale on the fallback's own additive contribution.
+} g_Params;
+
+const int kStepCount = 32;
+
+bool ReconstructWorldPos(ivec2 pixel, out vec3 worldPos, out float ndcDepth) {
+    ndcDepth = imageLoad(g_GBufferDepth, pixel).r;
+    if (ndcDepth <= 0.0) {
+        worldPos = vec3(0.0);
+        return false;
+    }
+    vec2 uv = (vec2(pixel) + 0.5) / g_Params.viewportSize;
+    vec4 clip = vec4(uv * 2.0 - 1.0, ndcDepth, 1.0);
+    vec4 world = g_Params.invViewProj * clip;
+    worldPos = world.xyz / world.w;
+    return true;
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 res = ivec2(g_Params.viewportSize);
+    if (pixel.x >= res.x || pixel.y >= res.y) {
+        return;
+    }
+
+    if (imageLoad(g_HitMask, pixel).r > 0.5) {
+        return; // ReflectionPass already found a real hit here -- nothing for the fallback to add.
+    }
+
+    vec3 worldPos;
+    float ndcDepth;
+    if (!ReconstructWorldPos(pixel, worldPos, ndcDepth)) {
+        return; // Sky/background.
+    }
+    vec3 normal = OctDecode(imageLoad(g_GBufferNormal, pixel).rg);
+    vec2 roughnessMetallic = imageLoad(g_GBufferRoughnessMetallic, pixel).rg;
+    float roughness = roughnessMetallic.r;
+    float metallic = roughnessMetallic.g;
+    vec3 albedo = imageLoad(g_GBufferAlbedo, pixel).rgb;
+
+    vec3 viewDir = normalize(g_Params.cameraPositionWorld - worldPos);
+    vec3 reflectDir = reflect(-viewDir, normal);
+    if (dot(reflectDir, normal) <= 0.0) {
+        return; // Same grazing-angle edge case ReflectionTrace.comp itself already guards against.
+    }
+
+    vec3 rayOrigin = worldPos + normal * 0.02;
+    float stepLength = g_Params.maxDistanceWorld / float(kStepCount);
+
+    bool hit = false;
+    ivec2 hitPixel = pixel;
+    for (int i = 1; i <= kStepCount && !hit; ++i) {
+        vec3 samplePos = rayOrigin + reflectDir * (stepLength * float(i));
+
+        vec4 sampleClip = g_Params.viewProj * vec4(samplePos, 1.0);
+        if (sampleClip.w <= 0.0001) {
+            break;
+        }
+        vec2 sampleUV = (sampleClip.xy / sampleClip.w) * 0.5 + 0.5;
+        if (sampleUV.x < 0.0 || sampleUV.x > 1.0 || sampleUV.y < 0.0 || sampleUV.y > 1.0) {
+            break; // Left the screen -- a screen-space march has nothing left to test past this point.
+        }
+
+        ivec2 samplePixel = clamp(ivec2(sampleUV * g_Params.viewportSize), ivec2(0), res - ivec2(1));
+        float bufferDepth = imageLoad(g_GBufferDepth, samplePixel).r;
+        if (bufferDepth <= 0.0) {
+            continue; // Sky/background there -- not a hit.
+        }
+
+        vec2 bufferUV = (vec2(samplePixel) + 0.5) / g_Params.viewportSize;
+        vec4 bufferClip = vec4(bufferUV * 2.0 - 1.0, bufferDepth, 1.0);
+        vec4 bufferWorld4 = g_Params.invViewProj * bufferClip;
+        vec3 bufferWorldPos = bufferWorld4.xyz / bufferWorld4.w;
+
+        float sampleDistToCam = length(samplePos - g_Params.cameraPositionWorld);
+        float bufferDistToCam = length(bufferWorldPos - g_Params.cameraPositionWorld);
+
+        if (bufferDistToCam < sampleDistToCam - 0.01 && (sampleDistToCam - bufferDistToCam) < g_Params.thicknessWorld) {
+            hit = true;
+            hitPixel = samplePixel;
+        }
+    }
+
+    if (!hit) {
+        return; // Even the fallback found nothing -- matches UE5.8's own "no SSR data" behavior.
+    }
+
+    // Fade the contribution out toward the screen edges (the hit pixel's own UV, not this pixel's)
+    // -- a marched ray that only barely stays on-screen is the classic SSR edge-artifact case.
+    vec2 hitUV = (vec2(hitPixel) + 0.5) / g_Params.viewportSize;
+    vec2 edgeDist = min(hitUV, vec2(1.0) - hitUV);
+    float edgeFade = clamp(min(edgeDist.x, edgeDist.y) / 0.05, 0.0, 1.0);
+
+    vec3 reflectedColor = imageLoad(g_OutputColor, hitPixel).rgb;
+
+    vec3 F0 = mix(vec3(0.04), albedo, metallic);
+    float NdotV = max(dot(normal, viewDir), 0.0);
+    vec3 fresnel = F_Schlick(F0, NdotV);
+
+    // Rough surfaces would only ever show a noisy, barely-visible single-sample fallback reflection
+    // -- fade the contribution down as roughness rises rather than spend a denoiser pass on it (this
+    // fallback is explicitly the "found nothing better" case, not Lumen's primary reflection path).
+    float roughnessFade = 1.0 - roughness;
+
+    vec4 baseColor = imageLoad(g_OutputColor, pixel);
+    vec3 finalColor = baseColor.rgb + fresnel * reflectedColor * edgeFade * roughnessFade * g_Params.intensity;
+    imageStore(g_OutputColor, pixel, vec4(finalColor, baseColor.a));
+}

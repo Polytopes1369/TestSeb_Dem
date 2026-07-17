@@ -328,7 +328,9 @@ namespace renderer {
     }
 
     void PostProcessPass::RecordComposite(VkCommandBuffer cmd, float deltaTimeSeconds, const Settings& settings,
-        const maths::mat4& invViewProj, const maths::mat4& prevViewProj, const maths::vec3& cameraPositionWorld) {
+        const maths::mat4& invViewProj, const maths::mat4& prevViewProj, const maths::vec3& cameraPositionWorld,
+        const maths::mat4& viewProj, const maths::vec3& sunDirection,
+        float fovYRadians, float aspectRatio, uint32_t frameIndex) {
         // --- Upload this frame's params UBO ---
         PostProcessParamsUBO params{};
         params.aperture = settings.aperture;
@@ -366,6 +368,49 @@ namespace renderer {
         params.fogHeightOffset = settings.fogHeightOffset;
         params.fogStartDistance = settings.fogStartDistance;
         params.fogMaxOpacity = settings.fogMaxOpacity;
+
+        // Phase PP4: God Rays -- project a point far along -sunDirection (the sun itself, since
+        // sunDirection points FROM the light TOWARD the scene) through this frame's `viewProj` to
+        // find its screen UV; `sunScreenValid` is 0 whenever that point sits behind the camera
+        // (clip.w <= 0) -- an off-screen-but-in-front sun is still valid (the classic technique's
+        // radial streaks read correctly even with the sun origin outside the viewport). maths::mat4
+        // has no vec4 type/operator* to lean on (see maths::mat4's own column-major `m` array
+        // layout, matched by ClusterRenderPipeline.cpp's own manual unprojections nowhere -- this is
+        // the first CPU-side forward projection in this codebase), so this multiplies manually.
+        float sunWorldX = cameraPositionWorld.x - sunDirection.x * 10000.0f;
+        float sunWorldY = cameraPositionWorld.y - sunDirection.y * 10000.0f;
+        float sunWorldZ = cameraPositionWorld.z - sunDirection.z * 10000.0f;
+        const auto& vp = viewProj.m;
+        float clipX = vp[0] * sunWorldX + vp[4] * sunWorldY + vp[8] * sunWorldZ + vp[12];
+        float clipY = vp[1] * sunWorldX + vp[5] * sunWorldY + vp[9] * sunWorldZ + vp[13];
+        float clipW = vp[3] * sunWorldX + vp[7] * sunWorldY + vp[11] * sunWorldZ + vp[15];
+        if (clipW > 0.0001f) {
+            params.sunScreenU = (clipX / clipW) * 0.5f + 0.5f;
+            params.sunScreenV = (clipY / clipW) * 0.5f + 0.5f;
+            params.sunScreenValid = 1.0f;
+        } else {
+            params.sunScreenValid = 0.0f;
+        }
+        params.godRaysIntensity = settings.godRaysIntensity;
+        params.godRaysDecay = settings.godRaysDecay;
+        params.godRaysDensity = settings.godRaysDensity;
+        params.godRaysWeight = settings.godRaysWeight;
+
+        // Phase PP5: Panini Projection -- half-FOV tangents drive the tangent-space UV remap (see
+        // PostProcessComposite.comp's own ApplyPaniniProjection comment). Matches maths::mat4::
+        // PerspectiveVulkan's own g=1/tan(fovY/2), m[0]=g/aspect relationship: tan(halfFovY) =
+        // 1/g, tan(halfFovX) = aspect * tan(halfFovY).
+        float halfFovTanY = std::tan(fovYRadians * 0.5f);
+        params.paniniD = settings.paniniD;
+        params.paniniS = settings.paniniS;
+        params.halfFovTanX = halfFovTanY * aspectRatio;
+        params.halfFovTanY = halfFovTanY;
+
+        params.sharpenIntensity = settings.sharpenIntensity;
+        params.sharpenRadiusPixels = settings.sharpenRadiusPixels;
+        params.filmGrainIntensity = settings.filmGrainIntensity;
+        params.filmGrainResponseMidpoint = settings.filmGrainResponseMidpoint;
+        params.frameIndex = frameIndex;
 
         vkCmdUpdateBuffer(cmd, m_ParamsBuffer.Handle(), 0, sizeof(PostProcessParamsUBO), &params);
 

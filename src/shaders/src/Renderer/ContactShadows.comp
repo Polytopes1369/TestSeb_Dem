@@ -1,0 +1,118 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+
+// Phase PP4 (post-process stack roadmap): Screen-Space Contact Shadows -- a short world-space
+// raymarch of renderer::ClusterResolvePass's own depth GBuffer toward the sun, catching the kind of
+// small-scale, thin-occluder self-shadowing (a character's fingers, thin foliage, a railing) that
+// renderer::VirtualShadowMapPass's own shadow-page resolution is too coarse to resolve reliably,
+// exactly matching UE5.8's own "Contact Shadows" post-process setting's stated purpose. Run
+// immediately after [12] Resolve and BEFORE [12b2]/[12b3] (Reflections/MegaLights) add anything --
+// at that exact point renderer::ClusterResolvePass's output color image holds ONLY the direct sun
+// term (already large-scale-shadow-tested by the Virtual Shadow Map), so a straight multiplicative
+// read-modify-write here is physically correct; multiplying after Reflections/MegaLights had already
+// added their own contributions would incorrectly darken indirect/point-light energy a *sun* contact
+// shadow has no business attenuating.
+//
+// Unlike renderer::ReflectionPass/GTAO.comp, this marches in WORLD space (not screen-space UV steps)
+// specifically so the occlusion test itself compares world-space distances-to-camera -- avoids the
+// nonlinear-depth-precision pitfalls of comparing raw reversed-Z depth values across a ray that
+// spans a meaningful depth range (see ReconstructWorldPos's shared convention with every other GI
+// pass in this codebase).
+
+#include "include/octahedral.glsl"
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(r32f, set = 0, binding = 0) uniform readonly image2D g_GBufferDepth;
+layout(rg16f, set = 0, binding = 1) uniform readonly image2D g_GBufferNormal;
+layout(rgba16f, set = 0, binding = 2) uniform image2D g_OutputColor; // Read-modify-write, matches ClusterResolvePass::kOutputColorFormat.
+
+layout(std140, set = 0, binding = 3) uniform ContactShadowParamsUBO {
+    mat4 invViewProj;
+    mat4 viewProj;
+    vec3 cameraPositionWorld;
+    float shadowLengthWorld; // Max world-space ray length -- caps how far a contact shadow can reach.
+    vec3 sunDirectionWorld;  // Points FROM the light TOWARD the scene (same convention as ClusterResolvePass::RecordResolve's own sunDirection).
+    float intensity;         // 0 = no darkening, 1 = fully black where an occluder is found.
+    vec2 viewportSize;
+    float thicknessWorld;    // Max world-space depth an occluder may sit behind the march ray and still count (rejects unrelated far background).
+    float _pad0;
+} g_Params;
+
+const int kStepCount = 12;
+
+bool ReconstructWorldPos(ivec2 pixel, out vec3 worldPos, out float ndcDepth) {
+    ndcDepth = imageLoad(g_GBufferDepth, pixel).r;
+    if (ndcDepth <= 0.0) {
+        worldPos = vec3(0.0);
+        return false;
+    }
+    vec2 uv = (vec2(pixel) + 0.5) / g_Params.viewportSize;
+    vec4 clip = vec4(uv * 2.0 - 1.0, ndcDepth, 1.0);
+    vec4 world = g_Params.invViewProj * clip;
+    worldPos = world.xyz / world.w;
+    return true;
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 res = ivec2(g_Params.viewportSize);
+    if (pixel.x >= res.x || pixel.y >= res.y) {
+        return;
+    }
+
+    vec3 worldPos;
+    float ndcDepth;
+    if (!ReconstructWorldPos(pixel, worldPos, ndcDepth)) {
+        return; // Sky/background -- nothing to shadow.
+    }
+    vec3 normal = OctDecode(imageLoad(g_GBufferNormal, pixel).rg);
+
+    vec3 rayDir = normalize(-g_Params.sunDirectionWorld); // Toward the light.
+    vec3 rayOrigin = worldPos + normal * 0.02; // Self-occlusion bias, matches ReflectionTrace.comp's own biasedOrigin.
+    float stepLength = g_Params.shadowLengthWorld / float(kStepCount);
+
+    float visibility = 1.0;
+    for (int i = 1; i <= kStepCount; ++i) {
+        vec3 samplePos = rayOrigin + rayDir * (stepLength * float(i));
+
+        vec4 sampleClip = g_Params.viewProj * vec4(samplePos, 1.0);
+        if (sampleClip.w <= 0.0001) {
+            break; // Behind the camera -- nothing further along this ray can be tested.
+        }
+        vec2 sampleUV = (sampleClip.xy / sampleClip.w) * 0.5 + 0.5;
+        if (sampleUV.x < 0.0 || sampleUV.x > 1.0 || sampleUV.y < 0.0 || sampleUV.y > 1.0) {
+            continue; // Left the screen -- can't test this step, keep marching (the ray may re-enter).
+        }
+
+        ivec2 samplePixel = ivec2(sampleUV * g_Params.viewportSize);
+        samplePixel = clamp(samplePixel, ivec2(0), res - ivec2(1));
+        float bufferDepth = imageLoad(g_GBufferDepth, samplePixel).r;
+        if (bufferDepth <= 0.0) {
+            continue; // Sky/background at that screen position -- not an occluder.
+        }
+
+        vec2 bufferUV = (vec2(samplePixel) + 0.5) / g_Params.viewportSize;
+        vec4 bufferClip = vec4(bufferUV * 2.0 - 1.0, bufferDepth, 1.0);
+        vec4 bufferWorld4 = g_Params.invViewProj * bufferClip;
+        vec3 bufferWorldPos = bufferWorld4.xyz / bufferWorld4.w;
+
+        float sampleDistToCam = length(samplePos - g_Params.cameraPositionWorld);
+        float bufferDistToCam = length(bufferWorldPos - g_Params.cameraPositionWorld);
+
+        // The real surface at this screen position sits closer to the camera than our march point
+        // (occludes it), and not so far behind it that it's really unrelated background geometry.
+        if (bufferDistToCam < sampleDistToCam - 0.01 && (sampleDistToCam - bufferDistToCam) < g_Params.thicknessWorld) {
+            // Fade the shadow strength out near the ray's own max length -- avoids a hard cutoff
+            // edge where the contact shadow simply stops mattering at exactly `shadowLengthWorld`.
+            float edgeFade = 1.0 - (float(i) / float(kStepCount));
+            visibility = min(visibility, mix(1.0, 1.0 - g_Params.intensity, edgeFade));
+            break; // First occluder along the ray wins -- classic contact-shadow convention.
+        }
+    }
+
+    if (visibility < 1.0) {
+        vec4 baseColor = imageLoad(g_OutputColor, pixel);
+        imageStore(g_OutputColor, pixel, vec4(baseColor.rgb * visibility, baseColor.a));
+    }
+}

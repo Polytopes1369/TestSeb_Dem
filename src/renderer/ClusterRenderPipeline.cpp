@@ -505,7 +505,9 @@ bool ClusterRenderPipeline::Init(
   // visibly toward a neighboring grid cell.
   m_SceneLights.pointLights[0].position = maths::vec3{ -3.0f, 2.5f, -1.5f };
   m_SceneLights.pointLights[0].color = maths::vec3{ 1.0f, 0.85f, 0.6f };
-  m_SceneLights.pointLights[0].intensity = 4.0f;
+  // Real photometric candela (renderer::PointLight's own comment, 2026-07-17 recalibration) --
+  // left at this class's own default (see LightingTypes.h) rather than a distinct override.
+  m_SceneLights.pointLights[0].intensity = renderer::PointLight{}.intensity;
   m_SceneLights.pointLights[0].radius = 8.0f;
   m_SceneLights.pointLightCount = 1;
 
@@ -548,6 +550,11 @@ bool ClusterRenderPipeline::Init(
     LOG_ERROR("[ClusterRenderPipeline] Failed to initialize ReflectionPass.");
     return false;
   }
+  // Phase PP4 (post-process stack roadmap): GTAO / Screen-Space Contact Shadows / SSR Fallback --
+  // needs m_Resolve's GBuffer (same as m_Reflection above) AND m_Reflection's own hit-mask (just
+  // Init'd), so must Init after both.
+  m_ScreenSpaceEffects.Init(createInfo.device, createInfo.allocator, createInfo.commandPool,
+                            createInfo.queue, createInfo.renderExtent, m_Resolve, m_Reflection);
   // Phase A of the MegaLights native-port roadmap: procedurally scatter kMaxMegaLights point
   // lights around the demo's 13-entity grid (see MegaLightsTypes.h's own GenerateProceduralLights
   // comment), then Init the pass -- needs m_Resolve's GBuffer (same as m_Reflection above) and
@@ -628,6 +635,35 @@ bool ClusterRenderPipeline::Init(
     }
   }
 
+  // Phase 7c (UE5.8 parity roadmap, water/erosion): forward-rendered water plane -- see
+  // ClusterRenderPipeline.h's own comment on m_WaterForward. Same borrowed-resource contract as
+  // m_HeroTessellation above, resolved for the water entity; `waterMaterial` is the caller's own
+  // materialTable.params[renderer::kWaterMaterialID] slot (populated by
+  // GenerateShowcaseMaterialTable()'s own water-recipe override, see that function's own comment).
+  {
+    // Matches VulkanContext::kWaterEntityIndex exactly (the water plane, generated last -- see
+    // that class' own comment) -- a plain literal here rather than a cross-file constant
+    // reference, same convention kHeroEntityID above already establishes.
+    constexpr uint32_t kWaterEntityID = 15u;
+    const auto& entityRanges = m_SurfaceCache.GetEntityRanges();
+    const auto waterRangeIt = entityRanges.find(kWaterEntityID);
+    if (waterRangeIt == entityRanges.end()) {
+      LOG_ERROR("[ClusterRenderPipeline] Water entity (meshID=15) has no Fallback Mesh draw range -- cannot initialize WaterForwardPass.");
+      return false;
+    }
+    if (!m_WaterForward.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
+                            GICompositePass::kOutputFormat, createInfo.depthFormat,
+                            createInfo.entityTransformBuffer,
+                            createInfo.materialTable.params[kWaterMaterialID],
+                            m_SurfaceCache.GetVertexBuffer(), m_SurfaceCache.GetIndexBuffer(),
+                            waterRangeIt->second, kWaterEntityID,
+                            m_SurfaceCacheRT.GetTLASHandle(), m_SurfaceCacheRT.GetDrawRangeBuffer(),
+                            m_TraceContext, createInfo.renderExtent)) {
+      LOG_ERROR("[ClusterRenderPipeline] Failed to initialize WaterForwardPass.");
+      return false;
+    }
+  }
+
   // Screen Trace GI -- linear screen-space depth raymarching falling back to the World Probe grid.
   m_ScreenTrace.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
                      createInfo.renderExtent, m_Resolve.GetOutputDepthView(), m_Resolve.GetOutputNormalView(),
@@ -642,7 +678,7 @@ bool ClusterRenderPipeline::Init(
   // GI Composite: blends m_Resolve's direct lighting / reflections with the denoised indirect GI.
   m_GIComposite.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
       createInfo.renderExtent, m_Resolve.GetOutputColorView(), m_Denoiser.GetOutputView(),
-      m_Resolve.GetOutputDepthView(), m_WorldProbes);
+      m_ScreenSpaceEffects.GetAOView(), m_Resolve.GetOutputDepthView(), m_WorldProbes);
 
   m_TAATSR.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
       m_RenderExtent, m_DisplayExtent,
@@ -867,6 +903,7 @@ void ClusterRenderPipeline::Shutdown() {
   m_SDFRayMarch.Shutdown();
 #endif
   m_MegaLights.Shutdown();
+  m_ScreenSpaceEffects.Shutdown();
   m_Reflection.Shutdown();
   m_ScreenTrace.Shutdown();
   m_GIComposite.Shutdown();
@@ -910,6 +947,7 @@ void ClusterRenderPipeline::Shutdown() {
 #endif
 
   m_HeroTessellation.Shutdown();
+  m_WaterForward.Shutdown();
   m_TransparentForward.Shutdown();
   m_ShadingBin.Shutdown();
   m_Resolve.Shutdown();
@@ -1553,15 +1591,39 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
 #ifndef NDEBUG
   if (cameraCopy.debugViewMode == DEBUG_VIEW_NORMAL) {
     m_ShadingBin.RecordClassifyAndSort(cmd, m_RenderExtent);
-    m_Resolve.RecordResolveBinned(cmd, viewProj, m_SceneLights.sun.direction, cameraPositionWorld, m_ShadingBin);
+    m_Resolve.RecordResolveBinned(cmd, viewProj, m_SceneLights.sun, cameraPositionWorld, m_ShadingBin);
   } else {
     maths::mat4 prevViewProjForResolve = m_HasPrevViewProj ? m_PrevViewProj : viewProj;
-    m_Resolve.RecordResolve(cmd, viewProj, prevViewProjForResolve, m_SceneLights.sun.direction, cameraPositionWorld, cameraCopy.debugViewMode);
+    m_Resolve.RecordResolve(cmd, viewProj, prevViewProjForResolve, m_SceneLights.sun, cameraPositionWorld, cameraCopy.debugViewMode);
   }
 #else
   m_ShadingBin.RecordClassifyAndSort(cmd, m_RenderExtent);
-  m_Resolve.RecordResolveBinned(cmd, viewProj, m_SceneLights.sun.direction, cameraPositionWorld, m_ShadingBin);
+  m_Resolve.RecordResolveBinned(cmd, viewProj, m_SceneLights.sun, cameraPositionWorld, m_ShadingBin);
 #endif
+
+  // =========================================================================================
+  // [12a] Phase PP4 (post-process stack roadmap): GTAO + Screen-Space Contact Shadows.
+  // Contact Shadows MUST run here -- immediately after [12] Resolve, BEFORE [12b2]/[12b3]
+  // (Reflections/MegaLights) add anything -- see ScreenSpaceEffectsPass::RecordContactShadows'
+  // own comment for why that ordering is load-bearing. GTAO has no such ordering constraint (its
+  // own owned AO image is only consumed later by [12e] GIComposite) -- grouped here purely for
+  // locality, both read the exact same GBuffer this same point in the frame already has ready.
+  // =========================================================================================
+  {
+    ScreenSpaceEffectsPass::Settings ssfxSettings{};
+    ssfxSettings.aoRadiusWorld = config::postprocess::AO_RADIUS_WORLD;
+    ssfxSettings.aoIntensity = config::postprocess::AO_INTENSITY;
+    ssfxSettings.aoPower = config::postprocess::AO_POWER;
+    ssfxSettings.contactShadowLengthWorld = config::postprocess::CONTACT_SHADOW_LENGTH_WORLD;
+    ssfxSettings.contactShadowIntensity = config::postprocess::CONTACT_SHADOW_INTENSITY;
+    ssfxSettings.contactShadowThicknessWorld = config::postprocess::CONTACT_SHADOW_THICKNESS_WORLD;
+    ssfxSettings.ssrFallbackMaxDistanceWorld = config::postprocess::SSR_FALLBACK_MAX_DISTANCE_WORLD;
+    ssfxSettings.ssrFallbackThicknessWorld = config::postprocess::SSR_FALLBACK_THICKNESS_WORLD;
+    ssfxSettings.ssrFallbackIntensity = config::postprocess::SSR_FALLBACK_INTENSITY;
+
+    m_ScreenSpaceEffects.RecordAmbientOcclusion(cmd, viewProj, cameraPositionWorld, cameraFrameInfo.fovYRadians, ssfxSettings);
+    m_ScreenSpaceEffects.RecordContactShadows(cmd, viewProj, cameraPositionWorld, m_SceneLights.sun.direction, ssfxSettings);
+  }
 
   // Captures THIS frame's shadow-page miss reports (written by SurfaceCacheCapture.frag at [1z]
   // above and by whichever ClusterResolve.comp/ClusterResolveBinned.comp path just ran) for
@@ -1626,6 +1688,16 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
       m_Reflection.RecordTrace(cmd, m_TraceContext, m_TraceContext.GetEntityCount(), traceMode, m_FrameIndex);
       m_Reflection.RecordTemporal(cmd);
       m_Reflection.RecordGather(cmd);
+
+      // Phase PP4: SSR Fallback -- needs m_Reflection's own hit-mask, just written by RecordTrace()
+      // above this same frame, so gated under the same `reflectionsEnabled` toggle (a stale
+      // hit-mask from a prior frame would otherwise misdirect this pass when reflections are
+      // debug-disabled).
+      ScreenSpaceEffectsPass::Settings ssrFallbackSettings{};
+      ssrFallbackSettings.ssrFallbackMaxDistanceWorld = config::postprocess::SSR_FALLBACK_MAX_DISTANCE_WORLD;
+      ssrFallbackSettings.ssrFallbackThicknessWorld = config::postprocess::SSR_FALLBACK_THICKNESS_WORLD;
+      ssrFallbackSettings.ssrFallbackIntensity = config::postprocess::SSR_FALLBACK_INTENSITY;
+      m_ScreenSpaceEffects.RecordSSRFallback(cmd, viewProj, cameraPositionWorld, ssrFallbackSettings);
     }
   }
 
@@ -1803,6 +1875,14 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
     m_TransparentForward.RecordDraw(cmd, transparentTargetImage, transparentTargetView, m_DepthImageView,
         m_RenderExtent, cameraCopy.view, cameraCopy.proj, m_Decompression.GetDecompressedIndexPoolBuffer(),
         cameraFrameInfo.position, m_SceneLights, globalTimeSeconds, m_TraceContext, traceMode, m_FrameIndex);
+
+    // Phase 7c (UE5.8 parity roadmap, water/erosion): recorded LAST among the forward passes --
+    // see ClusterRenderPipeline.h's own comment on m_WaterForward for why (it snapshots the
+    // already fully-composited frame, including the glass/translucent draw just above, for its
+    // own refraction term).
+    m_WaterForward.RecordDraw(cmd, viewProj, cameraFrameInfo.position,
+        transparentTargetImage, transparentTargetView, m_DepthImage, m_DepthImageView,
+        m_RenderExtent, traceMode, m_FrameIndex, globalTimeSeconds, m_TraceContext);
   }
 
   // =========================================================================================
@@ -1928,12 +2008,24 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
       ppSettings.fogHeightOffset = config::postprocess::FOG_HEIGHT_OFFSET;
       ppSettings.fogStartDistance = config::postprocess::FOG_START_DISTANCE;
       ppSettings.fogMaxOpacity = config::postprocess::FOG_MAX_OPACITY;
+      ppSettings.godRaysIntensity = config::postprocess::GOD_RAYS_INTENSITY;
+      ppSettings.godRaysDecay = config::postprocess::GOD_RAYS_DECAY;
+      ppSettings.godRaysDensity = config::postprocess::GOD_RAYS_DENSITY;
+      ppSettings.godRaysWeight = config::postprocess::GOD_RAYS_WEIGHT;
+      ppSettings.paniniD = config::postprocess::PANINI_D;
+      ppSettings.paniniS = config::postprocess::PANINI_S;
+      ppSettings.sharpenIntensity = config::postprocess::SHARPEN_INTENSITY;
+      ppSettings.sharpenRadiusPixels = config::postprocess::SHARPEN_RADIUS_PIXELS;
+      ppSettings.filmGrainIntensity = config::postprocess::FILM_GRAIN_INTENSITY;
+      ppSettings.filmGrainResponseMidpoint = config::postprocess::FILM_GRAIN_RESPONSE_MIDPOINT;
 
       // Same prevViewProj-or-current-frame-fallback expression [13d]'s own TAA pass already
       // resolved into its own block-scoped prevViewProjForTAA (out of scope here) -- Motion Blur's
       // own per-pixel reprojection needs the identical semantics, recomputed inline.
       maths::mat4 prevViewProjForPostProcess = m_HasPrevViewProj ? m_PrevViewProj : viewProj;
-      m_PostProcess.RecordComposite(cmd, deltaTimeSeconds, ppSettings, invViewProj, prevViewProjForPostProcess, cameraPositionWorld);
+      m_PostProcess.RecordComposite(cmd, deltaTimeSeconds, ppSettings, invViewProj, prevViewProjForPostProcess, cameraPositionWorld,
+          viewProj, m_SceneLights.sun.direction,
+          cameraFrameInfo.fovYRadians, cameraFrameInfo.aspectRatio, m_FrameIndex);
   }
 
 #ifndef NDEBUG

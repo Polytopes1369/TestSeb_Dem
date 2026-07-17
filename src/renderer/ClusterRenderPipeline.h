@@ -82,10 +82,12 @@
 #include "renderer/vulkan/GpuBuffer.h"
 #include "renderer/streaming/GpuGeometryPagePool.h"
 #include "renderer/passes/HeroTessellationPass.h"
+#include "renderer/passes/WaterForwardPass.h"
 #include "renderer/passes/HZBPass.h"
 #include "renderer/LightingTypes.h"
 #include "renderer/passes/ProceduralMaskGenerator.h"
 #include "renderer/passes/ReflectionPass.h"
+#include "renderer/passes/ScreenSpaceEffectsPass.h"
 #include "renderer/passes/MegaLightsPass.h"
 #include "renderer/passes/ScreenProbeGIPass.h"
 #include "renderer/passes/SurfaceCacheGIInjectPass.h"
@@ -429,6 +431,17 @@ namespace renderer {
         // consequence.
         HeroTessellationPass m_HeroTessellation;
 
+        // Phase 7c (UE5.8 parity roadmap, water/erosion): forward-rendered water plane (materialID
+        // kWaterMaterialID, culled out of the opaque Nanite path via core::EntityFlags::
+        // IsTransparent, same mechanism as m_HeroTessellation above -- see VulkanContext::
+        // BuildEntityData()'s own comment). Recorded LAST among the forward passes (after
+        // m_TransparentForward) -- see WaterForwardPass's own class comment for why: it blits the
+        // ALREADY fully-composited frame (opaque + GI + glass + hero) into its own private
+        // background-snapshot image for its refraction term, so anything drawn after it would be
+        // invisible to that refraction (and anything drawn before it that skipped this ordering
+        // would show through unrealistically, since water is meant to be the top-most surface).
+        WaterForwardPass m_WaterForward;
+
         // Lumen-style GI infrastructure -- unlike the debug-only stats/overlay block below, these
         // are real (if not yet light-transport-consuming) systems, not visualization tools, so
         // they compile in Release too (matching how the actual Nanite cluster pipeline above is
@@ -500,6 +513,13 @@ namespace renderer {
         // for the full pipeline and why its storage is raw RGBA16F radiance, not spherical harmonics
         // (physically incapable of a narrow specular lobe).
         ReflectionPass m_Reflection;
+
+        // Phase PP4 (post-process stack roadmap): GTAO (feeds m_GIComposite below) + Screen-Space
+        // Contact Shadows (multiplicative RMW on m_Resolve's output color, called right after [12]
+        // Resolve) + SSR Fallback (additive RMW on the same image, called after m_Reflection's own
+        // Trace/Temporal/Gather trio) -- see ScreenSpaceEffectsPass's own class comment for exactly
+        // why 3 independent Record*() call sites are needed instead of one.
+        ScreenSpaceEffectsPass m_ScreenSpaceEffects;
 
         // Phase A of the MegaLights native-port roadmap: RIS-weighted stochastic multi-point-light
         // direct lighting (up to kMaxMegaLights procedurally-authored point lights), one ray-traced

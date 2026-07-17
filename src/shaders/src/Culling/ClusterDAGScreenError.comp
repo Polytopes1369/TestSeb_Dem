@@ -38,14 +38,31 @@
 // ClusterLODSelectionPass.h) matches it field-for-field, declaring that same padding explicitly.
 // See renderer::ClusterLODSelectionPass for the driver that populates this SSBO from
 // geometry::ClusterIndexEntry / DAGNodeEntry.
+//
+// A group of up to 4 members can produce up to kMaxGroupOutputClusters (2, geometry::
+// ClusterDAGGroup / ClusterDAG.h) coarser output clusters that both replace the same members, so a
+// node can have up to 2 distinct parents and up to 4 children -- parentClusterID0/1 and
+// childClusterID0-3 below replace what used to be a single parentClusterID and 2 childClusterID
+// slots. THIS SHADER never actually reads any of the 6 ID fields below (parentClusterID0/1,
+// childClusterID0-3) -- they only exist here so this struct's byte layout matches the C++/other-
+// shader mirrors exactly; ClusterLODResidencyFallback.comp's ancestor walk and this engine's
+// CPU-side debug tooling are what actually consume them. clusterError/parentError/
+// parentSphereCenter below are the only fields this shader's own decision depends on, and they
+// stay single scalars/one vec3 each: parentError and parentSphereCenter are baked from the shared
+// PARENT GROUP's groupError/groupSphereCenter (identical for every member and every output
+// sibling), never from any one specific parentClusterID slot -- see parentSphereCenter's own
+// comment below for why that must not depend on which sibling ends up actually selected at runtime.
 struct DAGNodePayload {
     vec3 sphereCenter;
     float sphereRadius;
 
     uint clusterID;
-    uint parentClusterID;
+    uint parentClusterID0;
+    uint parentClusterID1;
     uint childClusterID0;
     uint childClusterID1;
+    uint childClusterID2;
+    uint childClusterID3;
     uint level;
 
     float clusterError;
@@ -63,22 +80,23 @@ struct DAGNodePayload {
     // projecting error to pixels -- see cluster_entity_transform.glsl's own comment for why this
     // matters.
     uint entityID;
-    uint _pad0;
-    uint _pad1;
-    uint _pad2;
 
-    // The DIRECT PARENT's own sphereCenter (geometry::ClusterIndexEntry::sphereCenter at
-    // parentClusterID, NOT this node's own center) -- parentError must be projected from the
-    // parent's own position, not this node's. Using this node's sphereCenter for both projections
-    // (the original approach) implicitly assumes parent and child sit at the same world position,
-    // which is false in general (a DAG merge's centroid drifts as clusters combine upward) -- on a
-    // large, near-continuously-curving-away surface like a 300m floor seen at a grazing angle, that
-    // drift is large enough that the SAME clusterError value projects on two different sides of
+    // The shared PARENT GROUP's own bounding-sphere center (geometry::ClusterDAGGroup::
+    // groupSphereCenter, baked into geometry::DAGNodeEntry::parentSphereCenter at cache-write
+    // time), NOT any individual output sibling's own center -- parentError must be projected from
+    // the group's own position, not this node's, and not from whichever of parentClusterID0/1 a
+    // runtime LOD cut happens to select (both siblings share this identical value by construction,
+    // see ClusterDAGGroup's own comment, so which one gets drawn never matters for this test).
+    // Using this node's own sphereCenter for both projections (the original, pre-grouping
+    // approach) implicitly assumes parent and child sit at the same world position, which is false
+    // in general (a DAG merge's centroid drifts as clusters combine upward) -- on a large, near-
+    // continuously-curving-away surface like a 300m floor seen at a grazing angle, that drift is
+    // large enough that the SAME clusterError value projects on two different sides of
     // pixelThreshold depending on which of the two positions is used, opening a gap where NEITHER
     // this node NOR its parent gets DAG_DECISION_DRAW -- a real, observed bug (see project memory
     // project_persistent_cluster_holes_open_bug.md), not a hypothetical one.
     vec3 parentSphereCenter;
-    float _pad3;
+    float _pad0;
 };
 
 struct DAGScreenErrorViewParams {

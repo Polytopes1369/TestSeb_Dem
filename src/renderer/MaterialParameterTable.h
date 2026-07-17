@@ -136,6 +136,17 @@ namespace renderer {
     // has no runtime-displaced/tessellated representation to protect).
     inline constexpr uint32_t kTerrainMaterialID = 16u;
 
+    // Phase 7c (UE5.8 parity roadmap, water/erosion): the water plane's material. Reserved one
+    // past kTerrainMaterialID, same "never collides with a real entity's showcase material"
+    // convention -- assigned explicitly to exactly one entity (the water plane, see
+    // VulkanContext::kWaterEntityIndex). Rendered ONLY by renderer::WaterForwardPass; never
+    // reaches the opaque Nanite resolve shaders (its entity is unconditionally excluded from that
+    // path via core::EntityFlags::IsTransparent, same mechanism as the hero entity -- see
+    // VulkanContext::BuildEntityData()'s own comment). `alpha` here is repurposed as the MAXIMUM
+    // depth-based absorption blend strength (not a fixed-function blend alpha -- WaterForward.frag
+    // composes manually against a background snapshot, see that pass's own header comment).
+    inline constexpr uint32_t kWaterMaterialID = 17u;
+
     // One generated table: the PBR parameters themselves, plus a parallel convenience flag so
     // callers (VulkanContext::BuildEntityData, deciding each entity's core::EntityFlags::
     // IsTransparent bit) don't need to re-derive "alpha < 1.0" themselves.
@@ -306,6 +317,17 @@ namespace renderer {
         // kTerrainMaterialID (16) likewise sits past every hand-authored slot, untouched by the
         // isTransparent loop above.
         table.params[kTerrainMaterialID].base = MakeBaseSlab(maths::vec3(0.24f, 0.42f, 0.15f), 0.88f, maths::vec3(0.0f, 0.0f, 0.0f), 0.0f);
+
+        // Phase 7c (UE5.8 parity roadmap, water/erosion): water -- deep blue-teal absorption tint
+        // (reused directly as WaterForward.frag's depth-based Beer-Lambert tint color, not just a
+        // flat diffuseAlbedo), near-mirror roughness (calm water), alpha repurposed as the maximum
+        // absorption blend strength at full depth (0.85 -- some background always shows through
+        // even at the deepest basin point). kWaterMaterialID (17) likewise sits past every
+        // hand-authored slot, untouched by the isTransparent loop above (WaterForwardPass reads
+        // this material directly via its own single-element buffer, not this SSBO array -- see
+        // that pass' own class comment).
+        table.params[kWaterMaterialID].base = MakeBaseSlab(maths::vec3(0.02f, 0.10f, 0.18f), 0.04f, maths::vec3(0.0f, 0.0f, 0.0f), 0.0f);
+        table.params[kWaterMaterialID].alpha = 0.85f;
 
         return table;
     }

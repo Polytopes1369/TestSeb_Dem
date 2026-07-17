@@ -109,7 +109,12 @@ namespace renderer {
                 // Radius scaled well below UE5.8's human-scale-level norm to suit this ~12x12 unit
                 // compact demo grid -- see the approved plan's own documented UE5.8-scale adaptation.
                 light.radius = 0.8f + unit(rng) * 1.7f;      // [0.8, 2.5]
-                light.intensity = 0.6f + unit(rng) * 1.9f;   // [0.6, 2.5], modest since 256 stack.
+                // Real luminous intensity in CANDELA (renderer::MegaLight's own comment, 2026-07-17
+                // recalibration matching UE5.8's own Point Light unit) -- [200, 800] candela is the
+                // same order of magnitude as UE5.8's own default new Point Light (~398 candela, see
+                // renderer::PointLight's own comment), scaled per-light since up to 200 of these
+                // stack within the dedicated MegaLights showcase zone.
+                light.intensity = 200.0f + unit(rng) * 600.0f;
 
                 data.lights[writeIndex] = light;
                 ++writeIndex;
