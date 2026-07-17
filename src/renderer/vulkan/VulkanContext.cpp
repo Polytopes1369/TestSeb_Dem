@@ -9,6 +9,7 @@
 #include "renderer/vulkan/VulkanUtils.h"
 #include "core/debug/ValidationMessageSink.h"
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cmath>
 #include <cstddef>
@@ -802,6 +803,22 @@ void VulkanContext::CreateLogicalDevice() {
   // tracing / mesh shader requirements already supports it), so enabled unconditionally here,
   // matching geometryShader's/fragmentStoresAndAtomics' own enablement rigor above.
   deviceFeatures2.features.multiDrawIndirect = VK_TRUE;
+  // independentBlend (Phase PP3, post-process stack roadmap): renderer::TransparentForwardPass's
+  // own forward pipeline now has 2 color attachments with DIFFERENT blend states (color: alpha-
+  // blended "over" compositing; g_RefractionOffset: a plain overwrite, blendEnable=FALSE -- see
+  // that pass' own pipeline-creation comment) -- without this feature, the spec requires every
+  // element of VkPipelineColorBlendStateCreateInfo::pAttachments to be IDENTICAL
+  // (VUID-VkPipelineColorBlendStateCreateInfo-pAttachments-00605), which vkCreateGraphicsPipelines
+  // then rejects. A near-universally-supported core Vulkan 1.0 feature bit on desktop GPUs, so
+  // enabled unconditionally here, matching multiDrawIndirect's own enablement rigor above.
+  deviceFeatures2.features.independentBlend = VK_TRUE;
+  // tessellationShader (Phase 7a, UE5.8 parity roadmap): core Vulkan 1.0 feature bit, no device
+  // extension required -- gates VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT/_EVALUATION_BIT
+  // (renderer::HeroTessellationPass, the hero Icosphere's own screen-space-adaptive
+  // displacement-mapped pipeline). A near-universally-supported core feature on desktop GPUs
+  // (same rigor as geometryShader/fragmentStoresAndAtomics/multiDrawIndirect above), enabled
+  // unconditionally here.
+  deviceFeatures2.features.tessellationShader = VK_TRUE;
 
   VkDeviceCreateInfo createInfo{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
   createInfo.pNext = &deviceFeatures2;
@@ -1351,16 +1368,49 @@ void VulkanContext::DispatchGeometryCompute(
 }
 
 maths::vec2 VulkanContext::GridSlot(int slotIndex) const {
-  // 3-wide grid (as many rows as needed) centered on (0,0,0), in the XZ plane
-  // (Y = 0 ground level), spaced kGridSpacing apart; with kEntityCount = 12
-  // this fills exactly 4 rows. Used both by GenerateGeometry() (to bake each
-  // primitive's world position at generation time) and UpdateEntityRotations()
-  // (to recover each entity's rotation pivot), so this is the single source of
-  // truth for the layout.
-  constexpr float kGridSpacing = 3.0f;
-  int col = slotIndex % 3;
-  int row = slotIndex / 3;
-  return maths::vec2{(col - 1) * kGridSpacing, (row - 1) * kGridSpacing};
+  // Feature-gallery layout: 9 zones on a 3x3 macro-grid (kZonePitch apart, in the XZ plane,
+  // Y = 0 ground level), each zone dedicated to ONE engine feature so the base scene reads as a
+  // side-by-side showcase instead of one dense grid of randomly-skinned primitives. Zones that
+  // hold two primitives offset them by kPairOffset either side of the zone center so both remain
+  // clearly separated (max primitive half-width here is 0.8, so a 2.0-unit pair separation never
+  // overlaps). Used both by GenerateGeometry() (to bake each primitive's world position at
+  // generation time) and UpdateEntityRotations() (to recover each entity's rotation pivot) --
+  // single source of truth for the layout, duplicated (deliberately, see its own comment) by
+  // renderer::MegaLightsTypes.cpp's EntityGridPosition() for MegaLights placement.
+  //
+  //   col -1        col 0          col 1
+  //   row -1  NANITE zone   WPO/displacement   METAL zone
+  //           (icosphere +  zone (cone, sways   (chrome box +
+  //           torus knot)   via WPO)            gold capsule)
+  //   row  0  DIELECTRIC    LUMEN/GI zone       TRANSPARENT/
+  //           zone (plane + (chamfer box in a   GLASS zone
+  //           pyramid)      2-wall color-bounce (clear sphere)
+  //                         corner)
+  //   row  1  TRANSLUCENT   EMISSIVE zone       MEGALIGHTS zone
+  //           zone (torus)  (glowing tube)      (cylinder lit by
+  //                                             ~200 stochastic
+  //                                             point lights)
+  constexpr float kZonePitch = 4.0f;
+  constexpr float kPairOffset = 1.0f;
+
+  struct ZoneEntry { float col, row, pairOffset; };
+  static constexpr std::array<ZoneEntry, 12> kLayout = {{
+      /* 0  Box (metal A, chrome)      */ {  1.0f, -1.0f, -kPairOffset },
+      /* 1  Cone (WPO/displacement)    */ {  0.0f, -1.0f,  0.0f },
+      /* 2  Icosphere (Nanite A)       */ { -1.0f, -1.0f, -kPairOffset },
+      /* 3  Plane (dielectric A)       */ { -1.0f,  0.0f, -kPairOffset },
+      /* 4  Sphere (glass/transparent) */ {  1.0f,  0.0f,  0.0f },
+      /* 5  Torus (translucent)        */ { -1.0f,  1.0f,  0.0f },
+      /* 6  Tube (emissive)            */ {  0.0f,  1.0f,  0.0f },
+      /* 7  Capsule (metal B, gold)    */ {  1.0f, -1.0f,  kPairOffset },
+      /* 8  Cylinder (MegaLights hero) */ {  1.0f,  1.0f,  0.0f },
+      /* 9  Pyramid (dielectric B)     */ { -1.0f,  0.0f,  kPairOffset },
+      /* 10 TorusKnot (Nanite B)       */ { -1.0f, -1.0f,  kPairOffset },
+      /* 11 ChamferBox (Lumen/GI hero) */ {  0.0f,  0.0f,  0.0f },
+  }};
+
+  const ZoneEntry& z = kLayout[static_cast<size_t>(slotIndex)];
+  return maths::vec2{z.col * kZonePitch + z.pairOffset, z.row * kZonePitch};
 }
 
 void VulkanContext::BuildEntityData() {
@@ -1370,11 +1420,11 @@ void VulkanContext::BuildEntityData() {
   // kEntityCount's dense-index requirement.
   core::IDManager::Init(0);
 
-  // One unique randomly-generated material per entity (materialID == entity index) instead of
-  // cycling through a handful of hand-authored recipes -- see GenerateRandomMaterialTable's own
-  // comment for why the seed is fixed rather than truly random.
-  constexpr uint32_t kMaterialRandomSeed = 1337u;
-  m_MaterialTable = renderer::GenerateRandomMaterialTable(kEntityCount, kMaterialRandomSeed);
+  // One deliberately hand-authored material per entity (materialID == entity index), each entity
+  // demonstrating exactly one named engine feature (metal, dielectric, glass, translucent,
+  // emissive, ...) instead of a randomly-rolled category -- see
+  // renderer::GenerateShowcaseMaterialTable's own comment for the full per-entity mapping.
+  m_MaterialTable = renderer::GenerateShowcaseMaterialTable();
 
   for (uint32_t i = 0; i < kEntityCount; ++i) {
     core::EntityID id = core::IDManager::GetNextID();
@@ -1387,12 +1437,22 @@ void VulkanContext::BuildEntityData() {
     core::SetFlag(entity.flags, core::EntityFlags::CastShadows, true);
 
     bool isTransparent = m_MaterialTable.isTransparent[i];
-    if (i == kFloorEntityIndex && isTransparent) {
-      // Force the floor opaque regardless of what GenerateRandomMaterialTable() rolled for it --
-      // see kFloorEntityIndex's own comment.
-      m_MaterialTable.params[i].alpha = 1.0f;
-      m_MaterialTable.isTransparent[i] = false;
-      isTransparent = false;
+    // Phase 7a (UE5.8 parity roadmap, hero asset tessellation): the Icosphere (kHeroEntityIndex)
+    // is the single tessellated/displaced hero asset, rendered ONLY by
+    // renderer::HeroTessellationPass -- never by the opaque Nanite VisBuffer pipeline (no
+    // representation for runtime-displaced geometry there) nor by TransparentForwardPass.
+    // Overrides its materialID to the reserved renderer::kHeroMaterialID slot (see that
+    // constant's own comment) and forces its entity IsTransparent flag true -- NOT because it's
+    // actually alpha-blended (kHeroMaterialID's own alpha is 1.0, fully opaque), but because
+    // ClusterLODCompact.comp's existing per-entity IsTransparent exclusion (see that shader's own
+    // EntityDataBuffer comment) is the exact "never enters the opaque candidate list" mechanism
+    // this entity also needs. TransparentForwardPass itself stays unaffected: it filters by
+    // materialTable.isTransparent[materialID], which correctly stays false for kHeroMaterialID
+    // (GenerateShowcaseMaterialTable() never sets it true -- see that function's own hero-recipe
+    // comment), so the hero entity's clusters never enter ITS candidate list either.
+    if (i == kHeroEntityIndex) {
+      entity.materialID = renderer::kHeroMaterialID;
+      isTransparent = true;
     }
     core::SetFlag(entity.flags, core::EntityFlags::IsTransparent, isTransparent);
   }
@@ -1913,11 +1973,11 @@ void VulkanContext::GenerateCapsule(
 }
 
 void VulkanContext::GenerateGeometry() {
-  // --- Grid layout: 12 primitives arranged on a 3-wide grid (see GridSlot()).
-  // Generation order below is Icosphere-first (so it lands at
-  // vertexOffset/indexOffset 0, keeping DebugReadbackGeometrySample's fixed
-  // sampling window — designed around a single icosphere living at the start of
-  // the buffers — valid unchanged); each primitive's grid *position* is
+  // --- Gallery layout: 12 primitives arranged into 9 widely-separated feature zones (see
+  // GridSlot()'s own comment for the full zone -> feature mapping). Generation order below is
+  // Icosphere-first (so it lands at vertexOffset/indexOffset 0, keeping
+  // DebugReadbackGeometrySample's fixed sampling window — designed around a single icosphere
+  // living at the start of the buffers — valid unchanged); each primitive's gallery *position* is
   // independent of generation order and set via GridSlot(slotIndex) below.
   auto gridSlot = [this](int slotIndex) -> maths::vec2 {
     return GridSlot(slotIndex);
@@ -1926,8 +1986,8 @@ void VulkanContext::GenerateGeometry() {
   uint32_t runningVertexOffset = 0;
   uint32_t runningIndexOffset = 0;
 
-  LOG_INFO("[GenerateGeometry] Generating 12 procedural primitives on a 3-wide "
-           "grid...");
+  LOG_INFO("[GenerateGeometry] Generating 12 procedural primitives across a 9-zone "
+           "feature-showcase gallery, plus the Lumen-corner walls and floor...");
 
   // -------------------------------------------------------------------------
   // ICOSPHERE (slot 2 visually) — generated first so it occupies buffer offset
@@ -2170,14 +2230,59 @@ void VulkanContext::GenerateGeometry() {
   }
 
   // -------------------------------------------------------------------------
-  // FLOOR PLANE (slot 12) — large 300m x 300m plane acting as the floor
+  // LUMEN/GI SHOWCASE CORNER (slots 12/13) — two static colored walls meeting at a right angle
+  // around the ChamferBox (slot 11, zone (0,0)): a plain-colored diffuse corner is the clearest
+  // possible demonstration of Lumen-style indirect color bounce (the neutral-gray ChamferBox
+  // picks up the red/green tint purely from bounced light, with no material trickery of its own).
+  //
+  // Both walls are baked FLAT (geom_plane.comp always emits a horizontal Y = worldOffsetY
+  // surface, same as the floor below) and stood up vertically at render time via a fixed
+  // (non-animated) 90-degree rotation set in UpdateEntityRotations() -- reusing the exact same
+  // "rotate about xform.center" pivot formula every spinning primitive already uses, just with a
+  // constant angle instead of a time-varying one. kWallSpan is used for both the plane's `width`
+  // (baked along local X) and `length` (baked along local Z) so each wall is square; after
+  // rotation whichever baked axis lands on world Y becomes the wall's height.
+  //
+  // Pivot math (see UpdateEntityRotations()): baking flat at worldOffsetY = kWallCenterY and then
+  // rotating about a pivot whose Y ALSO equals kWallCenterY keeps the wall's world-space footprint
+  // (its X or Z position) exactly pinned at the wall's own slot -- any mismatch between the bake
+  // height and the pivot height would shear the wall sideways instead of just standing it up.
+  {
+    constexpr float kWallSpan = 3.0f;     // Both baked axes; one becomes wall height after rotation.
+    constexpr float kFloorTopY = -0.8f;   // Must match the floor's own worldOffsetY below.
+    constexpr float kWallCenterY = kFloorTopY + kWallSpan * 0.5f; // Wall base sits exactly on the floor.
+
+    // WALL A (slot 12) — red, vertical plane fixed at X = -1.8, spanning Z in [-1.5, 1.5].
+    // Baked flat then stood up about the X axis... no -- about the Z axis (see
+    // UpdateEntityRotations(): RotateZ maps the baked local-X extent onto world Y, leaving X and Z
+    // pinned), which is why the wall's OWN world-space X position comes from `slot.x` below.
+    {
+      maths::vec2 slot = {-1.8f, 0.0f};
+      GeneratePlane(kWallSpan, kWallSpan, m_EntityData[kWallEntityIndexA].meshID, slot,
+                    runningVertexOffset, runningIndexOffset, kWallCenterY,
+                    config::FLOOR_VERTEX_SPACING);
+    }
+
+    // WALL B (slot 13) — green, vertical plane fixed at Z = -1.8, spanning X in [-1.5, 1.5].
+    // Stood up about the X axis instead (RotateX maps the baked local-Z extent onto world Y,
+    // leaving X and Z pinned) -- perpendicular to Wall A, closing the corner.
+    {
+      maths::vec2 slot = {0.0f, -1.8f};
+      GeneratePlane(kWallSpan, kWallSpan, m_EntityData[kWallEntityIndexB].meshID, slot,
+                    runningVertexOffset, runningIndexOffset, kWallCenterY,
+                    config::FLOOR_VERTEX_SPACING);
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // FLOOR PLANE (slot 14) — large 300m x 300m plane acting as the floor
   // -------------------------------------------------------------------------
   {
     maths::vec2 slot = {0.0f, 0.0f}; // centered at the world origin
     // Coarse spacing: geom_plane.comp emits a flat, unlit-detail surface (constant
     // up-normal, no displacement), so the hero-primitive VERTEX_SPACING (0.1m) would
     // waste 9M vertices on a 300m span for zero visual gain -- see FLOOR_VERTEX_SPACING.
-    GeneratePlane(300.0f, 300.0f, m_EntityData[12].meshID, slot,
+    GeneratePlane(300.0f, 300.0f, m_EntityData[kFloorEntityIndex].meshID, slot,
                   runningVertexOffset, runningIndexOffset, -0.8f,
                   config::FLOOR_VERTEX_SPACING);
   }
@@ -2223,7 +2328,7 @@ void VulkanContext::GenerateGeometry() {
         "Procedural geometry buffers overflowed -- see log for exact sizes.");
   }
 
-  LOG_INFO(std::format("[GenerateGeometry] All 13 primitives generated: "
+  LOG_INFO(std::format("[GenerateGeometry] All 12 primitives + 2 Lumen walls + floor generated: "
                        "totalVertexCount={} totalIndexCount={} "
                        "(buffers hold {} verts / {} indices max)",
                        runningVertexOffset, runningIndexOffset,
@@ -2234,22 +2339,50 @@ void VulkanContext::GenerateGeometry() {
 void VulkanContext::UpdateEntityRotations(float timeSeconds) {
   // Distinct per-axis angular speeds (radians/sec) and a per-entity phase
   // offset so the 12 primitives tumble out of sync with each other rather than
-  // spinning in lockstep. The floor plane remains completely static.
+  // spinning in lockstep. The floor plane and the 2 Lumen-corner walls remain
+  // completely static (the walls at a fixed 90-degree stand-up rotation, see below).
   constexpr float kSpeedX = 0.7f;
   constexpr float kSpeedY = 1.1f;
   constexpr float kSpeedZ = 0.5f;
   constexpr float kPhaseStep = 0.6f; // radians of extra offset per meshID
 
+  // Must exactly match GenerateGeometry()'s Lumen-corner wall block (kWallSpan/kFloorTopY there):
+  // the bake height and this pivot's Y both need to equal kWallCenterY, or the rotation shears the
+  // wall sideways instead of standing it up in place -- see that block's own comment for the math.
+  constexpr float kWallSpan = 3.0f;
+  constexpr float kFloorTopY = -0.8f;
+  constexpr float kWallCenterY = kFloorTopY + kWallSpan * 0.5f;
+
   std::array<EntityTransform, kEntityCount> transforms{};
 
   for (uint32_t meshID = 0; meshID < kEntityCount; ++meshID) {
     EntityTransform &xform = transforms[meshID];
-    if (meshID == 12) {
-      // Floor plane: static at Y = -0.8f
+    if (meshID == kFloorEntityIndex) {
+      // Floor plane: static at Y = kFloorTopY.
       xform.rotation = maths::mat4{};
       xform.centerX = 0.0f;
-      xform.centerY = -0.8f;
+      xform.centerY = kFloorTopY;
       xform.centerZ = 0.0f;
+      xform._pad0 = 0.0f;
+    } else if (meshID == kWallEntityIndexA) {
+      // Wall A (red): fixed 90-degree rotation about Z stands the flat-baked plane up so its
+      // baked local-X extent becomes world Y, while X/Z stay pinned at the wall's own slot (-1.8,
+      // 0.0) -- see GenerateGeometry()'s wall block for the full pivot derivation.
+      constexpr float kHalfPi = 1.5707963267948966f;
+      xform.rotation = maths::mat4::RotateZ(kHalfPi);
+      xform.centerX = -1.8f;
+      xform.centerY = kWallCenterY;
+      xform.centerZ = 0.0f;
+      xform._pad0 = 0.0f;
+    } else if (meshID == kWallEntityIndexB) {
+      // Wall B (green): fixed 90-degree rotation about X stands the flat-baked plane up so its
+      // baked local-Z extent becomes world Y, while X/Z stay pinned at the wall's own slot (0.0,
+      // -1.8) -- perpendicular to Wall A, closing the Lumen showcase corner.
+      constexpr float kHalfPi = 1.5707963267948966f;
+      xform.rotation = maths::mat4::RotateX(kHalfPi);
+      xform.centerX = 0.0f;
+      xform.centerY = kWallCenterY;
+      xform.centerZ = -1.8f;
       xform._pad0 = 0.0f;
     } else {
       float phase = static_cast<float>(meshID) * kPhaseStep;

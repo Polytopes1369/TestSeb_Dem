@@ -36,6 +36,7 @@
 #include <vulkan/vulkan.h>
 #include <vk_mem_alloc.h>
 
+#include "core/maths/Maths.h"
 #include "renderer/vulkan/GpuBuffer.h"
 
 namespace renderer {
@@ -83,26 +84,73 @@ namespace renderer {
 
             // Gamma Correction (final display encode, see PostProcessComposite.comp's own comment)
             float displayGamma = 2.2f;
+
+            // Phase PP2: Bloom (renderer::BloomPass's own owned mip chain -- see that pass' own
+            // Settings for the threshold/ghost/anamorphic/dirt knobs that shape its content;
+            // `bloomIntensity` here only scales how much of it gets added into the scene color).
+            float bloomIntensity = 1.0f;
+
+            // Chromatic Aberration: UV-space max per-channel radial offset at the screen corner.
+            float chromaticAberrationIntensity = 0.0015f;
+
+            // Vignette + Vignette Color Bleed
+            float vignetteIntensity = 0.35f;
+            float vignetteSmoothness = 0.55f;
+            float vignetteColorBleed = 0.4f; // 0 = neutral gray falloff, 1 = strong chromatic falloff.
+
+            // Phase PP3: Heat Distortion & Refraction -- global scale on renderer::
+            // TransparentForwardPass's own per-material g_RefractionOffset (see MaterialParameters::
+            // heatDistortion's own comment for the actual per-material intensity/source).
+            float heatDistortionIntensity = 1.0f;
+
+            // Motion Blur -- per-pixel velocity reconstructed from depth + invViewProj/prevViewProj,
+            // no separate velocity buffer needed (see PostProcessComposite.comp's own comment).
+            float motionBlurIntensity = 0.5f;
+            float motionBlurMaxVelocityUV = 0.05f; // Caps smear length on a teleport/camera-cut frame.
+
+            // Screen Space / Volumetric Height Fog (UE5.8's own analytic "Exponential Height Fog").
+            float fogColorR = 0.55f, fogColorG = 0.60f, fogColorB = 0.68f;
+            float fogDensity = 0.02f;
+            float fogHeightFalloff = 0.15f;
+            float fogHeightOffset = 0.0f;
+            float fogStartDistance = 5.0f;
+            float fogMaxOpacity = 0.85f;
         };
 
+        // `bloomView` (renderer::BloomPass::GetOutputView(), its own upsample-chain mip 0) is
+        // sampled by PostProcessComposite.comp's g_Bloom binding -- Phase PP2. `depthView`
+        // (renderer::ClusterResolvePass::GetOutputDepthView(), render-resolution, fixed identity --
+        // never ping-ponged) and `refractionOffsetView` (renderer::TransparentForwardPass::
+        // GetRefractionOffsetView(), also fixed identity) are both Phase PP3: sampled through a
+        // LINEAR sampler for their own implicit bilinear upsample to display resolution (this
+        // pipeline has no display-resolution depth anywhere -- see DepthOfField.comp's own comment).
         void Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
-            VkExtent2D displayExtent, VkImageView hdrColorView);
+            VkExtent2D displayExtent, VkImageView hdrColorView, VkImageView bloomView,
+            VkImageView depthView, VkImageView refractionOffsetView);
 
         void Shutdown();
 
-        // Recreates the descriptor bindings that reference `hdrColorView` -- called if
+        // Recreates the descriptor bindings that reference `hdrColorView`/`bloomView` -- called if
         // renderer::TAATSRPass's own output view identity ever changes (it currently doesn't
         // across a pass's lifetime, ping-ponging between two fixed views instead, but this mirrors
         // renderer::TAATSRPass::UpdateDescriptorSets' own convention for symmetry/future-proofing).
-        void UpdateDescriptorSets(VkImageView hdrColorView);
+        // `depthView`/`refractionOffsetView` are NOT re-bound here -- both source images keep a
+        // fixed identity for this pipeline's entire lifetime (see Init()'s own comment).
+        void UpdateDescriptorSets(VkImageView hdrColorView, VkImageView bloomView);
 
+        // `invViewProj`/`prevViewProj`/`cameraPositionWorld` (Phase PP3): feed Motion Blur's own
+        // per-pixel velocity reconstruction and Height Fog's own world-position/ray reconstruction
+        // -- the SAME matrices renderer::ClusterRenderPipeline::RecordFrame already computes once
+        // per frame for renderer::TAATSRPass and the opaque resolve's own motion-vector debug view.
+        //
         // Records AutoExposureHistogram.comp -> AutoExposureAdapt.comp -> PostProcessComposite.comp,
         // with a VkMemoryBarrier2 between each (Histogram's global-atomic writes must land before
         // Adapt's reduction reads them; Adapt's ExposureStateSSBO write must land before Composite
         // reads it). Caller owns the barrier that makes the HDR input visible to COMPUTE_SHADER
         // reads beforehand, and the barrier that makes GetOutputImage() visible to its own next
         // consumer afterward (this pass' own trailing barrier only covers COMPUTE_SHADER writes).
-        void RecordComposite(VkCommandBuffer cmd, float deltaTimeSeconds, const Settings& settings);
+        void RecordComposite(VkCommandBuffer cmd, float deltaTimeSeconds, const Settings& settings,
+            const maths::mat4& invViewProj, const maths::mat4& prevViewProj, const maths::vec3& cameraPositionWorld);
 
         VkImage GetOutputImage() const { return m_OutputImage; }
         VkImageView GetOutputView() const { return m_OutputView; }
@@ -134,8 +182,37 @@ namespace renderer {
             float saturation = 1.0f;
             float contrast = 1.0f;
             float displayGamma = 2.2f;
-            float _pad3 = 0.0f;
+            float _pad3b = 0.0f;
+
+            float bloomIntensity = 1.0f;
+            float chromaticAberrationIntensity = 0.0015f;
+            float vignetteIntensity = 0.35f;
+            float vignetteSmoothness = 0.55f;
+
+            float vignetteColorBleed = 0.4f;
+            float _pad4 = 0.0f, _pad5 = 0.0f, _pad6 = 0.0f;
+
+            // Phase PP3
+            maths::mat4 invViewProj;
+            maths::mat4 prevViewProj;
+
+            float cameraPosX = 0.0f, cameraPosY = 0.0f, cameraPosZ = 0.0f;
+            float heatDistortionIntensity = 1.0f;
+
+            float motionBlurIntensity = 0.5f;
+            float motionBlurMaxVelocityUV = 0.05f;
+            float _pad7 = 0.0f, _pad8 = 0.0f;
+
+            float fogColor[3] = { 0.55f, 0.60f, 0.68f };
+            float fogDensity = 0.02f;
+
+            float fogHeightFalloff = 0.15f;
+            float fogHeightOffset = 0.0f;
+            float fogStartDistance = 5.0f;
+            float fogMaxOpacity = 0.85f;
         };
+        static_assert(sizeof(PostProcessParamsUBO) == 336,
+            "PostProcessParamsUBO must match PostProcessComposite.comp's PostProcessParamsUBO exactly (std140 layout)");
 
         // Byte-for-byte mirror of AutoExposureAdapt.comp's push_constant block.
         struct AdaptPushConstants {

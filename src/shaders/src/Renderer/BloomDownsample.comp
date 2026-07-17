@@ -1,0 +1,81 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+
+// Stage 1/2 of renderer::BloomPass (Phase PP2, post-process stack roadmap): the "prefilter +
+// downsample" half of a dual-filter bloom (the same technique presented in Call of Duty: Advanced
+// Warfare's "Next Generation Post Processing" talk, and the one Unreal Engine's own non-FFT bloom
+// path approximates). Dispatched once per mip level of renderer::BloomPass's owned downsample
+// chain: mip 0 reads the HDR scene color directly (renderer::TAATSRPass's own output) and applies
+// a soft-knee bright-pass threshold before the box filter; every mip after that reads the mip
+// directly above it (already thresholded) with the exact same 13-tap box filter, no further
+// threshold. See renderer::BloomPass's own class comment for the full mip-chain layout.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform sampler2D g_Source; // HDR scene color (mip 0) or the mip directly above (mip > 0).
+layout(rgba16f, set = 0, binding = 1) uniform writeonly image2D g_Output;
+
+layout(push_constant) uniform PC {
+    vec2 outputTexelSize; // 1 / outputExtent, in the SOURCE's own UV space.
+    float threshold;      // Bloom threshold (luminance) -- mip 0 only.
+    float softKnee;       // Soft-knee width around threshold -- mip 0 only.
+    uint isFirstMip;      // Nonzero: apply the bright-pass threshold below.
+} pc;
+
+// 13-tap box filter over a 4x4 neighborhood (COD Advanced Warfare's own downsample kernel): 4
+// overlapping 2x2 boxes plus the center 2x2 box, weighted so the result stays a soft low-pass
+// instead of aliasing high-frequency bright pixels into flicker under camera motion.
+vec3 SampleBox13(vec2 uv, vec2 texelSize) {
+    vec3 a = textureLod(g_Source, uv + texelSize * vec2(-1.0, -1.0), 0.0).rgb;
+    vec3 b = textureLod(g_Source, uv + texelSize * vec2( 0.0, -1.0), 0.0).rgb;
+    vec3 c = textureLod(g_Source, uv + texelSize * vec2( 1.0, -1.0), 0.0).rgb;
+    vec3 d = textureLod(g_Source, uv + texelSize * vec2(-0.5, -0.5), 0.0).rgb;
+    vec3 e = textureLod(g_Source, uv + texelSize * vec2( 0.5, -0.5), 0.0).rgb;
+    vec3 f = textureLod(g_Source, uv + texelSize * vec2(-1.0,  0.0), 0.0).rgb;
+    vec3 g = textureLod(g_Source, uv, 0.0).rgb;
+    vec3 h = textureLod(g_Source, uv + texelSize * vec2( 1.0,  0.0), 0.0).rgb;
+    vec3 i = textureLod(g_Source, uv + texelSize * vec2(-0.5,  0.5), 0.0).rgb;
+    vec3 j = textureLod(g_Source, uv + texelSize * vec2( 0.5,  0.5), 0.0).rgb;
+    vec3 k = textureLod(g_Source, uv + texelSize * vec2(-1.0,  1.0), 0.0).rgb;
+    vec3 l = textureLod(g_Source, uv + texelSize * vec2( 0.0,  1.0), 0.0).rgb;
+    vec3 m = textureLod(g_Source, uv + texelSize * vec2( 1.0,  1.0), 0.0).rgb;
+
+    vec3 centerBox = (d + e + i + j) * 0.5;
+    vec3 topLeftBox = (a + b + f + g) * 0.125;
+    vec3 topRightBox = (b + c + g + h) * 0.125;
+    vec3 bottomLeftBox = (f + g + k + l) * 0.125;
+    vec3 bottomRightBox = (g + h + l + m) * 0.125;
+
+    return (centerBox * 0.5 + topLeftBox * 0.125 + topRightBox * 0.125 + bottomLeftBox * 0.125 + bottomRightBox * 0.125);
+}
+
+// UE-style soft-knee threshold curve: pixels well below `threshold` pass through at zero, pixels
+// well above pass through unchanged, and the `softKnee`-wide band around `threshold` blends
+// smoothly between the two instead of a hard cutoff (which would flicker on noisy/aliased bright
+// pixels crossing the threshold frame to frame).
+vec3 SoftThreshold(vec3 color, float threshold, float softKnee) {
+    float brightness = max(color.r, max(color.g, color.b));
+    float knee = threshold * softKnee + 1e-5;
+    float soft = brightness - threshold + knee;
+    soft = clamp(soft, 0.0, 2.0 * knee);
+    soft = soft * soft / (4.0 * knee + 1e-5);
+    float contribution = max(soft, brightness - threshold) / max(brightness, 1e-5);
+    return color * contribution;
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 outputSize = ivec2(1.0 / pc.outputTexelSize.x, 1.0 / pc.outputTexelSize.y);
+    if (pixel.x >= outputSize.x || pixel.y >= outputSize.y) {
+        return;
+    }
+
+    vec2 uv = (vec2(pixel) + 0.5) * pc.outputTexelSize;
+    vec3 color = SampleBox13(uv, pc.outputTexelSize);
+
+    if (pc.isFirstMip != 0u) {
+        color = SoftThreshold(color, pc.threshold, pc.softKnee);
+    }
+
+    imageStore(g_Output, pixel, vec4(color, 1.0));
+}

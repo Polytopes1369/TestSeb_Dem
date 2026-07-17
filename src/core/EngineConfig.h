@@ -178,6 +178,64 @@ inline float COLOR_CONTRAST = 1.0f;
 // this is load-bearing: the swapchain surface format is VK_FORMAT_B8G8R8A8_UNORM, not an _SRGB
 // format, so nothing else in the present path applies a display gamma encode).
 inline float DISPLAY_GAMMA = 2.2f;
+
+// --- Phase PP2 (post-process stack roadmap): Bloom / Lens Flare / Anamorphic Lens Flare / Lens
+// Dirt (all one dual-filter mip chain, see renderer::BloomPass's own class comment) / Chromatic
+// Aberration / Vignette + Vignette Color Bleed. Same convention as Phase PP1 above: artistic, not
+// hardware-tiered, so not wired into ApplyProfile().
+
+// Bloom
+inline float BLOOM_THRESHOLD = 1.0f;        // Bright-pass threshold, linear HDR luminance.
+inline float BLOOM_SOFT_KNEE = 0.5f;
+inline float BLOOM_INTENSITY = 1.0f;
+inline float BLOOM_UPSAMPLE_RADIUS = 1.0f;
+
+// Lens Flare (procedural radial ghosts, no texture asset)
+inline float LENS_FLARE_GHOST_INTENSITY = 0.3f;
+inline uint32_t LENS_FLARE_GHOST_COUNT = 4u;
+inline float LENS_FLARE_GHOST_SPACING = 1.0f;
+
+// Anamorphic Lens Flare (procedural horizontal streak, no texture asset)
+inline float ANAMORPHIC_FLARE_INTENSITY = 0.15f;
+inline float ANAMORPHIC_FLARE_STRETCH = 0.10f;
+
+// Lens Dirt (procedural value-noise mask, no texture asset)
+inline float LENS_DIRT_INTENSITY = 0.4f;
+inline float LENS_DIRT_SCALE = 6.0f;
+
+// Chromatic Aberration
+inline float CHROMATIC_ABERRATION_INTENSITY = 0.0015f;
+
+// Vignette + Vignette Color Bleed
+inline float VIGNETTE_INTENSITY = 0.35f;
+inline float VIGNETTE_SMOOTHNESS = 0.55f;
+inline float VIGNETTE_COLOR_BLEED = 0.4f;
+
+// --- Phase PP3 (post-process stack roadmap): Depth of Field / Motion Blur / Screen Space-
+// Volumetric Height Fog / Heat Distortion & Refraction. Same convention as PP1/PP2 above:
+// artistic, not hardware-tiered, so not wired into ApplyProfile().
+
+// Depth of Field (physically-derived Circle of Confusion -- see DepthOfField.comp's own comment;
+// EXPOSURE_APERTURE above doubles as this effect's own f-stop, matching a real physical camera).
+inline float DOF_FOCAL_LENGTH_MM = 50.0f;
+inline float DOF_FOCUS_DISTANCE_WORLD_UNITS = 10.0f;
+inline float DOF_MAX_COC_RADIUS_PIXELS = 24.0f;
+
+// Motion Blur (per-pixel velocity reconstructed from depth + view matrices, no stored velocity buffer)
+inline float MOTION_BLUR_INTENSITY = 0.5f;
+inline float MOTION_BLUR_MAX_VELOCITY_UV = 0.05f;
+
+// Screen Space / Volumetric Height Fog (UE5.8's own analytic "Exponential Height Fog")
+inline float FOG_COLOR_R = 0.55f, FOG_COLOR_G = 0.60f, FOG_COLOR_B = 0.68f;
+inline float FOG_DENSITY = 0.02f;
+inline float FOG_HEIGHT_FALLOFF = 0.15f;
+inline float FOG_HEIGHT_OFFSET = 0.0f;
+inline float FOG_START_DISTANCE = 5.0f;
+inline float FOG_MAX_OPACITY = 0.85f;
+
+// Heat Distortion & Refraction (global scale on renderer::TransparentForwardPass's own per-
+// material g_RefractionOffset -- see MaterialParameters::heatDistortion's own comment).
+inline float HEAT_DISTORTION_INTENSITY = 1.0f;
 } // namespace postprocess
 
 namespace volumetrics {

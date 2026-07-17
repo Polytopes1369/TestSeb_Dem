@@ -60,7 +60,7 @@ namespace renderer {
         // bug once renderer::MegaLightsPass started compositing real point lights into this image
         // (mirrors why renderer::ScreenTracePass::kOutputFormat is already this same HDR format for
         // the analogous indirect-GI radiance). The actual display-referred tonemap curve now lives
-        // in renderer::TonemapPass, the final step after renderer::TAATSRPass's own temporal
+        // in renderer::PostProcessPass, the final step after renderer::TAATSRPass's own temporal
         // resolve -- correct order for both: TAA's variance clipping wants linear HDR input, and
         // tonemapping HDR only once, at the very end, avoids compounding a non-linear curve through
         // every additive compositing step this value still passes through (renderer::MegaLightsPass,

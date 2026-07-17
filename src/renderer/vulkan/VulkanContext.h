@@ -213,22 +213,34 @@ private:
     VkPipelineLayout m_ComputePipelineLayout = VK_NULL_HANDLE;
     VkPipelineLayout m_GraphicsPipelineLayout = VK_NULL_HANDLE;
 
-    // Running total of vertices/indices written by GenerateGeometry() across all 12 primitives.
+    // Running total of vertices/indices written by GenerateGeometry() across all 12 primitives,
+    // the 2 Lumen-corner walls, and the floor.
     uint32_t m_TotalVertexCount = 0;
     uint32_t m_TotalIndexCount = 0;
 
-    // One EntityTransform slot per primitive meshID (box=0 .. floor=12); see struct_custo.glsl.
-    static constexpr uint32_t kEntityCount = 13;
-    // The floor plane is always generated last (see GenerateGeometry()'s own GeneratePlane() call)
-    // -- excluded from GenerateRandomMaterialTable()'s transparent/translucent categories in
-    // BuildEntityData() below (a see-through 300x300m ground plane would read as broken, not
-    // stylized, and would be the single worst-case primitive for TransparentForwardPass's
-    // unsorted-between-entities blending, being by far the largest on screen).
+    // One EntityTransform slot per entity (box=0 .. chamferBox=11, wallA=12, wallB=13, floor=14);
+    // see struct_custo.glsl. The base scene is a feature "gallery": 12 primitives laid out as 9
+    // widely-separated zones (see GridSlot()) each demonstrating one engine feature explicitly
+    // (Nanite density, WPO displacement, metal, dielectric, glass, translucent, emissive,
+    // MegaLights, Lumen GI), plus 2 static colored walls forming the Lumen GI corner and the floor.
+    static constexpr uint32_t kEntityCount = 15;
+    // The 2 static walls that form the Lumen/GI showcase corner (see GenerateGeometry()'s wall
+    // blocks and UpdateEntityRotations()'s fixed-rotation branch for them) -- generated right
+    // before the floor, so kFloorEntityIndex below stays "last".
+    static constexpr uint32_t kWallEntityIndexA = kEntityCount - 3;
+    static constexpr uint32_t kWallEntityIndexB = kEntityCount - 2;
+    // The floor plane is always generated last (see GenerateGeometry()'s own GeneratePlane() call).
     static constexpr uint32_t kFloorEntityIndex = kEntityCount - 1;
+    // Phase 7a (UE5.8 parity roadmap, hero asset tessellation): the Icosphere -- generated FIRST
+    // (see GenerateGeometry()'s own "Icosphere-first" comment, `m_EntityData[2].meshID` used
+    // directly), the single tessellated/displaced hero asset, rendered by
+    // renderer::HeroTessellationPass instead of the opaque Nanite path -- see BuildEntityData()'s
+    // own kHeroMaterialID override.
+    static constexpr uint32_t kHeroEntityIndex = 2;
 
     // CPU-authoritative entity records: built once by BuildEntityData() (meshID assigned via
     // core::IDManager) before GenerateGeometry() runs, then copied to m_EntityBuffer by
-    // UploadEntityData(). One entry per primitive (box=0 .. chamferBox=11), see struct_custo.glsl.
+    // UploadEntityData(). One entry per entity (box=0 .. floor=14), see struct_custo.glsl.
     std::array<core::EntityData, kEntityCount> m_EntityData{};
 
     // Phase 4 integration (UE5.8 parity roadmap, dynamic scenes onto main): CPU-readable mirror of
@@ -236,7 +248,7 @@ private:
     // comment.
     std::array<core::EntityTransformCPU, kEntityCount> m_EntityTransformsCPU{};
 
-    // Randomly-generated PBR materials (renderer::GenerateRandomMaterialTable), one slot per
+    // Hand-authored PBR showcase materials (renderer::GenerateShowcaseMaterialTable), one slot per
     // entity -- built once by BuildEntityData(), uploaded to the GPU by ClusterResolvePass::Init()
     // via ClusterRenderPipelineCreateInfo::materialTable.
     renderer::MaterialTable m_MaterialTable{};
@@ -325,9 +337,13 @@ private:
     // pattern. Must run after m_EntityBuffer is allocated and before it is bound for reading.
     void UploadEntityData();
 
-    // Single source of truth for the 3x3 world-space grid layout (also used by
-    // UpdateEntityRotations() to recover each entity's rotation pivot): column-major slot
-    // index in [0, 8], returns the (X, Z) world position of that slot's center (Y = 0).
+    // Single source of truth for the feature-gallery layout (also used by
+    // UpdateEntityRotations() to recover each entity's rotation pivot, and duplicated by
+    // renderer::MegaLightsTypes.cpp's EntityGridPosition() -- see that function's own comment):
+    // primitive slot index in [0, 11], returns the (X, Z) world position of that primitive's own
+    // showcase zone (Y = 0). Zones are spaced 4 units apart so each feature reads as its own
+    // distinct area rather than one continuous grid -- see the .cpp definition for the full
+    // zone -> feature mapping.
     maths::vec2 GridSlot(int slotIndex) const;
 
     // Records, submits, and blocks on a single one-shot compute dispatch that generates one

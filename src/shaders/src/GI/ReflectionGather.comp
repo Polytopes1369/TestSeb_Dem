@@ -29,7 +29,7 @@ layout(rg16f, set = 0, binding = 1) uniform readonly image2D g_GBufferNormal;
 layout(r32f, set = 0, binding = 2) uniform readonly image2D g_GBufferDepth;
 layout(rgba8, set = 0, binding = 3) uniform readonly image2D g_GBufferAlbedo;
 layout(rg8, set = 0, binding = 4) uniform readonly image2D g_GBufferRoughnessMetallic;
-layout(rgba8, set = 0, binding = 5) uniform image2D g_OutputColor; // Read-modify-write.
+layout(rgba16f, set = 0, binding = 5) uniform image2D g_OutputColor; // Read-modify-write. rgba16f: linear HDR, matches ClusterResolvePass::kOutputColorFormat.
 
 #define REFLECTION_VIEW_PARAMS_SET 0
 #define REFLECTION_VIEW_PARAMS_BINDING 6
