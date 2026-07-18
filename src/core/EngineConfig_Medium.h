@@ -71,6 +71,10 @@ namespace lumen {
 constexpr uint32_t CARDS_PER_FRAME_BUDGET = 12u;
 constexpr uint32_t EVICTION_FRAME_DELAY = 450u;
 
+// Surface Cache atlas resolution -- see EngineConfig_Low.h's own comment on this value. Midway
+// between Low's 1024 and High/Extrem's 2048.
+constexpr uint32_t SURFACE_CACHE_ATLAS_SIZE = 1536u;
+
 // Standard 48^3 probe grid for precise GI calculations.
 constexpr uint32_t PROBE_GRID_RESOLUTION = 48u;
 constexpr float PROBE_SPACING = 1.5f;

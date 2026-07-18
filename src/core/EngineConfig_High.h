@@ -26,8 +26,12 @@ constexpr uint32_t MAX_CLUSTER_VERTICES = 64u;
 constexpr uint32_t MAX_CLUSTER_TRIANGLES = 128u;
 constexpr uint32_t PAGE_SIZE_BYTES = 4096u;
 
-constexpr uint64_t VERTEX_BUFFER_BYTES = 1024 * 1024 * 1024;
-constexpr uint64_t INDEX_BUFFER_BYTES = 512 * 1024 * 1024;
+// 1.5GB vertex buffer / 768MB index buffer -- strictly between Medium (1GB/512MB) and Extrem
+// (2GB/1GB). Previously byte-for-byte identical to Medium's own values (an unintentional bug: the
+// single biggest VRAM knob in the engine did not differentiate these two tiers at all), fixed here
+// as the arithmetic midpoint, preserving the same 2:1 vertex:index ratio every other tier uses.
+constexpr uint64_t VERTEX_BUFFER_BYTES = 1536 * 1024 * 1024;
+constexpr uint64_t INDEX_BUFFER_BYTES = 768 * 1024 * 1024;
 
 // UE 5.8: r.Nanite.MaxPixelsPerEdge=1.0 (Epic geometry resolution, maximum details)
 constexpr float MAX_PIXELS_PER_EDGE = 1.0f;
@@ -69,6 +73,10 @@ constexpr float DISTANCE_SCALE = 1.20f;
 namespace lumen {
 constexpr uint32_t CARDS_PER_FRAME_BUDGET = 16u;
 constexpr uint32_t EVICTION_FRAME_DELAY = 600u;
+
+// Surface Cache atlas resolution -- see EngineConfig_Low.h's own comment on this value. Full
+// resolution: matches the original fixed 2048 footprint this engine always ran at pre-tiering.
+constexpr uint32_t SURFACE_CACHE_ATLAS_SIZE = 2048u;
 
 // High-quality 64^3 probe grid (262k probes) for flawless global illumination.
 constexpr uint32_t PROBE_GRID_RESOLUTION = 64u;

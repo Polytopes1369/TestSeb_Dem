@@ -77,6 +77,16 @@ namespace lumen {
 constexpr uint32_t CARDS_PER_FRAME_BUDGET = 8u; // Reduced for performance
 constexpr uint32_t EVICTION_FRAME_DELAY = 300u;
 
+// Surface Cache atlas resolution (square, texels): unlike CARDS_PER_FRAME_BUDGET above (which only
+// tunes the per-frame UPDATE RATE), this tunes the actual VRAM footprint of the 6 atlas images
+// renderer::SurfaceCachePass::Init() allocates -- formerly a hardcoded geometry::
+// kSurfaceCacheAtlasSize (2048) regardless of tier, identical on Low and Extrem. Halved from the
+// original 2048 to meaningfully cut VRAM on entry-level GPUs; the runtime SurfaceCacheAtlasAllocator
+// degrades gracefully under a smaller budget (evicts off-screen cards / defragments, see that
+// class's own comment), so a smaller atlas here costs GI update latency under heavy scenes, never a
+// crash or corruption.
+constexpr uint32_t SURFACE_CACHE_ATLAS_SIZE = 1024u;
+
 // 32^3 probe grid to keep global illumination lightweight.
 constexpr uint32_t PROBE_GRID_RESOLUTION = 32u;
 constexpr float PROBE_SPACING = 2.0f;
