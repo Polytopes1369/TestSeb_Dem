@@ -2877,14 +2877,15 @@ void VulkanContext::GenerateGeometry() {
   // vertically, so no further ground clearance is needed).
   // -------------------------------------------------------------------------
   {
-    constexpr float kCreatureClearingX = -10.0f; // Mirrors kTreeClearingX's own offset, opposite side.
-    constexpr float kCreatureGroundY = -0.8f;    // Matches the floor/trees' own ground level.
+    // Placement/radius constants now live as public VulkanContext class constants (kCreatureClearingX
+    // /kCreatureGroundY/kCreatureRadiusMin/kCreatureRadiusMax) -- the single source of truth shared
+    // with renderer::FurStrandPass (UE5.8 rendering-parity gap G10a), which grows fur strands off this
+    // exact bind-pose surface. Only the two mesh-resolution knobs stay local here (the fur system
+    // distributes its roots parametrically, independent of mesh resolution, so it never needs them).
     constexpr uint32_t kCreatureSidesPerRing = 8u;
     constexpr uint32_t kCreatureRingsPerSegment = 2u; // >1 so mid-segment vertices get a genuine 2-bone blend (see geom_creature.comp).
-    constexpr float kCreatureRadiusMin = 0.06f;
-    constexpr float kCreatureRadiusMax = 0.30f;
 
-    maths::vec2 slot = { kCreatureClearingX, 0.0f };
+    maths::vec2 slot = { kCreatureClearingX, kCreatureClearingZ };
     GenerateCreature(m_InstanceRegistry[kCreatureEntityIndex].meshID, slot,
                       kCreatureGroundY + kCreatureRadiusMax,
                       kCreatureSidesPerRing, kCreatureRingsPerSegment,
