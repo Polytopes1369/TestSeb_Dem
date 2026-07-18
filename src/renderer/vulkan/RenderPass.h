@@ -20,9 +20,11 @@ namespace renderer {
     // VulkanUtils' own throwing helpers) for the actual Vulkan calls, exactly as today. This base
     // only removes the need to hand-write a matching Shutdown() afterward.
     //
-    // Not a drop-in replacement for every existing pass: passes whose Init() returns void (e.g.
-    // HZBPass) or that need multi-stage/resizable initialization are out of scope for a mechanical
-    // migration and should keep their current hand-written Shutdown() unless deliberately reworked.
+    // Init() forwards any extra trailing arguments to InitImpl() (see its own comment below), so
+    // passes with construction-time parameters beyond the base 4 fit this base too. Not a drop-in
+    // replacement for every existing pass, though: passes whose Init() returns void (e.g. HZBPass)
+    // or that need multi-stage/resizable initialization are out of scope for a mechanical migration
+    // and should keep their current hand-written Shutdown() unless deliberately reworked.
     template<typename Derived>
     class RenderPass {
     protected:
@@ -49,14 +51,21 @@ namespace renderer {
         ~RenderPass() = default;
 
     public:
-        // Forwards to Derived::InitImpl() with the same signature every pass's Init() already uses.
-        // If InitImpl() returns false, Shutdown() runs immediately so a partially-constructed pass
-        // never leaks the resources it did manage to create before the failure.
-        bool Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue) {
+        // Forwards to Derived::InitImpl(device, allocator, commandPool, queue, extraArgs...).
+        // `ExtraArgs` is deduced from whatever a caller passes after `queue` -- several passes take
+        // extra construction-time parameters beyond the base 4 (e.g. AtmosCloudsPass's VkExtent2D +
+        // const AtmosClimatePass&, ShadowMapPass's cache path), and this lets each of them keep its
+        // own InitImpl signature instead of forcing every pass onto exactly 4 parameters. If
+        // InitImpl() returns false, Shutdown() runs immediately so a partially-constructed pass never
+        // leaks the resources it did manage to create before the failure.
+        template<typename... ExtraArgs>
+        bool Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
+            ExtraArgs&&... extraArgs) {
             m_Device = device;
             m_Allocator = allocator;
 
-            bool ok = static_cast<Derived*>(this)->InitImpl(device, allocator, commandPool, queue);
+            bool ok = static_cast<Derived*>(this)->InitImpl(
+                device, allocator, commandPool, queue, std::forward<ExtraArgs>(extraArgs)...);
             if (!ok) {
                 Shutdown();
             }
@@ -75,10 +84,12 @@ namespace renderer {
         }
 
         // Derived classes must implement:
-        //   bool InitImpl(VkDevice, VmaAllocator, VkCommandPool, VkQueue);
+        //   bool InitImpl(VkDevice, VmaAllocator, VkCommandPool, VkQueue, /* + this pass's own extra
+        //                 parameters, if any -- see the ExtraArgs comment on Init() above */);
         // Not declared here: Init() resolves it via static_cast<Derived*>(this), so ordinary member
-        // lookup on Derived finds Derived::InitImpl directly. A missing override surfaces as a plain
-        // "no member named InitImpl" compile error at the static_cast call site above.
+        // lookup on Derived finds Derived::InitImpl directly. A missing override, or one whose extra
+        // parameters don't match what a call site passed to Init(), surfaces as a plain "no member
+        // named InitImpl" / overload-resolution compile error at the static_cast call site above.
     };
 
 } // namespace renderer
