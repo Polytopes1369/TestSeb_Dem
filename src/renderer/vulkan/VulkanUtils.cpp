@@ -226,6 +226,42 @@ namespace renderer {
         vkUpdateDescriptorSets(device, 4, writes, 0, nullptr);
     }
 
+    VulkanUtils::DescriptorSetLayoutPoolAndSet VulkanUtils::CreateDescriptorSetLayoutPoolAndSet(
+        VkDevice device,
+        std::span<const VkDescriptorSetLayoutBinding> bindings,
+        std::span<const VkDescriptorPoolSize> poolSizes
+    ) {
+        DescriptorSetLayoutPoolAndSet result{};
+
+        VkDescriptorSetLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+        layoutInfo.bindingCount = static_cast<uint32_t>(bindings.size());
+        layoutInfo.pBindings = bindings.data();
+        if (vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &result.layout) != VK_SUCCESS) {
+            throw std::runtime_error("VulkanUtils: Failed to create descriptor set layout");
+        }
+
+        VkDescriptorPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
+        poolInfo.maxSets = 1;
+        poolInfo.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
+        poolInfo.pPoolSizes = poolSizes.data();
+        if (vkCreateDescriptorPool(device, &poolInfo, nullptr, &result.pool) != VK_SUCCESS) {
+            vkDestroyDescriptorSetLayout(device, result.layout, nullptr);
+            throw std::runtime_error("VulkanUtils: Failed to create descriptor pool");
+        }
+
+        VkDescriptorSetAllocateInfo allocSet{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+        allocSet.descriptorPool = result.pool;
+        allocSet.descriptorSetCount = 1;
+        allocSet.pSetLayouts = &result.layout;
+        if (vkAllocateDescriptorSets(device, &allocSet, &result.set) != VK_SUCCESS) {
+            vkDestroyDescriptorPool(device, result.pool, nullptr);
+            vkDestroyDescriptorSetLayout(device, result.layout, nullptr);
+            throw std::runtime_error("VulkanUtils: Failed to allocate descriptor set");
+        }
+
+        return result;
+    }
+
     void VulkanUtils::CreateStorageSampledImage2D(
         VmaAllocator allocator,
         VkDevice device,
