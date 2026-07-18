@@ -103,12 +103,18 @@ namespace renderer {
             VMA_MEMORY_USAGE_GPU_ONLY);
 
         // Draw count: atomically incremented by the culling shader (STORAGE_BUFFER_BIT), reset
-        // every frame via vkCmdFillBuffer (TRANSFER_DST_BIT), and usable directly as a
-        // vkCmdDrawIndexedIndirectCount countBuffer (INDIRECT_BUFFER_BIT).
+        // every frame via vkCmdFillBuffer (TRANSFER_DST_BIT), usable directly as a
+        // vkCmdDrawIndexedIndirectCount countBuffer (INDIRECT_BUFFER_BIT), and (Phase 0.2, PCG
+        // roadmap) a genuine vkCmdCopyBuffer SOURCE (TRANSFER_SRC_BIT) for a Debug-only readback --
+        // renderer::ClusterRenderPipeline::RunPcgInstanceDrawSmokeTest copies this GPU-atomic count
+        // out to a host-visible buffer to verify culling actually produced surviving clusters,
+        // mirroring renderer::ParticleSystemPass's own CounterBuffer precedent (see that buffer's
+        // own declaration comment: "both are genuine copy SOURCES, not just destinations").
         m_DrawCountBuffer.Create(
             allocator,
             sizeof(uint32_t),
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT
+                | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
             VMA_MEMORY_USAGE_GPU_ONLY);
 
         // --- Descriptor set layout: 4 bindings, all compute-visible, matching
