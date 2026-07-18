@@ -1711,14 +1711,14 @@ int main(int argc, char** argv) {
             // --- Animation Debug Panel (Code Audit Phase 2) ---
             // Displays skeletal animator state: bone chain, undulation gait parameters, etc.
             if (ImGui::BeginTabItem("Animation")) {
-                animation::debug::AnimationDebugPanel::RenderImGui(g_SkeletalAnimator);
+                animation::debug::AnimationDebugPanel::RenderImGui(clusterPipeline.GetSkeletalAnimator());
                 ImGui::EndTabItem();
             }
 
             // --- World Partition Streaming Debug Panel (Code Audit Phase 2) ---
             // Displays streaming manager state: tracked cells, in-flight loads, queue depth.
             if (ImGui::BeginTabItem("Streaming")) {
-                world::debug::WorldPartitionDebugPanel::RenderImGui(g_StreamingManager);
+                world::debug::WorldPartitionDebugPanel::RenderImGui(streamingManager);
                 ImGui::EndTabItem();
             }
 
