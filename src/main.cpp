@@ -23,6 +23,8 @@
 #include <chrono>
 #include <algorithm>
 #include <cmath>
+#include <atomic>
+#include <string>
 
 #ifndef NDEBUG
 #include "core/debug/DebugTestPipeline.h"
@@ -511,17 +513,55 @@ int main(int argc, char** argv) {
         LOG_INFO("[Main] scene.cache is up to date with current parameters. Skipping geometry cache build.");
     } else {
         LOG_INFO("[Main] scene.cache is missing or out of date. Rebuilding geometry cache...");
-        try {
-            geometryCacheTestPassed = geometry::RunVirtualGeometryCacheTest(
-                vkContext.GetDevice(), vkContext.GetAllocator(), vkContext.GetGraphicsQueue(), vkContext.GetCommandPool(),
-                vkContext.GetVertexBuffer(), vkContext.GetIndexBuffer(), vkContext.GetVertexSkinBuffer(),
-                vkContext.GetTotalVertexCount(), vkContext.GetTotalIndexCount(),
-                vkContext.GetEntityData(), vkContext.GetEntityCount());
+        // RunVirtualGeometryCacheTest is one monolithic, synchronous call (full GPU geometry
+        // readback + a per-entity cluster DAG build -- see ClusterDAG.h/VirtualGeometryCacheTest.h's
+        // own comments) that can block for minutes on a cold/mismatched cache. Calling it directly
+        // on this thread -- the same thread that owns the GLFW window -- would stop glfwPollEvents()
+        // from running for that whole time, so Win32 never services this window's message queue and
+        // the OS ghosts it as "Not Responding" (its standard hung-window detection) even though the
+        // engine is working correctly; the title bar can't even be dragged. There is no incremental-
+        // progress hook to poll here (it is a single function, not something restructured for this
+        // fix), so instead the whole call is moved onto a worker thread while this thread keeps
+        // pumping GLFW's message queue -- plus a small animated window-title cue so the user has
+        // some sign of life -- until the worker thread finishes.
+        std::atomic<bool> cacheBuildDone{ false };
+        bool cacheBuildResult = false;
+        std::thread cacheBuildThread([&]() {
+            try {
+                cacheBuildResult = geometry::RunVirtualGeometryCacheTest(
+                    vkContext.GetDevice(), vkContext.GetAllocator(), vkContext.GetGraphicsQueue(), vkContext.GetCommandPool(),
+                    vkContext.GetVertexBuffer(), vkContext.GetIndexBuffer(), vkContext.GetVertexSkinBuffer(),
+                    vkContext.GetTotalVertexCount(), vkContext.GetTotalIndexCount(),
+                    vkContext.GetEntityData(), vkContext.GetEntityCount());
+            }
+            catch (const std::exception& e) {
+                LOG_CRITICAL(std::format("[Main] RunVirtualGeometryCacheTest threw: {}", e.what()));
+                cacheBuildResult = false;
+            }
+            // Release-store: publishes cacheBuildResult to the polling loop's acquire-load below
+            // before that loop can stop and join this thread.
+            cacheBuildDone.store(true, std::memory_order_release);
+        });
+
+        // Minimal "please wait" pump -- deliberately not a loading screen (out of scope for this
+        // fix): it only keeps Win32 message processing alive, which is both what stops the OS from
+        // considering the window hung AND what a title-bar drag needs to actually track the mouse.
+        // No frame is presented here: the swapchain exists, but ClusterRenderPipeline (the only
+        // thing that knows how to record a frame) isn't built until after the cache is ready.
+        static const char* kSpinnerFrames[] = { "|", "/", "-", "\\" };
+        uint32_t spinnerIndex = 0;
+        while (!cacheBuildDone.load(std::memory_order_acquire)) {
+            glfwPollEvents();
+            std::string waitTitle = std::string("Vulkan 1.3 Bindless Demoscene - Building geometry cache ")
+                + kSpinnerFrames[spinnerIndex] + " (first run / scene change, please wait)";
+            glfwSetWindowTitle(window, waitTitle.c_str());
+            spinnerIndex = (spinnerIndex + 1) % 4;
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
-        catch (const std::exception& e) {
-            LOG_CRITICAL(std::format("[Main] RunVirtualGeometryCacheTest threw: {}", e.what()));
-            geometryCacheTestPassed = false;
-        }
+        cacheBuildThread.join();
+        glfwSetWindowTitle(window, "Vulkan 1.3 Bindless Demoscene");
+
+        geometryCacheTestPassed = cacheBuildResult;
         if (geometryCacheTestPassed) {
             geometry::SaveCacheConfig(vkContext.GetTotalVertexCount(), vkContext.GetTotalIndexCount(), vkContext.GetEntityCount());
         }
@@ -577,17 +617,48 @@ int main(int argc, char** argv) {
     // SurfaceCachePass::Init() to prune translucent-material cards at load time.
     pipelineInfo.entityDataCPU = vkContext.GetEntityData();
 
-    // Init is wrapped so an uncaught std::runtime_error (GpuBuffer allocation failure, missing
-    // SPIR-V file, ...) surfaces as a logged message instead of a silent std::terminate -- the
-    // console/log otherwise shows nothing at all for an exception escaping main.
+    // ClusterRenderPipeline::Init() sequentially creates ~40 render passes' worth of GPU buffers/
+    // images/pipelines (many involving first-time driver-side SPIR-V pipeline compilation -- there
+    // is no persisted VkPipelineCache anywhere in this codebase, so this cost is paid fresh on
+    // EVERY launch, not just a cold scene.cache) plus several one-shot staged uploads, all on
+    // whichever thread calls it. It has no GLFW dependency of its own (every handle it touches --
+    // device/allocator/queue/commandPool/images -- was already created by VulkanContext::Init()
+    // above) and, like geometry::RunVirtualGeometryCacheTest() before it, is a single self-contained
+    // call that returns a bool. Calling it directly here -- right after the cache-build wait, which
+    // already had this exact problem -- would again stop glfwPollEvents() from running for the
+    // whole 20-30+ second duration, so Win32 ghosts the window as "Not Responding" a second time.
+    // Same worker-thread + polling-pump pattern as the cache-build wait above, reused verbatim
+    // (including the try/catch, since GpuBuffer allocation failures/missing SPIR-V files can still
+    // throw std::runtime_error here).
     renderer::ClusterRenderPipeline clusterPipeline;
+    std::atomic<bool> pipelineInitDone{ false };
     bool pipelineInitOk = false;
-    try {
-        pipelineInitOk = clusterPipeline.Init(pipelineInfo);
+    std::thread pipelineInitThread([&]() {
+        try {
+            pipelineInitOk = clusterPipeline.Init(pipelineInfo);
+        }
+        catch (const std::exception& e) {
+            LOG_CRITICAL(std::format("[Main] ClusterRenderPipeline::Init threw: {}", e.what()));
+            pipelineInitOk = false;
+        }
+        // Release-store: publishes pipelineInitOk to the polling loop's acquire-load below before
+        // that loop can stop and join this thread.
+        pipelineInitDone.store(true, std::memory_order_release);
+    });
+
+    static const char* kPipelineInitSpinnerFrames[] = { "|", "/", "-", "\\" };
+    uint32_t pipelineInitSpinnerIndex = 0;
+    while (!pipelineInitDone.load(std::memory_order_acquire)) {
+        glfwPollEvents();
+        std::string waitTitle = std::string("Vulkan 1.3 Bindless Demoscene - Initializing render pipeline ")
+            + kPipelineInitSpinnerFrames[pipelineInitSpinnerIndex] + " (please wait)";
+        glfwSetWindowTitle(window, waitTitle.c_str());
+        pipelineInitSpinnerIndex = (pipelineInitSpinnerIndex + 1) % 4;
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
-    catch (const std::exception& e) {
-        LOG_CRITICAL(std::format("[Main] ClusterRenderPipeline::Init threw: {}", e.what()));
-    }
+    pipelineInitThread.join();
+    glfwSetWindowTitle(window, "Vulkan 1.3 Bindless Demoscene");
+
     if (!pipelineInitOk) {
         LOG_CRITICAL("[Main] ClusterRenderPipeline initialization FAILED.");
         clusterPipeline.Shutdown();
