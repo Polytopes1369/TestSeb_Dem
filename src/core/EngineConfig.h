@@ -450,6 +450,23 @@ struct EmitterConfig {
     float dragCoefficient = 0.5f;  // How strongly velocity relaxes toward the local Atmos wind vector each second.
     uint32_t spawnShape = 0;       // 0 = Cone burst ("embers" launch), 1 = Sphere volume drift ("ambient dust").
     float shapeParam0 = 0.3f;      // Sphere shape's radius in world units; unused by Cone.
+
+    // Subtask A4 (color-over-life / size-over-life curves) -- see renderer::ParticleSystemPass::
+    // EmitterParams::colorCurve/sizeCurve's own declaration comment (src/renderer/passes/
+    // ParticleSystemPass.h) for the full evaluation contract: 4 keyframes at normalized age
+    // 0.0/0.33/0.67/1.0, colorCurve DIRECT/authoritative (overrides colorR/G/B/A above once a custom
+    // curve is set), sizeCurve a MULTIPLIER on sizeMin/sizeMax's own per-particle roll. The defaults
+    // below intentionally reproduce a FLAT, unchanging curve -- colorCurve every key equal to
+    // (colorR, colorG, colorB, colorA) above, sizeCurve every key 1.0 -- so an emitter that never
+    // touches these new fields (every slot below except EMITTERS[0]'s Embers) renders IDENTICALLY to
+    // how it did before this roadmap step: a flat colorCurve reproduces the old "one fixed color for
+    // the particle's entire life" behavior exactly, and a flat 1.0 sizeCurve is a pure no-op
+    // multiplier on the existing size roll.
+    float colorCurve[4][4] = {
+        { 1.0f, 1.0f, 1.0f, 1.0f }, { 1.0f, 1.0f, 1.0f, 1.0f },
+        { 1.0f, 1.0f, 1.0f, 1.0f }, { 1.0f, 1.0f, 1.0f, 1.0f }
+    };
+    float sizeCurve[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
 };
 
 // Slot 0 preserves the ORIGINAL single-emitter defaults exactly (same position/spawn rate/physics
@@ -458,14 +475,36 @@ struct EmitterConfig {
 // (a slow-drifting sphere-volume spawn, distinct color/physics/shape from slot 0, both active
 // simultaneously). Slots 2-3 start inactive, ready for further ImGui-driven experimentation.
 inline EmitterConfig EMITTERS[kMaxEmitters] = {
+    // Subtask A4's own visible proof-of-feature: Embers now cool and die over their lifetime instead
+    // of holding one fixed orange from spawn to recycle -- bright warm-white glow at birth, settling
+    // to the original base orange mid-life, cooling to a dim dark red, then fully extinguishing
+    // (alpha -> 0) right at death. sizeCurve gives it a quick "pop" to full size followed by a gradual
+    // shrink as it burns out, on top of the existing sizeMin/sizeMax per-particle roll below.
     EmitterConfig{ /*active*/ true, /*position*/ 0.0f, 3.0f, 0.0f, /*spawnRate*/ 200.0f,
         /*color*/ 1.0f, 0.7f, 0.3f, 1.0f, /*size*/ 0.1f, 0.1f, /*lifetime*/ 2.0f, 4.0f,
         /*gravityY*/ -9.8f, /*bounce*/ 0.4f, /*friction*/ 0.85f, /*drag*/ 0.5f,
-        /*spawnShape*/ 0u, /*shapeParam0*/ 0.3f },
+        /*spawnShape*/ 0u, /*shapeParam0*/ 0.3f,
+        /*colorCurve*/ {
+            { 1.0f, 0.85f, 0.65f, 1.0f },  // Age 0.00 -- bright warm-white glow at birth.
+            { 1.0f, 0.7f, 0.3f, 1.0f },    // Age 0.33 -- settles to the original base orange.
+            { 0.55f, 0.15f, 0.05f, 0.8f }, // Age 0.67 -- cooling into a dim, dark red ember.
+            { 0.0f, 0.0f, 0.0f, 0.0f }     // Age 1.00 -- fully extinguished/transparent at death.
+        },
+        /*sizeCurve*/ { 0.6f, 1.0f, 0.8f, 0.0f } },
+    // Ambient Dust keeps an explicit FLAT curve matching its own Base Color exactly (rather than
+    // relying on EmitterConfig's own in-class default, which only matches the DEFAULT Base Color
+    // (1,1,1,1), not this emitter's actual dusty blue-gray one) -- see EmitterConfig::colorCurve's own
+    // declaration comment: this reproduces today's unchanged "one fixed color for life" look with zero
+    // visual regression from this roadmap step.
     EmitterConfig{ /*active*/ true, /*position*/ 4.0f, 2.0f, 2.0f, /*spawnRate*/ 40.0f,
         /*color*/ 0.6f, 0.7f, 0.85f, 0.5f, /*size*/ 0.03f, 0.07f, /*lifetime*/ 4.0f, 7.0f,
         /*gravityY*/ -0.2f, /*bounce*/ 0.0f, /*friction*/ 0.0f, /*drag*/ 1.0f,
-        /*spawnShape*/ 1u, /*shapeParam0*/ 1.5f },
+        /*spawnShape*/ 1u, /*shapeParam0*/ 1.5f,
+        /*colorCurve*/ {
+            { 0.6f, 0.7f, 0.85f, 0.5f }, { 0.6f, 0.7f, 0.85f, 0.5f },
+            { 0.6f, 0.7f, 0.85f, 0.5f }, { 0.6f, 0.7f, 0.85f, 0.5f }
+        },
+        /*sizeCurve*/ { 1.0f, 1.0f, 1.0f, 1.0f } },
     EmitterConfig{},
     EmitterConfig{},
 };
