@@ -100,6 +100,33 @@
 // one's emplace() actually wins the slot is immaterial; the loser's own local copy is simply
 // discarded after use.
 //
+// --- Phase 9.3 ("Profiling & Per-Frame Generation Budget") -------------------------------------
+// Real profiling (see ClusterRenderPipeline.cpp's RunPcgCellLoaderSmokeTest, STEP 6, and this
+// class' own Phase 9.3 commit message for the actual measured numbers) found the expensive part of
+// this pipeline -- pcg::GeneratePcgContentForCell() itself, disk read + JSON parse + graph
+// evaluation per overlapping volume -- already runs exactly where it should: this class' own
+// documented threading contract (LoadCellFullDetail()/LoadCellHlod()/UnloadCell() "called from a
+// core::LoadingManager worker thread, never the main thread", see this class' own declarations
+// below) keeps it off the main thread BY CONSTRUCTION, once a future caller wires this class into a
+// world::StreamingManager instance the same way main.cpp's live worldCellLoader/StreamingManager
+// pair already does today (see that pair's own maxConcurrentLoads=4 construction argument --
+// StreamingManager.h's own header comment documents that knob as the actual I/O/CPU load-balancing
+// bound for exactly this kind of worker-thread-dispatched generation work; a PCG-dedicated
+// StreamingManager gets this bound for free, no new code needed here).
+// What this class did NOT already have -- and what Phase 9.3 actually added -- is any bound on
+// Pump()'s OWN main-thread drain loop: before this phase, a single Pump() call processed its ENTIRE
+// m_PendingEvents queue unconditionally, with no cap. That is the one place in this whole pipeline
+// that broke this codebase's own established "every dispatch/drain point stays explicitly bounded,
+// never relying solely on an upstream caller's discipline" rule (core::LoadingManager::
+// PumpCompletions(budget) and world::StreamingManager::maxConcurrentLoads both already follow it;
+// see also this project's own ClusterDAG unbounded-parallelism incident, memorialized precisely for
+// this reason). A burst of many worker-thread completions landing between two Pump() calls --
+// several near-instant Phase 6.4 cache-HIT reloads finishing in the same frame, or a camera
+// teleport revealing/hiding many cells at once -- would previously all drain synchronously on the
+// main thread in ONE Pump() call. Pump()'s own `maxEventsThisCall` parameter (default
+// kDefaultMaxEventsPerPump) now bounds that, deferring any overflow to a later call -- see Pump()'s
+// own declaration comment below for the exact mechanism.
+//
 // --- Debug-only, whole file (see the #ifndef NDEBUG guard below) --------------------------------
 // Two independent reasons converge on the same conclusion:
 //   1. This class' constructor builds its volume index via PcgVolumeCellIndex.h's
@@ -195,11 +222,20 @@ namespace world {
         // (main-thread-only state) -- that lookup/release happens in Pump().
         void UnloadCell(const CellCoord& coord) override;
 
+        // PCG roadmap Phase 9.3 ("Profiling & Per-Frame Generation Budget"): upper bound on how many
+        // staged events a single Pump() call drains -- see that method's own .cpp comment for the
+        // full rationale. Deliberately the SAME numeric value this exact codebase already uses for
+        // the analogous main-thread drain point in the LIVE streaming loop (main.cpp's
+        // `clusterPipeline.GetLoadingManager().PumpCompletions(8u)`, right next to where a
+        // PCG-dedicated world::StreamingManager would also live) -- not a fresh guess.
+        static constexpr uint32_t kDefaultMaxEventsPerPump = 8;
+
         // Main-thread-only equivalent of WorldCellStreamingLoader::DrainEvents(), but -- unlike that
         // method -- this ALSO performs the actual pcg::PcgInstanceSpawnManager::SpawnInstances()/
         // DespawnInstances() calls itself rather than handing raw events back to a caller (see this
         // file's own top-of-file "Structural template" comment, point 2, for why). For each staged
-        // load event: calls SpawnInstances(event.spawnRequests) and records the returned slot list
+        // load event (up to `maxEventsThisCall`, oldest-staged first -- see Phase 9.3's own .cpp
+        // comment): calls SpawnInstances(event.spawnRequests) and records the returned slot list
         // against event.coord in m_CellToAcquiredSlots (appended, not overwritten -- see .cpp for
         // why). For each staged unload event: looks up event.coord in m_CellToAcquiredSlots; if
         // found, calls DespawnInstances() on that cell's full acquired-slot list and erases the
@@ -210,7 +246,15 @@ namespace world {
         // thread, after StreamingManager::Update() and core::LoadingManager::PumpCompletions() have
         // had a chance to actually invoke LoadCellFullDetail()/LoadCellHlod()/UnloadCell() above --
         // exactly WorldCellStreamingLoader::DrainEvents()'s own call-site convention (see main.cpp).
-        void Pump();
+        //
+        // `maxEventsThisCall` (Phase 9.3): if more than this many events are staged, only the OLDEST
+        // `maxEventsThisCall` are drained this call -- the rest stay queued in m_PendingEvents for a
+        // LATER Pump() call, exactly mirroring core::LoadingManager::PumpCompletions(uint32_t)'s own
+        // "returns the number actually invoked, may be less than requested" contract. Existing
+        // call sites that never needed this (every one before Phase 9.3) keep compiling and behaving
+        // identically via the default argument -- see kDefaultMaxEventsPerPump's own comment for why
+        // 8 specifically.
+        void Pump(uint32_t maxEventsThisCall = kDefaultMaxEventsPerPump);
 
         // --- Read-only accessors, mainly for RunPcgCellLoaderSmokeTest's/PcgCellLoaderTests' own
         // verification (mirrors renderer::debug::PcgVolumeInspector::GetVolumeCount()'s own "expose
