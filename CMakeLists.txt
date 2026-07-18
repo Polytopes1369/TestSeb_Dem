@@ -283,6 +283,18 @@ add_executable(PcgTerrainSamplerTests
 target_include_directories(PcgTerrainSamplerTests PRIVATE src ${Vulkan_INCLUDE_DIRS})
 add_test(NAME PcgTerrainSamplerTests COMMAND PcgTerrainSamplerTests)
 
+# PCG framework roadmap, Phase 3.4 ("Slope/Height Filter + Projection"): src/pcg/PcgSlopeHeightFilter.cpp
+# depends on Phase 2.2's Terrain Sampler (PcgTerrainSampler.cpp) for its Projection operation's
+# height/normal re-query and its terrain-batch Slope Filter overload's slope semantics, so this
+# target links that source alongside its own filter implementation and test file.
+add_executable(PcgSlopeHeightFilterTests
+    src/pcg/PcgSlopeHeightFilter.cpp
+    src/pcg/PcgTerrainSampler.cpp
+    tests/PcgSlopeHeightFilterTests.cpp
+)
+target_include_directories(PcgSlopeHeightFilterTests PRIVATE src ${Vulkan_INCLUDE_DIRS})
+add_test(NAME PcgSlopeHeightFilterTests COMMAND PcgSlopeHeightFilterTests)
+
 # PCG framework roadmap, Phase 5.1+5.2 ("PCG Graph Engine Core"): the node/link graph data model +
 # JSON serialization (src/pcg/PcgGraph.cpp) and the CPU topological evaluator + subgraph support
 # (src/pcg/PcgGraphEvaluator.cpp), built directly on Phase 1's data model. PcgGraph.cpp reuses
