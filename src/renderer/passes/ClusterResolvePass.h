@@ -153,7 +153,7 @@ namespace renderer {
         // modulation.
         void RecordResolve(VkCommandBuffer cmd, const maths::mat4& viewProj, const maths::mat4& prevViewProj,
             const DirectionalLight& sun, const maths::vec3& cameraPositionWorld, float surfaceWetness, float snowCoverage,
-            uint32_t debugViewMode = 0);
+            float globalTimeSeconds, uint32_t debugViewMode = 0);
 
         // --- Phase 1b: binned resolve path (renderer::ClusterShadingBinPass) ---
         // Second-phase init, called once after BOTH Init() above AND `shadingBinPass.Init()` have
@@ -186,7 +186,7 @@ namespace renderer {
         // must work correctly in Release, not just under a debug view mode).
         void RecordResolveBinned(VkCommandBuffer cmd, const maths::mat4& viewProj,
             const DirectionalLight& sun, const maths::vec3& cameraPositionWorld, float surfaceWetness, float snowCoverage,
-            const ClusterShadingBinPass& shadingBinPass);
+            float globalTimeSeconds, const ClusterShadingBinPass& shadingBinPass);
 
         // Binds Phase 3's renderer::VirtualShadowMapPass resources (physical page atlas + sampler,
         // page table, feedback buffer, sun clipmap levels UBO) into BOTH this pass's descriptor

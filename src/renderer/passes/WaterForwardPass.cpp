@@ -129,10 +129,11 @@ namespace renderer {
         }
 
         // =====================================================================================
-        // STEP 1 -- set 0 layout: 7 bindings (no shadow/World-Probe-Grid/MegaLights resources --
-        // water has no diffuse/shadowed term, see this class' own header comment).
+        // STEP 1 -- set 0 layout: 8 bindings (no shadow/World-Probe-Grid/MegaLights resources --
+        // water has no diffuse/shadowed term, see this class' own header comment). Binding 7 (Wave
+        // 2, UE5.8 water/foam parity): FoamUBO, see include/foam_generation.glsl's own comment.
         // =====================================================================================
-        VkDescriptorSetLayoutBinding bindings[7]{};
+        VkDescriptorSetLayoutBinding bindings[8]{};
         bindings[0] = { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr };         // MaterialParamsSSBO
         bindings[1] = { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, nullptr };           // EntityTransformSSBO (vertex-stage only)
         bindings[2] = { 2, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr }; // g_TLAS
@@ -140,21 +141,23 @@ namespace renderer {
         bindings[4] = { 4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr };         // FallbackIndexBuffer (HWRT)
         bindings[5] = { 5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr };         // EntityDrawRangeBuffer (HWRT)
         bindings[6] = { 6, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr }; // g_BackgroundSnapshot
+        bindings[7] = { 7, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr };         // FoamUBO (Wave 2)
 
         VkDescriptorSetLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-        layoutInfo.bindingCount = 7;
+        layoutInfo.bindingCount = 8;
         layoutInfo.pBindings = bindings;
         if (vkCreateDescriptorSetLayout(m_Device, &layoutInfo, nullptr, &m_SetLayout) != VK_SUCCESS) {
             throw std::runtime_error("Failed to create WaterForwardPass descriptor set layout!");
         }
 
-        VkDescriptorPoolSize poolSizes[3]{};
+        VkDescriptorPoolSize poolSizes[4]{};
         poolSizes[0] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 5 };             // bindings 0,1,3,4,5
         poolSizes[1] = { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1 }; // binding 2
         poolSizes[2] = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1 };     // binding 6
+        poolSizes[3] = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 };             // binding 7 (Wave 2)
         VkDescriptorPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
         poolInfo.maxSets = 1;
-        poolInfo.poolSizeCount = 3;
+        poolInfo.poolSizeCount = 4;
         poolInfo.pPoolSizes = poolSizes;
         if (vkCreateDescriptorPool(m_Device, &poolInfo, nullptr, &m_DescriptorPool) != VK_SUCCESS) {
             throw std::runtime_error("Failed to create WaterForwardPass descriptor pool!");
@@ -176,14 +179,22 @@ namespace renderer {
         // =====================================================================================
         m_MaterialParamsBuffer.Create(allocator, sizeof(MaterialParameters),
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
+        // Wave 2 (UE5.8 water/foam parity): fixed, hand-tuned foam recipe -- no per-material foam
+        // authoring exists yet (same "authored once, never changes at runtime" convention as
+        // waterMaterial above), matching WaterEffectsParams::FoamParams' own default field values.
+        FoamParams foamParams{};
+        m_FoamParamsBuffer.Create(allocator, sizeof(FoamParams),
+            VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
         VulkanUtils::ExecuteOneShotCommands(m_Device, commandPool, queue, [&](VkCommandBuffer cmd) {
             vkCmdUpdateBuffer(cmd, m_MaterialParamsBuffer.Handle(), 0, sizeof(MaterialParameters), &waterMaterial);
+            vkCmdUpdateBuffer(cmd, m_FoamParamsBuffer.Handle(), 0, sizeof(FoamParams), &foamParams);
             VulkanUtils::RecordMemoryBarrier(cmd,
                 VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
-                VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+                VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_UNIFORM_READ_BIT);
         });
         VkDescriptorBufferInfo materialParamsInfo{ m_MaterialParamsBuffer.Handle(), 0, m_MaterialParamsBuffer.Size() };
         VkDescriptorBufferInfo entityTransformInfo{ entityTransformBuffer, 0, VK_WHOLE_SIZE };
+        VkDescriptorBufferInfo foamParamsInfo{ m_FoamParamsBuffer.Handle(), 0, m_FoamParamsBuffer.Size() };
 
         VkWriteDescriptorSetAccelerationStructureKHR tlasWrite{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR };
         tlasWrite.accelerationStructureCount = 1;
@@ -198,7 +209,7 @@ namespace renderer {
         backgroundSnapshotInfo.imageView = m_BackgroundSnapshotView;
         backgroundSnapshotInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
-        VkWriteDescriptorSet writes[7]{};
+        VkWriteDescriptorSet writes[8]{};
         writes[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_Set, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &materialParamsInfo, nullptr };
         writes[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_Set, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &entityTransformInfo, nullptr };
         writes[2] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_Set, 2, 0, 1, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, nullptr, nullptr, nullptr };
@@ -207,8 +218,9 @@ namespace renderer {
         writes[4] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_Set, 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &fallbackIndexInfo, nullptr };
         writes[5] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_Set, 5, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &drawRangeInfo, nullptr };
         writes[6] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_Set, 6, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &backgroundSnapshotInfo, nullptr, nullptr };
+        writes[7] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_Set, 7, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &foamParamsInfo, nullptr };
 
-        vkUpdateDescriptorSets(m_Device, 7, writes, 0, nullptr);
+        vkUpdateDescriptorSets(m_Device, 8, writes, 0, nullptr);
 
         // =====================================================================================
         // STEP 3 -- pipeline layout: 3 sets (own set 0 above, plus SurfaceCacheTraceContext's set
@@ -361,6 +373,7 @@ namespace renderer {
             vmaDestroyImage(m_Allocator, m_BackgroundSnapshotImage, m_BackgroundSnapshotAllocation);
         }
         m_MaterialParamsBuffer.Destroy();
+        m_FoamParamsBuffer.Destroy();
 
         m_Pipeline = VK_NULL_HANDLE;
         m_PipelineLayout = VK_NULL_HANDLE;

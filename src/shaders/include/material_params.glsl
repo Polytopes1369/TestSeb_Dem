@@ -69,6 +69,13 @@ struct MaterialParams {
     // UE5.8 Lumen "Output Reflections" equivalent -- see renderer::MaterialParameters::
     // hasReflections' own comment (MaterialParameterTable.h). 0.0 = off, 1.0 = on.
     float hasReflections;
+    // Wave 2 (UE5.8 Substrate iridescence layer) -- see renderer::MaterialParameters::
+    // iridescenceAmount/iridescenceThickness's own comment (MaterialParameterTable.h). Consumed by
+    // substrate_bsdf.glsl's EvaluateSubstrateMaterial via include/iridescence_bsdf.glsl.
+    float iridescenceAmount;
+    float iridescenceThickness;
+    float _padIridescence0;
+    float _padIridescence1;
 };
 
 // Phase 7b (UE5.8 parity roadmap, terrain heightfield): mirror of renderer::kTerrainMaterialID

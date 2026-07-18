@@ -57,6 +57,8 @@
 #include "include/material_params.glsl"
 #include "include/substrate_bsdf.glsl"
 #include "include/terrain_shading.glsl" // Phase 7b (UE5.8 parity roadmap, terrain heightfield)
+#include "include/water_params.glsl" // Wave 2: kWaterLevel, for the underwater-caustics gate below.
+#include "include/procedural_light_modulation.glsl" // Wave 2 (UE5.8 caustics/light-function parity)
 #include "include/visbuffer_arbitration.glsl"
 
 #define MASK_ARRAY_SET 0
@@ -159,7 +161,10 @@ layout(std140, set = 0, binding = 7) uniform ResolveViewParamsUBO {
     // reflection_view_params.glsl) -- not previously threaded into this shader, since the
     // pre-Substrate shading here was pure Lambertian (no view-dependent term at all).
     vec3 cameraPositionWorld;
-    float _pad3;
+    // Wave 2 (UE5.8 caustics/light-function parity): repurposes what was dead std140 padding (same
+    // "reuse the padding" convention surfaceWetness/snowCoverage already established above) --
+    // feeds the procedural underwater caustics term and the sun's light-function modulation below.
+    float timeSeconds;
 } g_ViewParams;
 
 // Minimal GBuffer (renderer::ClusterResolvePass -- see its own class comment): written alongside
@@ -452,6 +457,12 @@ void main() {
         if (cluster.materialID == MATERIAL_ID_TERRAIN) {
             mat.base.diffuseAlbedo = ComputeTerrainAlbedo(worldPos, normal, mat.base.diffuseAlbedo);
         }
+        // Wave 2 (UE5.8 water/caustics parity): submerged terrain only -- see
+        // ComputeUnderwaterCaustics's own comment for why this is a procedural, texture-free
+        // approximation. A no-op (1.0) everywhere else, incl. every non-terrain material.
+        float causticsModulation = (cluster.materialID == MATERIAL_ID_TERRAIN)
+            ? ComputeUnderwaterCaustics(worldPos, g_ViewParams.timeSeconds, kWaterLevel)
+            : 1.0;
         gbufferMaterialID = materialSlot;
 
         // Step 4: Runtime Virtual Texture detail multiply -- worldPos.xz mapped into the VT volume's
@@ -504,6 +515,12 @@ void main() {
         vec3 skyAmbient = texture(g_SkyViewLUT, SkyViewLUTUVFromDirection(normal, g_ViewParams.sunDirection)).rgb;
         vec3 sunRadiance = g_ViewParams.sunColor * g_ViewParams.sunIntensity;
         vec3 directResponse = EvaluateSubstrateMaterial(mat, normal, viewDir, lightDir);
+        // Wave 2 (UE5.8 caustics/light-function parity): both are subtle direct-term modulations,
+        // multiplied together into a single factor -- causticsModulation is 1.0 (no-op) everywhere
+        // except submerged terrain (see its own computation above); the sun light function is a
+        // gentle always-on angular banding (see EvaluateSunLightFunction's own comment).
+        float sunLightFunction = EvaluateSunLightFunction(worldPos, g_ViewParams.sunDirection);
+        float sunModulation = causticsModulation * sunLightFunction;
         // kEmissiveScale converts this codebase's existing artist-authored, unitless emissive
         // multiplier (renderer::MaterialParameters::emissive, authored in a small ~0-3 range across
         // every material -- see renderer::GenerateShowcaseMaterialTable) into the same real
@@ -514,7 +531,7 @@ void main() {
         // "glowing", not just "well lit".
         const float kEmissiveScale = 1500.0;
         finalColor = mat.base.diffuseAlbedo * skyAmbient
-            + directResponse * sunRadiance * sunVisibility
+            + directResponse * sunRadiance * sunVisibility * sunModulation
             + EvaluateSubstrateEmissive(mat) * kEmissiveScale;
 
         // GBuffer capture (renderer::ClusterResolvePass's new outputs -- see this file's own

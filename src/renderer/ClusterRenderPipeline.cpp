@@ -2407,14 +2407,14 @@ void ClusterRenderPipeline::RecordFrameMid(VkCommandBuffer cmdMid, VkCommandBuff
 #ifndef NDEBUG
   if (cameraCopy.debugViewMode == DEBUG_VIEW_NORMAL) {
     m_ShadingBin.RecordClassifyAndSort(cmdMid, m_RenderExtent);
-    m_Resolve.RecordResolveBinned(cmdMid, viewProj, m_SceneLights.sun, cameraPositionWorld, surfaceWetness, snowCoverage, m_ShadingBin);
+    m_Resolve.RecordResolveBinned(cmdMid, viewProj, m_SceneLights.sun, cameraPositionWorld, surfaceWetness, snowCoverage, m_FrameScratch.globalTimeSeconds, m_ShadingBin);
   } else {
     maths::mat4 prevViewProjForResolve = m_HasPrevViewProj ? m_PrevViewProj : viewProj;
-    m_Resolve.RecordResolve(cmdMid, viewProj, prevViewProjForResolve, m_SceneLights.sun, cameraPositionWorld, surfaceWetness, snowCoverage, cameraCopy.debugViewMode);
+    m_Resolve.RecordResolve(cmdMid, viewProj, prevViewProjForResolve, m_SceneLights.sun, cameraPositionWorld, surfaceWetness, snowCoverage, m_FrameScratch.globalTimeSeconds, cameraCopy.debugViewMode);
   }
 #else
   m_ShadingBin.RecordClassifyAndSort(cmdMid, m_RenderExtent);
-  m_Resolve.RecordResolveBinned(cmdMid, viewProj, m_SceneLights.sun, cameraPositionWorld, surfaceWetness, snowCoverage, m_ShadingBin);
+  m_Resolve.RecordResolveBinned(cmdMid, viewProj, m_SceneLights.sun, cameraPositionWorld, surfaceWetness, snowCoverage, m_FrameScratch.globalTimeSeconds, m_ShadingBin);
 #endif
 }
 

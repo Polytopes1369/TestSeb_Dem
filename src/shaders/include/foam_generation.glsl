@@ -5,8 +5,11 @@
 #ifndef FOAM_GENERATION_GLSL
 #define FOAM_GENERATION_GLSL
 
-// Foam parameters
-layout(std140, set = 3, binding = 6) uniform FoamUBO {
+// Foam parameters. Binding renumbered to set=0/binding=7 (Wave 2 integration) to fit
+// renderer::WaterForwardPass's actual single-set (set 0) pipeline layout -- this file's only real
+// consumer is WaterForward.frag, whose existing bindings occupy 0-6 (see that shader's own binding
+// comments), so 7 is the next free slot in the SAME set, not a separate set 3.
+layout(std140, set = 0, binding = 7) uniform FoamUBO {
     vec4 foamColor;             // RGBA foam color (typically white with alpha)
     vec4 foamParameters;        // X: intensity, Y: wave height threshold, Z: edge fade, W: animation speed
     vec4 breakingWaveThreshold; // Wave height derivatives that trigger foam generation

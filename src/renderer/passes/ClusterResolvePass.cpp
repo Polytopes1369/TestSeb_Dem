@@ -29,6 +29,10 @@ namespace renderer {
         // std140 padding (still needed to round vec2 up to a 16-byte boundary) -- Atmos weather
         // system's surface response extension repurposes them as real data (surfaceWetness/
         // snowCoverage, see ClusterResolve.comp's own field comment) instead of growing the UBO.
+        // Wave 2 (UE5.8 caustics/light-function parity): the trailing pad float after
+        // cameraPositionWorld is likewise repurposed as real data (timeSeconds) rather than growing
+        // the UBO further -- feeds the procedural (texture-free) underwater caustics term and the
+        // sun's light-function modulation, both in ClusterResolve.comp/ClusterResolveBinned.comp.
         struct ResolveViewParams {
             maths::mat4 viewProj;
             maths::mat4 prevViewProj;
@@ -49,7 +53,7 @@ namespace renderer {
             float cameraPositionWorldX = 0.0f;
             float cameraPositionWorldY = 0.0f;
             float cameraPositionWorldZ = 0.0f;
-            float _pad3 = 0.0f;
+            float timeSeconds = 0.0f;
         };
         static_assert(sizeof(ResolveViewParams) == 192,
             "ResolveViewParams must match ResolveViewParamsUBO in ClusterResolve.comp exactly (std140 layout)");
@@ -492,7 +496,7 @@ namespace renderer {
 
     void ClusterResolvePass::RecordResolve(VkCommandBuffer cmd, const maths::mat4& viewProj, const maths::mat4& prevViewProj,
         const DirectionalLight& sun, const maths::vec3& cameraPositionWorld, float surfaceWetness, float snowCoverage,
-        uint32_t debugViewMode) {
+        float globalTimeSeconds, uint32_t debugViewMode) {
         ResolveViewParams viewParams{};
         viewParams.viewProj = viewProj;
         viewParams.prevViewProj = prevViewProj;
@@ -510,6 +514,7 @@ namespace renderer {
         viewParams.cameraPositionWorldX = cameraPositionWorld.x;
         viewParams.cameraPositionWorldY = cameraPositionWorld.y;
         viewParams.cameraPositionWorldZ = cameraPositionWorld.z;
+        viewParams.timeSeconds = globalTimeSeconds;
         vkCmdUpdateBuffer(cmd, m_ViewParamsBuffer.Handle(), 0, sizeof(ResolveViewParams), &viewParams);
 
         VulkanUtils::RecordMemoryBarrier(cmd,
@@ -676,7 +681,7 @@ namespace renderer {
 
     void ClusterResolvePass::RecordResolveBinned(VkCommandBuffer cmd, const maths::mat4& viewProj,
         const DirectionalLight& sun, const maths::vec3& cameraPositionWorld, float surfaceWetness, float snowCoverage,
-        const ClusterShadingBinPass& shadingBinPass) {
+        float globalTimeSeconds, const ClusterShadingBinPass& shadingBinPass) {
         // prevViewProj is never read by ClusterResolveBinned.comp (this path never serves
         // DEBUG_VIEW_MOTION_VECTORS) -- `viewProj` itself is reused as a harmless placeholder value
         // rather than introducing a separate identity-matrix concept for an otherwise-dead field.
@@ -697,6 +702,7 @@ namespace renderer {
         viewParams.cameraPositionWorldX = cameraPositionWorld.x;
         viewParams.cameraPositionWorldY = cameraPositionWorld.y;
         viewParams.cameraPositionWorldZ = cameraPositionWorld.z;
+        viewParams.timeSeconds = globalTimeSeconds;
         vkCmdUpdateBuffer(cmd, m_ViewParamsBuffer.Handle(), 0, sizeof(ResolveViewParams), &viewParams);
 
         VulkanUtils::RecordMemoryBarrier(cmd,

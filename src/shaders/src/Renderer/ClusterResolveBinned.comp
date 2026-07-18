@@ -28,6 +28,8 @@
 #include "include/material_params.glsl"
 #include "include/substrate_bsdf.glsl"
 #include "include/terrain_shading.glsl" // Phase 7b (UE5.8 parity roadmap, terrain heightfield)
+#include "include/water_params.glsl" // Wave 2: kWaterLevel, for the underwater-caustics gate below.
+#include "include/procedural_light_modulation.glsl" // Wave 2 (UE5.8 caustics/light-function parity)
 #include "include/shading_bin_common.glsl"
 
 #define MASK_ARRAY_SET 0
@@ -124,7 +126,9 @@ layout(std140, set = 0, binding = 6) uniform ResolveViewParamsUBO {
     // Substrate integration: the view direction Substrate's specular/Fresnel terms need -- see
     // ClusterResolve.comp's own identical ResolveViewParamsUBO.cameraPositionWorld comment.
     vec3 cameraPositionWorld;
-    float _pad3;
+    // Wave 2 (UE5.8 caustics/light-function parity) -- see ClusterResolve.comp's own identical
+    // ResolveViewParamsUBO.timeSeconds comment.
+    float timeSeconds;
 } g_ViewParams;
 
 // binding 7 == g_MaskTextures[], declared by mask_sampling.glsl.
@@ -309,6 +313,11 @@ void main() {
     if (pc.binIndex == MATERIAL_ID_TERRAIN) {
         mat.base.diffuseAlbedo = ComputeTerrainAlbedo(worldPos, normal, mat.base.diffuseAlbedo);
     }
+    // Wave 2 (UE5.8 water/caustics parity) -- see ClusterResolve.comp's own identical comment. Also
+    // a uniform branch across this dispatch, same reasoning as the terrain branch just above.
+    float causticsModulation = (pc.binIndex == MATERIAL_ID_TERRAIN)
+        ? ComputeUnderwaterCaustics(worldPos, g_ViewParams.timeSeconds, kWaterLevel)
+        : 1.0;
 
     // Step 4: Runtime Virtual Texture detail multiply -- see ClusterResolve.comp's own identical
     // comment for the full rationale (safe no-op multiply until real tile content exists).
@@ -350,9 +359,13 @@ void main() {
     vec3 skyAmbient = texture(g_SkyViewLUT, SkyViewLUTUVFromDirection(normal, g_ViewParams.sunDirection)).rgb;
     vec3 sunRadiance = g_ViewParams.sunColor * g_ViewParams.sunIntensity;
     vec3 directResponse = EvaluateSubstrateMaterial(mat, normal, viewDir, lightDir);
+    // Wave 2 (UE5.8 caustics/light-function parity) -- see ClusterResolve.comp's own identical
+    // comment.
+    float sunLightFunction = EvaluateSunLightFunction(worldPos, g_ViewParams.sunDirection);
+    float sunModulation = causticsModulation * sunLightFunction;
     const float kEmissiveScale = 1500.0;
     vec3 finalColor = mat.base.diffuseAlbedo * skyAmbient
-        + directResponse * sunRadiance * sunVisibility
+        + directResponse * sunRadiance * sunVisibility * sunModulation
         + EvaluateSubstrateEmissive(mat) * kEmissiveScale;
 
     // Opacity-mask soft edge feathering -- see ClusterResolve.comp's own comment.

@@ -27,6 +27,7 @@
 #include "include/material_params.glsl"
 #include "include/terrain_noise.glsl" // SampleTerrainHeight -- the real seabed depth reference.
 #include "include/water_params.glsl"  // kWaterLevel
+#include "include/foam_generation.glsl" // Wave 2 (UE5.8 water/foam parity) -- declares binding 7 (FoamUBO).
 // Rivers/waterfalls feature: this pass is the SHARED draw for both the flat lake plane and the
 // river/waterfall ribbon (see geom_river.comp's own header comment for why they share one
 // renderer::WaterForwardPass draw call instead of a dedicated river pass/entity) -- river_spline.glsl
@@ -259,6 +260,29 @@ void main() {
     // sharp rapids read as visibly foamy, without needing a separate foam texture/material. ---
     float whitewater = riverMask * clamp(riverSlope * 0.5, 0.0, 1.0);
     outRGB = mix(outRGB, vec3(0.90, 0.95, 1.0), whitewater * 0.6);
+
+    // --- Wave 2 (UE5.8 water/foam parity): wave-breaking foam on the OPEN LAKE -- distinct from the
+    // river/waterfall whitewater above (which is keyed off the authored river channel, not actual
+    // wave steepness), this is real DetectWaveBreaking()/GenerateFoamPattern() foam driven by the
+    // swell noise's own height derivative (steep/choppy patches break), gated by real shore
+    // proximity (this shader's own `waterDepth`, not the synthetic swell noise -- foam reads
+    // clearly near the shore/shallow basin, fades out over open deep water, matching real
+    // shallow-water wave breaking). Fills a genuine gap the river-only whitewater above never
+    // covered: previously the open lake had no foam at all. ---
+    {
+        const float kDerivativeEps = 0.3;
+        vec2 waveHeightDerivative = vec2(
+            WaveHeight(flowShiftedXZ + vec2(kDerivativeEps, 0.0), pc.timeSeconds) - WaveHeight(flowShiftedXZ - vec2(kDerivativeEps, 0.0), pc.timeSeconds),
+            WaveHeight(flowShiftedXZ + vec2(0.0, kDerivativeEps), pc.timeSeconds) - WaveHeight(flowShiftedXZ - vec2(0.0, kDerivativeEps), pc.timeSeconds)
+        ) * kWaveAmplitude;
+        float waveHeightNow = WaveHeight(flowShiftedXZ, pc.timeSeconds) * kWaveAmplitude;
+        float breakingAmount = DetectWaveBreaking(waveHeightDerivative, waveHeightNow, g_Foam.breakingWaveThreshold.x);
+        // Shallow-water fade: only the real seabed-relative depth (waterDepth, computed above for
+        // refraction) can tell shore from open basin -- the synthetic swell noise alone cannot.
+        breakingAmount *= 1.0 - smoothstep(0.0, 1.5, waterDepth);
+        vec4 lakeFoam = GenerateFoamPattern(inWorldPos, pc.timeSeconds, breakingAmount);
+        outRGB = BlendFoam(vec4(outRGB, 1.0), lakeFoam, 1.0).rgb;
+    }
 
     outColor = vec4(outRGB, 1.0);
 }
