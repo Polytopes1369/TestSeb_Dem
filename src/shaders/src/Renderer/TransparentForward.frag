@@ -225,7 +225,13 @@ void main() {
     uint pixelSeed = uint(gl_FragCoord.y) * 65536u + uint(gl_FragCoord.x);
     uint selectedIndex;
     float invPdf;
-    if (SelectLightRIS(inWorldPos, n, pixelSeed, pc.frameIndex, selectedIndex, invPdf)) {
+    // Phase 4, Feature 1 (light BVH for RIS spatial bias): this forward/translucent path has no
+    // geometry::LightBVH bound (that traversal lives only in MegaLightsShade.comp's own opaque
+    // path, see megalights_bvh.glsl's own header comment) -- passing an empty pool (poolCount = 0)
+    // makes SelectLightRIS fall back to its original full-population draw unchanged, exactly the
+    // "no regression" behavior that function's own comment documents for this case.
+    uint noSpatialPool[kMegaLightsSpatialPoolCapacity];
+    if (SelectLightRIS(inWorldPos, n, pixelSeed, pc.frameIndex, noSpatialPool, 0u, selectedIndex, invPdf)) {
         MegaLight light = g_Lights.lights[selectedIndex];
         vec3 toLight = light.position - inWorldPos;
         float dist = length(toLight);
