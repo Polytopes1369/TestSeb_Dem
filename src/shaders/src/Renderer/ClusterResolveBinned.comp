@@ -50,6 +50,13 @@
 #include "include/shadow_atlas_sampling.glsl"
 #include "include/shadow_sun_sampling.glsl"
 
+// Atmos weather system, Subtask 5: Sky-View LUT (ambient replacement) + Cloud Shadow Map (sun term
+// modulation) -- see this file's own Step 3 comment for exactly how each is used.
+#include "include/atmos_sky_lut_mapping.glsl"
+#include "include/atmos_clouds_density.glsl"
+layout(set = 0, binding = 26) uniform sampler2D g_SkyViewLUT;
+layout(set = 0, binding = 27) uniform sampler2D g_CloudShadowMap;
+
 // Step 4 (Virtual Texturing / RVT-SVT parity roadmap): see ClusterResolve.comp's own identical
 // include block comment -- this binned/Release path needs the exact same material-detail sampling
 // as the full-screen/Debug path.
@@ -283,6 +290,10 @@ void main() {
     float diff = max(dot(normal, lightDir), 0.0);
     // Phase 3: shadow visibility -- see ClusterResolve.comp's own identical comment.
     float sunVisibility = (diff > 0.0) ? SampleSunShadowVSM(worldPos) : 1.0;
+    // Atmos weather system, Subtask 5: modulate by cloud shadow transmittance (renderer::
+    // AtmosCloudsPass's own Cloud Shadow Map, sampled by world XZ -- see
+    // AtmosCloudShadowUVFromWorldXZ's own comment for the shared world-to-UV mapping).
+    sunVisibility *= texture(g_CloudShadowMap, AtmosCloudShadowUVFromWorldXZ(worldPos.xz)).r;
     // Substrate integration: the view direction EvaluateSubstrateMaterial's specular/Fresnel
     // terms need -- see this file's own ResolveViewParamsUBO.cameraPositionWorld comment.
     vec3 viewDir = normalize(g_ViewParams.cameraPositionWorld - worldPos);
@@ -319,14 +330,20 @@ void main() {
     // ClusterResolve.comp's own identical Step 3 comment for the full rationale, including the
     // 2026-07-17 real-photometric-lighting recalibration (EvaluateSubstrateMaterial's own contract
     // is "caller multiplies by the light's real color/intensity" -- its diffuse lobe already bakes
-    // in the /PI Lambertian normalization). kAmbientFraction stays a plain diffuseAlbedo tint,
-    // matching ClusterResolve.comp's own simplification (no single light direction for a BRDF to
-    // respond to).
-    const float kAmbientFraction = 0.05;
+    // in the /PI Lambertian normalization).
+    //
+    // Atmos weather system, Subtask 5: the flat kAmbientFraction*sunRadiance hemispheric fill (this
+    // shader's only skylight approximation before this phase, per its own now-removed comment: "no
+    // separate skylight system yet") is replaced by a single Sky-View LUT sample in the surface
+    // normal's own direction -- a cheap one-tap stand-in for a full cosine-weighted hemisphere
+    // integral (this shader's per-pixel budget doesn't afford multiple LUT taps here), still a
+    // genuine improvement: it now varies with sky color/sun elevation/cloud cover instead of being a
+    // constant regardless of time of day or weather.
+    vec3 skyAmbient = texture(g_SkyViewLUT, SkyViewLUTUVFromDirection(normal, g_ViewParams.sunDirection)).rgb;
     vec3 sunRadiance = g_ViewParams.sunColor * g_ViewParams.sunIntensity;
     vec3 directResponse = EvaluateSubstrateMaterial(mat, normal, viewDir, lightDir);
     const float kEmissiveScale = 1500.0;
-    vec3 finalColor = mat.base.diffuseAlbedo * kAmbientFraction * sunRadiance
+    vec3 finalColor = mat.base.diffuseAlbedo * skyAmbient
         + directResponse * sunRadiance * sunVisibility
         + EvaluateSubstrateEmissive(mat) * kEmissiveScale;
 

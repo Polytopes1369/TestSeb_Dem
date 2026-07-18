@@ -22,8 +22,10 @@ namespace renderer {
             uint32_t sampleCount = 0;
             uint32_t frameIndex = 0;
             uint32_t traceMode = 0;
+            // Atmos weather system, Subtask 5.
+            float sunDirX = 0.0f, sunDirY = 0.0f, sunDirZ = 0.0f;
         };
-        static_assert(sizeof(GIInjectPushConstants) == 32,
+        static_assert(sizeof(GIInjectPushConstants) == 44,
             "GIInjectPushConstants must match SurfaceCacheGIInject.comp's push_constant block exactly");
 
     } // namespace
@@ -37,9 +39,10 @@ namespace renderer {
         m_Device = device;
 
         // =====================================================================================
-        // STEP 1 -- set 0's layout: the 9 bindings SurfaceCacheGIInject.comp declares.
+        // STEP 1 -- set 0's layout: the 10 bindings SurfaceCacheGIInject.comp declares (9 original
+        // + binding 9, Atmos weather system Subtask 5's g_SkyViewLUT).
         // =====================================================================================
-        VkDescriptorSetLayoutBinding bindings[9]{};
+        VkDescriptorSetLayoutBinding bindings[10]{};
         bindings[0].binding = 0;
         bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
         bindings[0].descriptorCount = 1;
@@ -60,15 +63,20 @@ namespace renderer {
             bindings[b].descriptorCount = 1;
             bindings[b].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
         }
+        // Atmos weather system, Subtask 5 -- see SetAtmosSkyView()'s own comment.
+        bindings[9].binding = 9;
+        bindings[9].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        bindings[9].descriptorCount = 1;
+        bindings[9].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
         VkDescriptorSetLayoutCreateInfo setLayoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-        setLayoutInfo.bindingCount = 9;
+        setLayoutInfo.bindingCount = 10;
         setLayoutInfo.pBindings = bindings;
         VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &setLayoutInfo, nullptr, &m_SetLayout));
 
         VkDescriptorPoolSize poolSizes[4] = {
             { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1 },
-            { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 4 },
+            { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 5 }, // + g_SkyViewLUT (Atmos Subtask 5).
             { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1 },
             { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3 }
         };
@@ -161,6 +169,14 @@ namespace renderer {
         return true;
     }
 
+    void SurfaceCacheGIInjectPass::SetAtmosSkyView(VkImageView skyViewLUTView, VkSampler skyViewLUTSampler) {
+        VkDescriptorImageInfo skyViewInfo{ skyViewLUTSampler, skyViewLUTView, VK_IMAGE_LAYOUT_GENERAL };
+        VkWriteDescriptorSet write{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+        write.dstSet = m_Set; write.dstBinding = 9; write.descriptorCount = 1;
+        write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; write.pImageInfo = &skyViewInfo;
+        vkUpdateDescriptorSets(m_Device, 1, &write, 0, nullptr);
+    }
+
     void SurfaceCacheGIInjectPass::Shutdown() {
         if (m_Device != VK_NULL_HANDLE) {
             if (m_Pipeline != VK_NULL_HANDLE) vkDestroyPipeline(m_Device, m_Pipeline, nullptr);
@@ -179,7 +195,7 @@ namespace renderer {
     }
 
     void SurfaceCacheGIInjectPass::RecordInject(VkCommandBuffer cmd, const SurfaceCacheTraceContext& traceContext,
-        const SurfaceCachePass& surfaceCache, uint32_t traceMode) {
+        const SurfaceCachePass& surfaceCache, uint32_t traceMode, const maths::vec3& sunDirectionWorld) {
         const std::vector<geometry::SurfaceCacheCardEntry>& cards = surfaceCache.GetCards();
         if (cards.empty()) {
             return;
@@ -215,6 +231,7 @@ namespace renderer {
             pc.sampleCount = kSampleCountPerTexel;
             pc.frameIndex = m_FrameIndex;
             pc.traceMode = traceMode;
+            pc.sunDirX = sunDirectionWorld.x; pc.sunDirY = sunDirectionWorld.y; pc.sunDirZ = sunDirectionWorld.z;
             vkCmdPushConstants(cmd, m_PipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
 
             const uint32_t groupCountX = (card.atlasSize[0] + kWorkgroupSize - 1u) / kWorkgroupSize;

@@ -49,8 +49,11 @@ namespace renderer {
             float viewportWidth = 0.0f, viewportHeight = 0.0f;
             float thicknessWorld = 0.5f;
             float intensity = 1.0f;
+            // Atmos weather system, Subtask 5.
+            float sunDirX = 0.0f, sunDirY = 0.0f, sunDirZ = 0.0f;
+            float _pad0 = 0.0f;
         };
-        static_assert(sizeof(SSRFallbackParamsUBO) == 160, "SSRFallbackParamsUBO must match SSRFallback.comp's SSRFallbackParamsUBO exactly (std140 layout)");
+        static_assert(sizeof(SSRFallbackParamsUBO) == 176, "SSRFallbackParamsUBO must match SSRFallback.comp's SSRFallbackParamsUBO exactly (std140 layout)");
 
         VkPipeline CreateComputePipeline(VkDevice device, VkPipelineLayout layout, const char* shaderPath) {
             VkShaderModule shaderModule = VulkanPipeline::LoadShaderModule(device, shaderPath);
@@ -188,22 +191,24 @@ namespace renderer {
         // g_GBufferRoughnessMetallic / g_GBufferAlbedo / g_HitMask / g_OutputColor (RMW) / UBO.
         // =====================================================================================
         {
-            VkDescriptorSetLayoutBinding bindings[7]{};
+            VkDescriptorSetLayoutBinding bindings[8]{};
             for (uint32_t b = 0; b <= 4; ++b) {
                 bindings[b] = { b, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
             }
             bindings[5] = { 5, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
             bindings[6] = { 6, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+            // Atmos weather system, Subtask 5 -- see SetAtmosSkyView()'s own comment.
+            bindings[7] = { 7, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
 
             VkDescriptorSetLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-            layoutInfo.bindingCount = 7;
+            layoutInfo.bindingCount = 8;
             layoutInfo.pBindings = bindings;
             VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &layoutInfo, nullptr, &m_SSRFallbackSetLayout));
 
-            VkDescriptorPoolSize poolSizes[2] = { { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 6 }, { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 } };
+            VkDescriptorPoolSize poolSizes[3] = { { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 6 }, { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 }, { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1 } };
             VkDescriptorPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
             poolInfo.maxSets = 1;
-            poolInfo.poolSizeCount = 2;
+            poolInfo.poolSizeCount = 3;
             poolInfo.pPoolSizes = poolSizes;
             VK_CHECK(vkCreateDescriptorPool(m_Device, &poolInfo, nullptr, &m_SSRFallbackDescriptorPool));
 
@@ -231,6 +236,12 @@ namespace renderer {
         }
 
         LOG_INFO(std::format("[ScreenSpaceEffectsPass] Initialized: {} x {} GTAO/Contact Shadows/SSR Fallback.", m_RenderExtent.width, m_RenderExtent.height));
+    }
+
+    void ScreenSpaceEffectsPass::SetAtmosSkyView(VkImageView skyViewLUTView, VkSampler skyViewLUTSampler) {
+        VkDescriptorImageInfo skyViewInfo{ skyViewLUTSampler, skyViewLUTView, VK_IMAGE_LAYOUT_GENERAL };
+        VkWriteDescriptorSet write{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_SSRFallbackSet, 7, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &skyViewInfo, nullptr, nullptr };
+        vkUpdateDescriptorSets(m_Device, 1, &write, 0, nullptr);
     }
 
     void ScreenSpaceEffectsPass::Shutdown() {
@@ -336,7 +347,7 @@ namespace renderer {
     }
 
     void ScreenSpaceEffectsPass::RecordSSRFallback(VkCommandBuffer cmd, const maths::mat4& viewProj,
-        const maths::vec3& cameraPositionWorld, const Settings& settings) {
+        const maths::vec3& cameraPositionWorld, const maths::vec3& sunDirectionWorld, const Settings& settings) {
         SSRFallbackParamsUBO ubo{};
         ubo.invViewProj = viewProj.Inverse();
         ubo.viewProj = viewProj;
@@ -348,6 +359,7 @@ namespace renderer {
         ubo.viewportHeight = static_cast<float>(m_RenderExtent.height);
         ubo.thicknessWorld = settings.ssrFallbackThicknessWorld;
         ubo.intensity = settings.ssrFallbackIntensity;
+        ubo.sunDirX = sunDirectionWorld.x; ubo.sunDirY = sunDirectionWorld.y; ubo.sunDirZ = sunDirectionWorld.z;
         vkCmdUpdateBuffer(cmd, m_SSRFallbackParamsBuffer.Handle(), 0, sizeof(ubo), &ubo);
 
         VulkanUtils::RecordMemoryBarrier(cmd,

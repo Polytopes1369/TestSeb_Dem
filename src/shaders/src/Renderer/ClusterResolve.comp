@@ -80,6 +80,16 @@
 #include "include/shadow_atlas_sampling.glsl"
 #include "include/shadow_sun_sampling.glsl"
 
+// Atmos weather system, Subtask 5: Sky-View LUT (ambient replacement) + Cloud Shadow Map (sun term
+// modulation) -- see ClusterResolveBinned.comp's own identical binding comment (this Debug-only
+// full-screen path needs the exact same 2 bindings as that always-live one, just at different
+// indices since its own binding numbering already differs -- see this file's own binding-list
+// comment at the top).
+#include "include/atmos_sky_lut_mapping.glsl"
+#include "include/atmos_clouds_density.glsl"
+layout(set = 0, binding = 27) uniform sampler2D g_SkyViewLUT;
+layout(set = 0, binding = 28) uniform sampler2D g_CloudShadowMap;
+
 // Step 4 (Virtual Texturing / RVT-SVT parity roadmap): terrain/decal material detail sampled from
 // renderer::VirtualTextureManager's page table + physical atlas, exactly like UE 5.8's Runtime
 // Virtual Texture material expression -- see this shader's own Step 3 material-evaluation comment
@@ -399,9 +409,13 @@ void main() {
         vec3 lightDir = normalize(-g_ViewParams.sunDirection);
         float diff = max(dot(normal, lightDir), 0.0);
         // Phase 3: shadow visibility for the sun, sampled from renderer::VirtualShadowMapPass's
-        // 3-level clipmap -- only the direct `diff` term is shadowed, not the ambient/fill term
-        // below (kAmbientFraction has no directional occluder to speak of).
+        // 3-level clipmap -- only the direct `diff` term is shadowed, not the sky-ambient term below
+        // (its own Sky-View LUT sample already encodes the physical sky, no separate occluder term
+        // needed on top of it).
         float sunVisibility = (diff > 0.0) ? SampleSunShadowVSM(worldPos) : 1.0;
+        // Atmos weather system, Subtask 5: cloud shadow modulation -- see ClusterResolveBinned.comp's
+        // own identical comment.
+        sunVisibility *= texture(g_CloudShadowMap, AtmosCloudShadowUVFromWorldXZ(worldPos.xz)).r;
         // Substrate integration: the view direction EvaluateSubstrateMaterial's specular/Fresnel
         // terms need -- see this file's own ResolveViewParamsUBO.cameraPositionWorld comment.
         vec3 viewDir = normalize(g_ViewParams.cameraPositionWorld - worldPos);
@@ -467,12 +481,12 @@ void main() {
         // real color/intensity" (substrate_bsdf.glsl's own comment; its diffuse lobe already bakes
         // in the /PI Lambertian normalization, the specular/fuzz lobes need none), so `directResponse
         // * sunRadiance` is already the correct, complete outgoing radiance -- no extra factor here.
-        // kAmbientFraction is a flat hemispheric sky/ambient fill (this engine has no separate
-        // skylight system yet) expressed as a fraction of the sun's own illuminance, so it scales
-        // consistently with whatever sun intensity is configured instead of being a fixed, unscaled
-        // constant; it has no single light direction for a BRDF to respond to, so it stays a plain
-        // diffuseAlbedo tint (unchanged from the pre-Substrate shader's own identical simplification).
-        const float kAmbientFraction = 0.05;
+        // Atmos weather system, Subtask 5: the flat kAmbientFraction*sunRadiance hemispheric fill
+        // (this shader's only skylight approximation before this phase) is replaced by a single
+        // Sky-View LUT sample in the surface normal's own direction -- see ClusterResolveBinned.
+        // comp's own identical comment for the full rationale (cheap one-tap stand-in for a full
+        // cosine-weighted hemisphere integral, still a genuine improvement over a flat constant).
+        vec3 skyAmbient = texture(g_SkyViewLUT, SkyViewLUTUVFromDirection(normal, g_ViewParams.sunDirection)).rgb;
         vec3 sunRadiance = g_ViewParams.sunColor * g_ViewParams.sunIntensity;
         vec3 directResponse = EvaluateSubstrateMaterial(mat, normal, viewDir, lightDir);
         // kEmissiveScale converts this codebase's existing artist-authored, unitless emissive
@@ -484,7 +498,7 @@ void main() {
         // 0.85-albedo diffuse surface under this engine's default sun -- i.e. still reads as
         // "glowing", not just "well lit".
         const float kEmissiveScale = 1500.0;
-        finalColor = mat.base.diffuseAlbedo * kAmbientFraction * sunRadiance
+        finalColor = mat.base.diffuseAlbedo * skyAmbient
             + directResponse * sunRadiance * sunVisibility
             + EvaluateSubstrateEmissive(mat) * kEmissiveScale;
 

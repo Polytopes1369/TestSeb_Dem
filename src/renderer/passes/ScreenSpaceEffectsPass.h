@@ -72,9 +72,15 @@ namespace renderer {
         void RecordContactShadows(VkCommandBuffer cmd, const maths::mat4& viewProj,
             const maths::vec3& cameraPositionWorld, const maths::vec3& sunDirection, const Settings& settings);
 
-        // Dispatches SSRFallback.comp.
+        // Atmos weather system, Subtask 5: binds renderer::AtmosSkyPass's Sky-View LUT into the SSR
+        // Fallback set's binding 7 -- must be called exactly once after both Init() and
+        // AtmosSkyPass's own Init(), before the first RecordSSRFallback() call.
+        void SetAtmosSkyView(VkImageView skyViewLUTView, VkSampler skyViewLUTSampler);
+
+        // Dispatches SSRFallback.comp. `sunDirectionWorld` (Atmos Subtask 5): fed to the Sky-View
+        // LUT sample used when even the screen-space march itself finds nothing.
         void RecordSSRFallback(VkCommandBuffer cmd, const maths::mat4& viewProj,
-            const maths::vec3& cameraPositionWorld, const Settings& settings);
+            const maths::vec3& cameraPositionWorld, const maths::vec3& sunDirectionWorld, const Settings& settings);
 
         VkImageView GetAOView() const { return m_AOView; }
 
