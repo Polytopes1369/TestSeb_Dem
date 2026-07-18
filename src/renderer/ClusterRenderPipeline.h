@@ -595,6 +595,40 @@ namespace renderer {
         bool RunPcgFullPipelineSmokeTest(const std::vector<PcgFullPipelineSmokeTestMeshDesc>& weightedMeshes,
             VkCommandPool commandPool, VkQueue queue);
 
+        // PCG roadmap Phase 6.3 ("Runtime Generator Hook", world::PcgCellLoader): proves the LIVE
+        // streaming-triggered path -- world::IWorldCellLoader::LoadCellFullDetail()/UnloadCell() ->
+        // pcg::GeneratePcgContentForCell() -> world::PcgCellLoader::Pump() ->
+        // pcg::PcgInstanceSpawnManager::SpawnInstances()/DespawnInstances() -- actually runs
+        // end-to-end, simulating exactly what world::StreamingManager would trigger from a worker
+        // thread, WITHOUT needing a real StreamingManager/CellManifest/camera. Reuses
+        // `weightedMeshes` for the same reason RunPcgFullPipelineSmokeTest() does (real, already-
+        // resident streaming archetype meshes as spawner palette content). Writes a real, throwaway
+        // PcgVolume .actor file + PcgGraph JSON asset to a scratch temp directory (mirrors
+        // tests/PcgCellGeneratorTests.cpp's own WriteGraphAssetToDisk pattern, and
+        // renderer::debug::PcgVolumeInspector::BuildSyntheticDemoVolumes' own "write a real graph
+        // asset to disk" precedent), then constructs a real world::PcgCellLoader against that
+        // directory and a throwaway PcgInstanceDrawPass/PcgInstanceSpawnManager pair (same "borrow
+        // this pipeline's already-resident m_PagePool" convention as RunPcgFullPipelineSmokeTest's
+        // own STEP 4). Verifies, via renderer::PcgInstanceDrawPass::GetLiveInstanceCount() (no pixel
+        // readback needed -- see this phase's own task brief, "log-based PASS/FAIL confirmation is
+        // sufficient"):
+        //   1. The volume index found exactly 1 volume, overlapping exactly the 1 cell it was
+        //      authored to overlap.
+        //   2. LoadCellFullDetail() + Pump() drives a real SpawnInstances() call that acquires
+        //      exactly the expected number of instances (the synthetic grid-points source node's own
+        //      deterministic point count).
+        //   3. LoadCellHlod() + Pump() is a documented no-op (live instance count unchanged) -- see
+        //      world::PcgCellLoader::LoadCellHlod()'s own header comment for why HLOD-tier PCG
+        //      generation is out of scope for this phase.
+        //   4. UnloadCell() + Pump() drives a real DespawnInstances() call that releases every
+        //      instance the cell's own generation had acquired (live instance count back to 0).
+        // Not fatal on failure (logged only), matching every other smoke test's own convention. Whole
+        // declaration + definition compiled out of Release, matching RunPcgFullPipelineSmokeTest's
+        // own convention -- world::PcgCellLoader itself is ALSO whole-file Debug-only (see that
+        // class' own header comment for why), so this smoke test is its only in-engine validation.
+        bool RunPcgCellLoaderSmokeTest(const std::vector<PcgFullPipelineSmokeTestMeshDesc>& weightedMeshes,
+            VkCommandPool commandPool, VkQueue queue);
+
         // PCG editor-tooling roadmap, Phase 7.2 ("PCG Point Cloud Debug Visualization"): last
         // point count RunPcgFullPipelineSmokeTest() uploaded into m_PcgPointCloudDebugView (its own
         // STEP 2 filter output -- see that method's own comment for exactly where). 0 before that
