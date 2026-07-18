@@ -632,7 +632,19 @@ int main(int argc, char** argv) {
     // radius from the origin as the old 12-primitive grid did, so this same framing still covers
     // the whole gallery on frame 0; from here on the player drives the camera directly (see the
     // Unreal-editor-style fly controller in the main loop below).
-    Camera camera({ 12.3613f, 6.5726f, 0.0f }, { 0.0f, 0.0f, 0.0f });
+    //
+    // Look-at target raised from the origin to (0, 4, 0) -- purely a pitch adjustment, same
+    // position/distance -- so the Atmos sky/cloud system (renderer::AtmosSkyPass/AtmosCloudsPass,
+    // both unconditionally composited by PostProcessComposite.comp's own !hitScene branch) is
+    // actually visible on launch. At the origin target, this camera's pitch was ~-28 degrees with
+    // a 45-degree vertical FOV (Camera::m_FovDegrees), so even the TOP of the frustum (-28 + 22.5 =
+    // -5.5 degrees) stayed below the horizon and the 300x300 procedural terrain
+    // (VulkanContext::GenerateTerrain) filled the entire frame -- the sky/clouds were fully wired
+    // and rendered every frame, just never actually on screen. Raising the target to y=4 shallows
+    // the pitch to ~-11.8 degrees, putting the top of the frustum at ~+10.7 degrees above the
+    // horizon -- enough open sky to read the Sky-View LUT gradient and cloud layer while the
+    // showcase gallery still fills the rest of the frame.
+    Camera camera({ 12.3613f, 6.5726f, 0.0f }, { 0.0f, 4.0f, 0.0f });
 
     // Phase 5 (Streaming & Monde roadmap, Part 1): the single LWC origin-tracking instance driving
     // every render-boundary rebase this frame (Camera::UpdateRebased/GetRebasedPosition for the
