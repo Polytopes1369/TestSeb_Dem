@@ -405,7 +405,27 @@ void main() {
     // integral (this shader's per-pixel budget doesn't afford multiple LUT taps here), still a
     // genuine improvement: it now varies with sky color/sun elevation/cloud cover instead of being a
     // constant regardless of time of day or weather.
-    vec3 skyAmbient = texture(g_SkyViewLUT, SkyViewLUTUVFromDirection(normal, g_ViewParams.sunDirection)).rgb;
+    //
+    // kSkyAmbientIntensityScale: the OLD kAmbientFraction dial named in the comment above (a fraction
+    // of sunRadiance, deliberately kept small so ambient never competed with direct sun) is GONE --
+    // replaced by this raw AtmosSkyLUTs.comp Sky-View LUT sample with no equivalent scale retained.
+    // That LUT is a real physically-based sky raymarch (Bruneton/Hillaire coefficients, see that
+    // shader's own header comment) fed the SAME real 10,000-lux pc.sunIlluminance the direct sun term
+    // above uses -- but with no analogous reduction to the direct term's own `/PI` Lambertian
+    // normalization (EvaluateSubstrateMaterial's own contract, see this file's Step 3 comment), so it
+    // lands on a comparable-or-greater raw magnitude. Applied here completely UNSHADOWED (no
+    // sunVisibility, no AO -- AO is not even computable yet at this G-buffer-resolve stage, it is
+    // produced from THIS pass' own depth/normal output later) and ADDED (not blended) to every pixel
+    // regardless of occlusion, this alone reproduces the near-white/low-contrast/grainy/green-tinted
+    // haze bug even with GI and both fog systems fully disabled -- confirmed via renderer::debug::
+    // DebugBufferViewPass's "Resolve: Direct Color" buffer (index 1, upstream of GI/fog/post-process
+    // entirely) still showing the bug at this camera position (see this fix's own commit message for
+    // the before/after screenshots). 0.1 restores a physically-reasonable "ambient skylight is a
+    // minority fraction of direct sun" balance (matching the old, removed kAmbientFraction's own
+    // documented intent) without removing the real, genuine improvement (sky-color/sun-elevation/
+    // cloud-cover-reactive ambient) this Sky-View LUT sample adds over the flat constant it replaced.
+    const float kSkyAmbientIntensityScale = 0.1;
+    vec3 skyAmbient = texture(g_SkyViewLUT, SkyViewLUTUVFromDirection(normal, g_ViewParams.sunDirection)).rgb * kSkyAmbientIntensityScale;
     vec3 sunRadiance = g_ViewParams.sunColor * g_ViewParams.sunIntensity;
     vec3 directResponse = EvaluateSubstrateMaterial(mat, normal, viewDir, lightDir);
     // Substrate Glint / sparkle (UE5.8 rendering-parity gap G5): additive discrete-flake specular on

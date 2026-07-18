@@ -567,7 +567,14 @@ void main() {
         // Sky-View LUT sample in the surface normal's own direction -- see ClusterResolveBinned.
         // comp's own identical comment for the full rationale (cheap one-tap stand-in for a full
         // cosine-weighted hemisphere integral, still a genuine improvement over a flat constant).
-        vec3 skyAmbient = texture(g_SkyViewLUT, SkyViewLUTUVFromDirection(normal, g_ViewParams.sunDirection)).rgb;
+        // See ClusterResolveBinned.comp's own kSkyAmbientIntensityScale comment for the full root-
+        // cause writeup: the old kAmbientFraction dial this replaced is GONE with no equivalent
+        // retained here, so this raw LUT sample was applied at its full, real-photometric-lux,
+        // UNSHADOWED magnitude to every pixel regardless of occlusion -- part of the near-white/
+        // low-contrast/grainy/green-tinted haze bug (confirmed present even in this pass' own raw
+        // output, upstream of GI/fog/post-process entirely).
+        const float kSkyAmbientIntensityScale = 0.1;
+        vec3 skyAmbient = texture(g_SkyViewLUT, SkyViewLUTUVFromDirection(normal, g_ViewParams.sunDirection)).rgb * kSkyAmbientIntensityScale;
         vec3 sunRadiance = g_ViewParams.sunColor * g_ViewParams.sunIntensity;
         vec3 directResponse = EvaluateSubstrateMaterial(mat, normal, viewDir, lightDir);
         // Substrate Glint / sparkle (UE5.8 rendering-parity gap G5): additive high-frequency discrete-

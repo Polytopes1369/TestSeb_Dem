@@ -272,6 +272,12 @@ vec3 ApplyVolumetricFog(vec3 color, vec2 uv, vec3 worldPos, bool hitScene) {
     float viewZ = hitScene ? dot(worldPos - g_Params.cameraPositionWorld, g_Params.cameraForward) : ATMOS_FOG_FAR_Z;
     float froxelW = ViewZToFroxelW(viewZ);
     vec4 fogSample = texture(g_VolumetricFog, vec3(uv, froxelW));
+    // fogSample.a (transmittance) empirically confirmed ~1.0 across this scene (diagnostic false-
+    // color pass during this bug's investigation, see this fix's own commit message) -- the froxel
+    // grid's own extinction never gets thick enough here to meaningfully occlude the scene, so no
+    // floor/cap on it is needed (unlike the sibling analytic ApplyHeightFog's own fogMaxOpacity,
+    // which genuinely does saturate). fogSample.rgb (in-scattered light) is the entire bug instead --
+    // see ATMOS_FOG_INSCATTER_INTENSITY_SCALE in AtmosVolumetricFog.comp's own InjectLight.
     return color * fogSample.a + fogSample.rgb;
 }
 

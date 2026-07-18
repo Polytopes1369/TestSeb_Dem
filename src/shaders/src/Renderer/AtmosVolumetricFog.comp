@@ -173,6 +173,20 @@ float AtmosFogFbm(vec3 p) {
 const float ATMOS_FOG_HEIGHT_FALLOFF = 0.15;
 const float ATMOS_FOG_ALBEDO = 0.9; // Aerosol fog: mostly-scattering, little absorption.
 
+// g_AtmosGlobals.fogDensityTarget is a [0,1] NORMALIZED "how much fog" dial -- see EngineConfig.h's
+// own `config::atmos::FOG_DENSITY_TARGET` comment ("[0,1]") and AtmosClimatePass.cpp's
+// `std::clamp(..., 0.0f, 1.0f)` on every value that ever feeds this same UBO field -- never a raw
+// per-world-unit extinction coefficient in its own right. This constant is what converts that
+// normalized dial into one, chosen to match renderer::PostProcessPass::Settings' own already-tuned
+// analytic Exponential Height Fog (postprocess::FOG_DENSITY = 0.02 world^-1) at the dial's current
+// default (0.1 * 0.2 = 0.02) -- the same "agree with the sibling analytic fog" intent
+// ATMOS_FOG_HEIGHT_FALLOFF above already states for the vertical falloff SHAPE, just missing for
+// density until now. Without this scale, fogDensityTarget was consumed AS IF it were already a real
+// coefficient (up to 1.0 world^-1 at the dial's own max, 50x this fog's now-correct ground-level
+// default) -- part of the near-white/low-contrast/grainy haze bug; see
+// ATMOS_FOG_INSCATTER_INTENSITY_SCALE below (InjectLight) for the other, larger part.
+const float ATMOS_FOG_MAX_DENSITY = 0.2;
+
 void InjectMediaProps(ivec3 coord) {
     vec3 worldPos = FroxelToWorld(coord);
 
@@ -189,7 +203,7 @@ void InjectMediaProps(ivec3 coord) {
     vec3 windPos = worldPos * 0.3 - g_AtmosGlobals.windDirection * g_AtmosGlobals.windSpeed * g_AtmosGlobals.time * 0.05;
     float noiseFactor = clamp(0.7 + AtmosFogFbm(windPos) * 0.6, 0.3, 1.5);
 
-    float density = max(g_AtmosGlobals.fogDensityTarget * heightFactor * condensationBoost * noiseFactor, 0.0);
+    float density = max(g_AtmosGlobals.fogDensityTarget * ATMOS_FOG_MAX_DENSITY * heightFactor * condensationBoost * noiseFactor, 0.0);
     float scatteringCoeff = density * ATMOS_FOG_ALBEDO;
     float extinctionCoeff = density;
 
@@ -218,6 +232,35 @@ void InjectMediaProps(ivec3 coord) {
 // per-shader weighting/trace functions rather than force a shared abstraction" convention (see
 // megalights_ris.glsl's own header comment).
 const uint kVolumeLightCandidateCount = 16u;
+
+// Calibrates this froxel fog's total in-scattered radiance (sun + point + local-volume contributions
+// below) against the engine's real-photometric-lux sun (renderer::LightingTypes.h's own
+// DirectionalLight::intensity = 10,000 lux, "2026-07-17 recalibration" -- see that struct's own
+// comment). Direct surface lighting was updated in lockstep with that recalibration (every direct-lit
+// shader now computes `illuminance * albedo / PI`, see LightingTypes.h), but this in-scatter formula
+// (scatteringCoeff * phase * sunIlluminance, a standard physically-based volumetric-scattering term --
+// see HGPhase's own comment) was not: a normalized phase function integrates to 1 over the full
+// sphere (4*PI sr) rather than a Lambertian BRDF's PI-normalized hemisphere, so there is no equivalent
+// "/PI" this formula was ever missing -- multiplying real scattering coefficients (ATMOS_FOG_ALBEDO
+// times a world^-1 density, both O(1) or smaller) by phaseSun (which itself ranges up to ~1.5 for
+// ATMOS_FOG_PHASE_G's forward-scattering peak) by a real 10,000-lux sun simply produces in-scattered
+// radiance on the same order as (or larger than) directly-lit surfaces -- and unlike a surface's
+// direct term, this one is a raymarched INTEGRAL (AccumulateFog below) that keeps accumulating along
+// the whole view ray, so it saturates toward scatteringCoeff/extinctionCoeff * phase * sunIlluminance
+// in the optically-thick limit -- a ceiling INDEPENDENT of density (extinction cancels out), reached
+// within a few world units for the local, "blanket the whole gallery" Local Fog Volumes (G8,
+// config::localfog::VOLUMES, density up to 0.4 world^-1 for the waterfall-mist volume specifically)
+// regardless of ATMOS_FOG_MAX_DENSITY's own fix to the separate global-density dial above. Confirmed
+// empirically (renderer::debug::ScreenshotCapture-driven before/after comparison across several
+// tested values, see this fix's own commit): 0.08 (a first, more conservative guess) still
+// reproduced nearly the FULL haze bug on its own (isolated via a temporary false-color visualization
+// of fogSample.rgb alone); 0.005 matched a control render with this function's whole contribution
+// zeroed out in the tree/gallery zone, but the showcase zone's own denser (0.4) waterfall-mist local
+// volume was still visibly hazy at that scale in the --test-pipeline's own "08/09_radiosity_ssrt_on"
+// screenshots specifically. 0.001 is what clears that denser volume's own contribution down to a
+// comparably subtle level -- still a real, visible atmospheric/mist touch (this is a real feature,
+// not a bug to delete -- see local_fog_volumes.glsl's own header comment), not overwhelming the scene.
+const float ATMOS_FOG_INSCATTER_INTENSITY_SCALE = 0.001;
 
 float MegaLightVolumeWeight(MegaLight light, vec3 worldPos) {
     vec3 toLight = light.position - worldPos;
@@ -326,6 +369,13 @@ void InjectLight(ivec3 coord) {
         localContribution += volSun + volPoint;
     }
 
+    // See ATMOS_FOG_INSCATTER_INTENSITY_SCALE's own comment: calibrates the physically-derived
+    // sun/point/local in-scatter above against this engine's real-lux sun, applied AFTER every
+    // contribution is summed (uniformly tempers all three sources together) and BEFORE the
+    // debug-only bounds visualization below (which must stay at its own fixed, undimmed debug hues
+    // regardless of this scale -- it is a shape/extent overlay, not a lighting quantity).
+    vec3 inscatterTotal = (sunContribution + pointContribution + localContribution) * ATMOS_FOG_INSCATTER_INTENSITY_SCALE;
+
     // Debug-only bounds visualization: emit a bright, per-volume distinct color for every froxel
     // inside a local fog volume, so each volume's extent/shape reads clearly regardless of the
     // scene's own lighting. pc.debugVizBounds is forced 0 in Release (its ImGui toggle and the
@@ -335,12 +385,12 @@ void InjectLight(ivec3 coord) {
         for (uint i = 0u; i < pc.localFogVolumeCount; ++i) {
             if (EvaluateLocalFogVolumeDensity(g_LocalFogVolumes.volumes[i], worldPos) > 0.0) {
                 vec3 hue = 0.5 + 0.5 * cos(vec3(0.0, 2.09439510, 4.18879020) + float(i) * 1.7);
-                localContribution += hue * 6.0;
+                inscatterTotal += hue * 6.0;
             }
         }
     }
 
-    imageStore(g_RawLightStorage, coord, vec4(sunContribution + pointContribution + localContribution, 0.0));
+    imageStore(g_RawLightStorage, coord, vec4(inscatterTotal, 0.0));
 }
 
 // --- mode 2: AccumulateFog -----------------------------------------------------------------------
