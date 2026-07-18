@@ -1568,12 +1568,19 @@ void ClusterRenderPipeline::RecordFrameEarly(VkCommandBuffer cmdEarly,
 
 
   // SWRT/HWRT back-end shared by m_GIInject ([1z] below) and m_WorldProbes' own trace pass ([12c]
-  // in RecordFrameLate) -- debug-only toggle (main.cpp's 'T' key via SetDebugTraceMode), Release
-  // always uses HWRT (no debug toggle to switch back to SWRT).
+  // in RecordFrameLate). Base mode comes from config::lumen::_HARDWARE_RAYTRACING (per-tier: Low
+  // defaults to false/SWRT -- see EngineConfig_Low.h's own HARDWARE_RAYTRACING comment, weaker
+  // hardware trades GI quality for the cheaper sphere-traced Mesh SDF path -- every other tier
+  // defaults to true/HWRT). Debug additionally lets 'T'/'Y' (main.cpp) override this LIVE for A/B
+  // comparison via m_DebugTraceMode -- main.cpp seeds that toggle's own starting value from this
+  // same cvar once at startup (see its own comment there), so a fresh session already reflects
+  // the active tier before either key is ever pressed. Release has no override, so it always
+  // honors the tier's choice exactly (previously hardcoded HWRT unconditionally here, silently
+  // ignoring every tier's own HARDWARE_RAYTRACING setting).
 #ifndef NDEBUG
   uint32_t traceMode = m_DebugTraceMode;
 #else
-  uint32_t traceMode = 1u;
+  uint32_t traceMode = config::lumen::_HARDWARE_RAYTRACING ? 1u : 0u;
 #endif
 
   // Phase 2 (Lumen advanced roadmap): this frame's async-compute routing decision -- read by
@@ -1582,11 +1589,12 @@ void ClusterRenderPipeline::RecordFrameEarly(VkCommandBuffer cmdEarly,
   // this is now stored there instead of an outer-function-scope local. Forced OFF whenever
   // traceMode is SWRT (0): moving GIInject's SWRT path to the async queue would additionally need
   // ownership-transfer barriers for every per-entity Global SDF image it samples
-  // (TraceMeshSDFScene), which only the Debug SWRT toggle ever exercises -- not worth doubling the
-  // barrier surface for a debug-only configuration when Release always uses HWRT anyway (see
-  // SetDebugAsyncComputeEnabled's own header comment). The Debug toggle additionally gates it off
-  // entirely for staged bring-up (false = prove the CPU/struct plumbing alone with everything still
-  // graphics-queue-serialized; true = exercise the real cross-queue barrier design).
+  // (TraceMeshSDFScene) -- not worth doubling the barrier surface for a path only the Low tier's
+  // own config::lumen::_HARDWARE_RAYTRACING default (or the Debug 'T' key, on any tier) ever
+  // exercises, see SetDebugAsyncComputeEnabled's own header comment. The Debug toggle additionally
+  // gates it off entirely for staged bring-up (false = prove the CPU/struct plumbing alone with
+  // everything still graphics-queue-serialized; true = exercise the real cross-queue barrier
+  // design).
   bool useAsyncCompute = (traceMode == 1u);
 #ifndef NDEBUG
   useAsyncCompute = useAsyncCompute && m_DebugAsyncComputeEnabled;
