@@ -290,7 +290,40 @@ inline float SHARPEN_RADIUS_PIXELS = 1.0f;
 // Film Grain (animated, luminance-response-curved).
 inline float FILM_GRAIN_INTENSITY = 0.0f;
 inline float FILM_GRAIN_RESPONSE_MIDPOINT = 0.5f;
+
+// --- Real-time per-effect enable/disable toggles (ImGui "Post FX" tab, main.cpp) ---
+// Every effect below already has its own "strength" knob (an intensity/density/distance
+// parameter) whose zero value is mathematically equivalent to that effect being off -- see each
+// toggle's own call site in renderer::ClusterRenderPipeline::RecordFrame, which zeroes the
+// corresponding Settings field for one frame when its toggle is false rather than special-casing
+// every shader with a redundant enabled/disabled branch. Not wired into ApplyProfile() (these are
+// live debug/comparison switches, not a hardware-quality tier).
+inline bool BLOOM_ENABLED = true;
+inline bool CHROMATIC_ABERRATION_ENABLED = true;
+inline bool VIGNETTE_ENABLED = true;
+inline bool HEAT_DISTORTION_ENABLED = true;
+inline bool MOTION_BLUR_ENABLED = true;
+inline bool HEIGHT_FOG_ENABLED = true;
+inline bool GOD_RAYS_ENABLED = true;
+inline bool PANINI_ENABLED = true;
+inline bool SHARPEN_ENABLED = true;
+inline bool FILM_GRAIN_ENABLED = true;
+inline bool WHITE_BALANCE_ENABLED = true;
+inline bool COLOR_CORRECTION_ENABLED = true;
+inline bool DOF_ENABLED = true;
+inline bool AO_ENABLED = true;
+inline bool CONTACT_SHADOW_ENABLED = true;
+inline bool SSR_FALLBACK_ENABLED = true;
 } // namespace postprocess
+
+// Debug-only (ImGui "Buffer Viewer" tab, main.cpp) -- which intermediate GBuffer/GI buffer to
+// blit to the swapchain instead of the normal post-processed final image this frame. Index 0
+// ("Off") always means "show the real final composite" -- see
+// renderer::debug::DebugBufferViewPass and its call site in
+// renderer::ClusterRenderPipeline::RecordFrame for the actual list/ordering this indexes into.
+namespace debugview {
+inline int SELECTED_BUFFER_INDEX = 0;
+} // namespace debugview
 
 namespace volumetrics {
 inline uint32_t _TEXTURE_QUALITY = 4;

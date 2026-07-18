@@ -6,7 +6,12 @@
       "d:\\DemoScene\\DemoScene_Vulkan2026_BaseArchi\\DemoScene_2026-megalights-phase-a-worktree\\src\\renderer",
       "d:\\DemoScene\\DemoScene_Vulkan2026_BaseArchi\\DemoScene_2026-megalights-phase-a-worktree\\src\\shaders\\include",
       "d:\\DemoScene\\DemoScene_Vulkan2026_BaseArchi\\DemoScene_2026-megalights-phase-a-worktree\\src\\shaders\\src\\Renderer",
-      "d:\\DemoScene\\DemoScene_Vulkan2026_BaseArchi\\DemoScene_2026-megalights-phase-a-worktree\\src\\renderer\\passes"
+      "d:\\DemoScene\\DemoScene_Vulkan2026_BaseArchi\\DemoScene_2026-megalights-phase-a-worktree\\src\\renderer\\passes",
+      "d:\\DemoScene\\DemoScene_Vulkan2026_BaseArchi\\DemoScene_2026-nanite-cluster-grouping-worktree\\src\\renderer\\passes",
+      "d:\\DemoScene\\DemoScene_Vulkan2026_BaseArchi\\DemoScene_2026-nanite-cluster-grouping-worktree\\src\\shaders\\include",
+      "d:\\DemoScene\\DemoScene_Vulkan2026_BaseArchi\\DemoScene_2026-nanite-cluster-grouping-worktree\\src\\shaders\\src\\Culling",
+      "D:\\DemoScene\\DemoScene_Vulkan2026_BaseArchi\\DemoScene_2026-substrate-worktree\\src\\core",
+      "D:\\DemoScene\\DemoScene_Vulkan2026_BaseArchi\\DemoScene_2026-substrate-worktree"
     ]
   },
   "autoApprove": true,

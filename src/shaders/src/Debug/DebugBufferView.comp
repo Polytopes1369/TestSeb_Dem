@@ -1,0 +1,60 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+
+// Debug-only (see renderer::debug::DebugBufferViewPass's own class comment): a single generic
+// visualization shader for the ImGui "Buffer Viewer" dropdown. Rather than one dedicated pass per
+// candidate buffer, this reads ONE rebindable combined-image-sampler (the caller rewrites its
+// descriptor to whichever buffer view is currently selected, see DebugBufferViewPass::RecordView)
+// through a `visualizationMode` push constant that remaps that buffer's own raw texel encoding
+// into a displayable [0,1] RGB -- scalar buffers (depth/AO/roughness/hit-mask) as grayscale,
+// octahedral-encoded normals decoded and remapped from [-1,1] to [0,1], and HDR color buffers
+// exposure-normalized + ACES tonemapped (an untonemapped HDR buffer blitted directly would just
+// show as a mostly-white/clipped image). `sampler2D`, not `image2D`: this shader intentionally
+// uses UV-based sampling (not pixel-exact `imageLoad`) so ANY source resolution -- render-res
+// GBuffer, half-res Bloom mips, display-res composites -- maps correctly onto this pass' own fixed
+// output extent with an implicit bilinear resize, no per-buffer special-casing needed.
+
+#include "include/aces_tonemap.glsl"
+#include "include/octahedral.glsl"
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform sampler2D g_Source;
+layout(rgba8, set = 0, binding = 1) uniform writeonly image2D g_Output;
+
+layout(push_constant) uniform DebugBufferViewPC {
+    uint visualizationMode; // 0 = passthrough, 1 = grayscale, 2 = octahedral normal, 3 = HDR tonemap.
+} pc;
+
+const uint kModePassthrough = 0u;
+const uint kModeGrayscale = 1u;
+const uint kModeOctNormal = 2u;
+const uint kModeTonemap = 3u;
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 res = imageSize(g_Output);
+    if (pixel.x >= res.x || pixel.y >= res.y) {
+        return;
+    }
+
+    vec2 uv = (vec2(pixel) + 0.5) / vec2(res);
+    vec4 raw = texture(g_Source, uv);
+
+    vec3 color;
+    if (pc.visualizationMode == kModeGrayscale) {
+        color = vec3(raw.r);
+    } else if (pc.visualizationMode == kModeOctNormal) {
+        color = OctDecode(raw.rg) * 0.5 + 0.5;
+    } else if (pc.visualizationMode == kModeTonemap) {
+        // Fixed display-only exposure (this shader has no access to the real eye-adapted
+        // g_Exposure state, and doesn't need it -- this is a raw-signal debug view, not the final
+        // graded image): a flat 1.0 EV100 scale keeps mid-range HDR values visible without needing
+        // the full Physical Camera pipeline.
+        color = ACESFilmicTonemap(raw.rgb);
+    } else {
+        color = raw.rgb; // kModePassthrough: already display-ready (e.g. albedo).
+    }
+
+    imageStore(g_Output, pixel, vec4(clamp(color, 0.0, 1.0), 1.0));
+}

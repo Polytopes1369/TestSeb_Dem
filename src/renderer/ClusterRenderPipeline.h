@@ -108,6 +108,7 @@
 #include "renderer/passes/GICompositePass.h"
 #ifndef NDEBUG
 #include "renderer/debug/ClusterTriangleStatsPass.h"
+#include "renderer/debug/DebugBufferViewPass.h"
 #include "renderer/debug/DebugTextOverlay.h"
 #include "renderer/passes/SDFRayMarchPass.h"
 #endif
@@ -334,6 +335,13 @@ namespace renderer {
         // error path). Debug-only per CLAUDE.md's build-separation rule: this function's own file-
         // scope existence is guarded out of Release entirely, not merely skipped at runtime.
         void ValidateSplineBounds() const;
+
+        // Maps config::debugview::SELECTED_BUFFER_INDEX to one of this pipeline's own GBuffer/GI
+        // intermediate views (see the big index->buffer table in this method's own .cpp
+        // definition) and dispatches m_DebugBufferView with it -- backs the ImGui "Buffer Viewer"
+        // dropdown. Called at most once per frame, only when a buffer is actually selected (index
+        // != 0/"Off") -- see RecordFrame()'s own call site for exactly where.
+        void RecordDebugBufferView(VkCommandBuffer cmd);
 #endif
 
         VkDevice m_Device = VK_NULL_HANDLE;
@@ -639,6 +647,11 @@ namespace renderer {
         // like m_TriangleStats/m_DebugOverlay above. Only recorded (and only ever blitted to the
         // swapchain in place of m_Resolve's output) when camera.debugViewMode == DEBUG_VIEW_LUMEN.
         SDFRayMarchPass m_SDFRayMarch;
+
+        // Backs the ImGui "Buffer Viewer" dropdown -- see debug::DebugBufferViewPass's own class
+        // comment. Only dispatched (and only ever blitted to the swapchain in place of
+        // m_PostProcess's output) when config::debugview::SELECTED_BUFFER_INDEX != 0.
+        debug::DebugBufferViewPass m_DebugBufferView;
 #endif
     };
 
