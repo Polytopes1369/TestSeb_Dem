@@ -38,6 +38,8 @@ namespace renderer {
     class AtmosClimatePass;
     class GlobalSDFPass;
     class ClusterResolvePass;
+    class VirtualShadowMapPass;
+    class WorldProbeGridPass;
 
     // Byte-for-byte mirror of ParticleCommon.glsl's `Particle` struct -- 64 bytes, std430 (vec3
     // members are 16-byte aligned in std430, so the trailing scalar after each vec3 packs into the
@@ -65,10 +67,27 @@ namespace renderer {
 
         // Total particle-buffer capacity (both the alive and dead lists are sized to this, and the
         // dead-list is fully populated with indices 0..kMaxParticles-1 at Init() time -- see Init's
-        // own "seed the dead-list" comment). A mid-range GPU-particle budget for a single demoscene
-        // scene's worth of emitters (smoke/sparks/embers, Subtask 6) -- not tied to any hardware
-        // limit, just the working set this system's buffers are sized for.
-        static constexpr uint32_t kMaxParticles = 65536;
+        // own "seed the dead-list" comment). Must stay a power of two (ParticleSort.comp's bitonic
+        // network requirement, see that shader's own header comment).
+        //
+        // Subtask 6 finding (real bug, found only once RecordSimulate/RecordSort/RecordDraw were
+        // actually wired into RecordFrame and run every frame for the first time -- Init-time
+        // validation alone never dispatches these): the original value here, 65536, made
+        // RecordSort()'s 136 full-buffer bitonic compare-exchange dispatches (see that method's own
+        // comment) expensive enough, EVERY single frame, to blow past the Windows driver's TDR
+        // (Timeout Detection and Recovery) budget under Debug + validation-layer overhead, killing
+        // the device (VK_ERROR_DEVICE_LOST) partway through --test-pipeline. At
+        // config::particles::SPAWN_RATE_PER_SECOND's own default (200/s) and a ~2-4s particle
+        // lifetime, steady-state alive count is only a few hundred -- 65536 slots was ~100x more
+        // capacity than this demo's own single test emitter would ever actually use. Reduced to
+        // 4096 (2^12): still generous headroom over realistic steady-state counts, and cuts
+        // RecordSort()'s own dispatch count from 136 to 78 ((12*13)/2) with each dispatch covering
+        // 16x fewer workgroups -- resolved the hang. If a future scene needs a much larger particle
+        // budget, RecordSort's O(log2(N)^2) full-buffer network is the thing to replace first (a
+        // shared-memory local-merge bitonic sort, or an indirect dispatch sized to the actual
+        // aliveCount rounded up to the next power of two instead of always sorting the full fixed
+        // capacity), not just raising this constant back up.
+        static constexpr uint32_t kMaxParticles = 4096;
 
         // Allocates every buffer this pass owns (see this class' own header comment for the full
         // list) via `allocator`, seeds the dead-list with every index 0..kMaxParticles-1 and the
@@ -87,8 +106,18 @@ namespace renderer {
         // this pass draws onto the SAME color image and real depth-stencil attachment every other
         // forward pass (Hero/Water/TransparentForward) targets, not `resolvePass`'s own GBuffer
         // images (those are read-only inputs here, see GetOutputDepthView()'s own comment above).
+        // (Subtask 5) Also builds a THIRD render-pipeline set (set 3, "lighting"): `vsm`'s 4 Virtual
+        // Shadow Map resources (physical atlas + sampler, page table, feedback, sun clipmap levels --
+        // same 4-resource contract as renderer::TransparentForwardPass's own SetVirtualShadowMap, but
+        // taken directly as an Init() parameter here rather than a deferred setter, since
+        // ClusterRenderPipeline::Init() already has `vsm` fully ready by the time it reaches this
+        // call) and `worldProbes`' grid + a ONE-TIME-uploaded WorldProbeGridParamsUBO (mirrors
+        // TransparentForwardPass's own identical "static addressing" simplification -- the grid's
+        // toroidal recentering is not re-uploaded per frame here either, see that class' own Init()
+        // comment for why that limitation already exists elsewhere in this codebase).
         bool Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
             const AtmosClimatePass& atmosClimate, const GlobalSDFPass& globalSDF, const ClusterResolvePass& resolvePass,
+            const VirtualShadowMapPass& vsm, const WorldProbeGridPass& worldProbes,
             VkFormat colorFormat, VkFormat depthFormat);
 
         void Shutdown();
@@ -106,6 +135,18 @@ namespace renderer {
 
         VkBuffer GetIndirectDrawBufferHandle() const { return m_IndirectDrawBuffer.Handle(); }
         VkBuffer GetCounterBufferHandle() const { return m_CounterBuffer.Handle(); }
+
+#ifndef NDEBUG
+        // Debug-only observability (Subtask 6's own "GPU Particles: alive/max" HUD/ImGui readout):
+        // the alive-particle count as of the last completed GPU->CPU readback, 1-2 frames stale
+        // (RecordSort() copies CounterBuffer.aliveCount into a small host-visible buffer every call,
+        // with no fence-wait for that specific copy -- reading whatever bytes are currently there is
+        // the same "necessarily stale, purely observability" convention this codebase's own World
+        // Partition streaming overlay already accepts). Never compiled into Release -- per CLAUDE.md's
+        // stats-overlay exclusion rule, this whole accessor and its backing buffer exist only in
+        // Debug builds; RecordSort()'s own copy into that buffer is equally `#ifndef NDEBUG`-guarded.
+        uint32_t GetLastAliveCountApprox() const;
+#endif
 
         // Dispatches ParticleSimulation.comp in two passes against GetCurrentSet() (see that
         // shader's own header comment for the full spawn/update contract):
@@ -147,10 +188,11 @@ namespace renderer {
 
         // Dispatches ParticleSort.comp (see that shader's own header comment for the full InitKeys/
         // CompareExchange contract) against GetCurrentSet()'s particle state: one InitKeys pass,
-        // then the full O(log2(kMaxParticles)^2) bitonic compare-exchange network (136 dispatches
-        // for kMaxParticles == 65536), each followed by its own VkMemoryBarrier2 (global-memory
-        // bitonic sort has a genuine read-after-write dependency between every single step -- no
-        // shared-memory local-merge optimization exists yet, see ParticleSort.comp's own comment).
+        // then the full O(log2(kMaxParticles)^2) bitonic compare-exchange network (78 dispatches for
+        // kMaxParticles == 4096 -- see that constant's own comment on why it is NOT 65536), each
+        // followed by its own VkMemoryBarrier2 (global-memory bitonic sort has a genuine
+        // read-after-write dependency between every single step -- no shared-memory local-merge
+        // optimization exists yet, see ParticleSort.comp's own comment).
         // Finishes by copying CounterBuffer.aliveCount into the indirect-draw buffer's own
         // `instanceCount` field (a GPU-side vkCmdCopyBuffer, no CPU readback) so a future indirect
         // draw call (Subtask 4) always reflects this frame's real alive count with no extra work at
@@ -183,10 +225,23 @@ namespace renderer {
         // method's own comment) and after it (this call ends with vkCmdEndRendering and its own
         // color-attachment-to-whatever-the-caller-needs-next transition, same pattern as
         // TransparentForwardPass::RecordDraw's own trailing barrier).
+        // (Subtask 5) `sunDirectionWorld`/`sunColor`/`sunIntensity` feed the fragment shader's own
+        // shadowed-sun + indirect-diffuse combination (no BRDF/phase term -- a billboard has no real
+        // surface normal, see ParticleRender.frag's own header comment). `refractionOffsetView` is
+        // renderer::TransparentForwardPass::GetRefractionOffsetView() -- this pass becomes that
+        // image's first SECOND writer (bound with loadOp=LOAD at layout GENERAL the entire time, no
+        // extra barrier dance needed: it is already GENERAL by the time TransparentForwardPass's own
+        // RecordDraw finishes, see ParticleSystemPass.cpp's own comment, and dynamic rendering
+        // legally accepts GENERAL for any attachment use). `heatShimmerStrength` is a PER-DRAW-CALL
+        // toggle, not per-particle -- GpuParticle's already-merged 64-byte layout has no spare
+        // "isRefractive" flag, and a demoscene emitter is realistically one thermal "kind" or
+        // another (Subtask 6's ImGui panel will make this tunable per emitter).
         void RecordDraw(VkCommandBuffer cmd, VkImage colorImage, VkImageView colorView, VkImageView depthView,
-            VkExtent2D renderExtent, const maths::mat4& viewProj, const maths::vec3& cameraPositionWorld,
+            VkImageView refractionOffsetView, VkExtent2D renderExtent,
+            const maths::mat4& viewProj, const maths::vec3& cameraPositionWorld,
             const maths::vec3& cameraRightWorld, const maths::vec3& cameraUpWorld,
-            float softFadeDistanceWorld, float globalTimeSeconds);
+            const maths::vec3& sunDirectionWorld, const maths::vec3& sunColor, float sunIntensity,
+            float softFadeDistanceWorld, float heatShimmerStrength, float globalTimeSeconds);
 
     private:
         VkDevice m_Device = VK_NULL_HANDLE;
@@ -241,6 +296,13 @@ namespace renderer {
         VkPipelineLayout m_SortPipelineLayout = VK_NULL_HANDLE;
         VkPipeline m_SortPipeline = VK_NULL_HANDLE;
 
+#ifndef NDEBUG
+        // Subtask 6, Debug-only: see GetLastAliveCountApprox()'s own comment. 4 bytes, CPU_TO_GPU,
+        // persistently mapped -- RecordSort() vkCmdCopyBuffer's CounterBuffer.aliveCount into this
+        // every call, no fence-wait (deliberately stale-tolerant, observability only).
+        GpuBuffer m_AliveCountReadbackBuffer;
+#endif
+
         // Subtask 4 -- ParticleRender.vert/.frag's own set 2 (ParticleRenderParamsUBO + the sampled
         // GBuffer depth copy borrowed from `resolvePass`, see Init()'s own comment) plus the graphics
         // pipeline itself. Set 0/1 for this pipeline are m_SetLayout/m_SortSetLayout, REUSED
@@ -253,6 +315,15 @@ namespace renderer {
         VkDescriptorSet m_RenderSet = VK_NULL_HANDLE;
         VkPipelineLayout m_RenderPipelineLayout = VK_NULL_HANDLE;
         VkPipeline m_RenderPipeline = VK_NULL_HANDLE;
+
+        // Subtask 5 -- ParticleRender.frag's own set 3 ("lighting"): `vsm`'s 4 Virtual Shadow Map
+        // resources (borrowed, bound once, never re-written) + `worldProbes`' grid + a one-time-
+        // uploaded WorldProbeGridParamsUBO (see Init()'s own comment on why this is a static upload,
+        // not per-frame). Same one-time-bind convention as the Subtask 2 environment set.
+        GpuBuffer m_WorldProbeGridParamsBuffer; // WorldProbeGridParamsUBO, std140, GPU_ONLY, filled once at Init().
+        VkDescriptorSetLayout m_LightingSetLayout = VK_NULL_HANDLE;
+        VkDescriptorPool m_LightingDescriptorPool = VK_NULL_HANDLE;
+        VkDescriptorSet m_LightingSet = VK_NULL_HANDLE;
     };
 
 }

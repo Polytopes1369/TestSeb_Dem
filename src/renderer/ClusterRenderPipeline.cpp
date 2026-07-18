@@ -736,17 +736,18 @@ bool ClusterRenderPipeline::Init(
   }
 
   // GPU particle system (particle_system_integration_plan.md): buffer/descriptor-set skeleton
-  // (Subtask 1) + simulation (Subtask 2) + sort (Subtask 3) + billboard render (Subtask 4) pipelines
-  // -- see renderer::ParticleSystemPass's own class comment. Depends on m_AtmosClimate (wind) and
-  // m_GlobalSDF (collision clipmaps, both Init'd above at STEP 7) and m_Resolve (GBuffer depth copy
-  // for soft particles, Init'd far earlier at STEP 6) -- all three already ready by this point.
-  // colorFormat/depthFormat match TransparentForwardPass::Init's own call site immediately below:
-  // this pass draws onto the SAME m_GIComposite output image and real depth-stencil buffer every
-  // other forward pass targets. RecordSimulate/RecordSort/RecordDraw are all implemented but NOT yet
-  // called from RecordFrame (Subtask 6 wires that up), so this Init() has no RecordFrame ordering
-  // consequence yet.
+  // (Subtask 1) + simulation (Subtask 2) + sort (Subtask 3) + billboard render + Lumen/VSM lighting
+  // (Subtasks 4-5) pipelines -- see renderer::ParticleSystemPass's own class comment. Depends on
+  // m_AtmosClimate (wind), m_GlobalSDF (collision clipmaps, both Init'd above at STEP 7),
+  // m_Resolve (GBuffer depth copy for soft particles, Init'd far earlier at STEP 6),
+  // m_VirtualShadowMap (sun shadow, STEP 7) and m_WorldProbes (indirect diffuse, just above) -- all
+  // five already ready by this point. colorFormat/depthFormat match TransparentForwardPass::Init's
+  // own call site immediately below: this pass draws onto the SAME m_GIComposite output image and
+  // real depth-stencil buffer every other forward pass targets. RecordSimulate/RecordSort/
+  // RecordDraw are all implemented but NOT yet called from RecordFrame (Subtask 6 wires that up),
+  // so this Init() has no RecordFrame ordering consequence yet.
   if (!m_ParticleSystem.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
-                             m_AtmosClimate, m_GlobalSDF, m_Resolve,
+                             m_AtmosClimate, m_GlobalSDF, m_Resolve, m_VirtualShadowMap, m_WorldProbes,
                              GICompositePass::kOutputFormat, createInfo.depthFormat)) {
     LOG_ERROR("[ClusterRenderPipeline] Failed to initialize ParticleSystemPass.");
     return false;
@@ -1411,6 +1412,33 @@ void ClusterRenderPipeline::RecordFrameEarly(VkCommandBuffer cmdEarly,
     // queue (Feature 1's plan explicitly excludes it -- GIInject's HWRT path, the only mode ever
     // moved to async, does not sample the Global SDF at all).
     m_GlobalSDF.RecordUpdate(cmdEarly, cameraFrameInfo.position, entityTransformsCPU);
+
+    // 3b. GPU particle system, Subtask 6: simulate + sort this frame's particles. Must run after
+    // m_GlobalSDF's own update just above (ParticleSimulation.comp's collision response samples
+    // THIS frame's clipmap windows, see RecordSimulate's own comment) and after m_AtmosClimate's
+    // update earlier this frame (wind). Own dt tracking -- RecordFrameLate's own `deltaTimeSeconds`
+    // isn't computed until much later in the frame, see m_LastParticleFrameTimeSeconds' own
+    // declaration comment -- same clamp-against-stalls formula as that one.
+    {
+      float particleDeltaTimeSeconds = m_HasLastParticleFrameTime
+          ? (globalTimeSeconds - m_LastParticleFrameTimeSeconds) : (1.0f / 60.0f);
+      particleDeltaTimeSeconds = std::clamp(particleDeltaTimeSeconds, 0.0f, 0.25f);
+      m_LastParticleFrameTimeSeconds = globalTimeSeconds;
+      m_HasLastParticleFrameTime = true;
+
+      m_ParticleSpawnAccumulator += config::particles::SPAWN_RATE_PER_SECOND * particleDeltaTimeSeconds;
+      uint32_t particleSpawnCount = static_cast<uint32_t>(m_ParticleSpawnAccumulator);
+      m_ParticleSpawnAccumulator -= static_cast<float>(particleSpawnCount);
+
+      float particleEmitterPosition[3] = {
+          config::particles::EMITTER_POSITION_X, config::particles::EMITTER_POSITION_Y, config::particles::EMITTER_POSITION_Z };
+      m_ParticleSystem.RecordSimulate(cmdEarly, m_GlobalSDF, particleDeltaTimeSeconds, globalTimeSeconds,
+          particleEmitterPosition, particleSpawnCount);
+
+      float particleCameraPosition[3] = { cameraFrameInfo.position.x, cameraFrameInfo.position.y, cameraFrameInfo.position.z };
+      float particleCameraForward[3] = { cameraFrameInfo.forward.x, cameraFrameInfo.forward.y, cameraFrameInfo.forward.z };
+      m_ParticleSystem.RecordSort(cmdEarly, particleCameraPosition, particleCameraForward);
+    }
 
     // 4. Secondary-bounce injection into m_SurfaceCache's own radiance atlas + the TLAS refit that
     // must precede it (Phase 4 integration) -- `useAsyncCompute` (m_FrameScratch, see its own
@@ -2343,6 +2371,26 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
     m_WaterForward.RecordDraw(cmdLate, viewProj, cameraFrameInfo.position,
         transparentTargetImage, transparentTargetView, m_DepthImage, m_DepthImageView,
         m_RenderExtent, traceMode, m_FrameIndex, globalTimeSeconds, m_TraceContext);
+
+    // GPU particle system, Subtask 6: recorded LAST among the forward passes (even after
+    // m_WaterForward) -- particles are the plan doc's own "after opaque Nanite + transparent,
+    // before post-process" top layer. Draws onto the SAME transparentTargetImage/View + real depth
+    // buffer every forward pass above targets, and into m_TransparentForward's own shared
+    // heat-distortion image (see ParticleSystemPass::RecordDraw's own comment on why that's safe
+    // with no extra barrier). cameraRight/cameraUp are not tracked anywhere in CameraFrameInfo (see
+    // that struct's own field list) -- derived here via the same forward-cross-worldUp formula
+    // renderer::AtmosVolumetricFogPass::RecordUpdate/SDFRayMarchPass::RecordRayMarch already use.
+    {
+      const maths::vec3 worldUpHint{0.0f, 1.0f, 0.0f};
+      const maths::vec3 particleCameraRight = cameraFrameInfo.forward.Cross(worldUpHint).Normalize();
+      const maths::vec3 particleCameraUp = particleCameraRight.Cross(cameraFrameInfo.forward);
+      float particleHeatShimmerStrength = config::particles::HEAT_SHIMMER_ENABLED ? config::particles::HEAT_SHIMMER_STRENGTH : 0.0f;
+      m_ParticleSystem.RecordDraw(cmdLate, transparentTargetImage, transparentTargetView, m_DepthImageView,
+          m_TransparentForward.GetRefractionOffsetView(), m_RenderExtent,
+          viewProj, cameraFrameInfo.position, particleCameraRight, particleCameraUp,
+          m_SceneLights.sun.direction, m_SceneLights.sun.color, m_SceneLights.sun.intensity,
+          config::particles::SOFT_FADE_DISTANCE, particleHeatShimmerStrength, globalTimeSeconds);
+    }
   }
 
   // Phase 2 (Lumen advanced roadmap) fix, 2026-07-17: the old [1z2] hand-off block that used to
@@ -2579,7 +2627,8 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
 
     m_DebugOverlay.BuildFrameText(gpuMemUsedMB, pendingPageLoads, bytesPerSecond, hwTriangleCount, swTriangleCount,
         fps, static_cast<float>(m_RenderExtent.width), static_cast<float>(m_RenderExtent.height),
-        m_DebugRadiosityEnabled, m_DebugSSRTEnabled, traceMode, m_DebugWorldProbesEnabled);
+        m_DebugRadiosityEnabled, m_DebugSSRTEnabled, traceMode, m_DebugWorldProbesEnabled,
+        m_ParticleSystem.GetLastAliveCountApprox(), ParticleSystemPass::kMaxParticles);
 
     // Determine blitSourceImage early to draw HUD directly onto it -- m_PostProcess's own output
     // (not m_TAATSR's raw HDR buffer) in the normal path now, so the HUD's own colors (e.g. plain

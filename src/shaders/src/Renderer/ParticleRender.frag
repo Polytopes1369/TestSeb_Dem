@@ -1,8 +1,8 @@
 #version 460
 #extension GL_GOOGLE_include_directive : enable
 
-// Particle system Subtask 4 (see ParticleRender.vert's own header comment for the full billboard
-// contract this fragment shader receives). Two effects on top of the plain per-particle color:
+// Particle system Subtask 4+5 (see ParticleRender.vert's own header comment for the full billboard
+// contract this fragment shader receives). Effects on top of the plain per-particle color:
 //
 // --- Procedural sprite shape ---
 // This project has zero on-disk texture assets (CLAUDE.md's "no data in the .exe" constraint --
@@ -22,6 +22,25 @@
 // SSRFallback.comp's own ReconstructWorldPos) and fades on the resulting camera-space DISTANCE
 // difference, which stays physically meaningful (a fixed world-unit fade band) at every depth,
 // unlike a raw (and highly nonlinear, reversed-Z) NDC delta would.
+//
+// --- Subtask 5: sun (VSM-shadowed) + indirect diffuse (World Probe Grid) ---
+// A billboard has no real surface normal, so this is deliberately NOT a BRDF evaluation (no
+// NdotL/Henyey-Greenstein phase term -- the plan doc's own "simplified Lambertian" allowance) --
+// just the shadowed sun radiance plus indirect diffuse irradiance, both isotropic, added together
+// and modulating the particle's own albedo. Same VSM include block as TransparentForward.frag /
+// SurfaceCacheCapture.frag (shadow_page_table/feedback/atlas_sampling/sun_sampling.glsl); same
+// world_probe_sampling.glsl macro contract every other consumer (TransparentForward.frag,
+// HeroTessellation.frag) already uses.
+//
+// --- Subtask 5: heat-shimmer refraction ---
+// When g_Params.heatShimmerStrength > 0 (an emitter-level toggle -- see renderer::
+// ParticleSystemPass::RecordDraw's own comment for why this is per-draw-call, not per-particle:
+// GpuParticle's already-merged 64-byte layout has no spare "isRefractive" flag, and a demoscene
+// emitter is realistically one thermal "kind" or another, never a per-particle mix), writes a
+// small time-varying wobble into this pass' second color output -- renderer::
+// TransparentForwardPass's OWN shared g_RefractionOffset image (this codebase's first SECOND writer
+// of that image, see ParticleSystemPass::RecordDraw's own comment on why the load/store discipline
+// there matters), later read by PostProcessComposite.comp exactly like glass's own contribution.
 
 layout(std140, set = 2, binding = 0) uniform ParticleRenderParamsUBO {
     mat4 viewProj;
@@ -30,6 +49,9 @@ layout(std140, set = 2, binding = 0) uniform ParticleRenderParamsUBO {
     vec3 cameraRight; float _pad1;
     vec3 cameraUp; float _pad2;
     vec2 viewportSize; float softFadeDistance; float globalTime;
+    vec3 sunDirection; float sunIntensity; // sunDirection points FROM the light TOWARD the scene.
+    vec3 sunColor; float _pad3;
+    float heatShimmerStrength; float _pad4, _pad5, _pad6;
 } g_Params;
 
 // renderer::ClusterResolvePass::GetOutputDepthView() -- the SAMPLED GBuffer depth copy (R32_SFLOAT,
@@ -39,18 +61,43 @@ layout(std140, set = 2, binding = 0) uniform ParticleRenderParamsUBO {
 // sampled by the same draw's own fragment shader, hence needing this separate sampled copy).
 layout(set = 2, binding = 1) uniform sampler2D g_SceneDepth;
 
+#define SHADOW_PAGE_TABLE_SET 3
+#define SHADOW_PAGE_TABLE_BINDING 0
+#define SHADOW_FEEDBACK_SET 3
+#define SHADOW_FEEDBACK_BINDING 1
+#define SHADOW_ATLAS_SET 3
+#define SHADOW_ATLAS_BINDING 2
+#define SHADOW_SUN_LEVELS_SET 3
+#define SHADOW_SUN_LEVELS_BINDING 3
+#include "include/shadow_page_table.glsl"
+#include "include/shadow_feedback.glsl"
+#include "include/shadow_atlas_sampling.glsl"
+#include "include/shadow_sun_sampling.glsl"
+
+#define WORLD_PROBE_GRID_SET 3
+#define WORLD_PROBE_GRID_BINDING 4
+#define WORLD_PROBE_GRID_PARAMS_BINDING 5
+#include "include/world_probe_sampling.glsl"
+
 layout(location = 0) in vec3 inWorldPos;
 layout(location = 1) in vec2 inUV;
 layout(location = 2) in vec4 inColor;
 layout(location = 3) in float inNormalizedAge;
 
 layout(location = 0) out vec4 outColor;
+// renderer::TransparentForwardPass's own shared heat-distortion target -- see this file's own
+// header comment. Written every fragment (even when heatShimmerStrength == 0, in which case it is
+// simply (0,0) -- a plain overwrite, blendEnable=FALSE for this attachment, so an explicit zero is
+// required rather than "just don't write," which would leave whatever a PREVIOUS forward pass wrote
+// at this exact pixel untouched -- wrong, since a non-shimmering particle covering that pixel should
+// suppress any earlier distortion there, exactly like an opaque particle would).
+layout(location = 1) out vec2 outRefractionOffset;
 
 void main() {
     vec2 centered = inUV * 2.0 - 1.0;
     float shapeMask = smoothstep(1.0, 0.0, length(centered));
     if (shapeMask <= 0.0) {
-        discard; // Outside the sprite's soft circle -- skip the (otherwise wasted) depth reconstruction below.
+        discard; // Outside the sprite's soft circle -- skip the (otherwise wasted) work below.
     }
 
     vec2 screenUV = gl_FragCoord.xy / g_Params.viewportSize;
@@ -74,5 +121,23 @@ void main() {
     float lifeFade = smoothstep(0.0, 0.2, inNormalizedAge);
 
     float alpha = inColor.a * shapeMask * softFade * lifeFade;
-    outColor = vec4(inColor.rgb, alpha);
+
+    // --- Sun (VSM-shadowed) + indirect diffuse (World Probe Grid) -- see this file's own header
+    // comment for why there is no NdotL/phase-function term. A small constant floor keeps a
+    // particle sitting in full shadow with no probe coverage nearby from going pure black. ---
+    float sunVisibility = SampleSunShadowVSM(inWorldPos);
+    vec3 sunRadiance = g_Params.sunColor * g_Params.sunIntensity * sunVisibility;
+    vec3 indirectDiffuse = SampleWorldProbeGrid(inWorldPos);
+    vec3 lighting = sunRadiance + indirectDiffuse + vec3(0.02);
+
+    outColor = vec4(inColor.rgb * lighting, alpha);
+
+    if (g_Params.heatShimmerStrength > 0.0) {
+        vec2 shimmer = vec2(
+            sin(g_Params.globalTime * 3.0 + inWorldPos.x * 5.0 + inWorldPos.z * 3.0),
+            cos(g_Params.globalTime * 2.7 + inWorldPos.z * 5.0 - inWorldPos.x * 3.0));
+        outRefractionOffset = shimmer * g_Params.heatShimmerStrength * shapeMask * alpha;
+    } else {
+        outRefractionOffset = vec2(0.0);
+    }
 }

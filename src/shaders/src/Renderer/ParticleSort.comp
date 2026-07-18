@@ -22,13 +22,14 @@
 // One bitonic-sort compare-exchange STEP of the classic iterative network (Batcher's algorithm,
 // stage size `pc.stageSize` == k, pass size `pc.passSize` == j in the textbook k/j notation) over
 // the FULL kMaxParticles-length SortedPairsBuffer -- NOT just the alive prefix, since bitonic sort
-// requires a power-of-two element count and kMaxParticles (65536) already is one, while aliveCount
-// changes every frame and is not. This is why mode == 0 pads every unused slot with a sentinel: the
-// full buffer is unconditionally sortable, and after every (k, j) pair has run once (renderer::
-// ParticleSystemPass::RecordSort dispatches ceil(log2(kMaxParticles) * (log2(kMaxParticles)+1) / 2)
-// = 136 CompareExchange calls, one VkMemoryBarrier2 after each -- global-memory bitonic sort has a
-// true read-after-write dependency between every single step, this codebase does not yet have a
-// shared-memory local-merge optimization for the early stages), SortedPairsBuffer[0..aliveCount)
+// requires a power-of-two element count and kMaxParticles (4096, see renderer::ParticleSystemPass's
+// own comment on why not the originally-larger 65536) already is one, while aliveCount changes every
+// frame and is not. This is why mode == 0 pads every unused slot with a sentinel: the full buffer is
+// unconditionally sortable, and after every (k, j) pair has run once (renderer::ParticleSystemPass::
+// RecordSort dispatches ceil(log2(kMaxParticles) * (log2(kMaxParticles)+1) / 2) = 78 CompareExchange
+// calls, one VkMemoryBarrier2 after each -- global-memory bitonic sort has a true read-after-write
+// dependency between every single step, this codebase does not yet have a shared-memory local-merge
+// optimization for the early stages), SortedPairsBuffer[0..aliveCount)
 // holds exactly the alive particles, in back-to-front order, ready for Subtask 4's vertex shader to
 // index via gl_InstanceIndex. The comparison operators below are the MIRROR of the textbook
 // ascending-bitonic-sort network (`<` where the reference uses `>` and vice versa) specifically to
