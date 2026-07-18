@@ -307,6 +307,28 @@ add_executable(PcgSelfPruningFilterTests
 target_include_directories(PcgSelfPruningFilterTests PRIVATE src ${Vulkan_INCLUDE_DIRS})
 add_test(NAME PcgSelfPruningFilterTests COMMAND PcgSelfPruningFilterTests)
 
+# PCG framework roadmap, Phase 8.1 ("Biome Rule Asset" -- first/root subtask of Phase 8,
+# Biome/Ecosystem): PcgBiomeRules.cpp is pure composition/orchestration over all four Phase 3
+# filter files (density/transform, slope/height, boolean set ops, self-pruning), so this target
+# links every one of their .cpp files plus their own transitive dependencies (PcgTerrainSampler.cpp
+# for the Slope Filter's terrain-batch overload/Projection; PcgSplineSampler.cpp for Boolean Set
+# Ops' DifferenceFromSpline arc-length table, an unresolved external symbol at link time even though
+# PcgBiomeRules.cpp itself never calls that specific function) -- exactly the same per-file link-time
+# dependency set PcgSlopeHeightFilterTests/PcgBooleanSetOpsTests above already establish individually,
+# just unioned together here since this target links all four filter files at once.
+add_executable(PcgBiomeRulesTests
+    src/pcg/PcgBiomeRules.cpp
+    src/pcg/PcgDensityTransformFilter.cpp
+    src/pcg/PcgSlopeHeightFilter.cpp
+    src/pcg/PcgTerrainSampler.cpp
+    src/pcg/PcgBooleanSetOps.cpp
+    src/pcg/PcgSplineSampler.cpp
+    src/pcg/PcgSelfPruningFilter.cpp
+    tests/PcgBiomeRulesTests.cpp
+)
+target_include_directories(PcgBiomeRulesTests PRIVATE src ${Vulkan_INCLUDE_DIRS})
+add_test(NAME PcgBiomeRulesTests COMMAND PcgBiomeRulesTests)
+
 # PCG framework roadmap, Phase 5.1+5.2 ("PCG Graph Engine Core"): the node/link graph data model +
 # JSON serialization (src/pcg/PcgGraph.cpp) and the CPU topological evaluator + subgraph support
 # (src/pcg/PcgGraphEvaluator.cpp), built directly on Phase 1's data model. PcgGraph.cpp reuses
