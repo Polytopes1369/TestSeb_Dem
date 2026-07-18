@@ -1,0 +1,321 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+
+// Atmos weather system, Subtask 4 (atmos_integration_plan.md): Procedural Volumetric Clouds.
+// Three entry points in one file, selected by `pc.mode` (same convention AtmosSkyLUTs.comp /
+// AtmosVolumetricFog.comp already establish):
+//
+//   mode == 0 (GenerateShapeNoise, 128^3, once at Init): low-frequency Perlin FBM eroded by
+//     inverted Worley FBM via a Remap() -- the classic Schneider/Horizon-Zero-Dawn "billowy" base
+//     cloud shape (see ShapeNoiseValue()'s own comment).
+//   mode == 1 (GenerateDetailNoise, 32^3, once at Init): pure high-frequency Worley FBM, used to
+//     carve wispy erosion detail into the base shape near cloud edges.
+//   mode == 2 (RaymarchClouds, half-res, every frame): marches through a spherical shell (the same
+//     planet-local frame renderer::AtmosSkyPass's own LUT generation uses -- kGroundRadiusKm,
+//     camera fixed at kCameraHeightAboveGroundKm) between the cloud layer's inner/outer radii,
+//     sampling density (height gradient x shape noise x coverage from AtmosGlobalsUBO, eroded by
+//     detail noise, wind-scrolled), and for each in-cloud sample marches kLightSteps steps toward
+//     the sun accumulating optical depth for a Beer-Powder shaded, dual-lobe Henyey-Greenstein-
+//     weighted in-scattering estimate -- see atmos_integration_plan.md Subtask 4's own formulas.
+
+#include "include/math_utils.glsl"
+
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+
+layout(r8, set = 0, binding = 0) uniform writeonly image3D g_ShapeNoiseStorage;
+layout(set = 0, binding = 1) uniform sampler3D g_ShapeNoiseSampler;
+layout(r8, set = 0, binding = 2) uniform writeonly image3D g_DetailNoiseStorage;
+layout(set = 0, binding = 3) uniform sampler3D g_DetailNoiseSampler;
+layout(rgba16f, set = 0, binding = 4) uniform writeonly image2D g_CloudOutputStorage;
+
+// std140 mirror of AtmosClimatePass.cpp's AtmosGlobalsUBO -- see AtmosNoiseCommon.glsl's own header
+// comment for the authoritative field-by-field layout this must match.
+layout(std140, set = 0, binding = 5) uniform AtmosGlobalsUBO {
+    vec3 windDirection; float windSpeed;
+    float temperature, humidity, dewPoint, condensationLCL;
+    float cloudDensityTarget, fogDensityTarget, rainStrength, time;
+    vec4 windTurbulenceParams;
+} g_AtmosGlobals;
+
+layout(push_constant) uniform AtmosCloudsPC {
+    int mode;
+    int outputWidth;
+    int outputHeight;
+    float cameraPositionX, cameraPositionY, cameraPositionZ;
+    float cameraForwardX, cameraForwardY, cameraForwardZ;
+    float cameraRightX, cameraRightY, cameraRightZ;
+    float cameraUpX, cameraUpY, cameraUpZ;
+    float tanHalfFovY;
+    float aspectRatio;
+    float sunDirX, sunDirY, sunDirZ;
+    float sunColorR, sunColorG, sunColorB;
+    float sunIlluminance;
+} pc;
+
+vec3 GetCameraPosition() { return vec3(pc.cameraPositionX, pc.cameraPositionY, pc.cameraPositionZ); }
+vec3 GetCameraForward() { return vec3(pc.cameraForwardX, pc.cameraForwardY, pc.cameraForwardZ); }
+vec3 GetCameraRight() { return vec3(pc.cameraRightX, pc.cameraRightY, pc.cameraRightZ); }
+vec3 GetCameraUp() { return vec3(pc.cameraUpX, pc.cameraUpY, pc.cameraUpZ); }
+vec3 GetSunDirection() { return vec3(pc.sunDirX, pc.sunDirY, pc.sunDirZ); }
+vec3 GetSunColor() { return vec3(pc.sunColorR, pc.sunColorG, pc.sunColorB); }
+
+// --- Planet-local frame -- deliberately SHARED with AtmosSkyLUTs.comp's own constants (same
+// kGroundRadiusKm, same fixed camera altitude) rather than the plan doc's own slightly different
+// literal figures, so the cloud layer and the physical sky agree on what "the ground" and "the
+// camera's height in the atmosphere" mean -- see renderer::AtmosCloudsPass.h's own header comment. ---
+const float ATMOS_CLOUDS_GROUND_RADIUS_KM = 6360.0;
+const float ATMOS_CLOUDS_CAMERA_HEIGHT_KM = 0.5;
+const float ATMOS_CLOUDS_INNER_RADIUS_KM = ATMOS_CLOUDS_GROUND_RADIUS_KM + 1.5;
+const float ATMOS_CLOUDS_OUTER_RADIUS_KM = ATMOS_CLOUDS_GROUND_RADIUS_KM + 4.5;
+const float ATMOS_CLOUDS_PI = 3.14159265358979323846;
+
+// Must match renderer::AtmosCloudsPass::kShapeNoiseResolution/kDetailNoiseResolution exactly.
+const int ATMOS_CLOUDS_SHAPE_RES = 128;
+const int ATMOS_CLOUDS_DETAIL_RES = 32;
+
+bool RaySphereIntersect(vec3 ro, vec3 rd, float radius, out float t0, out float t1) {
+    float b = dot(ro, rd);
+    float c = dot(ro, ro) - radius * radius;
+    float discriminant = b * b - c;
+    if (discriminant < 0.0) {
+        t0 = t1 = -1.0;
+        return false;
+    }
+    float sq = sqrt(discriminant);
+    t0 = -b - sq;
+    t1 = -b + sq;
+    return t1 >= 0.0;
+}
+
+float Remap(float value, float low1, float high1, float low2, float high2) {
+    return low2 + (value - low1) * (high2 - low2) / max(high1 - low1, 1.0e-5);
+}
+
+// --- Tiling noise primitives (both wrap via mod(cell, freq), so `freq` MUST be an integer number
+// of cells for a seamless repeat -- callers only ever pass integer literals/multiples). ---
+
+vec3 CloudHash33(vec3 p) {
+    p = vec3(dot(p, vec3(127.1, 311.7, 74.7)),
+             dot(p, vec3(269.5, 183.3, 246.1)),
+             dot(p, vec3(113.5, 271.9, 124.6)));
+    return fract(sin(p) * 43758.5453123);
+}
+
+float TilingValueNoise3D(vec3 p, float freq) {
+    vec3 scaled = p * freq;
+    vec3 i = floor(scaled);
+    vec3 f = fract(scaled);
+    vec3 u = f * f * (3.0 - 2.0 * f);
+
+    float n000 = CloudHash33(mod(i + vec3(0, 0, 0), freq)).x;
+    float n100 = CloudHash33(mod(i + vec3(1, 0, 0), freq)).x;
+    float n010 = CloudHash33(mod(i + vec3(0, 1, 0), freq)).x;
+    float n110 = CloudHash33(mod(i + vec3(1, 1, 0), freq)).x;
+    float n001 = CloudHash33(mod(i + vec3(0, 0, 1), freq)).x;
+    float n101 = CloudHash33(mod(i + vec3(1, 0, 1), freq)).x;
+    float n011 = CloudHash33(mod(i + vec3(0, 1, 1), freq)).x;
+    float n111 = CloudHash33(mod(i + vec3(1, 1, 1), freq)).x;
+
+    float nx00 = mix(n000, n100, u.x), nx10 = mix(n010, n110, u.x);
+    float nx01 = mix(n001, n101, u.x), nx11 = mix(n011, n111, u.x);
+    return mix(mix(nx00, nx10, u.y), mix(nx01, nx11, u.y), u.z);
+}
+
+float TilingWorleyNoise3D(vec3 p, float freq) {
+    vec3 scaled = p * freq;
+    vec3 baseCell = floor(scaled);
+    vec3 f = fract(scaled);
+
+    float minDistSq = 1.0e6;
+    for (int z = -1; z <= 1; ++z) {
+        for (int y = -1; y <= 1; ++y) {
+            for (int x = -1; x <= 1; ++x) {
+                vec3 offset = vec3(x, y, z);
+                vec3 cell = mod(baseCell + offset, freq);
+                vec3 featurePoint = offset + CloudHash33(cell) - f;
+                minDistSq = min(minDistSq, dot(featurePoint, featurePoint));
+            }
+        }
+    }
+    return clamp(sqrt(minDistSq), 0.0, 1.0);
+}
+
+float PerlinFbm3D(vec3 p, float baseFreq) {
+    float sum = 0.0;
+    sum += TilingValueNoise3D(p, baseFreq) * 0.571;
+    sum += TilingValueNoise3D(p, baseFreq * 2.0) * 0.286;
+    sum += TilingValueNoise3D(p, baseFreq * 4.0) * 0.143;
+    return sum;
+}
+
+float WorleyFbm3D(vec3 p, float baseFreq) {
+    float sum = 0.0;
+    sum += TilingWorleyNoise3D(p, baseFreq) * 0.625;
+    sum += TilingWorleyNoise3D(p, baseFreq * 2.0) * 0.25;
+    sum += TilingWorleyNoise3D(p, baseFreq * 4.0) * 0.125;
+    return sum;
+}
+
+// --- mode 0 / 1: noise texture generation (once, at Init) ------------------------------------------
+
+// Schneider/Horizon-Zero-Dawn "Perlin-Worley" combination: inverted Worley FBM acts as an erosion
+// mask that carves billowy cauliflower-like edges into the softer, low-frequency Perlin FBM base --
+// far more cloud-like than either noise alone.
+void GenerateShapeNoise(ivec3 coord) {
+    vec3 p = (vec3(coord) + 0.5) / float(ATMOS_CLOUDS_SHAPE_RES);
+    float perlin = PerlinFbm3D(p, 4.0);
+    float worley = WorleyFbm3D(p, 4.0);
+    float shape = clamp(Remap(perlin, worley * 0.5, 1.0, 0.0, 1.0), 0.0, 1.0);
+    imageStore(g_ShapeNoiseStorage, coord, vec4(shape, 0.0, 0.0, 0.0));
+}
+
+void GenerateDetailNoise(ivec3 coord) {
+    vec3 p = (vec3(coord) + 0.5) / float(ATMOS_CLOUDS_DETAIL_RES);
+    float detail = 1.0 - WorleyFbm3D(p, 3.0);
+    imageStore(g_DetailNoiseStorage, coord, vec4(detail, 0.0, 0.0, 0.0));
+}
+
+// --- mode 2: raymarch --------------------------------------------------------------------------
+
+// World-km -> repeating noise-UVW scale: chosen so the shape texture repeats roughly every 6km of
+// world space (detail every 1.5km, 4x finer -- matches the visual "large soft shape, small wispy
+// erosion" cloud look) -- tunable, not derived from any physical constant.
+const float ATMOS_CLOUDS_SHAPE_UV_SCALE = 1.0 / 6.0;
+const float ATMOS_CLOUDS_DETAIL_UV_SCALE = 1.0 / 1.5;
+const float ATMOS_CLOUDS_WIND_SCROLL_SCALE = 0.02; // km per (world wind-speed unit x time second).
+const float ATMOS_CLOUDS_EROSION_STRENGTH = 0.4;
+const float ATMOS_CLOUDS_EXTINCTION_SCALE = 1.2; // Per km, at density == 1.
+
+float SampleCloudDensity(vec3 pos) {
+    float radius = length(pos);
+    float heightFrac = clamp((radius - ATMOS_CLOUDS_INNER_RADIUS_KM) / (ATMOS_CLOUDS_OUTER_RADIUS_KM - ATMOS_CLOUDS_INNER_RADIUS_KM), 0.0, 1.0);
+    // Anvil-style vertical density gradient: thin at the base, full-bodied through the middle,
+    // tapering again near the top.
+    float heightGradient = smoothstep(0.0, 0.2, heightFrac) * (1.0 - smoothstep(0.6, 1.0, heightFrac));
+    if (heightGradient <= 0.0) {
+        return 0.0;
+    }
+
+    vec3 windOffset = g_AtmosGlobals.windDirection * g_AtmosGlobals.windSpeed * g_AtmosGlobals.time * ATMOS_CLOUDS_WIND_SCROLL_SCALE;
+
+    // Coverage ties Subtask 1's climate state into cloud volume (objective #2: "higher humidity
+    // increases cloud volume/thickness").
+    float coverage = clamp(g_AtmosGlobals.cloudDensityTarget * (0.5 + 0.5 * g_AtmosGlobals.humidity), 0.0, 1.0);
+
+    vec3 shapeUVW = (pos - windOffset) * ATMOS_CLOUDS_SHAPE_UV_SCALE;
+    float shape = texture(g_ShapeNoiseSampler, shapeUVW).r;
+    float baseDensity = clamp(Remap(shape * heightGradient, 1.0 - coverage, 1.0, 0.0, 1.0), 0.0, 1.0);
+    if (baseDensity <= 0.0) {
+        return 0.0;
+    }
+
+    vec3 detailUVW = (pos - windOffset * 1.5) * ATMOS_CLOUDS_DETAIL_UV_SCALE;
+    float detail = texture(g_DetailNoiseSampler, detailUVW).r;
+    float eroded = clamp(Remap(baseDensity, detail * ATMOS_CLOUDS_EROSION_STRENGTH, 1.0, 0.0, 1.0), 0.0, 1.0);
+    return eroded;
+}
+
+float HGPhase(float cosTheta, float g) {
+    float g2 = g * g;
+    float denom = 4.0 * ATMOS_CLOUDS_PI * pow(max(1.0 + g2 - 2.0 * g * cosTheta, 1.0e-6), 1.5);
+    return (1.0 - g2) / denom;
+}
+
+const int ATMOS_CLOUDS_MARCH_STEPS = 48;
+const int ATMOS_CLOUDS_LIGHT_STEPS = 5;
+const float ATMOS_CLOUDS_LIGHT_STEP_KM = 0.3;
+
+void RaymarchClouds(ivec2 pixel) {
+    vec2 uv = (vec2(pixel) + 0.5) / vec2(pc.outputWidth, pc.outputHeight);
+    float ndcX = uv.x * 2.0 - 1.0;
+    float ndcY = 1.0 - uv.y * 2.0;
+    vec3 rayDir = normalize(GetCameraForward()
+        + ndcX * pc.aspectRatio * pc.tanHalfFovY * GetCameraRight()
+        + ndcY * pc.tanHalfFovY * GetCameraUp());
+
+    vec3 ro = vec3(0.0, ATMOS_CLOUDS_GROUND_RADIUS_KM + ATMOS_CLOUDS_CAMERA_HEIGHT_KM, 0.0);
+
+    float tInner0, tInner1;
+    bool hitInner = RaySphereIntersect(ro, rayDir, ATMOS_CLOUDS_INNER_RADIUS_KM, tInner0, tInner1);
+    float tOuter0, tOuter1;
+    bool hitOuter = RaySphereIntersect(ro, rayDir, ATMOS_CLOUDS_OUTER_RADIUS_KM, tOuter0, tOuter1);
+
+    if (!hitOuter || tOuter1 <= 0.0) {
+        imageStore(g_CloudOutputStorage, pixel, vec4(0.0, 0.0, 0.0, 1.0));
+        return;
+    }
+
+    float marchStart = (hitInner && tInner1 > 0.0) ? tInner1 : max(tOuter0, 0.0);
+    float marchEnd = tOuter1;
+    if (marchEnd <= marchStart + 1.0e-4) {
+        imageStore(g_CloudOutputStorage, pixel, vec4(0.0, 0.0, 0.0, 1.0));
+        return;
+    }
+
+    vec3 sunArrivalDir = GetSunDirection(); // FROM the light TOWARD the scene.
+    vec3 towardSun = -sunArrivalDir;
+    float cosTheta = dot(rayDir, towardSun);
+    float phase = mix(HGPhase(cosTheta, 0.6), HGPhase(cosTheta, -0.2), 0.5);
+
+    float stepSize = (marchEnd - marchStart) / float(ATMOS_CLOUDS_MARCH_STEPS);
+    vec3 throughput = vec3(1.0);
+    vec3 inscatter = vec3(0.0);
+
+    for (int i = 0; i < ATMOS_CLOUDS_MARCH_STEPS; ++i) {
+        float t = marchStart + (float(i) + 0.5) * stepSize;
+        vec3 pos = ro + rayDir * t;
+        float density = SampleCloudDensity(pos);
+
+        if (density > 1.0e-3) {
+            float opticalDepth = 0.0;
+            vec3 lightPos = pos;
+            for (int j = 0; j < ATMOS_CLOUDS_LIGHT_STEPS; ++j) {
+                lightPos += towardSun * ATMOS_CLOUDS_LIGHT_STEP_KM;
+                opticalDepth += SampleCloudDensity(lightPos) * ATMOS_CLOUDS_LIGHT_STEP_KM;
+            }
+            opticalDepth *= ATMOS_CLOUDS_EXTINCTION_SCALE;
+
+            // Beer-Powder Law (atmos_integration_plan.md Subtask 4's own formula): approximates
+            // both direct sunlight attenuation AND self-shadowing ("powder" darkening) in thick
+            // cloud cores without a separate ambient-occlusion term.
+            float beerPowder = 2.0 * exp(-opticalDepth) * (1.0 - exp(-2.0 * opticalDepth));
+
+            vec3 stepInscatter = vec3(density * beerPowder * phase * pc.sunIlluminance) * GetSunColor();
+            inscatter += throughput * stepInscatter * stepSize;
+            throughput *= exp(-vec3(density * ATMOS_CLOUDS_EXTINCTION_SCALE * stepSize));
+
+            if (all(lessThan(throughput, vec3(0.01)))) {
+                break;
+            }
+        }
+    }
+
+    float transmittance = clamp(dot(throughput, vec3(1.0 / 3.0)), 0.0, 1.0);
+    imageStore(g_CloudOutputStorage, pixel, vec4(inscatter, transmittance));
+}
+
+void main() {
+    ivec3 coord = ivec3(gl_GlobalInvocationID.xyz);
+
+    if (pc.mode == 2) {
+        // Only the first Z-local-thread of the single dispatched Z-group does real work -- see
+        // renderer::AtmosCloudsPass::kWorkgroupSize3D's own comment (identical convention to
+        // AtmosVolumetricFog.comp's mode-2 AccumulateFog).
+        if (gl_LocalInvocationID.z != 0u || coord.x >= pc.outputWidth || coord.y >= pc.outputHeight) {
+            return;
+        }
+        RaymarchClouds(coord.xy);
+        return;
+    }
+
+    int resolution = (pc.mode == 0) ? ATMOS_CLOUDS_SHAPE_RES : ATMOS_CLOUDS_DETAIL_RES;
+    if (coord.x >= resolution || coord.y >= resolution || coord.z >= resolution) {
+        return;
+    }
+
+    if (pc.mode == 0) {
+        GenerateShapeNoise(coord);
+    } else {
+        GenerateDetailNoise(coord);
+    }
+}

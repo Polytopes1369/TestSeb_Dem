@@ -606,6 +606,14 @@ bool ClusterRenderPipeline::Init(
     return false;
   }
 
+  // Atmos weather system, Subtask 4: Procedural Volumetric Clouds -- half-res output sized from
+  // this frame's own render extent (see AtmosCloudsPass.h's own class comment for why).
+  if (!m_AtmosClouds.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
+                          createInfo.renderExtent, m_AtmosClimate)) {
+    LOG_ERROR("[ClusterRenderPipeline] Failed to initialize AtmosCloudsPass.");
+    return false;
+  }
+
   // World Probe grid (Lumen "Translucency Volume") -- reuses the same shared trace-scene sets and
   // HWRT/BLAS/TLAS as every other GI consumer above; see ClusterRenderPipeline.h's own comment on
   // its live consumers (m_ScreenTrace's fallback, GICompositePass's debug visualization). Must be
@@ -748,7 +756,7 @@ bool ClusterRenderPipeline::Init(
   m_PostProcess.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
       m_DisplayExtent, m_DepthOfField.GetOutputView(), m_Bloom.GetOutputView(),
       m_Resolve.GetOutputDepthView(), m_TransparentForward.GetRefractionOffsetView(),
-      m_AtmosSky.GetSkyViewLUTView(), m_AtmosFog.GetIntegratedFogView());
+      m_AtmosSky.GetSkyViewLUTView(), m_AtmosFog.GetIntegratedFogView(), m_AtmosClouds.GetCloudView());
 
 #ifndef NDEBUG
   // Two-tier SDF ray march DEBUG VISUALIZATION (see ClusterRenderPipeline.h's own comment on
@@ -950,6 +958,7 @@ void ClusterRenderPipeline::Shutdown() {
   m_SDFRayMarch.Shutdown();
   m_DebugBufferView.Shutdown();
 #endif
+  m_AtmosClouds.Shutdown();
   m_AtmosFog.Shutdown();
   m_MegaLights.Shutdown();
   m_ScreenSpaceEffects.Shutdown();
@@ -2451,6 +2460,12 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
       m_AtmosFog.RecordUpdate(cmdLate, cameraPositionWorld, cameraFrameInfo.forward, maths::vec3{0.0f, 1.0f, 0.0f},
           cameraFrameInfo.fovYRadians, cameraFrameInfo.aspectRatio,
           m_SceneLights.sun.direction, m_SceneLights.sun.color, m_SceneLights.sun.intensity, m_FrameIndex);
+
+      // Atmos weather system, Subtask 4: refresh the half-res cloud raymarch immediately alongside
+      // the fog update above -- same producer/consumer-adjacency reasoning.
+      m_AtmosClouds.RecordUpdate(cmdLate, cameraPositionWorld, cameraFrameInfo.forward, maths::vec3{0.0f, 1.0f, 0.0f},
+          cameraFrameInfo.fovYRadians, cameraFrameInfo.aspectRatio,
+          m_SceneLights.sun.direction, m_SceneLights.sun.color, m_SceneLights.sun.intensity);
 
       m_PostProcess.RecordComposite(cmdLate, deltaTimeSeconds, ppSettings, invViewProj, prevViewProjForPostProcess, cameraPositionWorld,
           viewProj, m_SceneLights.sun.direction, cameraFrameInfo.forward,

@@ -148,14 +148,14 @@ namespace renderer {
         // pipeline has no display-resolution depth anywhere -- see DepthOfField.comp's own comment).
         // `skyViewLUTView` (Atmos weather system, Subtask 2): renderer::AtmosSkyPass's own Sky-View
         // LUT view. `volumetricFogView` (Atmos Subtask 3): renderer::AtmosVolumetricFogPass's own
-        // integrated fog 3D texture. Both sampled read-only through this pass' own m_LinearSampler
-        // -- fixed identity for this pipeline's entire lifetime (neither producer pass ever
-        // recreates its own images after Init()), same convention as `depthView`/
-        // `refractionOffsetView` below.
+        // integrated fog 3D texture. `cloudsView` (Atmos Subtask 4): renderer::AtmosCloudsPass's own
+        // half-resolution cloud buffer. All sampled read-only through this pass' own m_LinearSampler
+        // -- fixed identity for this pipeline's entire lifetime (no producer pass ever recreates its
+        // own images after Init()), same convention as `depthView`/`refractionOffsetView` below.
         void Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
             VkExtent2D displayExtent, VkImageView hdrColorView, VkImageView bloomView,
             VkImageView depthView, VkImageView refractionOffsetView, VkImageView skyViewLUTView,
-            VkImageView volumetricFogView);
+            VkImageView volumetricFogView, VkImageView cloudsView);
 
         void Shutdown();
 
