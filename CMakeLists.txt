@@ -357,6 +357,48 @@ add_executable(PcgEcosystemExclusionTests
 target_include_directories(PcgEcosystemExclusionTests PRIVATE src ${Vulkan_INCLUDE_DIRS})
 add_test(NAME PcgEcosystemExclusionTests COMMAND PcgEcosystemExclusionTests)
 
+# PCG framework roadmap, Phase 8.3 ("Climate-Driven Biome Selection" -- third subtask of Phase 8,
+# Biome/Ecosystem, sequential after Phase 8.1 above): PcgClimateBiomeSelector.cpp is pure composition
+# over Phase 8.1's own pcg::ApplyBiome (no new point-set filtering algorithm of its own), so this
+# target links the identical Phase 3 filter .cpp set PcgBiomeRulesTests already needs (ApplyBiome's
+# own transitive link-time dependency set, see that target's own comment above) plus PcgBiomeRules.cpp
+# itself.
+#
+# Unlike every other tests/*.cpp target in this file, this one's own production code
+# (PcgClimateBiomeSelector.cpp) references a full renderer::AtmosClimatePass definition (for
+# SampleCurrentClimate -- see that function's own header comment on why PcgClimateBiomeSelector.h
+# itself only forward-declares the type), which pulls in Vulkan/VMA headers; and this SPECIFIC test
+# file goes one step further and actually constructs a real (never-Init()'d) renderer::AtmosClimatePass
+# value for TestSampleCurrentClimateSanity, which requires AtmosClimatePass's GpuBuffer member's
+# out-of-line destructor (GpuBuffer.cpp) to link, which in turn needs a real VMA implementation TU
+# (VmaUsage.cpp) and Logger.cpp (GpuBuffer.cpp's own LOG_INFO/LOG_ERROR call sites under a Debug
+# build) -- the exact same Vulkan/VMA link-time dependency set PcgGpuNodeExecutorTests below already
+# establishes for a different reason (real GPU dispatch there; here, only a never-Init()'d value's
+# construction/destruction ever actually runs -- no live VkDevice/VkQueue/VmaAllocator is required or
+# even constructed, since Init()/RecordUpdate() are deliberately never called by this test).
+# AtmosClimatePass.cpp itself is also linked (its RecordUpdate() body calls
+# VulkanUtils::RecordMemoryBarrier, an unresolved external at link time otherwise, even though this
+# test never calls RecordUpdate) -- see VulkanUtils.cpp alongside it for that reason.
+add_executable(PcgClimateBiomeSelectorTests
+    src/pcg/PcgClimateBiomeSelector.cpp
+    src/pcg/PcgBiomeRules.cpp
+    src/pcg/PcgDensityTransformFilter.cpp
+    src/pcg/PcgSlopeHeightFilter.cpp
+    src/pcg/PcgTerrainSampler.cpp
+    src/pcg/PcgBooleanSetOps.cpp
+    src/pcg/PcgSplineSampler.cpp
+    src/pcg/PcgSelfPruningFilter.cpp
+    src/renderer/passes/AtmosClimatePass.cpp
+    src/renderer/vulkan/GpuBuffer.cpp
+    src/renderer/vulkan/VmaUsage.cpp
+    src/renderer/vulkan/VulkanUtils.cpp
+    src/core/Logger.cpp
+    tests/PcgClimateBiomeSelectorTests.cpp
+)
+target_include_directories(PcgClimateBiomeSelectorTests PRIVATE src ${Vulkan_INCLUDE_DIRS} vendor/vma)
+target_link_libraries(PcgClimateBiomeSelectorTests PRIVATE Vulkan::Vulkan)
+add_test(NAME PcgClimateBiomeSelectorTests COMMAND PcgClimateBiomeSelectorTests)
+
 # PCG framework roadmap, Phase 5.1+5.2 ("PCG Graph Engine Core"): the node/link graph data model +
 # JSON serialization (src/pcg/PcgGraph.cpp) and the CPU topological evaluator + subgraph support
 # (src/pcg/PcgGraphEvaluator.cpp), built directly on Phase 1's data model. PcgGraph.cpp reuses
