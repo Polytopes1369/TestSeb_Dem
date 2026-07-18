@@ -156,6 +156,7 @@
 #include "renderer/passes/PostProcessPass.h"
 #include "renderer/passes/ScreenTracePass.h"
 #include "renderer/passes/GICompositePass.h"
+#include "renderer/passes/SubsurfaceScatteringPass.h"
 #ifndef NDEBUG
 #include "renderer/debug/ClusterTriangleStatsPass.h"
 #include "renderer/debug/DebugBufferViewPass.h"
@@ -425,6 +426,16 @@ namespace renderer {
         // SetDebugRadiosityEnabled/SetDebugWorldProbesEnabled's own Release-always-on convention).
         void SetDebugReflectionsEnabled(bool enabled) { m_DebugReflectionsEnabled = enabled; }
         void SetDebugTAATSREnabled(bool enabled) { m_DebugTAATSREnabled = enabled; }
+
+        // Screen-space Subsurface Scattering (UE5.8 rendering-parity gap G4): gates RecordFrameLate()'s
+        // [12f] m_SubsurfaceScattering.RecordUpdate() call (skipped means m_GIComposite's output is
+        // left un-diffused this frame, so the effect's cost/contribution is directly A/B-able) and
+        // scales the material-authored diffusion radius (a live tuning knob). Both are Debug-only:
+        // Release has no toggle and always runs the pass at the authored radius (radiusScale == 1.0),
+        // matching every other Set*Enabled setter's own Release-always-on convention. Main.cpp's own
+        // Post FX ImGui tab.
+        void SetDebugSSSEnabled(bool enabled) { m_DebugSSSEnabled = enabled; }
+        void SetDebugSSSRadiusScale(float scale) { m_DebugSSSRadiusScale = scale; }
 
         // Phase 1 (Nanite advanced): gates RecordFrame()'s per-frame WPOGlobalsUBO upload of
         // `enhancedDisplacementDebugMultiplier` -- 1.0 when enabled (full effect, the Release-
@@ -885,6 +896,15 @@ namespace renderer {
         // GICompositePass's own class comment.
         GICompositePass m_GIComposite;
 
+        // Screen-space Subsurface Scattering (UE5.8 rendering-parity gap G4, "Subsurface Profile"
+        // shading model): a separable diffusion-profile blur applied IN PLACE to m_GIComposite's
+        // fully-lit output image (right after it composites, before the forward passes/TAA), gated
+        // per-pixel by each material's SubstrateSlab::sssProfileScale so only thin organic (skin/wax/
+        // foliage) surfaces get the soft light-bleed look -- see SubsurfaceScatteringPass's own class
+        // comment. Always initialized (not Debug-only), same build-separation rule as every other
+        // real render pass; only the A/B enable toggle + radius-tuning slider are Debug-only.
+        SubsurfaceScatteringPass m_SubsurfaceScattering;
+
         // Final spatial denoiser (À-Trous wavelet, edge-guided by m_Resolve's own G-buffer normal/
         // depth): a spatial cleanup pass over m_ScreenTrace's own noisy combined (near-field +
         // World Probe fallback) indirect term, applied only in the normal (non-debug-visualization)
@@ -949,6 +969,11 @@ namespace renderer {
         // m_DebugReflectionsEnabled above.
         bool m_DebugMegaLightsEnabled = true;
         bool m_DebugTAATSREnabled = config::temporal::ENABLED_BY_DEFAULT;
+        // UE5.8 rendering-parity gap G4 (screen-space SSS): see SetDebugSSSEnabled/
+        // SetDebugSSSRadiusScale's own comments. Defaults: enabled true (Release-always-on
+        // equivalent), radius scale 1.0 (the material's authored radius unmodified).
+        bool m_DebugSSSEnabled = true;
+        float m_DebugSSSRadiusScale = 1.0f;
         // Phase 1 (Nanite advanced): see SetDebugEnhancedDisplacementEnabled/
         // SetDebugSplineDeformationEnabled's own comments -- both default to true (Release-always-on
         // equivalent, no toggle exists there, matching m_DebugReflectionsEnabled's own convention).

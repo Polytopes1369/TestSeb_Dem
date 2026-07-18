@@ -106,6 +106,12 @@ struct DebugState {
     bool dumpDAGCutGapsRequested = false;
     // Toggles TAA + TSR on / off (Key 'A')
     bool taatsrEnabled = config::temporal::ENABLED_BY_DEFAULT;
+    // UE5.8 rendering-parity gap G4 (screen-space Subsurface Scattering): renderer::
+    // ClusterRenderPipeline::SetDebugSSSEnabled gates the [12f] SubsurfaceScatteringPass so its
+    // cost/contribution can be A/B'd, and SetDebugSSSRadiusScale scales the material-authored
+    // diffusion radius as a live tuning knob. Both driven from the Post FX ImGui tab below.
+    bool sssEnabled = true;
+    float sssRadiusScale = 1.0f;
     // Phase 1 (Nanite advanced): renderer::ClusterRenderPipeline::SetDebugEnhancedDisplacementEnabled
     // -- gates the multi-octave procedural noise displacement on entity 2 (Icosphere, see
     // enhanced_displacement.glsl). Key 'J' -- moved off 'B' (this branch's original key) during the
@@ -977,6 +983,10 @@ int main(int argc, char** argv) {
                 ImGui::Checkbox("Ambient Occlusion (GTAO)", &config::postprocess::AO_ENABLED);
                 ImGui::Checkbox("Contact Shadows", &config::postprocess::CONTACT_SHADOW_ENABLED);
                 ImGui::Checkbox("SSR Fallback", &config::postprocess::SSR_FALLBACK_ENABLED);
+                // UE5.8 rendering-parity gap G4: screen-space Subsurface Scattering A/B toggle +
+                // diffusion-radius tuning (the material's authored radius is multiplied by this).
+                ImGui::Checkbox("Subsurface Scattering", &g_DebugState.sssEnabled);
+                ImGui::SliderFloat("SSS Radius Scale", &g_DebugState.sssRadiusScale, 0.0f, 4.0f);
                 ImGui::EndTabItem();
             }
 
@@ -1564,6 +1574,8 @@ int main(int argc, char** argv) {
         clusterPipeline.SetDebugReflectionsEnabled(g_DebugState.reflectionsEnabled);
         clusterPipeline.SetDebugMegaLightsEnabled(g_DebugState.megaLightsEnabled);
         clusterPipeline.SetDebugTAATSREnabled(g_DebugState.taatsrEnabled);
+        clusterPipeline.SetDebugSSSEnabled(g_DebugState.sssEnabled);
+        clusterPipeline.SetDebugSSSRadiusScale(g_DebugState.sssRadiusScale);
         clusterPipeline.SetDebugEnhancedDisplacementEnabled(g_DebugState.enhancedDisplacementEnabled);
         clusterPipeline.SetDebugSplineDeformationEnabled(g_DebugState.splineDeformationEnabled);
         clusterPipeline.SetDebugAsyncComputeEnabled(g_DebugState.asyncComputeEnabled);

@@ -806,6 +806,15 @@ bool ClusterRenderPipeline::Init(
       createInfo.renderExtent, m_Resolve.GetOutputColorView(), m_Denoiser.GetOutputView(),
       m_ScreenSpaceEffects.GetAOView(), m_Resolve.GetOutputDepthView(), m_WorldProbes);
 
+  // Screen-space Subsurface Scattering (UE5.8 rendering-parity gap G4): a separable diffusion-profile
+  // blur applied IN PLACE to m_GIComposite's fully-lit output image, gated per-pixel by each
+  // material's SubstrateSlab::sssProfileScale -- see SubsurfaceScatteringPass's own class comment.
+  // Reads m_GIComposite's output view (both blurred-from and written-back-to) plus m_Resolve's own
+  // GBuffer depth/normal/materialID views and material-params SSBO (the SSS gate + diffusion radius).
+  m_SubsurfaceScattering.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
+      createInfo.renderExtent, m_GIComposite.GetOutputView(), m_Resolve.GetOutputDepthView(),
+      m_Resolve.GetOutputNormalView(), m_Resolve.GetOutputMaterialIDView(), m_Resolve.GetMaterialParamsBuffer());
+
   m_TAATSR.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
       m_RenderExtent, m_DisplayExtent,
       m_GIComposite.GetOutputView(), m_Resolve.GetOutputDepthView());
@@ -1045,6 +1054,7 @@ void ClusterRenderPipeline::Shutdown() {
   m_Reflection.Shutdown();
   m_ScreenTrace.Shutdown();
   m_GIComposite.Shutdown();
+  m_SubsurfaceScattering.Shutdown();
   m_Denoiser.Shutdown();
   // Phase PP1/PP2 (post-process stack roadmap): reverse Init() order (m_TAATSR -> m_Bloom ->
   // m_PostProcess), so shut down m_PostProcess and m_Bloom before m_TAATSR below. This was missing
@@ -2457,6 +2467,40 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
     depInfo.memoryBarrierCount = 1;
     depInfo.pMemoryBarriers = &barrier;
     vkCmdPipelineBarrier2(cmdLate, &depInfo);
+  }
+
+  // =========================================================================================
+  // [12f] Screen-space Subsurface Scattering (UE5.8 rendering-parity gap G4): separable
+  // diffusion-profile blur applied IN PLACE to m_GIComposite's fully-lit output image, gated
+  // per-pixel by each material's SubstrateSlab::sssProfileScale -- see SubsurfaceScatteringPass'
+  // own class comment. Runs HERE: after the opaque scene is fully lit/composited ([12e] GIComposite
+  // just above, whose trailing barrier already made its output visible to this pass' own sampled
+  // read) and BEFORE [13c]'s forward-transparent passes + [13d] TAA -- so it diffuses ONLY the
+  // opaque SSS geometry (the forward glass/water/particles are not yet in the image) and is
+  // temporally resolved together with everything else. It writes the diffused result back into the
+  // SAME m_GIComposite output image, so no downstream consumer needs rewiring; it ends with its own
+  // barrier re-establishing that image's visibility to the forward color-attachment writes + TAA
+  // sampled read below (a superset of the trailing barrier this pass' write-back replaced).
+  // =========================================================================================
+  {
+    // proj[1][1] == 1/tan(fovY/2): converts a material's world-space diffusion radius into a
+    // screen-space pixel radius at each pixel's own camera distance (see the shader's push constant).
+    const float sssProjScaleY = 1.0f / std::tan(cameraFrameInfo.fovYRadians * 0.5f);
+#ifndef NDEBUG
+    // Debug-only A/B toggle + radius tuning (main.cpp's Post FX tab, via SetDebugSSSEnabled/
+    // SetDebugSSSRadiusScale). Also skipped entirely in ANY debug visualization view mode: SSS is a
+    // final-look material response, and blurring a hash-colored cluster/normal/etc. visualization
+    // would muddy the very per-cluster boundaries those views exist to inspect (same reasoning the
+    // [12d] denoiser's own applyDenoise gate uses). Release has no toggle/debug views and always runs
+    // the pass at the material's authored radius (CLAUDE.md's Debug/Release build-separation rule).
+    const bool sssEnabled = m_DebugSSSEnabled && (cameraCopy.debugViewMode == DEBUG_VIEW_NORMAL);
+    const float sssRadiusScale = m_DebugSSSRadiusScale;
+#else
+    const bool sssEnabled = true;
+    const float sssRadiusScale = 1.0f;
+#endif
+    m_SubsurfaceScattering.RecordUpdate(cmdLate, invViewProj, cameraPositionWorld, sssProjScaleY,
+        sssRadiusScale, sssEnabled);
   }
 
   // =========================================================================================

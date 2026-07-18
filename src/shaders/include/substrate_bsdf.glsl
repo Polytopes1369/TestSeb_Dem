@@ -6,8 +6,13 @@
 // direct sun term, TransparentForward.frag, ReflectionGather.comp's Lumen reflection composite,
 // MegaLightsShade.comp's local-light term). See the Substrate integration plan's own Context section
 // for what this reproduces (the Slab BSDF's full parameter set + the vertical layering operator) and
-// what is deliberately out of scope (horizontal mixing, Hair/Eye/Water shading models, full
-// screen-space SSS diffusion, glint).
+// what is deliberately out of scope (horizontal mixing, Hair/Eye/Water shading models, glint).
+// NOTE (UE5.8 rendering-parity gap G4): full screen-space SSS diffusion was ORIGINALLY out of scope
+// here (this file only ever provided the cheap analytic wrap-diffuse approximation, EvaluateSlabDiffuse's
+// sssAmount/sssRadius blend) -- it is now implemented as a real separable screen-space diffusion pass
+// (renderer::SubsurfaceScatteringPass, driven by SubstrateSlab::sssProfileScale, material_params.glsl),
+// which runs AFTER this BSDF has been fully evaluated and composited, so it needs no term here: SSS is
+// a post-lighting screen-space material response, not a per-light BSDF lobe.
 //
 // Reuses include/ggx_brdf.glsl's D_GGX/G_SmithGGXCorrelated/F_Schlick/BuildTangentBasis verbatim --
 // no duplicate BRDF math (that file is this codebase's one and only isotropic-GGX implementation,
