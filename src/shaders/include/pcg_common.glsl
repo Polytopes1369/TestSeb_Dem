@@ -99,4 +99,66 @@ float PcgGetEffectiveDensity(vec3 localPos, vec3 boundsMin, vec3 boundsMax, floa
     return clamp(density, 0.0, 1.0) * PcgComputeDensityFalloff(localPos, boundsMin, boundsMax, steepness);
 }
 
+// ------------------------------------------------------------------------------------------------
+// PCG framework roadmap, Phase 5.3 ("GPU-Resident Node Execution"): a small, deterministic 3D value
+// noise, added here (rather than reusing AtmosNoiseCommon.glsl's existing curl/fractal noise, which
+// is tuned for wind-field turbulence, a different visual target) specifically for the reference GPU
+// PCG node type this phase proves the execute-callback registration mechanism with
+// (PcgDensityNoise.comp / src/pcg/PcgGpuDensityNoiseNode.h, "pcg.gpu.density_noise"). No CPU-side
+// PCG noise/filter node existed anywhere in this codebase at the time this was written (Phase 3's
+// CPU filters, one of which is a density/noise transform, are a separate, concurrently-developed
+// phase) -- this is therefore an INDEPENDENT implementation, not a GPU port of an existing CPU
+// algorithm, built entirely from PcgHash32 above so it stays within this file's existing "one
+// deterministic hash family" contract rather than introducing a second one. If/when Phase 3 lands
+// its own CPU-side density-noise filter, a future cleanup pass should reconcile the two rather than
+// carrying two independently-tuned noise functions forward indefinitely -- flagged here so that
+// duplication is not accidentally overlooked.
+// ------------------------------------------------------------------------------------------------
+
+// Hashes one integer lattice cell corner to a [0, 1) scalar. Three axis coordinates are spread
+// apart with distinct large odd multipliers (a standard "spatial hash" idiom) before being folded
+// together with XOR and run through PcgHash32's own avalanche mix -- deterministic and collision-
+// resistant enough for a visual noise field (this is explicitly NOT claimed to be a cryptographic
+// or statistically rigorous hash, only "looks like noise, is 100% reproducible for the same input").
+// `cell` uses signed ints (a lattice coordinate can legitimately be negative for a world-space
+// position near/behind the origin); the int->uint cast below is a well-defined two's-complement
+// bit-pattern reinterpretation in GLSL, exactly like C++'s equivalent cast, so negative cells hash
+// just as deterministically as positive ones.
+float PcgLatticeHash01(ivec3 cell) {
+    uint h = PcgHash32(uint(cell.x) * 73856093u ^ uint(cell.y) * 19349663u ^ uint(cell.z) * 83492791u);
+    return float(h) * (1.0 / 4294967296.0);
+}
+
+// Trilinearly-interpolated 3D value noise over `p` (world-space, already pre-scaled by whatever
+// frequency the caller wants -- this function itself has no notion of "frequency", it always
+// samples at unit lattice spacing). Uses a smoothstep-style (3t^2 - 2t^3) fade curve on the
+// fractional lattice position, matching Perlin's own "improved" interpolant, so the result has a
+// continuous first derivative across lattice cell boundaries (a plain linear fade would produce
+// visible faceting/creasing at cell edges). Returns a value in [0, 1); callers wanting a
+// signed/centered noise (e.g. PcgDensityNoise.comp's own density offset) remap it themselves
+// (`noise * 2.0 - 1.0`) rather than baking that convention into this shared helper.
+float PcgValueNoise3D(vec3 p) {
+    vec3 cellOrigin = floor(p);
+    vec3 f = p - cellOrigin;
+    vec3 u = f * f * (3.0 - 2.0 * f);
+    ivec3 i = ivec3(cellOrigin);
+
+    float n000 = PcgLatticeHash01(i + ivec3(0, 0, 0));
+    float n100 = PcgLatticeHash01(i + ivec3(1, 0, 0));
+    float n010 = PcgLatticeHash01(i + ivec3(0, 1, 0));
+    float n110 = PcgLatticeHash01(i + ivec3(1, 1, 0));
+    float n001 = PcgLatticeHash01(i + ivec3(0, 0, 1));
+    float n101 = PcgLatticeHash01(i + ivec3(1, 0, 1));
+    float n011 = PcgLatticeHash01(i + ivec3(0, 1, 1));
+    float n111 = PcgLatticeHash01(i + ivec3(1, 1, 1));
+
+    float nx00 = mix(n000, n100, u.x);
+    float nx10 = mix(n010, n110, u.x);
+    float nx01 = mix(n001, n101, u.x);
+    float nx11 = mix(n011, n111, u.x);
+    float nxy0 = mix(nx00, nx10, u.y);
+    float nxy1 = mix(nx01, nx11, u.y);
+    return mix(nxy0, nxy1, u.z);
+}
+
 #endif // PCG_COMMON_GLSL

@@ -1,0 +1,67 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+
+// PCG framework roadmap, Phase 5.3 ("GPU-Resident Node Execution"): reference GPU node type
+// "pcg.gpu.density_noise" (src/pcg/PcgGpuDensityNoiseNode.h) -- proves the PcgGpuNodeExecuteFn
+// registration mechanism (src/pcg/PcgGraphEvaluator.h) end-to-end with one real, working dispatch.
+//
+// One thread per point (local_size_x = 64, matching this project's PrimitiveGen convention -- see
+// e.g. geom_sphere.comp): reads a PcgGpuPoint from InputPoints at
+// pc.inputOffsetElements + gl_GlobalInvocationID.x, samples PcgValueNoise3D (pcg_common.glsl) at
+// that point's world-space position (scaled by pc.noiseFrequency), remaps the result from [0,1) to
+// a signed offset scaled by pc.noiseAmplitude, adds it to the point's existing density, clamps to
+// [pc.densityFloor, pc.densityCeil], and writes the modulated point to OutputPoints at
+// pc.outputOffsetElements + gl_GlobalInvocationID.x.
+//
+// InputPoints and OutputPoints may alias the SAME underlying VkBuffer (an in-place transform, the
+// primary way PcgGpuDensityNoiseNode::Execute binds this shader) -- each invocation only ever reads
+// and writes its OWN element (no invocation ever touches another invocation's index), so binding the
+// identical buffer to both bindings is race-free by construction: there is no read-after-write or
+// write-after-write hazard between different invocations, and a single invocation's own
+// read-then-write of the same element has no concurrency hazard with itself.
+#include "include/pcg_common.glsl"
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer InputPoints  { PcgGpuPoint inPoints[]; };
+layout(std430, binding = 1) writeonly buffer OutputPoints { PcgGpuPoint outPoints[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint  pointCount;            // Total points to process this dispatch -- threads with id >= this are no-ops.
+    uint  inputOffsetElements;   // Element (not byte) offset into InputPoints -- see PcgGpuPointBuffer's own comment in PcgGraphEvaluator.h for why this is element-indexed.
+    uint  outputOffsetElements;  // Element offset into OutputPoints (may equal inputOffsetElements when InputPoints/OutputPoints alias the same buffer).
+    uint  seedOverride;          // XOR'd into each point's own seed before deriving this dispatch's noise sample offset -- 0 leaves a point's seed untouched. Lets a caller/test force a different noise realization without re-uploading points.
+    float noiseFrequency;        // World-space frequency multiplier fed into PcgValueNoise3D (larger = finer noise detail).
+    float noiseAmplitude;        // Half-width of the signed density offset applied (final offset is in [-noiseAmplitude, +noiseAmplitude) before the clamp below).
+    float densityFloor;          // Final clamp lower bound applied to the modulated density.
+    float densityCeil;           // Final clamp upper bound applied to the modulated density.
+} pc;
+
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    if (id >= pc.pointCount) {
+        return;
+    }
+
+    PcgGpuPoint p = inPoints[pc.inputOffsetElements + id];
+
+    // Fold the (optionally overridden) per-point seed into the sampled lattice position so that two
+    // points sharing the exact same world position (a degenerate/synthetic test case) still draw
+    // independent noise realizations -- a small deterministic per-seed sub-lattice offset, not a
+    // second RNG stream, keeps the whole thing a pure, fully reproducible function of
+    // (position, seed, push-constant fields).
+    uint effectiveSeed = p.seed ^ pc.seedOverride;
+    vec3 seedJitter = vec3(
+        PcgRandomFloat01(effectiveSeed, 0u),
+        PcgRandomFloat01(effectiveSeed, 1u),
+        PcgRandomFloat01(effectiveSeed, 2u)
+    );
+    vec3 samplePos = p.position * pc.noiseFrequency + seedJitter;
+
+    float noise01 = PcgValueNoise3D(samplePos);  // [0, 1)
+    float noiseSigned = noise01 * 2.0 - 1.0;      // [-1, 1)
+
+    p.density = clamp(p.density + noiseSigned * pc.noiseAmplitude, pc.densityFloor, pc.densityCeil);
+
+    outPoints[pc.outputOffsetElements + id] = p;
+}
