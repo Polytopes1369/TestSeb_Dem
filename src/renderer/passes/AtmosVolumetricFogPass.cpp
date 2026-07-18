@@ -309,8 +309,7 @@ namespace renderer {
         pc.frameIndex = frameIndex;
 
         // Local Fog Volumes (G8): inject the uploaded volumes unless the master runtime toggle is
-        // off (which zeroes the injected count for this frame -- the SSBO itself stays untouched,
-        // matching volumetrics::_VOLUMETRIC_FOG_ENABLE's own live-toggle convention).
+        // off (which zeroes the injected count for this frame -- the SSBO itself stays untouched).
         pc.localFogVolumeCount = config::localfog::ENABLE ? m_LocalFogVolumeCount : 0u;
 
         // Debug-only bounds visualization: the config read that drives the shader flag is compiled

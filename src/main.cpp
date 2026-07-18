@@ -935,7 +935,6 @@ int main(int argc, char** argv) {
             uint32_t PROBE_GRID_RESOLUTION = config::lumen::PROBE_GRID_RESOLUTION;
             uint32_t VSM_PHYSICAL_PAGE_CAPACITY = config::lumen::VSM_PHYSICAL_PAGE_CAPACITY;
             uint32_t TRANSLUCENCY_LIGHTING_VOLUME_DIM = config::postprocess::_TRANSLUCENCY_LIGHTING_VOLUME_DIM;
-            uint32_t VOLUMETRIC_FOG_GRID_PIXEL_SIZE = config::volumetrics::_VOLUMETRIC_FOG_GRID_PIXEL_SIZE;
             // The "Hardware Ray Tracing" checkbox's own value only takes effect at the NEXT session
             // start (see main()'s g_DebugState.traceMode seeding comment, right before the frame
             // loop) -- 'T'/'Y' remain the live, no-reload way to change trace mode mid-session.
@@ -954,7 +953,6 @@ int main(int argc, char** argv) {
                 config::lumen::PROBE_GRID_RESOLUTION,
                 config::lumen::VSM_PHYSICAL_PAGE_CAPACITY,
                 config::postprocess::_TRANSLUCENCY_LIGHTING_VOLUME_DIM,
-                config::volumetrics::_VOLUMETRIC_FOG_GRID_PIXEL_SIZE,
                 config::lumen::_HARDWARE_RAYTRACING,
                 config::g_ActiveProfileName
             };
@@ -972,7 +970,6 @@ int main(int argc, char** argv) {
         if (config::lumen::PROBE_GRID_RESOLUTION != startup.PROBE_GRID_RESOLUTION) { needsReload = true; reloadReason += "Probe Grid Resolution; "; }
         if (config::lumen::VSM_PHYSICAL_PAGE_CAPACITY != startup.VSM_PHYSICAL_PAGE_CAPACITY) { needsReload = true; reloadReason += "VSM Page Capacity; "; }
         if (config::postprocess::_TRANSLUCENCY_LIGHTING_VOLUME_DIM != startup.TRANSLUCENCY_LIGHTING_VOLUME_DIM) { needsReload = true; reloadReason += "Translucency Volume Dim; "; }
-        if (config::volumetrics::_VOLUMETRIC_FOG_GRID_PIXEL_SIZE != startup.VOLUMETRIC_FOG_GRID_PIXEL_SIZE) { needsReload = true; reloadReason += "Volumetric Fog Grid Pixel Size; "; }
         if (config::lumen::_HARDWARE_RAYTRACING != startup.HARDWARE_RAYTRACING) { needsReload = true; reloadReason += "Hardware Ray Tracing (takes effect next session -- 'T'/'Y' keys change it live without a restart); "; }
         if (config::g_ActiveProfileName != startup.profileName) { needsReload = true; reloadReason += "Profile Preset (changed to " + config::g_ActiveProfileName + "); "; }
 
@@ -1040,11 +1037,6 @@ int main(int argc, char** argv) {
                     config::temporal::JITTER_FRAME_COUNT = static_cast<uint32_t>(jitterCount);
                 }
                 ImGui::Checkbox("Enabled By Default", &config::temporal::ENABLED_BY_DEFAULT);
-                ImGui::DragFloat("Screen Percentage", &config::temporal::_SCREEN_PERCENTAGE, 1.0f, 10.0f, 200.0f);
-                int upscaler = static_cast<int>(config::temporal::_TEMPORAL_AA_UPSCALER);
-                if (ImGui::DragInt("Temporal AA Upscaler", &upscaler, 1, 0, 5)) {
-                    config::temporal::_TEMPORAL_AA_UPSCALER = static_cast<uint32_t>(upscaler);
-                }
                 ImGui::EndTabItem();
             }
 
@@ -1114,16 +1106,7 @@ int main(int argc, char** argv) {
                     config::lumen::VSM_PHYSICAL_PAGE_CAPACITY = static_cast<uint32_t>(pageCap);
                 }
                 ImGui::Checkbox("Hardware Ray Tracing", &config::lumen::_HARDWARE_RAYTRACING);
-                ImGui::Checkbox("Trace Mesh SDF", &config::lumen::_TRACE_MESH_SDF);
-                ImGui::Checkbox("Screen Space Probe Occlusion", &config::lumen::_SCREEN_SPACE_PROBE_OCCLUSION);
-                ImGui::Checkbox("Reflections Allow", &config::lumen::_REFLECTIONS_ALLOW);
                 ImGui::Checkbox("Megalights Enable", &config::lumen::_MEGALIGHTS_ENABLE);
-                ImGui::EndTabItem();
-            }
-
-            // --- Tab Reflection ---
-            if (ImGui::BeginTabItem("Reflection")) {
-                ImGui::Checkbox("Screen Space Reflections", &config::reflections::_SCREEN_SPACE_REFLECTIONS);
                 ImGui::EndTabItem();
             }
 
@@ -1213,17 +1196,6 @@ int main(int argc, char** argv) {
 
             // --- Tab Volumetric ---
             if (ImGui::BeginTabItem("Volumetric")) {
-                int skyQual = static_cast<int>(config::volumetrics::_SKY_ATMOSPHERE_QUALITY);
-                if (ImGui::DragInt("Sky Atmosphere Quality", &skyQual, 1, 1, 5)) {
-                    config::volumetrics::_SKY_ATMOSPHERE_QUALITY = static_cast<uint32_t>(skyQual);
-                }
-                ImGui::Checkbox("Volumetric Fog", &config::volumetrics::_VOLUMETRIC_FOG_ENABLE);
-                int fogGrid = static_cast<int>(config::volumetrics::_VOLUMETRIC_FOG_GRID_PIXEL_SIZE);
-                if (ImGui::DragInt("Fog Grid Pixel Size", &fogGrid, 2, 2, 32)) {
-                    config::volumetrics::_VOLUMETRIC_FOG_GRID_PIXEL_SIZE = static_cast<uint32_t>(fogGrid);
-                }
-                ImGui::DragFloat("Cloud Ray Sample Scale", &config::volumetrics::_VOLUMETRIC_CLOUD_VIEW_RAY_SAMPLE_COUNT_SCALE, 0.05f, 0.1f, 10.0f);
-
                 // --- Local Fog Volumes (UE5.8 rendering-parity gap G8) -- localized box/sphere fog
                 // regions injected additively into the froxel grid (see config::localfog::VOLUMES
                 // and renderer::AtmosVolumetricFogPass). "Enable Local Fog Volumes" is a real runtime
