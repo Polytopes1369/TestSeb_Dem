@@ -228,6 +228,17 @@ target_include_directories(PcgDataModelTests PRIVATE src ${Vulkan_INCLUDE_DIRS})
 add_test(NAME PcgDataModelTests COMMAND PcgDataModelTests)
 add_test(NAME BlockCodecTests COMMAND BlockCodecTests)
 
+# PCG framework roadmap, Phase 2.3 ("Volume Sampler"): PcgVolumeSampler.cpp is the sampler
+# implementation under test; it depends only on the header-only Phase 1 PCG data-model types
+# (PcgPointData.h/PcgSpatialData.h/PcgSeededRandom.h), so this target links no other project
+# source beyond the sampler and the test file itself.
+add_executable(PcgVolumeSamplerTests
+    src/pcg/PcgVolumeSampler.cpp
+    tests/PcgVolumeSamplerTests.cpp
+)
+target_include_directories(PcgVolumeSamplerTests PRIVATE src ${Vulkan_INCLUDE_DIRS})
+add_test(NAME PcgVolumeSamplerTests COMMAND PcgVolumeSamplerTests)
+
 add_executable(AsyncDecompressingLoaderTests
     src/io/AsyncFileStreamer.cpp
     src/io/BlockCodec.cpp
