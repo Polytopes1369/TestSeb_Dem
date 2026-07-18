@@ -164,9 +164,16 @@ namespace renderer {
         // unchanged) -- Release passes 1.0 (no toggle exists there), matching every other Debug-only
         // tuning knob's Release-always-on convention (see renderer::ClusterRenderPipeline's own
         // SetDebugGlint* setters); Debug drives them from the Post FX ImGui sliders.
+        // `mixMaskSharpnessScale` (UE5.8 rendering-parity gap G6, Substrate horizontal mixing):
+        // Debug-only tuning multiplier on every horizontally-mixed material's authored mixContrast
+        // (the blend sharpness), threaded into ResolveViewParamsUBO and consumed by
+        // substrate_bsdf.glsl's EvaluateSubstrateMixMask. Defaults to 1.0 (authored value unchanged);
+        // Release passes 1.0 (no toggle exists there), driven in Debug by the Post FX "Mix Sharpness"
+        // slider (renderer::ClusterRenderPipeline's own SetDebugMixMaskSharpnessScale setter).
         void RecordResolve(VkCommandBuffer cmd, const maths::mat4& viewProj, const maths::mat4& prevViewProj,
             const DirectionalLight& sun, const maths::vec3& cameraPositionWorld, float surfaceWetness, float snowCoverage,
-            float glintDensityScale = 1.0f, float glintIntensityScale = 1.0f, uint32_t debugViewMode = 0);
+            float glintDensityScale = 1.0f, float glintIntensityScale = 1.0f, float mixMaskSharpnessScale = 1.0f,
+            uint32_t debugViewMode = 0);
 
         // --- Phase 1b: binned resolve path (renderer::ClusterShadingBinPass) ---
         // Second-phase init, called once after BOTH Init() above AND `shadingBinPass.Init()` have
@@ -197,13 +204,14 @@ namespace renderer {
         // `snowCoverage` -- see RecordResolve()'s own comment (this Release-live path needs the
         // exact same weather modulation the Debug-only full-screen path gets, since this feature
         // must work correctly in Release, not just under a debug view mode).
-        // `glintDensityScale`/`glintIntensityScale` (UE5.8 rendering-parity gap G5): see RecordResolve's
-        // own comment -- this Release-live path needs the same glint tuning inputs (1.0 in Release ->
-        // the material's authored sparkle renders unchanged). No defaults here: `shadingBinPass` (a
+        // `glintDensityScale`/`glintIntensityScale` (UE5.8 rendering-parity gap G5) and
+        // `mixMaskSharpnessScale` (UE5.8 rendering-parity gap G6): see RecordResolve's own comment --
+        // this Release-live path needs the same tuning inputs (all 1.0 in Release -> the material's
+        // authored sparkle/mix-sharpness renders unchanged). No defaults here: `shadingBinPass` (a
         // non-defaulted trailing reference) follows them, so both callers pass them explicitly.
         void RecordResolveBinned(VkCommandBuffer cmd, const maths::mat4& viewProj,
             const DirectionalLight& sun, const maths::vec3& cameraPositionWorld, float surfaceWetness, float snowCoverage,
-            float glintDensityScale, float glintIntensityScale, const ClusterShadingBinPass& shadingBinPass);
+            float glintDensityScale, float glintIntensityScale, float mixMaskSharpnessScale, const ClusterShadingBinPass& shadingBinPass);
 
         // Binds Phase 3's renderer::VirtualShadowMapPass resources (physical page atlas + sampler,
         // page table, feedback buffer, sun clipmap levels UBO) into BOTH this pass's descriptor
