@@ -42,9 +42,72 @@ const uint kMegaLightsCandidateCount = 16u; // RIS M -- see the approved plan's 
 // own streaming-RIS combine's M-weighting term -- see each call site's own comment.
 const float kMegaLightsTemporalHistoryMaxM = 20.0 * float(kMegaLightsCandidateCount);
 
+// UE5.8 rendering-parity gap G3: per-light-type angular shaping, SHARED by the RIS target-weight
+// proxy below AND by every consumer's own final shading (MegaLightsFinalShade.comp's opaque path,
+// TransparentForward.frag/Tessellation.frag/ParticleRender.frag's inline forward paths,
+// AtmosVolumetricFog.comp's fog in-scatter) so a spot cone / photometric profile / rect one-sided
+// cut is applied identically wherever a MegaLight is evaluated. `L` is the NORMALIZED surface->light
+// direction (so the light->surface / emission direction is -L). Returns a scalar in [0,1]:
+//   POINT        -- always 1 (isotropic, no angular shaping).
+//   SPOT         -- smoothstep between the outer and inner cone cosines (UE5.8's own spot cone falloff).
+//   PHOTOMETRIC  -- one of the plain analytic MEGALIGHT_IES_* profiles (no baked data, CLAUDE.md rule).
+//   RECT         -- the one-sided-emission cut only (1 in front of the emitter, 0 behind unless
+//                   two-sided); a rect's real area response is handled by point-on-rect sampling +
+//                   LTC in the shading code, not by this scalar, so this returns just the facing gate.
+float MegaLightSpotWindow(MegaLight light, vec3 L) {
+    // cos of the angle between the cone axis (light.direction, light->scene) and the light->surface
+    // direction (-L). smoothstep(outer, inner, .) is 1 inside the inner cone, 0 outside the outer.
+    float cosDir = dot(light.direction, -L);
+    return smoothstep(light.spotCosOuter, light.spotCosInner, cosDir);
+}
+
+float MegaLightIESWindow(MegaLight light, vec3 L) {
+    vec3 d = -L; // light -> surface (emission) direction.
+    float cosTheta = clamp(dot(light.direction, d), -1.0, 1.0);
+    uint profile = MegaLightIESProfile(light);
+    if (profile == MEGALIGHT_IES_NARROW) {
+        // Tight pencil beam: a high-exponent forward cosine lobe, zero on the back hemisphere.
+        return pow(max(cosTheta, 0.0), 8.0);
+    } else if (profile == MEGALIGHT_IES_WIDE) {
+        // Broad flood: a gentle ramp that stays near-uniform across most of the forward hemisphere
+        // and only fades near/behind the equator.
+        return smoothstep(-0.25, 0.55, cosTheta);
+    }
+    // MEGALIGHT_IES_BARN -- asymmetric rectangular "barn-door" cut. Project the emission direction
+    // onto the two in-plane axes (tangentU and the derived tangentV) and gate each independently with
+    // a different width, plus a lateral offset on the U axis, to fake the characteristic lopsided
+    // rectangular pool a real barn-door fixture throws.
+    float fwd = cosTheta;
+    if (fwd <= 1.0e-3) return 0.0;
+    vec3 tV = cross(light.direction, light.tangentU);
+    float u = dot(d, light.tangentU) / fwd; // tan(angle) in the U plane.
+    float v = dot(d, tV) / fwd;             // tan(angle) in the V plane.
+    float gateU = 1.0 - smoothstep(0.85, 1.45, abs(u - 0.20)); // wide, offset to one side.
+    float gateV = 1.0 - smoothstep(0.28, 0.55, abs(v));         // narrow.
+    return saturate(fwd) * gateU * gateV;
+}
+
+float MegaLightAngularShaping(MegaLight light, vec3 L) {
+    if (light.lightType == MEGALIGHT_TYPE_SPOT) {
+        return MegaLightSpotWindow(light, L);
+    } else if (light.lightType == MEGALIGHT_TYPE_PHOTOMETRIC) {
+        return MegaLightIESWindow(light, L);
+    } else if (light.lightType == MEGALIGHT_TYPE_RECT) {
+        // One-sided emission gate: a surface behind the rect (relative to its normal) receives
+        // nothing unless the light is flagged two-sided.
+        if (MegaLightRectTwoSided(light)) return 1.0;
+        return (dot(light.direction, -L) > 0.0) ? 1.0 : 0.0;
+    }
+    return 1.0; // MEGALIGHT_TYPE_POINT.
+}
+
 // Unshadowed contribution-magnitude proxy used both to build reservoir weights AND (implicitly, via
 // SelectLightRIS's outInvPdf) to cancel out of the final unbiased estimator -- see that function's
-// own comment. Clamped to avoid a near-zero-distance sample dominating the reservoir.
+// own comment. Clamped to avoid a near-zero-distance sample dominating the reservoir. G3: for a
+// non-POINT light the proxy is additionally scaled by MegaLightAngularShaping so the RIS candidate
+// draw is biased AWAY from a light whose cone/profile/facing barely reaches this shading point (a
+// spot pointing away contributes ~0 and should rarely win the reservoir) -- purely an importance
+// bias, the unbiased estimator stays correct because the SAME proxy divides back out in outInvPdf.
 float MegaLightTargetWeight(MegaLight light, vec3 worldPos, vec3 normal) {
     vec3 toLight = light.position - worldPos;
     float distSq = max(dot(toLight, toLight), 1.0e-4);
@@ -60,7 +123,7 @@ float MegaLightTargetWeight(MegaLight light, vec3 worldPos, vec3 normal) {
     float windowSq = 1.0 - nd2 * nd2;
     float window = saturate(windowSq * windowSq);
 
-    float w = light.intensity * NdotL / distSq * window;
+    float w = light.intensity * NdotL / distSq * window * MegaLightAngularShaping(light, lightDir);
     return min(w, 50.0);
 }
 

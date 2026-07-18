@@ -1,7 +1,10 @@
 #pragma once
 // Feature 1 of Phase 4 (MegaLights advanced roadmap: light BVH for RIS spatial bias, temporal
 // ReSTIR with revalidated visibility -- see the approved plan). A CPU-built spatial acceleration
-// structure over renderer::MegaLight AABBs (light.position +/- light.radius), consumed by
+// structure over renderer::MegaLight AABBs (shape-aware as of UE5.8-parity gap G3: an isotropic
+// point/photometric light still bounds as position +/- radius, but a spot light bounds its actual
+// cone and a rect light its actual illuminated slab -- see BuildLightBVH's own ComputeLightAABB for
+// the exact per-type derivation), consumed by
 // megalights_bvh.glsl's GPU-side GatherSpatialLightCandidates to bias MegaLightsShade.comp's
 // SelectLightRIS candidate draw toward lights actually near the current shading point. This is
 // NOT an O(N)-iteration-avoidance structure -- SelectLightRIS already draws a fixed O(1) budget of
@@ -66,8 +69,9 @@ namespace geometry {
     };
 
     // Builds a median-split (top-down, largest-centroid-extent-axis) binary BVH over
-    // `lights[0, lightCount)`'s world-space AABBs, each derived from `light.position +/-
-    // light.radius` (confirmed fields on renderer::MegaLight, see MegaLightsTypes.h). Returns a
+    // `lights[0, lightCount)`'s world-space AABBs, each derived shape-awarely from the light's own
+    // type/position/radius/direction/cone/rect fields (G3 -- see the .cpp's own ComputeLightAABB;
+    // confirmed fields on renderer::MegaLight, see MegaLightsTypes.h). Returns a
     // LightBVH with empty nodes/lightIndices when lightCount == 0 -- a valid, no-op BVH:
     // GatherSpatialLightCandidates (megalights_bvh.glsl) simply finds no candidates, and
     // SelectLightRIS falls back to its own full-population draw (see megalights_ris.glsl's own

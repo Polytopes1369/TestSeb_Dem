@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cfloat>
+#include <cmath>
 #include <format>
 
 namespace geometry {
@@ -18,6 +19,73 @@ namespace geometry {
 
         float AxisComponent(const maths::vec3& v, int axis) {
             return axis == 0 ? v.x : (axis == 1 ? v.y : v.z);
+        }
+
+        // UE5.8 rendering-parity gap G3: compute a light's WORLD-space AABB honoring its actual shape,
+        // not the pre-G3 pure `position +/- radius` sphere bound. A too-tight bound would let
+        // GatherSpatialLightCandidates (megalights_bvh.glsl) miss a shading point a long thin spot
+        // cone actually reaches; a too-loose one (a sphere sized off `radius` for a wide flat rect)
+        // would over-include every distant pixel and defeat the BVH's whole spatial-bias purpose.
+        //   POINT / PHOTOMETRIC -- isotropic reach: the original position +/- radius sphere bound
+        //                          (a photometric profile only SHAPES intensity within that reach,
+        //                          it never extends past `radius`, so the sphere bound stays correct).
+        //   SPOT                -- the cone's own bound: the union of the apex (light.position) and
+        //                          the base disk at position + direction*radius, whose radius is
+        //                          radius * tan(outerHalfAngle). A disk of radius r about unit normal
+        //                          n has per-axis extent r * sqrt(1 - n[axis]^2) (the projection of
+        //                          the disk onto each axis), the standard tight disk AABB.
+        //   RECT                -- the illuminated slab in front of the emitter: the union of the 4
+        //                          rect corners (center +/- tangentU*halfX +/- tangentV*halfY) and
+        //                          those same 4 corners pushed forward by direction*radius, i.e. the
+        //                          oriented box spanning the rect quad through its full range of reach.
+        //                          A two-sided rect additionally unions the corners pushed BACKWARD.
+        void ComputeLightAABB(const renderer::MegaLight& light, maths::vec3& outMin, maths::vec3& outMax) {
+            maths::ResetAABB(outMin, outMax);
+            const uint32_t type = light.lightType;
+
+            if (type == static_cast<uint32_t>(renderer::MegaLightType::Spot)) {
+                const maths::vec3 axis = light.direction.Normalize();
+                // outer half-angle cosine -> tan for the base-disk radius. Clamp cos into (eps,1] so a
+                // hemispherical (~90 degree) outer cone stays finite rather than blowing tan up to inf.
+                const float cosOuter = std::clamp(light.spotCosOuter, 1.0e-2f, 1.0f);
+                const float sinOuter = std::sqrt(std::max(0.0f, 1.0f - cosOuter * cosOuter));
+                const float baseRadius = light.radius * (sinOuter / cosOuter);
+                const maths::vec3 baseCenter = light.position + axis * light.radius;
+                const maths::vec3 diskExtent{
+                    baseRadius * std::sqrt(std::max(0.0f, 1.0f - axis.x * axis.x)),
+                    baseRadius * std::sqrt(std::max(0.0f, 1.0f - axis.y * axis.y)),
+                    baseRadius * std::sqrt(std::max(0.0f, 1.0f - axis.z * axis.z)) };
+                maths::ExpandAABB(outMin, outMax, light.position);        // apex
+                maths::ExpandAABB(outMin, outMax, baseCenter - diskExtent); // base disk min corner
+                maths::ExpandAABB(outMin, outMax, baseCenter + diskExtent); // base disk max corner
+                return;
+            }
+
+            if (type == static_cast<uint32_t>(renderer::MegaLightType::Rect)) {
+                const maths::vec3 n = light.direction.Normalize();
+                const maths::vec3 u = light.tangentU.Normalize();
+                const maths::vec3 v = n.Cross(u);
+                const maths::vec3 hu = u * light.rectHalfExtentX;
+                const maths::vec3 hv = v * light.rectHalfExtentY;
+                const maths::vec3 reach = n * light.radius;
+                const bool twoSided = (light.iesProfileAndFlags & renderer::kMegaLightFlagRectTwoSided) != 0u;
+                for (int su = -1; su <= 1; su += 2) {
+                    for (int sv = -1; sv <= 1; sv += 2) {
+                        const maths::vec3 corner = light.position + hu * static_cast<float>(su) + hv * static_cast<float>(sv);
+                        maths::ExpandAABB(outMin, outMax, corner);          // the quad itself
+                        maths::ExpandAABB(outMin, outMax, corner + reach);  // pushed to full front reach
+                        if (twoSided) {
+                            maths::ExpandAABB(outMin, outMax, corner - reach); // and back reach
+                        }
+                    }
+                }
+                return;
+            }
+
+            // POINT / PHOTOMETRIC: the original isotropic sphere bound.
+            const maths::vec3 radiusExtent{ light.radius, light.radius, light.radius };
+            maths::ExpandAABB(outMin, outMax, light.position - radiusExtent);
+            maths::ExpandAABB(outMin, outMax, light.position + radiusExtent);
         }
 
         // Builds the subtree over items[begin, end), appends it (depth-first, left subtree fully
@@ -98,12 +166,14 @@ namespace geometry {
         items.reserve(lightCount);
         for (uint32_t i = 0; i < lightCount; ++i) {
             const renderer::MegaLight& light = lights[i];
-            const maths::vec3 radiusExtent{ light.radius, light.radius, light.radius };
 
             BuildLight item{};
             item.originalIndex = i;
-            item.boundsMin = light.position - radiusExtent;
-            item.boundsMax = light.position + radiusExtent;
+            // G3: shape-aware oriented AABB (spot cone / rect slab / isotropic sphere) -- see
+            // ComputeLightAABB's own comment. The split heuristic still keys off the light POSITION
+            // as the centroid (a stable per-light point regardless of shape), matching how EntityBVH
+            // splits on its own precomputed AABB centroids.
+            ComputeLightAABB(light, item.boundsMin, item.boundsMax);
             item.centroid = light.position;
             items.push_back(item);
         }

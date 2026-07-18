@@ -112,6 +112,10 @@ layout(std140, set = 0, binding = 7) uniform MegaLightsViewParamsUBO {
     // ResolveViewParamsUBO.cameraPositionWorld comment for the identical addition pattern there).
     vec3 cameraPositionWorld;
     float _pad2;
+    // G3: per-type enable/scale controls -- declared here only for byte-identical UBO layout across
+    // all three MegaLights stages; Stage 1 (this shader) never reads it (only MegaLightsFinalShade.comp
+    // does), same "declared but unused" convention as spatialReuseRadiusPixels above.
+    vec4 typedLightControls;
 } g_ViewParams;
 
 // Substrate integration: this pixel's clamped materialID (0xFFFF = background), letting this

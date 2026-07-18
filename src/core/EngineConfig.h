@@ -132,6 +132,19 @@ inline float SPATIAL_BIAS_RADIUS = 3.25f;
 // heuristic/thresholds as the temporal reuse disocclusion test) still passes for most of a
 // continuous surface at this demo's typical view distances.
 inline float SPATIAL_REUSE_RADIUS_PIXELS = 24.0f;
+
+// UE5.8 rendering-parity gap G3 (extended light-type roster: spot / rect-area / photometric). Live,
+// Debug-tunable per-TYPE enable switches + a global intensity multiplier for the new (non-point)
+// types -- threaded into MegaLightsViewParamsUBO.typedLightControls every frame by
+// renderer::MegaLightsPass::RecordShade and consumed by MegaLightsFinalShade.comp. Not a
+// hardware-quality tier (same rationale as SPATIAL_BIAS_RADIUS above), so NOT mirrored into the
+// per-profile EngineConfig_{Low,...}.h overrides. Defaults keep every new type ON at unit intensity,
+// so a Release build (which never opens the Debug ImGui panel that mutates these) always shows the
+// full roster exactly as authored.
+inline bool SPOT_LIGHTS_ENABLED = true;
+inline bool RECT_LIGHTS_ENABLED = true;
+inline bool PHOTOMETRIC_LIGHTS_ENABLED = true;
+inline float TYPED_LIGHT_INTENSITY_SCALE = 1.0f;
 } // namespace megalights
 
 namespace postprocess {
