@@ -673,6 +673,25 @@ namespace renderer {
         //      same instance count as step 2 while world::PcgCellLoader::GetCacheHitCount()/
         //      GetCacheMissCount() prove pcg::GeneratePcgContentForCell was NOT called again (exactly
         //      1 total cache hit, 0 additional misses beyond the 1 the first load already produced).
+        //   6. PCG roadmap Phase 6.5 ("Bake-vs-Runtime Determinism Validation"), this method's own
+        //      internal STEP 5: everything above only ever compares AGGREGATE INSTANCE COUNTS
+        //      (GetLiveInstanceCount()) -- never whether individual spawn requests (position/
+        //      rotation/scale/meshID/materialID, in order) actually survived the LIVE runtime path
+        //      unchanged. This step re-derives, BY HAND, the exact pcg::PcgCellGenerationInput
+        //      world::PcgCellLoader::StageFullDetailGeneration() built internally for this same cell
+        //      back in step 3's original load, and calls pcg::GeneratePcgContentForCell() on it
+        //      DIRECTLY -- entirely independent of cellLoader/its cache/any worker-thread plumbing --
+        //      simulating exactly what a hypothetical future offline bake tool would do (see
+        //      pcg::PcgCellGenerator.h's own top-of-file comment, which explicitly names that
+        //      caller). That "simulated bake" result, run once on this thread and once on a
+        //      genuinely separate std::thread (joined before comparison), must be BYTE-IDENTICAL to
+        //      itself across threads (proving pcg::GeneratePcgContentForCell is deterministic across
+        //      threads, not just repeated same-thread calls -- see tests/PcgCellGeneratorTests.cpp's
+        //      own TestDeterminism for the same-thread case this closes the gap on) AND
+        //      byte-identical to world::PcgCellLoader::GetCachedResultForTest()'s own
+        //      live-runtime-cached result for the same coord (proving the live streaming-triggered
+        //      path never silently diverges from what a direct/offline-bake-style call to the same
+        //      pure function would produce).
         // Not fatal on failure (logged only), matching every other smoke test's own convention. Whole
         // declaration + definition compiled out of Release, matching RunPcgFullPipelineSmokeTest's
         // own convention -- world::PcgCellLoader itself is ALSO whole-file Debug-only (see that

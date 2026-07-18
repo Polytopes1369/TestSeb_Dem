@@ -120,6 +120,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <mutex>
+#include <optional>
 #include <unordered_map>
 #include <vector>
 
@@ -229,6 +230,31 @@ namespace world {
         size_t GetCacheHitCount() const { std::lock_guard<std::mutex> lock(m_CacheMutex); return m_CacheHitCount; }
         size_t GetCacheMissCount() const { std::lock_guard<std::mutex> lock(m_CacheMutex); return m_CacheMissCount; }
         size_t GetCachedCellCount() const { std::lock_guard<std::mutex> lock(m_CacheMutex); return m_GenerationResultCache.size(); }
+
+        // Phase 6.5 ("Bake-vs-Runtime Determinism Validation") accessor -- worker-thread-safe (locks
+        // m_CacheMutex), same convention as the 3 accessors just above. Returns a COPY of the cached
+        // pcg::PcgCellGenerationResult for `coord` (std::nullopt if nothing is cached for it yet --
+        // e.g. LoadCellFullDetail() was never called for this coord, or that coord has no overlapping
+        // PCG volume at all, so StageFullDetailGeneration() never reached its cache-populating path).
+        // This is the ONE thing GetCacheHitCount()/GetCacheMissCount()/GetLoadedCellCount() above
+        // cannot expose: they only ever prove a hit/miss/load HAPPENED, never what the live runtime
+        // path's own generated content actually WAS. RunPcgCellLoaderSmokeTest's own Phase 6.5 step
+        // uses this to compare the exact spawn-request list the LIVE world::PcgCellLoader path
+        // produced/cached against a separately, directly-computed pcg::GeneratePcgContentForCell()
+        // call simulating a hypothetical offline bake tool -- proving the live path never silently
+        // diverges (wrong order, corrupted transform, dropped/duplicated request) from what generation
+        // itself actually produced, a property no existing count-only accessor could ever catch. A
+        // copy (not a reference) is returned for the exact same reason the cache-hit path in
+        // StageFullDetailGeneration() (.cpp) copies out while still holding the lock: cheap (a
+        // handful of small PcgSpawnRequest structs at most, see this cache's own bound comment), and
+        // avoids handing out a reference a concurrent worker thread's insert for a DIFFERENT coord
+        // could invalidate via unordered_map rehashing.
+        std::optional<pcg::PcgCellGenerationResult> GetCachedResultForTest(const CellCoord& coord) const {
+            std::lock_guard<std::mutex> lock(m_CacheMutex);
+            auto it = m_GenerationResultCache.find(coord);
+            if (it == m_GenerationResultCache.end()) return std::nullopt;
+            return it->second;
+        }
 
     private:
         // Shared staging helper for LoadCellFullDetail(): looks up `coord`, runs
