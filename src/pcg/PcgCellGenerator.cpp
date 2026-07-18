@@ -10,7 +10,9 @@
 #include "pcg/PcgSeededRandom.h"
 #include "pcg/PcgSpatialData.h"
 
+#include <chrono>
 #include <filesystem>
+#include <format>
 #include <fstream>
 #include <limits>
 #include <optional>
@@ -250,6 +252,20 @@ namespace pcg {
             return result;
         }
 
+#ifndef NDEBUG
+        // PCG roadmap Phase 9.3 ("Profiling & Per-Frame Generation Budget"): real wall-clock cost of
+        // THIS call, on whichever thread called it -- the number PcgCellLoader.h's own "Phase 6.4"
+        // comment justifies caching against, and the number a future live caller's
+        // world::IWorldCellLoader::LoadCellFullDetail() worker-thread dispatch (see that interface's
+        // own threading contract, StreamingTypes.h) exists specifically to keep OFF the main thread.
+        // The clock reads themselves (not just the LOG_INFO call below, which is already a zero-cost
+        // no-op in Release per core/Logger.h's own guarantee) are wrapped in this #ifndef NDEBUG block
+        // too -- this file ships in EVERY configuration including Release (see this file's own header
+        // comment), so per CLAUDE.md rule 8 ("zero overhead debug tooling"), nothing measurable may
+        // persist in a Release build, not even a couple of steady_clock::now() calls.
+        const auto profileStart = std::chrono::steady_clock::now();
+#endif
+
         // Built fresh per call, not cached/shared across calls -- hoisting this (and any per-volume
         // parsed-graph result) out of the per-cell hot path is exactly Phase 6.4's ("Generation
         // Caching") job, deliberately out of scope for this phase, which stays a self-contained, pure
@@ -264,6 +280,15 @@ namespace pcg {
         for (const worldpartition::PcgVolumeDesc& volumeDesc : input.overlappingVolumes) {
             GenerateForOneVolume(volumeDesc, input.cellCoord, cellVolume, registry, result.spawnRequests);
         }
+
+#ifndef NDEBUG
+        const double elapsedMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - profileStart).count();
+        LOG_INFO(std::format(
+            "[PcgCellGenerator] GeneratePcgContentForCell(cell=({},{},{}), volumes={}): {} spawn request(s) "
+            "produced in {:.3f} ms (registry build + per-volume disk read/JSON parse/graph evaluation/clip).",
+            input.cellCoord.x, input.cellCoord.y, input.cellCoord.z,
+            input.overlappingVolumes.size(), result.spawnRequests.size(), elapsedMs));
+#endif
 
         return result;
     }

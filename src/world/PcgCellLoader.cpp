@@ -3,6 +3,7 @@
 
 #include "core/Logger.h"
 
+#include <chrono>
 #include <format>
 #include <mutex>
 #include <unordered_set>
@@ -75,6 +76,14 @@ namespace world {
         // hit, freshly generated on a miss) and is always a value THIS function fully owns from this
         // point on -- std::move-ing out of it below (building the PcgCellLoadEvent) is therefore
         // always safe, regardless of which path filled it in. ---
+        // PCG roadmap Phase 9.3 ("Profiling & Per-Frame Generation Budget"): times the cache-HIT path
+        // specifically (a plain mutex lock + unordered_map lookup + small-struct-vector copy) to
+        // quantify, with a real number, exactly how much Phase 6.4's cache saves versus a MISS -- see
+        // pcg::GeneratePcgContentForCell's own Phase 9.3 timing (PcgCellGenerator.cpp) for the MISS
+        // side of that comparison; deliberately not re-measured here a second time to avoid two
+        // overlapping timers reporting near-duplicate numbers for the same underlying call.
+        const auto lookupStart = std::chrono::steady_clock::now();
+
         pcg::PcgCellGenerationResult result;
         bool cacheHit = false;
         {
@@ -90,9 +99,10 @@ namespace world {
         }
 
         if (cacheHit) {
+            const double lookupMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - lookupStart).count();
             LOG_INFO(std::format(
                 "[PcgCellLoader] Cache HIT for cell ({}, {}): reusing {} previously-generated spawn "
-                "request(s), pcg::GeneratePcgContentForCell was NOT called.", coord.x, coord.z, result.spawnRequests.size()));
+                "request(s) in {:.4f} ms, pcg::GeneratePcgContentForCell was NOT called.", coord.x, coord.z, result.spawnRequests.size(), lookupMs));
         } else {
             // worldpartition::CellCoord (3-axis, y always 0 in this codebase's Grid2D-only runtime
             // streaming grid) -- see PcgVolumeCellIndex.h's own ToOfflineCellCoord comment.
@@ -150,11 +160,29 @@ namespace world {
         m_PendingEvents.push_back(std::move(event));
     }
 
-    void PcgCellLoader::Pump() {
+    void PcgCellLoader::Pump(uint32_t maxEventsThisCall) {
+        const auto pumpStart = std::chrono::steady_clock::now();
+
         std::vector<PcgCellLoadEvent> events;
+        size_t deferredCount = 0;
         {
             std::lock_guard<std::mutex> lock(m_EventsMutex);
-            events.swap(m_PendingEvents);
+            if (m_PendingEvents.size() <= static_cast<size_t>(maxEventsThisCall)) {
+                events.swap(m_PendingEvents);
+            } else {
+                // PCG roadmap Phase 9.3 ("Profiling & Per-Frame Generation Budget"): more events are
+                // staged than this call's budget allows -- drain only the OLDEST `maxEventsThisCall`
+                // (m_PendingEvents is appended-to in staging order by LoadCellFullDetail/UnloadCell,
+                // so its front is always the longest-waiting event) and leave the rest queued for a
+                // LATER Pump() call. Mirrors core::LoadingManager::PumpCompletions(uint32_t)'s own
+                // "returns the number actually invoked, may be less than requested" contract -- see
+                // this method's own declaration comment (PcgCellLoader.h) and this file's own
+                // top-of-file "Phase 9.3" comment for the full rationale.
+                const auto splitPoint = m_PendingEvents.begin() + static_cast<std::ptrdiff_t>(maxEventsThisCall);
+                events.assign(std::make_move_iterator(m_PendingEvents.begin()), std::make_move_iterator(splitPoint));
+                m_PendingEvents.erase(m_PendingEvents.begin(), splitPoint);
+                deferredCount = m_PendingEvents.size();
+            }
         }
 
         for (PcgCellLoadEvent& event : events) {
@@ -192,6 +220,22 @@ namespace world {
                 m_SpawnManager.DespawnInstances(it->second);
                 m_CellToAcquiredSlots.erase(it);
             }
+        }
+
+        // PCG roadmap Phase 9.3 ("Profiling & Per-Frame Generation Budget"): one summary line per
+        // non-trivial Pump() call -- total events actually drained this call, the budget that was in
+        // effect, real wall-clock cost, and (the new, Phase-9.3-added behavior) how many events were
+        // left queued for a later call because this call's budget was exceeded. Silent (no log line)
+        // when there was nothing to do, matching every other per-frame poll in this codebase's own
+        // "don't spam the log every frame when idle" convention.
+        if (!events.empty() || deferredCount > 0) {
+            const double pumpMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - pumpStart).count();
+            LOG_INFO(std::format(
+                "[PcgCellLoader] Pump: drained {} event(s) this call (budget={}) in {:.4f} ms.{}",
+                events.size(), maxEventsThisCall, pumpMs,
+                deferredCount > 0
+                    ? std::format(" {} event(s) deferred to a later Pump() call.", deferredCount)
+                    : std::string()));
         }
     }
 

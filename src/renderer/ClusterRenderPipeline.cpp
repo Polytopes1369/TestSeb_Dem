@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cassert>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <format>
@@ -4679,6 +4680,165 @@ bool ClusterRenderPipeline::RunPcgCellLoaderSmokeTest(
         "-- {}. A real offline bake tool calling GeneratePcgContentForCell directly would NOT reproduce what "
         "the live streaming path actually served.", mismatchBakeVsRuntime));
     return false;
+  }
+
+  // =========================================================================================
+  // STEP 6 -- PCG roadmap Phase 9.3 ("Profiling & Per-Frame Generation Budget"): everything above
+  // (Steps 1-5) deliberately uses a TINY 3x3=9-point single-volume/single-cell scenario -- correct
+  // for proving Phase 6.3/6.4/6.5's own logic, but useless for characterizing real per-cell cost.
+  // This step builds a SEPARATE, denser, 4-cell scenario purely to get REAL wall-clock numbers (via
+  // the Phase 9.3 timing this same commit added to pcg::GeneratePcgContentForCell and
+  // world::PcgCellLoader::StageFullDetailGeneration/Pump -- see those functions' own comments) for a
+  // "moderately dense authored cell", AND to concretely demonstrate Pump()'s new `maxEventsThisCall`
+  // budget actually deferring overflow to a later call rather than merely asserting that it does.
+  // Uses its OWN scratch actors directory / world::PcgCellLoader / PcgInstanceDrawPass (Steps 1-5's
+  // own `pcgPass` was already Shutdown() above) so it cannot interact with anything already
+  // verified. Every check below is LOGGED, never fatal (no `return false`) -- this step characterizes
+  // performance, it does not gate correctness (already fully proven by Steps 1-5 above).
+  // =========================================================================================
+  {
+    const std::filesystem::path profilingActorsDir = scratchDir / "profiling_actors";
+    std::error_code profilingDirEc;
+    std::filesystem::remove_all(profilingActorsDir, profilingDirEc);
+    std::filesystem::create_directories(profilingActorsDir, profilingDirEc);
+
+    // A 2x2 block of cells (4 cells total, world [400,440) x [400,440) at this test's own
+    // kTestCellSize=20) -- far from cell (0,0)/(5,5) already used above, so zero interaction with
+    // Steps 1-5. 32x32=1024 points spread across the whole block (~256/cell average) -- a defensible
+    // "moderately dense" scatter (roughly one point per 1.35 sq. m, comparable to a dense grass/rock/
+    // bush layer), spread over MULTIPLE cells specifically so the Pump() budget demo below (STEP 6b)
+    // has more than kDefaultMaxEventsPerPump-worth of staged events to actually defer.
+    constexpr int32_t kProfCellBase = 20; // Cells (20,20)..(21,21).
+    constexpr int32_t kProfGridCount = 32; // 32x32 = 1024 points.
+    constexpr float kProfOrigin = 402.0f;  // 1-unit margin inside the block's [400,440) outer edge.
+    constexpr float kProfSpacing = 1.16f;  // 402 + 31*1.16 = 437.96, safely inside 439 (1-unit inner margin).
+
+    pcg::PcgGraph profGraph;
+    std::string profCatalogError;
+    pcg::PcgAttributeSet profGridParams;
+    profGridParams.Set("countX", kProfGridCount);
+    profGridParams.Set("countZ", kProfGridCount);
+    profGridParams.Set("spacing", kProfSpacing);
+    profGridParams.Set("originX", kProfOrigin);
+    profGridParams.Set("originZ", kProfOrigin);
+    // Reuses the SAME "pcg.smoketest.cellloader_grid_points" node type Step 1 already registered
+    // above (PCG_REGISTER_NODE_TYPE's own registry is process-global -- see that node's own
+    // registration comment) -- only the params (a denser grid) differ, and `catalog` (built once,
+    // top of this function) already knows this type.
+    const uint32_t profSourceNode = pcg::AddNodeFromCatalog(profGraph, catalog, "pcg.smoketest.cellloader_grid_points", profGridParams, "GridPoints", &profCatalogError);
+
+    pcg::PcgAttributeSet profSpawnerParams;
+    std::vector<pcg::PcgMeshSpawnEntry> profPalette;
+    for (const PcgFullPipelineSmokeTestMeshDesc& mesh : weightedMeshes) {
+      profPalette.push_back(pcg::PcgMeshSpawnEntry{ mesh.meshID, mesh.materialID, mesh.weight });
+    }
+    pcg::EncodeWeightedMeshList(profSpawnerParams, profPalette);
+    profSpawnerParams.Set(pcg::kSpawnerDensityThresholdParamKey, 0.0f);
+    profSpawnerParams.Set(pcg::kSpawnerSeedParamKey, 9300);
+    const uint32_t profSpawnerNode = pcg::AddNodeFromCatalog(profGraph, catalog, "pcg.spawner.weighted_mesh", profSpawnerParams, "Spawner", &profCatalogError);
+
+    std::string profLinkError;
+    const bool profGraphOk = (profSourceNode != pcg::PcgNode::kInvalidId) && (profSpawnerNode != pcg::PcgNode::kInvalidId) &&
+        (profGraph.AddLink(profSourceNode, "Points", profSpawnerNode, "Points", &profLinkError) == pcg::PcgGraph::AddLinkStatus::Ok);
+
+    if (!profGraphOk) {
+      LOG_ERROR(std::format("[ClusterRenderPipeline] PCG Phase 9.3 profiling step SKIPPED (non-fatal): could not build the profiling graph ({} / {}).", profCatalogError, profLinkError));
+    } else {
+      const std::filesystem::path profGraphAssetPath = scratchDir / "Phase93ProfilingGrid.pcggraph.json";
+      {
+        std::ofstream profGraphOut(profGraphAssetPath, std::ios::binary | std::ios::trunc);
+        profGraphOut << profGraph.SerializeToJson();
+      }
+
+      worldpartition::PcgVolumeDesc profVolumeDesc;
+      profVolumeDesc.bounds.boundsMin = { 401.0f, 0.0f, 401.0f };
+      profVolumeDesc.bounds.boundsMax = { 439.0f, 5.0f, 439.0f };
+      profVolumeDesc.graphAssetPath = profGraphAssetPath.string();
+      profVolumeDesc.seed = 9300u;
+
+      worldpartition::UuidGenerator profUuidGen(0x504347395F50524FULL); // "PCG9_PRO" folded, distinct from Step 1's seed.
+      const worldpartition::Uuid profVolumeUuid = profUuidGen.Generate();
+      const worldpartition::ActorRecord profVolumeRecord = worldpartition::BuildPcgVolumeActorRecord(profVolumeUuid, profVolumeDesc);
+      const std::filesystem::path profVolumeActorPath = worldpartition::MakeActorFilePath(profilingActorsDir, profVolumeUuid);
+
+      if (!worldpartition::WriteActorFile(profVolumeActorPath, profVolumeRecord)) {
+        LOG_ERROR("[ClusterRenderPipeline] PCG Phase 9.3 profiling step SKIPPED (non-fatal): could not write the scratch profiling PcgVolume actor file.");
+      } else {
+        constexpr uint32_t kProfMaxInstances = 1536u; // Headroom over the 1024-point grid.
+        PcgInstanceDrawPass profPass;
+        maths::vec3 profSunDir = (m_BaseSunDirection.Length() > 0.0f) ? m_BaseSunDirection.Normalize() : maths::vec3(0.3f, 0.8f, 0.4f).Normalize();
+        profPass.Init(m_Device, m_Allocator, commandPool, queue,
+            m_PagePool.GetPhysicalPoolBuffer(), GenerateShowcaseMaterialTable(),
+            profSunDir, maths::vec3(1.0f, 0.96f, 0.9f), 3.0f, maths::vec3(0.12f, 0.12f, 0.14f),
+            VK_FORMAT_R16G16B16A16_SFLOAT, VK_FORMAT_D32_SFLOAT,
+            kProfMaxInstances, 32768u);
+        pcg::PcgInstanceSpawnManager profSpawnManager(profPass);
+
+        world::PcgCellLoader profCellLoader(profilingActorsDir, kTestCellSize, profSpawnManager);
+        LOG_INFO(std::format(
+            "[ClusterRenderPipeline] PCG Phase 9.3 profiling: indexed {} volume(s) into {} cell(s) "
+            "(expected 1 volume spanning a 2x2=4-cell block).",
+            profCellLoader.GetVolumeCount(), profCellLoader.GetIndexedCellCount()));
+
+        // --- STEP 6a: real generation cost for a moderately dense cell -- each LoadCellFullDetail()
+        // below triggers exactly one Phase-6.4 cache-MISS pcg::GeneratePcgContentForCell() call,
+        // timed and logged by THIS SAME commit's PcgCellGenerator.cpp instrumentation (see that
+        // function's own "[PcgCellGenerator] GeneratePcgContentForCell(...)" log line for the
+        // authoritative per-cell number) -- aggregate wall-clock across all 4 measured here too, for
+        // a single top-level number. ---
+        const auto genAllStart = std::chrono::steady_clock::now();
+        const std::array<world::CellCoord, 4> profCells = {
+            world::CellCoord{ kProfCellBase, kProfCellBase }, world::CellCoord{ kProfCellBase + 1, kProfCellBase },
+            world::CellCoord{ kProfCellBase, kProfCellBase + 1 }, world::CellCoord{ kProfCellBase + 1, kProfCellBase + 1 },
+        };
+        for (const world::CellCoord& coord : profCells) {
+          profCellLoader.LoadCellFullDetail(coord);
+        }
+        const double genAllMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - genAllStart).count();
+
+        size_t totalRequestedInstances = 0;
+        for (const world::CellCoord& coord : profCells) {
+          if (auto cached = profCellLoader.GetCachedResultForTest(coord)) totalRequestedInstances += cached->spawnRequests.size();
+        }
+        LOG_INFO(std::format(
+            "[ClusterRenderPipeline] PCG Phase 9.3 profiling (STEP 6a): 4x LoadCellFullDetail (all cache "
+            "MISSes, ~256 pts/cell average, 1024 total authored points) took {:.3f} ms aggregate "
+            "({:.3f} ms/cell average); {} total spawn request(s) staged across the 4 cells; cache "
+            "miss count = {}.",
+            genAllMs, genAllMs / 4.0, totalRequestedInstances, profCellLoader.GetCacheMissCount()));
+
+        // --- STEP 6b: Pump() budget demonstration -- 4 events are now staged (one per cell above),
+        // MORE than a deliberately small budget of 2, so this concretely PROVES (not just asserts)
+        // that Pump(2) only drains the oldest 2 and defers the rest, across two calls. ---
+        const uint32_t demoBudget = 2u;
+        const auto pump1Start = std::chrono::steady_clock::now();
+        profCellLoader.Pump(demoBudget);
+        const double pump1Ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - pump1Start).count();
+        const size_t loadedAfterPump1 = profCellLoader.GetLoadedCellCount();
+        const uint32_t liveAfterPump1 = profPass.GetLiveInstanceCount();
+
+        const auto pump2Start = std::chrono::steady_clock::now();
+        profCellLoader.Pump(demoBudget);
+        const double pump2Ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - pump2Start).count();
+        const size_t loadedAfterPump2 = profCellLoader.GetLoadedCellCount();
+        const uint32_t liveAfterPump2 = profPass.GetLiveInstanceCount();
+
+        const bool budgetDemoOk = (loadedAfterPump1 <= 2) && (loadedAfterPump2 == 4) && (liveAfterPump2 == totalRequestedInstances) && (liveAfterPump1 < liveAfterPump2);
+        LOG_INFO(std::format(
+            "[ClusterRenderPipeline] PCG Phase 9.3 profiling (STEP 6b), budget={} events/call: Pump() #1 "
+            "drained to {} loaded cell(s)/{} live instance(s) in {:.4f} ms; Pump() #2 drained the "
+            "DEFERRED remainder to {} loaded cell(s)/{} live instance(s) in {:.4f} ms. Deferral behavior "
+            "{}.",
+            demoBudget, loadedAfterPump1, liveAfterPump1, pump1Ms, loadedAfterPump2, liveAfterPump2, pump2Ms,
+            budgetDemoOk ? "VERIFIED (Pump() #1 did NOT drain all 4 staged events; #2 drained exactly the rest)"
+                         : "COULD NOT BE VERIFIED -- see counts above"));
+        if (!budgetDemoOk) {
+          LOG_WARNING("[ClusterRenderPipeline] PCG Phase 9.3 profiling (STEP 6b): budget-deferral counts were not exactly as expected -- see the raw numbers logged just above. Non-fatal (this step characterizes performance, it does not gate correctness).");
+        }
+
+        profPass.Shutdown();
+      }
+    }
   }
 
   std::string passMsg = std::format(
