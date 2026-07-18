@@ -53,14 +53,27 @@ set(IMGUI_SOURCES
 # imgui_node_editor_api) -- the upstream repo's examples/, external/ (its own private ImGui fork
 # submodule, unused here) and docs/ are deliberately NOT copied in, keeping the vendored footprint
 # to exactly what src/renderer/debug/PcgGraphEditorPanel.cpp needs to link against.
-# This is purely an editor tool (an ImGui node-canvas widget), same exclusion discipline as
-# ${IMGUI_SOURCES}: Debug-only, zero object code and zero string/symbol footprint in Release.
+# The 3 files below (imgui_canvas/imgui_node_editor/imgui_node_editor_api) are purely editor tool
+# code (an ImGui node-canvas widget), same exclusion discipline as ${IMGUI_SOURCES}: Debug-only,
+# zero object code and zero string/symbol footprint in Release.
 set(NODE_EDITOR_DIR "${CMAKE_CURRENT_SOURCE_DIR}/vendor/imgui-node-editor")
 set(NODE_EDITOR_SOURCES
-    ${NODE_EDITOR_DIR}/crude_json.cpp
     ${NODE_EDITOR_DIR}/imgui_canvas.cpp
     ${NODE_EDITOR_DIR}/imgui_node_editor.cpp
     ${NODE_EDITOR_DIR}/imgui_node_editor_api.cpp
+)
+
+# crude_json.cpp is vendored alongside the 3 files above (same upstream library, same provenance
+# comment) but is compiled UNCONDITIONALLY (both Debug and Release), NOT Debug-only like them --
+# unlike the other 3, it has zero ImGui dependency (crude_json.h/.cpp is a small freestanding JSON
+# value/parser, see that header's own comment) and is reused by the PCG graph roadmap's Phase 5.1
+# graph engine (src/pcg/PcgGraph.cpp) for its human-inspectable graph serialization format, which is
+# core engine functionality, not an editor/debug-only tool -- see PcgGraph.cpp's own top-of-file
+# comment for the full rationale. src/pcg/PcgGraph.cpp includes crude_json.h via a relative path
+# (not through NODE_EDITOR_DIR's include directory, which stays Debug-only below), so this is the
+# only CMake wiring crude_json.cpp itself actually needs.
+set(CRUDE_JSON_SOURCES
+    ${NODE_EDITOR_DIR}/crude_json.cpp
 )
 
 # --- Création de l'exécutable ---
@@ -70,6 +83,7 @@ add_executable(${PROJECT_NAME}
 )
 
 target_sources(${PROJECT_NAME} PRIVATE
+    ${CRUDE_JSON_SOURCES}
     $<$<CONFIG:Debug>:${IMGUI_SOURCES}>
     $<$<CONFIG:Debug>:${NODE_EDITOR_SOURCES}>
 )
@@ -227,6 +241,22 @@ add_executable(PcgDataModelTests
 target_include_directories(PcgDataModelTests PRIVATE src ${Vulkan_INCLUDE_DIRS})
 add_test(NAME PcgDataModelTests COMMAND PcgDataModelTests)
 add_test(NAME BlockCodecTests COMMAND BlockCodecTests)
+
+# PCG framework roadmap, Phase 5.1+5.2 ("PCG Graph Engine Core"): the node/link graph data model +
+# JSON serialization (src/pcg/PcgGraph.cpp) and the CPU topological evaluator + subgraph support
+# (src/pcg/PcgGraphEvaluator.cpp), built directly on Phase 1's data model. PcgGraph.cpp reuses
+# vendor/imgui-node-editor's crude_json.cpp for JSON (see CRUDE_JSON_SOURCES's own comment above --
+# that file is compiled unconditionally, not Debug-only, precisely because this engine-core target
+# needs it in every config); crude_json.h is included via a relative path from PcgGraph.cpp, so no
+# extra include directory beyond `src` is needed here.
+add_executable(PcgGraphEngineTests
+    src/pcg/PcgGraph.cpp
+    src/pcg/PcgGraphEvaluator.cpp
+    ${CRUDE_JSON_SOURCES}
+    tests/PcgGraphEngineTests.cpp
+)
+target_include_directories(PcgGraphEngineTests PRIVATE src ${Vulkan_INCLUDE_DIRS})
+add_test(NAME PcgGraphEngineTests COMMAND PcgGraphEngineTests)
 
 add_executable(AsyncDecompressingLoaderTests
     src/io/AsyncFileStreamer.cpp
