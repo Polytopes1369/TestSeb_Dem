@@ -16,6 +16,7 @@ namespace debugpipeline {
                 case TestStatus::Pass: return "PASS";
                 case TestStatus::Warn: return "WARN";
                 case TestStatus::Fail: return "FAIL";
+                case TestStatus::Skip: return "SKIP";
             }
             return "UNKNOWN";
         }
@@ -72,12 +73,13 @@ namespace debugpipeline {
             return {};
         }
 
-        uint32_t passCount = 0, warnCount = 0, failCount = 0;
+        uint32_t passCount = 0, warnCount = 0, failCount = 0, skipCount = 0;
         for (const auto& result : m_Results) {
             switch (result.status) {
                 case TestStatus::Pass: ++passCount; break;
                 case TestStatus::Warn: ++warnCount; break;
                 case TestStatus::Fail: ++failCount; break;
+                case TestStatus::Skip: ++skipCount; break;
             }
         }
 
@@ -99,7 +101,7 @@ namespace debugpipeline {
         out << "| Driver | " << m_Header.driverVersionText << " |\n";
         out << "| Active EngineConfig preset | " << m_Header.activeConfigPreset << " |\n";
         out << "| Total tests | " << m_Results.size() << " |\n";
-        out << "| Pass / Warn / Fail | " << passCount << " / " << warnCount << " / " << failCount << " |\n\n";
+        out << "| Pass / Warn / Fail / Skip | " << passCount << " / " << warnCount << " / " << failCount << " / " << skipCount << " |\n\n";
 
         // --- Summary table: quick top-level scan before diving into any one section. ---
         out << "## Summary\n\n";
@@ -143,8 +145,8 @@ namespace debugpipeline {
         }
 
         out.close();
-        LOG_INFO(std::format("[TestReport] Wrote report to '{}' ({} pass / {} warn / {} fail).",
-                              reportPath, passCount, warnCount, failCount));
+        LOG_INFO(std::format("[TestReport] Wrote report to '{}' ({} pass / {} warn / {} fail / {} skip).",
+                              reportPath, passCount, warnCount, failCount, skipCount));
         return reportPath;
     }
 

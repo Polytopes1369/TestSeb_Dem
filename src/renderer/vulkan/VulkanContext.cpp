@@ -8,6 +8,11 @@
 #include "renderer/vulkan/RayTracingFunctions.h"
 #include "renderer/vulkan/VulkanUtils.h"
 #include "core/debug/ValidationMessageSink.h"
+// Phase 5 (Streaming & Monde roadmap, Part 2, Gap 3): geometry::SimplifiableMesh/
+// ComputeFaceAccumulatedNormals -- BakeHlodProxyIntoSlot() reuses the SAME normal-recomputation
+// helper the offline HLOD bake chain documents (world::CellHlodVertex's own header comment) rather
+// than inventing a second implementation.
+#include "geometry/MeshSimplifier.h"
 #include <algorithm>
 #include <array>
 #include <cassert>
@@ -361,6 +366,27 @@ void VulkanContext::Init(std::string_view appName, GLFWwindow *window) {
   }
   LOG_INFO("[VulkanContext] VMA Allocator initialized successfully.");
 
+  // Phase 5 (Streaming & Monde roadmap, Part 2, Gap 3): load the SAME world_data/cellmanifest.bin
+  // main.cpp's own world::CellManifest instance loads (see world::kDefaultManifestPath's own
+  // comment for why both sides share one literal) BEFORE BuildEntityData()/GenerateGeometry() run,
+  // so both can key each dedicated streaming unit's materialID/shape (BuildEntityData()) and actual
+  // baked geometry (GenerateGeometry()) off the SAME real per-cell archetype data for that SAME
+  // unit. Loaded once here (not lazily inside either) so a missing/unreadable file degrades exactly
+  // once, gracefully -- matching this codebase's "streaming is additive, not load-bearing"
+  // convention (see world::CellManifest::Load()'s own header comment and main.cpp's own identical
+  // fallback log): every dedicated-unit lookup below then simply finds nothing and every streaming
+  // unit falls back to the pre-Phase-5 shared 4-archetype rotation, exactly as before this feature.
+  if (m_CellManifest.Load(world::kDefaultManifestPath)) {
+    LOG_INFO(std::format("[VulkanContext] Loaded {} authored cells from '{}' for HLOD proxy bake-in "
+                         "(kStreamingUnitCount={}).", m_CellManifest.RecordCount(),
+                         world::kDefaultManifestPath, kStreamingUnitCount));
+  } else {
+    LOG_WARNING(std::format("[VulkanContext] '{}' not found or unreadable -- HLOD proxy bake-in "
+                            "skipped; every streaming unit falls back to the shared 4-archetype "
+                            "rotation (run WorldPartitionBakeTool.exe once to enable real per-cell "
+                            "geometry).", world::kDefaultManifestPath));
+  }
+
   // Author entity data on the CPU (meshID assigned via core::IDManager) before
   // any GPU buffer exists for it, per the engine's CPU-authored / GPU-generated
   // architecture.
@@ -389,10 +415,15 @@ void VulkanContext::Init(std::string_view appName, GLFWwindow *window) {
   VkBufferCreateInfo vInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
   vInfo.size = m_VertexBufferBytes;
   // TRANSFER_SRC_BIT is required for the DEBUG readback (vkCmdCopyBuffer) in
-  // DebugReadbackGeometrySample()
+  // DebugReadbackGeometrySample(). TRANSFER_DST_BIT (Phase 5, Streaming & Monde roadmap, Part 2,
+  // Gap 3) is required by BakeHlodProxyIntoSlot()'s own vkCmdCopyBuffer, which writes a real,
+  // offline-baked HLOD proxy mesh straight into this SSBO from a staging buffer -- every other
+  // primitive in this buffer is instead written by a compute shader's storage-buffer WRITE (no
+  // TRANSFER_DST_BIT needed for that path), so this bit was never required until this feature.
   vInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                 VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
-                VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+                VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                VK_BUFFER_USAGE_TRANSFER_DST_BIT;
   VmaAllocationCreateInfo vAlloc{.usage = VMA_MEMORY_USAGE_GPU_ONLY};
   if (vmaCreateBuffer(m_Allocator, &vInfo, &vAlloc, &m_VertexBuffer,
                       &m_VertexAllocation, nullptr) != VK_SUCCESS) {
@@ -403,10 +434,12 @@ void VulkanContext::Init(std::string_view appName, GLFWwindow *window) {
   VkBufferCreateInfo iInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
   iInfo.size = m_IndexBufferBytes;
   // TRANSFER_SRC_BIT is required for the DEBUG readback (vkCmdCopyBuffer) in
-  // DebugReadbackGeometrySample()
+  // DebugReadbackGeometrySample(). TRANSFER_DST_BIT -- see vInfo.usage's own comment above, same
+  // reasoning applies to the index SSBO.
   iInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                 VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
-                VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+                VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                VK_BUFFER_USAGE_TRANSFER_DST_BIT;
   if (vmaCreateBuffer(m_Allocator, &iInfo, &vAlloc, &m_IndexBuffer,
                       &m_IndexAllocation, nullptr) != VK_SUCCESS) {
     throw std::runtime_error("Failed to allocate index SSBO!");
@@ -1636,10 +1669,23 @@ void VulkanContext::BuildEntityData() {
   // see GenerateGeometry()'s streaming block) but core::EntityFlags::StreamingInactive so it never
   // draws until world::WorldCellStreamingLoader's main-thread pump claims it via
   // SetStreamingUnitState().
+  // Phase 5 (Streaming & Monde roadmap, Part 2, Gap 3): dedicated units get their materialID from
+  // the SAME real per-cell archetypeShape GenerateGeometry() later bakes their fine mesh's
+  // silhouette from (see that function's own streaming-pool block) -- both must agree, or a unit's
+  // material (e.g. green "Bush") would visibly mismatch its baked mesh shape (e.g. a "Tree"
+  // capsule). Units beyond the dedicated range (no manifest, or this unit's index exceeds the
+  // authored cell count) keep the pre-Phase-5 unit%4 shared rotation.
+  const std::vector<world::CellCoord>& orderedCellsForShape = m_CellManifest.GetOrderedCells();
   for (uint32_t i = kEntityCount; i < kTotalEntityCount; ++i) {
     core::EntityID id = core::IDManager::GetNextID();
     uint32_t unit = (i - kEntityCount) / kStreamingSlotsPerUnit;
     uint32_t shape = unit % kStreamingArchetypeShapeCount;
+    if (unit < orderedCellsForShape.size()) {
+      std::optional<world::CellPlacement> dedicatedPlacement = m_CellManifest.GetPlacement(orderedCellsForShape[unit]);
+      if (dedicatedPlacement.has_value()) {
+        shape = dedicatedPlacement->archetypeShape % kStreamingArchetypeShapeCount;
+      }
+    }
 
     core::EntityData &entity = m_EntityData[i];
     entity.meshID = static_cast<uint32_t>(id & 0xFFFFFFFFu);
@@ -2605,29 +2651,83 @@ void VulkanContext::GenerateGeometry() {
   // streaming budget) rather than unique per-cell geometry.
   //
   // Every unit's 2 slots are baked at their OWN distinct, widely-separated parking position (never
-  // the origin, and never shared with another slot) -- geom_autosmooth.comp's post-pass welds
-  // normals across ANY vertices within a small world-space epsilon regardless of meshID (see that
-  // shader's own comment), so baking multiple archetypes on top of each other at (0,0,0) would
-  // silently corrupt their normals. world::WorldCellStreamingLoader's runtime translation (see
-  // struct_custo.glsl's EntityTransform comment) is an ADDITIVE offset on top of whatever position
-  // a mesh is baked at -- exactly the same rotation-pivot math every other entity already uses, see
+  // the origin, and never shared with another slot, see StreamingSlotParkPosition()) --
+  // geom_autosmooth.comp's post-pass welds normals across ANY vertices within a small world-space
+  // epsilon regardless of meshID (see that shader's own comment), so baking multiple archetypes on
+  // top of each other at (0,0,0) would silently corrupt their normals. world::
+  // WorldCellStreamingLoader's runtime translation (see struct_custo.glsl's EntityTransform
+  // comment) cancels this SAME park offset back out before adding the desired absolute world
+  // position (see SetStreamingUnitState()'s own comment for the double-offset bug this fixes) --
+  // exactly the same rotation-pivot math every other entity already uses, see
   // UpdateEntityRotations()'s streaming-pool loop below -- so parking slots stay fully compatible
   // with being moved to an arbitrary cell position at runtime.
+  //
+  // Phase 5 (Streaming & Monde roadmap, Part 2, Gap 3): each unit that has a corresponding authored
+  // cell in m_CellManifest (unit index == that cell's index in GetOrderedCells(), see
+  // m_CellToStreamingUnit's own comment) gets its COARSE slot baked from that cell's REAL,
+  // offline-simplified HLOD proxy mesh (BakeHlodProxyIntoSlot()) instead of a generic box, and its
+  // FINE slot baked from that SAME cell's real authored archetype shape (not an arbitrary unit%4
+  // rotation) -- giving a genuine, visibly different triangle count between the two representations
+  // of the SAME cell, per-cell, exactly as authored. Units with no corresponding cell (manifest
+  // missing/unreadable, or this unit's index exceeds the authored cell count) fall back to the
+  // pre-Phase-5 generic-box-coarse / unit%4-rotation-fine behavior unchanged.
+  //
+  // BUG FOUND + FIXED while growing kStreamingUnitCount 6 -> 50 for this feature: GenerateIcosphere/
+  // GenerateSphere/GenerateCapsule/GenerateTorus/GenerateBox all read the GLOBAL, MUTABLE
+  // config::VERTEX_SPACING directly (no per-call override, unlike GeneratePlane's own `spacing`
+  // parameter) -- under the "Extrem" quality profile (config::EngineConfig_Extrem.h,
+  // VERTEX_SPACING=0.02) a single fine archetype mesh tessellates into tens of thousands of
+  // indices. geom_autosmooth.comp's post-pass (right after this block) is an O(totalVertexCount *
+  // totalIndexCount) brute-force neighbor scan (see that shader's own comment) -- multiplying BOTH
+  // dimensions by the streaming pool's own ~8.3x unit-count growth pushed its cost far enough past
+  // what completes within the GPU driver's TDR window to hard-hang the process (confirmed
+  // empirically: reproduced a "VulkanUtils: Failed to wait idle on queue for one-shot commands"
+  // throw from this exact function at kStreamingUnitCount=50 with VERTEX_SPACING left at the active
+  // profile's value). Streaming archetypes are small background props, never meant to track the
+  // interactive showcase gallery's own hero-asset fidelity -- config::VERTEX_SPACING is temporarily
+  // overridden to a small, FIXED, profile-independent value for this block only (saved/restored
+  // around it), capping every fine mesh's triangle count to a small constant regardless of
+  // kStreamingUnitCount or the active quality profile, exactly the same reasoning GeneratePlane's
+  // own `spacing` parameter already documents for the analogous terrain-vs-hero-asset tradeoff.
   // -------------------------------------------------------------------------
   {
-    constexpr float kParkSpacing = 3.0f;
-    constexpr float kParkBaseX = -400.0f; // Far outside the showcase gallery (a few meters around the origin) and the streaming demo world itself (see BakeDemoWorld.cpp's kWorldCenterX).
-    constexpr float kParkBaseZ = -400.0f;
+    const std::vector<world::CellCoord>& orderedCells = m_CellManifest.GetOrderedCells();
+    m_CellToStreamingUnit.clear();
+
+    const float savedVertexSpacing = config::VERTEX_SPACING;
+    config::VERTEX_SPACING = 0.12f; // See this block's own header comment for why this must be fixed, not profile-dependent.
 
     for (uint32_t unit = 0; unit < kStreamingUnitCount; ++unit) {
-      uint32_t shape = unit % kStreamingArchetypeShapeCount;
+      std::optional<world::CellPlacement> dedicatedPlacement;
+      if (unit < orderedCells.size()) {
+        dedicatedPlacement = m_CellManifest.GetPlacement(orderedCells[unit]);
+        if (dedicatedPlacement.has_value()) {
+          m_CellToStreamingUnit[orderedCells[unit]] = unit;
+        }
+      }
+      uint32_t shape = dedicatedPlacement.has_value()
+          ? (dedicatedPlacement->archetypeShape % kStreamingArchetypeShapeCount)
+          : (unit % kStreamingArchetypeShapeCount);
 
       uint32_t coarseIdx = StreamingUnitCoarseSlot(unit);
-      maths::vec2 coarseSlot{ kParkBaseX + static_cast<float>(coarseIdx) * kParkSpacing, kParkBaseZ };
-      GenerateBox(0.6f, 0.6f, 0.6f, m_EntityData[coarseIdx].meshID, coarseSlot, runningVertexOffset, runningIndexOffset);
+      maths::vec2 coarseSlot = StreamingSlotParkPosition(coarseIdx);
+
+      bool bakedRealCoarseProxy = false;
+      if (dedicatedPlacement.has_value() && dedicatedPlacement->hlodVertexCount > 0 && dedicatedPlacement->hlodIndexCount > 0) {
+        bakedRealCoarseProxy = BakeHlodProxyIntoSlot(*dedicatedPlacement, m_EntityData[coarseIdx].meshID,
+                                                      coarseSlot, runningVertexOffset, runningIndexOffset);
+      }
+      if (!bakedRealCoarseProxy) {
+        // Fallback: no manifest, this unit exceeds the authored cell count, this cell's HLOD proxy
+        // was empty (BuildHlodForCell produced zero triangles -- degrades exactly like "no
+        // authored content", see world::CellPlacement's own hlodIndexCount==0 comment), or the
+        // manifest's own blob offsets failed BakeHlodProxyIntoSlot()'s bounds check -- the
+        // pre-Phase-5 plain-box coarse mesh either way.
+        GenerateBox(0.6f, 0.6f, 0.6f, m_EntityData[coarseIdx].meshID, coarseSlot, runningVertexOffset, runningIndexOffset);
+      }
 
       uint32_t fineIdx = StreamingUnitFineSlot(unit);
-      maths::vec2 fineSlot{ kParkBaseX + static_cast<float>(fineIdx) * kParkSpacing, kParkBaseZ };
+      maths::vec2 fineSlot = StreamingSlotParkPosition(fineIdx);
       switch (shape) {
         case 0: { // Rock: icosphere.
           uint32_t baseFaceCount = 20u, vertsPerFace = 0u;
@@ -2646,6 +2746,18 @@ void VulkanContext::GenerateGeometry() {
           break;
       }
     }
+
+    // Restore the active quality profile's own VERTEX_SPACING immediately -- see this block's own
+    // header comment. Every OTHER GenerateXxx() call in this function (gallery primitives, walls,
+    // floor, water) runs either before this block or is unaffected since streaming is the LAST
+    // block GenerateGeometry() executes, but restoring defensively (rather than relying on that
+    // ordering never changing) costs nothing and avoids a silent, hard-to-diagnose regression if a
+    // future edit ever adds a primitive after this block.
+    config::VERTEX_SPACING = savedVertexSpacing;
+
+    LOG_INFO(std::format("[GenerateGeometry] Streaming pool: {}/{} units dedicated to real authored "
+                         "cells with baked HLOD proxies (out of {} authored cells in the manifest).",
+                         m_CellToStreamingUnit.size(), kStreamingUnitCount, orderedCells.size()));
   }
 
   m_TotalVertexCount = runningVertexOffset;
@@ -2697,7 +2809,168 @@ void VulkanContext::GenerateGeometry() {
                        m_IndexBufferBytes / sizeof(uint32_t)));
 }
 
-void VulkanContext::UpdateEntityRotations(float timeSeconds) {
+maths::vec2 VulkanContext::StreamingSlotParkPosition(uint32_t slotIndex) {
+  // See this function's own header-comment (VulkanContext.h) for why this must be the ONE shared
+  // implementation both GenerateGeometry() (bake time) and SetStreamingUnitState() (runtime, to
+  // cancel this same offset back out) call -- these constants must never drift into two copies.
+  constexpr float kParkSpacing = 3.0f;
+  constexpr float kParkBaseX = -400.0f; // Far outside the showcase gallery (a few meters around the origin) and the streaming demo world itself (see BakeDemoWorld.cpp's kWorldCenterX).
+  constexpr float kParkBaseZ = -400.0f;
+  return maths::vec2{ kParkBaseX + static_cast<float>(slotIndex) * kParkSpacing, kParkBaseZ };
+}
+
+bool VulkanContext::BakeHlodProxyIntoSlot(const world::CellPlacement &placement, uint32_t meshID,
+                                          const maths::vec2 &worldOffset,
+                                          uint32_t &runningVertexOffset, uint32_t &runningIndexOffset) {
+  const std::vector<world::CellHlodVertex> &blobVerts = m_CellManifest.GetHlodVertices();
+  const std::vector<uint32_t> &blobIndices = m_CellManifest.GetHlodIndices();
+
+  // Bounds-check the manifest's own claimed ranges against the actual blob arrays before trusting
+  // them -- see this function's own header comment (VulkanContext.h).
+  if (static_cast<uint64_t>(placement.hlodVertexOffset) + placement.hlodVertexCount > blobVerts.size() ||
+      static_cast<uint64_t>(placement.hlodIndexOffset) + placement.hlodIndexCount > blobIndices.size()) {
+    LOG_ERROR("[GenerateGeometry] HLOD proxy record references an out-of-range blob slice -- "
+             "skipping, falling back to the plain-box coarse mesh for this unit.");
+    return false;
+  }
+
+  // Also guard the FIXED-size vertex/index SSBOs themselves -- same overflow contract
+  // GenerateGeometry()'s own post-loop check enforces for the whole scene, checked per-slot here
+  // too so one oversized manifest can't silently corrupt whatever geometry is generated after it in
+  // this same function.
+  const VkDeviceSize vertexBytesAfter = static_cast<VkDeviceSize>(runningVertexOffset + placement.hlodVertexCount) * sizeof(renderer::Vertex);
+  const VkDeviceSize indexBytesAfter = static_cast<VkDeviceSize>(runningIndexOffset + placement.hlodIndexCount) * sizeof(uint32_t);
+  if (vertexBytesAfter > m_VertexBufferBytes || indexBytesAfter > m_IndexBufferBytes) {
+    LOG_ERROR("[GenerateGeometry] Baking this cell's HLOD proxy would overflow the fixed-size "
+             "vertex/index SSBOs -- skipping, falling back to the plain-box coarse mesh for this unit.");
+    return false;
+  }
+
+  // Build a temporary geometry::SimplifiableMesh purely to recompute per-vertex normals via
+  // ComputeFaceAccumulatedNormals -- the manifest's blob deliberately stores positions+UVs only,
+  // never normals (see RuntimeCellManifest.h's own header comment). `triangles` uses the SAME
+  // cell-local 0-based indexing the manifest's own hlodIndexOffset/Count range already is (see
+  // world::CellPlacement's own comment), so no rebase is needed for this local computation.
+  geometry::SimplifiableMesh localMesh;
+  localMesh.positions.reserve(placement.hlodVertexCount);
+  for (uint32_t v = 0; v < placement.hlodVertexCount; ++v) {
+    const world::CellHlodVertex &src = blobVerts[placement.hlodVertexOffset + v];
+    localMesh.positions.push_back(maths::vec3{ src.x, src.y, src.z });
+  }
+  localMesh.triangles.reserve(placement.hlodIndexCount);
+  for (uint32_t idx = 0; idx < placement.hlodIndexCount; ++idx) {
+    localMesh.triangles.push_back(blobIndices[placement.hlodIndexOffset + idx]);
+  }
+  std::vector<maths::vec3> normals = geometry::ComputeFaceAccumulatedNormals(localMesh);
+
+  // Assemble the CPU-side renderer::Vertex array (position rebased by worldOffset -- the SAME
+  // "baked at the slot's own park position" convention every other streaming-slot generator in
+  // this block already uses, see StreamingSlotParkPosition()'s own comment) ready for a straight
+  // memcpy into the staging buffer.
+  std::vector<renderer::Vertex> vertices(placement.hlodVertexCount);
+  for (uint32_t v = 0; v < placement.hlodVertexCount; ++v) {
+    const world::CellHlodVertex &src = blobVerts[placement.hlodVertexOffset + v];
+    renderer::Vertex &dst = vertices[v];
+    dst.position = maths::vec3{ src.x + worldOffset.x, src.y, src.z + worldOffset.y };
+    dst.materialID = 0.0f; // Dead field -- see GenerateBox()'s own "params.materialID = 0.0f" precedent: actual material comes from EntityData::materialID via meshID indirection, never from this per-vertex field.
+    dst.normal = normals[v];
+    dst.meshID = meshID;
+    dst.uv = maths::vec2{ src.u, src.v };
+    dst.uv2 = maths::vec2{ src.u, src.v };
+  }
+
+  // Global (buffer-absolute) index array: the manifest's own indices are cell-local (0-based into
+  // THIS record's own vertex range, see world::CellPlacement's own comment) -- rebase each one by
+  // runningVertexOffset so it correctly addresses this slot's own destination range once copied.
+  std::vector<uint32_t> indices(placement.hlodIndexCount);
+  for (uint32_t idx = 0; idx < placement.hlodIndexCount; ++idx) {
+    indices[idx] = blobIndices[placement.hlodIndexOffset + idx] + runningVertexOffset;
+  }
+
+  const VkDeviceSize vertexBytes = static_cast<VkDeviceSize>(vertices.size()) * sizeof(renderer::Vertex);
+  const VkDeviceSize indexBytes = static_cast<VkDeviceSize>(indices.size()) * sizeof(uint32_t);
+
+  // --- Staging + vkCmdCopyBuffer, mirroring UploadEntityData()'s own one-shot pattern exactly
+  // (same VMA_MEMORY_USAGE_CPU_ONLY + VMA_ALLOCATION_CREATE_MAPPED_BIT staging buffer, same
+  // blocking ExecuteOneShotCommands submission -- safe to destroy the staging buffers immediately
+  // after it returns, see VulkanUtils::ExecuteOneShotCommands' own vkQueueWaitIdle -- same trailing
+  // VkMemoryBarrier2 making the transfer-write visible to whatever reads these SSBOs next: both the
+  // vertex/fragment shaders that eventually raster this mesh AND geometry::BuildClusterDAG's own
+  // CPU-side ReadbackFullGeometry() a few statements later in this same Init() call (main.cpp),
+  // hence the COMPUTE + VERTEX stage mask below, wider than UploadEntityData()'s VERTEX-only one). ---
+  VkBufferCreateInfo stagingVertexInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+  stagingVertexInfo.size = vertexBytes;
+  stagingVertexInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+  VmaAllocationCreateInfo stagingAllocInfo{};
+  stagingAllocInfo.usage = VMA_MEMORY_USAGE_CPU_ONLY;
+  stagingAllocInfo.flags = VMA_ALLOCATION_CREATE_MAPPED_BIT;
+
+  VkBuffer stagingVertexBuffer = VK_NULL_HANDLE;
+  VmaAllocation stagingVertexAlloc = VK_NULL_HANDLE;
+  VmaAllocationInfo stagingVertexAllocResult{};
+  if (vmaCreateBuffer(m_Allocator, &stagingVertexInfo, &stagingAllocInfo, &stagingVertexBuffer,
+                      &stagingVertexAlloc, &stagingVertexAllocResult) != VK_SUCCESS) {
+    LOG_ERROR("[GenerateGeometry] Failed to allocate HLOD proxy vertex staging buffer!");
+    return false;
+  }
+  std::memcpy(stagingVertexAllocResult.pMappedData, vertices.data(), static_cast<size_t>(vertexBytes));
+
+  VkBufferCreateInfo stagingIndexInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+  stagingIndexInfo.size = indexBytes;
+  stagingIndexInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+  VkBuffer stagingIndexBuffer = VK_NULL_HANDLE;
+  VmaAllocation stagingIndexAlloc = VK_NULL_HANDLE;
+  VmaAllocationInfo stagingIndexAllocResult{};
+  if (vmaCreateBuffer(m_Allocator, &stagingIndexInfo, &stagingAllocInfo, &stagingIndexBuffer,
+                      &stagingIndexAlloc, &stagingIndexAllocResult) != VK_SUCCESS) {
+    LOG_ERROR("[GenerateGeometry] Failed to allocate HLOD proxy index staging buffer!");
+    vmaDestroyBuffer(m_Allocator, stagingVertexBuffer, stagingVertexAlloc);
+    return false;
+  }
+  std::memcpy(stagingIndexAllocResult.pMappedData, indices.data(), static_cast<size_t>(indexBytes));
+
+  renderer::VulkanUtils::ExecuteOneShotCommands(m_Device, m_CommandPool, m_GraphicsQueue, [&](VkCommandBuffer cmd) {
+    VkBufferCopy vertexCopyRegion{};
+    vertexCopyRegion.srcOffset = 0;
+    vertexCopyRegion.dstOffset = static_cast<VkDeviceSize>(runningVertexOffset) * sizeof(renderer::Vertex);
+    vertexCopyRegion.size = vertexBytes;
+    vkCmdCopyBuffer(cmd, stagingVertexBuffer, m_VertexBuffer, 1, &vertexCopyRegion);
+
+    VkBufferCopy indexCopyRegion{};
+    indexCopyRegion.srcOffset = 0;
+    indexCopyRegion.dstOffset = static_cast<VkDeviceSize>(runningIndexOffset) * sizeof(uint32_t);
+    indexCopyRegion.size = indexBytes;
+    vkCmdCopyBuffer(cmd, stagingIndexBuffer, m_IndexBuffer, 1, &indexCopyRegion);
+
+    // Explicit transfer-write -> vertex/compute-shader-read visibility barrier -- same pattern as
+    // UploadEntityData()'s own trailing VkMemoryBarrier2.
+    VkMemoryBarrier2 memBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    memBarrier.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+    memBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    memBarrier.dstStageMask = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    memBarrier.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
+
+    VkDependencyInfo depInfo{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    depInfo.memoryBarrierCount = 1;
+    depInfo.pMemoryBarriers = &memBarrier;
+    vkCmdPipelineBarrier2(cmd, &depInfo);
+  });
+
+  vmaDestroyBuffer(m_Allocator, stagingVertexBuffer, stagingVertexAlloc);
+  vmaDestroyBuffer(m_Allocator, stagingIndexBuffer, stagingIndexAlloc);
+
+  runningVertexOffset += placement.hlodVertexCount;
+  runningIndexOffset += placement.hlodIndexCount;
+  return true;
+}
+
+std::optional<uint32_t> VulkanContext::GetDedicatedStreamingUnitForCell(const world::CellCoord &coord) const {
+  auto it = m_CellToStreamingUnit.find(coord);
+  if (it == m_CellToStreamingUnit.end()) return std::nullopt;
+  return it->second;
+}
+
+void VulkanContext::UpdateEntityRotations(float timeSeconds, const maths::vec3 &originOffset) {
   // Distinct per-axis angular speeds (radians/sec) and a per-entity phase
   // offset so the 12 primitives tumble out of sync with each other rather than
   // spinning in lockstep. The floor plane and the 2 Lumen-corner walls remain
@@ -2785,33 +3058,59 @@ void VulkanContext::UpdateEntityRotations(float timeSeconds) {
       xform._pad0 = 0.0f;
     }
 
+    // Phase 5 (Streaming & Monde roadmap, Part 1): rebase this entity into the current LWC origin
+    // cell's frame by subtracting `originOffset` from the `translation` channel ONLY (never
+    // `center` -- see this function's own declaration comment in VulkanContext.h for the full
+    // worked-out reason). Every entity above leaves `translation` at its default zero (the "no
+    // additional world-space offset" case struct_custo.glsl's own comment documents for every
+    // original showcase/wall/floor/water entity), so this uniformly turns that zero into exactly
+    // `-originOffset` -- the entire rebase, applied once, correct regardless of this entity's own
+    // rotation.
+    xform.translationX = -originOffset.x;
+    xform.translationY = -originOffset.y;
+    xform.translationZ = -originOffset.z;
+    xform._pad1 = 0.0f;
+
     // Phase 4 integration (UE5.8 parity roadmap, dynamic scenes onto main): CPU-readable mirror of
     // the SAME values just computed above for GPU upload -- zero extra computation, see
-    // GetEntityTransformsCPU()'s own comment on why this exists.
+    // GetEntityTransformsCPU()'s own comment on why this exists. Phase 5: now includes the same
+    // rebased `translation`, so every consumer of this CPU mirror (TLAS refit, Global SDF
+    // object-space compositing) operates in the SAME current-frame LWC-rebased reference frame as
+    // the rasterized VisBuffer pipeline -- one single "world space" notion per frame, never two
+    // divergent ones (see renderer::ClusterRenderPipeline.h's own m_FrameScratch header comment for
+    // why that single-choke-point property matters).
     m_EntityTransformsCPU[meshID] = core::EntityTransformCPU{
-        xform.rotation, maths::vec3{xform.centerX, xform.centerY, xform.centerZ}};
+        xform.rotation, maths::vec3{xform.centerX, xform.centerY, xform.centerZ},
+        maths::vec3{xform.translationX, xform.translationY, xform.translationZ}};
   }
 
   // --- Runtime World Partition streaming pool: static (no self-rotation), positioned entirely by
   // m_StreamingUnitTranslation (see SetStreamingUnitState()) -- center/rotation stay exactly as
-  // baked (identity rotation, center == the slot's own parking position, see GenerateGeometry()'s
-  // streaming block), so worldPos == translation + bakedPos (this class's own EntityTransform
-  // comment). Both slots of a unit always share the same translation. ---
+  // baked (identity rotation, center == 0), so worldPos == translation + bakedPos (this class's own
+  // EntityTransform comment). Phase 5 (Streaming & Monde roadmap, Part 2, Gap 3) BUG FIX: indexed
+  // per-SLOT now, NOT per-unit -- coarse and fine no longer share one translation value, see
+  // m_StreamingUnitTranslation's own declaration-site comment for exactly why (each slot's baked
+  // position already includes its own DIFFERENT park offset, which SetStreamingUnitState() must
+  // cancel independently per slot). ---
   for (uint32_t unit = 0; unit < kStreamingUnitCount; ++unit) {
-    const maths::vec3 &t = m_StreamingUnitTranslation[unit];
     for (uint32_t slotInUnit = 0; slotInUnit < kStreamingSlotsPerUnit; ++slotInUnit) {
       uint32_t i = kStreamingSlotBase + unit * kStreamingSlotsPerUnit + slotInUnit;
+      const maths::vec3 &t = m_StreamingUnitTranslation[i - kStreamingSlotBase];
       EntityTransform &xform = transforms[i];
       xform.rotation = maths::mat4{};
       xform.centerX = 0.0f;
       xform.centerY = 0.0f;
       xform.centerZ = 0.0f;
       xform._pad0 = 0.0f;
-      xform.translationX = t.x;
-      xform.translationY = t.y;
-      xform.translationZ = t.z;
+      // Phase 5 (Streaming & Monde roadmap, Part 1): same rebase as the gallery loop above --
+      // subtract `originOffset` from `translation` only (`center` is already 0 here, the streaming
+      // pool's own local-origin-baked convention, see struct_custo.glsl's EntityTransform comment).
+      xform.translationX = t.x - originOffset.x;
+      xform.translationY = t.y - originOffset.y;
+      xform.translationZ = t.z - originOffset.z;
       xform._pad1 = 0.0f;
-      m_EntityTransformsCPU[i] = core::EntityTransformCPU{ xform.rotation, maths::vec3{0.0f, 0.0f, 0.0f}, t };
+      maths::vec3 rebasedTranslation{ xform.translationX, xform.translationY, xform.translationZ };
+      m_EntityTransformsCPU[i] = core::EntityTransformCPU{ xform.rotation, maths::vec3{0.0f, 0.0f, 0.0f}, rebasedTranslation };
     }
   }
 
@@ -2830,16 +3129,30 @@ void VulkanContext::SetStreamingUnitState(uint32_t unit, bool active, bool useFi
                                            const maths::vec3 &worldPos, uint32_t cellID) {
   assert(unit < kStreamingUnitCount);
 
-  // Translation takes effect on the NEXT UpdateEntityRotations() call (once per frame, see that
-  // function's own streaming-pool loop) -- no GPU touch needed here, unlike EntityData below,
-  // because the whole transform buffer is already re-uploaded wholesale every frame regardless.
-  m_StreamingUnitTranslation[unit] = active ? worldPos : maths::vec3{0.0f, 0.0f, 0.0f};
-
   uint32_t coarseIdx = StreamingUnitCoarseSlot(unit);
   uint32_t fineIdx = StreamingUnitFineSlot(unit);
 
   bool coarseActive = active && !useFineVariant;
   bool fineActive = active && useFineVariant;
+
+  // Phase 5 (Streaming & Monde roadmap, Part 2, Gap 3) BUG FIX: translation must cancel THIS
+  // slot's own baked park offset (StreamingSlotParkPosition()) before adding the desired absolute
+  // world position, or the composed worldPos = translation + center + rotation*(restPos-center)
+  // formula (center==0, rotation==identity here, so this collapses to translation + restPos)
+  // double-counts the park offset -- the entity would render up to ~560 units away from where the
+  // streaming system intended it (see m_StreamingUnitTranslation's own declaration-site comment for
+  // the full derivation). Coarse and fine slots have DIFFERENT park positions (by design, so
+  // GenerateGeometry()'s autosmooth post-pass never welds their normals together at bake time), so
+  // each needs its own independently-canceled translation -- takes effect on the NEXT
+  // UpdateEntityRotations() call (once per frame, see that function's own streaming-pool loop); no
+  // GPU touch needed here, unlike EntityData below, because the whole transform buffer is already
+  // re-uploaded wholesale every frame regardless.
+  m_StreamingUnitTranslation[coarseIdx - kStreamingSlotBase] = coarseActive
+      ? (worldPos - maths::vec3{ StreamingSlotParkPosition(coarseIdx).x, 0.0f, StreamingSlotParkPosition(coarseIdx).y })
+      : maths::vec3{0.0f, 0.0f, 0.0f};
+  m_StreamingUnitTranslation[fineIdx - kStreamingSlotBase] = fineActive
+      ? (worldPos - maths::vec3{ StreamingSlotParkPosition(fineIdx).x, 0.0f, StreamingSlotParkPosition(fineIdx).y })
+      : maths::vec3{0.0f, 0.0f, 0.0f};
 
   core::EntityData &coarse = m_EntityData[coarseIdx];
   core::SetFlag(coarse.flags, core::EntityFlags::StreamingInactive, !coarseActive);

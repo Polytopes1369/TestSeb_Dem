@@ -169,6 +169,7 @@ add_test(NAME LoadingManagerTests COMMAND LoadingManagerTests)
 
 add_executable(StreamingManagerTests
     src/core/LoadingManager.cpp
+    src/core/Logger.cpp
     src/world/StreamingManager.cpp
     tests/StreamingManagerTests.cpp
 )
@@ -286,17 +287,47 @@ if(WORLDPARTITION_MESHOPT_DEFINE)
 endif()
 add_test(NAME HlodPipelineTests COMMAND HlodPipelineTests)
 
+# Phase 5 (Streaming & Monde roadmap, Part 2, Gap 2): round-trip test for the v1 -> v2
+# RuntimeCellManifest format bump -- deliberately links BOTH the offline writer
+# (tools/WorldPartition/RuntimeCellManifest.cpp) AND the runtime reader (src/world/CellManifest.cpp)
+# in the SAME test executable, the one place in this codebase where crossing the src//tools/
+# boundary in a single binary is exactly the point: this is the one seam the two sides must agree on
+# byte-for-byte, and only a test that links both can actually prove that.
+add_executable(RuntimeCellManifestV2Tests
+    tools/WorldPartition/RuntimeCellManifest.cpp
+    src/world/CellManifest.cpp
+    tests/RuntimeCellManifestV2Tests.cpp
+)
+target_include_directories(RuntimeCellManifestV2Tests PRIVATE src tools ${Vulkan_INCLUDE_DIRS})
+add_test(NAME RuntimeCellManifestV2Tests COMMAND RuntimeCellManifestV2Tests)
+
 # WorldPartitionBakeTool: standalone dev-time content-authoring executable (see
 # tools/WorldPartition/BakeDemoWorld.cpp's own header comment) -- NOT a test, not registered via
 # add_test, run manually once to populate world_data/ for the runtime streaming demo. Links the
 # same OFPA sources as OfpaSerializationTests plus RuntimeCellManifest.cpp.
+#
+# Phase 5 (Streaming & Monde roadmap, Part 2) build-target fix: this target previously did NOT link
+# HlodPipeline.cpp/MeshSimplifier.cpp/Logger.cpp (only HlodPipelineTests did, see
+# WORLDPARTITION_HLOD_SOURCES above) -- BakeDemoWorld.cpp now calls HlodPipeline::BuildHlodForCell
+# (real HLOD proxy baking, Gap 3), so those sources plus the new ArchetypeMeshLibrary.cpp (Gap 1,
+# this tool's own CPU mesh source for HlodPipeline::GatherCellMeshes) must be linked here too, or
+# this target fails at link time with unresolved externals the moment BakeDemoWorld.cpp is compiled
+# against HlodPipeline.h's declarations.
 add_executable(WorldPartitionBakeTool
     ${WORLDPARTITION_OFPA_SOURCES}
     tools/WorldPartition/SpatialHashGrid.cpp
     tools/WorldPartition/RuntimeCellManifest.cpp
+    tools/WorldPartition/HlodPipeline.cpp
+    tools/WorldPartition/ArchetypeMeshLibrary.cpp
+    src/geometry/MeshSimplifier.cpp
+    src/core/Logger.cpp
     tools/WorldPartition/BakeDemoWorld.cpp
 )
 target_include_directories(WorldPartitionBakeTool PRIVATE src tools ${Vulkan_INCLUDE_DIRS})
+if(WORLDPARTITION_MESHOPT_DEFINE)
+    target_compile_definitions(WorldPartitionBakeTool PRIVATE ${WORLDPARTITION_MESHOPT_DEFINE})
+    target_link_libraries(WorldPartitionBakeTool PRIVATE ${WORLDPARTITION_MESHOPT_LIB})
+endif()
 
 # ==============================================================================
 # AUTOMATIZED SHADER COMPILATION & POST-BUILD COPY
