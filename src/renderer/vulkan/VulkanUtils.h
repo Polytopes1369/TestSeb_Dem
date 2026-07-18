@@ -3,6 +3,7 @@
 #include <vulkan/vulkan.h>
 #include <vk_mem_alloc.h>
 #include <functional>
+#include <span>
 
 namespace renderer {
 
@@ -103,6 +104,34 @@ namespace renderer {
             VkBuffer vertexBuffer,
             VkBuffer indexBuffer,
             VkBuffer drawRangeBuffer
+        );
+
+        // Result of CreateDescriptorSetLayoutPoolAndSet: the layout, the pool it was allocated from,
+        // and the one set allocated out of that pool. Pool and set share the layout's lifetime by
+        // convention -- callers destroy all three together (vkDestroyDescriptorPool implicitly frees
+        // `set`; `set` itself is never individually freed).
+        struct DescriptorSetLayoutPoolAndSet {
+            VkDescriptorSetLayout layout = VK_NULL_HANDLE;
+            VkDescriptorPool pool = VK_NULL_HANDLE;
+            VkDescriptorSet set = VK_NULL_HANDLE;
+        };
+
+        // Bundles the "create set layout from bindings -> create a pool sized for exactly one set of
+        // that layout -> allocate that one set" three-call sequence repeated verbatim (only the
+        // bindings/poolSizes arrays differ) at the top of every single-set pass's Init() --
+        // AtmosSkyPass, AtmosCloudsPass, HZBPass, and 38+ other passes all open with this exact
+        // sequence. `poolSizes` must describe the descriptor counts consumed by `bindings` (typically
+        // one VkDescriptorPoolSize per distinct VkDescriptorType among `bindings`, with
+        // descriptorCount equal to how many bindings use that type); this function does not derive
+        // pool sizes from bindings automatically, since a handful of callers intentionally over-
+        // provision the pool relative to a single set's own layout (multi-set pools). maxSets is
+        // always 1 -- passes needing more than one set from the same layout (e.g. AtmosCloudsPass's
+        // separate shadow set) call this twice with two different bindings/poolSizes pairs, exactly
+        // as they do today with the raw Vulkan calls.
+        static DescriptorSetLayoutPoolAndSet CreateDescriptorSetLayoutPoolAndSet(
+            VkDevice device,
+            std::span<const VkDescriptorSetLayoutBinding> bindings,
+            std::span<const VkDescriptorPoolSize> poolSizes
         );
 
         // Allocates a single-mip, single-layer, 2D GPU-only image (STORAGE_BIT for compute

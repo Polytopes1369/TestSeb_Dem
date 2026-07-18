@@ -26,9 +26,9 @@ namespace renderer {
 
     } // namespace
 
-    bool AtmosSkyPass::Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue) {
-        m_Device = device;
-        m_Allocator = allocator;
+    bool AtmosSkyPass::InitImpl(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue) {
+        // Note: m_Device / m_Allocator are already set by RenderPass<AtmosSkyPass>::Init() before
+        // this runs.
 
         // --- 3 LUT images: STORAGE (this shader's own imageStore) | SAMPLED (Transmittance/Multi-
         // Scattering read back within THIS shader for later modes; Sky-View read by PostProcess-
@@ -38,10 +38,33 @@ namespace renderer {
         // this codebase (e.g. renderer::MegaLightsPass's own raw radiance image). ---
         VulkanUtils::CreateStorageSampledImage2D(allocator, device, kLUTFormat, kTransmittanceExtent,
             m_Transmittance.image, m_Transmittance.allocation, m_Transmittance.view);
+        RegisterResource([this] {
+            vkDestroyImageView(m_Device, m_Transmittance.view, nullptr);
+            vmaDestroyImage(m_Allocator, m_Transmittance.image, m_Transmittance.allocation);
+            m_Transmittance.view = VK_NULL_HANDLE;
+            m_Transmittance.image = VK_NULL_HANDLE;
+            m_Transmittance.allocation = VK_NULL_HANDLE;
+        });
+
         VulkanUtils::CreateStorageSampledImage2D(allocator, device, kLUTFormat, kMultiScatteringExtent,
             m_MultiScattering.image, m_MultiScattering.allocation, m_MultiScattering.view);
+        RegisterResource([this] {
+            vkDestroyImageView(m_Device, m_MultiScattering.view, nullptr);
+            vmaDestroyImage(m_Allocator, m_MultiScattering.image, m_MultiScattering.allocation);
+            m_MultiScattering.view = VK_NULL_HANDLE;
+            m_MultiScattering.image = VK_NULL_HANDLE;
+            m_MultiScattering.allocation = VK_NULL_HANDLE;
+        });
+
         VulkanUtils::CreateStorageSampledImage2D(allocator, device, kLUTFormat, kSkyViewExtent,
             m_SkyView.image, m_SkyView.allocation, m_SkyView.view);
+        RegisterResource([this] {
+            vkDestroyImageView(m_Device, m_SkyView.view, nullptr);
+            vmaDestroyImage(m_Allocator, m_SkyView.image, m_SkyView.allocation);
+            m_SkyView.view = VK_NULL_HANDLE;
+            m_SkyView.image = VK_NULL_HANDLE;
+            m_SkyView.allocation = VK_NULL_HANDLE;
+        });
 
         VkClearColorValue zeroClear{}; zeroClear.float32[0] = zeroClear.float32[1] = zeroClear.float32[2] = 0.0f; zeroClear.float32[3] = 1.0f;
         VulkanUtils::ExecuteOneShotCommands(device, commandPool, queue, [&](VkCommandBuffer cmd) {
@@ -62,6 +85,7 @@ namespace renderer {
         samplerInfo.compareEnable = VK_FALSE;
         samplerInfo.unnormalizedCoordinates = VK_FALSE;
         VK_CHECK(vkCreateSampler(m_Device, &samplerInfo, nullptr, &m_LUTSampler));
+        RegisterResource([this] { vkDestroySampler(m_Device, m_LUTSampler, nullptr); m_LUTSampler = VK_NULL_HANDLE; });
 
         // --- Descriptor set: 5 bindings -- see AtmosSkyLUTs.comp's own binding comments. Storage +
         // sampler pairs on the SAME underlying view are safe here because mode is uniform across an
@@ -74,26 +98,24 @@ namespace renderer {
             { 3, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // g_MultiScatteringSampler
             { 4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },          // g_SkyViewStorage
         } };
-        VkDescriptorSetLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-        layoutInfo.bindingCount = static_cast<uint32_t>(bindings.size());
-        layoutInfo.pBindings = bindings.data();
-        VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &layoutInfo, nullptr, &m_SetLayout));
-
         std::array<VkDescriptorPoolSize, 2> poolSizes{ {
             { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 3 },
             { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2 },
         } };
-        VkDescriptorPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
-        poolInfo.maxSets = 1;
-        poolInfo.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
-        poolInfo.pPoolSizes = poolSizes.data();
-        VK_CHECK(vkCreateDescriptorPool(m_Device, &poolInfo, nullptr, &m_DescriptorPool));
-
-        VkDescriptorSetAllocateInfo allocSet{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-        allocSet.descriptorPool = m_DescriptorPool;
-        allocSet.descriptorSetCount = 1;
-        allocSet.pSetLayouts = &m_SetLayout;
-        VK_CHECK(vkAllocateDescriptorSets(m_Device, &allocSet, &m_Set));
+        // Was 3 separate calls (vkCreateDescriptorSetLayout / vkCreateDescriptorPool /
+        // vkAllocateDescriptorSets) -- same repeated 3-call sequence as 40+ other passes, now bundled
+        // in VulkanUtils::CreateDescriptorSetLayoutPoolAndSet.
+        auto descSet = VulkanUtils::CreateDescriptorSetLayoutPoolAndSet(m_Device, bindings, poolSizes);
+        m_SetLayout = descSet.layout;
+        m_DescriptorPool = descSet.pool;
+        m_Set = descSet.set;
+        RegisterResource([this] {
+            vkDestroyDescriptorPool(m_Device, m_DescriptorPool, nullptr);
+            vkDestroyDescriptorSetLayout(m_Device, m_SetLayout, nullptr);
+            m_DescriptorPool = VK_NULL_HANDLE;
+            m_SetLayout = VK_NULL_HANDLE;
+            m_Set = VK_NULL_HANDLE;
+        });
 
         VkDescriptorImageInfo transStorageInfo{ VK_NULL_HANDLE, m_Transmittance.view, VK_IMAGE_LAYOUT_GENERAL };
         VkDescriptorImageInfo transSamplerInfo{ m_LUTSampler, m_Transmittance.view, VK_IMAGE_LAYOUT_GENERAL };
@@ -116,10 +138,20 @@ namespace renderer {
         plInfo.pushConstantRangeCount = 1;
         plInfo.pPushConstantRanges = &pushRange;
         VK_CHECK(vkCreatePipelineLayout(m_Device, &plInfo, nullptr, &m_PipelineLayout));
+        RegisterResource([this] { vkDestroyPipelineLayout(m_Device, m_PipelineLayout, nullptr); m_PipelineLayout = VK_NULL_HANDLE; });
 
         VkShaderModule shader = VulkanPipeline::LoadShaderModule(m_Device, "shaders/AtmosSkyLUTs.comp.spv");
         m_Pipeline = VulkanPipeline::CreateComputePipeline(m_Device, m_PipelineLayout, shader);
         vkDestroyShaderModule(m_Device, shader, nullptr);
+        RegisterResource([this] { vkDestroyPipeline(m_Device, m_Pipeline, nullptr); m_Pipeline = VK_NULL_HANDLE; });
+
+        // Not a Vulkan handle -- but the original hand-written Shutdown() reset this cache state too,
+        // so a Shutdown() followed by a fresh Init() on the same instance doesn't start out believing
+        // stale Transmittance/Multi-Scattering LUTs (from before the shutdown) are still valid.
+        RegisterResource([this] {
+            m_HasGeneratedStaticLUTs = false;
+            m_LastStaticSunDirection = {};
+        });
 
         LOG_INFO(std::format("[AtmosSkyPass] Initialized (Transmittance {}x{}, Multi-Scattering {}x{}, Sky-View {}x{}).",
             kTransmittanceExtent.width, kTransmittanceExtent.height,
@@ -128,37 +160,11 @@ namespace renderer {
         return true;
     }
 
-    void AtmosSkyPass::Shutdown() {
-        if (m_Device != VK_NULL_HANDLE) {
-            if (m_Pipeline != VK_NULL_HANDLE) vkDestroyPipeline(m_Device, m_Pipeline, nullptr);
-            if (m_PipelineLayout != VK_NULL_HANDLE) vkDestroyPipelineLayout(m_Device, m_PipelineLayout, nullptr);
-            if (m_SetLayout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(m_Device, m_SetLayout, nullptr);
-            if (m_DescriptorPool != VK_NULL_HANDLE) vkDestroyDescriptorPool(m_Device, m_DescriptorPool, nullptr);
-            if (m_LUTSampler != VK_NULL_HANDLE) vkDestroySampler(m_Device, m_LUTSampler, nullptr);
-            if (m_Transmittance.view != VK_NULL_HANDLE) vkDestroyImageView(m_Device, m_Transmittance.view, nullptr);
-            if (m_MultiScattering.view != VK_NULL_HANDLE) vkDestroyImageView(m_Device, m_MultiScattering.view, nullptr);
-            if (m_SkyView.view != VK_NULL_HANDLE) vkDestroyImageView(m_Device, m_SkyView.view, nullptr);
-        }
-        if (m_Allocator != VK_NULL_HANDLE) {
-            if (m_Transmittance.image != VK_NULL_HANDLE) vmaDestroyImage(m_Allocator, m_Transmittance.image, m_Transmittance.allocation);
-            if (m_MultiScattering.image != VK_NULL_HANDLE) vmaDestroyImage(m_Allocator, m_MultiScattering.image, m_MultiScattering.allocation);
-            if (m_SkyView.image != VK_NULL_HANDLE) vmaDestroyImage(m_Allocator, m_SkyView.image, m_SkyView.allocation);
-        }
-
-        m_Transmittance = {};
-        m_MultiScattering = {};
-        m_SkyView = {};
-        m_Pipeline = VK_NULL_HANDLE;
-        m_PipelineLayout = VK_NULL_HANDLE;
-        m_SetLayout = VK_NULL_HANDLE;
-        m_Set = VK_NULL_HANDLE;
-        m_DescriptorPool = VK_NULL_HANDLE;
-        m_LUTSampler = VK_NULL_HANDLE;
-        m_HasGeneratedStaticLUTs = false;
-        m_LastStaticSunDirection = {};
-        m_Allocator = VK_NULL_HANDLE;
-        m_Device = VK_NULL_HANDLE;
-    }
+    // Shutdown() is inherited from RenderPass<AtmosSkyPass>: it runs every RegisterResource()
+    // cleanup registered above, in reverse order (pipeline -> pipeline layout -> descriptor
+    // pool+layout -> sampler -> Sky-View -> Multi-Scattering -> Transmittance), which destroys
+    // exactly the same handles the hand-written Shutdown() used to, in the same dependency-safe
+    // order (consumers before the resources they depend on).
 
     void AtmosSkyPass::DispatchMode(VkCommandBuffer cmd, int32_t mode, VkExtent2D extent,
         const maths::vec3& sunDirectionWorld, float sunIlluminanceLux) {
