@@ -13,6 +13,7 @@
 #include "include/struct_custo.glsl"
 #include "include/enhanced_displacement.glsl"
 #include "include/spline_deformation.glsl"
+#include "include/skeletal_animation.glsl"
 #include "include/displacement_bounds.glsl"
 
 #define PAGE_TABLE_SET 0

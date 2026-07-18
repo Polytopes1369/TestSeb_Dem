@@ -21,6 +21,13 @@
 #include "include/wpo_deformation.glsl"
 #include "include/enhanced_displacement.glsl"
 #include "include/spline_deformation.glsl"
+// Skeletal-animation feature: this entity's clusters never carry core::EntityFlags::
+// IsSkeletallyAnimated (the one skinned entity, the procedural creature, is always fully opaque --
+// see VulkanContext::BuildEntityData()'s own comment -- so its clusters never reach this
+// TRANSPARENT-only forward pass), so ApplySkeletalSkinning() is never actually called here. Only
+// included for the SKELETAL_MAX_DEVIATION constant displacement_bounds.glsl references
+// unconditionally below (this file has no bone-matrices SSBO binding of its own).
+#include "include/skeletal_animation.glsl"
 #include "include/displacement_bounds.glsl"
 
 // Mirrors renderer::TransparentClusterEntry (TransparentForwardPass.h) field-for-field.

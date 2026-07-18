@@ -147,11 +147,33 @@ namespace geometry {
     // differently-classified (opaque vs. masked) clusters that can never merge -- see this file's
     // BuildLevelAdjacencyWeights) -- in the latter case every still-unpaired top node becomes its
     // own root, so `rootIndices` may contain more than one entry.
+    //
+    // `allVertexSkins`, when non-null, must be index-aligned 1:1 with `allVertices` (same global
+    // vertex index space) -- populated only for a scene that generated a
+    // core::EntityFlags::IsSkeletallyAnimated entity (see VulkanContext::GenerateCreature /
+    // geometry::VirtualGeometryCacheTest.cpp's readback of the second, skin-data SSBO). Every
+    // level-0 leaf ClusterDAGNode this targetMeshID produces gets its mesh.boneIndices/boneWeights
+    // populated from this array (see SimplifiableMesh's own comment); ignored entirely when null
+    // (every other, non-skinned entity's call site).
+    //
+    // `forceSingleLevelDAG`, when true, skips the grouping/simplification loop entirely -- every
+    // level-0 leaf cluster is directly promoted to a DAG root, so this entity has exactly one LOD
+    // (no coarser level ever exists for it). Required for a skeletally-animated entity: bone
+    // influence data has no valid QEM/grouping carry-through (see SimplifiableMesh::boneIndices'
+    // own comment for why), so any level above 0 would either silently drop skin data (a leaf-set
+    // rendered without it, wrongly falling back to bind pose) or crash indexing empty parallel
+    // arrays. A small procedural creature's own triangle budget comfortably fits within one or a
+    // handful of leaf clusters, so forgoing coarser LODs costs nothing perceptible for this feature
+    // -- see project documentation for this deliberate scope decision. Defaulted false so the
+    // existing single call site (VirtualGeometryCacheTest.cpp, every non-skinned entity) needs no
+    // change.
     ClusterDAG BuildClusterDAG(
         uint32_t targetMeshID,
         const std::vector<renderer::Vertex>& allVertices,
         const std::vector<uint32_t>& allIndices,
-        uint32_t maskTextureIndex);
+        uint32_t maskTextureIndex,
+        const std::vector<ClusterVertexSkin>* allVertexSkins = nullptr,
+        bool forceSingleLevelDAG = false);
 
     // Validates a whole DAG's structural and error-monotonicity invariants. Intended to run once
     // at startup, right after BuildClusterDAG, before the DAG is trusted for runtime LOD cuts.

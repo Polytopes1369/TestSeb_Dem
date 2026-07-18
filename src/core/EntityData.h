@@ -9,7 +9,7 @@ namespace core {
         uint32_t cellID;
         uint32_t flags; // Bit 0: CastShadows, Bit 1: IsInteractive, Bit 2: IsDynamic, Bit 3: UseCustomFog,
                          // Bit 4: IsTransparent, Bit 5: HasEnhancedDisplacement, Bit 6: HasSplineDeformation,
-                         // Bit 7: StreamingInactive, Bit 8: IsTessellated
+                         // Bit 7: StreamingInactive, Bit 8: IsTessellated, Bit 9: IsSkeletallyAnimated
     };
 
     enum EntityFlags : uint32_t {
@@ -50,7 +50,21 @@ namespace core {
         // did. VulkanContext::BuildEntityData() also still forces IsTransparent true for every
         // IsTessellated entity (not just materialID-based alpha), for that same exclusion reason --
         // NOT because tessellated entities are actually alpha-blended.
-        IsTessellated = 1 << 8
+        IsTessellated = 1 << 8,
+        // Skeletal-animation feature: opts this entity into GPU linear-blend vertex skinning
+        // inside the NORMAL Nanite cluster/LOD/culling pipeline (unlike IsTessellated above, this
+        // does NOT divert the entity to a separate rendering path -- the whole point of Nanite-
+        // style skinning, vs. a traditional skinned-mesh renderer, is that LOD/culling keep working
+        // on deformed geometry). Mirrors WPO/HasSplineDeformation's own "in-place per-vertex
+        // deformation" idiom: gates ApplySkeletalSkinning() (src/shaders/include/
+        // skeletal_animation.glsl), called identically from both ClusterRaster.vert (hardware
+        // raster path) and cluster_software_raster_core.glsl (software raster path), plus the
+        // deferred resolve shaders (ClusterResolve.comp/ClusterResolveBinned.comp) that must
+        // re-derive the exact same deformed triangle for barycentric reconstruction -- see those
+        // files' own ENTITY_FLAG_IS_SKELETALLY_ANIMATED call sites. Currently set on exactly one
+        // entity, the procedural creature (VulkanContext::kCreatureEntityIndex,
+        // src/shaders/src/PrimitiveGen/geom_creature.comp).
+        IsSkeletallyAnimated = 1 << 9
     };
 
     inline void SetFlag(uint32_t& flags, EntityFlags f, bool value) {

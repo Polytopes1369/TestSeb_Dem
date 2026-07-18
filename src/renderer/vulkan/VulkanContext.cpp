@@ -13,6 +13,8 @@
 // ComputeFaceAccumulatedNormals -- BakeHlodProxyIntoSlot() reuses the SAME normal-recomputation
 // helper the offline HLOD bake chain documents (world::CellHlodVertex's own header comment) rather
 // than inventing a second implementation.
+#include "animation/SkeletalAnimator.h" // animation::SkeletalAnimator::kBoneCount/kSegmentLength -- see GenerateCreature()'s own comment.
+#include "geometry/ClusterFormat.h" // geometry::ClusterVertexSkin -- see GetVertexSkinBuffer()'s own comment.
 #include "geometry/MeshSimplifier.h"
 #include <algorithm>
 #include <array>
@@ -233,6 +235,26 @@ struct RiverParams {
   uint32_t segmentsAcross;
   float halfWidth;
   float _padUnused;
+  uint32_t meshID;
+  float materialID;
+  uint32_t vertexOffset;
+  uint32_t indexOffset;
+  float worldOffsetX;
+  float worldOffsetY;
+  float worldOffsetZ;
+};
+
+// Skeletal-animation feature: geom_creature.comp's own Params UBO -- must match that shader's
+// Params block exactly (std140). boneCount/segmentLength MUST equal animation::SkeletalAnimator::
+// kBoneCount/kSegmentLength exactly (see GenerateCreature()'s own comment) so the generated
+// bind-pose mesh matches the CPU-side skeleton's own analytic bind pose bit-for-bit.
+struct CreatureParams {
+  uint32_t boneCount;
+  uint32_t sidesPerRing;
+  uint32_t ringsPerSegment;
+  float segmentLength;
+  float radiusMin;
+  float radiusMax;
   uint32_t meshID;
   float materialID;
   uint32_t vertexOffset;
@@ -466,6 +488,23 @@ void VulkanContext::Init(std::string_view appName, GLFWwindow *window) {
     throw std::runtime_error("Failed to allocate index SSBO!");
   }
   LOG_INFO(std::format("[VulkanContext] Allocated index SSBO: size={} MB.", m_IndexBufferBytes / (1024 * 1024)));
+
+  // Skeletal-animation feature -- see GetVertexSkinBuffer()'s own comment: index-aligned 1:1 with
+  // m_VertexBuffer (same element count), so its byte size is scaled off the exact same vertex
+  // capacity, just with geometry::ClusterVertexSkin (8 bytes/vertex) instead of renderer::Vertex
+  // (48 bytes/vertex) per slot. No TRANSFER_DST_BIT (unlike m_VertexBuffer/m_IndexBuffer): this
+  // buffer is only ever written by geom_creature.comp's compute dispatch, never by a staging-buffer
+  // upload. TRANSFER_SRC_BIT is required for geometry::RunVirtualGeometryCacheTest's own readback.
+  VkDeviceSize vertexSkinBufferBytes =
+      (m_VertexBufferBytes / sizeof(renderer::Vertex)) * sizeof(geometry::ClusterVertexSkin);
+  VkBufferCreateInfo vsInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+  vsInfo.size = vertexSkinBufferBytes;
+  vsInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+  if (vmaCreateBuffer(m_Allocator, &vsInfo, &vAlloc, &m_VertexSkinBuffer,
+                      &m_VertexSkinAllocation, nullptr) != VK_SUCCESS) {
+    throw std::runtime_error("Failed to allocate vertex-skin SSBO!");
+  }
+  LOG_INFO(std::format("[VulkanContext] Allocated vertex-skin SSBO: size={} MB.", vertexSkinBufferBytes / (1024 * 1024)));
 
   VkBufferCreateInfo pInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
   pInfo.size = 256;
@@ -1250,7 +1289,7 @@ void VulkanContext::CreateSyncObjects() {
 }
 
 void VulkanContext::CreatePipelinesAndDescriptors() {
-  VkDescriptorPoolSize poolSizes[] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4},
+  VkDescriptorPoolSize poolSizes[] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 5},
                                       {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1}};
   VkDescriptorPoolCreateInfo poolInfo{
       VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
@@ -1262,7 +1301,7 @@ void VulkanContext::CreatePipelinesAndDescriptors() {
     throw std::runtime_error("Failed to create Geometry Descriptor Pool!");
   }
 
-  VkDescriptorSetLayoutBinding bindings[5] = {};
+  VkDescriptorSetLayoutBinding bindings[6] = {};
   bindings[0].binding = 0; // Vertices SSBO
   bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
   bindings[0].descriptorCount = 1;
@@ -1292,9 +1331,22 @@ void VulkanContext::CreatePipelinesAndDescriptors() {
   bindings[4].descriptorCount = 1;
   bindings[4].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
 
+  // Skeletal-animation feature: vertex-skin SSBO (geometry::ClusterVertexSkin per vertex slot,
+  // index-aligned with binding 0's Vertex SSBO) -- compute-stage-only WRITE, since only
+  // geom_creature.comp's dispatch ever references binding 5 in its own GLSL source (every other
+  // geom_*.comp shader shares this same descriptor set/layout but simply never declares this
+  // binding, an already-established harmless pattern in this shared-descriptor-set design -- see
+  // e.g. how the box-face generator never references binding 2's Params UBO either). Not read by
+  // any vertex/fragment shader (unlike bindings 0/1/3/4): its only consumer is the CPU-side
+  // readback geometry::RunVirtualGeometryCacheTest performs once at startup.
+  bindings[5].binding = 5;
+  bindings[5].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  bindings[5].descriptorCount = 1;
+  bindings[5].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
   VkDescriptorSetLayoutCreateInfo layoutInfo{
       VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-  layoutInfo.bindingCount = 5;
+  layoutInfo.bindingCount = 6;
   layoutInfo.pBindings = bindings;
   if (vkCreateDescriptorSetLayout(m_Device, &layoutInfo, nullptr,
                                   &m_GeometryLayout) != VK_SUCCESS) {
@@ -1317,9 +1369,10 @@ void VulkanContext::CreatePipelinesAndDescriptors() {
   VkDescriptorBufferInfo entityTransformInfo{m_EntityTransformBuffer, 0,
                                              VK_WHOLE_SIZE};
   VkDescriptorBufferInfo entityDataInfo{m_EntityBuffer, 0, VK_WHOLE_SIZE};
+  VkDescriptorBufferInfo vertexSkinInfo{m_VertexSkinBuffer, 0, VK_WHOLE_SIZE};
 
-  VkWriteDescriptorSet writes[5] = {};
-  for (int i = 0; i < 5; i++) {
+  VkWriteDescriptorSet writes[6] = {};
+  for (int i = 0; i < 6; i++) {
     writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     writes[i].dstSet = m_GeometryDescriptorSet;
     writes[i].dstBinding = i;
@@ -1335,8 +1388,10 @@ void VulkanContext::CreatePipelinesAndDescriptors() {
   writes[3].pBufferInfo = &entityTransformInfo;
   writes[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
   writes[4].pBufferInfo = &entityDataInfo;
+  writes[5].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  writes[5].pBufferInfo = &vertexSkinInfo;
 
-  vkUpdateDescriptorSets(m_Device, 5, writes, 0, nullptr);
+  vkUpdateDescriptorSets(m_Device, 6, writes, 0, nullptr);
 
   // Compute layout setup: shared by all non-box primitive generators, which
   // read their per-dispatch parameters from the Params UBO (binding = 2) bound
@@ -1391,6 +1446,7 @@ void VulkanContext::CreatePipelinesAndDescriptors() {
       {"shaders/geom_chamferBox.comp.spv", &m_ChamferBoxPipeline},
       {"shaders/geom_terrain.comp.spv", &m_TerrainPipeline},
       {"shaders/geom_river.comp.spv", &m_RiverPipeline},
+      {"shaders/geom_creature.comp.spv", &m_CreaturePipeline},
       {"shaders/autosmooth.comp.spv", &m_AutosmoothPipeline},
   };
   for (const auto &desc : simplePrimitives) {
@@ -1700,6 +1756,15 @@ void VulkanContext::BuildEntityData() {
       entity.materialID = renderer::kTerrainMaterialID;
       isTransparent = m_MaterialTable.isTransparent[entity.materialID];
     }
+    // Skeletal-animation feature: the procedural creature -- stays fully opaque (no exclusion
+    // mechanism needed, unlike the hero/tessellated/water entities: skinned geometry renders
+    // through the NORMAL opaque Nanite VisBuffer pipeline, gated purely by
+    // core::EntityFlags::IsSkeletallyAnimated below -- see that flag's own comment for why this is
+    // the whole point of "Nanite skinning" vs. a separate forward pass).
+    if (i == kCreatureEntityIndex) {
+      entity.materialID = renderer::kCreatureMaterialID;
+      isTransparent = m_MaterialTable.isTransparent[entity.materialID];
+    }
     // Phase 7c (UE5.8 parity roadmap, water/erosion): the water entity -- same exclusion mechanism
     // as the hero entity's own override above (forced IsTransparent so ClusterLODCompact.comp
     // never routes its clusters into the opaque candidate list; TransparentForwardPass itself stays
@@ -1730,6 +1795,12 @@ void VulkanContext::BuildEntityData() {
     }
     if (i == 6u) {
       core::SetFlag(entity.flags, core::EntityFlags::HasSplineDeformation, true);
+    }
+    // Skeletal-animation feature: opts the procedural creature into GPU linear-blend vertex
+    // skinning inside the normal Nanite cluster pipeline -- see core::EntityFlags::
+    // IsSkeletallyAnimated's own comment.
+    if (i == kCreatureEntityIndex) {
+      core::SetFlag(entity.flags, core::EntityFlags::IsSkeletallyAnimated, true);
     }
   }
 
@@ -2353,6 +2424,52 @@ void VulkanContext::GenerateRiver(
   runningIndexOffset += 6u * (segmentsAlong - 1u) * (segmentsAcross - 1u);
 }
 
+void VulkanContext::GenerateCreature(
+    uint32_t meshID, maths::vec2 slot, float worldOffsetY,
+    uint32_t sidesPerRing, uint32_t ringsPerSegment, float radiusMin, float radiusMax,
+    uint32_t& runningVertexOffset, uint32_t& runningIndexOffset) {
+  assert(sidesPerRing >= 3u);
+  assert(ringsPerSegment >= 1u);
+  assert(radiusMin > 0.0f);
+  assert(radiusMax > radiusMin);
+
+  CreatureParams params{};
+  // MUST equal animation::SkeletalAnimator::kBoneCount/kSegmentLength exactly -- see this
+  // function's own header comment (VulkanContext.h) for why the generated bind-pose mesh and the
+  // CPU-side skeleton's own analytic bind pose can never be allowed to drift apart.
+  params.boneCount = animation::SkeletalAnimator::kBoneCount;
+  params.segmentLength = animation::SkeletalAnimator::kSegmentLength;
+  params.sidesPerRing = sidesPerRing;
+  params.ringsPerSegment = ringsPerSegment;
+  params.radiusMin = radiusMin;
+  params.radiusMax = radiusMax;
+  params.meshID = meshID;
+  params.materialID = 0.0f; // See GenerateTerrain()'s own identical comment on this field.
+  params.vertexOffset = runningVertexOffset;
+  params.indexOffset = runningIndexOffset;
+  params.worldOffsetX = slot.x;
+  params.worldOffsetY = worldOffsetY;
+  params.worldOffsetZ = slot.y;
+
+  uint32_t totalRings = (params.boneCount - 1u) * params.ringsPerSegment + 1u;
+  uint32_t ringVertexCount = totalRings * params.sidesPerRing;
+  // +2: tail pole cap + head pole cap (see geom_creature.comp's own vertex-generation comment).
+  uint32_t totalVerts = ringVertexCount + 2u;
+
+  constexpr uint32_t kLocalSizeX = 64u; // geom_creature.comp local_size_x = 64
+  uint32_t groupCount = (totalVerts + kLocalSizeX - 1u) / kLocalSizeX;
+
+  DispatchGeometryCompute(m_CreaturePipeline, m_ComputePipelineLayout, &params,
+                          sizeof(params), nullptr, 0, groupCount, 1, 1);
+
+  runningVertexOffset += totalVerts;
+  // Body quads between consecutive rings (6 indices/quad) + 2 pole fans (3 indices/triangle,
+  // sidesPerRing triangles/fan) -- see geom_creature.comp's own index-generation comment.
+  uint32_t bodyIndexCount = (totalRings - 1u) * params.sidesPerRing * 6u;
+  uint32_t capIndexCount = 2u * params.sidesPerRing * 3u;
+  runningIndexOffset += bodyIndexCount + capIndexCount;
+}
+
 void VulkanContext::GenerateCapsule(
     float Radius, float Height,
     uint32_t meshID, maths::vec2 slot,
@@ -2718,6 +2835,32 @@ void VulkanContext::GenerateGeometry() {
     }
 
     treePass.Shutdown();
+  }
+
+  // -------------------------------------------------------------------------
+  // SKELETAL-ANIMATION CREATURE (entity kCreatureEntityIndex) — a procedurally-generated,
+  // procedurally-animated segmented "worm/snake" (16-bone single-chain skeleton, animation::
+  // SkeletalAnimator), the one entity in the whole showcase carrying core::EntityFlags::
+  // IsSkeletallyAnimated. Placed in its own small clearing on the opposite side of the gallery from
+  // the trees (see kTreeClearingX's own comment for that precedent) so it reads as a distinct
+  // feature area, resting directly on the terrain (worldOffsetY = floor top + radiusMax, so its
+  // belly touches the ground -- its idle undulation only sways side-to-side in X/Z, never
+  // vertically, so no further ground clearance is needed).
+  // -------------------------------------------------------------------------
+  {
+    constexpr float kCreatureClearingX = -10.0f; // Mirrors kTreeClearingX's own offset, opposite side.
+    constexpr float kCreatureGroundY = -0.8f;    // Matches the floor/trees' own ground level.
+    constexpr uint32_t kCreatureSidesPerRing = 8u;
+    constexpr uint32_t kCreatureRingsPerSegment = 2u; // >1 so mid-segment vertices get a genuine 2-bone blend (see geom_creature.comp).
+    constexpr float kCreatureRadiusMin = 0.06f;
+    constexpr float kCreatureRadiusMax = 0.30f;
+
+    maths::vec2 slot = { kCreatureClearingX, 0.0f };
+    GenerateCreature(m_EntityData[kCreatureEntityIndex].meshID, slot,
+                      kCreatureGroundY + kCreatureRadiusMax,
+                      kCreatureSidesPerRing, kCreatureRingsPerSegment,
+                      kCreatureRadiusMin, kCreatureRadiusMax,
+                      runningVertexOffset, runningIndexOffset);
   }
 
   // -------------------------------------------------------------------------
@@ -3564,6 +3707,9 @@ void VulkanContext::Shutdown() {
   if (m_VertexBuffer != VK_NULL_HANDLE) {
     vmaDestroyBuffer(m_Allocator, m_VertexBuffer, m_VertexAllocation);
   }
+  if (m_VertexSkinBuffer != VK_NULL_HANDLE) {
+    vmaDestroyBuffer(m_Allocator, m_VertexSkinBuffer, m_VertexSkinAllocation);
+  }
   if (m_IndexBuffer != VK_NULL_HANDLE) {
     vmaDestroyBuffer(m_Allocator, m_IndexBuffer, m_IndexAllocation);
   }
@@ -3602,7 +3748,7 @@ void VulkanContext::Shutdown() {
        {m_ConePipeline, m_IcospherePipeline, m_PlanePipeline, m_SpherePipeline,
         m_TorusPipeline, m_TubePipeline, m_CapsulePipeline, m_CylinderPipeline,
         m_PyramidPipeline, m_TorusKnotPipeline, m_ChamferBoxPipeline,
-        m_TerrainPipeline, m_RiverPipeline, m_AutosmoothPipeline}) {
+        m_TerrainPipeline, m_RiverPipeline, m_CreaturePipeline, m_AutosmoothPipeline}) {
     if (pipeline != VK_NULL_HANDLE) {
       vkDestroyPipeline(m_Device, pipeline, nullptr);
     }

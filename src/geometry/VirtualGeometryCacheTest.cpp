@@ -13,6 +13,7 @@
 #include "renderer/RenderTypes.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
@@ -37,12 +38,18 @@ namespace geometry {
         // -------------------------------------------------------------------------------------
         bool ReadbackFullGeometry(
             VkDevice device, VmaAllocator allocator, VkQueue graphicsQueue, VkCommandPool commandPool,
-            VkBuffer vertexBuffer, VkBuffer indexBuffer,
+            VkBuffer vertexBuffer, VkBuffer indexBuffer, VkBuffer vertexSkinBuffer,
             uint32_t totalVertexCount, uint32_t totalIndexCount,
-            std::vector<renderer::Vertex>& outVertices, std::vector<uint32_t>& outIndices) {
+            std::vector<renderer::Vertex>& outVertices, std::vector<uint32_t>& outIndices,
+            std::vector<ClusterVertexSkin>& outSkins) {
 
             const VkDeviceSize vertexBytes = static_cast<VkDeviceSize>(totalVertexCount) * sizeof(renderer::Vertex);
             const VkDeviceSize indexBytes = static_cast<VkDeviceSize>(totalIndexCount) * sizeof(uint32_t);
+            // Skeletal-animation feature: mirrors vertexBytes' own sizing (same totalVertexCount,
+            // index-aligned 1:1 with outVertices) -- see VulkanContext::GetVertexSkinBuffer()'s own
+            // comment for why this buffer exists at full scene scale even though only the creature
+            // entity's own vertex range is ever meaningfully written by geom_creature.comp.
+            const VkDeviceSize skinBytes = static_cast<VkDeviceSize>(totalVertexCount) * sizeof(ClusterVertexSkin);
 
             VkBuffer stagingVertex = VK_NULL_HANDLE;
             VmaAllocation stagingVertexAlloc = VK_NULL_HANDLE;
@@ -66,6 +73,18 @@ namespace geometry {
                 return false;
             }
 
+            VkBuffer stagingSkin = VK_NULL_HANDLE;
+            VmaAllocation stagingSkinAlloc = VK_NULL_HANDLE;
+            VkBufferCreateInfo sInfo{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+            sInfo.size = skinBytes;
+            sInfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+            if (vmaCreateBuffer(allocator, &sInfo, &stagingAllocInfo, &stagingSkin, &stagingSkinAlloc, nullptr) != VK_SUCCESS) {
+                LOG_ERROR("[GeometryCacheTest] Failed to allocate vertex-skin staging buffer for full readback!");
+                vmaDestroyBuffer(allocator, stagingVertex, stagingVertexAlloc);
+                vmaDestroyBuffer(allocator, stagingIndex, stagingIndexAlloc);
+                return false;
+            }
+
             VkCommandBufferAllocateInfo cmdAllocInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
             cmdAllocInfo.commandPool = commandPool;
             cmdAllocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
@@ -76,6 +95,7 @@ namespace geometry {
                 LOG_ERROR("[GeometryCacheTest] Failed to allocate the full-readback command buffer!");
                 vmaDestroyBuffer(allocator, stagingVertex, stagingVertexAlloc);
                 vmaDestroyBuffer(allocator, stagingIndex, stagingIndexAlloc);
+                vmaDestroyBuffer(allocator, stagingSkin, stagingSkinAlloc);
                 return false;
             }
 
@@ -87,6 +107,8 @@ namespace geometry {
             vkCmdCopyBuffer(cmd, vertexBuffer, stagingVertex, 1, &vertexCopyRegion);
             VkBufferCopy indexCopyRegion{ 0, 0, indexBytes };
             vkCmdCopyBuffer(cmd, indexBuffer, stagingIndex, 1, &indexCopyRegion);
+            VkBufferCopy skinCopyRegion{ 0, 0, skinBytes };
+            vkCmdCopyBuffer(cmd, vertexSkinBuffer, stagingSkin, 1, &skinCopyRegion);
 
             vkEndCommandBuffer(cmd);
 
@@ -99,6 +121,7 @@ namespace geometry {
 
             outVertices.resize(totalVertexCount);
             outIndices.resize(totalIndexCount);
+            outSkins.resize(totalVertexCount);
 
             bool ok = true;
 
@@ -122,8 +145,19 @@ namespace geometry {
                 ok = false;
             }
 
+            void* mappedSkins = nullptr;
+            if (ok && vmaMapMemory(allocator, stagingSkinAlloc, &mappedSkins) == VK_SUCCESS) {
+                std::memcpy(outSkins.data(), mappedSkins, static_cast<size_t>(skinBytes));
+                vmaUnmapMemory(allocator, stagingSkinAlloc);
+            }
+            else if (ok) {
+                LOG_ERROR("[GeometryCacheTest] Failed to map vertex-skin staging buffer!");
+                ok = false;
+            }
+
             vmaDestroyBuffer(allocator, stagingVertex, stagingVertexAlloc);
             vmaDestroyBuffer(allocator, stagingIndex, stagingIndexAlloc);
+            vmaDestroyBuffer(allocator, stagingSkin, stagingSkinAlloc);
             return ok;
         }
 
@@ -147,11 +181,29 @@ namespace geometry {
 
             std::vector<maths::vec3> normals = ComputeFaceAccumulatedNormals(node.mesh);
 
+            // Skeletal-animation feature: only ever non-empty for a forceSingleLevelDAG (level-0
+            // only) entity's leaf nodes -- see SimplifiableMesh::boneIndices' own comment. Size is
+            // checked (not just non-empty) since it must match vertexCount exactly to index safely
+            // below; ClusterDAG.cpp's leaf loop always populates both in lockstep with positions/
+            // uvs when allVertexSkins was supplied, so a mismatch here would indicate a logic bug
+            // upstream, not a legitimate "partially populated" state.
+            bool hasSkin = node.mesh.boneIndices.size() == vertexCount && node.mesh.boneWeights.size() == vertexCount;
+
             outData = ClusterData{};
             for (uint32_t v = 0; v < vertexCount; ++v) {
                 outData.positions[v] = QuantizePosition(node.mesh.positions[v], node.boundsMin, node.boundsMax);
                 outData.normals[v] = EncodeOctNormal24(normals[v]);
                 outData.uvs[v] = EncodeUV(node.mesh.uvs[v]);
+                if (hasSkin) {
+                    const std::array<uint8_t, 4>& idx = node.mesh.boneIndices[v];
+                    const std::array<uint8_t, 4>& w = node.mesh.boneWeights[v];
+                    outData.skin[v] = ClusterVertexSkin{
+                        { idx[0], idx[1], idx[2], idx[3] },
+                        { w[0], w[1], w[2], w[3] }
+                    };
+                }
+                // else: outData.skin[v] stays zero-initialized (ClusterData{} above), the documented
+                // "no skinning influence" state for every non-skeletally-animated cluster.
             }
             for (uint32_t i = 0; i < indexCount; ++i) {
                 outData.indices[i] = static_cast<uint8_t>(node.mesh.triangles[i]);
@@ -405,7 +457,7 @@ namespace geometry {
 
     bool RunVirtualGeometryCacheTest(
         VkDevice device, VmaAllocator allocator, VkQueue graphicsQueue, VkCommandPool commandPool,
-        VkBuffer vertexBuffer, VkBuffer indexBuffer,
+        VkBuffer vertexBuffer, VkBuffer indexBuffer, VkBuffer vertexSkinBuffer,
         uint32_t totalVertexCount, uint32_t totalIndexCount,
         const core::EntityData* entityData, uint32_t entityCount) {
 
@@ -413,8 +465,9 @@ namespace geometry {
 
         std::vector<renderer::Vertex> allVertices;
         std::vector<uint32_t> allIndices;
-        if (!ReadbackFullGeometry(device, allocator, graphicsQueue, commandPool, vertexBuffer, indexBuffer,
-            totalVertexCount, totalIndexCount, allVertices, allIndices)) {
+        std::vector<ClusterVertexSkin> allVertexSkins;
+        if (!ReadbackFullGeometry(device, allocator, graphicsQueue, commandPool, vertexBuffer, indexBuffer, vertexSkinBuffer,
+            totalVertexCount, totalIndexCount, allVertices, allIndices, allVertexSkins)) {
             LOG_ERROR("[GeometryCacheTest] Aborting: full geometry readback failed.");
             return false;
         }
@@ -498,12 +551,19 @@ namespace geometry {
             core::LoadingManager dagBuildPool(std::min(kMaxConcurrentDagBuilds, std::max(entityCount, 1u)));
 
             for (uint32_t entityIdx = 0; entityIdx < entityCount; ++entityIdx) {
-                dagBuildPool.Submit([entityIdx, &entityData, &allVertices, &allIndices, &results]() {
+                dagBuildPool.Submit([entityIdx, &entityData, &allVertices, &allIndices, &allVertexSkins, &results]() {
                     EntityResult& res = results[entityIdx];
                     res.meshID = entityData[entityIdx].meshID;
                     EntityMaterialProperties materialProps = GetEntityMaterialProperties(entityData[entityIdx].materialID);
 
-                    res.dag = BuildClusterDAG(res.meshID, allVertices, allIndices, materialProps.maskTextureIndex);
+                    // Skeletal-animation feature: a core::EntityFlags::IsSkeletallyAnimated entity's
+                    // DAG must skip grouping/simplification entirely (forceSingleLevelDAG) and gets
+                    // its leaf vertices' bone influence threaded in from allVertexSkins -- see
+                    // BuildClusterDAG's own header comment for why (categorical bone data has no
+                    // valid QEM/grouping carry-through).
+                    bool isSkeletallyAnimated = core::GetFlag(entityData[entityIdx].flags, core::EntityFlags::IsSkeletallyAnimated);
+                    res.dag = BuildClusterDAG(res.meshID, allVertices, allIndices, materialProps.maskTextureIndex,
+                        isSkeletallyAnimated ? &allVertexSkins : nullptr, isSkeletallyAnimated);
                     if (res.dag.nodes.empty()) {
                         return; // Empty DAG, success remains true
                     }

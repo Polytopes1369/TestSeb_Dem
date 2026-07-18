@@ -25,6 +25,11 @@ float InflateDisplacementBound(float baseAmplitude, uint entityFlags) {
     if (GetFlag(entityFlags, ENTITY_FLAG_HAS_SPLINE_DEFORMATION)) {
         bound += SPLINE_MAX_DEVIATION;
     }
+    // Skeletal-animation feature: same reuse-maxWPOAmplitude contract as the two features above --
+    // see skeletal_animation.glsl's own SKELETAL_MAX_DEVIATION comment.
+    if (GetFlag(entityFlags, ENTITY_FLAG_IS_SKELETALLY_ANIMATED)) {
+        bound += SKELETAL_MAX_DEVIATION;
+    }
     return bound;
 }
 
@@ -47,6 +52,9 @@ float GetOriginalWPOAmplitude(float storedAmplitude, uint entityFlags) {
     }
     if (GetFlag(entityFlags, ENTITY_FLAG_HAS_SPLINE_DEFORMATION)) {
         original -= SPLINE_MAX_DEVIATION;
+    }
+    if (GetFlag(entityFlags, ENTITY_FLAG_IS_SKELETALLY_ANIMATED)) {
+        original -= SKELETAL_MAX_DEVIATION;
     }
     return max(original, 0.0);
 }

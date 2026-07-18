@@ -108,6 +108,7 @@
 #include <vulkan/vulkan.h>
 #include <vk_mem_alloc.h>
 
+#include "animation/SkeletalAnimator.h"
 #include "core/Camera.h"
 #include "core/EngineConfig.h"
 #include "core/EntityData.h" // core::EntityTransformCPU
@@ -554,6 +555,13 @@ namespace renderer {
         // entity 6 (Tube)'s clusters (see spline_deformation.glsl's own header comment for why this
         // is applied in local space before rotation).
         GpuBuffer m_SplineControlPointsBuffer;
+
+        // Skeletal-animation feature: procedural creature's bone hierarchy + per-frame animation
+        // evaluation -- see animation::SkeletalAnimator's own class comment. Owned here (not by
+        // VulkanContext) matching m_SplineControlPointsBuffer's own "the pipeline that consumes it
+        // also owns/updates it" placement; RecordFrameMid() calls RecordUpdate() once per frame,
+        // right alongside the existing WPOGlobalsUBO upload, before either raster pass runs.
+        animation::SkeletalAnimator m_SkeletalAnimator;
 
         // Generates the bindless procedural cutout mask array (mask_sampling.glsl) once at Init()
         // time, before any raster/resolve pass is initialized -- see ProceduralMaskGenerator's own

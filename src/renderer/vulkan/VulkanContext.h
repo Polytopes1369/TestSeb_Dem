@@ -180,6 +180,20 @@ public:
     VkCommandPool GetCommandPool() const { return m_CommandPool; }
     VkBuffer GetVertexBuffer() const { return m_VertexBuffer; }
     VkBuffer GetIndexBuffer() const { return m_IndexBuffer; }
+    // Skeletal-animation feature: a second SSBO, index-aligned 1:1 with m_VertexBuffer (same
+    // element count, geometry::ClusterVertexSkin per slot instead of renderer::Vertex), written
+    // ONLY by geom_creature.comp's compute dispatch (every other geom_*.comp shader's descriptor
+    // set binds this same buffer at binding 5 but never references it in its own GLSL source, an
+    // established harmless pattern -- see CreatePipelinesAndDescriptors()'s own comment) alongside
+    // its normal Vertex-SSBO write, at the exact same vertexOffset+vIdx slot. Exists at FULL scene
+    // vertex-buffer scale (not just the creature's own small vertex range) purely so its index
+    // space trivially matches renderer::Vertex's own global vertex index -- geometry::
+    // RunVirtualGeometryCacheTest's readback (ReadbackFullGeometry) and geometry::BuildClusterDAG
+    // both key off that exact same global index. Every non-creature vertex's slot here stays
+    // zero-initialized (never written), which decodes as "zero bone weight, no skinning
+    // influence" -- harmless since it is only ever consumed for entities carrying
+    // core::EntityFlags::IsSkeletallyAnimated.
+    VkBuffer GetVertexSkinBuffer() const { return m_VertexSkinBuffer; }
     const core::EntityData* GetEntityData() const { return m_EntityData.data(); }
     // Returns the TOTAL entity count including the streaming pool (kTotalEntityCount), not just
     // the fixed showcase gallery -- every existing "iterate every entity" consumer (GlobalSDFPass's
@@ -294,6 +308,9 @@ private:
     VmaAllocation m_VertexAllocation = VK_NULL_HANDLE;
     VkBuffer m_IndexBuffer = VK_NULL_HANDLE;
     VmaAllocation m_IndexAllocation = VK_NULL_HANDLE;
+    // Skeletal-animation feature -- see GetVertexSkinBuffer()'s own comment.
+    VkBuffer m_VertexSkinBuffer = VK_NULL_HANDLE;
+    VmaAllocation m_VertexSkinAllocation = VK_NULL_HANDLE;
     VkBuffer m_ParamsBuffer = VK_NULL_HANDLE;
     VmaAllocation m_ParamsAllocation = VK_NULL_HANDLE;
 
@@ -341,6 +358,12 @@ private:
     // Rivers/waterfalls feature: geom_river.comp -- same shared Params UBO / DispatchGeometryCompute
     // path, own RiverParams struct (see GenerateRiver()'s own comment).
     VkPipeline m_RiverPipeline = VK_NULL_HANDLE;
+    // Skeletal-animation feature: geom_creature.comp -- same shared Params UBO /
+    // DispatchGeometryCompute path, own CreatureParams struct (see GenerateCreature()'s own
+    // comment). Generates the procedural skinned creature's bind-pose mesh + per-vertex bone
+    // weight/index data (written into a SECOND SSBO, GetVertexSkinBuffer() -- see that accessor's
+    // own comment -- via the shared descriptor set's binding 5, unique to this one primitive).
+    VkPipeline m_CreaturePipeline = VK_NULL_HANDLE;
 
     // The box is generated via 6 dispatches (one per cube face) of the same geom_box.comp
     // module, each specialized with a different VkSpecializationInfo (axis mapping / winding)
@@ -382,15 +405,31 @@ private:
     static constexpr uint32_t kTreeEntityIndexBase = 12;
     static constexpr uint32_t kTreeEntityCount = kTreeVisualCount * 2u; // bark + leaves per tree.
 
-    static constexpr uint32_t kEntityCount = 16 + kTreeEntityCount;
+    // Skeletal-animation feature: base bumped from 16 to 17 (was 12 showcase + 2 walls + floor +
+    // water = 16) to make room for the ONE procedural skinned creature entity
+    // (kCreatureEntityIndex below), inserted right after the tree entities and right before the
+    // walls -- exactly the same "bump the base, every kEntityCount-relative constant below shifts
+    // automatically" migration this project already used once before to insert the tree entities
+    // themselves (see kTreeEntityIndexBase's own comment for that precedent).
+    static constexpr uint32_t kEntityCount = 17 + kTreeEntityCount;
+    // Skeletal-animation feature: the procedural creature (geom_creature.comp) -- see
+    // GenerateCreature()'s own comment. Placed at kEntityCount-5, i.e. immediately before the 2
+    // Lumen-corner walls below (kEntityCount-4/-3), its own small "showcase clearing" the same way
+    // the procedural trees got one (see GenerateGeometry()'s own TREES block comment) -- picked
+    // specifically because every OTHER fixed index in this file (kWallEntityIndexA/B,
+    // kFloorEntityIndex, kWaterEntityIndex) is defined RELATIVE to kEntityCount, so inserting this
+    // one new entity by bumping the base (16 -> 17 above) shifts all of them down by exactly one
+    // slot automatically, with no other constant needing to change.
+    static constexpr uint32_t kCreatureEntityIndex = kEntityCount - 5;
     // The 2 static walls that form the Lumen/GI showcase corner (see GenerateGeometry()'s wall
     // blocks and UpdateEntityRotations()'s fixed-rotation branch for them) -- generated right
     // before the floor. Deliberately offset from kEntityCount by 4/3 (not 3/2, as before Phase 7c)
     // so adding the water plane as the new last entity does not shift these -- both stay at
     // kEntityCount-4/kEntityCount-3 (12/13 before the tree entities above were inserted, now
-    // shifted to 20/21), since GenerateShowcaseMaterialTable()'s own per-slot recipes are keyed by
-    // an EXPLICIT materialID override at those two entity indices (see BuildEntityData()'s own
-    // kWallMaterialIDA/B constants), not by an implicit materialID==entityIndex assumption.
+    // shifted further by the skeletal-animation creature insertion above), since
+    // GenerateShowcaseMaterialTable()'s own per-slot recipes are keyed by an EXPLICIT materialID
+    // override at those two entity indices (see BuildEntityData()'s own kWallMaterialIDA/B
+    // constants), not by an implicit materialID==entityIndex assumption.
     static constexpr uint32_t kWallEntityIndexA = kEntityCount - 4;
     static constexpr uint32_t kWallEntityIndexB = kEntityCount - 3;
     // The floor (a Phase 7b terrain heightfield) is generated right before the water plane -- see
@@ -623,6 +662,25 @@ private:
     // silently drift apart (see that file's own header comment for the full 3-consumer contract).
     void GenerateRiver(
         uint32_t meshID, uint32_t segmentsAlong, uint32_t segmentsAcross,
+        uint32_t& runningVertexOffset, uint32_t& runningIndexOffset);
+
+    // Skeletal-animation feature: dispatches m_CreaturePipeline (geom_creature.comp), generating
+    // the procedural creature's BIND-POSE mesh -- a straight single-chain "spine" of
+    // animation::SkeletalAnimator::kBoneCount joints, each a tapered ring of `sidesPerRing`
+    // vertices, plus two pole caps (tail/head) -- and, alongside the normal Vertex SSBO write,
+    // each vertex's linear-blend-skinning bone indices/weights into the second SSBO
+    // (GetVertexSkinBuffer(), the shared descriptor set's binding 5) at the SAME vertexOffset+vIdx
+    // slot. The bind pose here MUST exactly match animation::SkeletalAnimator::
+    // BindPoseBoneLocalPosition()'s own analytic straight-chain formula (bone i at local-space X =
+    // i * kSegmentLength, Y=Z=0) -- both this dispatch's CreatureParams (segmentLength/boneCount)
+    // and the CPU-side skeleton are derived from the SAME animation::SkeletalAnimator constants
+    // (kBoneCount/kSegmentLength), so they can never drift apart. `sidesPerRing`/`ringsPerSegment`
+    // control mesh resolution (rings between two bones, needed so a vertex OFF a bone's exact
+    // position gets a genuine 2-bone blended weight -- see geom_creature.comp's own header comment);
+    // `radiusMin`/`radiusMax` shape the tapered body profile.
+    void GenerateCreature(
+        uint32_t meshID, maths::vec2 slot, float worldOffsetY,
+        uint32_t sidesPerRing, uint32_t ringsPerSegment, float radiusMin, float radiusMax,
         uint32_t& runningVertexOffset, uint32_t& runningIndexOffset);
 
     // Authors m_EntityData on the CPU: assigns each of the kEntityCount entities a meshID via
