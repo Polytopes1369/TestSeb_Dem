@@ -26,7 +26,17 @@ struct SubstrateSlab {
     vec3 fuzzColor;
     float fuzzAmount;
     float fuzzRoughness;
-    float _pad0;
+    // Screen-space Subsurface Scattering (UE5.8 rendering-parity gap G4, "Subsurface Profile"
+    // shading model) -- world-space diffusion radius consumed by renderer::SubsurfaceScatteringPass'
+    // separable screen-space diffusion blur (the Jimenez/Burley "Separable SSS" technique). 0.0
+    // (default) = disabled: the pixel is never touched by that pass, exactly the pre-G4 behavior at
+    // zero extra cost. DISTINCT from sssAmount/sssRadius above: those drive the cheap analytic
+    // wrap-diffuse baked into EvaluateSlabDiffuse (substrate_bsdf.glsl), whereas this drives a real
+    // post-lighting screen-space diffusion pass -- exactly Substrate's own distinction between its
+    // "Subsurface" (wrap) and "Subsurface Profile" (screen-space diffusion) models. A material
+    // authors ONE or the other, never both (both together would double-count subsurface transport).
+    // Occupies what was _pad0. See renderer::SubstrateSlab::sssProfileScale (MaterialParameterTable.h).
+    float sssProfileScale;
     float _pad1;
     float _pad2;
 };
