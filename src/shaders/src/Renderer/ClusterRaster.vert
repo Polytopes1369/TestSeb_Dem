@@ -33,6 +33,7 @@
 #include "include/wpo_deformation.glsl"
 #include "include/enhanced_displacement.glsl"
 #include "include/spline_deformation.glsl"
+#include "include/skeletal_animation.glsl"
 #include "include/displacement_bounds.glsl"
 
 layout(std430, set = 0, binding = 0) readonly buffer ClusterCullMetadataSSBO {
@@ -64,6 +65,15 @@ layout(std140, set = 0, binding = 2) uniform WPOGlobalsUBO {
 // spline_deformation.glsl's own header comment for the local-space-before-rotation contract.
 layout(std430, set = 0, binding = 6) readonly buffer SplineControlPointsSSBO {
     SplineControlPoint splineControlPoints[SPLINE_CONTROL_POINT_COUNT];
+};
+
+// Skeletal-animation feature: this frame's bone-matrices SSBO (animation::SkeletalAnimator::
+// GetBoneMatricesBuffer(), uploaded once per frame by SkeletalAnimator::RecordUpdate) -- bound
+// read-only at binding 7, the first free slot past bindings 0-6 above. See
+// skeletal_animation.glsl's own header comment for the byte layout and
+// ApplySkeletalSkinning's own header comment for the local-space-before-rotation contract.
+layout(std430, set = 0, binding = 7) readonly buffer SkeletalBoneMatricesSSBO {
+    mat4 boneMatrices[SKELETAL_MAX_BONES];
 };
 
 // Camera matrices via Push Constants -- same layout as draw.vert's CameraPushConstants.
@@ -111,6 +121,19 @@ void main() {
     EntityTransform xform = entityTransforms[ed.meshID];
     mat3 rotation = mat3(xform.rotation);
     vec3 localPos = worldPos - xform.center;
+
+    // Skeletal-animation feature: linear-blend vertex skinning, applied in LOCAL space BEFORE the
+    // per-entity rigid rotation (and before spline bend below) -- see skeletal_animation.glsl's own
+    // header comment for why this ordering matches ApplySplineDeformation's own contract exactly
+    // (both are intrinsic rest-pose mesh-shape properties, not world-space effects). Bone
+    // indices/weights are decoded straight from the compressed pool, exactly like
+    // position/normal/UV -- see cluster_vertex_decode.glsl's own DecodeClusterSkin.
+    if (GetFlag(ed.flags, ENTITY_FLAG_IS_SKELETALLY_ANIMATED)) {
+        uvec4 boneIndices;
+        vec4 boneWeights;
+        DecodeClusterSkin(pageByteBase, localVertexIndex, boneIndices, boneWeights);
+        localPos = ApplySkeletalSkinning(localPos, boneIndices, boneWeights, boneMatrices);
+    }
 
     // Phase 1 (Nanite advanced): spline bend, applied in LOCAL space BEFORE the per-entity rigid
     // rotation -- see spline_deformation.glsl's own header comment for why this ordering is

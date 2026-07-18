@@ -27,19 +27,38 @@
 
 #include "renderer/passes/GlobalSDFPass.h"
 #include "renderer/vulkan/GpuBuffer.h"
+#include "renderer/vulkan/RenderPass.h"
 #include "renderer/passes/SurfaceCachePass.h"
 
 namespace renderer {
 
-    class SurfaceCacheTraceContext {
+    // Migrated to RenderPass<Derived> (see renderer/vulkan/RenderPass.h): Init()/Shutdown() are
+    // inherited. Note InitImpl() still calls the inherited Shutdown() as its own first statement
+    // (self-reinit, same pattern/reason as ShadowMapPass's own migration comment). The single
+    // descriptor pool here allocates 2 DIFFERENT-layout sets (mesh SDF trace + surface cache
+    // sampling, maxSets=2) -- VulkanUtils::CreateDescriptorSetLayoutPoolAndSet only covers the
+    // single-layout/single-set case, so this stays raw Vulkan calls wrapped in RegisterResource(),
+    // same reasoning as ReflectionPass's own migration.
+    class SurfaceCacheTraceContext : public RenderPass<SurfaceCacheTraceContext> {
+        friend class RenderPass<SurfaceCacheTraceContext>; // Lets Init() call our private InitImpl().
+
     public:
         SurfaceCacheTraceContext() = default;
 
         SurfaceCacheTraceContext(const SurfaceCacheTraceContext&) = delete;
         SurfaceCacheTraceContext& operator=(const SurfaceCacheTraceContext&) = delete;
 
-        // Must match mesh_sdf_trace.glsl's kMaxTracedEntities exactly.
-        static inline uint32_t kMaxTracedEntities = 128u;
+        // Must match mesh_sdf_trace.glsl's kMaxTracedEntities exactly -- this is the g_EntitySDF
+        // descriptor array's fixed PHYSICAL capacity, baked into the shader's SPIR-V at shader-
+        // compile time, so it can never track config::lumen::MAX_TRACED_ENTITIES (a per-quality-
+        // tier AND live-debug-slider RUNTIME value -- see EngineConfig_Low/Medium/High/Extrem.h and
+        // main.cpp's "Max Traced Entities" DragInt) without desyncing the descriptor set layout's
+        // descriptorCount from what the shader actually declares (undefined behavior per the Vulkan
+        // spec, caught by validation layers as an unwritten/undersized descriptor array). Init()
+        // instead clamps the ACTUAL traced-entity count to min(config::lumen::MAX_TRACED_ENTITIES,
+        // kMaxTracedEntities), so quality tiers still scale GI trace cost down as intended without
+        // ever resizing this fixed pool/layout/array.
+        static constexpr uint32_t kMaxTracedEntities = 128u;
         // Sentinel SDF value the unused (>= entityCount) g_EntitySDF array slots are filled with --
         // matches GlobalSDFPass::kFarValue's role (always farther than kSphereTraceEpsilon, so a
         // ray that reaches an unused slot's dummy volume can never register a false hit).
@@ -64,10 +83,9 @@ namespace renderer {
         // its 1x1x1 "far" fallback volume, and allocates/writes both descriptor sets. Returns
         // false (logged) only if tracedEntities.size() would silently lose entities beyond
         // kMaxTracedEntities (still succeeds, but truncates -- see Init()'s own log).
-        bool Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
-            const GlobalSDFPass& globalSDF, const SurfaceCachePass& surfaceCache);
-
-        void Shutdown();
+        // Init(VkDevice, VmaAllocator, VkCommandPool, VkQueue, const GlobalSDFPass&,
+        // const SurfaceCachePass&) -> bool and Shutdown() are inherited from
+        // RenderPass<SurfaceCacheTraceContext>; see InitImpl() below.
 
         // Re-uploads the card table and rebuilds the per-entity card-index grouping from
         // `surfaceCache`'s CURRENT state. Required because renderer::SurfaceCachePass's atlas is
@@ -95,8 +113,10 @@ namespace renderer {
         const std::vector<TracedEntity>& GetTracedEntities() const { return m_TracedEntities; }
 
     private:
-        VkDevice m_Device = VK_NULL_HANDLE;
-        VmaAllocator m_Allocator = VK_NULL_HANDLE;
+        bool InitImpl(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
+            const GlobalSDFPass& globalSDF, const SurfaceCachePass& surfaceCache);
+
+        // m_Device / m_Allocator are inherited (protected) from RenderPass<SurfaceCacheTraceContext>.
 
         uint32_t m_EntityCount = 0;
         std::vector<TracedEntity> m_TracedEntities;

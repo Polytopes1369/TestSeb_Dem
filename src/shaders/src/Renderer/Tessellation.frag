@@ -216,7 +216,10 @@ void main() {
 
         // Substrate: EvaluateSubstrateMaterial already applies its own NdotL internally -- megaNdotL
         // is kept only for the occlusion early-out check above, no longer multiplied in here.
-        outRGB += EvaluateSubstrateMaterial(mat, n, viewDir, megaLightDir) * light.color * light.intensity / distSq * window * visibility * invPdf;
+        // G3: MegaLightAngularShaping applies the per-type cone/photometric/rect-facing window (1 for
+        // a POINT light -- pre-G3 behavior unchanged); a rect is point-approximated on this forward
+        // path (no LTC), same documented scope as TransparentForward.frag's own MegaLights term.
+        outRGB += EvaluateSubstrateMaterial(mat, n, viewDir, megaLightDir) * light.color * light.intensity / distSq * window * MegaLightAngularShaping(light, megaLightDir) * visibility * invPdf;
     }
 
     // --- Optional front-layer specular reflection (Lumen-style, single GGX-VNDF sample) -- gated

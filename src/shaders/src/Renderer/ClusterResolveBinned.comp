@@ -24,6 +24,7 @@
 #include "include/wpo_deformation.glsl"
 #include "include/enhanced_displacement.glsl"
 #include "include/spline_deformation.glsl"
+#include "include/skeletal_animation.glsl"
 #include "include/displacement_bounds.glsl"
 #include "include/material_params.glsl"
 #include "include/substrate_bsdf.glsl"
@@ -118,7 +119,11 @@ layout(std140, set = 0, binding = 6) uniform ResolveViewParamsUBO {
     float snowCoverage;
     // Phase 3: sun direction -- see ClusterResolve.comp's own identical field comment.
     vec3 sunDirection;
-    float _pad2;
+    // Glint / sparkle (UE5.8 rendering-parity gap G5) Debug-only density tuning multiplier -- see
+    // ClusterResolve.comp's own identical glintDensityScale field comment (this binned/Release path
+    // shares the exact same UBO layout/contents; in Release it is a hardcoded 1.0, so the sparkle
+    // still renders at the material's authored density here just as it does in the Debug path).
+    float glintDensityScale;
     // Real photometric sun color/intensity (LUX) -- see ClusterResolve.comp's own identical field
     // comment (2026-07-17 recalibration).
     vec3 sunColor;
@@ -126,8 +131,18 @@ layout(std140, set = 0, binding = 6) uniform ResolveViewParamsUBO {
     // Substrate integration: the view direction Substrate's specular/Fresnel terms need -- see
     // ClusterResolve.comp's own identical ResolveViewParamsUBO.cameraPositionWorld comment.
     vec3 cameraPositionWorld;
-    // Wave 2 (UE5.8 caustics/light-function parity) -- see ClusterResolve.comp's own identical
-    // ResolveViewParamsUBO.timeSeconds comment.
+    // Glint / sparkle (UE5.8 rendering-parity gap G5) Debug-only intensity tuning multiplier -- see
+    // ClusterResolve.comp's own identical glintIntensityScale field comment.
+    float glintIntensityScale;
+    // Substrate horizontal mixing (UE5.8 rendering-parity gap G6) Debug-only blend-sharpness tuning
+    // multiplier -- see ClusterResolve.comp's own identical mixMaskSharpnessScale field comment (this
+    // binned/Release path shares the exact same UBO layout/contents; in Release it is a hardcoded
+    // 1.0, so a horizontally-mixed material blends at its authored mixContrast here just as it does
+    // in the Debug path). The first field to grow this UBO past 192 bytes -> a fresh 16-byte block.
+    float mixMaskSharpnessScale;
+    // Wave 2 (UE5.8 caustics/light-function parity): joins mixMaskSharpnessScale's freshly-opened
+    // 16-byte block -- see ClusterResolve.comp's own identical ResolveViewParamsUBO.timeSeconds
+    // comment.
     float timeSeconds;
 } g_ViewParams;
 
@@ -172,6 +187,13 @@ layout(r16ui, set = 0, binding = 24) uniform writeonly uimage2D g_OutputMaterial
 // binding comment.
 layout(std430, set = 0, binding = 25) readonly buffer SplineControlPointsSSBO {
     SplineControlPoint splineControlPoints[SPLINE_CONTROL_POINT_COUNT];
+};
+
+// Skeletal-animation feature: binding 28 -- the first free slot past this shader's full 0-27
+// range (0-25 original + 26/27 Atmos weather's g_SkyViewLUT/g_CloudShadowMap, declared further up
+// this file). See ClusterRaster.vert's identical binding comment.
+layout(std430, set = 0, binding = 28) readonly buffer SkeletalBoneMatricesSSBO {
+    mat4 boneMatrices[SKELETAL_MAX_BONES];
 };
 
 layout(push_constant) uniform BinIndexPC {
@@ -224,6 +246,22 @@ void main() {
     vec3 p0Local = p0 - xform.center;
     vec3 p1Local = p1 - xform.center;
     vec3 p2Local = p2 - xform.center;
+
+    // Skeletal-animation feature: linear-blend vertex skinning, applied in LOCAL space BEFORE the
+    // per-entity rigid rotation (and before spline bend below) -- this binned/Release resolve path
+    // must re-derive the EXACT same deformed triangle both rasterizers already drew, so its own
+    // re-projection for barycentric reconstruction is consistent -- see ClusterRaster.vert's
+    // identical comment.
+    if (GetFlag(ed.flags, ENTITY_FLAG_IS_SKELETALLY_ANIMATED)) {
+        uvec4 boneIndices0, boneIndices1, boneIndices2;
+        vec4 boneWeights0, boneWeights1, boneWeights2;
+        DecodeClusterSkin(pageByteBase, i0, boneIndices0, boneWeights0);
+        DecodeClusterSkin(pageByteBase, i1, boneIndices1, boneWeights1);
+        DecodeClusterSkin(pageByteBase, i2, boneIndices2, boneWeights2);
+        p0Local = ApplySkeletalSkinning(p0Local, boneIndices0, boneWeights0, boneMatrices);
+        p1Local = ApplySkeletalSkinning(p1Local, boneIndices1, boneWeights1, boneMatrices);
+        p2Local = ApplySkeletalSkinning(p2Local, boneIndices2, boneWeights2, boneMatrices);
+    }
 
     // Phase 1 (Nanite advanced): spline bend, applied in LOCAL space BEFORE the per-entity rigid
     // rotation -- see ClusterRaster.vert's identical comment.
@@ -313,6 +351,17 @@ void main() {
     if (pc.binIndex == MATERIAL_ID_TERRAIN) {
         mat.base.diffuseAlbedo = ComputeTerrainAlbedo(worldPos, normal, mat.base.diffuseAlbedo);
     }
+    // Substrate horizontal material mixing (UE5.8 rendering-parity gap G6): resolve base (A) + mixB
+    // (B) into one effective base by the per-pixel world-space procedural mask, right after the
+    // material lookup -- see ClusterResolve.comp's own identical call-site comment for the full
+    // rationale (every downstream term then shades the correctly-blended surface). This is the
+    // Release-live (binned) path, so it MUST run here too, not only in the Debug full-screen path.
+    // Zero cost when this dispatch's bin material doesn't mix (mixAmount == 0, uniform across the
+    // whole dispatch since every thread shares pc.binIndex's material -> no warp divergence). The
+    // raw-mask out param is unused here (only ClusterResolve.comp's DEBUG_VIEW_SUBSTRATE_MIXING
+    // needs it -- Debug views never take this binned path, see this shader's own header comment).
+    float mixMaskUnused = 0.0;
+    mat = ApplySubstrateHorizontalMix(mat, worldPos, g_ViewParams.mixMaskSharpnessScale, mixMaskUnused);
     // Wave 2 (UE5.8 water/caustics parity) -- see ClusterResolve.comp's own identical comment. Also
     // a uniform branch across this dispatch, same reasoning as the terrain branch just above.
     float causticsModulation = (pc.binIndex == MATERIAL_ID_TERRAIN)
@@ -359,13 +408,20 @@ void main() {
     vec3 skyAmbient = texture(g_SkyViewLUT, SkyViewLUTUVFromDirection(normal, g_ViewParams.sunDirection)).rgb;
     vec3 sunRadiance = g_ViewParams.sunColor * g_ViewParams.sunIntensity;
     vec3 directResponse = EvaluateSubstrateMaterial(mat, normal, viewDir, lightDir);
+    // Substrate Glint / sparkle (UE5.8 rendering-parity gap G5): additive discrete-flake specular on
+    // top of the smooth GGX lobe -- see ClusterResolve.comp's own identical call-site comment for the
+    // full rationale (perspNorm-based world-space footprint for the anti-alias, sun-shadowed/sun-scaled
+    // exactly like directResponse). Zero cost when no material in this bin uses glint.
+    float glintFootprint = perspNorm / max(g_ViewParams.viewportSize.y, 1.0);
+    vec3 glint = EvaluateSubstrateGlint(mat, normal, viewDir, lightDir, worldPos, glintFootprint,
+        g_ViewParams.glintDensityScale, g_ViewParams.glintIntensityScale);
     // Wave 2 (UE5.8 caustics/light-function parity) -- see ClusterResolve.comp's own identical
     // comment.
     float sunLightFunction = EvaluateSunLightFunction(worldPos, g_ViewParams.sunDirection);
     float sunModulation = causticsModulation * sunLightFunction;
     const float kEmissiveScale = 1500.0;
     vec3 finalColor = mat.base.diffuseAlbedo * skyAmbient
-        + directResponse * sunRadiance * sunVisibility * sunModulation
+        + (directResponse + glint) * sunRadiance * sunVisibility * sunModulation
         + EvaluateSubstrateEmissive(mat) * kEmissiveScale;
 
     // Opacity-mask soft edge feathering -- see ClusterResolve.comp's own comment.

@@ -101,6 +101,10 @@ layout(std140, set = 0, binding = 2) uniform MegaLightsViewParamsUBO {
     float spatialReuseRadiusPixels;
     vec3 cameraPositionWorld;
     float _pad2;
+    // G3: per-type enable/scale controls -- declared here only for byte-identical UBO layout across
+    // all three MegaLights stages; Stage 2 (this shader) never reads it (only MegaLightsFinalShade.comp
+    // does), same "declared but unused" convention already used for most fields in this mirror.
+    vec4 typedLightControls;
 } g_ViewParams;
 
 layout(push_constant) uniform MegaLightsPushConstants {

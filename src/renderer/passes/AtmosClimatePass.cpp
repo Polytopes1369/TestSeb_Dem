@@ -87,45 +87,44 @@ namespace renderer {
 
     } // namespace
 
-    bool AtmosClimatePass::Init(VkDevice device, VmaAllocator allocator, VkCommandPool /*commandPool*/, VkQueue /*queue*/) {
-        m_Device = device;
-        m_Allocator = allocator;
-
+    bool AtmosClimatePass::InitImpl(VkDevice device, VmaAllocator allocator, VkCommandPool /*commandPool*/, VkQueue /*queue*/) {
         m_GlobalsBuffer.Create(allocator, sizeof(AtmosGlobalsUBO),
             VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
+        RegisterResource([this] { m_GlobalsBuffer.Destroy(); });
+
+        RegisterResource([this] {
+            m_LastDewPointCelsius = 0.0f;
+            m_LastLCLHeightMeters = 0.0f;
+            m_SurfaceWetness = 0.0f;
+            m_SnowCoverage = 0.0f;
+
+            // Dynamic Weather Simulation state -- reset so a Shutdown()/Init() cycle (e.g.
+            // device-lost recovery) restarts the simulation cleanly from t=0 rather than resuming
+            // mid-drift with a now-meaningless m_LastFrameTimeSeconds baseline.
+            m_HasLastFrameTime = false;
+            m_LastFrameTimeSeconds = 0.0f;
+            m_SimulationTime = 0.0;
+            m_CurrentInitialized = false;
+            m_CurrentTemperatureCelsius = 0.0f;
+            m_CurrentRelativeHumidity = 0.0f;
+            m_CurrentWindSpeedMPS = 0.0f;
+            m_CurrentCloudDensity = 0.0f;
+            m_CurrentFogDensity = 0.0f;
+            m_CurrentRainStrength = 0.0f;
+            m_SeasonPhase01 = 0.0f;
+            m_WeightClear = 1.0f;
+            m_WeightOvercast = 0.0f;
+            m_WeightStormy = 0.0f;
+            m_SeasonalSunElevationOffsetRad = 0.0f;
+        });
 
         LOG_INFO(std::format("[AtmosClimatePass] Initialized ({} byte AtmosGlobalsUBO).", sizeof(AtmosGlobalsUBO)));
         return true;
     }
 
-    void AtmosClimatePass::Shutdown() {
-        m_GlobalsBuffer.Destroy();
-        m_LastDewPointCelsius = 0.0f;
-        m_LastLCLHeightMeters = 0.0f;
-        m_SurfaceWetness = 0.0f;
-        m_SnowCoverage = 0.0f;
-        m_Allocator = VK_NULL_HANDLE;
-        m_Device = VK_NULL_HANDLE;
-
-        // Dynamic Weather Simulation state -- reset so a Shutdown()/Init() cycle (e.g. device-lost
-        // recovery) restarts the simulation cleanly from t=0 rather than resuming mid-drift with a
-        // now-meaningless m_LastFrameTimeSeconds baseline.
-        m_HasLastFrameTime = false;
-        m_LastFrameTimeSeconds = 0.0f;
-        m_SimulationTime = 0.0;
-        m_CurrentInitialized = false;
-        m_CurrentTemperatureCelsius = 0.0f;
-        m_CurrentRelativeHumidity = 0.0f;
-        m_CurrentWindSpeedMPS = 0.0f;
-        m_CurrentCloudDensity = 0.0f;
-        m_CurrentFogDensity = 0.0f;
-        m_CurrentRainStrength = 0.0f;
-        m_SeasonPhase01 = 0.0f;
-        m_WeightClear = 1.0f;
-        m_WeightOvercast = 0.0f;
-        m_WeightStormy = 0.0f;
-        m_SeasonalSunElevationOffsetRad = 0.0f;
-    }
+    // Shutdown() is inherited from RenderPass<AtmosClimatePass>: runs the two RegisterResource()
+    // cleanups above in reverse (state reset, then m_GlobalsBuffer.Destroy()) -- order is immaterial
+    // here since neither depends on the other, unlike AtmosSkyPass's handle-dependency chain.
 
     void AtmosClimatePass::RecordUpdate(VkCommandBuffer cmd, float globalTimeSeconds) {
         // --- Own per-frame dt tracking (mirrors ClusterRenderPipeline::m_LastParticleFrameTimeSeconds's

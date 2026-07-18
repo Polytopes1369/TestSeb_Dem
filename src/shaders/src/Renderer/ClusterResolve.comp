@@ -53,6 +53,7 @@
 #include "include/wpo_deformation.glsl"
 #include "include/enhanced_displacement.glsl"
 #include "include/spline_deformation.glsl"
+#include "include/skeletal_animation.glsl"
 #include "include/displacement_bounds.glsl"
 #include "include/material_params.glsl"
 #include "include/substrate_bsdf.glsl"
@@ -150,7 +151,13 @@ layout(std140, set = 0, binding = 7) uniform ResolveViewParamsUBO {
     // hardcoded, unrelated `vec3(0.5, 1.0, 0.5)` (a light/shadow direction mismatch would have
     // misaligned the lit/unlit transition against the shadow itself).
     vec3 sunDirection;
-    float _pad2;
+    // Glint / sparkle (UE5.8 rendering-parity gap G5) Debug-only tuning multiplier on every material's
+    // authored SubstrateSlab::glintDensity -- repurposes what was dead std140 padding after the vec3
+    // sunDirection (the same "reuse dead padding instead of growing the UBO" pattern surfaceWetness/
+    // snowCoverage above already use). 1.0 in Release (renderer::ClusterRenderPipeline hardcodes it,
+    // no toggle exists there); driven by the Post FX ImGui "Glint Density" slider in Debug. Consumed
+    // by EvaluateSubstrateGlint's call site below.
+    float glintDensityScale;
     // Real photometric sun color/intensity (LUX, matching renderer::DirectionalLight's own
     // comment -- 2026-07-17 recalibration): consumed by the physically-based Lambertian direct
     // lighting term below instead of the old implicit "intensity = 1, no color" hardcode.
@@ -161,9 +168,22 @@ layout(std140, set = 0, binding = 7) uniform ResolveViewParamsUBO {
     // reflection_view_params.glsl) -- not previously threaded into this shader, since the
     // pre-Substrate shading here was pure Lambertian (no view-dependent term at all).
     vec3 cameraPositionWorld;
-    // Wave 2 (UE5.8 caustics/light-function parity): repurposes what was dead std140 padding (same
-    // "reuse the padding" convention surfaceWetness/snowCoverage already established above) --
-    // feeds the procedural underwater caustics term and the sun's light-function modulation below.
+    // Glint / sparkle (UE5.8 rendering-parity gap G5) Debug-only tuning multiplier on every material's
+    // authored SubstrateSlab::glintIntensity -- same dead-padding reuse / Release-hardcoded-1.0 /
+    // Debug-ImGui-slider convention as glintDensityScale above (Post FX "Glint Intensity" slider).
+    float glintIntensityScale;
+    // Substrate horizontal mixing (UE5.8 rendering-parity gap G6) Debug-only tuning multiplier on
+    // every horizontally-mixed material's authored mixContrast (the blend sharpness). Unlike the
+    // fields above, this is the FIRST to actually GROW this UBO past its previously-fully-packed 192
+    // bytes -- no dead std140 padding remained to reuse, so it opens a fresh 16-byte block (the CPU
+    // mirror ResolveViewParams pads to match). 1.0 in Release (renderer::ClusterRenderPipeline
+    // hardcodes it, no toggle exists there); driven by the Post FX ImGui "Mix Sharpness" slider in
+    // Debug. Consumed by EvaluateSubstrateMixMask via the ApplySubstrateHorizontalMix call below.
+    float mixMaskSharpnessScale;
+    // Wave 2 (UE5.8 caustics/light-function parity): joins mixMaskSharpnessScale's freshly-opened
+    // 16-byte block (2 of its 4 slots now used, 2 remain dead padding) rather than opening yet
+    // another one -- feeds the procedural underwater caustics term and the sun's light-function
+    // modulation below.
     float timeSeconds;
 } g_ViewParams;
 
@@ -219,6 +239,13 @@ layout(std430, set = 0, binding = 20) readonly buffer EntityDataBuffer {
 // identical binding comment for the buffer's own contents/upload.
 layout(std430, set = 0, binding = 26) readonly buffer SplineControlPointsSSBO {
     SplineControlPoint splineControlPoints[SPLINE_CONTROL_POINT_COUNT];
+};
+
+// Skeletal-animation feature: binding 29 -- the first free slot past this shader's full 0-28
+// range (0-26 original + 27/28 Atmos weather's g_SkyViewLUT/g_CloudShadowMap, declared further
+// down this file). See ClusterRaster.vert's identical binding comment.
+layout(std430, set = 0, binding = 29) readonly buffer SkeletalBoneMatricesSSBO {
+    mat4 boneMatrices[SKELETAL_MAX_BONES];
 };
 
 #ifdef _DEBUG
@@ -326,6 +353,21 @@ void main() {
         vec3 p0Local = p0 - xform.center;
         vec3 p1Local = p1 - xform.center;
         vec3 p2Local = p2 - xform.center;
+
+        // Skeletal-animation feature: linear-blend vertex skinning, applied in LOCAL space BEFORE
+        // the per-entity rigid rotation (and before spline bend below) -- must exactly reproduce
+        // the rasterizer's own transform, same reasoning as the spline bend comment immediately
+        // below.
+        if (GetFlag(ed.flags, ENTITY_FLAG_IS_SKELETALLY_ANIMATED)) {
+            uvec4 boneIndices0, boneIndices1, boneIndices2;
+            vec4 boneWeights0, boneWeights1, boneWeights2;
+            DecodeClusterSkin(pageByteBase, i0, boneIndices0, boneWeights0);
+            DecodeClusterSkin(pageByteBase, i1, boneIndices1, boneWeights1);
+            DecodeClusterSkin(pageByteBase, i2, boneIndices2, boneWeights2);
+            p0Local = ApplySkeletalSkinning(p0Local, boneIndices0, boneWeights0, boneMatrices);
+            p1Local = ApplySkeletalSkinning(p1Local, boneIndices1, boneWeights1, boneMatrices);
+            p2Local = ApplySkeletalSkinning(p2Local, boneIndices2, boneWeights2, boneMatrices);
+        }
 
         // Phase 1 (Nanite advanced): spline bend, applied in LOCAL space BEFORE the per-entity
         // rigid rotation -- see ClusterRaster.vert's identical comment. Must exactly reproduce the
@@ -457,9 +499,22 @@ void main() {
         if (cluster.materialID == MATERIAL_ID_TERRAIN) {
             mat.base.diffuseAlbedo = ComputeTerrainAlbedo(worldPos, normal, mat.base.diffuseAlbedo);
         }
+        // Substrate horizontal material mixing (UE5.8 rendering-parity gap G6): resolve the base (A)
+        // and mixB (B) Slabs into ONE effective base by a per-pixel world-space procedural mask, right
+        // after the material lookup so every downstream term (the VT detail multiply, weather
+        // modulation, the full Slab BSDF, glint, emissive, AND the GBuffer albedo/roughness outputs
+        // below) transparently shades the correctly-blended surface with no per-term awareness of
+        // mixing -- see substrate_bsdf.glsl's ApplySubstrateHorizontalMix. Zero cost for the vast
+        // majority of materials (mixAmount == 0 early-outs; mixB is never even read). mixMask is the
+        // raw A/B weight, surfaced only for DEBUG_VIEW_SUBSTRATE_MIXING below; g_ViewParams.
+        // mixMaskSharpnessScale is the Debug-only live blend-sharpness knob (1.0 in Release).
+        float mixMask = 0.0;
+        mat = ApplySubstrateHorizontalMix(mat, worldPos, g_ViewParams.mixMaskSharpnessScale, mixMask);
         // Wave 2 (UE5.8 water/caustics parity): submerged terrain only -- see
         // ComputeUnderwaterCaustics's own comment for why this is a procedural, texture-free
-        // approximation. A no-op (1.0) everywhere else, incl. every non-terrain material.
+        // approximation. A no-op (1.0) everywhere else, incl. every non-terrain material. Reads
+        // cluster.materialID (the pre-mix identity), not `mat`, since mixing never changes what
+        // counts as "terrain" for this purpose.
         float causticsModulation = (cluster.materialID == MATERIAL_ID_TERRAIN)
             ? ComputeUnderwaterCaustics(worldPos, g_ViewParams.timeSeconds, kWaterLevel)
             : 1.0;
@@ -515,6 +570,18 @@ void main() {
         vec3 skyAmbient = texture(g_SkyViewLUT, SkyViewLUTUVFromDirection(normal, g_ViewParams.sunDirection)).rgb;
         vec3 sunRadiance = g_ViewParams.sunColor * g_ViewParams.sunIntensity;
         vec3 directResponse = EvaluateSubstrateMaterial(mat, normal, viewDir, lightDir);
+        // Substrate Glint / sparkle (UE5.8 rendering-parity gap G5): additive high-frequency discrete-
+        // flake specular ON TOP OF the smooth GGX lobe already in directResponse (it never replaces it)
+        // -- see substrate_bsdf.glsl's EvaluateSubstrateGlint. Zero cost for the vast majority of
+        // materials (glintIntensity == 0 early-outs to vec3(0)). `perspNorm` IS this pixel's view-space
+        // distance from the camera (see the Step 4 VT-LOD comment above); footprint = that distance /
+        // viewport height approximates this pixel's world-space size, which anti-aliases the sparkle so
+        // it fades (rather than shimmering) with distance -- dFdx/dFdy are unavailable in a compute
+        // shader (same reason the VT sample above uses perspNorm, see that comment). It is a sun-lit
+        // specular term, so it is shadowed and scaled by the sun radiance exactly like directResponse.
+        float glintFootprint = perspNorm / max(g_ViewParams.viewportSize.y, 1.0);
+        vec3 glint = EvaluateSubstrateGlint(mat, normal, viewDir, lightDir, worldPos, glintFootprint,
+            g_ViewParams.glintDensityScale, g_ViewParams.glintIntensityScale);
         // Wave 2 (UE5.8 caustics/light-function parity): both are subtle direct-term modulations,
         // multiplied together into a single factor -- causticsModulation is 1.0 (no-op) everywhere
         // except submerged terrain (see its own computation above); the sun light function is a
@@ -531,7 +598,7 @@ void main() {
         // "glowing", not just "well lit".
         const float kEmissiveScale = 1500.0;
         finalColor = mat.base.diffuseAlbedo * skyAmbient
-            + directResponse * sunRadiance * sunVisibility * sunModulation
+            + (directResponse + glint) * sunRadiance * sunVisibility * sunModulation
             + EvaluateSubstrateEmissive(mat) * kEmissiveScale;
 
         // GBuffer capture (renderer::ClusterResolvePass's new outputs -- see this file's own
@@ -687,6 +754,14 @@ void main() {
             } else {
                 finalColor = vec3(0.15, 0.45, 0.95) * mat.topWeight;
             }
+        } else if (pc.viewMode == 17) { // DEBUG_VIEW_SUBSTRATE_MIXING
+            // Raw horizontal-mix mask (UE5.8 rendering-parity gap G6): blue = pure base "A" slab
+            // (mixMask 0), red = pure mixB "B" slab (mixMask 1), the gradient between them showing
+            // the spatially-varying procedural blend. A non-mixing material (mixAmount == 0) left
+            // mixMask at 0 above -> solid blue, correctly reading as "no B contribution". This view
+            // directly proves the blend is a non-uniform procedural gradient (the rusting-metal
+            // Pyramid, slot 9), not a flat average or a hard seam.
+            finalColor = mix(vec3(0.1, 0.2, 0.9), vec3(0.9, 0.25, 0.1), mixMask);
         } else if (pc.viewMode != 0 && pc.viewMode != 9 && pc.viewMode != 13) {
             // Placeholders (Global SDF / Lumen visualizations not implemented by this shader).
             finalColor = vec3(1.0, 0.0, 1.0);
@@ -703,10 +778,11 @@ void main() {
         } else if (pc.viewMode == 15) {
             // DEBUG_VIEW_SHADOW_CASCADES: no world position exists for a background pixel -- leave
             // finalColor at the plain background color, matching MOTION_VECTORS/SPATIAL_PROBES above.
-        } else if (pc.viewMode == 3 || pc.viewMode == 4 || pc.viewMode == 5 || pc.viewMode == 6 || pc.viewMode == 7 || pc.viewMode == 16) {
-            // NANITE_INSTANCES/PRIMITIVES/SHADING_BINS/RASTER_BINS/WPO/SUBSTRATE_SLABS: all per-cluster
-            // visualizations with nothing meaningful to show on a no-geometry pixel -- leave
-            // finalColor at the plain background color, matching NANITE_TRIANGLES/CLUSTERS above.
+        } else if (pc.viewMode == 3 || pc.viewMode == 4 || pc.viewMode == 5 || pc.viewMode == 6 || pc.viewMode == 7 || pc.viewMode == 16 || pc.viewMode == 17) {
+            // NANITE_INSTANCES/PRIMITIVES/SHADING_BINS/RASTER_BINS/WPO/SUBSTRATE_SLABS/SUBSTRATE_MIXING:
+            // all per-cluster/per-surface visualizations with nothing meaningful to show on a
+            // no-geometry pixel -- leave finalColor at the plain background color, matching
+            // NANITE_TRIANGLES/CLUSTERS above.
         } else if (pc.viewMode != 0 && pc.viewMode != 1 && pc.viewMode != 2 && pc.viewMode != 8 && pc.viewMode != 11) {
             // For Lumen / SDF placeholders, render the placeholder color even on background
             finalColor = vec3(1.0, 0.0, 1.0);
@@ -760,6 +836,8 @@ void main() {
         chars[0]=83; chars[1]=72; chars[2]=65; chars[3]=68; chars[4]=79; chars[5]=87; chars[6]=32; chars[7]=67; chars[8]=65; chars[9]=83; chars[10]=67; chars[11]=65; chars[12]=68; chars[13]=69; chars[14]=83; len=15;
     } else if (pc.viewMode == 16) { // "SUBSTRATE SLABS"
         chars[0]=83; chars[1]=85; chars[2]=66; chars[3]=83; chars[4]=84; chars[5]=82; chars[6]=65; chars[7]=84; chars[8]=69; chars[9]=32; chars[10]=83; chars[11]=76; chars[12]=65; chars[13]=66; chars[14]=83; len=15;
+    } else if (pc.viewMode == 17) { // "SUBSTRATE MIXING"
+        chars[0]=83; chars[1]=85; chars[2]=66; chars[3]=83; chars[4]=84; chars[5]=82; chars[6]=65; chars[7]=84; chars[8]=69; chars[9]=32; chars[10]=77; chars[11]=73; chars[12]=88; chars[13]=73; chars[14]=78; chars[15]=71; len=16;
     }
 
     if (len > 0) {

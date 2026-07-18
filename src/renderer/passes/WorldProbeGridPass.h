@@ -62,6 +62,7 @@
 
 #include "core/maths/Maths.h"
 #include "core/EngineConfig.h"
+#include "renderer/vulkan/RenderPass.h"
 
 namespace renderer {
 
@@ -81,7 +82,14 @@ namespace renderer {
     static_assert(sizeof(WorldProbeGridParams) == 32,
         "WorldProbeGridParams must match world_probe_sampling.glsl's WorldProbeGridParamsUBO exactly (std140 layout)");
 
-    class WorldProbeGridPass {
+    // Migrated to RenderPass<Derived> (see renderer/vulkan/RenderPass.h): Init()/Shutdown() are
+    // inherited. Note InitImpl() still calls the inherited Shutdown() as its own first statement
+    // (preserved from the original Init(), which self-reinitializes -- see ShadowMapPass's own
+    // migration comment for the exact same pattern and why m_Device/m_Allocator must be
+    // re-assigned right after that call).
+    class WorldProbeGridPass : public RenderPass<WorldProbeGridPass> {
+        friend class RenderPass<WorldProbeGridPass>; // Lets Init() call our private InitImpl().
+
     public:
         WorldProbeGridPass() = default;
 
@@ -111,11 +119,9 @@ namespace renderer {
         // smaller set-0 shape vs. SurfaceCacheGIInjectPass's own) plus the compute pipeline. `traceContext`,
         // `surfaceCache` and `rtPass` must all already be Init'd and must outlive this pass, exactly
         // like renderer::SurfaceCacheGIInjectPass::Init's own contract.
-        bool Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
-            const SurfaceCacheTraceContext& traceContext, const SurfaceCachePass& surfaceCache,
-            const SurfaceCacheRayTracingPass& rtPass);
-
-        void Shutdown();
+        // Init(VkDevice, VmaAllocator, VkCommandPool, VkQueue, const SurfaceCacheTraceContext&,
+        // const SurfaceCachePass&, const SurfaceCacheRayTracingPass&) -> bool and Shutdown() are
+        // inherited from RenderPass<WorldProbeGridPass>; see InitImpl() below.
 
         // Atmos weather system, Subtask 5: binds renderer::AtmosSkyPass's Sky-View LUT into set 0's
         // binding 5 -- must be called exactly once after both Init() and AtmosSkyPass's own Init(),
@@ -161,8 +167,11 @@ namespace renderer {
             int32_t probeMax[3] = { 0, 0, 0 }; // Exclusive.
         };
 
-        VkDevice m_Device = VK_NULL_HANDLE;
-        VmaAllocator m_Allocator = VK_NULL_HANDLE;
+        bool InitImpl(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
+            const SurfaceCacheTraceContext& traceContext, const SurfaceCachePass& surfaceCache,
+            const SurfaceCacheRayTracingPass& rtPass);
+
+        // m_Device / m_Allocator are inherited (protected) from RenderPass<WorldProbeGridPass>.
 
         VkImage m_GridImage = VK_NULL_HANDLE;
         VmaAllocation m_GridAllocation = VK_NULL_HANDLE;

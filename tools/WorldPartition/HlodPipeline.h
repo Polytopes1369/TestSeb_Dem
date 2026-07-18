@@ -21,6 +21,7 @@
 #include "Uuid.h"
 #include "WorldPartitionTypes.h"
 #include "geometry/MeshSimplifier.h"
+#include "pcg/PcgPointData.h"
 
 namespace worldpartition {
 
@@ -135,6 +136,62 @@ namespace worldpartition {
     HlodProxyMesh BuildHlodForCell(
         const SpatialHashCell& cell, const ActorMeshFetchFn& fetchMesh,
         const HlodLevel& level, ISimplificationBackend& backend);
+
+    // ---------------------------------------------------------------------------------------
+    // Stage 1 (PCG variant): PCG scatter -> per-instance archetype meshes
+    // ---------------------------------------------------------------------------------------
+
+    // PCG roadmap Phase 4.3 ("PCG -> HLOD Integration"): the PCG-scatter analogue of
+    // GatherCellMeshes above -- instead of resolving one SimplifiableMesh per AUTHORED actor via a
+    // caller-supplied fetch callback, this resolves one SimplifiableMesh per PCG-SCATTERED POINT
+    // via ArchetypeMeshLibrary::BuildArchetypeMesh (the same fixed 4-shape CPU archetype pool
+    // GatherCellMeshes' own ActorMeshFetchFn implementations already draw from for authored
+    // Rock/Bush/Tree/Debris actors, see ArchetypeMeshLibrary.h) -- each instance's archetype mesh
+    // (built in LOCAL space, centered at its own origin) is transformed into world space by that
+    // point's own PcgPoint::GetLocalToWorld() before being added to the returned list, exactly the
+    // same "resolve raw geometry, do not merge yet" contract GatherCellMeshes upholds (merging is
+    // still MergeCellMeshes's job, invoked downstream by BuildHlodForPcgScatter).
+    //
+    // `scatteredPoints` and `perPointArchetypeShape` are parallel arrays; if their sizes disagree
+    // (a caller bug), only the shorter length's worth of pairs is processed -- never an out-of-
+    // bounds read. An empty `scatteredPoints` returns an empty mesh list, not an error (mirrors
+    // GatherCellMeshes' own "skip, don't fail" convention for a cell with nothing to contribute).
+    std::vector<geometry::SimplifiableMesh> GatherPcgScatterMeshes(
+        const std::vector<pcg::PcgPoint>& scatteredPoints, const std::vector<uint32_t>& perPointArchetypeShape);
+
+    // Gathers every scattered point's world-space-transformed archetype instance mesh, merges and
+    // simplifies them down to `level.triangleBudget` triangles using `backend` -- the PCG-scatter
+    // counterpart of BuildHlodForCell, sharing its exact merge/simplify/bounds-recompute tail (see
+    // this .cpp's MergeSimplifyAndBoundProxy helper) so the two entry points never duplicate the
+    // QEM-simplification call: only the mesh-GATHERING step differs (one authored actor per cell vs.
+    // potentially hundreds of PCG-scattered instances per cell).
+    //
+    // A cell with e.g. 200 PCG-scattered rocks/bushes therefore still collapses into ONE cheap
+    // combined HLOD proxy mesh, exactly like authored World Partition content already does via
+    // BuildHlodForCell -- real UE5.8 HLOD-of-PCG behavior.
+    HlodProxyMesh BuildHlodForPcgScatter(
+        const std::vector<pcg::PcgPoint>& scatteredPoints, const std::vector<uint32_t>& perPointArchetypeShape,
+        const HlodLevel& level, ISimplificationBackend& backend);
+
+    // ---------------------------------------------------------------------------------------
+    // Usage example / integration point (PCG roadmap Phase 4.3): synthetic scatter -> HLOD demo
+    // ---------------------------------------------------------------------------------------
+
+    // Hand-builds a small, fully deterministic (PcgSeededRandom-driven, see that class's own
+    // determinism contract) synthetic PcgPoint scatter -- `pointCount` instances spread across a
+    // flat disc of `scatterRadius`, each with a random archetype shape assignment (uniform over
+    // ArchetypeMeshLibrary::kArchetypeShapeCount) and a random yaw + a small uniform-scale jitter --
+    // then feeds it through BuildHlodForPcgScatter exactly like a real World Partition bake would
+    // for a cell whose content came from a PCG graph rather than hand-authored actors.
+    //
+    // A standalone, clearly-separated integration point: does NOT touch BakeDemoWorld.cpp's
+    // existing single-authored-prop-per-cell baking path (out of scope, see this function's own
+    // roadmap phase) -- exists purely to demonstrate/exercise BuildHlodForPcgScatter end-to-end with
+    // a realistic (100-200 instance) point count, and is exercised directly by
+    // tests/HlodPipelineTests.cpp.
+    HlodProxyMesh BuildHlodForSyntheticPcgScatterDemo(
+        uint32_t pointCount = 150, float scatterRadius = 10.0f, uint32_t seed = 0xFEEDC0DEu,
+        uint32_t triangleBudget = 256u);
 
     // ---------------------------------------------------------------------------------------
     // Stage 3: texture atlas baking

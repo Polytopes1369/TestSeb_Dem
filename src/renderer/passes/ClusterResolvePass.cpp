@@ -24,15 +24,19 @@ namespace renderer {
         // to a 16-byte boundary (160 bytes) + vec3 sunColor + 1 float sunIntensity (real LUX, see
         // renderer::DirectionalLight's own comment -- physically-based recalibration, 2026-07-17)
         // rounding up to 176 bytes + vec3 cameraPositionWorld (Substrate integration:
-        // EvaluateSubstrateMaterial's view-direction term) + 1 pad float rounding up to 192 bytes
+        // EvaluateSubstrateMaterial's view-direction term) + glintIntensityScale (gap G5, which
+        // reused what had been that trailing pad float) rounding up to 192 bytes. Gap G6 (horizontal
+        // mixing) then appends mixMaskSharpnessScale + 3 explicit pad floats -- the first field to
+        // actually grow this UBO, since no dead padding remained to reuse -- rounding it to 208 bytes
         // total. The 2 floats immediately after viewportWidth/viewportHeight were originally dead
         // std140 padding (still needed to round vec2 up to a 16-byte boundary) -- Atmos weather
         // system's surface response extension repurposes them as real data (surfaceWetness/
         // snowCoverage, see ClusterResolve.comp's own field comment) instead of growing the UBO.
-        // Wave 2 (UE5.8 caustics/light-function parity): the trailing pad float after
-        // cameraPositionWorld is likewise repurposed as real data (timeSeconds) rather than growing
-        // the UBO further -- feeds the procedural (texture-free) underwater caustics term and the
-        // sun's light-function modulation, both in ClusterResolve.comp/ClusterResolveBinned.comp.
+        // Wave 2 (UE5.8 caustics/light-function parity): timeSeconds joins the 16-byte block G6's
+        // mixMaskSharpnessScale opens below (2 of its 4 floats now real data, 2 remain dead padding)
+        // rather than growing the UBO with a further block -- feeds the procedural (texture-free)
+        // underwater caustics term and the sun's light-function modulation, both in ClusterResolve.
+        // comp/ClusterResolveBinned.comp.
         struct ResolveViewParams {
             maths::mat4 viewProj;
             maths::mat4 prevViewProj;
@@ -43,7 +47,12 @@ namespace renderer {
             float sunDirectionX = 0.0f;
             float sunDirectionY = 0.0f;
             float sunDirectionZ = 0.0f;
-            float _pad2 = 0.0f;
+            // Glint / sparkle (UE5.8 rendering-parity gap G5): Debug-only per-material glintDensity
+            // tuning multiplier, occupying what was dead std140 padding after the vec3 sunDirection
+            // (same "reuse dead padding" pattern as surfaceWetness/snowCoverage above) -- 1.0 in
+            // Release, driven by the Post FX ImGui "Glint Density" slider in Debug. See
+            // ClusterResolve.comp's own glintDensityScale field comment.
+            float glintDensityScale = 1.0f;
             float sunColorR = 0.0f;
             float sunColorG = 0.0f;
             float sunColorB = 0.0f;
@@ -53,9 +62,24 @@ namespace renderer {
             float cameraPositionWorldX = 0.0f;
             float cameraPositionWorldY = 0.0f;
             float cameraPositionWorldZ = 0.0f;
+            // Glint / sparkle (UE5.8 rendering-parity gap G5): Debug-only per-material glintIntensity
+            // tuning multiplier, occupying what was the trailing dead pad float -- 1.0 in Release,
+            // driven by the Post FX ImGui "Glint Intensity" slider in Debug.
+            float glintIntensityScale = 1.0f;
+            // Substrate horizontal mixing (UE5.8 rendering-parity gap G6): Debug-only per-material
+            // blend-sharpness tuning multiplier. The FIRST field to actually GROW this UBO past its
+            // previously-fully-packed 192 bytes -- glintIntensityScale above already consumed the last
+            // dead pad float, so this opens a fresh std140 16-byte block. 1.0 in Release, driven by the
+            // Post FX ImGui "Mix Sharpness" slider in Debug. See ClusterResolve.comp's own field comment.
+            float mixMaskSharpnessScale = 1.0f;
+            // Wave 2 (UE5.8 caustics/light-function parity): real elapsed time, joining this same
+            // freshly-opened block (see this struct's own top comment) -- see ClusterResolve.comp's
+            // own timeSeconds field comment.
             float timeSeconds = 0.0f;
+            float _padMix1 = 0.0f;
+            float _padMix2 = 0.0f;
         };
-        static_assert(sizeof(ResolveViewParams) == 192,
+        static_assert(sizeof(ResolveViewParams) == 208,
             "ResolveViewParams must match ResolveViewParamsUBO in ClusterResolve.comp exactly (std140 layout)");
 
         // Step 4: byte-for-byte mirror of VirtualTextureVolumeUBO in ClusterResolve.comp/
@@ -83,7 +107,7 @@ namespace renderer {
         VkImageView swVisBufferAtomicView, const std::vector<VkDescriptorImageInfo>& maskImageInfos,
         VkBuffer wpoGlobalsBuffer, VkBuffer entityTransformBuffer, VkBuffer entityDataBuffer,
         const std::array<MaterialParameters, kMaxMaterials>& materialTable,
-        VkBuffer splineControlPointsBuffer) {
+        VkBuffer splineControlPointsBuffer, VkBuffer boneMatricesBuffer) {
         Shutdown();
 
         m_Device = device;
@@ -99,6 +123,9 @@ namespace renderer {
         m_EntityTransformBuffer = entityTransformBuffer;
         m_EntityDataBuffer = entityDataBuffer;
         m_SplineControlPointsBuffer = splineControlPointsBuffer;
+        // Skeletal-animation feature: animation::SkeletalAnimator::GetBoneMatricesBuffer() -- same
+        // "retained for InitBinnedResolve()" rationale as m_SplineControlPointsBuffer above.
+        m_BoneMatricesBuffer = boneMatricesBuffer;
         m_MaskImageInfos = maskImageInfos;
 
         // --- Output color image: RGBA8 storage image, sized to the render target. ---
@@ -205,7 +232,8 @@ namespace renderer {
             // own doc comment), not a per-frame value -- filled once, here, in the same one-time
             // command buffer as the image transitions above (no ordering dependency between them,
             // so recording order doesn't matter). Well under vkCmdUpdateBuffer's 65536-byte limit
-            // (kMaxMaterials * sizeof(MaterialParameters) = 32 * 48 = 1536 bytes). No intra-
+            // (kMaxMaterials * sizeof(MaterialParameters) = 32 * 320 = 10240 bytes, after gap G6's
+            // horizontal-mix additions grew the struct from 208 to 320 bytes). No intra-
             // command-buffer barrier is needed after this write -- ExecuteOneShotCommands' own
             // vkQueueWaitIdle fully orders it before any later-submitted command buffer's reads,
             // exactly like ClusterRenderPipeline::Init()'s own one-time setup submit.
@@ -242,7 +270,7 @@ namespace renderer {
         // Step 4's renderer::VirtualTextureManager resources -- see SetVirtualTexture()'s own
         // comment, 25 is Substrate's g_OutputMaterialID, 26 is Phase 1 Nanite advanced's
         // SplineControlPointsSSBO). ---
-        VkDescriptorSetLayoutBinding bindings[29]{};
+        VkDescriptorSetLayoutBinding bindings[30]{};
         bindings[0] = { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };         // ClusterCullMetadataSSBO
         bindings[1] = { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };         // CompressedClusterPoolSSBO
         bindings[2] = { 2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };          // g_HWClusterIDImage (r32ui)
@@ -276,14 +304,17 @@ namespace renderer {
         // Atmos weather system, Subtask 5 -- see SetAtmosCloudLighting()'s own comment.
         bindings[27] = { 27, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // g_SkyViewLUT
         bindings[28] = { 28, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // g_CloudShadowMap
+        // Skeletal-animation feature: binding 29 -- the first free slot past this shader's full
+        // 0-28 range. See ClusterRaster.vert's identical binding comment.
+        bindings[29] = { 29, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };        // SkeletalBoneMatricesSSBO
 
         VkDescriptorSetLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-        layoutInfo.bindingCount = 29;
+        layoutInfo.bindingCount = 30;
         layoutInfo.pBindings = bindings;
         VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &layoutInfo, nullptr, &m_SetLayout));
 
         VkDescriptorPoolSize poolSizes[4]{};
-        poolSizes[0] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 9 };  // + material params, shadow page table, shadow feedback, entity transform, entity data, VT feedback, spline control points.
+        poolSizes[0] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 10 };  // + material params, shadow page table, shadow feedback, entity transform, entity data, VT feedback, spline control points, bone matrices.
         poolSizes[1] = { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 9 };   // + g_OutputMaterialID (Substrate integration).
         poolSizes[2] = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 5 + maskTextureCount + kMaxPhysicalPools }; // + g_ShadowPhysicalAtlas, g_PageTable, g_PhysicalPools[], g_SkyViewLUT, g_CloudShadowMap.
         poolSizes[3] = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 4 };  // + g_ShadowSunLevels, VirtualTextureVolumeUBO.
@@ -360,8 +391,10 @@ namespace renderer {
 
         // Phase 1 (Nanite advanced): binding 26 -- see this shader's own binding comment above.
         VkDescriptorBufferInfo splineControlPointsInfo{ splineControlPointsBuffer, 0, VK_WHOLE_SIZE };
+        // Skeletal-animation feature: binding 29 -- see this shader's own binding comment above.
+        VkDescriptorBufferInfo boneMatricesInfo{ boneMatricesBuffer, 0, VK_WHOLE_SIZE };
 
-        VkWriteDescriptorSet writes[19]{};
+        VkWriteDescriptorSet writes[20]{};
         writes[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_DescriptorSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &clusterMetadataInfo, nullptr };
         writes[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_DescriptorSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &compressedPoolInfo, nullptr };
         writes[2] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_DescriptorSet, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &hwClusterIDInfo, nullptr, nullptr };
@@ -387,7 +420,8 @@ namespace renderer {
         writes[16] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_DescriptorSet, 20, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &entityDataInfo, nullptr };
         writes[17] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_DescriptorSet, 25, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &outputMaterialIDInfo, nullptr, nullptr };
         writes[18] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_DescriptorSet, 26, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &splineControlPointsInfo, nullptr };
-        vkUpdateDescriptorSets(m_Device, 19, writes, 0, nullptr);
+        writes[19] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_DescriptorSet, 29, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &boneMatricesInfo, nullptr };
+        vkUpdateDescriptorSets(m_Device, 20, writes, 0, nullptr);
 
         // --- Pipeline layout + pipeline ---
         VkPipelineLayoutCreateInfo pipelineLayoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
@@ -496,6 +530,7 @@ namespace renderer {
 
     void ClusterResolvePass::RecordResolve(VkCommandBuffer cmd, const maths::mat4& viewProj, const maths::mat4& prevViewProj,
         const DirectionalLight& sun, const maths::vec3& cameraPositionWorld, float surfaceWetness, float snowCoverage,
+        float glintDensityScale, float glintIntensityScale, float mixMaskSharpnessScale,
         float globalTimeSeconds, uint32_t debugViewMode) {
         ResolveViewParams viewParams{};
         viewParams.viewProj = viewProj;
@@ -504,6 +539,13 @@ namespace renderer {
         viewParams.viewportHeight = static_cast<float>(m_RenderExtent.height);
         viewParams.surfaceWetness = surfaceWetness;
         viewParams.snowCoverage = snowCoverage;
+        // Glint / sparkle (UE5.8 rendering-parity gap G5): Debug-only tuning multipliers (1.0 in
+        // Release) -- see the ResolveViewParams struct's own field comments above.
+        viewParams.glintDensityScale = glintDensityScale;
+        viewParams.glintIntensityScale = glintIntensityScale;
+        // Substrate horizontal mixing (UE5.8 rendering-parity gap G6): Debug-only blend-sharpness
+        // multiplier (1.0 in Release) -- see the ResolveViewParams struct's own field comment above.
+        viewParams.mixMaskSharpnessScale = mixMaskSharpnessScale;
         viewParams.sunDirectionX = sun.direction.x;
         viewParams.sunDirectionY = sun.direction.y;
         viewParams.sunDirectionZ = sun.direction.z;
@@ -564,7 +606,7 @@ namespace renderer {
         // shadow bindings rather than renumbering them. Bindings 20-23 are Step 4's renderer::
         // VirtualTextureManager resources -- see SetVirtualTexture()'s own comment. Binding 24 is
         // Substrate's g_OutputMaterialID, 25 is Phase 1 Nanite advanced's SplineControlPointsSSBO. ---
-        std::array<VkDescriptorSetLayoutBinding, 28> bindings{};
+        std::array<VkDescriptorSetLayoutBinding, 29> bindings{};
         bindings[0] = { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };  // ClusterCullMetadataSSBO
         bindings[1] = { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };  // CompressedClusterPoolSSBO
         bindings[2] = { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };  // g_SortedPixelList
@@ -597,6 +639,9 @@ namespace renderer {
         // Atmos weather system, Subtask 5 -- see SetAtmosCloudLighting()'s own comment.
         bindings[26] = { 26, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // g_SkyViewLUT
         bindings[27] = { 27, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // g_CloudShadowMap
+        // Skeletal-animation feature: binding 28 -- the first free slot past this shader's full
+        // 0-27 range. See ClusterResolveBinned.comp's own identical binding comment.
+        bindings[28] = { 28, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };        // SkeletalBoneMatricesSSBO
 
         VkDescriptorSetLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
         layoutInfo.bindingCount = static_cast<uint32_t>(bindings.size());
@@ -604,7 +649,7 @@ namespace renderer {
         VK_CHECK(vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &m_ResolveBinnedSetLayout));
 
         std::array<VkDescriptorPoolSize, 4> poolSizes{};
-        poolSizes[0] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 12 }; // cluster metadata, compressed pool, sorted list, offsets, histogram, material params, shadow page table, shadow feedback, entity transform, entity data, VT feedback, spline control points
+        poolSizes[0] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 13 }; // cluster metadata, compressed pool, sorted list, offsets, histogram, material params, shadow page table, shadow feedback, entity transform, entity data, VT feedback, spline control points, bone matrices
         poolSizes[1] = { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 6 };   // color, normal, depth, albedo, roughness-metallic, materialID
         poolSizes[2] = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 4 };  // view params, WPO globals, shadow sun levels, VT volume
         poolSizes[3] = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, maskTextureCount + 4 + kMaxPhysicalPools }; // + shadow physical atlas, g_PageTable, g_PhysicalPools[], g_SkyViewLUT, g_CloudShadowMap
@@ -638,8 +683,9 @@ namespace renderer {
         VkDescriptorBufferInfo entityTransformInfo{ m_EntityTransformBuffer, 0, VK_WHOLE_SIZE };
         VkDescriptorBufferInfo entityDataInfo{ m_EntityDataBuffer, 0, VK_WHOLE_SIZE };
         VkDescriptorBufferInfo splineControlPointsInfo{ m_SplineControlPointsBuffer, 0, VK_WHOLE_SIZE };
+        VkDescriptorBufferInfo boneMatricesInfo{ m_BoneMatricesBuffer, 0, VK_WHOLE_SIZE };
 
-        std::array<VkWriteDescriptorSet, 18> writes{};
+        std::array<VkWriteDescriptorSet, 19> writes{};
         writes[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ResolveBinnedSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &clusterMetaInfo, nullptr };
         writes[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ResolveBinnedSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &compressedPoolInfo, nullptr };
         writes[2] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ResolveBinnedSet, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &sortedListInfo, nullptr };
@@ -662,6 +708,7 @@ namespace renderer {
         writes[15] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ResolveBinnedSet, 19, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &entityDataInfo, nullptr };
         writes[16] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ResolveBinnedSet, 24, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &outputMaterialIDInfo, nullptr, nullptr };
         writes[17] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ResolveBinnedSet, 25, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &splineControlPointsInfo, nullptr };
+        writes[18] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ResolveBinnedSet, 28, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &boneMatricesInfo, nullptr };
         vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
 
         VkPushConstantRange pushRange{ VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(uint32_t) }; // binIndex
@@ -681,6 +728,7 @@ namespace renderer {
 
     void ClusterResolvePass::RecordResolveBinned(VkCommandBuffer cmd, const maths::mat4& viewProj,
         const DirectionalLight& sun, const maths::vec3& cameraPositionWorld, float surfaceWetness, float snowCoverage,
+        float glintDensityScale, float glintIntensityScale, float mixMaskSharpnessScale,
         float globalTimeSeconds, const ClusterShadingBinPass& shadingBinPass) {
         // prevViewProj is never read by ClusterResolveBinned.comp (this path never serves
         // DEBUG_VIEW_MOTION_VECTORS) -- `viewProj` itself is reused as a harmless placeholder value
@@ -692,6 +740,14 @@ namespace renderer {
         viewParams.viewportHeight = static_cast<float>(m_RenderExtent.height);
         viewParams.surfaceWetness = surfaceWetness;
         viewParams.snowCoverage = snowCoverage;
+        // Glint / sparkle (UE5.8 rendering-parity gap G5): Debug-only tuning multipliers (1.0 in
+        // Release, so the material's authored sparkle renders unchanged on this Release path).
+        viewParams.glintDensityScale = glintDensityScale;
+        viewParams.glintIntensityScale = glintIntensityScale;
+        // Substrate horizontal mixing (UE5.8 rendering-parity gap G6): Debug-only blend-sharpness
+        // multiplier (1.0 in Release, so a horizontally-mixed material blends at its authored
+        // mixContrast on this Release path) -- see the ResolveViewParams struct's own field comment.
+        viewParams.mixMaskSharpnessScale = mixMaskSharpnessScale;
         viewParams.sunDirectionX = sun.direction.x;
         viewParams.sunDirectionY = sun.direction.y;
         viewParams.sunDirectionZ = sun.direction.z;

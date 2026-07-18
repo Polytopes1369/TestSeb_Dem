@@ -40,6 +40,7 @@
 #include <vector>
 
 #include "pcg/PcgAttributeSet.h"
+#include "pcg/PcgMeshSpawner.h"
 #include "pcg/PcgPointData.h"
 #include "pcg/PcgSpatialData.h"
 
@@ -76,6 +77,14 @@ namespace pcg {
         Volume = 3,         // pcg::PcgVolumeData
         Landscape = 4,      // pcg::PcgLandscapeData
         Spline = 5,         // pcg::PcgSplineData
+        // Phase 4.1 ("Weighted Mesh Spawner") additive extension: a resolved list of
+        // pcg::PcgSpawnRequest -- one per surviving input point, each already carrying a chosen
+        // meshID/materialID plus that point's own transform (see PcgMeshSpawner.h's own top-of-file
+        // comment for the full rationale and the exact "why PcgGraph.h can safely #include
+        // PcgMeshSpawner.h without a circular dependency" explanation). Appended at the END of this
+        // enum (not inserted alphabetically/thematically) specifically so every PRE-EXISTING
+        // enumerator keeps its original numeric value -- purely additive, backward-compatible.
+        SpawnRequests = 6, // std::vector<pcg::PcgSpawnRequest>
     };
 
     // Human-readable name for a PcgPinDataType -- used both by JSON serialization (so the format
@@ -101,7 +110,13 @@ namespace pcg {
         PcgSurfaceData,
         PcgVolumeData,
         PcgLandscapeData,
-        PcgSplineData
+        PcgSplineData,
+        // Phase 4.1 ("Weighted Mesh Spawner") additive extension -- see PcgPinDataType::SpawnRequests'
+        // own comment above and PcgMeshSpawner.h's own top-of-file comment for the full rationale.
+        // Appended at the END of the variant's alternative list (matching PcgPinDataType::SpawnRequests
+        // being appended at the end of its enum) so every pre-existing alternative keeps its original
+        // std::variant index -- purely additive, no existing index()/switch-case mapping shifts.
+        std::vector<PcgSpawnRequest>
     >;
 
     // Maps a non-empty PcgPinData's currently-held alternative to its PcgPinDataType. Calling this

@@ -59,10 +59,19 @@
 #include "geometry/EntityBVH.h"
 #include "renderer/passes/GlobalSDFPass.h"
 #include "renderer/vulkan/GpuBuffer.h"
+#include "renderer/vulkan/RenderPass.h"
 
 namespace renderer {
 
-    class SDFRayMarchPass {
+    // Migrated to RenderPass<Derived> (see renderer/vulkan/RenderPass.h): Init()/Shutdown() are
+    // inherited. Note InitImpl() still calls the inherited Shutdown() as its own first statement
+    // (self-reinit, same pattern/reason as ShadowMapPass's own migration comment). One pool
+    // allocates 2 DIFFERENT-layout sets (entity + clipmap, maxSets=2) -- same reasoning as
+    // ReflectionPass/SurfaceCacheTraceContext: left as raw Vulkan calls wrapped in
+    // RegisterResource() rather than extending the single-set helper for this one caller.
+    class SDFRayMarchPass : public RenderPass<SDFRayMarchPass> {
+        friend class RenderPass<SDFRayMarchPass>; // Lets Init() call our private InitImpl().
+
     public:
         SDFRayMarchPass() = default;
 
@@ -85,10 +94,9 @@ namespace renderer {
         // layout for whatever later pass displays it). Returns false (logged) only on an actual
         // cache-file I/O failure; a scene with zero (or more than kMaxEntitySDFs, truncated and
         // logged) fallback meshes is valid.
-        bool Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
-            const std::filesystem::path& cacheFilePath, uint32_t outputWidth, uint32_t outputHeight);
-
-        void Shutdown();
+        // Init(VkDevice, VmaAllocator, VkCommandPool, VkQueue, const std::filesystem::path&,
+        // uint32_t, uint32_t) -> bool and Shutdown() are inherited from
+        // RenderPass<SDFRayMarchPass>; see InitImpl() below.
 
         // Binds `globalSDF`'s 4 clipmap level views into this pass's own descriptor set, using this
         // pass's OWN nearest-filter sampler (NOT GlobalSDFPass::GetEntitySDFSampler-equivalent --
@@ -144,8 +152,10 @@ namespace renderer {
             uint32_t entityID = 0;
         };
 
-        VkDevice m_Device = VK_NULL_HANDLE;
-        VmaAllocator m_Allocator = VK_NULL_HANDLE;
+        bool InitImpl(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
+            const std::filesystem::path& cacheFilePath, uint32_t outputWidth, uint32_t outputHeight);
+
+        // m_Device / m_Allocator are inherited (protected) from RenderPass<SDFRayMarchPass>.
 
         uint32_t m_OutputWidth = 0;
         uint32_t m_OutputHeight = 0;

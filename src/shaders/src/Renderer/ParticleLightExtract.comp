@@ -59,6 +59,19 @@ void main() {
     outLight.radius = 0.0;
     outLight.color = vec3(0.0);
     outLight.intensity = 0.0;
+    // G3: a particle-derived light is always an isotropic POINT light -- explicitly initialize every
+    // extended shape field (a GLSL-local struct is NOT zero-initialized, so leaving lightType garbage
+    // could misclassify an ember as a spot/rect/photometric light). The values below are the inert
+    // MEGALIGHT_TYPE_POINT defaults; MegaLightAngularShaping returns 1 for a POINT light regardless of
+    // them, so an ember lights exactly as it did pre-G3.
+    outLight.direction = vec3(0.0, -1.0, 0.0);
+    outLight.lightType = MEGALIGHT_TYPE_POINT;
+    outLight.tangentU = vec3(1.0, 0.0, 0.0);
+    outLight.rectHalfExtentX = 0.0;
+    outLight.spotCosInner = 0.0;
+    outLight.spotCosOuter = 0.0;
+    outLight.rectHalfExtentY = 0.0;
+    outLight.iesProfileAndFlags = 0u;
 
     if (slot < aliveCount) {
         uint particleIndex = aliveIndices[slot];

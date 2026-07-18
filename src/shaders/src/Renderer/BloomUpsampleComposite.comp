@@ -151,5 +151,19 @@ void main() {
         result += (ghosts + streak) * mix(1.0, dirt, pc.dirtIntensity);
     }
 
-    imageStore(g_Output, pixel, vec4(max(result, vec3(0.0)), 1.0));
+    // Clamp the WRITTEN result into a finite, fp16-representable range before the store. This is the
+    // real fix for the "bloom crushes the whole frame to black" bug (BLOOM_INTENSITY was force-
+    // disabled as an interim workaround): the per-tap SanitizeHDR guards above only bound each
+    // INDIVIDUAL input tap to 50000, but `result = detail + blurred` is a raw ADDITION of two such
+    // full-magnitude terms (NOT a normalized average like the box/tent filters those guards were
+    // sized for), so it reaches up to ~100000 -- well over fp16's 65504 max finite value -- and this
+    // imageStore into the R16G16B16A16_SFLOAT bloom image would otherwise write +Inf. That +Inf then
+    // flowed straight into PostProcessComposite.comp's final color (which additionally used to read
+    // g_Bloom UN-sanitized), survived ACES tonemapping as NaN, and clamp(NaN, 0, 1) collapsed the
+    // ENTIRE frame to black. Clamping at the store -- the exact point where the overflow occurs, and
+    // downstream of every SanitizeHDR call -- guarantees the bloom image (and every intermediate
+    // upsample mip, which all pass through this same line) is always finite. 65000 stays safely below
+    // fp16 max so any tiny bilinear-filtered overshoot on the consuming side still cannot reach +Inf.
+    vec3 finalColor = clamp(result, vec3(0.0), vec3(65000.0));
+    imageStore(g_Output, pixel, vec4(finalColor, 1.0));
 }

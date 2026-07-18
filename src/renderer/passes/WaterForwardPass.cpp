@@ -2,6 +2,7 @@
 
 #include <cstring>
 #include <format>
+#include <span>
 #include <stdexcept>
 
 #include "core/Logger.h"
@@ -35,7 +36,7 @@ namespace renderer {
 
     } // namespace
 
-    bool WaterForwardPass::Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
+    bool WaterForwardPass::InitImpl(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
         VkFormat colorFormat, VkFormat depthFormat,
         VkBuffer entityTransformBuffer,
         const MaterialParameters& waterMaterial,
@@ -43,8 +44,10 @@ namespace renderer {
         const SurfaceCachePass::EntityDrawRange& waterEntityDrawRange, uint32_t waterEntityID,
         VkAccelerationStructureKHR tlasHandle, VkBuffer drawRangeBuffer,
         const SurfaceCacheTraceContext& traceContext, VkExtent2D renderExtent) {
+        // Self-reinit (see ShadowMapPass's own migration comment for the identical pattern):
+        // Shutdown() clears m_Device/m_Allocator, which RenderPass<WaterForwardPass>::Init() already
+        // set to this call's values just before invoking this function -- restore them.
         Shutdown();
-
         m_Device = device;
         m_Allocator = allocator;
         m_RenderExtent = renderExtent;
@@ -85,6 +88,13 @@ namespace renderer {
         if (vkCreateImageView(m_Device, &snapshotViewInfo, nullptr, &m_BackgroundSnapshotView) != VK_SUCCESS) {
             throw std::runtime_error("Failed to create WaterForwardPass background snapshot image view!");
         }
+        RegisterResource([this] {
+            vkDestroyImageView(m_Device, m_BackgroundSnapshotView, nullptr);
+            vmaDestroyImage(m_Allocator, m_BackgroundSnapshotImage, m_BackgroundSnapshotAllocation);
+            m_BackgroundSnapshotView = VK_NULL_HANDLE;
+            m_BackgroundSnapshotImage = VK_NULL_HANDLE;
+            m_BackgroundSnapshotAllocation = VK_NULL_HANDLE;
+        });
 
         // One-shot UNDEFINED -> SHADER_READ_ONLY_OPTIMAL transition -- so RecordDraw() never needs
         // a first-frame special case (every frame sees the exact same precondition on entry: this
@@ -127,6 +137,7 @@ namespace renderer {
         if (vkCreateSampler(m_Device, &samplerInfo, nullptr, &m_BackgroundSnapshotSampler) != VK_SUCCESS) {
             throw std::runtime_error("Failed to create WaterForwardPass background snapshot sampler!");
         }
+        RegisterResource([this] { vkDestroySampler(m_Device, m_BackgroundSnapshotSampler, nullptr); m_BackgroundSnapshotSampler = VK_NULL_HANDLE; });
 
         // =====================================================================================
         // STEP 1 -- set 0 layout: 8 bindings (no shadow/World-Probe-Grid/MegaLights resources --
@@ -143,33 +154,23 @@ namespace renderer {
         bindings[6] = { 6, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr }; // g_BackgroundSnapshot
         bindings[7] = { 7, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr };         // FoamUBO (Wave 2)
 
-        VkDescriptorSetLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-        layoutInfo.bindingCount = 8;
-        layoutInfo.pBindings = bindings;
-        if (vkCreateDescriptorSetLayout(m_Device, &layoutInfo, nullptr, &m_SetLayout) != VK_SUCCESS) {
-            throw std::runtime_error("Failed to create WaterForwardPass descriptor set layout!");
-        }
-
         VkDescriptorPoolSize poolSizes[4]{};
         poolSizes[0] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 5 };             // bindings 0,1,3,4,5
         poolSizes[1] = { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1 }; // binding 2
         poolSizes[2] = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1 };     // binding 6
         poolSizes[3] = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 };             // binding 7 (Wave 2)
-        VkDescriptorPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
-        poolInfo.maxSets = 1;
-        poolInfo.poolSizeCount = 4;
-        poolInfo.pPoolSizes = poolSizes;
-        if (vkCreateDescriptorPool(m_Device, &poolInfo, nullptr, &m_DescriptorPool) != VK_SUCCESS) {
-            throw std::runtime_error("Failed to create WaterForwardPass descriptor pool!");
-        }
-
-        VkDescriptorSetAllocateInfo setAlloc{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-        setAlloc.descriptorPool = m_DescriptorPool;
-        setAlloc.descriptorSetCount = 1;
-        setAlloc.pSetLayouts = &m_SetLayout;
-        if (vkAllocateDescriptorSets(m_Device, &setAlloc, &m_Set) != VK_SUCCESS) {
-            throw std::runtime_error("Failed to allocate WaterForwardPass descriptor set!");
-        }
+        auto descSet = VulkanUtils::CreateDescriptorSetLayoutPoolAndSet(m_Device,
+            std::span{ bindings, 8 }, std::span{ poolSizes, 4 });
+        m_SetLayout = descSet.layout;
+        m_DescriptorPool = descSet.pool;
+        m_Set = descSet.set;
+        RegisterResource([this] {
+            vkDestroyDescriptorPool(m_Device, m_DescriptorPool, nullptr);
+            vkDestroyDescriptorSetLayout(m_Device, m_SetLayout, nullptr);
+            m_DescriptorPool = VK_NULL_HANDLE;
+            m_SetLayout = VK_NULL_HANDLE;
+            m_Set = VK_NULL_HANDLE;
+        });
 
         // =====================================================================================
         // STEP 2 -- writes. Single-element MaterialParams buffer -- see Init()'s own
@@ -179,12 +180,14 @@ namespace renderer {
         // =====================================================================================
         m_MaterialParamsBuffer.Create(allocator, sizeof(MaterialParameters),
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
+        RegisterResource([this] { m_MaterialParamsBuffer.Destroy(); });
         // Wave 2 (UE5.8 water/foam parity): fixed, hand-tuned foam recipe -- no per-material foam
         // authoring exists yet (same "authored once, never changes at runtime" convention as
         // waterMaterial above), matching WaterEffectsParams::FoamParams' own default field values.
         FoamParams foamParams{};
         m_FoamParamsBuffer.Create(allocator, sizeof(FoamParams),
             VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
+        RegisterResource([this] { m_FoamParamsBuffer.Destroy(); });
         VulkanUtils::ExecuteOneShotCommands(m_Device, commandPool, queue, [&](VkCommandBuffer cmd) {
             vkCmdUpdateBuffer(cmd, m_MaterialParamsBuffer.Handle(), 0, sizeof(MaterialParameters), &waterMaterial);
             vkCmdUpdateBuffer(cmd, m_FoamParamsBuffer.Handle(), 0, sizeof(FoamParams), &foamParams);
@@ -244,6 +247,7 @@ namespace renderer {
         if (vkCreatePipelineLayout(m_Device, &pipelineLayoutInfo, nullptr, &m_PipelineLayout) != VK_SUCCESS) {
             throw std::runtime_error("Failed to create WaterForwardPass pipeline layout!");
         }
+        RegisterResource([this] { vkDestroyPipelineLayout(m_Device, m_PipelineLayout, nullptr); m_PipelineLayout = VK_NULL_HANDLE; });
 
         // =====================================================================================
         // STEP 4 -- graphics pipeline, built manually (same reasoning as TessellationPass'
@@ -349,6 +353,7 @@ namespace renderer {
         if (vkCreateGraphicsPipelines(m_Device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_Pipeline) != VK_SUCCESS) {
             throw std::runtime_error("Failed to create WaterForwardPass graphics pipeline!");
         }
+        RegisterResource([this] { vkDestroyPipeline(m_Device, m_Pipeline, nullptr); m_Pipeline = VK_NULL_HANDLE; });
 
         vkDestroyShaderModule(m_Device, vertModule, nullptr);
         vkDestroyShaderModule(m_Device, fragModule, nullptr);
@@ -357,40 +362,13 @@ namespace renderer {
         return true;
     }
 
-    void WaterForwardPass::Shutdown() {
-        if (m_Device != VK_NULL_HANDLE) {
-            if (m_Pipeline != VK_NULL_HANDLE) vkDestroyPipeline(m_Device, m_Pipeline, nullptr);
-            if (m_PipelineLayout != VK_NULL_HANDLE) vkDestroyPipelineLayout(m_Device, m_PipelineLayout, nullptr);
-            if (m_DescriptorPool != VK_NULL_HANDLE) {
-                // Destroying the pool implicitly frees m_Set.
-                vkDestroyDescriptorPool(m_Device, m_DescriptorPool, nullptr);
-            }
-            if (m_SetLayout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(m_Device, m_SetLayout, nullptr);
-            if (m_BackgroundSnapshotSampler != VK_NULL_HANDLE) vkDestroySampler(m_Device, m_BackgroundSnapshotSampler, nullptr);
-            if (m_BackgroundSnapshotView != VK_NULL_HANDLE) vkDestroyImageView(m_Device, m_BackgroundSnapshotView, nullptr);
-        }
-        if (m_BackgroundSnapshotImage != VK_NULL_HANDLE) {
-            vmaDestroyImage(m_Allocator, m_BackgroundSnapshotImage, m_BackgroundSnapshotAllocation);
-        }
-        m_MaterialParamsBuffer.Destroy();
-        m_FoamParamsBuffer.Destroy();
-
-        m_Pipeline = VK_NULL_HANDLE;
-        m_PipelineLayout = VK_NULL_HANDLE;
-        m_DescriptorPool = VK_NULL_HANDLE;
-        m_SetLayout = VK_NULL_HANDLE;
-        m_Set = VK_NULL_HANDLE;
-        m_BackgroundSnapshotSampler = VK_NULL_HANDLE;
-        m_BackgroundSnapshotView = VK_NULL_HANDLE;
-        m_BackgroundSnapshotImage = VK_NULL_HANDLE;
-        m_BackgroundSnapshotAllocation = VK_NULL_HANDLE;
-        m_FallbackVertexBuffer = VK_NULL_HANDLE;
-        m_FallbackIndexBuffer = VK_NULL_HANDLE;
-        m_WaterEntityDrawRange = SurfaceCachePass::EntityDrawRange{};
-        m_WaterEntityID = 0;
-        m_Device = VK_NULL_HANDLE;
-        m_Allocator = VK_NULL_HANDLE;
-    }
+    // Shutdown() is inherited from RenderPass<WaterForwardPass>: runs the RegisterResource()
+    // cleanups above in reverse (pipeline -> pipeline layout -> descriptor pool+layout -> Wave 2 foam
+    // params buffer -> material params buffer -> sampler -> background snapshot image+view), the
+    // same dependency-safe order the hand-written Shutdown() used. m_FallbackVertexBuffer/
+    // m_FallbackIndexBuffer/m_WaterEntityDrawRange/m_WaterEntityID left un-reset (same reasoning as
+    // AtmosCloudsPass's m_OutputExtent: private, no getters, unconditionally re-set at the top of
+    // every InitImpl()).
 
     void WaterForwardPass::RecordDraw(VkCommandBuffer cmd, const maths::mat4& viewProj, const maths::vec3& cameraPositionWorld,
         VkImage colorImage, VkImageView colorView, VkImage depthImage, VkImageView depthView,

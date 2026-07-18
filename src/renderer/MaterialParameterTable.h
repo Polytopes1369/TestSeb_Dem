@@ -76,21 +76,43 @@ namespace renderer {
         // would double-count subsurface transport -- see GenerateShowcaseMaterialTable's own waxy SSS
         // showcase recipe, which sets this and leaves sssAmount at 0). Occupies what was _pad0.
         float sssProfileScale = 0.0f;
-        float _pad1 = 0.0f;
-        float _pad2 = 0.0f;
+        // Glint / sparkle (UE5.8 rendering-parity gap G5): the discrete-microfacet "flake" specular
+        // response Substrate supports (metal-flake paint, glittery snow, sugar/salt-like surfaces) --
+        // an ADDITIVE high-frequency term on top of the smooth GGX lobe, see substrate_bsdf.glsl's
+        // EvaluateSlabGlint/EvaluateSubstrateGlint. glintDensity [0,1] tunes how fine/numerous the
+        // flakes are (denser -> smaller world-space flake cells -> more, finer sparkles); glintIntensity
+        // is the sparkle brightness AND its enable flag in one -- 0.0 (default) disables the whole term
+        // at zero cost, exactly like sssProfileScale / fuzzAmount / secondRoughnessWeight above. These
+        // occupy what were _pad1/_pad2 (no struct-size change -- static_assert below still 96 bytes).
+        float glintDensity = 0.0f;
+        float glintIntensity = 0.0f;
     };
     static_assert(sizeof(SubstrateSlab) == 96,
         "SubstrateSlab must match the SubstrateSlab struct in material_params.glsl exactly (std430 layout)");
 
     // GLSL-friendly, std430-compatible mirror of MaterialParams in
-    // src/shaders/include/material_params.glsl -- two SubstrateSlab blocks (base + optional top)
-    // plus a trailing 16-byte block, matching Substrate's own "vertical layering" model: a material
-    // is either a single Slab (topWeight == 0.0, the exact behavior every material had before this
-    // struct existed) or a Base slab with a Top slab (Coat/Fuzz-emphasis/SSS-emphasis) layered over
-    // it, composited by substrate_bsdf.glsl's EvaluateSubstrateMaterial (see that function's own
-    // comment for the vertical-layer energy-conservation formula).
+    // src/shaders/include/material_params.glsl -- three SubstrateSlab blocks (base + the
+    // horizontal-mix partner `mixB` + optional vertical-layer `top`) plus two trailing 16-byte
+    // blocks, matching Substrate's own TWO composition operators: a material is a single Slab
+    // (topWeight == 0.0 AND mixAmount == 0.0, the exact behavior every material had before this
+    // struct existed), OR a Base slab with a Top slab (Coat/Fuzz/SSS-emphasis) layered over it
+    // VERTICALLY (composited by substrate_bsdf.glsl's EvaluateSubstrateMaterial), OR a Base slab
+    // (A) spatially blended with a `mixB` slab (B) HORIZONTALLY by a per-pixel procedural mask
+    // (composited by substrate_bsdf.glsl's ApplySubstrateHorizontalMix -- UE5.8 rendering-parity
+    // gap G6), OR any combination (the horizontal mix resolves to one effective base first, then
+    // the vertical coat layers over that result).
     struct MaterialParameters {
         SubstrateSlab base;
+        // Horizontal mixing (UE5.8 rendering-parity gap G6): the "B side" Slab that `base` (the "A
+        // side") is spatially blended with across the SAME surface by a per-pixel procedural mask
+        // -- rust patches over bare metal, moss over rock, dirt over paint, etc. DISTINCT from
+        // `top` below: `top` is a coat stacked VERTICALLY over the base (Substrate's layering
+        // operator, a Fresnel-weighted coat-over-base energy split), whereas `mixB` sits
+        // side-by-side with `base` and one wins per pixel by the mask weight (Substrate's mixing
+        // operator, a parameter-space lerp of the two Slabs). Never evaluated at all unless
+        // `mixAmount` (below) > 0.0 -- exactly the pre-G6 single-base behavior at identical cost.
+        // See substrate_bsdf.glsl's ApplySubstrateHorizontalMix / EvaluateSubstrateMixMask.
+        SubstrateSlab mixB;
         SubstrateSlab top;
         // Substrate's vertical-layer Coverage/weight, [0, 1]. 0.0 (default) = fast path, `top` is
         // never evaluated -- identical cost and result to a single flat Slab material.
@@ -117,6 +139,20 @@ namespace renderer {
         // matching real UE5.8 rather than paying the trace cost for every alpha-blended surface.
         // 0.0 = off (default, matches every other category incl. "Translucent" below), 1.0 = on.
         float hasReflections = 0.0f;
+        // Horizontal mixing (UE5.8 rendering-parity gap G6) control block -- these four floats drive
+        // substrate_bsdf.glsl's world-space procedural blend mask (see EvaluateSubstrateMixMask).
+        // mixAmount [0,1]: master coverage AND enable flag in one -- 0.0 (default) disables the
+        // whole operator at zero cost (mixB never touched), exactly like topWeight above and
+        // SubstrateSlab::glintIntensity's own "0.0 == off" convention. mixScale: world-space noise
+        // frequency (cycles per world unit) of the blend mask -- higher = smaller/more-numerous
+        // patches. mixContrast: transition sharpness -- higher = crisper A/B boundary (distinct
+        // patches), lower = a soft gradient (a flat 0 would degenerate to a hard 50% seam, so the
+        // shader floors it). mixBias [0,1]: mask threshold -- shifts how much of the surface reads
+        // as B (the mixB slab) vs A (the base slab). Defaults leave the operator off.
+        float mixAmount = 0.0f;
+        float mixScale = 1.0f;
+        float mixContrast = 1.0f;
+        float mixBias = 0.5f;
         // Wave 2 (UE5.8 Substrate iridescence layer): thin-film interference "shimmer" -- see
         // renderer::IridescenceMaterialParams' own comment (MaterialParameterTable.h intentionally
         // keeps these as two flat scalars here rather than embedding that struct directly, matching
@@ -128,7 +164,7 @@ namespace renderer {
         float _padIridescence0 = 0.0f;
         float _padIridescence1 = 0.0f;
     };
-    static_assert(sizeof(MaterialParameters) == 224,
+    static_assert(sizeof(MaterialParameters) == 336,
         "MaterialParameters must match MaterialParams in material_params.glsl exactly (std430 layout)");
 
     // Bounds both this CPU-side array and the matching GPU SSBO (ClusterResolvePass allocates
@@ -187,6 +223,11 @@ namespace renderer {
     // as two separate co-located entities, not one entity with per-vertex-varying materials.
     inline constexpr uint32_t kTreeBarkMaterialID = 22u;
     inline constexpr uint32_t kTreeLeafMaterialID = 23u;
+
+    // Skeletal-animation feature: the procedural skinned creature's material. Reserved one past
+    // kTreeLeafMaterialID, same "never collides with a real entity's showcase material" convention
+    // -- assigned explicitly to exactly one entity (VulkanContext::kCreatureEntityIndex).
+    inline constexpr uint32_t kCreatureMaterialID = 24u;
 
     // One generated table: the PBR parameters themselves, plus a parallel convenience flag so
     // callers (VulkanContext::BuildEntityData, deciding each entity's core::EntityFlags::
@@ -262,8 +303,17 @@ namespace renderer {
             p.base = MakeBaseSlab(maths::vec3(0.6f, 0.6f, 0.6f), 0.8f, maths::vec3(0.0f, 0.0f, 0.0f), 0.0f);
         }
 
-        // Metal A "chrome" (Box, slot 0): near-white, low roughness, fully metallic.
-        table.params[0].base = MakeBaseSlab(maths::vec3(0.85f, 0.85f, 0.88f), 0.08f, maths::vec3(0.0f, 0.0f, 0.0f), 1.0f);
+        // Metal-flake (Box, slot 0): UE5.8 rendering-parity gap G5 (Substrate Glint/sparkle) showcase.
+        // A bright metal (still recognizably "Metal A") that additionally sparkles with a high-frequency
+        // discrete-flake specular -- classic metal-flake car paint. Roughness bumped from the old flat
+        // chrome's 0.08 to 0.22 so the body highlight is a broad soft sheen rather than a single hard
+        // hotspot, letting the individual glints read clearly across the whole lit face rather than
+        // being drowned by a mirror highlight. glintDensity/glintIntensity drive substrate_bsdf.glsl's
+        // EvaluateSubstrateGlint (summed into the sun term by ClusterResolve.comp/ClusterResolveBinned.
+        // comp); the effect shifts with view angle, distinct from the smooth GGX highlight beside it.
+        table.params[0].base = MakeBaseSlab(maths::vec3(0.82f, 0.83f, 0.88f), 0.22f, maths::vec3(0.0f, 0.0f, 0.0f), 1.0f);
+        table.params[0].base.glintDensity = 0.6f;
+        table.params[0].base.glintIntensity = 3.0f;
 
         // WPO/displacement (Cone, slot 1): vivid teal dielectric so the WPO sway
         // (geometry::EntityMaterialTable's materialID==1 case) reads clearly against a plain color.
@@ -311,8 +361,27 @@ namespace renderer {
         // own colors read clearly rather than mixing with a tinted base.
         table.params[8].base = MakeBaseSlab(maths::vec3(0.7f, 0.7f, 0.7f), 0.6f, maths::vec3(0.0f, 0.0f, 0.0f), 0.0f);
 
-        // Dielectric B (Pyramid, slot 9): matte deep green, fully opaque non-metal.
-        table.params[9].base = MakeBaseSlab(maths::vec3(0.15f, 0.55f, 0.25f), 0.75f, maths::vec3(0.0f, 0.0f, 0.0f), 0.0f);
+        // Horizontal material mixing (Pyramid, slot 9): UE5.8 rendering-parity gap G6 showcase --
+        // rusting metal. Repurposes what was the "Dielectric B" slot (the scene still demonstrates
+        // plain dielectrics via slot 3 "Dielectric A", the two Cornell walls, the terrain and the
+        // floor). The base "A" Slab is clean steel (fully metallic, low roughness, neutral gray F0,
+        // zero diffuseAlbedo -- a metal's color lives in F0, see MakeBaseSlab); the mixB "B" Slab is
+        // oxidized rust (dielectric, high roughness, warm orange-brown diffuseAlbedo, flat 0.04 F0).
+        // A world-space procedural mask (substrate_bsdf.glsl's EvaluateSubstrateMixMask, driven by
+        // the four mix* controls below) blends the two per-pixel, so the pyramid shows rust patches
+        // spreading across bare steel: every physically meaningful Slab parameter (albedo, roughness,
+        // F0, effectively metallic->dielectric) transitions TOGETHER across each patch boundary --
+        // the whole point of parameter-space horizontal mixing, versus a naive average or a hard
+        // seam. The pyramid's large flat faces read the patchy blend clearly. mixContrast/mixScale/
+        // mixBias tuned for several distinct-but-soft-edged rust patches over roughly half the
+        // surface; mixAmount 1.0 = full effect. This is the only slot with mixAmount > 0.0 -- every
+        // other material keeps the zero-cost single-base fast path (see MaterialParameters::mixAmount).
+        table.params[9].base = MakeBaseSlab(maths::vec3(0.55f, 0.57f, 0.60f), 0.28f, maths::vec3(0.0f, 0.0f, 0.0f), 1.0f);
+        table.params[9].mixB = MakeBaseSlab(maths::vec3(0.42f, 0.20f, 0.09f), 0.90f, maths::vec3(0.0f, 0.0f, 0.0f), 0.0f);
+        table.params[9].mixAmount = 1.0f;
+        table.params[9].mixScale = 2.2f;
+        table.params[9].mixContrast = 4.0f;
+        table.params[9].mixBias = 0.5f;
 
         // Screen-space Subsurface Scattering showcase (TorusKnot, slot 10) -- UE5.8 rendering-parity
         // gap G4, "Subsurface Profile" shading model. Repurposes what was the "Nanite B neutral"
@@ -420,6 +489,17 @@ namespace renderer {
         // on the opaque VisBuffer path rather than being routed to a forward blend pass.
         table.params[kTreeLeafMaterialID].base =
             MakeBaseSlab(maths::vec3(0.16f, 0.42f, 0.12f), 0.75f, maths::vec3(0.0f, 0.0f, 0.0f), 0.0f);
+
+        // Skeletal-animation feature: creature -- a mottled olive-brown "chitin/hide" look (moderate
+        // roughness, a faint dielectric sheen so its segmented body reads distinctly from the matte
+        // terrain/foliage around it), fully opaque, non-metal. kCreatureMaterialID likewise sits past
+        // every hand-authored slot above, untouched by the isTransparent loop.
+        table.params[kCreatureMaterialID].base =
+            MakeBaseSlab(maths::vec3(0.22f, 0.24f, 0.10f), 0.55f, maths::vec3(0.0f, 0.0f, 0.0f), 0.0f);
+        table.params[kCreatureMaterialID].hasReflections = 1.0f;
+        table.params[kCreatureMaterialID].topWeight = 0.20f;
+        table.params[kCreatureMaterialID].top.roughness = 0.30f;
+        table.params[kCreatureMaterialID].top.f0 = maths::vec3(0.03f, 0.03f, 0.03f);
 
         return table;
     }
