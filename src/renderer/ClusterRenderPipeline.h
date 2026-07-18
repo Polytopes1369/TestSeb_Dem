@@ -135,6 +135,7 @@
 #include "renderer/passes/WaterForwardPass.h"
 #include "renderer/passes/ParticleSystemPass.h"
 #include "renderer/passes/VegetationScatterPass.h"
+#include "renderer/passes/FurStrandPass.h"
 #include "renderer/passes/HZBPass.h"
 #include "renderer/LightingTypes.h"
 #include "renderer/passes/ProceduralMaskGenerator.h"
@@ -241,6 +242,14 @@ namespace renderer {
         // built by renderer::GenerateShowcaseMaterialTable) -- uploaded once into ClusterResolvePass's
         // GPU SSBO and TransparentForwardPass's own descriptor set.
         MaterialTable materialTable{};
+
+        // Hair/Fur shading model (UE5.8 rendering-parity gap G10a): the skinned creature's bind-pose
+        // placement/radius geometry (VulkanContext::kCreature* constants) + its EntityTransform slot
+        // index, needed by renderer::FurStrandPass to grow fur strands off the creature's exact
+        // animated surface. Filled by the caller (main.cpp) from VulkanContext. Left at its defaults
+        // if fur is never used -- the pass still Init's harmlessly, just placing roots on a default
+        // creature footprint.
+        CreatureFurGeometry creatureFurGeometry{};
     };
 
     class ClusterRenderPipeline {
@@ -375,12 +384,21 @@ namespace renderer {
         // (instance-count readout) -- same "borrow a const ref" convention as GetParticleSystem().
         const VegetationScatterPass& GetVegetationScatter() const { return m_VegetationScatter; }
 
+        // UE5.8 rendering-parity gap G10a: hair/fur strand pass (strand-count readout) -- same
+        // "borrow a const ref" convention as GetVegetationScatter().
+        const FurStrandPass& GetFurStrand() const { return m_FurStrand; }
+
 #ifndef NDEBUG
         // Debug-only: re-runs the vegetation scatter generator from the current config::vegetation::
         // density/region/seed knobs. Waits for the device to go idle first (the generation is a
         // blocking one-shot submit on the graphics queue, so no in-flight frame may still reference
         // the instance buffer) -- backs the Debug "Vegetation" tab's Regenerate button.
         void RegenerateVegetationScatter();
+
+        // Debug-only: re-runs the fur strand-root generator from the current config::fur:: strand-
+        // count/length/geometry knobs. Same device-idle-then-blocking-one-shot discipline as
+        // RegenerateVegetationScatter above -- backs the Debug "Fur / Hair" tab's Regenerate button.
+        void RegenerateFur();
 #endif
 
 #ifndef NDEBUG
@@ -892,6 +910,16 @@ namespace renderer {
         // the scatter and water snapshots a frame that includes it. Always initialized (not Debug-
         // only), same build-separation rule as m_ParticleSystem above.
         VegetationScatterPass m_VegetationScatter;
+
+        // Hair/Fur shading model (UE5.8 rendering-parity gap G10a): GPU-instanced procedural fur
+        // strands grown off the skinned creature's animated surface -- see renderer::FurStrandPass's
+        // own class comment for the "own buffers + own lightweight forward pass, culled independently
+        // of the Nanite path" structure it shares with m_VegetationScatter, and for why fur gets its
+        // own dedicated hair BSDF (include/hair_bsdf.glsl) outside the Substrate material path.
+        // RecordCull/RecordDraw run in RecordFrameLate's [13c] forward block, right after
+        // m_VegetationScatter (both opaque, depth-writing) and before m_TransparentForward. Always
+        // initialized (not Debug-only), same build-separation rule as m_VegetationScatter above.
+        FurStrandPass m_FurStrand;
         // Subtask 6: this pass' own frame-to-frame delta-time tracking, computed independently from
         // RecordFrameLate's own `deltaTimeSeconds` (that one isn't computed yet by the time
         // RecordFrameEarly reaches m_ParticleSystem.RecordSimulate() -- see that call site's own

@@ -1,0 +1,117 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+
+// Fur-strand system (UE5.8 rendering-parity gap G10a), strand-ROOT generator. Runs ONCE at
+// renderer::FurStrandPass::Init (re-runnable via GenerateStrands() for Debug density/length tuning),
+// one invocation per strand, sampling the skinned creature's ANALYTIC bind-pose surface to author
+// each strand's root record (FurStrandRoot). Follows renderer::VegetationScatterPass's scatter
+// generator (VegetationScatterGen.comp) structurally: fill this pass' OWN dedicated GPU buffers
+// (never the shared Nanite geometry SSBO), with the live count written entirely on the GPU into a
+// counter a later CPU readback consumes.
+//
+// The creature is the segmented worm/snake (VulkanContext::kCreatureEntityIndex): a straight
+// single-chain spine along local +X, ringed by a tapered circular cross-section. This shader samples
+// that exact bind-pose surface analytically -- t01 in [0,1] along the spine, an angle around the
+// cross-section -- using the SAME RadiusProfile and the SAME 2-bone linear-blend-skinning weight
+// authoring geom_creature.comp uses, so a root sits precisely where a creature surface vertex would
+// and skins identically to it (FurStrand.vert / FurStrandCull.comp re-skin the root every frame via
+// FurCommon.glsl's FurSkinRestToWorld). Distributing roots parametrically (not per mesh-ring)
+// decouples fur density from the creature's mesh resolution, exactly the density-independent scatter
+// VegetationScatterGen.comp achieves for grass.
+
+#include "include/math_utils.glsl"   // PI, TAU
+#include "include/FurCommon.glsl"    // FurStrandRoot, FurHash*, packing convention
+
+layout(local_size_x = 64) in;
+
+layout(std430, set = 0, binding = 0) writeonly buffer StrandRootBuffer { FurStrandRoot roots[]; };
+layout(std430, set = 0, binding = 1) buffer CounterBuffer { uint strandCount; };
+
+layout(push_constant) uniform Params {
+    float worldOffsetX;   // Creature bake offset (geom_creature.comp's worldOffsetX/Y/Z), baked into rootRestPos so it matches the creature's own vertices exactly.
+    float worldOffsetY;
+    float worldOffsetZ;
+    float radiusMin;      // Cross-section radius at the tail/head tips (creature RadiusProfile input).
+    float radiusMax;      // Cross-section radius at the body's widest point.
+    float segmentLength;  // animation::SkeletalAnimator::kSegmentLength (bone spacing along +X).
+    uint  boneCount;      // animation::SkeletalAnimator::kBoneCount.
+    uint  requestedStrands; // How many strands to attempt to place this run (<= buffer capacity).
+    float lengthJitter;   // [0,1] per-strand length variation half-range.
+    float rootLift;       // Small outward push (world units) so a root starts just clear of the skin, hiding the strand's base seam.
+    uint  seed;           // Global determinism seed.
+    uint  _pad;
+} pc;
+
+// Creature radius profile along the spine (t01: 0 = tail, 1 = head) -- byte-for-byte the same formula
+// as geom_creature.comp's RadiusProfile (tapers to radiusMin at both ends, bulging to radiusMax
+// mid-body). Kept in sync by hand (a GLSL function cannot be shared across separately-compiled
+// shaders), exactly as geom_creature.comp already documents for its own C++ mirror.
+float FurRadiusProfile(float t01) {
+    float shapeEnvelope = sin(t01 * PI);
+    return mix(pc.radiusMin, pc.radiusMax, pow(max(shapeEnvelope, 0.0), 0.6));
+}
+
+uint PackBytes4(uint b0, uint b1, uint b2, uint b3) {
+    return (b0 & 0xFFu) | ((b1 & 0xFFu) << 8u) | ((b2 & 0xFFu) << 16u) | ((b3 & 0xFFu) << 24u);
+}
+
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    if (id >= pc.requestedStrands) {
+        return;
+    }
+    if (pc.boneCount < 2u || pc.radiusMax <= pc.radiusMin) {
+        return; // Degenerate creature params -- author no strands rather than NaN geometry.
+    }
+
+    // --- Per-strand deterministic placement + appearance jitter ---
+    uint h0 = FurHashCombine(pc.seed, id);
+    uint h1 = FurHashU(h0 ^ 0x1234567u);
+    uint h2 = FurHashU(h0 ^ 0x89abcdefu);
+    uint h3 = FurHashU(h0 ^ 0x55aa55aau);
+
+    // Keep a small margin off the two pole caps so strands never poke out of the tail/head fans.
+    const float kEndMargin = 0.03;
+    float t01 = mix(kEndMargin, 1.0 - kEndMargin, FurHashToUnitFloat(h0));
+    float angleFrac = FurHashToUnitFloat(h1);
+    float ang = angleFrac * TAU;
+
+    float globalT = t01 * float(pc.boneCount - 1u); // Continuous bone-index parameter, [0, boneCount-1].
+    float radius = FurRadiusProfile(t01);
+
+    // Bind-pose analytic surface point + radial outward normal (matches geom_creature.comp exactly:
+    // spine along +X, cross-section circle in the YZ plane).
+    vec3 pAnalytic = vec3(globalT * pc.segmentLength, cos(ang) * radius, sin(ang) * radius);
+    vec3 normal = normalize(vec3(0.0, cos(ang), sin(ang)));
+
+    // Root position in the creature's rest-pose local space (the space FurSkinRestToWorld expects):
+    // analytic surface point, lifted a hair clear of the skin, plus the creature's own bake offset so
+    // it lands in the identical coordinate frame as the creature's Vertex.position data.
+    vec3 rootRest = pAnalytic + normal * pc.rootLift
+        + vec3(pc.worldOffsetX, pc.worldOffsetY, pc.worldOffsetZ);
+
+    // 2-bone linear-blend-skinning weights -- identical authoring to geom_creature.comp: blend
+    // between the two adjacent spine bones by the parametric fraction, w0+w1 == 255 by construction
+    // (w1 = remainder), slots 2/3 unused. A single chain never needs more than 2 influences.
+    uint boneLow = min(uint(floor(globalT)), pc.boneCount - 2u);
+    uint boneHigh = boneLow + 1u;
+    float blend = clamp(globalT - float(boneLow), 0.0, 1.0);
+    uint w0 = uint(round((1.0 - blend) * 255.0));
+    uint w1 = 255u - w0;
+
+    FurStrandRoot r;
+    r.rootRestPos = rootRest;
+    r.lengthScale = 1.0 + (FurHashToUnitFloat(h2) * 2.0 - 1.0) * clamp(pc.lengthJitter, 0.0, 1.0);
+    r.growthNormal = normal;
+    r.curlPhase = FurHashToUnitFloat(h3) * TAU;
+    r.boneIndicesPacked = PackBytes4(boneLow, boneHigh, 0u, 0u);
+    r.boneWeightsPacked = PackBytes4(w0, w1, 0u, 0u);
+    r.tint = 0.75 + FurHashToUnitFloat(FurHashU(h1 ^ h2)) * 0.40; // [0.75, 1.15]
+    r._pad = 0.0;
+
+    // Compact into the live buffer + grow the GPU-side count (same append-and-count idiom
+    // VegetationScatterGen.comp uses -- leaves room to add density-based pruning later without any
+    // CPU-side change). Every strand survives today, so the final count == requestedStrands.
+    uint slot = atomicAdd(strandCount, 1u);
+    roots[slot] = r;
+}
