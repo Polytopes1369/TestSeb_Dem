@@ -30,7 +30,7 @@
 // and modulating the particle's own albedo. Same VSM include block as TransparentForward.frag /
 // SurfaceCacheCapture.frag (shadow_page_table/feedback/atlas_sampling/sun_sampling.glsl); same
 // world_probe_sampling.glsl macro contract every other consumer (TransparentForward.frag,
-// HeroTessellation.frag) already uses.
+// Tessellation.frag) already uses.
 //
 // --- Subtask 5: heat-shimmer refraction ---
 // When g_Params.heatShimmerStrength > 0 (an emitter-level toggle -- see renderer::
@@ -41,6 +41,14 @@
 // TransparentForwardPass's OWN shared g_RefractionOffset image (this codebase's first SECOND writer
 // of that image, see ParticleSystemPass::RecordDraw's own comment on why the load/store discipline
 // there matters), later read by PostProcessComposite.comp exactly like glass's own contribution.
+
+// Only needed here for the kParticleKind* constants this file's own shapeMask branch below reads --
+// the actual ParticleBuffer/DeadList/AliveList/Counter SSBO bindings this header also declares go
+// unused in this stage (ParticleRender.vert is set 0's only real reader), which is harmless: set 0's
+// own VkDescriptorSetLayoutBinding stage flags already include VK_SHADER_STAGE_FRAGMENT_BIT (see
+// renderer::ParticleSystemPass::Init's own STEP 3 comment), so redeclaring the same bindings here is
+// legal and costs nothing at runtime.
+#include "include/ParticleCommon.glsl"
 
 layout(std140, set = 2, binding = 0) uniform ParticleRenderParamsUBO {
     mat4 viewProj;
@@ -83,6 +91,7 @@ layout(location = 0) in vec3 inWorldPos;
 layout(location = 1) in vec2 inUV;
 layout(location = 2) in vec4 inColor;
 layout(location = 3) in float inNormalizedAge;
+layout(location = 4) flat in uint inKind; // kParticleKindEmber/Rain/Snow (ParticleCommon.glsl) -- see this file's own shapeMask comment below.
 
 layout(location = 0) out vec4 outColor;
 // renderer::TransparentForwardPass's own shared heat-distortion target -- see this file's own
@@ -94,10 +103,21 @@ layout(location = 0) out vec4 outColor;
 layout(location = 1) out vec2 outRefractionOffset;
 
 void main() {
-    vec2 centered = inUV * 2.0 - 1.0;
-    float shapeMask = smoothstep(1.0, 0.0, length(centered));
+    vec2 centered = inUV * 2.0 - 1.0; // Both axes in [-1, 1]; y runs along ParticleRender.vert's rotatedOffset "length" axis, x across its "width" axis.
+    float shapeMask;
+    if (inKind == kParticleKindRain) {
+        // Precipitation feature: rain is a thin streak, not a round sprite -- fade out fast across the
+        // (already-thin, see SpawnPrecipitationParticle's own size.x) width, and only softly at the
+        // very tip of the (long, size.y) length, so it reads as a falling line rather than a blob.
+        shapeMask = smoothstep(1.0, 0.15, abs(centered.x)) * smoothstep(1.0, 0.9, abs(centered.y));
+    } else {
+        // Embers and snow: the original plain analytic soft-circle mask (this project has zero on-disk
+        // texture assets, see this file's own header comment) -- snow reuses it unmodified, a soft
+        // round flake needs no kind-specific change here.
+        shapeMask = smoothstep(1.0, 0.0, length(centered));
+    }
     if (shapeMask <= 0.0) {
-        discard; // Outside the sprite's soft circle -- skip the (otherwise wasted) work below.
+        discard; // Outside the sprite's soft shape -- skip the (otherwise wasted) work below.
     }
 
     vec2 screenUV = gl_FragCoord.xy / g_Params.viewportSize;

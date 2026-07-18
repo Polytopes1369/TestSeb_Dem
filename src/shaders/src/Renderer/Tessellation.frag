@@ -2,18 +2,27 @@
 #extension GL_GOOGLE_include_directive : enable
 #extension GL_EXT_ray_query : require
 
-// Phase 7a (UE5.8 parity roadmap, hero asset tessellation): same "never appears in
-// ClusterResolvePass's own GBuffer" constraint TransparentForward.frag's own header comment
-// documents (this material's entity is unconditionally excluded from the opaque Nanite path via
-// core::EntityFlags::IsTransparent, see VulkanContext::BuildEntityData()'s own comment) -- so this
-// fragment shader does its OWN inline direct+MegaLights+indirect+optional-reflection composition,
-// reusing the exact same MegaLights RIS integration TransparentForward.frag already established
-// (see that shader's own header comment for the full rationale: translucent/hero surfaces have no
-// GBuffer entry for MegaLightsPass' own compute-pass composite to reach, so its algorithm is
-// inlined here via the shared megalights_ris.glsl plus this shader's own TraceShadowRay copy).
-// OPAQUE, unlike TransparentForward.frag: no Fresnel-boosted alpha, outColor.a is always 1.0.
-// `inWorldNormal` is already the DISPLACED surface normal (HeroTessellation.tese's own
-// ComputeDisplacedNormal), not a flat undisplaced one.
+// Generalized Nanite Tessellation (renderer::TessellationPass, generalized from the earlier
+// single-hardcoded-entity "HeroTessellationPass" -- see that class' own class comment): same
+// "never appears in ClusterResolvePass's own GBuffer" constraint TransparentForward.frag's own
+// header comment documents (every tessellated entity's materialID is unconditionally excluded
+// from the opaque Nanite path via core::EntityFlags::IsTransparent, see
+// VulkanContext::BuildEntityData()'s own comment) -- so this fragment shader does its OWN inline
+// direct+MegaLights+indirect+optional-reflection composition, reusing the exact same MegaLights
+// RIS integration TransparentForward.frag already established (see that shader's own header
+// comment for the full rationale: translucent/tessellated surfaces have no GBuffer entry for
+// MegaLightsPass' own compute-pass composite to reach, so its algorithm is inlined here via the
+// shared megalights_ris.glsl plus this shader's own TraceShadowRay copy). OPAQUE, unlike
+// TransparentForward.frag: no Fresnel-boosted alpha, outColor.a is always 1.0. `inWorldNormal` is
+// already the DISPLACED surface normal (Tessellation.tese's own ComputeDisplacedNormal), not a
+// flat undisplaced one.
+//
+// Materials: generalized from the original single-element "always exactly one hero material"
+// buffer to a full MaterialParameters[kMaxMaterials] SSBO (binding 7, same shape/convention as
+// TransparentForward.frag's own g_MaterialParams) -- pc.materialID (set fresh per draw call by
+// renderer::TessellationPass::RecordDraw's own per-entity loop) selects which entity's own
+// material recipe shades this fragment, clamped the same way TransparentForward.frag's own
+// materialSlot is (see MATERIAL_TABLE_SIZE below).
 
 #include "include/material_params.glsl"
 #include "include/math_utils.glsl"
@@ -41,19 +50,20 @@
 // ONE g_TLAS binding for both, same convention TransparentForward.frag already established.
 layout(set = 0, binding = 9) uniform accelerationStructureEXT g_TLAS;
 
-// This pass' own small sun-lighting UBO -- see renderer::HeroTessellationPass.cpp's own
-// HeroLightingUBO comment for why viewProj/cameraPos are NOT duplicated here (already in the push
-// constants below, needed by the vertex/tessellation stages too).
-layout(std140, set = 0, binding = 0) uniform HeroLightingUBO {
+// This pass' own small sun-lighting UBO -- see renderer::TessellationPass.cpp's own
+// TessellationLightingUBO comment for why viewProj/cameraPos are NOT duplicated here (already in
+// the push constants below, needed by the vertex/tessellation stages too).
+layout(std140, set = 0, binding = 0) uniform TessellationLightingUBO {
     vec4 sunDirectionAndIntensity; // xyz = direction (points FROM the light TOWARD the scene), w = intensity.
     vec4 sunColor;                 // rgb = color, a unused.
 } g_Lighting;
 
-// Single-element buffer -- this pass only ever shades ONE fixed material (see
-// renderer::HeroTessellationPass.cpp's own `heroMaterial` parameter comment), unlike
-// TransparentForward.frag's own per-fragment materialID-indexed array.
+// Full MaterialParameters[kMaxMaterials] array -- generalized from the original single-element
+// hero-only buffer (see renderer::TessellationPass.cpp's own `materialTable` parameter comment),
+// same shape/convention as TransparentForward.frag's own g_MaterialParams. pc.materialID (below)
+// selects this draw's own entity's slot.
 layout(std430, set = 0, binding = 7) readonly buffer MaterialParamsSSBO {
-    MaterialParams mat;
+    MaterialParams params[];
 } g_MaterialParams;
 
 #define WORLD_PROBE_GRID_SET 0
@@ -61,7 +71,7 @@ layout(std430, set = 0, binding = 7) readonly buffer MaterialParamsSSBO {
 #define WORLD_PROBE_GRID_PARAMS_BINDING 6
 #include "include/world_probe_sampling.glsl"
 
-// binding 8 == g_EntityTransforms, declared by HeroTessellation.vert only -- this fragment shader
+// binding 8 == g_EntityTransforms, declared by Tessellation.vert only -- this fragment shader
 // never needs it, the vertex/tessellation stages already resolved the (displaced) world position.
 
 // HWRT resources (own set 0 bindings 11-13, NOT part of SurfaceCacheTraceContext's set 1/2 --
@@ -79,9 +89,11 @@ layout(std430, set = 0, binding = 13) readonly buffer EntityDrawRangeBuffer { En
 layout(location = 0) in vec3 inWorldPos;
 layout(location = 1) in vec3 inWorldNormal;
 
-// Byte-for-byte mirror of HeroTessellationConstants in .vert/.tesc/.tese -- same full struct
-// declared identically in every stage sharing this one push-constant range.
-layout(push_constant) uniform HeroTessellationConstants {
+// Byte-for-byte mirror of TessellationConstants in .vert/.tesc/.tese -- same full struct
+// declared identically in every stage sharing this one push-constant range. `materialID`
+// (formerly this layout's trailing `_pad1` float, in the original single-hero-material shape)
+// selects g_MaterialParams.params[] below.
+layout(push_constant) uniform TessellationConstants {
     mat4 viewProj;
     float cameraPositionWorldX, cameraPositionWorldY, cameraPositionWorldZ;
     float _pad0;
@@ -91,7 +103,7 @@ layout(push_constant) uniform HeroTessellationConstants {
     uint entityCount;
     float viewportWidth, viewportHeight;
     float displacementScale;
-    float _pad1;
+    uint materialID;
 } pc;
 
 layout(location = 0) out vec4 outColor;
@@ -151,13 +163,19 @@ bool TraceShadowRay(vec3 origin, vec3 dir, float tMax) {
 
 void main() {
     vec3 n = normalize(inWorldNormal);
-    MaterialParams mat = g_MaterialParams.mat;
+    // Clamped the same way TransparentForward.frag's own materialSlot is -- an out-of-range
+    // materialID (should never happen, VulkanContext::BuildEntityData() only ever assigns valid
+    // slots, but this mirrors the codebase's own established defensive convention) safely falls
+    // back to the table's last slot instead of an out-of-bounds SSBO read.
+    uint materialSlot = min(pc.materialID, MATERIAL_TABLE_SIZE - 1u);
+    MaterialParams mat = g_MaterialParams.params[materialSlot];
     vec3 cameraPositionWorld = vec3(pc.cameraPositionWorldX, pc.cameraPositionWorldY, pc.cameraPositionWorldZ);
     vec3 viewDir = normalize(cameraPositionWorld - inWorldPos);
 
-    // --- Sun-direct (Substrate full Slab BSDF response, incl. this recipe's Clear Coat Top slab --
-    // see renderer::GenerateShowcaseMaterialTable's own kHeroMaterialID comment) + indirect diffuse
-    // (always computed -- cheap, one 3D texture sample). ---
+    // --- Sun-direct (Substrate full Slab BSDF response -- some tessellated entities' recipes,
+    // e.g. renderer::GenerateShowcaseMaterialTable's own kHeroMaterialID, add a Clear Coat Top
+    // slab; entities using an ordinary showcase recipe get a plain single-Slab response) +
+    // indirect diffuse (always computed -- cheap, one 3D texture sample). ---
     vec3 sunDir = normalize(-g_Lighting.sunDirectionAndIntensity.xyz);
     float sunNdotL = max(dot(n, sunDir), 0.0);
     float sunVisibility = (sunNdotL > 0.0) ? SampleSunShadowVSM(inWorldPos) : 1.0;
@@ -166,7 +184,7 @@ void main() {
     vec3 indirectLighting = SampleWorldProbeGrid(inWorldPos);
 
     // Fully opaque -- no blend stage involved (blendEnable = false, see
-    // renderer::HeroTessellationPass's own class comment), so no alpha-weighting concern here.
+    // renderer::TessellationPass's own class comment), so no alpha-weighting concern here.
     vec3 outRGB = sunResponse + indirectLighting * mat.base.diffuseAlbedo + EvaluateSubstrateEmissive(mat);
 
     // --- MegaLights: RIS-selected point light + 1 shadow-visibility ray, exactly
@@ -202,8 +220,9 @@ void main() {
     }
 
     // --- Optional front-layer specular reflection (Lumen-style, single GGX-VNDF sample) -- gated
-    // per-material via mat.hasReflections (kHeroMaterialID's own recipe has it on, showcasing the
-    // same technique TransparentForwardPass's "Transparent: clear/glass-like" category uses). ---
+    // per-material via mat.hasReflections (e.g. kHeroMaterialID's own recipe has it on),
+    // showcasing the same technique TransparentForwardPass's "Transparent: clear/glass-like"
+    // category uses. ---
     if (mat.hasReflections > 0.5) {
         // Substrate: Fresnel-only "Lumen Performance mode" reflection weight, generalized to
         // Substrate's vertical layering -- see substrate_bsdf.glsl's own

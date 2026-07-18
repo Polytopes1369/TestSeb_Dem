@@ -1,6 +1,6 @@
 #pragma once
 // Phase 7c (UE5.8 parity roadmap, water/erosion): forward-rendered water plane -- mirrors
-// renderer::HeroTessellationPass's own STRUCTURE (Init/RecordDraw, hand-built graphics pipeline,
+// renderer::TessellationPass's own STRUCTURE (Init/RecordDraw, hand-built graphics pipeline,
 // GENERAL<->ATTACHMENT barrier dance, single-element MaterialParams buffer) without being a
 // generalization of it. This pass composes MANUALLY in-shader against a frozen snapshot of the
 // background (blendEnable=false, see RecordDraw's own comment), unlike TransparentForwardPass's
@@ -9,11 +9,11 @@
 // shader branch adding divergence for nothing. This class also needs neither VirtualShadowMapPass
 // nor WorldProbeGridPass nor MegaLights (water has no diffuse/shadowed term, only refraction + a
 // front-layer specular reflection identical to hero/glass's own) -- set 0 is 7 bindings here versus
-// HeroTessellationPass's 14.
+// TessellationPass's 14.
 //
 // --- Refraction mechanism ---
 // This pipeline is forward-hybrid: the caller's own `colorImage` IS the final composited frame at
-// the point this pass runs (recorded LAST, after TransparentForwardPass/HeroTessellationPass --
+// the point this pass runs (recorded LAST, after TransparentForwardPass/TessellationPass --
 // see renderer::ClusterRenderPipeline::RecordFrame's own call-site ordering), not an intermediate
 // G-buffer, so there is no separate screen-space color buffer to sample for a classic deferred-
 // style UV-offset refraction, and reading + writing the SAME image within one sub-pass is
@@ -27,10 +27,10 @@
 // on fixed-function blending.
 //
 // --- Render target handling ---
-// Same as TransparentForwardPass/HeroTessellationPass: renders into whichever color/depth images
+// Same as TransparentForwardPass/TessellationPass: renders into whichever color/depth images
 // the caller hands it (LOAD-op vkCmdBeginRendering onto ClusterResolvePass's own output color
 // image, real D32_SFLOAT depth), depth-tests READ-ONLY (depthWriteEnable=false, like glass, unlike
-// HeroTessellationPass -- water never needs to occlude anything drawn after it).
+// TessellationPass -- water never needs to occlude anything drawn after it).
 
 #include <cstdint>
 #include <vulkan/vulkan.h>
@@ -52,17 +52,17 @@ namespace renderer {
         WaterForwardPass(const WaterForwardPass&) = delete;
         WaterForwardPass& operator=(const WaterForwardPass&) = delete;
 
-        // `commandPool`/`queue` are ACTUALLY used here (unlike HeroTessellationPass::Init's own use
+        // `commandPool`/`queue` are ACTUALLY used here (unlike TessellationPass::Init's own use
         // of them, both for one-shot uploads) -- for the one-shot UNDEFINED->SHADER_READ_ONLY_OPTIMAL
         // transition of m_BackgroundSnapshotImage, so RecordDraw() never needs a first-frame special
         // case (every frame sees the same precondition on entry). `colorFormat` must match
         // renderer::ClusterResolvePass::kOutputColorFormat exactly -- m_BackgroundSnapshotImage is
         // allocated with that same format/extent (`renderExtent`). `waterMaterial` (the caller's own
         // materialTable.params[renderer::kWaterMaterialID]) is copied once into this pass' own
-        // single-element GPU buffer at Init() time, same convention renderer::HeroTessellationPass
+        // single-element GPU buffer at Init() time, same convention renderer::TessellationPass
         // established. `fallbackVertexBuffer`/`fallbackIndexBuffer`, `waterEntityDrawRange`/
         // `waterEntityID`, `tlasHandle`/`drawRangeBuffer`, `traceContext` -- identical borrowed-
-        // resource contract to HeroTessellationPass::Init's own parameters of the same name.
+        // resource contract to TessellationPass::Init's own parameters of the same name.
         bool Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
             VkFormat colorFormat, VkFormat depthFormat,
             VkBuffer entityTransformBuffer,
@@ -75,7 +75,7 @@ namespace renderer {
         void Shutdown();
 
         // Records the water entity's single indexed draw. Same layout contract as
-        // HeroTessellationPass::RecordDraw (color: GENERAL on entry/exit, depth:
+        // TessellationPass::RecordDraw (color: GENERAL on entry/exit, depth:
         // DEPTH_STENCIL_READ_ONLY_OPTIMAL on entry/exit, never written -- see this class' own header
         // comment) PLUS an additional internal blit of `colorImage` into this pass' own background
         // snapshot before rendering -- entirely self-contained, no extra caller-side bookkeeping.
@@ -114,7 +114,7 @@ namespace renderer {
 
         // Pipeline layout spans 3 sets: set 0 (m_SetLayout, above), set 1 (mesh SDF trace scene)
         // and set 2 (surface cache sampling), both borrowed unmodified from the caller's
-        // SurfaceCacheTraceContext -- same 3-set shape TransparentForwardPass/HeroTessellationPass
+        // SurfaceCacheTraceContext -- same 3-set shape TransparentForwardPass/TessellationPass
         // already establish.
         VkPipelineLayout m_PipelineLayout = VK_NULL_HANDLE;
         VkPipeline m_Pipeline = VK_NULL_HANDLE;
