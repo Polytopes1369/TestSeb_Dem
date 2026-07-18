@@ -736,14 +736,18 @@ bool ClusterRenderPipeline::Init(
   }
 
   // GPU particle system (particle_system_integration_plan.md): buffer/descriptor-set skeleton
-  // (Subtask 1) + simulation compute pipeline (Subtask 2) -- see renderer::ParticleSystemPass's own
-  // class comment. Depends on m_AtmosClimate (wind, Init'd above at STEP 7) and m_GlobalSDF
-  // (collision clipmaps, also Init'd above at STEP 7), both already ready by this point in Init().
-  // No RecordSort/RecordDraw exist yet (Subtasks 3-4), and RecordSimulate() itself is not yet
+  // (Subtask 1) + simulation (Subtask 2) + sort (Subtask 3) + billboard render (Subtask 4) pipelines
+  // -- see renderer::ParticleSystemPass's own class comment. Depends on m_AtmosClimate (wind) and
+  // m_GlobalSDF (collision clipmaps, both Init'd above at STEP 7) and m_Resolve (GBuffer depth copy
+  // for soft particles, Init'd far earlier at STEP 6) -- all three already ready by this point.
+  // colorFormat/depthFormat match TransparentForwardPass::Init's own call site immediately below:
+  // this pass draws onto the SAME m_GIComposite output image and real depth-stencil buffer every
+  // other forward pass targets. RecordSimulate/RecordSort/RecordDraw are all implemented but NOT yet
   // called from RecordFrame (Subtask 6 wires that up), so this Init() has no RecordFrame ordering
   // consequence yet.
   if (!m_ParticleSystem.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
-                             m_AtmosClimate, m_GlobalSDF)) {
+                             m_AtmosClimate, m_GlobalSDF, m_Resolve,
+                             GICompositePass::kOutputFormat, createInfo.depthFormat)) {
     LOG_ERROR("[ClusterRenderPipeline] Failed to initialize ParticleSystemPass.");
     return false;
   }
