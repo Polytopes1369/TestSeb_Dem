@@ -60,6 +60,13 @@ namespace lumen {
 constexpr uint32_t CARDS_PER_FRAME_BUDGET = 32u;
 constexpr uint32_t EVICTION_FRAME_DELAY = 1200u;
 
+// Surface Cache atlas resolution -- see EngineConfig_Low.h's own comment on this value. Capped at
+// the same 2048 as High rather than scaling further: atlas resolution is not this tier's GI
+// differentiator (PROBE_GRID_RESOLUTION/MAX_TRACED_ENTITIES/RADIOSITY_BOUNCE_COUNT/
+// SURFACE_CACHE_GI_SAMPLE_COUNT above already scale GI fidelity at Extrem), and 2048 was the
+// original engine-wide fixed size, so this tier is guaranteed no worse than the pre-tiering baseline.
+constexpr uint32_t SURFACE_CACHE_ATLAS_SIZE = 2048u;
+
 // Extreme-quality 80^3 probe grid (512k probes) for flawless global illumination.
 constexpr uint32_t PROBE_GRID_RESOLUTION = 80u;
 constexpr float PROBE_SPACING = 0.8f;

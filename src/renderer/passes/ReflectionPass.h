@@ -55,7 +55,19 @@ namespace renderer {
         static constexpr uint32_t kGridWorkgroupSize = 8; // Every stage's local_size_x/y (full-res dispatch).
 
         static constexpr VkFormat kRadianceFormat = VK_FORMAT_R16G16B16A16_SFLOAT; // rgb = radiance, a = validity.
-        static constexpr VkFormat kWorldPosFormat = VK_FORMAT_R32G32B32A32_SFLOAT; // rgb = world pos, a = validity.
+        // rgb = world pos, a = validity. Considered for an RGBA16F downgrade during the 2026-07-18
+        // VRAM-reduction audit (same oversized-format pattern as renderer::SurfaceCachePass's own
+        // kWorldPosFormat, see that class's own comment) and deliberately kept at fp32: ReflectionTrace
+        // .comp reconstructs this from depth (worldPos = invViewProj * ndc, no camera-relative
+        // rebasing) across a scene whose floor/terrain entity spans roughly [-150, +150] world units
+        // (VulkanContext::GenerateTerrain(300.0f, 300.0f, ...)), where fp16's ULP is ~0.125 units.
+        // ReflectionTemporal.comp's own disocclusion test (distance(historyWorldPos.xyz,
+        // newWorldPos.xyz) > kDisocclusionDistanceThreshold) compares this value against a fixed
+        // 0.5-unit threshold that comment explicitly says assumes only a "~14m camera-orbit-diameter
+        // scene scale" -- fp16 quantization at the terrain's actual extent would eat a large fraction
+        // of that already-tight budget, risking visible reflection flicker/ghosting near it. Kept at
+        // fp32.
+        static constexpr VkFormat kWorldPosFormat = VK_FORMAT_R32G32B32A32_SFLOAT;
         static constexpr VkFormat kNormalFormat = VK_FORMAT_R16G16_SFLOAT;         // Octahedral-encoded.
 
         // Phase 2 (Lumen advanced roadmap): fixed (non-ping-ponged) auxiliary images, same lifetime

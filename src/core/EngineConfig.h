@@ -76,6 +76,10 @@ inline uint32_t _TSR_VELOCITY_HEADING_CONVECTIVE = 1;
 namespace lumen {
 inline uint32_t CARDS_PER_FRAME_BUDGET = 16u;
 inline uint32_t EVICTION_FRAME_DELAY = 600u;
+// Surface Cache atlas resolution (square, texels) -- see EngineConfig_Low.h's own comment on this
+// value for the full rationale. Wired into renderer::SurfaceCachePass::Init(), replacing what used
+// to be a hardcoded geometry::kSurfaceCacheAtlasSize regardless of tier.
+inline uint32_t SURFACE_CACHE_ATLAS_SIZE = 2048u;
 
 inline uint32_t PROBE_GRID_RESOLUTION = 64u;
 inline float PROBE_SPACING = 1.0f;
@@ -778,6 +782,8 @@ inline void ApplyProfile(std::string_view profileName) {
     lumen::CARDS_PER_FRAME_BUDGET =
         config_extrem::lumen::CARDS_PER_FRAME_BUDGET;
     lumen::EVICTION_FRAME_DELAY = config_extrem::lumen::EVICTION_FRAME_DELAY;
+    lumen::SURFACE_CACHE_ATLAS_SIZE =
+        config_extrem::lumen::SURFACE_CACHE_ATLAS_SIZE;
     lumen::PROBE_GRID_RESOLUTION = config_extrem::lumen::PROBE_GRID_RESOLUTION;
     lumen::PROBE_SPACING = config_extrem::lumen::PROBE_SPACING;
     lumen::PROBE_SAMPLE_DIRECTIONS =
@@ -855,6 +861,7 @@ inline void ApplyProfile(std::string_view profileName) {
         config_high::temporal::TSR_VELOCITY_HEADING_CONVECTIVE;
     lumen::CARDS_PER_FRAME_BUDGET = config_high::lumen::CARDS_PER_FRAME_BUDGET;
     lumen::EVICTION_FRAME_DELAY = config_high::lumen::EVICTION_FRAME_DELAY;
+    lumen::SURFACE_CACHE_ATLAS_SIZE = config_high::lumen::SURFACE_CACHE_ATLAS_SIZE;
     lumen::PROBE_GRID_RESOLUTION = config_high::lumen::PROBE_GRID_RESOLUTION;
     lumen::PROBE_SPACING = config_high::lumen::PROBE_SPACING;
     lumen::PROBE_SAMPLE_DIRECTIONS =
@@ -930,6 +937,8 @@ inline void ApplyProfile(std::string_view profileName) {
     lumen::CARDS_PER_FRAME_BUDGET =
         config_medium::lumen::CARDS_PER_FRAME_BUDGET;
     lumen::EVICTION_FRAME_DELAY = config_medium::lumen::EVICTION_FRAME_DELAY;
+    lumen::SURFACE_CACHE_ATLAS_SIZE =
+        config_medium::lumen::SURFACE_CACHE_ATLAS_SIZE;
     lumen::PROBE_GRID_RESOLUTION = config_medium::lumen::PROBE_GRID_RESOLUTION;
     lumen::PROBE_SPACING = config_medium::lumen::PROBE_SPACING;
     lumen::PROBE_SAMPLE_DIRECTIONS =
@@ -1007,6 +1016,7 @@ inline void ApplyProfile(std::string_view profileName) {
         config_low::temporal::TSR_VELOCITY_HEADING_CONVECTIVE;
     lumen::CARDS_PER_FRAME_BUDGET = config_low::lumen::CARDS_PER_FRAME_BUDGET;
     lumen::EVICTION_FRAME_DELAY = config_low::lumen::EVICTION_FRAME_DELAY;
+    lumen::SURFACE_CACHE_ATLAS_SIZE = config_low::lumen::SURFACE_CACHE_ATLAS_SIZE;
     lumen::PROBE_GRID_RESOLUTION = config_low::lumen::PROBE_GRID_RESOLUTION;
     lumen::PROBE_SPACING = config_low::lumen::PROBE_SPACING;
     lumen::PROBE_SAMPLE_DIRECTIONS = config_low::lumen::PROBE_SAMPLE_DIRECTIONS;
