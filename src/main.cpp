@@ -1096,6 +1096,21 @@ int main(int argc, char** argv) {
                         ImGui::SliderFloat("Friction", &cfg.friction, 0.0f, 1.0f);
                         ImGui::DragFloat("Wind Drag", &cfg.dragCoefficient, 0.02f, 0.0f, 5.0f);
 
+                        // Module stack roadmap (subtask A3): two independently-toggleable force
+                        // modules layered on top of the fixed physics knobs above -- a small,
+                        // fixed-size, data-driven stand-in for a real Niagara module graph (a full
+                        // visual-scripting node editor is out of scope for this project, see
+                        // renderer::ParticleSystemPass::EmitterParams' own header comment).
+                        ImGui::Separator();
+                        ImGui::TextUnformatted("Force Modules");
+                        ImGui::Checkbox("Curl-Noise Turbulence", &cfg.curlNoiseEnabled);
+                        ImGui::DragFloat("Turbulence Strength (m/s^2)", &cfg.curlNoiseStrength, 0.02f, 0.0f, 10.0f);
+                        ImGui::DragFloat("Turbulence Scale", &cfg.curlNoiseScale, 0.005f, 0.01f, 3.0f);
+                        ImGui::Checkbox("Radial Attractor/Repulsor", &cfg.attractorEnabled);
+                        ImGui::DragFloat3("Attractor Offset (from emitter)", &cfg.attractorOffsetX, 0.05f);
+                        ImGui::DragFloat("Attractor Strength (+attract/-repel)", &cfg.attractorStrength, 0.05f, -20.0f, 20.0f);
+                        ImGui::DragFloat("Attractor Falloff Radius (m)", &cfg.attractorRadius, 0.05f, 0.05f, 50.0f);
+
                         // Multi-emitter roadmap (subtask A1) validation/debug instrumentation: proves
                         // this emitter is independently alive/producing particles, not just that the
                         // aggregate total below is nonzero.

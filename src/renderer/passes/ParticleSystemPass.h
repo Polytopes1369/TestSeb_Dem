@@ -74,13 +74,30 @@ namespace renderer {
         ParticleSystemPass(const ParticleSystemPass&) = delete;
         ParticleSystemPass& operator=(const ParticleSystemPass&) = delete;
 
-        // Byte-for-byte mirror of ParticleCommon.glsl's `EmitterParams` struct -- 80 bytes, std430,
+        // Byte-for-byte mirror of ParticleCommon.glsl's `EmitterParams` struct -- 112 bytes, std430,
         // same flat-float convention as GpuParticle above (avoids vec3's implicit alignment surprises
         // when reasoning about the byte layout by eye). One instance per emitter slot (kMaxEmitters
         // below); renderer::ClusterRenderPipeline builds a full kMaxEmitters-length array of these
         // from config::particles::EMITTERS[] every frame and passes it to RecordSimulate(), which
         // re-uploads it wholesale (see that method's own comment) -- every field here is meant to be
         // edited live via main.cpp's Particles ImGui tab with no restart required.
+        //
+        // Module stack roadmap (subtask A3): Niagara-style artists stack independent modules onto an
+        // emitter rather than tuning one fixed hardcoded physics block -- a full visual-scripting graph
+        // is out of scope for a "zero data in the .exe" demoscene binary, so this is instead a small,
+        // fixed-size, DATA-DRIVEN set of additional force modules layered on top of the existing
+        // gravity/wind-drag/SDF-bounce physics (which keeps working exactly as before -- see
+        // ParticleSimulation.comp's UpdateParticle, whose ember branch now applies these additively).
+        // Two modules, each independently toggleable per emitter, added in the two 16-byte slots this
+        // struct grows by below:
+        //   1. Curl-noise turbulence (curlNoiseEnabled/Strength/Scale) -- a divergence-free procedural
+        //      force via AtmosNoiseCommon.glsl's existing AtmosFractalCurlNoise3D (same helper Atmos
+        //      wind turbulence already uses, kept consistent with this codebase's established
+        //      noise-generation conventions rather than introducing a second implementation).
+        //   2. Radial attractor/repulsor (attractorEnabled/Offset/Strength/Radius) -- a smoothstep
+        //      falloff force toward (positive strength) or away from (negative strength) a point that
+        //      is an OFFSET from the emitter's own live position (so it tags along with a moving
+        //      emitter instead of needing a separately-authored fixed world point).
         struct EmitterParams {
             float positionX = 0.0f, positionY = 0.0f, positionZ = 0.0f;
             float shapeParam0 = 0.0f;
@@ -89,9 +106,21 @@ namespace renderer {
             float lifetimeMin = 2.0f, lifetimeMax = 4.0f;
             float gravityY = -9.8f, bounceElasticity = 0.4f, friction = 0.85f, dragCoefficient = 0.5f;
             uint32_t spawnShape = 0;
-            float _pad0 = 0.0f, _pad1 = 0.0f, _pad2 = 0.0f;
+            // Module stack roadmap (subtask A3): curl-noise turbulence module -- replaces the 3
+            // previously-unused trailing pad floats that used to close spawnShape's own 16-byte slot,
+            // so this swap costs no extra bytes.
+            uint32_t curlNoiseEnabled = 0;   // Nonzero = apply turbulence force every UpdateParticle() call for embers spawned from this emitter.
+            float curlNoiseStrength = 0.0f;  // Force magnitude, m/s^2 applied to velocity per second at full strength.
+            float curlNoiseScale = 0.0f;     // World-space frequency multiplier fed into the curl-noise field (bigger = finer swirls).
+            // Module stack roadmap (subtask A3): radial attractor/repulsor module -- its own new
+            // 16+16-byte slot pair (matches this struct's existing "vec3 + trailing scalar" convention).
+            float attractorOffsetX = 0.0f, attractorOffsetY = 0.0f, attractorOffsetZ = 0.0f; // World-space offset from this emitter's own live position.
+            float attractorStrength = 0.0f;  // Positive = attract toward the point, negative = repel away from it, m/s^2 at zero distance (before falloff below).
+            float attractorRadius = 1.0f;    // World units -- force falls off smoothly (smoothstep) to zero at this distance.
+            uint32_t attractorEnabled = 0;
+            float _pad0 = 0.0f, _pad1 = 0.0f;
         };
-        static_assert(sizeof(EmitterParams) == 80, "EmitterParams must match ParticleCommon.glsl's EmitterParams struct exactly (std430 layout)");
+        static_assert(sizeof(EmitterParams) == 112, "EmitterParams must match ParticleCommon.glsl's EmitterParams struct exactly (std430 layout)");
 
         // Maximum simultaneous emitter slots (multi-emitter roadmap, subtask A1) -- small and fixed
         // (unlike kMaxParticles, no sort/perf pressure motivates a larger number yet; a future

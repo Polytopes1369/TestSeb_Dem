@@ -1501,6 +1501,16 @@ void ClusterRenderPipeline::RecordFrameEarly(VkCommandBuffer cmdEarly,
         gpu.gravityY = cfg.gravityY; gpu.bounceElasticity = cfg.bounceElasticity;
         gpu.friction = cfg.friction; gpu.dragCoefficient = cfg.dragCoefficient;
         gpu.spawnShape = cfg.spawnShape;
+        // Module stack roadmap (subtask A3): curl-noise turbulence + radial attractor/repulsor force
+        // modules -- same "copy the live ImGui-edited config value into this frame's GPU struct"
+        // pattern as every field above.
+        gpu.curlNoiseEnabled = cfg.curlNoiseEnabled ? 1u : 0u;
+        gpu.curlNoiseStrength = cfg.curlNoiseStrength;
+        gpu.curlNoiseScale = cfg.curlNoiseScale;
+        gpu.attractorEnabled = cfg.attractorEnabled ? 1u : 0u;
+        gpu.attractorOffsetX = cfg.attractorOffsetX; gpu.attractorOffsetY = cfg.attractorOffsetY; gpu.attractorOffsetZ = cfg.attractorOffsetZ;
+        gpu.attractorStrength = cfg.attractorStrength;
+        gpu.attractorRadius = cfg.attractorRadius;
 
         if (cfg.active) {
           m_ParticleSpawnAccumulator[i] += cfg.spawnRate * particleDeltaTimeSeconds;

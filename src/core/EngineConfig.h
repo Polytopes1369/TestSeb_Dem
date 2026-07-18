@@ -437,6 +437,14 @@ inline constexpr uint32_t kMaxEmitters = 4;
 // SPAWN_RATE_PER_SECOND/EMITTER_POSITION_*/GRAVITY/BOUNCE_ELASTICITY/FRICTION/DRAG_COEFFICIENT
 // globals this namespace used to hold directly (subtask A1 keeps their per-emitter defaults exactly
 // equivalent to the old always-on single emitter -- see EMITTERS[0] below).
+// Module stack roadmap (subtask A3): two independently-toggleable force modules layered on top of
+// the physics fields above (which are unchanged) -- deliberately added at the END of this struct so
+// every existing positional EmitterConfig{...} aggregate initializer below (which lists fewer values
+// than there are members) keeps relying on THESE new fields' own default member initializers rather
+// than needing to be rewritten; only EMITTERS[1] below explicitly opts into curl-noise turbulence by
+// listing values through that field. A full visual-scripting module graph is out of scope for this
+// project (see renderer::ParticleSystemPass::EmitterParams' own header comment) -- this mirrors that
+// struct's small fixed-size data-driven set exactly, field-for-field.
 struct EmitterConfig {
     bool active = false;
     float positionX = 0.0f, positionY = 0.0f, positionZ = 0.0f;
@@ -450,13 +458,28 @@ struct EmitterConfig {
     float dragCoefficient = 0.5f;  // How strongly velocity relaxes toward the local Atmos wind vector each second.
     uint32_t spawnShape = 0;       // 0 = Cone burst ("embers" launch), 1 = Sphere volume drift ("ambient dust").
     float shapeParam0 = 0.3f;      // Sphere shape's radius in world units; unused by Cone.
+    // Module stack roadmap (subtask A3): curl-noise turbulence module.
+    bool curlNoiseEnabled = false;
+    float curlNoiseStrength = 0.5f; // m/s^2 -- only applied while curlNoiseEnabled is true.
+    float curlNoiseScale = 0.3f;    // World-space frequency multiplier -- bigger = finer swirls.
+    // Module stack roadmap (subtask A3): radial attractor/repulsor module.
+    bool attractorEnabled = false;
+    float attractorOffsetX = 0.0f, attractorOffsetY = 0.0f, attractorOffsetZ = 0.0f; // World-space offset from this emitter's own live position.
+    float attractorStrength = 1.0f; // Positive = attract, negative = repel, m/s^2 at zero distance (before falloff).
+    float attractorRadius = 3.0f;   // World units -- smoothstep falloff to zero at this distance.
 };
 
 // Slot 0 preserves the ORIGINAL single-emitter defaults exactly (same position/spawn rate/physics
 // values the old flat globals held) so this roadmap step changes nothing about the existing "embers"
 // look by default. Slot 1 is a new "Ambient Dust" emitter proving multi-emitter support end-to-end
 // (a slow-drifting sphere-volume spawn, distinct color/physics/shape from slot 0, both active
-// simultaneously). Slots 2-3 start inactive, ready for further ImGui-driven experimentation.
+// simultaneously) -- module stack roadmap (subtask A3): this emitter's curl-noise turbulence module
+// is also enabled by default here, as a visible proof the new force module actually works, since its
+// already-slow drift (drag=1.0, gentle initial velocity) reads turbulence clearly instead of being
+// swamped by a fast base motion the way embers' own launched-burst velocity would. Slots 2-3 start
+// inactive, ready
+// for further ImGui-driven experimentation (including the new attractor/repulsor module, left off by
+// default on every slot here since no existing emitter's look calls for it).
 inline EmitterConfig EMITTERS[kMaxEmitters] = {
     EmitterConfig{ /*active*/ true, /*position*/ 0.0f, 3.0f, 0.0f, /*spawnRate*/ 200.0f,
         /*color*/ 1.0f, 0.7f, 0.3f, 1.0f, /*size*/ 0.1f, 0.1f, /*lifetime*/ 2.0f, 4.0f,
@@ -465,7 +488,8 @@ inline EmitterConfig EMITTERS[kMaxEmitters] = {
     EmitterConfig{ /*active*/ true, /*position*/ 4.0f, 2.0f, 2.0f, /*spawnRate*/ 40.0f,
         /*color*/ 0.6f, 0.7f, 0.85f, 0.5f, /*size*/ 0.03f, 0.07f, /*lifetime*/ 4.0f, 7.0f,
         /*gravityY*/ -0.2f, /*bounce*/ 0.0f, /*friction*/ 0.0f, /*drag*/ 1.0f,
-        /*spawnShape*/ 1u, /*shapeParam0*/ 1.5f },
+        /*spawnShape*/ 1u, /*shapeParam0*/ 1.5f,
+        /*curlNoiseEnabled*/ true, /*curlNoiseStrength*/ 0.5f, /*curlNoiseScale*/ 0.35f },
     EmitterConfig{},
     EmitterConfig{},
 };
