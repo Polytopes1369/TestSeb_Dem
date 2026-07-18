@@ -537,6 +537,40 @@ namespace renderer {
         // convention (renderer::VulkanContext.h).
         bool RunPcgInstanceDrawSmokeTest(const std::vector<PcgSmokeTestInstanceDesc>& instances,
             VkCommandPool commandPool, VkQueue queue);
+
+        // Phase 4.2 (PCG roadmap, "Spawner-to-DrawPass Glue" capstone): one weighted candidate mesh
+        // for RunPcgFullPipelineSmokeTest()'s own pcg::SpawnFromPoints() call -- the same
+        // {meshID, materialID} shape PcgSmokeTestInstanceDesc above already uses (the caller
+        // resolves both via renderer::VulkanContext::GetStreamingArchetypeFineMeshInfo(), same as
+        // main.cpp's own RunPcgInstanceDrawSmokeTest call site -- this class has no VulkanContext
+        // dependency of its own, see PcgSmokeTestInstanceDesc's own comment), plus a relative spawn
+        // `weight` (pcg::PcgMeshSpawnEntry::weight parity -- see PcgMeshSpawner.h's own comment for
+        // exactly how weights are normalized into a selection probability).
+        struct PcgFullPipelineSmokeTestMeshDesc {
+            uint32_t meshID = 0;
+            uint32_t materialID = 0;
+            float weight = 1.0f;
+        };
+
+        // Phase 4.2 capstone: runs the ENTIRE PCG pipeline for the first time in this roadmap --
+        // sampler (pcg::SampleVolume, Phase 2.3) -> filter (pcg::PruneByDistance, Phase 3.2) ->
+        // spawner (pcg::SpawnFromPoints, Phase 4.1) -> glue (pcg::PcgInstanceSpawnManager, THIS
+        // phase, wrapping a throwaway renderer::PcgInstanceDrawPass) -> the same GPU cull/draw path
+        // RunPcgInstanceDrawSmokeTest() above already proves -> an offscreen render + CPU readback --
+        // proving every phase from Phase 0 through Phase 4 composes end-to-end, not just each phase
+        // in isolation. Mirrors RunPcgInstanceDrawSmokeTest()'s own "throwaway pass, offscreen
+        // render, readback, log PASS/FAIL" structure, self-contained offscreen color+depth pair, and
+        // non-fatal-on-failure convention (logged only, never throws) -- see that method's own
+        // comment for the parts of this structure reused verbatim (never touches any live scene
+        // attachment or the real per-frame RecordFrame*() sequence). `weightedMeshes` supplies the
+        // same streaming archetype meshes RunPcgInstanceDrawSmokeTest's own caller (main.cpp)
+        // already resolves. `commandPool`/`queue` are the caller's own one-shot-command resources,
+        // exactly like RunPcgInstanceDrawSmokeTest's own parameters. Logs and returns false (never
+        // throws) on the first failing check, at any stage of the pipeline. Safe to call any time
+        // after this pipeline's own Init() has returned true. Whole declaration + definition
+        // compiled out of Release, matching RunPcgInstanceDrawSmokeTest's own convention.
+        bool RunPcgFullPipelineSmokeTest(const std::vector<PcgFullPipelineSmokeTestMeshDesc>& weightedMeshes,
+            VkCommandPool commandPool, VkQueue queue);
 #endif
 
     private:
