@@ -113,6 +113,7 @@
 #include "core/EntityData.h" // core::EntityTransformCPU
 #include "core/LoadingManager.h"
 #include "core/maths/Maths.h"
+#include "geometry/ClusterFormat.h" // geometry::ClusterIndexEntry / DAGNodeEntry -- Phase 0.2 debug copy, see m_DebugIndexEntriesCopy's own comment.
 #include "renderer/passes/ATrousDenoisePass.h"
 #include "renderer/passes/ClusterHardwareRasterPass.h"
 #include "renderer/passes/ClusterLODSelectionPass.h"
@@ -162,6 +163,12 @@
 #include "renderer/debug/DebugBufferViewPass.h"
 #include "renderer/debug/DebugTextOverlay.h"
 #include "renderer/passes/SDFRayMarchPass.h"
+// Phase 0.2 (UE5.8-parity PCG roadmap, "PCG Instance Draw Path"): only ever instantiated (as a
+// local variable) inside RunPcgInstanceDrawSmokeTest() below -- see that method's own comment.
+// PcgInstanceDrawPass.cpp itself still compiles unconditionally in every build config (it is a
+// real rendering mechanism, not debug/test tooling, per CLAUDE.md's build-separation rule), only
+// this Debug-only *validation* of it is excluded from Release.
+#include "renderer/passes/PcgInstanceDrawPass.h"
 #endif
 
 namespace renderer {
@@ -484,6 +491,50 @@ namespace renderer {
             outHwTriangleCount = m_LastHWTriangleCount;
             outSwTriangleCount = m_LastSWTriangleCount;
         }
+
+        // Phase 0.2 (UE5.8-parity PCG roadmap, "PCG Instance Draw Path"): one test instance's
+        // desired {meshID, materialID, transform} -- the exact "CPU-populated list" shape
+        // renderer::PcgInstanceDrawPass::AcquireInstance() expects. `meshID` must name an entity
+        // whose clusters are already resident (any entity from the fixed showcase gallery or the
+        // World Partition streaming pool works, since ClusterRenderPipeline::Init() streams every
+        // cluster page in unconditionally at startup -- see this class' own header comment). The
+        // caller (main.cpp) is expected to resolve real meshIDs via renderer::VulkanContext's own
+        // accessors (e.g. GetStreamingArchetypeFineMeshInfo()) -- this class deliberately has no
+        // dependency on the concrete VulkanContext type (see core::EntityTransformCPU's own comment
+        // in EntityData.h for why renderer:: code never depends on it directly).
+        struct PcgSmokeTestInstanceDesc {
+            uint32_t meshID = 0;
+            uint32_t materialID = 0;
+            maths::vec3 position{};
+            maths::quat rotation{};
+            maths::vec3 scale{ 1.0f, 1.0f, 1.0f };
+        };
+
+        // Proves renderer::PcgInstanceDrawPass's GPU-driven instanced-mesh draw path actually
+        // rasterizes real Nanite cluster geometry end-to-end -- not a mere compile/link check.
+        // Builds a throwaway PcgInstanceDrawPass instance (borrowing this pipeline's already-
+        // resident m_PagePool physical pool + m_Decompression decompressed index pool, and this
+        // frame's m_DebugIndexEntriesCopy/m_DebugDagEntriesCopy -- Init()'s own debug-only copy of
+        // the full cache tables, see that member's own comment), acquires one instance per entry in
+        // `instances`, uploads them, and records ONE self-contained offscreen render (its own small
+        // color+depth image pair, its own one-shot command buffer -- never touches any live scene
+        // attachment or the real per-frame RecordFrame*() sequence) with a camera framed to see
+        // every supplied instance. Verifies, via CPU readback:
+        //   1. RecordCull()'s GPU-computed draw count (renderer::ClusterCullingPass's own atomic
+        //      counter, never CPU-computed) is > 0 -- proves the candidate clusters survived
+        //      frustum/backface culling.
+        //   2. A sampled sweep of the rendered color image contains at least one non-background
+        //      pixel -- proves those surviving clusters actually rasterized real, lit geometry (not
+        //      just an empty draw call).
+        // `commandPool`/`queue` are the caller's own one-shot-command resources (e.g.
+        // VulkanContext::GetCommandPool()/GetGraphicsQueue()) -- this method borrows them for its
+        // own blocking one-shot submits, exactly like every Init()-time staging upload elsewhere in
+        // this codebase. Logs and returns false (never throws) on the first failing check. Safe to
+        // call any time after this pipeline's own Init() has returned true. Whole declaration +
+        // definition compiled out of Release, matching RunInstanceRegistrySmokeTest's own
+        // convention (renderer::VulkanContext.h).
+        bool RunPcgInstanceDrawSmokeTest(const std::vector<PcgSmokeTestInstanceDesc>& instances,
+            VkCommandPool commandPool, VkQueue queue);
 #endif
 
     private:
@@ -540,6 +591,25 @@ namespace renderer {
         // error path). Debug-only per CLAUDE.md's build-separation rule: this function's own file-
         // scope existence is guarded out of Release entirely, not merely skipped at runtime.
         void ValidateSplineBounds() const;
+
+        // Phase 0.3 (PCG roadmap, dynamic Lumen registration) validation: registers a small,
+        // synthetic-entityID set of test entities into BOTH m_GlobalSDF and m_SurfaceCache at
+        // runtime -- reusing already-baked Fallback Mesh geometry read back out of this pipeline's
+        // OWN scene.cache (borrowed from a few already-resident entityIDs via
+        // GlobalSDFPass::GetTracedEntityInfos(), since every entityID this engine's content
+        // currently defines is already part of each pass's fixed Init()-time roster -- there is no
+        // "dormant" entityID left to register from, so a fresh SYNTHETIC identity is used instead;
+        // see GlobalSDFPass::RegisterEntity/SurfaceCachePass::RegisterEntity's own comments for the
+        // full "newEntityID vs sourceEntityID" contract this exercises). Confirms the entities are
+        // counted in each pass's composite/atlas list, exercises one real
+        // RecordUpdate()/UpdateVisibility()+RecordCapture() dispatch through one-shot command
+        // buffers so the new code paths actually run at least once (not just get counted), then
+        // unregisters everything it added and confirms every count returns to its pre-test
+        // baseline. Entirely log-based (LOG_INFO/LOG_ERROR in the .cpp) -- called once, at the very
+        // end of Init(), same placement convention as ValidateSplineBounds() above (both need the
+        // rest of this pipeline's Init()-time state -- here, m_GlobalSDF/m_SurfaceCache's own fixed
+        // roster -- already fully built).
+        void RunPhase03DynamicLumenSmokeTest(VkCommandPool commandPool, VkQueue queue);
 
         // Maps config::debugview::SELECTED_BUFFER_INDEX to one of this pipeline's own GBuffer/GI
         // intermediate views (see the big index->buffer table in this method's own .cpp
@@ -1014,6 +1084,16 @@ namespace renderer {
         // comment. Only dispatched (and only ever blitted to the swapchain in place of
         // m_PostProcess's output) when config::debugview::SELECTED_BUFFER_INDEX != 0.
         debug::DebugBufferViewPass m_DebugBufferView;
+
+        // Phase 0.2 (UE5.8-parity PCG roadmap, "PCG Instance Draw Path"): retains Init()'s own
+        // local `indexEntries`/`dagEntries` vectors (STEP 1 above; normally discarded once every
+        // GPU-resident table is built) purely so RunPcgInstanceDrawSmokeTest() has a full,
+        // index-aligned cluster/DAG table to scan for a chosen meshID's leaf clusters -- mirrors
+        // ClusterLODSelectionPass::m_DebugDagNodesCopy's own identical "Debug-only retained Init()
+        // local" precedent exactly (see that member's own comment). Never touched by any GPU-facing
+        // code; empty (and zero-cost) in Release.
+        std::vector<geometry::ClusterIndexEntry> m_DebugIndexEntriesCopy;
+        std::vector<geometry::DAGNodeEntry> m_DebugDagEntriesCopy;
 #endif
     };
 

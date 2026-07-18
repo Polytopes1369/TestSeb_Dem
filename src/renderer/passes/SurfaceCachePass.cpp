@@ -139,6 +139,8 @@ namespace renderer {
 
         m_Device = device;
         m_Allocator = allocator;
+        // Phase 0.3: stashed for RegisterEntity()'s later re-reads -- see that member's own comment.
+        m_CacheFilePath = cacheFilePath;
 
         // =====================================================================================
         // STEP 1 -- Read the card table + every fallback mesh's geometry (CPU side).
@@ -662,6 +664,14 @@ namespace renderer {
         m_EntityRanges.clear();
         m_AtlasAllocator.Reset();
         m_DirtyCardQueue.clear();
+        // Phase 0.3: m_DynamicEntityGeometry's GpuBuffer members self-destroy via their own RAII
+        // dtor as soon as the map erases/clears them -- no explicit .Destroy() call needed here,
+        // unlike m_VertexBuffer/m_IndexBuffer/m_LightingUBO above (also GpuBuffer, but destroyed
+        // explicitly by this class's existing convention for its own top-level members).
+        m_DynamicEntityGeometry.clear();
+        m_DynamicEntityCardSlots.clear();
+        m_FreeDynamicCardSlots.clear();
+        m_CacheFilePath.clear();
         m_Allocator = VK_NULL_HANDLE;
         m_Device = VK_NULL_HANDLE;
     }
@@ -872,6 +882,14 @@ namespace renderer {
         };
 
         for (uint32_t i = 0; i < static_cast<uint32_t>(m_Cards.size()); ++i) {
+            // Phase 0.3: a tombstoned (UnregisterEntity()'d) slot sitting in m_FreeDynamicCardSlots,
+            // awaiting reuse by a future RegisterEntity() call -- its m_Cards[i] entry may hold stale
+            // data from before eviction, so it must never be tested/allocated here. Every Init()-time
+            // real card and every currently-claimed dynamic slot has active == true (see
+            // CardRuntimeState's own comment) and falls through unaffected.
+            if (!m_CardStates[i].active) {
+                continue;
+            }
             const geometry::SurfaceCacheCardEntry& card = m_Cards[i];
             // Every card of one entity shares the entity's full AABB (see SurfaceCacheCardEntry's
             // own comment in ClusterFormat.h) -- testing it directly is exactly an entity-level
@@ -994,10 +1012,12 @@ namespace renderer {
 
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_Pipeline);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_PipelineLayout, 0, 1, &m_LightingDescriptorSet, 0, nullptr);
-        VkBuffer vertexBuffer = m_VertexBuffer.Handle();
-        VkDeviceSize vertexOffset0 = 0;
-        vkCmdBindVertexBuffers(cmd, 0, 1, &vertexBuffer, &vertexOffset0);
-        vkCmdBindIndexBuffer(cmd, m_IndexBuffer.Handle(), 0, VK_INDEX_TYPE_UINT32);
+        // Phase 0.3: the vertex/index buffer bind is now done PER CARD, right before its own draw
+        // (see below), instead of once here -- a dynamically-registered entity's geometry lives in
+        // its own dedicated buffer (EntityDrawRange::isDynamic), not the shared combined buffer this
+        // used to bind unconditionally. Each card capture is already its own disjoint begin/end
+        // rendering scope, so one extra pair of binds per card is immaterial next to the rest of
+        // its cost (a full viewport/scissor/push-constant/draw sequence).
 
         VkRenderingAttachmentInfo colorAttachments[6]{};
         colorAttachments[0].sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
@@ -1053,6 +1073,31 @@ namespace renderer {
             }
             const EntityDrawRange& range = rangeIt->second;
 
+            // Phase 0.3: pick this card's own entity's geometry buffer -- the shared Init()-time
+            // combined buffer normally, or this entity's own dedicated one if it was registered at
+            // runtime via RegisterEntity() (see EntityDrawRange::isDynamic's own comment).
+            VkBuffer cardVertexBuffer = m_VertexBuffer.Handle();
+            VkBuffer cardIndexBuffer = m_IndexBuffer.Handle();
+            if (range.isDynamic) {
+                auto dynIt = m_DynamicEntityGeometry.find(card.entityID);
+                if (dynIt == m_DynamicEntityGeometry.end()) {
+                    // Should not happen -- RegisterEntity() always sets m_EntityRanges and
+                    // m_DynamicEntityGeometry together, and UnregisterEntity() clears both together
+                    // (see those methods' own comments). Defensive skip rather than binding a null
+                    // buffer.
+                    LOG_WARNING(std::format(
+                        "[SurfaceCachePass] Card {} references dynamic entityID={} with no registered "
+                        "geometry buffer; skipping.", cardIndex, card.entityID));
+                    state.dirty = false;
+                    continue;
+                }
+                cardVertexBuffer = dynIt->second.vertexBuffer.Handle();
+                cardIndexBuffer = dynIt->second.indexBuffer.Handle();
+            }
+            VkDeviceSize cardVertexOffset0 = 0;
+            vkCmdBindVertexBuffers(cmd, 0, 1, &cardVertexBuffer, &cardVertexOffset0);
+            vkCmdBindIndexBuffer(cmd, cardIndexBuffer, 0, VK_INDEX_TYPE_UINT32);
+
             VkRect2D cardRect{};
             cardRect.offset = { static_cast<int32_t>(state.rect.x), static_cast<int32_t>(state.rect.y) };
             cardRect.extent = { card.atlasSize[0], card.atlasSize[1] };
@@ -1107,6 +1152,196 @@ namespace renderer {
         depInfo.memoryBarrierCount = 1;
         depInfo.pMemoryBarriers = &barrier;
         vkCmdPipelineBarrier2(cmd, &depInfo);
+    }
+
+    uint32_t SurfaceCachePass::GetActiveCardCount() const {
+        uint32_t count = 0;
+        for (const CardRuntimeState& state : m_CardStates) {
+            if (state.active) {
+                ++count;
+            }
+        }
+        return count;
+    }
+
+    bool SurfaceCachePass::RegisterEntity(uint32_t newEntityID, uint32_t sourceEntityID, VkCommandPool commandPool, VkQueue queue) {
+        // --- Reject a collision with an already-resident entity (Init-time OR a prior
+        // RegisterEntity() call) -- see this method's own header comment. ---
+        if (m_EntityRanges.contains(newEntityID)) {
+            LOG_WARNING(std::format(
+                "[SurfaceCachePass] RegisterEntity: entityID={} is already registered; ignoring.", newEntityID));
+            return false;
+        }
+        if (m_DynamicEntityGeometry.size() >= kMaxDynamicEntities) {
+            LOG_WARNING(std::format(
+                "[SurfaceCachePass] RegisterEntity: dynamic entity capacity ({}) exhausted, cannot register "
+                "newEntityID={} (sourceEntityID={}).", kMaxDynamicEntities, newEntityID, sourceEntityID));
+            return false;
+        }
+
+        // --- Re-read sourceEntityID's Fallback Mesh geometry + AABB from the cache file (mirrors
+        // Init()'s own STEP 1, for exactly one entity). ---
+        geometry::CacheFileManager cacheManager;
+        geometry::CacheFileHeader header{};
+        if (!cacheManager.ReadHeader(m_CacheFilePath, header)) {
+            LOG_ERROR(std::format("[SurfaceCachePass] RegisterEntity: failed to read cache header '{}'.", m_CacheFilePath.string()));
+            return false;
+        }
+        std::vector<geometry::FallbackMeshIndexEntry> fallbackTable;
+        if (!cacheManager.ReadFallbackMeshTable(m_CacheFilePath, header, fallbackTable)) {
+            LOG_ERROR("[SurfaceCachePass] RegisterEntity: failed to read the fallback-mesh table.");
+            return false;
+        }
+        auto entryIt = std::find_if(fallbackTable.begin(), fallbackTable.end(),
+            [sourceEntityID](const geometry::FallbackMeshIndexEntry& entry) { return entry.entityID == sourceEntityID; });
+        if (entryIt == fallbackTable.end()) {
+            LOG_WARNING(std::format(
+                "[SurfaceCachePass] RegisterEntity: sourceEntityID={} has no Fallback Mesh in '{}'; cannot register newEntityID={}.",
+                sourceEntityID, m_CacheFilePath.string(), newEntityID));
+            return false;
+        }
+
+        std::vector<geometry::FallbackVertex> vertices;
+        std::vector<uint32_t> indices;
+        if (!cacheManager.ReadFallbackMeshGeometry(m_CacheFilePath, *entryIt, vertices, indices)) {
+            LOG_ERROR(std::format(
+                "[SurfaceCachePass] RegisterEntity: failed to read Fallback Mesh geometry for sourceEntityID={}.", sourceEntityID));
+            return false;
+        }
+        if (vertices.empty() || indices.size() < 3) {
+            LOG_WARNING(std::format(
+                "[SurfaceCachePass] RegisterEntity: sourceEntityID={} has empty Fallback Mesh geometry; cannot register newEntityID={}.",
+                sourceEntityID, newEntityID));
+            return false;
+        }
+
+        const maths::vec3 boundsMin{ entryIt->boundsMin[0], entryIt->boundsMin[1], entryIt->boundsMin[2] };
+        const maths::vec3 boundsMax{ entryIt->boundsMax[0], entryIt->boundsMax[1], entryIt->boundsMax[2] };
+        std::vector<geometry::SurfaceCacheCardEntry> newCards = geometry::GenerateEntityCards(newEntityID, boundsMin, boundsMax);
+        if (newCards.empty()) {
+            LOG_WARNING(std::format(
+                "[SurfaceCachePass] RegisterEntity: GenerateEntityCards produced zero cards (fully degenerate "
+                "AABB) for sourceEntityID={}; cannot register newEntityID={}.", sourceEntityID, newEntityID));
+            return false;
+        }
+
+        // --- GPU resources: this entity's own dedicated vertex/index buffer (see the class
+        // comment's Phase 0.3 section for why this cannot reuse the shared combined buffer). ---
+        const VkDeviceSize vertexBytes = static_cast<VkDeviceSize>(vertices.size()) * sizeof(geometry::FallbackVertex);
+        const VkDeviceSize indexBytes = static_cast<VkDeviceSize>(indices.size()) * sizeof(uint32_t);
+
+        DynamicEntityGeometry dynGeo{};
+        dynGeo.vertexBuffer.Create(m_Allocator, vertexBytes,
+            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+            VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+            VMA_MEMORY_USAGE_GPU_ONLY);
+        dynGeo.indexBuffer.Create(m_Allocator, indexBytes,
+            VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+            VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+            VMA_MEMORY_USAGE_GPU_ONLY);
+
+        VkBuffer stagingBuffer = VK_NULL_HANDLE;
+        VmaAllocation stagingAllocation = VK_NULL_HANDLE;
+        VmaAllocationInfo stagingAllocResultInfo{};
+        VkBufferCreateInfo stagingInfo{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+        stagingInfo.size = vertexBytes + indexBytes;
+        stagingInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+        VmaAllocationCreateInfo stagingAllocInfo{};
+        stagingAllocInfo.usage = VMA_MEMORY_USAGE_CPU_ONLY;
+        stagingAllocInfo.flags = VMA_ALLOCATION_CREATE_MAPPED_BIT;
+        VK_CHECK(vmaCreateBuffer(m_Allocator, &stagingInfo, &stagingAllocInfo, &stagingBuffer, &stagingAllocation, &stagingAllocResultInfo));
+        std::memcpy(stagingAllocResultInfo.pMappedData, vertices.data(), static_cast<size_t>(vertexBytes));
+        std::memcpy(static_cast<char*>(stagingAllocResultInfo.pMappedData) + vertexBytes, indices.data(), static_cast<size_t>(indexBytes));
+
+        VulkanUtils::ExecuteOneShotCommands(m_Device, commandPool, queue, [&](VkCommandBuffer cmd) {
+            VkBufferCopy vertexCopy{ 0, 0, vertexBytes };
+            vkCmdCopyBuffer(cmd, stagingBuffer, dynGeo.vertexBuffer.Handle(), 1, &vertexCopy);
+            VkBufferCopy indexCopy{ vertexBytes, 0, indexBytes };
+            vkCmdCopyBuffer(cmd, stagingBuffer, dynGeo.indexBuffer.Handle(), 1, &indexCopy);
+
+            VkMemoryBarrier2 uploadBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+            uploadBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+            uploadBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+            uploadBarrier.dstStageMask = VK_PIPELINE_STAGE_2_VERTEX_INPUT_BIT;
+            uploadBarrier.dstAccessMask = VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_2_INDEX_READ_BIT;
+            VkDependencyInfo uploadDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+            uploadDep.memoryBarrierCount = 1;
+            uploadDep.pMemoryBarriers = &uploadBarrier;
+            vkCmdPipelineBarrier2(cmd, &uploadDep);
+            });
+        vmaDestroyBuffer(m_Allocator, stagingBuffer, stagingAllocation);
+
+        // --- Commit: claim a card slot per new card (reusing a tombstoned one from
+        // m_FreeDynamicCardSlots when available, else growing m_Cards/m_CardStates -- see those
+        // members' own comments), non-resident until the next UpdateVisibility() call naturally
+        // grants them an atlas page exactly like any other card. ---
+        std::vector<uint32_t> claimedSlots;
+        claimedSlots.reserve(newCards.size());
+        for (const geometry::SurfaceCacheCardEntry& card : newCards) {
+            uint32_t slot;
+            if (!m_FreeDynamicCardSlots.empty()) {
+                slot = m_FreeDynamicCardSlots.back();
+                m_FreeDynamicCardSlots.pop_back();
+                m_Cards[slot] = card;
+                m_CardStates[slot] = CardRuntimeState{}; // active=true, resident=false, dirty=false by default.
+            }
+            else {
+                slot = static_cast<uint32_t>(m_Cards.size());
+                m_Cards.push_back(card);
+                m_CardStates.push_back(CardRuntimeState{});
+            }
+            claimedSlots.push_back(slot);
+        }
+        m_DynamicEntityCardSlots[newEntityID] = std::move(claimedSlots);
+
+        EntityDrawRange range{};
+        range.vertexOffset = 0;
+        range.firstIndex = 0;
+        range.indexCount = static_cast<uint32_t>(indices.size());
+        range.isDynamic = true;
+        m_EntityRanges[newEntityID] = range;
+        m_DynamicEntityGeometry[newEntityID] = std::move(dynGeo);
+
+        LOG_INFO(std::format(
+            "[SurfaceCachePass] RegisterEntity: newEntityID={} (sourceEntityID={}, {} card(s), {} vertices, "
+            "{} indices) registered -- {} total card slot(s) ({} active), {}/{} dynamic-entity headroom used.",
+            newEntityID, sourceEntityID, m_DynamicEntityCardSlots[newEntityID].size(), vertices.size(), indices.size(),
+            m_Cards.size(), GetActiveCardCount(), m_DynamicEntityGeometry.size(), kMaxDynamicEntities));
+        return true;
+    }
+
+    void SurfaceCachePass::UnregisterEntity(uint32_t entityID) {
+        auto geomIt = m_DynamicEntityGeometry.find(entityID);
+        auto slotsIt = m_DynamicEntityCardSlots.find(entityID);
+        if (geomIt == m_DynamicEntityGeometry.end() || slotsIt == m_DynamicEntityCardSlots.end()) {
+            LOG_WARNING(std::format(
+                "[SurfaceCachePass] UnregisterEntity: entityID={} is not a dynamically-registered entity "
+                "(either unknown, or one of Init()'s fixed-roster entries -- never removable); ignoring.", entityID));
+            return;
+        }
+
+        for (uint32_t slot : slotsIt->second) {
+            CardRuntimeState& state = m_CardStates[slot];
+            if (state.resident) {
+                m_AtlasAllocator.Free(state.rect);
+            }
+            // Resets resident/dirty/active all to their "not in use" defaults in one assignment --
+            // any stale entry still sitting in m_DirtyCardQueue for this slot is gracefully skipped
+            // by RecordCapture's own existing `if (!state.resident || !state.dirty) continue;` check
+            // (the exact same race EvictAllUnwantedCards()/DefragmentAtlas() already document).
+            state = CardRuntimeState{};
+            state.active = false;
+            m_FreeDynamicCardSlots.push_back(slot);
+        }
+
+        m_EntityRanges.erase(entityID);
+        m_DynamicEntityCardSlots.erase(slotsIt);
+        m_DynamicEntityGeometry.erase(geomIt); // GpuBuffer members self-destroy via their own RAII dtor here.
+
+        LOG_INFO(std::format(
+            "[SurfaceCachePass] UnregisterEntity: entityID={} removed -- {} total card slot(s) ({} active), "
+            "{}/{} dynamic-entity headroom used.",
+            entityID, m_Cards.size(), GetActiveCardCount(), m_DynamicEntityGeometry.size(), kMaxDynamicEntities));
     }
 
 }
