@@ -3,6 +3,7 @@
 #include <cstring>
 #include <format>
 
+#include "core/EngineConfig.h"
 #include "core/Logger.h"
 #include "renderer/passes/ClusterResolvePass.h"
 #include "renderer/passes/SurfaceCacheRayTracingPass.h"
@@ -52,6 +53,20 @@ namespace renderer {
             std::memcpy(dst + kHeaderBytes, lightsData.lights.data(), kMaxMegaLights * sizeof(MegaLight));
         }
 
+        // Steps 2-4 below (raw radiance image + the owned ATrousDenoisePass instance + both compute
+        // pipelines) are this pass' expensive setup -- skipped entirely when the active quality tier
+        // disables MegaLights (config::lumen::_MEGALIGHTS_ENABLE; EngineConfig_Low/Medium/High.h all
+        // set MEGALIGHTS_ENABLE = false, only EngineConfig_Extrem.h leaves it true), mirroring
+        // RecordShade's own per-frame gating in renderer::ClusterRenderPipeline::RecordFrame ([12b3]).
+        // Step 1's light SSBO above stays unconditional regardless of this flag -- renderer::
+        // AtmosVolumetricFogPass::Init and renderer::TransparentForwardPass::Init both bind
+        // GetLightBufferHandle()/GetLightBufferSize() into their OWN descriptor sets at their own
+        // Init() time (see those call sites in ClusterRenderPipeline::Init), which requires a real,
+        // valid VkBuffer handle regardless of whether MegaLights itself will ever shade with it --
+        // unlike Steps 2-4 (a full-resolution rgba16f image, an entire second owned pass, and 2
+        // compute pipelines), Step 1 costs only ~8 KB (kHeaderBytes + kMaxMegaLights * sizeof(
+        // MegaLight), see above) and must never be skipped.
+        if (config::lumen::_MEGALIGHTS_ENABLE) {
         // =====================================================================================
         // STEP 2 -- Raw shade radiance image (rgba16f linear HDR -- see MegaLightsPass::
         // kRadianceFormat's own comment for why this format is forced) + the dedicated
@@ -225,6 +240,16 @@ namespace renderer {
 
         LOG_INFO(std::format("[MegaLightsPass] Initialized: {} lights, {} candidates/pixel, {} x {}.",
             m_LightCount, 16u, m_RenderExtent.width, m_RenderExtent.height));
+        } else {
+            // Tier disables MegaLights: m_ShadePipeline/m_CompositePipeline/m_Denoiser/
+            // m_RawRadianceImage/m_ViewParamsBuffer are all deliberately left at their default-
+            // constructed VK_NULL_HANDLE state -- RecordShade() early-outs on m_ShadePipeline ==
+            // VK_NULL_HANDLE (see that function's own comment) so this is safe even if the live
+            // Debug-only ImGui "Megalights Enable" checkbox (main.cpp, Lumen tab) flips
+            // config::lumen::_MEGALIGHTS_ENABLE mid-session without a matching re-Init.
+            LOG_INFO(std::format("[MegaLightsPass] Skipped (tier disables MegaLights): {} lights uploaded, shading resources not allocated ({} x {}).",
+                m_LightCount, m_RenderExtent.width, m_RenderExtent.height));
+        }
         return true;
     }
 
@@ -259,6 +284,17 @@ namespace renderer {
     }
 
     void MegaLightsPass::RecordShade(VkCommandBuffer cmd, const maths::mat4& viewProj, const maths::vec3& cameraPositionWorld, uint32_t frameIndex) {
+        // Belt-and-braces guard: Init() skips creating m_ShadePipeline (Steps 2-4, see that
+        // function's own comment) whenever config::lumen::_MEGALIGHTS_ENABLE was false at Init time.
+        // RecordShade's only caller (renderer::ClusterRenderPipeline::RecordFrame, [12b3]) already
+        // gates this call on that same flag, but the flag is ALSO a live Debug-only ImGui checkbox
+        // ("Megalights Enable", main.cpp Lumen tab) a developer can flip mid-session with no matching
+        // re-Init -- without this guard that would dispatch into null pipeline/descriptor-set handles
+        // the instant the checkbox flips true on a tier that skipped setup.
+        if (m_ShadePipeline == VK_NULL_HANDLE) {
+            return;
+        }
+
         MegaLightsViewParamsUBO ubo{};
         ubo.invViewProj = viewProj.Inverse();
         ubo.viewportWidth = static_cast<float>(m_RenderExtent.width);
