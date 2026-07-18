@@ -1787,6 +1787,18 @@ int main(int argc, char** argv) {
         VkCommandBufferBeginInfo cmdEarlyBeginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
         vkBeginCommandBuffer(cmdEarly, &cmdEarlyBeginInfo);
 
+        // Applies every m_EntityBuffer patch queued by this frame's streaming tick above
+        // (SetStreamingUnitState() calls -- no command buffer existed yet at that point in the loop,
+        // see that function's own comment) via vkCmdUpdateBuffer, right at the start of cmdEarly --
+        // this frame's first GPU submission (see this block's own comment just above: "nothing before
+        // this point in the frame touches the swapchain, the transfer queue's uploads, or the
+        // async-compute queue"), so the patch + its trailing barrier are visible to every later pass
+        // this frame that reads m_EntityBuffer (RecordFrameEarly below, cmdMid's culling/LOD compute
+        // via same-queue submission order, and asyncComputeCmd via its own semaphore wait on this very
+        // submission) with no separate wait of any kind. See VulkanContext::
+        // FlushPendingEntityDataPatches()'s own comment for the full rationale.
+        vkContext.FlushPendingEntityDataPatches(cmdEarly);
+
         // Phase 5 (Streaming & Monde roadmap, Part 1): pass the REBASED camera position (both to
         // `cameraPositionWorld` and CameraFrameInfo::position), never the raw absolute one --
         // renderer::ClusterRenderPipeline::m_FrameScratch caches whatever is passed here exactly
