@@ -229,7 +229,18 @@ namespace renderer {
         // this image directly via vkCmdBlitImage (see that class's own comment), which requires
         // the source image to carry this usage flag -- matching renderer::ClusterResolvePass's
         // own output image, the blit's normal (non-debug) source.
-        outputImageInfo.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        // COLOR_ATTACHMENT_BIT: renderer::debug::DebugTextOverlay::RecordDraw draws the stat HUD
+        // directly onto whatever image ClusterRenderPipeline's [13b] overlay-target selection
+        // picked for the current debug view (see that call site's own comment) via
+        // vkCmdBeginRendering, which requires the target image to carry this usage flag regardless
+        // of the image also being a STORAGE image written by imageStore -- matching
+        // renderer::PostProcessPass's own imageInfo.usage comment (its own output image gained this
+        // exact flag for the identical reason) and renderer::GICompositePass's own unconditional
+        // one. This pass's whole .cpp is already Debug-only (see the file's own #ifndef NDEBUG
+        // guard), so unlike PostProcessPass (compiled in both configs) this flag does not need its
+        // own separate #ifndef NDEBUG -- it would never reach a Release build regardless.
+        outputImageInfo.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT
+            | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
         outputImageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
         outputImageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         VK_CHECK(vmaCreateImage(allocator, &outputImageInfo, &gpuOnlyAlloc, &m_OutputImage, &m_OutputAllocation, nullptr));

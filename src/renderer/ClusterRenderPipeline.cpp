@@ -735,6 +735,23 @@ bool ClusterRenderPipeline::Init(
     }
   }
 
+  // GPU particle system (particle_system_integration_plan.md): buffer/descriptor-set skeleton
+  // (Subtask 1) + simulation (Subtask 2) + sort (Subtask 3) + billboard render (Subtask 4) pipelines
+  // -- see renderer::ParticleSystemPass's own class comment. Depends on m_AtmosClimate (wind) and
+  // m_GlobalSDF (collision clipmaps, both Init'd above at STEP 7) and m_Resolve (GBuffer depth copy
+  // for soft particles, Init'd far earlier at STEP 6) -- all three already ready by this point.
+  // colorFormat/depthFormat match TransparentForwardPass::Init's own call site immediately below:
+  // this pass draws onto the SAME m_GIComposite output image and real depth-stencil buffer every
+  // other forward pass targets. RecordSimulate/RecordSort/RecordDraw are all implemented but NOT yet
+  // called from RecordFrame (Subtask 6 wires that up), so this Init() has no RecordFrame ordering
+  // consequence yet.
+  if (!m_ParticleSystem.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
+                             m_AtmosClimate, m_GlobalSDF, m_Resolve,
+                             GICompositePass::kOutputFormat, createInfo.depthFormat)) {
+    LOG_ERROR("[ClusterRenderPipeline] Failed to initialize ParticleSystemPass.");
+    return false;
+  }
+
   // Screen Trace GI -- linear screen-space depth raymarching falling back to the World Probe grid.
   m_ScreenTrace.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
                      createInfo.renderExtent, m_Resolve.GetOutputDepthView(), m_Resolve.GetOutputNormalView(),
@@ -1033,6 +1050,7 @@ void ClusterRenderPipeline::Shutdown() {
 
   m_HeroTessellation.Shutdown();
   m_WaterForward.Shutdown();
+  m_ParticleSystem.Shutdown();
   m_TransparentForward.Shutdown();
   m_ShadingBin.Shutdown();
   m_Resolve.Shutdown();
@@ -2144,6 +2162,14 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
   // `megaLightsEnabled` (debug-only toggle, main.cpp's 'X' key) gates the call entirely, same
   // Release-always-on convention as `reflectionsEnabled` above (a real live consumer from frame
   // one).
+  //
+  // Phase 4 of the "Nanite advanced" roadmap (light BVH for RIS spatial bias, temporal ReSTIR with
+  // per-frame revalidated visibility): RecordShade now also takes `prevViewProjForMegaLights` --
+  // its own reservoir reprojection needs the previous frame's combined view-projection matrix, same
+  // `m_HasPrevViewProj` frame-0-safety ternary already used for [12b2]'s own
+  // prevViewProjForReflection above (identity matrix on the very first frame ever recorded; see
+  // MegaLightsPass::RecordShade's own header comment for why an identity matrix is always safe here
+  // even then, thanks to the reservoir's own sentinel-fill invalid-history guard).
   // =========================================================================================
   {
 #ifndef NDEBUG
@@ -2152,7 +2178,8 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
     bool megaLightsEnabled = true;
 #endif
     if (megaLightsEnabled) {
-      m_MegaLights.RecordShade(cmdLate, viewProj, cameraPositionWorld, m_FrameIndex);
+      maths::mat4 prevViewProjForMegaLights = m_HasPrevViewProj ? m_PrevViewProj : maths::mat4{};
+      m_MegaLights.RecordShade(cmdLate, viewProj, prevViewProjForMegaLights, cameraPositionWorld, m_FrameIndex);
     }
   }
 

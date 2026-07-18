@@ -829,6 +829,17 @@ void VulkanContext::CreateLogicalDevice() {
   // ray tracing / Int64 image atomics requirements already supports it), so enabled
   // unconditionally here, matching geometryShader's own enablement rigor above.
   deviceFeatures2.features.fragmentStoresAndAtomics = VK_TRUE;
+  // vertexPipelineStoresAndAtomics (particle system Subtask 4): ParticleRender.vert -- a vertex
+  // shader -- includes ParticleCommon.glsl and reads (never writes) its writable
+  // VK_DESCRIPTOR_TYPE_STORAGE_BUFFER `ParticleBuffer`/`SortedPairsBuffer` blocks; the SPIR-V still
+  // declares them writable (the shared include has no readonly variant, since
+  // ParticleSimulation.comp genuinely writes the same block). Per the Vulkan spec, ANY writable
+  // storage buffer/image/texel-buffer variable in the vertex/tessellation/geometry stages requires
+  // this feature enabled, or vkCreateGraphicsPipelines fails validation
+  // (VUID-RuntimeSpirv-NonWritable-06341) -- the vertex-stage sibling of fragmentStoresAndAtomics
+  // immediately above, same near-universal desktop-GPU support, enabled unconditionally here for
+  // the same reason.
+  deviceFeatures2.features.vertexPipelineStoresAndAtomics = VK_TRUE;
   // multiDrawIndirect: renderer::TransparentForwardPass::RecordDraw() issues ONE
   // vkCmdDrawIndexedIndirect covering every static transparent leaf cluster in a single call
   // (drawCount = cluster count, e.g. 712 in this demo's scene -- see that class' own class

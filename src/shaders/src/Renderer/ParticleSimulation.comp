@@ -1,0 +1,227 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+
+// Particle system Subtask 2 (particle_system_integration_plan.md, project root): the GPU-driven
+// spawn + physics-update kernel every RecordSimulate() call dispatches twice (see
+// renderer::ParticleSystemPass::RecordSimulate's own comment for the exact two-dispatch contract) --
+// which half runs is selected by pc.mode, this codebase's established "one shader, multiple modes
+// via a push-constant int + branch in main()" convention (see e.g. GlobalSDFComposite.comp).
+//
+// --- mode == 1: Spawn ---
+// One thread per REQUESTED new particle (dispatched over ceil(spawnCount / 64) workgroups, NOT over
+// kMaxParticles -- gl_GlobalInvocationID.x >= pc.spawnCount threads exit immediately). Each valid
+// thread atomically pops exactly one index off the tail of the dead-list (ParticleCommon.glsl's
+// DeadListBuffer, mirroring renderer::ParticleSystemPass::RecordSimulate's own "pop from the tail"
+// comment) and fully (re)initializes that particle slot: position/velocity jittered around the
+// caller-supplied emitter position, life = maxLife, a freshly re-seeded PRNG state. Deliberately does
+// NOT touch AliveListBuffer/CounterBuffer.aliveCount -- see mode == 0 below for why that would
+// double-count.
+//
+// --- mode == 0: Update ---
+// One thread per PARTICLE SLOT (dispatched over ceil(kMaxParticles / 64) workgroups) -- covers every
+// pre-existing alive particle AND every particle mode == 1 just spawned this same RecordSimulate()
+// call, uniformly, since both look identical here (a slot with life > 0). A dead slot (life <= 0)
+// costs one branch and returns. A live slot integrates gravity + wind (AtmosNoiseCommon.glsl's
+// SampleWindVelocity, fed by AtmosGlobalsUBO -- Atmos weather system Subtask 1) + a simple drag term
+// that relaxes velocity toward the local wind vector, resolves Global SDF collisions (mirrors
+// SDFRayMarch.comp's own SelectLevel/SampleClipmap toroidal-addressing convention exactly -- see that
+// shader's own "Toroidal clipmap addressing" header comment), then either returns its index to the
+// dead-list (life just expired) or appends it to AliveListBuffer (still alive). This is the ONLY
+// place either list is written from an existing particle, which is exactly why
+// renderer::ParticleSystemPass::RecordSimulate resets aliveCount to 0 immediately before mode == 1's
+// dispatch: this mode == 0 pass rebuilds the alive-list from scratch every call, so a particle spawned
+// this frame is counted exactly once (here), not twice (once by mode == 1, once by mode == 0).
+
+#include "include/ParticleCommon.glsl"
+#include "include/AtmosNoiseCommon.glsl"
+
+layout(local_size_x = 64) in;
+
+// std140 mirror of AtmosClimatePass.cpp's AtmosGlobalsUBO -- see AtmosNoiseCommon.glsl's own header
+// comment for the authoritative field-by-field layout this must match.
+layout(std140, set = 1, binding = 0) uniform AtmosGlobalsUBO {
+    vec3 windDirection; float windSpeed;
+    float temperature, humidity, dewPoint, condensationLCL;
+    float cloudDensityTarget, fogDensityTarget, rainStrength, time;
+    vec4 windTurbulenceParams;
+} g_AtmosGlobals;
+
+// Must match renderer::GlobalSDFPass::kLevelCount exactly -- same toroidal clipmap array
+// SDFRayMarch.comp's own uGlobalClipmaps binds, sampled with the same NEAREST filter for the same
+// reason (linear filtering would blend across the wrap seam).
+layout(set = 1, binding = 1) uniform sampler3D uGlobalClipmaps[4];
+
+layout(push_constant) uniform ParticleSimulationPC {
+    float dt;
+    float time;
+    float emitterPosition[3];
+    float bounceElasticity;   // [0,1]: fraction of the pre-collision normal-relative speed kept after a bounce.
+    float friction;           // [0,1]: fraction of the pre-collision tangential-relative speed kept after a bounce.
+    float dragCoefficient;    // [0,1] per second-ish: how strongly velocity relaxes toward the local wind vector.
+    float gravityY;           // World-space gravitational acceleration (negative = downward), m/s^2.
+    float levelVoxelSize[4];
+    int levelCenterVoxel[12]; // 4 levels * (x,y,z), flattened -- mirrors SDFRayMarchPC's own layout.
+    int clipmapResolution;
+    uint spawnCount;
+    uint randomSeedBase;      // Per-call PRNG salt (e.g. frame index) so repeated spawns don't reuse the same jitter sequence.
+    int mode;                 // 0 = update existing particles, 1 = spawn new particles.
+} pc;
+
+vec3 GetEmitterPosition() { return vec3(pc.emitterPosition[0], pc.emitterPosition[1], pc.emitterPosition[2]); }
+vec3 GetLevelCenterVoxel(int level) {
+    return vec3(pc.levelCenterVoxel[level * 3 + 0], pc.levelCenterVoxel[level * 3 + 1], pc.levelCenterVoxel[level * 3 + 2]);
+}
+
+// Which (if any) clipmap level currently covers world position `p` -- mirrors SDFRayMarch.comp's own
+// SelectLevel exactly (see that shader's header comment for the fixed-lattice rationale).
+int SelectGlobalSDFLevel(vec3 p) {
+    for (int level = 0; level < 4; ++level) {
+        float halfExtent = float(pc.clipmapResolution) * 0.5 * pc.levelVoxelSize[level];
+        vec3 center = GetLevelCenterVoxel(level) * pc.levelVoxelSize[level];
+        vec3 d = abs(p - center);
+        if (d.x < halfExtent && d.y < halfExtent && d.z < halfExtent) {
+            return level;
+        }
+    }
+    return -1;
+}
+
+// World-unit signed distance at `p` from `level`'s clipmap -- mirrors SDFRayMarch.comp's own
+// SampleClipmap exactly.
+float SampleClipmapLevel(int level, vec3 p) {
+    float voxelSize = pc.levelVoxelSize[level];
+    ivec3 worldVoxel = ivec3(floor(p / voxelSize));
+    int res = pc.clipmapResolution;
+    ivec3 wrapped = ((worldVoxel % res) + res) % res;
+    vec3 uvw = (vec3(wrapped) + 0.5) / float(res);
+    return texture(uGlobalClipmaps[level], uvw).r;
+}
+
+// Global SDF signed distance at world position `p`, or a large positive "no data" sentinel if `p`
+// falls outside every clipmap level's currently-streamed window -- treated by the collision step
+// below as "definitely not colliding," matching renderer::GlobalSDFPass::kFarValue's own "far"
+// convention for an as-yet-uncomposited texel.
+float SampleGlobalSDF(vec3 p) {
+    int level = SelectGlobalSDFLevel(p);
+    if (level < 0) {
+        return 1.0e4;
+    }
+    return SampleClipmapLevel(level, p);
+}
+
+// Cheap integer hash (Wang-style, same "no texture lookups" procedural-noise discipline as
+// AtmosNoiseCommon.glsl's own AtmosHash33) -- decorrelates one uint seed into another.
+uint HashUint(uint x) {
+    x ^= x >> 16u; x *= 0x7feb352du;
+    x ^= x >> 15u; x *= 0x846ca68bu;
+    x ^= x >> 16u;
+    return x;
+}
+
+// Advances `seed` in place and returns a uniform float in [0, 1) -- the standard "seed doubles as
+// PRNG state" idiom, matching this file's own per-particle randomSeed field's purpose.
+float NextRandomFloat(inout uint seed) {
+    seed = HashUint(seed);
+    return float(seed) / 4294967296.0;
+}
+
+void SpawnParticle(uint slotIndex, uint spawnRequestIndex) {
+    uint seed = HashUint(pc.randomSeedBase ^ (slotIndex * 2654435761u) ^ (spawnRequestIndex * 40503u));
+
+    // Small conical launch jitter around a mostly-upward initial velocity -- a generic "embers/
+    // sparks" default; Subtask 6's ImGui emitter panel is where this becomes user-tunable.
+    vec3 jitterDir = normalize(vec3(
+        NextRandomFloat(seed) * 2.0 - 1.0,
+        NextRandomFloat(seed) * 0.5 + 0.5,
+        NextRandomFloat(seed) * 2.0 - 1.0));
+    float speed = 1.0 + NextRandomFloat(seed) * 2.0;
+    float life = 2.0 + NextRandomFloat(seed) * 2.0;
+
+    Particle p;
+    p.position = GetEmitterPosition() + (vec3(NextRandomFloat(seed), NextRandomFloat(seed), NextRandomFloat(seed)) - 0.5) * 0.1;
+    p.life = life;
+    p.velocity = jitterDir * speed;
+    p.maxLife = life;
+    p.color = vec4(1.0, 0.7, 0.3, 1.0);
+    p.size = vec2(0.1, 0.1);
+    p.rotation = NextRandomFloat(seed) * 6.28318530718;
+    p.randomSeed = seed;
+    particles[slotIndex] = p;
+}
+
+void UpdateParticle(uint slotIndex) {
+    Particle p = particles[slotIndex];
+    if (p.life <= 0.0) {
+        return; // Already dead (and already resting in the dead-list from a previous frame, or never spawned) -- nothing to do.
+    }
+
+    // --- Gravity + wind + drag ---
+    vec3 wind = SampleWindVelocity(p.position, pc.time, g_AtmosGlobals.windDirection, g_AtmosGlobals.windSpeed, g_AtmosGlobals.windTurbulenceParams);
+    p.velocity.y += pc.gravityY * pc.dt;
+    p.velocity += (wind - p.velocity) * clamp(pc.dragCoefficient * pc.dt, 0.0, 1.0);
+    vec3 newPosition = p.position + p.velocity * pc.dt;
+
+    // --- Global SDF collision (central-difference normal, reflect() split into elastic-normal /
+    // frictional-tangential components -- see this file's own header comment) ---
+    float dist = SampleGlobalSDF(newPosition);
+    if (dist < 0.0) {
+        const float kNormalEpsilon = 0.05; // World units -- small relative to a typical clipmap voxel (kBaseVoxelSize = 0.5).
+        vec3 n = vec3(
+            SampleGlobalSDF(newPosition + vec3(kNormalEpsilon, 0.0, 0.0)) - SampleGlobalSDF(newPosition - vec3(kNormalEpsilon, 0.0, 0.0)),
+            SampleGlobalSDF(newPosition + vec3(0.0, kNormalEpsilon, 0.0)) - SampleGlobalSDF(newPosition - vec3(0.0, kNormalEpsilon, 0.0)),
+            SampleGlobalSDF(newPosition + vec3(0.0, 0.0, kNormalEpsilon)) - SampleGlobalSDF(newPosition - vec3(0.0, 0.0, kNormalEpsilon)));
+        float nLen = length(n);
+        n = nLen > 1.0e-8 ? n / nLen : vec3(0.0, 1.0, 0.0);
+
+        // Push the particle back out to the surface (dist is negative -- the penetration depth --
+        // so subtracting n * dist moves it along +n by exactly that depth).
+        newPosition -= n * dist;
+
+        vec3 reflected = reflect(p.velocity, n);
+        float normalSpeed = dot(reflected, n);
+        vec3 tangentVelocity = reflected - n * normalSpeed;
+        p.velocity = n * normalSpeed * pc.bounceElasticity + tangentVelocity * pc.friction;
+    }
+    p.position = newPosition;
+
+    p.life -= pc.dt;
+    particles[slotIndex] = p;
+
+    if (p.life <= 0.0) {
+        uint deadSlot = atomicAdd(deadCount, 1u);
+        deadIndices[deadSlot] = slotIndex;
+    } else {
+        uint aliveSlot = atomicAdd(aliveCount, 1u);
+        aliveIndices[aliveSlot] = slotIndex;
+    }
+}
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+
+    if (pc.mode == 1) {
+        if (index >= pc.spawnCount) {
+            return;
+        }
+        // Pop one index off the tail of the dead-list -- atomicAdd(deadCount, -1) returns the
+        // PRE-decrement value, so the slot this thread claims is at deadIndices[oldValue - 1].
+        // uint wraps on underflow, so oldValue == 0 (nothing left to pop) is diagnosed as
+        // oldValue > deadIndices.length() would be if this ran, hence the explicit guard below
+        // instead of trusting an unsigned-wraparound comparison.
+        uint oldDeadCount = atomicAdd(deadCount, -1u);
+        if (oldDeadCount == 0u) {
+            // No dead slots left to spawn into -- undo the decrement (it wrapped to UINT_MAX) and
+            // give up on this spawn request; the caller's spawnQueue was simply optimistic this
+            // frame (kMaxParticles is already fully alive).
+            atomicAdd(deadCount, 1u);
+            return;
+        }
+        uint slotIndex = deadIndices[oldDeadCount - 1u];
+        SpawnParticle(slotIndex, index);
+    } else {
+        if (index >= particles.length()) {
+            return;
+        }
+        UpdateParticle(index);
+    }
+}

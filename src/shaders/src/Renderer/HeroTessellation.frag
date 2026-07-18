@@ -174,7 +174,12 @@ void main() {
     uint pixelSeed = uint(gl_FragCoord.y) * 65536u + uint(gl_FragCoord.x);
     uint selectedIndex;
     float invPdf;
-    if (SelectLightRIS(inWorldPos, n, pixelSeed, pc.frameIndex, selectedIndex, invPdf)) {
+    // Phase 4, Feature 1 (light BVH for RIS spatial bias): no geometry::LightBVH bound in this
+    // pass either (see TransparentForward.frag's own identical comment on its own call site) --
+    // an empty pool (poolCount = 0) makes SelectLightRIS fall back to its original full-population
+    // draw unchanged.
+    uint noSpatialPool[kMegaLightsSpatialPoolCapacity];
+    if (SelectLightRIS(inWorldPos, n, pixelSeed, pc.frameIndex, noSpatialPool, 0u, selectedIndex, invPdf)) {
         MegaLight light = g_Lights.lights[selectedIndex];
         vec3 toLight = light.position - inWorldPos;
         float dist = length(toLight);

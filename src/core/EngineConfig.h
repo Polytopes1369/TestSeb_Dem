@@ -132,6 +132,21 @@ inline bool _HARDWARE_RAYTRACING_NANITE_MODE = true;
 inline bool _MEGALIGHTS_ENABLE = true;
 } // namespace lumen
 
+// Phase 4 of the "Nanite advanced" roadmap (light BVH for RIS spatial bias, temporal ReSTIR with
+// per-frame revalidated visibility -- see the approved plan) -- live simulation/tuning knobs, same
+// convention as atmos:: above: not a hardware-quality tier, so NOT mirrored into
+// EngineConfig_{Low,Medium,High,Extrem}.h / ApplyProfile()'s per-tier overrides.
+namespace megalights {
+// World-unit radius of the query box renderer::MegaLightsPass's geometry::LightBVH is traversed
+// against (megalights_bvh.glsl's GatherSpatialLightCandidates) to bias SelectLightRIS's candidate
+// draw toward lights near the current shading point -- see that function's own header comment for
+// why this is a BIAS, not an O(N)-avoidance optimization. Tuned to cover one hero-zone light
+// cluster (renderer::GenerateProceduralLights' own ~1.2-unit jittered-disk placement radius around
+// the MegaLights showcase zone) while excluding neighboring zones, which sit >= kZonePitch (4.0
+// units, MegaLightsTypes.cpp) away.
+inline float SPATIAL_BIAS_RADIUS = 3.25f;
+} // namespace megalights
+
 namespace reflections {
 inline uint32_t _QUALITY = 4;
 inline uint32_t _METHOD = 2;
