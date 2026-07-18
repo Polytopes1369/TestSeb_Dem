@@ -31,9 +31,6 @@ inline float FLOOR_VERTEX_SPACING = 1.0f;
 // Temporary kill-switch
 inline bool ENTITY_SELF_ROTATION_ENABLED = false;
 
-// --- VIEW DISTANCE ---
-inline uint32_t _VIEW_DISTANCE_QUALITY = 4;
-
 namespace nanite {
 // Lower threshold shifts more tiny triangles to the software rasterizer.
 inline float SOFTWARE_RASTER_THRESHOLD_PIXELS = 8.0f;
@@ -49,13 +46,7 @@ constexpr uint32_t PAGE_SIZE_BYTES = 4096u;
 // Allocated buffer sizes
 inline uint64_t VERTEX_BUFFER_BYTES = 1024 * 1024 * 1024;
 inline uint64_t INDEX_BUFFER_BYTES = 512 * 1024 * 1024;
-
-inline float _MAX_PIXELS_PER_EDGE = 1.0f;
 } // namespace nanite
-
-namespace streaming {
-inline uint32_t _POOL_SIZE_MB = 8000;
-} // namespace streaming
 
 namespace temporal {
 inline float RENDER_SCALE = 1.000f;
@@ -65,8 +56,6 @@ inline float VARIANCE_CLAMP_FACTOR = 1.5f;
 inline uint32_t JITTER_FRAME_COUNT = 16u;
 inline bool ENABLED_BY_DEFAULT = true;
 
-inline uint32_t _ANTI_ALIASING_QUALITY = 4;
-inline uint32_t _ANTI_ALIASING_METHOD = 4;
 inline float _SCREEN_PERCENTAGE = 100.0f;
 inline uint32_t _TEMPORAL_AA_UPSCALER = 1;
 inline float _TSR_HISTORY_SCREEN_PERCENTAGE = 100.0f;
@@ -122,13 +111,11 @@ inline uint32_t VSM_MAX_PAGES_RENDERED_PER_FRAME = 512u;
 // resident page count is small enough that a single generous default covers every profile.
 inline uint32_t VSM_MAX_DYNAMIC_PAGES_RENDERED_PER_FRAME = 512u;
 
-inline uint32_t _GI_QUALITY = 4;
 inline bool _HARDWARE_RAYTRACING = true;
 inline bool _TRACE_MESH_SDF = true;
 inline bool _SCREEN_SPACE_PROBE_OCCLUSION = true;
 inline bool _REFLECTIONS_ALLOW = true;
 inline uint32_t _REFLECTIONS_DOWNSAMPLE_FACTOR = 1;
-inline bool _HARDWARE_RAYTRACING_NANITE_MODE = true;
 inline bool _MEGALIGHTS_ENABLE = true;
 } // namespace lumen
 
@@ -157,16 +144,12 @@ inline float SPATIAL_REUSE_RADIUS_PIXELS = 24.0f;
 } // namespace megalights
 
 namespace reflections {
-inline uint32_t _QUALITY = 4;
-inline uint32_t _METHOD = 2;
 inline bool _SCREEN_SPACE_REFLECTIONS = true;
 } // namespace reflections
 
 namespace postprocess {
-inline uint32_t _QUALITY = 4;
 inline uint32_t _EFFECTS_QUALITY = 4;
 inline uint32_t _TRANSLUCENCY_LIGHTING_VOLUME_DIM = 64;
-inline uint32_t _REFRACTION_QUALITY = 3;
 
 // --- Phase PP1 (post-process stack roadmap): Physical Camera / Auto Exposure / White Balance /
 // Color Correction / Tone Mapping / Gamma Correction -- renderer::PostProcessPass's own tunable
@@ -388,7 +371,6 @@ inline bool PCG_POINT_CLOUD_VIZ = false;
 } // namespace debugview
 
 namespace volumetrics {
-inline uint32_t _TEXTURE_QUALITY = 4;
 inline uint32_t _SKY_ATMOSPHERE_QUALITY = 3;
 inline bool _VOLUMETRIC_FOG_ENABLE = true;
 inline uint32_t _VOLUMETRIC_FOG_GRID_PIXEL_SIZE = 4;
@@ -753,15 +735,12 @@ inline void ApplyProfile(std::string_view profileName) {
     WINDOW_HEIGHT = config_extrem::WINDOW_HEIGHT;
     TARGET_FPS = config_extrem::TARGET_FPS;
     VERTEX_SPACING = config_extrem::VERTEX_SPACING;
-    _VIEW_DISTANCE_QUALITY = config_extrem::VIEW_DISTANCE_QUALITY;
     nanite::SOFTWARE_RASTER_THRESHOLD_PIXELS =
         config_extrem::nanite::SOFTWARE_RASTER_THRESHOLD_PIXELS;
     nanite::LOD_PIXEL_ERROR_THRESHOLD =
         config_extrem::nanite::LOD_PIXEL_ERROR_THRESHOLD;
     nanite::VERTEX_BUFFER_BYTES = config_extrem::nanite::VERTEX_BUFFER_BYTES;
     nanite::INDEX_BUFFER_BYTES = config_extrem::nanite::INDEX_BUFFER_BYTES;
-    nanite::_MAX_PIXELS_PER_EDGE = config_extrem::nanite::MAX_PIXELS_PER_EDGE;
-    streaming::_POOL_SIZE_MB = config_extrem::streaming::POOL_SIZE_MB;
     temporal::RENDER_SCALE = config_extrem::temporal::RENDER_SCALE;
     temporal::BLEND_ALPHA = config_extrem::temporal::BLEND_ALPHA;
     temporal::BLEND_ALPHA_STATIC = config_extrem::temporal::BLEND_ALPHA_STATIC;
@@ -769,10 +748,6 @@ inline void ApplyProfile(std::string_view profileName) {
         config_extrem::temporal::VARIANCE_CLAMP_FACTOR;
     temporal::JITTER_FRAME_COUNT = config_extrem::temporal::JITTER_FRAME_COUNT;
     temporal::ENABLED_BY_DEFAULT = config_extrem::temporal::ENABLED_BY_DEFAULT;
-    temporal::_ANTI_ALIASING_QUALITY =
-        config_extrem::temporal::ANTI_ALIASING_QUALITY;
-    temporal::_ANTI_ALIASING_METHOD =
-        config_extrem::temporal::ANTI_ALIASING_METHOD;
     temporal::_SCREEN_PERCENTAGE = config_extrem::temporal::SCREEN_PERCENTAGE;
     temporal::_TEMPORAL_AA_UPSCALER =
         config_extrem::temporal::TEMPORAL_AA_UPSCALER;
@@ -809,7 +784,6 @@ inline void ApplyProfile(std::string_view profileName) {
         config_extrem::lumen::VSM_PHYSICAL_PAGE_CAPACITY;
     lumen::VSM_MAX_PAGES_RENDERED_PER_FRAME =
         config_extrem::lumen::VSM_MAX_PAGES_RENDERED_PER_FRAME;
-    lumen::_GI_QUALITY = config_extrem::lumen::GI_QUALITY;
     lumen::_HARDWARE_RAYTRACING = config_extrem::lumen::HARDWARE_RAYTRACING;
     lumen::_TRACE_MESH_SDF = config_extrem::lumen::TRACE_MESH_SDF;
     lumen::_SCREEN_SPACE_PROBE_OCCLUSION =
@@ -817,20 +791,12 @@ inline void ApplyProfile(std::string_view profileName) {
     lumen::_REFLECTIONS_ALLOW = config_extrem::lumen::REFLECTIONS_ALLOW;
     lumen::_REFLECTIONS_DOWNSAMPLE_FACTOR =
         config_extrem::lumen::REFLECTIONS_DOWNSAMPLE_FACTOR;
-    lumen::_HARDWARE_RAYTRACING_NANITE_MODE =
-        config_extrem::lumen::HARDWARE_RAYTRACING_NANITE_MODE;
     lumen::_MEGALIGHTS_ENABLE = config_extrem::lumen::MEGALIGHTS_ENABLE;
-    reflections::_QUALITY = config_extrem::reflections::QUALITY;
-    reflections::_METHOD = config_extrem::reflections::METHOD;
     reflections::_SCREEN_SPACE_REFLECTIONS =
         config_extrem::reflections::SCREEN_SPACE_REFLECTIONS;
-    postprocess::_QUALITY = config_extrem::postprocess::QUALITY;
     postprocess::_EFFECTS_QUALITY = config_extrem::postprocess::EFFECTS_QUALITY;
     postprocess::_TRANSLUCENCY_LIGHTING_VOLUME_DIM =
         config_extrem::postprocess::TRANSLUCENCY_LIGHTING_VOLUME_DIM;
-    postprocess::_REFRACTION_QUALITY =
-        config_extrem::postprocess::REFRACTION_QUALITY;
-    volumetrics::_TEXTURE_QUALITY = config_extrem::volumetrics::TEXTURE_QUALITY;
     volumetrics::_SKY_ATMOSPHERE_QUALITY =
         config_extrem::volumetrics::SKY_ATMOSPHERE_QUALITY;
     volumetrics::_VOLUMETRIC_FOG_ENABLE =
@@ -844,15 +810,12 @@ inline void ApplyProfile(std::string_view profileName) {
     WINDOW_HEIGHT = config_high::WINDOW_HEIGHT;
     TARGET_FPS = config_high::TARGET_FPS;
     VERTEX_SPACING = config_high::VERTEX_SPACING;
-    _VIEW_DISTANCE_QUALITY = config_high::VIEW_DISTANCE_QUALITY;
     nanite::SOFTWARE_RASTER_THRESHOLD_PIXELS =
         config_high::nanite::SOFTWARE_RASTER_THRESHOLD_PIXELS;
     nanite::LOD_PIXEL_ERROR_THRESHOLD =
         config_high::nanite::LOD_PIXEL_ERROR_THRESHOLD;
     nanite::VERTEX_BUFFER_BYTES = config_high::nanite::VERTEX_BUFFER_BYTES;
     nanite::INDEX_BUFFER_BYTES = config_high::nanite::INDEX_BUFFER_BYTES;
-    nanite::_MAX_PIXELS_PER_EDGE = config_high::nanite::MAX_PIXELS_PER_EDGE;
-    streaming::_POOL_SIZE_MB = config_high::streaming::POOL_SIZE_MB;
     temporal::RENDER_SCALE = config_high::temporal::RENDER_SCALE;
     temporal::BLEND_ALPHA = config_high::temporal::BLEND_ALPHA;
     temporal::BLEND_ALPHA_STATIC = config_high::temporal::BLEND_ALPHA_STATIC;
@@ -860,10 +823,6 @@ inline void ApplyProfile(std::string_view profileName) {
         config_high::temporal::VARIANCE_CLAMP_FACTOR;
     temporal::JITTER_FRAME_COUNT = config_high::temporal::JITTER_FRAME_COUNT;
     temporal::ENABLED_BY_DEFAULT = config_high::temporal::ENABLED_BY_DEFAULT;
-    temporal::_ANTI_ALIASING_QUALITY =
-        config_high::temporal::ANTI_ALIASING_QUALITY;
-    temporal::_ANTI_ALIASING_METHOD =
-        config_high::temporal::ANTI_ALIASING_METHOD;
     temporal::_SCREEN_PERCENTAGE = config_high::temporal::SCREEN_PERCENTAGE;
     temporal::_TEMPORAL_AA_UPSCALER =
         config_high::temporal::TEMPORAL_AA_UPSCALER;
@@ -896,7 +855,6 @@ inline void ApplyProfile(std::string_view profileName) {
         config_high::lumen::VSM_PHYSICAL_PAGE_CAPACITY;
     lumen::VSM_MAX_PAGES_RENDERED_PER_FRAME =
         config_high::lumen::VSM_MAX_PAGES_RENDERED_PER_FRAME;
-    lumen::_GI_QUALITY = config_high::lumen::GI_QUALITY;
     lumen::_HARDWARE_RAYTRACING = config_high::lumen::HARDWARE_RAYTRACING;
     lumen::_TRACE_MESH_SDF = config_high::lumen::TRACE_MESH_SDF;
     lumen::_SCREEN_SPACE_PROBE_OCCLUSION =
@@ -904,20 +862,12 @@ inline void ApplyProfile(std::string_view profileName) {
     lumen::_REFLECTIONS_ALLOW = config_high::lumen::REFLECTIONS_ALLOW;
     lumen::_REFLECTIONS_DOWNSAMPLE_FACTOR =
         config_high::lumen::REFLECTIONS_DOWNSAMPLE_FACTOR;
-    lumen::_HARDWARE_RAYTRACING_NANITE_MODE =
-        config_high::lumen::HARDWARE_RAYTRACING_NANITE_MODE;
     lumen::_MEGALIGHTS_ENABLE = config_high::lumen::MEGALIGHTS_ENABLE;
-    reflections::_QUALITY = config_high::reflections::QUALITY;
-    reflections::_METHOD = config_high::reflections::METHOD;
     reflections::_SCREEN_SPACE_REFLECTIONS =
         config_high::reflections::SCREEN_SPACE_REFLECTIONS;
-    postprocess::_QUALITY = config_high::postprocess::QUALITY;
     postprocess::_EFFECTS_QUALITY = config_high::postprocess::EFFECTS_QUALITY;
     postprocess::_TRANSLUCENCY_LIGHTING_VOLUME_DIM =
         config_high::postprocess::TRANSLUCENCY_LIGHTING_VOLUME_DIM;
-    postprocess::_REFRACTION_QUALITY =
-        config_high::postprocess::REFRACTION_QUALITY;
-    volumetrics::_TEXTURE_QUALITY = config_high::volumetrics::TEXTURE_QUALITY;
     volumetrics::_SKY_ATMOSPHERE_QUALITY =
         config_high::volumetrics::SKY_ATMOSPHERE_QUALITY;
     volumetrics::_VOLUMETRIC_FOG_ENABLE =
@@ -931,15 +881,12 @@ inline void ApplyProfile(std::string_view profileName) {
     WINDOW_HEIGHT = config_medium::WINDOW_HEIGHT;
     TARGET_FPS = config_medium::TARGET_FPS;
     VERTEX_SPACING = config_medium::VERTEX_SPACING;
-    _VIEW_DISTANCE_QUALITY = config_medium::VIEW_DISTANCE_QUALITY;
     nanite::SOFTWARE_RASTER_THRESHOLD_PIXELS =
         config_medium::nanite::SOFTWARE_RASTER_THRESHOLD_PIXELS;
     nanite::LOD_PIXEL_ERROR_THRESHOLD =
         config_medium::nanite::LOD_PIXEL_ERROR_THRESHOLD;
     nanite::VERTEX_BUFFER_BYTES = config_medium::nanite::VERTEX_BUFFER_BYTES;
     nanite::INDEX_BUFFER_BYTES = config_medium::nanite::INDEX_BUFFER_BYTES;
-    nanite::_MAX_PIXELS_PER_EDGE = config_medium::nanite::MAX_PIXELS_PER_EDGE;
-    streaming::_POOL_SIZE_MB = config_medium::streaming::POOL_SIZE_MB;
     temporal::RENDER_SCALE = config_medium::temporal::RENDER_SCALE;
     temporal::BLEND_ALPHA = config_medium::temporal::BLEND_ALPHA;
     temporal::BLEND_ALPHA_STATIC = config_medium::temporal::BLEND_ALPHA_STATIC;
@@ -947,10 +894,6 @@ inline void ApplyProfile(std::string_view profileName) {
         config_medium::temporal::VARIANCE_CLAMP_FACTOR;
     temporal::JITTER_FRAME_COUNT = config_medium::temporal::JITTER_FRAME_COUNT;
     temporal::ENABLED_BY_DEFAULT = config_medium::temporal::ENABLED_BY_DEFAULT;
-    temporal::_ANTI_ALIASING_QUALITY =
-        config_medium::temporal::ANTI_ALIASING_QUALITY;
-    temporal::_ANTI_ALIASING_METHOD =
-        config_medium::temporal::ANTI_ALIASING_METHOD;
     temporal::_SCREEN_PERCENTAGE = config_medium::temporal::SCREEN_PERCENTAGE;
     temporal::_TEMPORAL_AA_UPSCALER =
         config_medium::temporal::TEMPORAL_AA_UPSCALER;
@@ -987,7 +930,6 @@ inline void ApplyProfile(std::string_view profileName) {
         config_medium::lumen::VSM_PHYSICAL_PAGE_CAPACITY;
     lumen::VSM_MAX_PAGES_RENDERED_PER_FRAME =
         config_medium::lumen::VSM_MAX_PAGES_RENDERED_PER_FRAME;
-    lumen::_GI_QUALITY = config_medium::lumen::GI_QUALITY;
     lumen::_HARDWARE_RAYTRACING = config_medium::lumen::HARDWARE_RAYTRACING;
     lumen::_TRACE_MESH_SDF = config_medium::lumen::TRACE_MESH_SDF;
     lumen::_SCREEN_SPACE_PROBE_OCCLUSION =
@@ -995,20 +937,12 @@ inline void ApplyProfile(std::string_view profileName) {
     lumen::_REFLECTIONS_ALLOW = config_medium::lumen::REFLECTIONS_ALLOW;
     lumen::_REFLECTIONS_DOWNSAMPLE_FACTOR =
         config_medium::lumen::REFLECTIONS_DOWNSAMPLE_FACTOR;
-    lumen::_HARDWARE_RAYTRACING_NANITE_MODE =
-        config_medium::lumen::HARDWARE_RAYTRACING_NANITE_MODE;
     lumen::_MEGALIGHTS_ENABLE = config_medium::lumen::MEGALIGHTS_ENABLE;
-    reflections::_QUALITY = config_medium::reflections::QUALITY;
-    reflections::_METHOD = config_medium::reflections::METHOD;
     reflections::_SCREEN_SPACE_REFLECTIONS =
         config_medium::reflections::SCREEN_SPACE_REFLECTIONS;
-    postprocess::_QUALITY = config_medium::postprocess::QUALITY;
     postprocess::_EFFECTS_QUALITY = config_medium::postprocess::EFFECTS_QUALITY;
     postprocess::_TRANSLUCENCY_LIGHTING_VOLUME_DIM =
         config_medium::postprocess::TRANSLUCENCY_LIGHTING_VOLUME_DIM;
-    postprocess::_REFRACTION_QUALITY =
-        config_medium::postprocess::REFRACTION_QUALITY;
-    volumetrics::_TEXTURE_QUALITY = config_medium::volumetrics::TEXTURE_QUALITY;
     volumetrics::_SKY_ATMOSPHERE_QUALITY =
         config_medium::volumetrics::SKY_ATMOSPHERE_QUALITY;
     volumetrics::_VOLUMETRIC_FOG_ENABLE =
@@ -1022,15 +956,12 @@ inline void ApplyProfile(std::string_view profileName) {
     WINDOW_HEIGHT = config_low::WINDOW_HEIGHT;
     TARGET_FPS = config_low::TARGET_FPS;
     VERTEX_SPACING = config_low::VERTEX_SPACING;
-    _VIEW_DISTANCE_QUALITY = config_low::VIEW_DISTANCE_QUALITY;
     nanite::SOFTWARE_RASTER_THRESHOLD_PIXELS =
         config_low::nanite::SOFTWARE_RASTER_THRESHOLD_PIXELS;
     nanite::LOD_PIXEL_ERROR_THRESHOLD =
         config_low::nanite::LOD_PIXEL_ERROR_THRESHOLD;
     nanite::VERTEX_BUFFER_BYTES = config_low::nanite::VERTEX_BUFFER_BYTES;
     nanite::INDEX_BUFFER_BYTES = config_low::nanite::INDEX_BUFFER_BYTES;
-    nanite::_MAX_PIXELS_PER_EDGE = config_low::nanite::MAX_PIXELS_PER_EDGE;
-    streaming::_POOL_SIZE_MB = config_low::streaming::POOL_SIZE_MB;
     temporal::RENDER_SCALE = config_low::temporal::RENDER_SCALE;
     temporal::BLEND_ALPHA = config_low::temporal::BLEND_ALPHA;
     temporal::BLEND_ALPHA_STATIC = config_low::temporal::BLEND_ALPHA_STATIC;
@@ -1038,10 +969,6 @@ inline void ApplyProfile(std::string_view profileName) {
         config_low::temporal::VARIANCE_CLAMP_FACTOR;
     temporal::JITTER_FRAME_COUNT = config_low::temporal::JITTER_FRAME_COUNT;
     temporal::ENABLED_BY_DEFAULT = config_low::temporal::ENABLED_BY_DEFAULT;
-    temporal::_ANTI_ALIASING_QUALITY =
-        config_low::temporal::ANTI_ALIASING_QUALITY;
-    temporal::_ANTI_ALIASING_METHOD =
-        config_low::temporal::ANTI_ALIASING_METHOD;
     temporal::_SCREEN_PERCENTAGE = config_low::temporal::SCREEN_PERCENTAGE;
     temporal::_TEMPORAL_AA_UPSCALER =
         config_low::temporal::TEMPORAL_AA_UPSCALER;
@@ -1073,7 +1000,6 @@ inline void ApplyProfile(std::string_view profileName) {
         config_low::lumen::VSM_PHYSICAL_PAGE_CAPACITY;
     lumen::VSM_MAX_PAGES_RENDERED_PER_FRAME =
         config_low::lumen::VSM_MAX_PAGES_RENDERED_PER_FRAME;
-    lumen::_GI_QUALITY = config_low::lumen::GI_QUALITY;
     lumen::_HARDWARE_RAYTRACING = config_low::lumen::HARDWARE_RAYTRACING;
     lumen::_TRACE_MESH_SDF = config_low::lumen::TRACE_MESH_SDF;
     lumen::_SCREEN_SPACE_PROBE_OCCLUSION =
@@ -1081,20 +1007,12 @@ inline void ApplyProfile(std::string_view profileName) {
     lumen::_REFLECTIONS_ALLOW = config_low::lumen::REFLECTIONS_ALLOW;
     lumen::_REFLECTIONS_DOWNSAMPLE_FACTOR =
         config_low::lumen::REFLECTIONS_DOWNSAMPLE_FACTOR;
-    lumen::_HARDWARE_RAYTRACING_NANITE_MODE =
-        config_low::lumen::HARDWARE_RAYTRACING_NANITE_MODE;
     lumen::_MEGALIGHTS_ENABLE = config_low::lumen::MEGALIGHTS_ENABLE;
-    reflections::_QUALITY = config_low::reflections::QUALITY;
-    reflections::_METHOD = config_low::reflections::METHOD;
     reflections::_SCREEN_SPACE_REFLECTIONS =
         config_low::reflections::SCREEN_SPACE_REFLECTIONS;
-    postprocess::_QUALITY = config_low::postprocess::QUALITY;
     postprocess::_EFFECTS_QUALITY = config_low::postprocess::EFFECTS_QUALITY;
     postprocess::_TRANSLUCENCY_LIGHTING_VOLUME_DIM =
         config_low::postprocess::TRANSLUCENCY_LIGHTING_VOLUME_DIM;
-    postprocess::_REFRACTION_QUALITY =
-        config_low::postprocess::REFRACTION_QUALITY;
-    volumetrics::_TEXTURE_QUALITY = config_low::volumetrics::TEXTURE_QUALITY;
     volumetrics::_SKY_ATMOSPHERE_QUALITY =
         config_low::volumetrics::SKY_ATMOSPHERE_QUALITY;
     volumetrics::_VOLUMETRIC_FOG_ENABLE =
