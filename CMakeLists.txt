@@ -452,6 +452,14 @@ add_executable(AsyncDecompressingLoaderTests
 target_include_directories(AsyncDecompressingLoaderTests PRIVATE src ${Vulkan_INCLUDE_DIRS})
 add_test(NAME AsyncDecompressingLoaderTests COMMAND AsyncDecompressingLoaderTests)
 
+add_executable(AsyncFileStreamerBenchmark
+    src/io/AsyncFileStreamer.cpp
+    src/core/Logger.cpp
+    tests/AsyncFileStreamerBenchmark.cpp
+)
+target_include_directories(AsyncFileStreamerBenchmark PRIVATE src ${Vulkan_INCLUDE_DIRS})
+add_test(NAME AsyncFileStreamerBenchmark COMMAND AsyncFileStreamerBenchmark)
+
 add_executable(VirtualTextureTests
     src/renderer/streaming/VirtualTextureManager.cpp
     src/renderer/vulkan/GpuBuffer.cpp
