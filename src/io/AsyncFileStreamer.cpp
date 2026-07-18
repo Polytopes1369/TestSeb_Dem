@@ -86,8 +86,38 @@ namespace geometry {
 
     void AsyncFileStreamer::Close() {
         if (m_CompletionPort != nullptr) {
+            // Drain every request submitted before this call BEFORE waking any worker thread to
+            // exit -- this is what actually delivers the class's documented contract (see
+            // AsyncFileStreamer.h's own Close() comment: "Any request submitted before this call
+            // but not yet completed will still have its callback invoked... before the threads
+            // are joined"). WaitForAllPending() blocks this thread until m_PendingRequests
+            // reaches zero, which only happens once every in-flight request's callback has
+            // already run (see OnRequestFinished()). Calling it here, before any shutdown packet
+            // exists in the port's queue, is what makes it deadlock-free: the worker threads are
+            // still alive and still blocked in GetQueuedCompletionStatus, so every genuine
+            // completion the OS is still working on is guaranteed to eventually be dequeued by
+            // one of them, its callback invoked, and the counter decremented -- there is nothing
+            // yet in the queue that could cause a worker to exit early.
+            //
+            // Posting the shutdown packets FIRST (the previous implementation) was the bug: a
+            // shutdown packet requires no real I/O to complete, so a worker could dequeue it and
+            // break out of its loop while an earlier real ReadFile for this same file was still
+            // in flight on the device. With N worker threads all racing GetQueuedCompletionStatus
+            // against the same port, this could let every worker exit before that read's
+            // completion packet ever got serviced, leaking its heap-allocated StreamingRequest
+            // (see SubmitRead) and silently dropping its callback -- and, worse, letting a caller
+            // that (correctly, per the documented contract) assumed Close() drained everything
+            // proceed to free buffers or destroy `this` out from under a callback that hadn't run
+            // yet (see AsyncDecompressingLoader.cpp, GeometryStreamingCoordinator::Shutdown(), and
+            // VirtualTextureStreamingCoordinator::Shutdown(), all three of which capture raw `this`
+            // or raw buffer pointers into the completion callback and rely on exactly this
+            // ordering for their own pointer-lifetime safety).
+            WaitForAllPending();
+
             // Wake every worker thread exactly once each: GetQueuedCompletionStatus dequeues one
             // packet per call, so N threads need N shutdown packets to all observe one and exit.
+            // Safe to do only now: every real completion has already been drained above, so these
+            // are the only packets left in the port's queue for any worker to observe next.
             for (size_t i = 0; i < m_WorkerThreads.size(); ++i) {
                 PostQueuedCompletionStatus(m_CompletionPort, 0, kShutdownCompletionKey, nullptr);
             }
