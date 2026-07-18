@@ -71,6 +71,7 @@
 
 #include "core/maths/Maths.h"
 #include "renderer/vulkan/GpuBuffer.h"
+#include "renderer/vulkan/RenderPass.h"
 
 namespace renderer {
 
@@ -79,7 +80,15 @@ namespace renderer {
     class SurfaceCacheRayTracingPass;
     class ClusterResolvePass;
 
-    class ScreenProbeGIPass {
+    // Migrated to RenderPass<Derived> (see renderer/vulkan/RenderPass.h): Init()/Shutdown() are
+    // inherited. Note InitImpl() still calls the inherited Shutdown() as its own first statement
+    // (self-reinit, same pattern/reason as ShadowMapPass's own migration comment). 5 separate
+    // descriptor pools (Trace/Temporal maxSets=4 each fine+coarse ping-pong; Gather maxSets=2;
+    // BuildArgs maxSets=2; Classify maxSets=1) -- only Classify fits the single-set helper, the
+    // other 4 stay raw Vulkan + RegisterResource(), same reasoning as ReflectionPass.
+    class ScreenProbeGIPass : public RenderPass<ScreenProbeGIPass> {
+        friend class RenderPass<ScreenProbeGIPass>; // Lets Init() call our private InitImpl().
+
     public:
         ScreenProbeGIPass() = default;
 
@@ -103,12 +112,10 @@ namespace renderer {
         // `traceContext`/`surfaceCache`/`rtPass`/`resolvePass` must all already be Init'd and must
         // outlive this pass -- their resources are bound into this pass' own descriptor sets
         // unmodified (mirrors renderer::SurfaceCacheGIInjectPass's own borrowing convention).
-        bool Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
-            VkExtent2D renderExtent, const SurfaceCacheTraceContext& traceContext,
-            const SurfaceCachePass& surfaceCache, const SurfaceCacheRayTracingPass& rtPass,
-            const ClusterResolvePass& resolvePass);
-
-        void Shutdown();
+        // Init(VkDevice, VmaAllocator, VkCommandPool, VkQueue, VkExtent2D,
+        // const SurfaceCacheTraceContext&, const SurfaceCachePass&, const SurfaceCacheRayTracingPass&,
+        // const ClusterResolvePass&) -> bool and Shutdown() are inherited from
+        // RenderPass<ScreenProbeGIPass>; see InitImpl() below.
 
         // Uploads this frame's ScreenProbeViewParamsUBO (invViewProj, prevViewProj, viewport/probe
         // grid sizes) -- `viewProj` is this frame's combined matrix (its inverse is computed here,
@@ -158,8 +165,12 @@ namespace renderer {
             VkImage normalImage = VK_NULL_HANDLE; VmaAllocation normalAllocation = VK_NULL_HANDLE; VkImageView normalView = VK_NULL_HANDLE;
         };
 
-        VkDevice m_Device = VK_NULL_HANDLE;
-        VmaAllocator m_Allocator = VK_NULL_HANDLE;
+        bool InitImpl(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
+            VkExtent2D renderExtent, const SurfaceCacheTraceContext& traceContext,
+            const SurfaceCachePass& surfaceCache, const SurfaceCacheRayTracingPass& rtPass,
+            const ClusterResolvePass& resolvePass);
+
+        // m_Device / m_Allocator are inherited (protected) from RenderPass<ScreenProbeGIPass>.
 
         uint32_t m_ProbeCountX = 0;
         uint32_t m_ProbeCountY = 0;

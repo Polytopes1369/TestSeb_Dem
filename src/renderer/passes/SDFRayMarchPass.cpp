@@ -65,14 +65,17 @@ namespace renderer {
 
     } // namespace
 
-    bool SDFRayMarchPass::Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
+    bool SDFRayMarchPass::InitImpl(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
         const std::filesystem::path& cacheFilePath, uint32_t outputWidth, uint32_t outputHeight) {
+        // Self-reinit (see ShadowMapPass's own migration comment for the identical pattern):
+        // Shutdown() clears m_Device/m_Allocator, which RenderPass<SDFRayMarchPass>::Init() already
+        // set to this call's values just before invoking this function -- restore them.
         Shutdown();
-
         m_Device = device;
         m_Allocator = allocator;
         m_OutputWidth = outputWidth;
         m_OutputHeight = outputHeight;
+        RegisterResource([this] { m_OutputWidth = 0; m_OutputHeight = 0; });
 
         // =====================================================================================
         // STEP 1 -- Read every fallback mesh's geometry and build one CPU-side Mesh SDF per
@@ -206,6 +209,13 @@ namespace renderer {
             viewInfo.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
             VK_CHECK(vkCreateImageView(m_Device, &viewInfo, nullptr, &entitySdf.view));
         }
+        RegisterResource([this] {
+            for (EntitySDF& entitySdf : m_Entities) {
+                vkDestroyImageView(m_Device, entitySdf.view, nullptr);
+                vmaDestroyImage(m_Allocator, entitySdf.image, entitySdf.allocation);
+            }
+            m_Entities.clear();
+        });
 
         VkImageCreateInfo placeholderImageInfo = entityImageInfo;
         placeholderImageInfo.extent = { 1, 1, 1 };
@@ -216,6 +226,11 @@ namespace renderer {
         placeholderViewInfo.format = GlobalSDFPass::kClipmapFormat;
         placeholderViewInfo.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
         VK_CHECK(vkCreateImageView(m_Device, &placeholderViewInfo, nullptr, &m_PlaceholderView));
+        RegisterResource([this] {
+            vkDestroyImageView(m_Device, m_PlaceholderView, nullptr);
+            vmaDestroyImage(m_Allocator, m_PlaceholderImage, m_PlaceholderAllocation);
+            m_PlaceholderImage = VK_NULL_HANDLE; m_PlaceholderAllocation = VK_NULL_HANDLE; m_PlaceholderView = VK_NULL_HANDLE;
+        });
 
         VkImageCreateInfo outputImageInfo{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
         outputImageInfo.imageType = VK_IMAGE_TYPE_2D;
@@ -251,6 +266,11 @@ namespace renderer {
         outputViewInfo.format = kOutputFormat;
         outputViewInfo.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
         VK_CHECK(vkCreateImageView(m_Device, &outputViewInfo, nullptr, &m_OutputView));
+        RegisterResource([this] {
+            vkDestroyImageView(m_Device, m_OutputView, nullptr);
+            vmaDestroyImage(m_Allocator, m_OutputImage, m_OutputAllocation);
+            m_OutputImage = VK_NULL_HANDLE; m_OutputAllocation = VK_NULL_HANDLE; m_OutputView = VK_NULL_HANDLE;
+        });
 
         VkSamplerCreateInfo entitySamplerInfo{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
         entitySamplerInfo.magFilter = VK_FILTER_LINEAR;
@@ -263,6 +283,7 @@ namespace renderer {
         entitySamplerInfo.maxLod = 0.0f;
         entitySamplerInfo.unnormalizedCoordinates = VK_FALSE;
         VK_CHECK(vkCreateSampler(m_Device, &entitySamplerInfo, nullptr, &m_EntitySampler));
+        RegisterResource([this] { vkDestroySampler(m_Device, m_EntitySampler, nullptr); m_EntitySampler = VK_NULL_HANDLE; });
 
         VkSamplerCreateInfo clipmapSamplerInfo = entitySamplerInfo;
         // Nearest -- see SetGlobalSDFViews()'s own comment on why a toroidally-wrapped clipmap must
@@ -270,6 +291,7 @@ namespace renderer {
         clipmapSamplerInfo.magFilter = VK_FILTER_NEAREST;
         clipmapSamplerInfo.minFilter = VK_FILTER_NEAREST;
         VK_CHECK(vkCreateSampler(m_Device, &clipmapSamplerInfo, nullptr, &m_ClipmapSampler));
+        RegisterResource([this] { vkDestroySampler(m_Device, m_ClipmapSampler, nullptr); m_ClipmapSampler = VK_NULL_HANDLE; });
 
         // --- Storage buffers: BVH nodes, leaf entity indices, entity params -- each at least 1
         // element even for an empty scene, so the descriptor set always has a valid buffer bound
@@ -284,6 +306,11 @@ namespace renderer {
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
         m_EntityParamsBuffer.Create(allocator, entityParamCount * sizeof(EntitySDFParamsGPU),
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
+        RegisterResource([this] {
+            m_BVHNodeBuffer.Destroy();
+            m_LeafEntityIndexBuffer.Destroy();
+            m_EntityParamsBuffer.Destroy();
+        });
 
         std::vector<EntitySDFParamsGPU> entityParams(entityParamCount);
         for (size_t i = 0; i < uploads.size(); ++i) {
@@ -306,6 +333,7 @@ namespace renderer {
         entitySetLayoutInfo.bindingCount = 4;
         entitySetLayoutInfo.pBindings = entityBindings;
         VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &entitySetLayoutInfo, nullptr, &m_EntitySetLayout));
+        RegisterResource([this] { vkDestroyDescriptorSetLayout(m_Device, m_EntitySetLayout, nullptr); m_EntitySetLayout = VK_NULL_HANDLE; });
 
         VkDescriptorSetLayoutBinding clipmapBindings[3]{};
         clipmapBindings[0] = { 0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, GlobalSDFPass::kLevelCount, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
@@ -317,6 +345,7 @@ namespace renderer {
         clipmapSetLayoutInfo.bindingCount = 3;
         clipmapSetLayoutInfo.pBindings = clipmapBindings;
         VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &clipmapSetLayoutInfo, nullptr, &m_ClipmapSetLayout));
+        RegisterResource([this] { vkDestroyDescriptorSetLayout(m_Device, m_ClipmapSetLayout, nullptr); m_ClipmapSetLayout = VK_NULL_HANDLE; });
 
         VkDescriptorPoolSize poolSizes[3]{};
         poolSizes[0] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3 };
@@ -327,6 +356,13 @@ namespace renderer {
         poolInfo.poolSizeCount = 3;
         poolInfo.pPoolSizes = poolSizes;
         VK_CHECK(vkCreateDescriptorPool(m_Device, &poolInfo, nullptr, &m_DescriptorPool));
+        RegisterResource([this] {
+            // Destroying the pool implicitly frees both sets allocated from it.
+            vkDestroyDescriptorPool(m_Device, m_DescriptorPool, nullptr);
+            m_DescriptorPool = VK_NULL_HANDLE;
+            m_EntitySet = VK_NULL_HANDLE;
+            m_ClipmapSet = VK_NULL_HANDLE;
+        });
 
         VkDescriptorSetAllocateInfo entitySetAllocInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
         entitySetAllocInfo.descriptorPool = m_DescriptorPool;
@@ -489,6 +525,7 @@ namespace renderer {
         layoutInfo.pushConstantRangeCount = 1;
         layoutInfo.pPushConstantRanges = &pushConstantRange;
         VK_CHECK(vkCreatePipelineLayout(m_Device, &layoutInfo, nullptr, &m_PipelineLayout));
+        RegisterResource([this] { vkDestroyPipelineLayout(m_Device, m_PipelineLayout, nullptr); m_PipelineLayout = VK_NULL_HANDLE; });
 
         VkShaderModule compModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/SDFRayMarch.comp.spv");
 
@@ -501,56 +538,24 @@ namespace renderer {
         pipelineInfo.stage = stage;
         pipelineInfo.layout = m_PipelineLayout;
         VK_CHECK(vkCreateComputePipelines(m_Device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_Pipeline));
+        RegisterResource([this] { vkDestroyPipeline(m_Device, m_Pipeline, nullptr); m_Pipeline = VK_NULL_HANDLE; });
 
         vkDestroyShaderModule(m_Device, compModule, nullptr);
+
+        // Not a Vulkan handle, private, no getter -- always unconditionally re-set at the top of
+        // InitImpl(), so it does not strictly need this cleanup for correctness. Registered anyway
+        // (cheap) since this pass's complexity makes an extra defensive reset worth the one line.
+        RegisterResource([this] { m_RootNodeIndex = -1; });
 
         return true;
     }
 
-    void SDFRayMarchPass::Shutdown() {
-        if (m_Device != VK_NULL_HANDLE) {
-            if (m_Pipeline != VK_NULL_HANDLE) vkDestroyPipeline(m_Device, m_Pipeline, nullptr);
-            if (m_PipelineLayout != VK_NULL_HANDLE) vkDestroyPipelineLayout(m_Device, m_PipelineLayout, nullptr);
-            if (m_DescriptorPool != VK_NULL_HANDLE) vkDestroyDescriptorPool(m_Device, m_DescriptorPool, nullptr);
-            if (m_EntitySetLayout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(m_Device, m_EntitySetLayout, nullptr);
-            if (m_ClipmapSetLayout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(m_Device, m_ClipmapSetLayout, nullptr);
-            if (m_EntitySampler != VK_NULL_HANDLE) vkDestroySampler(m_Device, m_EntitySampler, nullptr);
-            if (m_ClipmapSampler != VK_NULL_HANDLE) vkDestroySampler(m_Device, m_ClipmapSampler, nullptr);
-            if (m_OutputView != VK_NULL_HANDLE) vkDestroyImageView(m_Device, m_OutputView, nullptr);
-            if (m_PlaceholderView != VK_NULL_HANDLE) vkDestroyImageView(m_Device, m_PlaceholderView, nullptr);
-            for (EntitySDF& entitySdf : m_Entities) {
-                if (entitySdf.view != VK_NULL_HANDLE) vkDestroyImageView(m_Device, entitySdf.view, nullptr);
-            }
-        }
-        if (m_Allocator != VK_NULL_HANDLE) {
-            if (m_OutputImage != VK_NULL_HANDLE) vmaDestroyImage(m_Allocator, m_OutputImage, m_OutputAllocation);
-            if (m_PlaceholderImage != VK_NULL_HANDLE) vmaDestroyImage(m_Allocator, m_PlaceholderImage, m_PlaceholderAllocation);
-            for (EntitySDF& entitySdf : m_Entities) {
-                if (entitySdf.image != VK_NULL_HANDLE) vmaDestroyImage(m_Allocator, entitySdf.image, entitySdf.allocation);
-            }
-        }
-        m_BVHNodeBuffer.Destroy();
-        m_LeafEntityIndexBuffer.Destroy();
-        m_EntityParamsBuffer.Destroy();
-        m_Entities.clear();
-
-        m_Pipeline = VK_NULL_HANDLE;
-        m_PipelineLayout = VK_NULL_HANDLE;
-        m_DescriptorPool = VK_NULL_HANDLE;
-        m_EntitySetLayout = VK_NULL_HANDLE;
-        m_ClipmapSetLayout = VK_NULL_HANDLE;
-        m_EntitySet = VK_NULL_HANDLE;
-        m_ClipmapSet = VK_NULL_HANDLE;
-        m_EntitySampler = VK_NULL_HANDLE;
-        m_ClipmapSampler = VK_NULL_HANDLE;
-        m_OutputImage = VK_NULL_HANDLE; m_OutputAllocation = VK_NULL_HANDLE; m_OutputView = VK_NULL_HANDLE;
-        m_PlaceholderImage = VK_NULL_HANDLE; m_PlaceholderAllocation = VK_NULL_HANDLE; m_PlaceholderView = VK_NULL_HANDLE;
-        m_RootNodeIndex = -1;
-        m_OutputWidth = 0;
-        m_OutputHeight = 0;
-        m_Allocator = VK_NULL_HANDLE;
-        m_Device = VK_NULL_HANDLE;
-    }
+    // Shutdown() is inherited from RenderPass<SDFRayMarchPass>: runs the RegisterResource()
+    // cleanups above in reverse (root-node-index reset -> pipeline -> pipeline layout ->
+    // descriptor pool [also nulls m_EntitySet/m_ClipmapSet, implicitly freed with the pool] ->
+    // clipmap set layout -> entity set layout -> 3 BVH/leaf/entity-param SSBOs -> clipmap sampler
+    // -> entity sampler -> output image+view -> placeholder image+view -> entity SDF images+views
+    // -> output extent reset), the same dependency-safe order the hand-written Shutdown() used.
 
     void SDFRayMarchPass::SetGlobalSDFViews(const GlobalSDFPass& globalSDF) {
         VkDescriptorImageInfo clipmapImageInfos[GlobalSDFPass::kLevelCount]{};

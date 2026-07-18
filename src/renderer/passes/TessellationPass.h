@@ -80,6 +80,7 @@
 
 #include "core/maths/Maths.h"
 #include "renderer/vulkan/GpuBuffer.h"
+#include "renderer/vulkan/RenderPass.h"
 #include "renderer/LightingTypes.h"
 #include "renderer/MaterialParameterTable.h" // MaterialParameters, kMaxMaterials
 #include "renderer/passes/SurfaceCachePass.h" // EntityDrawRange
@@ -103,7 +104,15 @@ namespace renderer {
         uint32_t materialID = 0;
     };
 
-    class TessellationPass {
+    // Migrated to RenderPass<Derived> (see renderer/vulkan/RenderPass.h): Init()/Shutdown() are
+    // inherited. Note InitImpl() still calls the inherited Shutdown() as its own first statement
+    // (self-reinit, same pattern/reason as ShadowMapPass's own migration comment) -- but this class
+    // only ever tracked m_Device (never its own m_Allocator; every VMA allocation goes through a
+    // GpuBuffer, which captures the allocator itself), so only m_Device needs restoring after that
+    // call, not m_Allocator.
+    class TessellationPass : public RenderPass<TessellationPass> {
+        friend class RenderPass<TessellationPass>; // Lets Init() call our private InitImpl().
+
     public:
         TessellationPass() = default;
 
@@ -127,18 +136,12 @@ namespace renderer {
         // TraceShadowRay and this pass' own optional reflection trace's TraceHWRT, same
         // one-TLAS-two-consumers convention TransparentForwardPass already established.
         // `vsm`/`worldProbes`/`traceContext` must all already be Init'd and must outlive this pass.
-        bool Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
-            VkFormat colorFormat, VkFormat depthFormat,
-            VkBuffer entityTransformBuffer,
-            const std::array<MaterialParameters, kMaxMaterials>& materialTable,
-            VkBuffer fallbackVertexBuffer, VkBuffer fallbackIndexBuffer,
-            const std::vector<TessellatedEntityDrawInfo>& entities,
-            VkAccelerationStructureKHR tlasHandle, VkBuffer drawRangeBuffer,
-            VkBuffer lightBuffer, VkDeviceSize lightBufferSize,
-            const VirtualShadowMapPass& vsm, const WorldProbeGridPass& worldProbes,
-            const SurfaceCacheTraceContext& traceContext);
-
-        void Shutdown();
+        // Init(VkDevice, VmaAllocator, VkCommandPool, VkQueue, VkFormat, VkFormat, VkBuffer,
+        // const std::array<MaterialParameters, kMaxMaterials>&, VkBuffer, VkBuffer,
+        // const std::vector<TessellatedEntityDrawInfo>&, VkAccelerationStructureKHR, VkBuffer,
+        // VkBuffer, VkDeviceSize, const VirtualShadowMapPass&, const WorldProbeGridPass&,
+        // const SurfaceCacheTraceContext&) -> bool and Shutdown() are inherited from
+        // RenderPass<TessellationPass>; see InitImpl() below.
 
         // No-op (returns immediately, no barriers/draw recorded) if Init() was given an empty
         // `entities` list -- see Init()'s own comment. Otherwise records one indexed draw
@@ -162,7 +165,18 @@ namespace renderer {
             const SceneLights& sceneLights);
 
     private:
-        VkDevice m_Device = VK_NULL_HANDLE;
+        bool InitImpl(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
+            VkFormat colorFormat, VkFormat depthFormat,
+            VkBuffer entityTransformBuffer,
+            const std::array<MaterialParameters, kMaxMaterials>& materialTable,
+            VkBuffer fallbackVertexBuffer, VkBuffer fallbackIndexBuffer,
+            const std::vector<TessellatedEntityDrawInfo>& entities,
+            VkAccelerationStructureKHR tlasHandle, VkBuffer drawRangeBuffer,
+            VkBuffer lightBuffer, VkDeviceSize lightBufferSize,
+            const VirtualShadowMapPass& vsm, const WorldProbeGridPass& worldProbes,
+            const SurfaceCacheTraceContext& traceContext);
+
+        // m_Device is inherited (protected) from RenderPass<TessellationPass>.
 
         // Every tessellated entity's identity -- see TessellatedEntityDrawInfo's own comment.
         // Fixed after Init() (this codebase's own scene is fully deterministic, see

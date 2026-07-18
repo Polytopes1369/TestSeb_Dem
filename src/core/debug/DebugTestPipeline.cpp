@@ -37,28 +37,31 @@
 //      down cleanly. Does NOT (cannot, headless) verify audio is actually audible/correctly
 //      panned -- see this feature's own delivery notes for how that was verified instead.
 //
-// Phase 9.2 (PCG roadmap, test-pipeline integration) additionally surfaces 4 pre-existing PCG smoke
-// tests (Phases 0.1/0.2/0.3/4.2 of the UE5.8-parity PCG roadmap) that already ran once,
+// Phase 9.2 (PCG roadmap, test-pipeline integration) additionally surfaces 5 pre-existing PCG smoke
+// tests (Phases 0.1/0.2/0.3/4.2/6.3 of the UE5.8-parity PCG roadmap) that already ran once,
 // unconditionally, at VulkanContext::Init()/ClusterRenderPipeline::Init() time -- well before this
 // function is ever reached -- but previously only ever logged PASS/FAIL via LOG_INFO/LOG_ERROR, with
 // no queryable result and no report entry. Rather than re-running GPU/CPU work that already happened
-// (tests 13/14/16 are one-shot offscreen renders with no live state left to re-exercise; test 15's
-// own registration probe already unregistered everything it added), each smoke test function gained
-// a small Debug-only `..SmokeTestResult { bool ran; bool passed; std::string details; }` member +
-// getter (VulkanContext::GetInstanceRegistrySmokeTestResult(),
+// (tests 13/14/16/17 are one-shot offscreen renders/scratch-directory runs with no live state left to
+// re-exercise; test 15's own registration probe already unregistered everything it added), each
+// smoke test function gained a small Debug-only `..SmokeTestResult { bool ran; bool passed;
+// std::string details; }` member + getter (VulkanContext::GetInstanceRegistrySmokeTestResult(),
 // ClusterRenderPipeline::GetPcgInstanceDrawSmokeTestResult()/GetPcgFullPipelineSmokeTestResult()/
-// GetPhase03DynamicLumenSmokeTestResult()) that its own existing Init()-time call site populates
-// unmodified in control flow -- this design was chosen over moving the calls themselves into RunAll()
-// because their real test content (specific streaming-archetype meshIDs, m_DebugIndexEntriesCopy/
-// m_DebugDagEntriesCopy cache tables, m_GlobalSDF/m_SurfaceCache's Init()-time-fixed roster) is only
-// resolved/valid at those exact existing call sites, and Phase 0.3's own smoke test runs from deep
-// inside ClusterRenderPipeline::Init() itself (ordering-dependent on internal state), not from
-// main.cpp, making a move far riskier than a few generically-additive getters. Tests 13/14/16 below
-// query their result and convert it straight into a FeatureTestResult; test 15 is genuinely
-// Skip-able (not just Fail-able) if GlobalSDFPass::GetTracedEntityInfos() had nothing to borrow from
-// at Init() time. A would-be 5th entry (Phase 6.3, a runtime generator hook into live World Partition
-// cell streaming) was checked for and NOT present in this worktree's merged history -- skipped
-// entirely, not stubbed, per this task's own scope.
+// GetPhase03DynamicLumenSmokeTestResult()/GetPcgCellLoaderSmokeTestResult()) that its own existing
+// Init()-time call site populates unmodified in control flow -- this design was chosen over moving
+// the calls themselves into RunAll() because their real test content (specific streaming-archetype
+// meshIDs, m_DebugIndexEntriesCopy/m_DebugDagEntriesCopy cache tables, m_GlobalSDF/m_SurfaceCache's
+// Init()-time-fixed roster, a scratch on-disk PcgVolume/PcgGraph asset pair) is only resolved/valid
+// at those exact existing call sites, and Phase 0.3's own smoke test runs from deep inside
+// ClusterRenderPipeline::Init() itself (ordering-dependent on internal state), not from main.cpp,
+// making a move far riskier than a few generically-additive getters. Tests 13/14/16/17 below query
+// their result and convert it straight into a FeatureTestResult; test 15 is genuinely Skip-able (not
+// just Fail-able) if GlobalSDFPass::GetTracedEntityInfos() had nothing to borrow from at Init() time.
+// Phase 6.3 (test 17, a runtime generator hook into live World Partition cell streaming via
+// world::PcgCellLoader) was originally checked for and NOT present when tests 13-16 were first wired
+// in; it landed on main in a later merge and was reconciled in alongside a RenderPass<> migration
+// that also touched this class -- see that merge commit's own message for the conflict-resolution
+// details.
 #ifndef NDEBUG
 
 #include "core/debug/DebugTestPipeline.h"
@@ -871,13 +874,53 @@ namespace debugpipeline {
                     "Ran once at startup (main.cpp, right after ClusterRenderPipeline::Init()), against its "
                     "own self-contained offscreen 256x256 render target. This same run's filtered point set "
                     "is what main.cpp's \"PCG Graph Editor\" tab visualizes via "
-                    "GetDebugPcgPointCloudCount()/PCG_POINT_CLOUD_VIZ. Not re-run inside this pipeline. "
-                    "NOTE: Phase 6.3 (runtime PCG generator hook into live World Partition cell streaming) "
-                    "has no smoke test of its own to surface here -- that class/subtask was not present in "
-                    "this worktree's merged history at the time Phase 9.2 landed (checked via `git log "
-                    "main --oneline | grep -i pcg` and a source-tree search for PcgCellLoader-shaped "
-                    "names); out of scope for this task per its own instructions, add a 17th entry here "
-                    "once that subtask lands."
+                    "GetDebugPcgPointCloudCount()/PCG_POINT_CLOUD_VIZ. Not re-run inside this pipeline. See "
+                    "test #17 below for Phase 6.3's own live-streaming-triggered variant of this same "
+                    "sampler->filter->spawner->render chain."
+                };
+            });
+
+        // === 17. PCG Phase 6.3: runtime generator hook (world::PcgCellLoader, live cell streaming) =
+        // Phase 6.3 was not yet merged to main when tests 13-16 above were first wired in (Phase 9.2's
+        // own original scope note said "check for it, use it if present, don't block on it if not");
+        // it has since landed (world::PcgCellLoader + ClusterRenderPipeline::RunPcgCellLoaderSmokeTest,
+        // called from main.cpp right after RunPcgFullPipelineSmokeTest() above), so it is surfaced
+        // here following the exact same already-ran-at-Init()-time/query-a-getter pattern as 13-16.
+        runTest("PCG Phase 6.3: Runtime Generator Hook (world::PcgCellLoader, Live Cell Streaming)",
+            "src/world/PcgCellLoader.cpp, src/renderer/ClusterRenderPipeline.cpp",
+            [&]() -> TestOutcome {
+                const renderer::ClusterRenderPipeline::PcgSmokeTestResult& result = clusterPipeline.GetPcgCellLoaderSmokeTestResult();
+                if (!result.ran) {
+                    return TestOutcome{
+                        TestStatus::Skip, 0,
+                        "ClusterRenderPipeline::RunPcgCellLoaderSmokeTest() (called once from main.cpp "
+                        "right after RunPcgFullPipelineSmokeTest(), reusing the same 3 streaming archetype "
+                        "meshes as a weighted palette) has already run and recorded a result by the time "
+                        "this pipeline starts.",
+                        "GetPcgCellLoaderSmokeTestResult().ran == false -- the smoke test's call site in "
+                        "main.cpp was never reached (unexpected in a normal --test-pipeline run).",
+                        "This entry surfaces an Init()-time smoke test's already-completed result; it is "
+                        "not re-run here."
+                    };
+                }
+                return TestOutcome{
+                    result.passed ? TestStatus::Pass : TestStatus::Fail, 0,
+                    "A real, throwaway PcgVolume actor + PcgGraph JSON asset on scratch disk is indexed "
+                    "into exactly 1 volume overlapping exactly 1 cell; world::IWorldCellLoader::"
+                    "LoadCellFullDetail()+Pump() drives a real pcg::GeneratePcgContentForCell() -> "
+                    "PcgInstanceSpawnManager::SpawnInstances() call acquiring exactly the grid source "
+                    "node's own deterministic point count; LoadCellHlod() on a different cell is confirmed "
+                    "a documented no-op (live instance count unchanged); UnloadCell()+Pump() despawns every "
+                    "acquired instance back to 0 -- proves the LIVE streaming-triggered generation path "
+                    "world::StreamingManager would drive works end-to-end, simulating exactly that trigger "
+                    "without needing a real StreamingManager/CellManifest/camera.",
+                    result.details,
+                    "Ran once at startup (main.cpp, right after ClusterRenderPipeline::Init()), via a "
+                    "throwaway world::PcgCellLoader against a scratch temp directory (%TEMP%/"
+                    "PcgCellLoaderSmokeTest) and its own throwaway PcgInstanceDrawPass/"
+                    "PcgInstanceSpawnManager pair -- never touches the live scene attachment, "
+                    "RecordFrame*() sequence, or world_data/cellmanifest.bin. Not re-run inside this "
+                    "pipeline."
                 };
             });
 

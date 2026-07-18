@@ -40,10 +40,18 @@
 
 #include "core/maths/Maths.h"
 #include "renderer/vulkan/GpuBuffer.h"
+#include "renderer/vulkan/RenderPass.h"
 
 namespace renderer {
 
-    class ShadowMapPass {
+    // Migrated to RenderPass<Derived> (see renderer/vulkan/RenderPass.h): Init()/Shutdown() are
+    // inherited. Note InitImpl() still calls the inherited Shutdown() as its own first statement
+    // (preserved from the original Init(), which self-reinitializes: calling Init() again on an
+    // already-initialized instance releases the old GPU resources before rebuilding) -- InitImpl()
+    // re-assigns m_Device/m_Allocator right after that call since Shutdown() clears them.
+    class ShadowMapPass : public RenderPass<ShadowMapPass> {
+        friend class RenderPass<ShadowMapPass>; // Lets Init() call our private InitImpl().
+
     public:
         ShadowMapPass() = default;
 
@@ -70,10 +78,8 @@ namespace renderer {
         // (logged) only on an actual cache-file I/O failure; a scene with zero fallback meshes is
         // valid (Init() succeeds, the scene bounding sphere degenerates to radius 0 at the origin,
         // RecordCapture() is then a depth-clear-only no-geometry no-op).
-        bool Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
-            const std::filesystem::path& cacheFilePath);
-
-        void Shutdown();
+        // Init(VkDevice, VmaAllocator, VkCommandPool, VkQueue, const std::filesystem::path&) -> bool
+        // and Shutdown() are inherited from RenderPass<ShadowMapPass>; see InitImpl() below.
 
         // Recomputes the light's view-projection matrix from `sunDirection` (fit to the scene's
         // bounding sphere computed at Init(), via mat4::LookAt + mat4::OrthoVulkan -- see the class
@@ -96,8 +102,10 @@ namespace renderer {
         const maths::mat4& GetLightViewProj() const { return m_LightViewProj; }
 
     private:
-        VkDevice m_Device = VK_NULL_HANDLE;
-        VmaAllocator m_Allocator = VK_NULL_HANDLE;
+        bool InitImpl(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
+            const std::filesystem::path& cacheFilePath);
+
+        // m_Device / m_Allocator are inherited (protected) from RenderPass<ShadowMapPass>.
 
         GpuBuffer m_VertexBuffer; // geometry::FallbackVertex[], GPU_ONLY (only .position is read).
         GpuBuffer m_IndexBuffer;  // uint32_t[], GPU_ONLY.

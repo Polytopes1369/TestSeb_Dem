@@ -82,13 +82,22 @@
 #include "renderer/MegaLightsTypes.h"
 #include "renderer/passes/ATrousDenoisePass.h"
 #include "renderer/vulkan/GpuBuffer.h"
+#include "renderer/vulkan/RenderPass.h"
 
 namespace renderer {
 
     class ClusterResolvePass;
     class SurfaceCacheRayTracingPass;
 
-    class MegaLightsPass {
+    // Migrated to RenderPass<Derived> (see renderer/vulkan/RenderPass.h): Init()/Shutdown() are
+    // inherited -- InitImpl() registers each resource's cleanup right after creating it, in
+    // creation order, and Shutdown() runs those cleanups in reverse. m_Denoiser (an owned
+    // ATrousDenoisePass instance) is treated as one more registered resource -- its own
+    // Shutdown() call is wrapped like any other cleanup, not migrated itself (ATrousDenoisePass's
+    // own Init() returns void, out of scope for a mechanical RenderPass<> migration).
+    class MegaLightsPass : public RenderPass<MegaLightsPass> {
+        friend class RenderPass<MegaLightsPass>; // Lets Init() call our private InitImpl().
+
     public:
         MegaLightsPass() = default;
 
@@ -110,11 +119,9 @@ namespace renderer {
         // `resolvePass`/`rtPass` must already be Init'd and outlive this pass -- borrowed,
         // unmodified, same convention as renderer::ReflectionPass::Init. `lightsData` is copied once
         // into an owned host-visible SSBO here, not retained by reference.
-        bool Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
-            VkExtent2D renderExtent, const ClusterResolvePass& resolvePass,
-            const SurfaceCacheRayTracingPass& rtPass, const MegaLightsData& lightsData);
-
-        void Shutdown();
+        // Init(VkDevice, VmaAllocator, VkCommandPool, VkQueue, VkExtent2D, const ClusterResolvePass&,
+        // const SurfaceCacheRayTracingPass&, const MegaLightsData&) -> bool and Shutdown() are
+        // inherited from RenderPass<MegaLightsPass>; see InitImpl() below.
 
         // `cameraPositionWorld` (Substrate integration): feeds EvaluateSubstrateMaterial's specular/
         // Fresnel view-direction term in MegaLightsShade.comp -- the pre-Substrate shader had no
@@ -149,8 +156,11 @@ namespace renderer {
         }
 
     private:
-        VkDevice m_Device = VK_NULL_HANDLE;
-        VmaAllocator m_Allocator = VK_NULL_HANDLE;
+        bool InitImpl(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
+            VkExtent2D renderExtent, const ClusterResolvePass& resolvePass,
+            const SurfaceCacheRayTracingPass& rtPass, const MegaLightsData& lightsData);
+
+        // m_Device / m_Allocator are inherited (protected) from RenderPass<MegaLightsPass>.
         VkExtent2D m_RenderExtent{ 0, 0 };
 
         GpuBuffer m_LightBuffer; // Host-visible SSBO: 16-byte header (lightCount + pad) + kMaxMegaLights slots, filled once at Init.

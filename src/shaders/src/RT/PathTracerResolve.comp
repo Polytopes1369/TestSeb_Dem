@@ -1,0 +1,44 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+
+// UE5.8 rendering-parity gap G10b -- reference Path Tracer resolve pass (DEBUG-only, see
+// PathTracer.rgen's header). Reads the persistent HDR accumulation SUM (PathTracer.rgen's g_Accum),
+// divides by the accumulated sample count to get the mean radiance, then applies the SAME physical
+// exposure + ACES filmic tonemap + display gamma the real-time PostProcessComposite.comp path uses
+// (so the reference view is directly comparable to the Lumen view), writing an rgba8 display image
+// that renderer::ClusterRenderPipeline blits to the swapchain in place of the normal composite when
+// the path-tracer reference mode is active.
+
+#include "include/aces_tonemap.glsl"
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(rgba32f, set = 0, binding = 0) uniform readonly image2D g_Accum;   // Running SUM of per-sample radiance.
+layout(rgba8, set = 0, binding = 1) uniform writeonly image2D g_Display;  // Tonemapped display output (blitted to swapchain).
+
+layout(push_constant) uniform ResolvePushConstants {
+    uint sampleCount; // Number of accumulated samples (>= 1) to average by.
+    float exposure;   // Precomputed 1.0 / (1.2 * 2^EV100) from the physical camera (matches PostProcessComposite.comp).
+    float invGamma;   // 1.0 / DISPLAY_GAMMA.
+    uint width;
+    uint height;
+} pc;
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (pixel.x >= int(pc.width) || pixel.y >= int(pc.height)) {
+        return;
+    }
+
+    vec3 sum = imageLoad(g_Accum, pixel).rgb;
+    vec3 mean = sum / float(max(pc.sampleCount, 1u));
+
+    // Physical exposure -> ACES filmic tonemap (Narkowicz) -> display gamma encode -- the same
+    // display-referred chain PostProcessComposite.comp applies, so this reference is exposed and
+    // graded like the real-time view it is meant to validate.
+    vec3 exposed = mean * pc.exposure;
+    vec3 tonemapped = ACESFilmicTonemap(exposed);
+    vec3 display = pow(max(tonemapped, vec3(0.0)), vec3(pc.invGamma));
+
+    imageStore(g_Display, pixel, vec4(display, 1.0));
+}
