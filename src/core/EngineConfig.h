@@ -694,6 +694,30 @@ inline bool WIREFRAME = false;               // Debug-only wireframe/bounds visu
 #endif
 } // namespace vegetation
 
+// Hair/Fur shading model (UE5.8 rendering-parity gap G10a) -- GPU-instanced procedural fur strands
+// grown off the skinned creature entity's surface (renderer::FurStrandPass). Same "runtime state,
+// not a hardware-quality tier" convention as config::vegetation:: above (NOT mirrored into
+// EngineConfig_{Low,Medium,High,Extrem}.h). ENABLED / OCCLUSION_CULL_ENABLED / the appearance knobs
+// take effect live every frame; the strand-count/length/geometry knobs are consumed only when the
+// strands are (re)generated -- the Debug "Fur / Hair" ImGui tab exposes a Regenerate button that
+// reapplies them at runtime.
+namespace fur {
+inline bool ENABLED = true;                  // Master runtime toggle -- skip the per-frame cull+draw entirely.
+inline bool OCCLUSION_CULL_ENABLED = true;   // Per-strand HZB occlusion test (frustum culling always on).
+inline uint32_t STRAND_COUNT = 14000u;       // Strands baked onto the creature (clamped to FurStrandPass::kMaxStrands). Consumed on (re)generate.
+inline float LENGTH = 0.16f;                 // Base strand length, world units. Consumed on (re)generate (via lengthScale baking) + live at draw.
+inline float LENGTH_JITTER = 0.35f;          // [0,1] per-strand length variation half-range. Consumed on (re)generate.
+inline float WIDTH = 0.020f;                 // Ribbon width, world units (live at draw).
+inline float CURL_AMOUNT = 0.35f;            // Gravity droop + curl strength as a fraction of length (live at draw).
+inline float ROOT_LIFT = 0.008f;             // Outward root offset so a strand's base sits just clear of the skin. Consumed on (re)generate.
+inline float SPEC_INTENSITY = 0.55f;         // Overall hair specular scale (live at draw).
+inline float TRT_INTENSITY = 0.55f;          // Weight of the colored secondary (TRT) highlight (live at draw).
+inline uint32_t SEED = 1337u;                // Global determinism seed. Consumed on (re)generate.
+#ifndef NDEBUG
+inline bool WIREFRAME = false;               // Debug-only wireframe/bounds visualization (gated out of Release per CLAUDE.md rule 8).
+#endif
+} // namespace fur
+
 // Procedural 3D Audio Engine (src/audio/, closes the "moteur de son 3D + style FL studio" gap in
 // this project's own CLAUDE.md design brief -- a fully procedural, real-time-streamed-synthesis
 // audio subsystem, zero .wav/.ogg assets, see audio::AudioEngine's own class comment) -- live-

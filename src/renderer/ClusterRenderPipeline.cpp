@@ -873,6 +873,24 @@ bool ClusterRenderPipeline::Init(
     return false;
   }
 
+  // Hair/Fur shading model (UE5.8 rendering-parity gap G10a) -- GPU-instanced procedural fur strands
+  // grown off the skinned creature's surface. Same dependency set as m_VegetationScatter (VSM +
+  // World Probes for forward lighting, m_HZB for the per-strand occlusion cull), plus the skinned-
+  // root inputs: m_SkeletalAnimator's bone-matrices buffer (this frame's animated pose, updated in
+  // place -- the handle is stable) and the shared entity-transform buffer, both re-read every frame
+  // to keep each strand's root glued to the animated skin. Draws onto the SAME m_GIComposite color +
+  // real depth target every other forward pass targets. Strand roots are baked (bake-time) inside
+  // this Init(), like the vegetation scatter above.
+  if (!m_FurStrand.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
+                        m_VirtualShadowMap, m_WorldProbes,
+                        m_HZB.GetFullView(), m_HZB.GetMipExtent(0), m_HZB.GetMipLevelCount(),
+                        m_SkeletalAnimator.GetBoneMatricesBuffer(), createInfo.entityTransformBuffer,
+                        createInfo.creatureFurGeometry,
+                        GICompositePass::kOutputFormat, createInfo.depthFormat)) {
+    LOG_ERROR("[ClusterRenderPipeline] Failed to initialize FurStrandPass.");
+    return false;
+  }
+
   // Screen Trace GI -- linear screen-space depth raymarching falling back to the World Probe grid.
   m_ScreenTrace.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
                      createInfo.renderExtent, m_Resolve.GetOutputDepthView(), m_Resolve.GetOutputNormalView(),
@@ -1327,6 +1345,7 @@ void ClusterRenderPipeline::Shutdown() {
   m_WaterForward.Shutdown();
   m_ParticleSystem.Shutdown();
   m_VegetationScatter.Shutdown();
+  m_FurStrand.Shutdown();
   m_TransparentForward.Shutdown();
   m_ShadingBin.Shutdown();
   m_Resolve.Shutdown();
@@ -1364,6 +1383,17 @@ void ClusterRenderPipeline::RegenerateVegetationScatter() {
   if (m_Device != VK_NULL_HANDLE) {
     vkDeviceWaitIdle(m_Device);
     m_VegetationScatter.GenerateScatter();
+  }
+}
+
+void ClusterRenderPipeline::RegenerateFur() {
+  // Same device-idle-then-blocking-one-shot discipline as RegenerateVegetationScatter above: the fur
+  // strand-root generator is a blocking one-shot submit overwriting the strand-root buffer, so no
+  // in-flight frame may still be culling/drawing from it. Debug-only, invoked from the ImGui
+  // "Fur / Hair" tab.
+  if (m_Device != VK_NULL_HANDLE) {
+    vkDeviceWaitIdle(m_Device);
+    m_FurStrand.GenerateStrands();
   }
 }
 #endif
@@ -2906,6 +2936,27 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
           m_DepthImage, m_DepthImageView, m_RenderExtent, viewProj, cameraFrameInfo.position,
           m_SceneLights.sun.direction, m_SceneLights.sun.color, m_SceneLights.sun.intensity,
           vegetationWireframe);
+    }
+
+    // Hair/Fur strands (UE5.8 rendering-parity gap G10a): recorded right after m_VegetationScatter
+    // (both opaque, depth-writing forward passes leaving depth READ_ONLY on exit) and BEFORE
+    // m_TransparentForward -- so glass depth-tests against the fur and m_WaterForward snapshots a
+    // frame that includes it. The per-strand frustum/HZB cull runs first (compute, outside any
+    // rendering scope) against this frame's freshly-rebuilt HZB and this frame's animated bone
+    // matrices (m_SkeletalAnimator.RecordUpdate ran back in RecordFrameMid, its trailing barrier
+    // already covering COMPUTE), then the single indirect instanced draw. Gated by the live master
+    // toggle + a nonzero strand count.
+    if (config::fur::ENABLED && m_FurStrand.GetStrandCount() > 0) {
+      m_FurStrand.RecordCull(cmdLate, viewProj, cameraFrameInfo.position,
+          config::fur::OCCLUSION_CULL_ENABLED);
+      bool furWireframe = false;
+#ifndef NDEBUG
+      furWireframe = config::fur::WIREFRAME;
+#endif
+      m_FurStrand.RecordDraw(cmdLate, transparentTargetImage, transparentTargetView,
+          m_DepthImage, m_DepthImageView, m_RenderExtent, viewProj, cameraFrameInfo.position,
+          m_SceneLights.sun.direction, m_SceneLights.sun.color, m_SceneLights.sun.intensity,
+          globalTimeSeconds, furWireframe);
     }
 
     m_TransparentForward.RecordDraw(cmdLate, transparentTargetImage, transparentTargetView, m_DepthImageView,

@@ -617,6 +617,20 @@ int main(int argc, char** argv) {
     // SurfaceCachePass::Init() to prune translucent-material cards at load time.
     pipelineInfo.entityDataCPU = vkContext.GetEntityData();
 
+    // Hair/Fur shading model (UE5.8 rendering-parity gap G10a): tell renderer::FurStrandPass where the
+    // skinned creature's bind-pose surface lives, sourced from VulkanContext's own single-source-of-
+    // truth creature constants + animation::SkeletalAnimator's skeleton constants, so fur roots land
+    // on exactly the surface geom_creature.comp baked. creatureMeshID indexes the EntityTransform
+    // buffer for the creature (== its meshID) so the pass re-skins each root through the same
+    // transform ClusterRaster.vert uses for the creature's own vertices.
+    pipelineInfo.creatureFurGeometry.worldOffset = vkContext.GetCreatureBakeWorldOffset();
+    pipelineInfo.creatureFurGeometry.radiusMin = vkContext.GetCreatureRadiusMin();
+    pipelineInfo.creatureFurGeometry.radiusMax = vkContext.GetCreatureRadiusMax();
+    pipelineInfo.creatureFurGeometry.segmentLength = animation::SkeletalAnimator::kSegmentLength;
+    pipelineInfo.creatureFurGeometry.boneCount = animation::SkeletalAnimator::kBoneCount;
+    pipelineInfo.creatureFurGeometry.creatureMeshID =
+        vkContext.GetEntityData()[vkContext.GetCreatureEntityIndex()].meshID;
+
     // ClusterRenderPipeline::Init() sequentially creates ~40 render passes' worth of GPU buffers/
     // images/pipelines (many involving first-time driver-side SPIR-V pipeline compilation -- there
     // is no persisted VkPipelineCache anywhere in this codebase, so this cost is paid fresh on
@@ -1563,6 +1577,52 @@ int main(int argc, char** argv) {
                 ImGui::TextDisabled("Instances: %u / %u",
                     clusterPipeline.GetVegetationScatter().GetInstanceCount(),
                     renderer::VegetationScatterPass::kMaxInstances);
+
+                ImGui::EndTabItem();
+            }
+
+            // --- Tab Fur / Hair (UE5.8 rendering-parity gap G10a) -- GPU-instanced procedural fur
+            // strands grown off the skinned creature, shaded with the dedicated hair BSDF. ENABLED /
+            // occlusion / wireframe + appearance (width/curl/spec) take effect live; the strand-count
+            // /length/geometry knobs are consumed on Regenerate (a blocking device-idle re-bake). ---
+            if (ImGui::BeginTabItem("Fur / Hair")) {
+                ImGui::Checkbox("Enabled", &config::fur::ENABLED);
+                ImGui::Checkbox("Occlusion Cull (HZB)", &config::fur::OCCLUSION_CULL_ENABLED);
+                ImGui::Checkbox("Wireframe", &config::fur::WIREFRAME);
+
+                ImGui::Separator();
+                ImGui::TextUnformatted("Appearance (live)");
+                ImGui::SliderFloat("Strand Width (m)", &config::fur::WIDTH, 0.004f, 0.06f);
+                ImGui::SliderFloat("Curl / Droop", &config::fur::CURL_AMOUNT, 0.0f, 1.0f);
+                ImGui::SliderFloat("Specular Intensity", &config::fur::SPEC_INTENSITY, 0.0f, 2.0f);
+                ImGui::SliderFloat("TRT (2nd highlight)", &config::fur::TRT_INTENSITY, 0.0f, 2.0f);
+                ImGui::SliderFloat("Strand Length (m)", &config::fur::LENGTH, 0.02f, 0.5f);
+
+                ImGui::Separator();
+                ImGui::TextUnformatted("Strand parameters (applied on Regenerate)");
+                {
+                    int strands = static_cast<int>(config::fur::STRAND_COUNT);
+                    if (ImGui::SliderInt("Strand Count", &strands, 0,
+                            static_cast<int>(renderer::FurStrandPass::kMaxStrands))) {
+                        config::fur::STRAND_COUNT = static_cast<uint32_t>(strands < 0 ? 0 : strands);
+                    }
+                }
+                ImGui::SliderFloat("Length Jitter", &config::fur::LENGTH_JITTER, 0.0f, 1.0f);
+                ImGui::SliderFloat("Root Lift (m)", &config::fur::ROOT_LIFT, 0.0f, 0.05f);
+                {
+                    int seed = static_cast<int>(config::fur::SEED);
+                    if (ImGui::InputInt("Seed", &seed)) {
+                        config::fur::SEED = static_cast<uint32_t>(seed < 0 ? 0 : seed);
+                    }
+                }
+                if (ImGui::Button("Regenerate Strands")) {
+                    clusterPipeline.RegenerateFur();
+                }
+
+                ImGui::Separator();
+                ImGui::TextDisabled("Strands: %u / %u",
+                    clusterPipeline.GetFurStrand().GetStrandCount(),
+                    renderer::FurStrandPass::kMaxStrands);
 
                 ImGui::EndTabItem();
             }
