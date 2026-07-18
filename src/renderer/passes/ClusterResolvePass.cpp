@@ -198,7 +198,7 @@ namespace renderer {
             // own doc comment), not a per-frame value -- filled once, here, in the same one-time
             // command buffer as the image transitions above (no ordering dependency between them,
             // so recording order doesn't matter). Well under vkCmdUpdateBuffer's 65536-byte limit
-            // (kMaxMaterials * sizeof(MaterialParameters) = 32 * 48 = 1536 bytes). No intra-
+            // (kMaxMaterials * sizeof(MaterialParameters) = 32 * 208 = 6656 bytes). No intra-
             // command-buffer barrier is needed after this write -- ExecuteOneShotCommands' own
             // vkQueueWaitIdle fully orders it before any later-submitted command buffer's reads,
             // exactly like ClusterRenderPipeline::Init()'s own one-time setup submit.

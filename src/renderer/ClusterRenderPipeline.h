@@ -136,7 +136,6 @@
 #include "renderer/passes/ReflectionPass.h"
 #include "renderer/passes/ScreenSpaceEffectsPass.h"
 #include "renderer/passes/MegaLightsPass.h"
-#include "renderer/passes/ScreenProbeGIPass.h"
 #include "renderer/passes/SurfaceCacheGIInjectPass.h"
 #include "renderer/passes/SurfaceCachePass.h"
 #include "renderer/passes/SurfaceCacheRayTracingPass.h"
@@ -703,9 +702,9 @@ namespace renderer {
         // genuine page-table-virtualized system -- a 3-level clipmap of Virtual Shadow Maps for the
         // sun plus a per-point-light 6-face cube, sharing one physical page pool, incrementally
         // updated (bounded pages rendered per frame) instead of a full redraw -- see
-        // VirtualShadowMapPass's own class comment for the full per-frame contract.
-        // ShadowMapPass.h/.cpp remain in the repo (file deletion blocked, see memory
-        // feedback_file_deletion_blocked) but are no longer instantiated here.
+        // VirtualShadowMapPass's own class comment for the full per-frame contract. ShadowMapPass.h/
+        // .cpp (the pre-Phase-3 pass this replaced) were deleted outright -- zero remaining
+        // references anywhere in this codebase (confirmed via repo-wide grep before deletion).
         VirtualShadowMapPass m_VirtualShadowMap;
         // Step 4 (Virtual Texturing / RVT-SVT, UE 5.8 parity): renderer::VirtualTextureManager owns
         // the page table + physical atlas (own single Albedo pool, see Init()'s own comment on the
@@ -714,10 +713,16 @@ namespace renderer {
         // and renderer::VirtualTextureStreamingCoordinator streams previously-baked tiles back off
         // disk (.vtcache, io::VirtualTextureCacheFormat.h) via GPU feedback misses -- mirrors the
         // exact three-way split VirtualShadowMapPass/m_Streaming already establish for shadow pages/
-        // geometry clusters respectively. Gated by config::lumen::BUILD_VIRTUAL_TEXTURES at the
-        // per-frame streaming step only (see VirtualTextureStreamingCoordinator::RecordBeginFrame's
-        // own comment) -- Init() and the descriptor wiring below always run unconditionally, exactly
-        // like VirtualShadowMapPass's own config::lumen::BUILD_SHADOWS gating.
+        // geometry clusters respectively. config::lumen::BUILD_VIRTUAL_TEXTURES gates the per-frame
+        // streaming step (see VirtualTextureStreamingCoordinator::RecordBeginFrame's own comment) AND
+        // m_VTRenderPass's own Init() (see ClusterRenderPipeline.cpp's Step 4 comment for why: unlike
+        // m_VTManager/m_VTStreaming, m_VTRenderPass's resources are never read by m_Resolve's
+        // descriptor wiring, so skipping its Init() when the feature is off costs nothing).
+        // m_VTManager.Init(), m_VTStreaming.Init(), and the m_Resolve descriptor wiring itself all
+        // still run unconditionally regardless of the flag -- ClusterResolvePass's set-0 layout
+        // statically references their bindings with no descriptorBindingPartiallyBound, so every one
+        // of them must stay validly populated every frame, exactly like VirtualShadowMapPass's own
+        // Init() stays unconditional under config::lumen::BUILD_SHADOWS.
         VirtualTextureManager m_VTManager;
         VirtualTextureRenderPass m_VTRenderPass;
         VirtualTextureStreamingCoordinator m_VTStreaming;
@@ -762,10 +767,10 @@ namespace renderer {
         // ScreenTracePass/GICompositePass integration below replaced it as this codebase's near-
         // field screen-space GI term (a plain per-pixel screen-space march instead of a per-tile
         // probe grid); the instantiation was removed here to stop paying for its ~10 full-resolution
-        // images/3 pipelines every run. ScreenProbeGIPass.h/.cpp and its 3 shaders (ScreenProbeTrace/
-        // Temporal/Gather.comp) remain in the repo (file deletion blocked, see memory
-        // feedback_file_deletion_blocked) but are no longer instantiated here -- same convention as
-        // ShadowMapPass.h/.cpp above.
+        // images/3 pipelines every run. ScreenProbeGIPass.h/.cpp and its 4 shaders (ScreenProbeTrace/
+        // Temporal/Gather/Classify.comp, the last from Phase 6's hierarchical placement) were deleted
+        // outright -- zero remaining references anywhere in this codebase (confirmed via repo-wide
+        // grep before deletion), same as ShadowMapPass.h/.cpp above.
 
         // Phase 2 (UE5.8 parity roadmap): specular reflections / GI -- traces ONE GGX-VNDF-
         // importance-sampled ray per pixel per frame (full resolution), sampling the same
