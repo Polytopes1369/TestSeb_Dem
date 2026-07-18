@@ -17,8 +17,11 @@ float ComputeIridescenceFresnel(vec3 wavelength, float thickness, float coatIOR,
     float sinTheta = sqrt(1.0 - cosTheta * cosTheta);
     float pathDifference = 2.0 * thickness * sqrt(max(0.0, 1.0 - (sinTheta / coatIOR) * (sinTheta / coatIOR)));
 
-    // Phase shift from reflection at the air-film interface (~π radians, or half wavelength)
-    float phaseShift = 0.5 * 1e9;  // Simplified: half wavelength
+    // Phase shift from reflection at the air-film interface (~π radians, i.e. half a wavelength),
+    // per-channel since each RGB wavelength has its own half-wavelength offset -- a single scalar
+    // constant here would swamp the (tens-to-hundreds of nm) path difference and make the whole
+    // interference pattern angle/thickness-invariant, defeating the effect entirely.
+    vec3 phaseShift = 0.5 * wavelength;
 
     // Constructive/destructive interference
     vec3 interference = cos((2.0 * 3.14159265 / wavelength) * (pathDifference + phaseShift));

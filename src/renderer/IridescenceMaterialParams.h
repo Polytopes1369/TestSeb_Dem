@@ -1,9 +1,8 @@
 #pragma once
 
-#include <glm/glm.hpp>
 #include <cstdint>
 
-namespace render {
+namespace renderer {
 
 // Iridescence material parameters (added to Substrate BSDF)
 // This structure is mirrored in iridescence_bsdf.glsl
@@ -23,11 +22,4 @@ struct alignas(16) LightFunctionMaterialParams {
     uint32_t _padding1 = 0;
 };
 
-// Extended material parameters (to be merged into global MaterialParameterTable)
-// This allows easy toggling of iridescence + light functions per material
-struct alignas(16) ExtendedMaterialFeatures {
-    IridescenceMaterialParams iridescence;
-    LightFunctionMaterialParams lightFunction;
-};
-
-} // namespace render
+} // namespace renderer
