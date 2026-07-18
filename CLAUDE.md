@@ -35,3 +35,11 @@ Tout est 100% procedural GPU driven.
    * **Isolation par fichiers & CMake :** Les fichiers sources dédiés au debug (ex: `DebugInputRouter.cpp`, `Logger.cpp`, `GpuDebugBuffer.cpp`) doivent être exclus de la compilation via des conditions de build CMake (`if(CMAKE_BUILD_TYPE STREQUAL "Debug")`) ou encapsulés par une garde de précompilation englobant l'intégralité du fichier (`#ifdef _DEBUG ... #endif`). En mode Release, le compilateur ne doit générer *aucun* code objet pour ces fonctionnalités.
    * **Zéro overhead de chaînes de caractères :** Aucune chaîne de texte verbeuse, aucun formatage de diagnostic, et aucun symbole lié aux outils de debug ne doit persister dans l'exécutable final de production afin de garantir un poids minimal et une optimisation maximale.
    
+## IMPORTANT : Avant de commencer à analyser ou à modifier le code, tu dois impérativement respecter ce protocole strict :
+1. Crée et bascule sur une nouvelle branche Git locale isolée (SANS la pousser sur GitHub/Remote) en utilisant un nom descriptif basé sur la tâche.
+!!! Crée un répertoire de travail séparé. !!! 
+2. Effectue tout ton travail de modification et de test uniquement sur cette branche.
+3. Une fois la tâche entièrement résolue et validée, effectue un commit de tes changements sur cette branche locale.
+4. Enfin, bascule à nouveau sur la branche d'origine (la branche courante actuelle) et fusionne (merge) ta branche locale temporaire dedans afin que le résultat final se retrouve directement dans mon espace de travail actif. Supprime ensuite la branche temporaire locale que tu as créée.
+
+Confirme que tu as créé la branche locale avant de formuler ta première proposition technique.

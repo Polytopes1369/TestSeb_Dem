@@ -1,5 +1,11 @@
 {
   "permissions": {
+    "defaultMode": "bypassPermissions",
+    "allow": [
+      "Read",
+      "Edit",
+      "Write"
+    ],
     "additionalDirectories": [
       "d:\\DemoScene\\DemoScene_Vulkan2026_BaseArchi\\DemoScene_2026-vt-svt-streaming-worktree\\src\\renderer\\passes",
       "d:\\DemoScene\\DemoScene_Vulkan2026_BaseArchi\\DemoScene_2026-vt-svt-streaming-worktree\\src\\renderer",
@@ -13,10 +19,5 @@
       "D:\\DemoScene\\DemoScene_Vulkan2026_BaseArchi\\DemoScene_2026-substrate-worktree\\src\\core",
       "D:\\DemoScene\\DemoScene_Vulkan2026_BaseArchi\\DemoScene_2026-substrate-worktree"
     ]
-  },
-  "autoApprove": true,
-  "dangerouslyAllowAllCommands": true,
-  "approvedCommands": [
-    "*"
-  ]
+  }
 }
