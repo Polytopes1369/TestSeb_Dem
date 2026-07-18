@@ -22,6 +22,18 @@
 #include "renderer/vulkan/GpuImage.h" // Phase 0.2: RunPcgInstanceDrawSmokeTest()'s own offscreen color/depth images.
 #include "renderer/vulkan/VulkanUtils.h"
 
+// Phase 4.2 (PCG roadmap, "Spawner-to-DrawPass Glue" capstone): the full sampler -> filter ->
+// spawner -> glue chain RunPcgFullPipelineSmokeTest() below exercises end-to-end. All four are
+// pure-CPU, header-declared algorithm types with no Vulkan dependency of their own (PcgInstanceSpawnManager.h
+// is the sole exception, since it wraps renderer::PcgInstanceDrawPass -- already reachable from this
+// file via ClusterRenderPipeline.h's own Debug-only include) -- safe to include unconditionally here
+// exactly like GpuImage.h just above, even though only the Debug-only smoke test function at the
+// bottom of this file actually uses them.
+#include "pcg/PcgInstanceSpawnManager.h"
+#include "pcg/PcgMeshSpawner.h"
+#include "pcg/PcgSelfPruningFilter.h"
+#include "pcg/PcgVolumeSampler.h"
+
 namespace renderer {
 
     namespace {
@@ -3632,6 +3644,353 @@ bool ClusterRenderPipeline::RunPcgInstanceDrawSmokeTest(
       "[ClusterRenderPipeline] PcgInstanceDrawPass smoke test PASSED: {} instance(s), {} candidate "
       "cluster(s), GPU draw count={}, non-background pixel(s) found in the {}x{} offscreen render.",
       instances.size(), candidateCount, gpuDrawCount, kTestWidth, kTestHeight));
+  return true;
+}
+
+bool ClusterRenderPipeline::RunPcgFullPipelineSmokeTest(
+    const std::vector<PcgFullPipelineSmokeTestMeshDesc>& weightedMeshes, VkCommandPool commandPool, VkQueue queue) {
+  LOG_INFO("[ClusterRenderPipeline] Running PCG full-pipeline (sampler->filter->spawner->glue->draw) smoke test...");
+
+  if (weightedMeshes.empty()) {
+    LOG_ERROR("[ClusterRenderPipeline] PCG full-pipeline smoke test FAILED: no weighted meshes supplied.");
+    return false;
+  }
+  if (m_DebugIndexEntriesCopy.empty() || m_DebugDagEntriesCopy.empty()) {
+    LOG_ERROR("[ClusterRenderPipeline] PCG full-pipeline smoke test FAILED: no cached cluster/DAG "
+              "table (m_DebugIndexEntriesCopy empty -- was this called before Init() succeeded?).");
+    return false;
+  }
+
+  // =========================================================================================
+  // STEP 1 -- Sampler (Phase 2.3): scatter a small grid of points through a test volume centered
+  // at the world origin. Grid mode (not Random) is used so the point count/layout is a pure
+  // function of the parameters below -- fully reproducible run to run, no reliance on how many
+  // points a density-driven Random draw happens to produce. A thin Y half-extent (0.01) keeps
+  // every point essentially on the y=0 plane (countY collapses to 1, see PcgVolumeSampler.cpp's
+  // own ComputeAxisGridPointCount -- always >= 1 even for a near-zero extent), matching this
+  // test's simple ground-plane framing (same convention RunPcgInstanceDrawSmokeTest's own instances
+  // already use, all at position.y == 0).
+  // =========================================================================================
+  pcg::PcgVolumeData testVolume{};
+  testVolume.center = maths::vec3(0.0f, 0.0f, 0.0f);
+  testVolume.halfExtents = maths::vec3(3.0f, 0.01f, 3.0f);
+  // testVolume.orientation left at its default (identity quaternion) -- a plain axis-aligned box.
+
+  pcg::PcgVolumeSamplerParams samplerParams{};
+  samplerParams.mode = pcg::PcgVolumeSamplingMode::Grid;
+  samplerParams.gridSpacing = maths::vec3(1.2f, 1.0f, 1.2f);
+  samplerParams.jitterFraction = 0.25f;
+
+  constexpr uint32_t kSamplerSeed = 1337u;
+  std::vector<pcg::PcgPoint> sampledPoints = pcg::SampleVolume(testVolume, samplerParams, kSamplerSeed);
+  if (sampledPoints.empty()) {
+    LOG_ERROR("[ClusterRenderPipeline] PCG full-pipeline smoke test FAILED: SampleVolume() produced zero points.");
+    return false;
+  }
+
+  // =========================================================================================
+  // STEP 2 -- Filter (Phase 3.2): thin the grid with a minimum-separation prune. minDistance
+  // (1.5) is deliberately larger than the grid's own spacing (1.2) so the filter demonstrably
+  // removes points (not a no-op pass-through) while still leaving a healthy scattered subset,
+  // proving points genuinely survive a real filter step before reaching the spawner.
+  // =========================================================================================
+  constexpr float kPruneMinDistance = 1.5f;
+  std::vector<pcg::PcgPoint> filteredPoints =
+      pcg::PruneByDistance(sampledPoints, kPruneMinDistance, pcg::PcgPruningMode::Uniform);
+  if (filteredPoints.empty()) {
+    LOG_ERROR("[ClusterRenderPipeline] PCG full-pipeline smoke test FAILED: PruneByDistance() removed every point.");
+    return false;
+  }
+  LOG_INFO(std::format(
+      "[ClusterRenderPipeline] PCG full-pipeline smoke test: sampler produced {} point(s), filter kept {} of them.",
+      sampledPoints.size(), filteredPoints.size()));
+
+  // =========================================================================================
+  // STEP 3 -- Spawner (Phase 4.1): resolve each surviving point into one PcgSpawnRequest, picking
+  // a mesh from `weightedMeshes` (the caller-supplied streaming archetypes).
+  // =========================================================================================
+  std::vector<pcg::PcgMeshSpawnEntry> spawnEntries;
+  spawnEntries.reserve(weightedMeshes.size());
+  for (const PcgFullPipelineSmokeTestMeshDesc& mesh : weightedMeshes) {
+    spawnEntries.push_back(pcg::PcgMeshSpawnEntry{ mesh.meshID, mesh.materialID, mesh.weight });
+  }
+
+  constexpr uint32_t kSpawnerSeed = 4242u;
+  std::vector<pcg::PcgSpawnRequest> spawnRequests = pcg::SpawnFromPoints(filteredPoints, spawnEntries, kSpawnerSeed);
+  if (spawnRequests.empty()) {
+    LOG_ERROR("[ClusterRenderPipeline] PCG full-pipeline smoke test FAILED: SpawnFromPoints() produced zero requests.");
+    return false;
+  }
+
+  // =========================================================================================
+  // STEP 4 -- Glue (Phase 4.2, THIS phase): a throwaway PcgInstanceDrawPass (identical setup to
+  // RunPcgInstanceDrawSmokeTest() above -- see that method's own comment for why every field here
+  // is chosen the way it is), sized exactly to `spawnRequests.size()` instances so a mismatch
+  // between requested and acquired slots below is unambiguously a real bug, never a sizing
+  // artifact of this test. maxCandidateClusters is deliberately generous (a fixed 8192, versus
+  // RunPcgInstanceDrawSmokeTest's 256 for its own fixed 3 instances) since this test's instance
+  // count is itself a function of the sampler/filter parameters above, not a fixed literal.
+  // =========================================================================================
+  PcgInstanceDrawPass pcgPass;
+  maths::vec3 sunDir = (m_BaseSunDirection.Length() > 0.0f) ? m_BaseSunDirection.Normalize() : maths::vec3(0.3f, 0.8f, 0.4f).Normalize();
+  pcgPass.Init(m_Device, m_Allocator, commandPool, queue,
+      m_PagePool.GetPhysicalPoolBuffer(), GenerateShowcaseMaterialTable(),
+      sunDir, maths::vec3(1.0f, 0.96f, 0.9f), 3.0f, maths::vec3(0.12f, 0.12f, 0.14f),
+      VK_FORMAT_R16G16B16A16_SFLOAT, VK_FORMAT_D32_SFLOAT,
+      static_cast<uint32_t>(spawnRequests.size()), 8192u);
+
+  pcg::PcgInstanceSpawnManager spawnManager(pcgPass);
+  std::vector<uint32_t> acquiredSlots = spawnManager.SpawnInstances(spawnRequests);
+  if (acquiredSlots.size() != spawnRequests.size()) {
+    LOG_ERROR(std::format(
+        "[ClusterRenderPipeline] PCG full-pipeline smoke test FAILED: PcgInstanceSpawnManager::SpawnInstances() "
+        "only acquired {} of {} request(s) -- the throwaway pool was sized exactly to spawnRequests.size(), so "
+        "this indicates a real bug, not expected pool exhaustion.",
+        acquiredSlots.size(), spawnRequests.size()));
+    pcgPass.Shutdown();
+    return false;
+  }
+
+  maths::vec3 sceneCenter(0.0f, 0.0f, 0.0f);
+  for (const pcg::PcgSpawnRequest& request : spawnRequests) {
+    sceneCenter = sceneCenter + request.position;
+  }
+  sceneCenter = sceneCenter * (1.0f / static_cast<float>(spawnRequests.size()));
+
+  // =========================================================================================
+  // STEP 5 -- Render (Phase 0.2, reused unmodified): the same self-contained offscreen
+  // color+depth pair, GPU cull, and one-shot draw+readback sequence RunPcgInstanceDrawSmokeTest()
+  // above already validates in isolation -- run here against THIS test's own real
+  // sampler/filter/spawner-produced instance set instead of a hand-authored PcgSmokeTestInstanceDesc
+  // list. A wider camera framing (vs. RunPcgInstanceDrawSmokeTest's own) accounts for this test's
+  // scattered grid spanning a ~6x6 area, versus that test's single 6-unit-wide row.
+  // =========================================================================================
+  constexpr uint32_t kTestWidth = 256;
+  constexpr uint32_t kTestHeight = 256;
+  constexpr VkFormat kTestColorFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
+  constexpr VkFormat kTestDepthFormat = VK_FORMAT_D32_SFLOAT;
+
+  GpuImage colorImage;
+  GpuImage depthImage;
+  {
+    VkImageCreateInfo colorInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    colorInfo.imageType = VK_IMAGE_TYPE_2D;
+    colorInfo.format = kTestColorFormat;
+    colorInfo.extent = {kTestWidth, kTestHeight, 1};
+    colorInfo.mipLevels = 1;
+    colorInfo.arrayLayers = 1;
+    colorInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+    colorInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+    colorInfo.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    colorInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    colorImage.Create(m_Allocator, m_Device, colorInfo, VMA_MEMORY_USAGE_GPU_ONLY, VK_IMAGE_ASPECT_COLOR_BIT);
+
+    VkImageCreateInfo depthInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    depthInfo.imageType = VK_IMAGE_TYPE_2D;
+    depthInfo.format = kTestDepthFormat;
+    depthInfo.extent = {kTestWidth, kTestHeight, 1};
+    depthInfo.mipLevels = 1;
+    depthInfo.arrayLayers = 1;
+    depthInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+    depthInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+    depthInfo.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+    depthInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    depthImage.Create(m_Allocator, m_Device, depthInfo, VMA_MEMORY_USAGE_GPU_ONLY, VK_IMAGE_ASPECT_DEPTH_BIT);
+  }
+
+  uint32_t candidateCount = pcgPass.UploadInstances(commandPool, queue, m_DebugIndexEntriesCopy, m_DebugDagEntriesCopy, m_PagePool);
+  if (candidateCount == 0) {
+    LOG_ERROR("[ClusterRenderPipeline] PCG full-pipeline smoke test FAILED: UploadInstances() produced zero "
+              "candidate clusters (no spawned meshID had any matching leaf cluster in the cache tables).");
+    pcgPass.Shutdown();
+    colorImage.Destroy();
+    depthImage.Destroy();
+    return false;
+  }
+
+  // Camera framed wider/further back than RunPcgInstanceDrawSmokeTest's own (this test's points
+  // spread across a ~6x6 area, not a single 6-unit row).
+  maths::vec3 eye = sceneCenter + maths::vec3(0.0f, 10.0f, 20.0f);
+  maths::mat4 view = maths::mat4::LookAt(eye, sceneCenter, maths::vec3(0.0f, 1.0f, 0.0f));
+  maths::mat4 proj = maths::mat4::PerspectiveVulkan(70.0f * (3.14159265f / 180.0f),
+      static_cast<float>(kTestWidth) / static_cast<float>(kTestHeight), 0.1f, 200.0f);
+  CameraPushConstants camera{};
+  camera.view = view;
+  camera.proj = proj;
+
+  maths::mat4 viewProj = proj * view;
+  ClusterCullViewParams cullViewParams{};
+  cullViewParams.frustumPlanes = ExtractFrustumPlanes(viewProj);
+  cullViewParams.cameraPositionWorld = eye;
+
+  GpuBuffer drawCountReadback;
+  drawCountReadback.Create(m_Allocator, sizeof(uint32_t), VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_CPU_ONLY, /*mapped=*/true);
+
+  VkDeviceSize colorBytes = static_cast<VkDeviceSize>(kTestWidth) * kTestHeight * 8; // RGBA16F = 8 bytes/pixel.
+  GpuBuffer colorReadback;
+  colorReadback.Create(m_Allocator, colorBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_CPU_ONLY, /*mapped=*/true);
+
+  VulkanUtils::ExecuteOneShotCommands(m_Device, commandPool, queue, [&](VkCommandBuffer cmd) {
+    VkImageMemoryBarrier2 toAttachment[2]{};
+    toAttachment[0] = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+    toAttachment[0].srcStageMask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
+    toAttachment[0].srcAccessMask = 0;
+    toAttachment[0].dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+    toAttachment[0].dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+    toAttachment[0].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    toAttachment[0].newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    toAttachment[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toAttachment[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toAttachment[0].image = colorImage.Image();
+    toAttachment[0].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+
+    toAttachment[1] = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+    toAttachment[1].srcStageMask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
+    toAttachment[1].srcAccessMask = 0;
+    toAttachment[1].dstStageMask = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
+    toAttachment[1].dstAccessMask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    toAttachment[1].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    toAttachment[1].newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    toAttachment[1].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toAttachment[1].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toAttachment[1].image = depthImage.Image();
+    toAttachment[1].subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+
+    VkDependencyInfo depInfo0{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    depInfo0.imageMemoryBarrierCount = 2;
+    depInfo0.pImageMemoryBarriers = toAttachment;
+    vkCmdPipelineBarrier2(cmd, &depInfo0);
+
+    // GPU frustum/backface cull + atomic compaction, recorded BEFORE vkCmdBeginRendering -- see
+    // RunPcgInstanceDrawSmokeTest()'s own identical comment for why.
+    pcgPass.RecordClear(cmd);
+    pcgPass.RecordCull(cmd, cullViewParams);
+
+    VkRenderingAttachmentInfo colorAttachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    colorAttachment.imageView = colorImage.View();
+    colorAttachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    colorAttachment.clearValue.color = {{0.02f, 0.02f, 0.03f, 1.0f}};
+
+    VkRenderingAttachmentInfo depthAttachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    depthAttachment.imageView = depthImage.View();
+    depthAttachment.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    depthAttachment.clearValue.depthStencil = {0.0f, 0}; // Reversed-Z: far/clear = 0.0.
+
+    VkRenderingInfo renderingInfo{VK_STRUCTURE_TYPE_RENDERING_INFO};
+    renderingInfo.renderArea = {{0, 0}, {kTestWidth, kTestHeight}};
+    renderingInfo.layerCount = 1;
+    renderingInfo.colorAttachmentCount = 1;
+    renderingInfo.pColorAttachments = &colorAttachment;
+    renderingInfo.pDepthAttachment = &depthAttachment;
+
+    vkCmdBeginRendering(cmd, &renderingInfo);
+    pcgPass.RecordDraw(cmd, camera, {kTestWidth, kTestHeight}, m_Decompression.GetDecompressedIndexPoolBuffer());
+    vkCmdEndRendering(cmd);
+
+    VkImageMemoryBarrier2 toTransfer{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+    toTransfer.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+    toTransfer.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+    toTransfer.dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+    toTransfer.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+    toTransfer.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    toTransfer.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    toTransfer.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toTransfer.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toTransfer.image = colorImage.Image();
+    toTransfer.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    VkDependencyInfo depInfo1{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    depInfo1.imageMemoryBarrierCount = 1;
+    depInfo1.pImageMemoryBarriers = &toTransfer;
+    vkCmdPipelineBarrier2(cmd, &depInfo1);
+
+    VkBufferImageCopy copyRegion{};
+    copyRegion.bufferOffset = 0;
+    copyRegion.bufferRowLength = 0;
+    copyRegion.bufferImageHeight = 0;
+    copyRegion.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    copyRegion.imageOffset = {0, 0, 0};
+    copyRegion.imageExtent = {kTestWidth, kTestHeight, 1};
+    vkCmdCopyImageToBuffer(cmd, colorImage.Image(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, colorReadback.Handle(), 1, &copyRegion);
+
+    VkBufferCopy drawCountCopy{0, 0, sizeof(uint32_t)};
+    vkCmdCopyBuffer(cmd, pcgPass.GetDrawCountBuffer(), drawCountReadback.Handle(), 1, &drawCountCopy);
+
+    VkMemoryBarrier2 finalBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    finalBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+    finalBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    finalBarrier.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT;
+    finalBarrier.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT;
+    VkDependencyInfo depInfo2{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    depInfo2.memoryBarrierCount = 1;
+    depInfo2.pMemoryBarriers = &finalBarrier;
+    vkCmdPipelineBarrier2(cmd, &depInfo2);
+  });
+
+  uint32_t gpuDrawCount = 0;
+  std::memcpy(&gpuDrawCount, drawCountReadback.MappedData(), sizeof(uint32_t));
+
+  // Minimal IEEE 754 binary16 -> float decode -- identical helper to RunPcgInstanceDrawSmokeTest's
+  // own (duplicated locally rather than factored out, matching this codebase's general preference
+  // for each Debug-only smoke test staying a fully self-contained, independently-readable block).
+  auto HalfToFloatApprox = [](uint16_t h) -> float {
+    uint32_t sign = static_cast<uint32_t>(h & 0x8000u) << 16;
+    uint32_t exponent = (h >> 10) & 0x1Fu;
+    uint32_t mantissa = h & 0x3FFu;
+    uint32_t bits;
+    if (exponent == 0) {
+      bits = sign;
+    } else if (exponent == 0x1Fu) {
+      bits = sign | 0x7F800000u | (mantissa << 13);
+    } else {
+      bits = sign | ((exponent - 15u + 127u) << 23) | (mantissa << 13);
+    }
+    float f;
+    std::memcpy(&f, &bits, sizeof(f));
+    return f;
+  };
+
+  bool foundNonBackgroundPixel = false;
+  const auto* pixels = static_cast<const uint16_t*>(colorReadback.MappedData()); // RGBA16F, 4x uint16 per pixel.
+  constexpr float kBackgroundThreshold = 0.04f; // Above the clear color's own ~0.02-0.03 channel values.
+  for (uint32_t sample = 0; sample < kTestWidth * kTestHeight && !foundNonBackgroundPixel; ++sample) {
+    float r = HalfToFloatApprox(pixels[sample * 4 + 0]);
+    float g = HalfToFloatApprox(pixels[sample * 4 + 1]);
+    float b = HalfToFloatApprox(pixels[sample * 4 + 2]);
+    if (r > kBackgroundThreshold || g > kBackgroundThreshold || b > kBackgroundThreshold) {
+      foundNonBackgroundPixel = true;
+    }
+  }
+
+  drawCountReadback.Destroy();
+  colorReadback.Destroy();
+  pcgPass.Shutdown();
+  colorImage.Destroy();
+  depthImage.Destroy();
+
+  if (gpuDrawCount == 0) {
+    LOG_ERROR("[ClusterRenderPipeline] PCG full-pipeline smoke test FAILED: GPU-computed draw count "
+              "(renderer::ClusterCullingPass's own atomic counter) is 0 -- every candidate cluster was "
+              "culled (frustum/backface) despite the camera being framed to see them.");
+    return false;
+  }
+  if (!foundNonBackgroundPixel) {
+    LOG_ERROR("[ClusterRenderPipeline] PCG full-pipeline smoke test FAILED: the rendered offscreen "
+              "image contains no pixel above the background threshold -- clusters survived culling "
+              "(draw count > 0) but nothing visibly rasterized.");
+    return false;
+  }
+
+  LOG_INFO(std::format(
+      "[ClusterRenderPipeline] PCG full-pipeline smoke test PASSED: sampler={} point(s), filter kept {}, "
+      "spawner produced {} request(s), glue acquired {} instance(s), {} candidate cluster(s), GPU draw "
+      "count={}, non-background pixel(s) found in the {}x{} offscreen render. Full sampler->filter->"
+      "spawner->glue->render PCG pipeline verified end-to-end.",
+      sampledPoints.size(), filteredPoints.size(), spawnRequests.size(), acquiredSlots.size(),
+      candidateCount, gpuDrawCount, kTestWidth, kTestHeight));
   return true;
 }
 #endif

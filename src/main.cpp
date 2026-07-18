@@ -569,6 +569,31 @@ int main(int argc, char** argv) {
             LOG_ERROR("[Main] PcgInstanceDrawPass smoke test FAILED -- see log above for the specific check.");
         }
     }
+
+    // Phase 4.2 (PCG roadmap, "Spawner-to-DrawPass Glue" capstone): the real, first-ever end-to-end
+    // run of the FULL PCG pipeline (sampler -> filter -> spawner -> this phase's own glue -> Phase
+    // 0.2's draw path -> a rendered pixel) -- see ClusterRenderPipeline::RunPcgFullPipelineSmokeTest's
+    // own comment for exactly what it checks at each stage. Reuses the SAME 3 already-resident World
+    // Partition streaming archetype meshes (Rock/Bush/Tree fine variants) the smoke test just above
+    // already resolves via VulkanContext::GetStreamingArchetypeFineMeshInfo, now supplied as a
+    // weighted mesh palette (equal 1.0 weight each) for pcg::SpawnFromPoints to pick from -- this
+    // class has no VulkanContext dependency of its own, see PcgFullPipelineSmokeTestMeshDesc's own
+    // comment. Not fatal on failure (logged only), matching every other smoke test's own convention.
+    {
+        std::vector<renderer::ClusterRenderPipeline::PcgFullPipelineSmokeTestMeshDesc> pcgFullPipelineMeshes;
+        static constexpr uint32_t kFullPipelineUnits[3] = { 0u, 1u, 2u }; // Rock, Bush, Tree (same units as above).
+        for (uint32_t i = 0; i < 3u; ++i) {
+            VulkanContext::StreamingArchetypeMeshInfo meshInfo = vkContext.GetStreamingArchetypeFineMeshInfo(kFullPipelineUnits[i]);
+            renderer::ClusterRenderPipeline::PcgFullPipelineSmokeTestMeshDesc desc{};
+            desc.meshID = meshInfo.meshID;
+            desc.materialID = meshInfo.materialID;
+            desc.weight = 1.0f;
+            pcgFullPipelineMeshes.push_back(desc);
+        }
+        if (!clusterPipeline.RunPcgFullPipelineSmokeTest(pcgFullPipelineMeshes, vkContext.GetCommandPool(), vkContext.GetGraphicsQueue())) {
+            LOG_ERROR("[Main] PCG full-pipeline smoke test FAILED -- see log above for the specific check.");
+        }
+    }
 #endif
 
     // Frame-pacing fence, created signaled so the first frame's wait passes immediately. Replaces
