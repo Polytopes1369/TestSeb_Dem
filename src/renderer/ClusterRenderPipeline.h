@@ -164,6 +164,12 @@
 #include "renderer/debug/DebugBufferViewPass.h"
 #include "renderer/debug/DebugTextOverlay.h"
 #include "renderer/debug/ParticleDebugViewPass.h"
+// PCG editor-tooling roadmap, Phase 7.2 ("PCG Point Cloud Debug Visualization"): draws
+// RunPcgFullPipelineSmokeTest()'s own point set as wireframe box gizmos -- see that class' own
+// header comment. Owned by m_PcgPointCloudDebugView below; RunPcgFullPipelineSmokeTest() uploads
+// into it directly (its own local `filteredPoints`), so no extra CPU-side point-set member is
+// needed on this class.
+#include "renderer/debug/PcgPointCloudDebugView.h"
 #include "renderer/passes/SDFRayMarchPass.h"
 // Phase 0.2 (UE5.8-parity PCG roadmap, "PCG Instance Draw Path"): only ever instantiated (as a
 // local variable) inside RunPcgInstanceDrawSmokeTest() below -- see that method's own comment.
@@ -588,6 +594,16 @@ namespace renderer {
         // compiled out of Release, matching RunPcgInstanceDrawSmokeTest's own convention.
         bool RunPcgFullPipelineSmokeTest(const std::vector<PcgFullPipelineSmokeTestMeshDesc>& weightedMeshes,
             VkCommandPool commandPool, VkQueue queue);
+
+        // PCG editor-tooling roadmap, Phase 7.2 ("PCG Point Cloud Debug Visualization"): last
+        // point count RunPcgFullPipelineSmokeTest() uploaded into m_PcgPointCloudDebugView (its own
+        // STEP 2 filter output -- see that method's own comment for exactly where). 0 before that
+        // method has ever run successfully far enough to reach its filter step. Read by the "PCG
+        // Graph Editor" tab's own point-cloud-visualization toggle (main.cpp) to show a live count
+        // next to the checkbox -- the actual draw is entirely internal to RecordFrame (gated by
+        // config::debugview::PCG_POINT_CLOUD_VIZ), main.cpp never touches the raw pcg::PcgPoint
+        // data itself.
+        uint32_t GetDebugPcgPointCloudCount() const { return m_PcgPointCloudDebugView.GetPointCount(); }
 #endif
 
     private:
@@ -1169,6 +1185,13 @@ namespace renderer {
         // own case 15) when that specific index is selected, same "additive, only-when-selected"
         // convention as m_DebugBufferView itself.
         debug::ParticleDebugViewPass m_ParticleDebugView;
+
+        // PCG editor-tooling roadmap, Phase 7.2 ("PCG Point Cloud Debug Visualization"): draws
+        // RunPcgFullPipelineSmokeTest()'s own sampler->filter point set as wireframe box gizmos in
+        // the live 3D scene -- see debug::PcgPointCloudDebugView's own class comment. Recorded in
+        // RecordFrame's [13c] forward block, right after m_ParticleSystem.RecordDraw, gated by
+        // config::debugview::PCG_POINT_CLOUD_VIZ (the "PCG Graph Editor" tab's own checkbox).
+        debug::PcgPointCloudDebugView m_PcgPointCloudDebugView;
 #endif
     };
 

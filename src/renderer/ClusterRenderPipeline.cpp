@@ -917,6 +917,14 @@ bool ClusterRenderPipeline::Init(
   // debug::ParticleDebugViewPass's own class comment. Sized to its own fixed 256x256 grid, not
   // m_DisplayExtent (one pixel per particle slot, not per screen pixel).
   m_ParticleDebugView.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue);
+
+  // PCG editor-tooling roadmap, Phase 7.2 ("PCG Point Cloud Debug Visualization"): backs the "PCG
+  // Graph Editor" tab's own point-cloud-visualization toggle -- see debug::PcgPointCloudDebugView's
+  // own class comment. Same colorFormat/depthFormat pair m_VegetationScatter/m_WaterForward/
+  // m_Tessellation already receive at their own Init() call sites (the shared [13c] forward
+  // color/depth target this pass draws onto too).
+  m_PcgPointCloudDebugView.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
+      GICompositePass::kOutputFormat, createInfo.depthFormat);
 #endif
 
 #ifndef NDEBUG
@@ -2881,6 +2889,20 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
           m_SceneLights, m_WorldProbes.GetGridOriginWorld(),
           config::particles::SOFT_FADE_DISTANCE, particleHeatShimmerStrength, globalTimeSeconds, m_FrameIndex);
     }
+
+#ifndef NDEBUG
+    // PCG editor-tooling roadmap, Phase 7.2 ("PCG Point Cloud Debug Visualization"): recorded LAST
+    // among the [13c] forward passes (right after m_ParticleSystem.RecordDraw) so its wireframe box
+    // gizmos composite on top of everything else drawn this frame -- see
+    // debug::PcgPointCloudDebugView's own class comment for the full barrier/depth-state rationale.
+    // Gated by the "PCG Graph Editor" tab's own checkbox (main.cpp); a no-op call (RecordDraw()
+    // itself also early-outs on GetPointCount() == 0) when either the toggle is off or
+    // RunPcgFullPipelineSmokeTest() has never uploaded a point set.
+    if (config::debugview::PCG_POINT_CLOUD_VIZ) {
+      m_PcgPointCloudDebugView.RecordDraw(cmdLate, transparentTargetImage, transparentTargetView,
+          m_DepthImage, m_DepthImageView, m_RenderExtent, viewProj);
+    }
+#endif
   }
 
   // Phase 2 (Lumen advanced roadmap) fix, 2026-07-17: the old [1z2] hand-off block that used to
@@ -3704,6 +3726,15 @@ bool ClusterRenderPipeline::RunPcgFullPipelineSmokeTest(
   LOG_INFO(std::format(
       "[ClusterRenderPipeline] PCG full-pipeline smoke test: sampler produced {} point(s), filter kept {} of them.",
       sampledPoints.size(), filteredPoints.size()));
+
+  // PCG editor-tooling roadmap, Phase 7.2 ("PCG Point Cloud Debug Visualization"): uploads THIS
+  // point set (the real sampler->filter output, not a hand-authored test fixture) into
+  // m_PcgPointCloudDebugView so the "PCG Graph Editor" tab's own toggle (main.cpp) can draw it as
+  // wireframe box gizmos -- see that class' own header comment. Uploaded here, right after the
+  // filter step succeeds, rather than after the whole smoke test finishes, so a point set is still
+  // available to visualize even if a LATER stage (spawner/glue/render) fails below -- exactly the
+  // debugging scenario this visualization exists for.
+  m_PcgPointCloudDebugView.SetPoints(commandPool, queue, filteredPoints);
 
   // =========================================================================================
   // STEP 3 -- Spawner (Phase 4.1): resolve each surviving point into one PcgSpawnRequest, picking

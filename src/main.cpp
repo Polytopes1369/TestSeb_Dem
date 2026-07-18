@@ -32,6 +32,9 @@
 // Phase 7.1 (PCG editor-tooling roadmap): "PCG Graph Editor" tab scaffold, see that header's own
 // comment for what it does/doesn't do yet.
 #include "renderer/debug/PcgGraphEditorPanel.h"
+// Phase 7.3 (PCG editor-tooling roadmap): "Node Data Inspector" panel drawn alongside the canvas
+// above, plus its own self-contained demo PcgGraph (see that header's DemoGraphState comment).
+#include "renderer/debug/PcgNodeDataInspector.h"
 #endif
 
 // Unreal-editor style viewport navigation: hold the Right Mouse Button to enable FPS-style
@@ -165,6 +168,18 @@ static DebugState g_DebugState;
 // for exactly what it does/doesn't do yet. Initialized once right after ImGui_ImplVulkan_Init()
 // below, drawn from inside ConfigTabs, torn down alongside every other ImGui teardown call.
 static renderer::debug::PcgGraphEditorPanel g_PcgGraphEditorPanel;
+
+// Phase 7.3 (PCG editor-tooling roadmap): the "Node Data Inspector" panel drawn right alongside
+// g_PcgGraphEditorPanel's own canvas above, inside the same "PCG Graph Editor" tab (see
+// renderer::debug::PcgNodeDataInspector's own header comment). g_PcgInspectorDemoGraph is a small,
+// entirely SELF-CONTAINED PcgGraph + PcgGraphEvaluator::EvalResult pair built and evaluated exactly
+// once (renderer::debug::BuildDemoInspectorGraph(), called right after g_PcgGraphEditorPanel.Init()
+// below) purely so this panel has real, non-empty data to display -- Phase 7.1's own canvas has no
+// real backing PcgGraph at all yet. NOT wired to a real authored PCG Volume's graph; that is a
+// future Phase 6 integration point (see tools/WorldPartition/PcgVolumeActor.h, developed elsewhere
+// in this roadmap).
+static renderer::debug::PcgNodeDataInspector g_PcgNodeDataInspector;
+static renderer::debug::DemoGraphState g_PcgInspectorDemoGraph;
 
 static void KeyCallback(GLFWwindow* window, int key, int scancode, int action, int mods) {
     if (action != GLFW_PRESS) return;
@@ -457,6 +472,10 @@ int main(int argc, char** argv) {
     // Phase 7.1 (PCG editor-tooling roadmap): create the node-editor context once ImGui itself is
     // fully up -- see g_PcgGraphEditorPanel's own declaration-site comment.
     g_PcgGraphEditorPanel.Init();
+
+    // Phase 7.3 (PCG editor-tooling roadmap): build + evaluate the Node Data Inspector's own
+    // self-contained demo graph once -- see g_PcgInspectorDemoGraph's own declaration-site comment.
+    g_PcgInspectorDemoGraph = renderer::debug::BuildDemoInspectorGraph();
 #endif
 
     // Builds the consolidated virtual geometry .cache file (scene.cache): reads back the spawned
@@ -1475,9 +1494,41 @@ int main(int argc, char** argv) {
 
             // --- Tab PCG Graph Editor -- Phase 7.1 (PCG editor-tooling roadmap) scaffold: proves
             // the vendored thedmd/imgui-node-editor library is wired end-to-end, nothing more.
-            // See renderer::debug::PcgGraphEditorPanel's own header comment for full context. ---
+            // See renderer::debug::PcgGraphEditorPanel's own header comment for full context.
+            // Phase 7.3 adds the "Node Data Inspector" side panel right below the canvas (same tab,
+            // not a disconnected one -- conceptually the two are the same tool): it shows live
+            // post-evaluation pin data for g_PcgInspectorDemoGraph, a small self-contained demo
+            // graph built at startup, entirely SEPARATE from the canvas above's own placeholder
+            // demo nodes (those are still wired to nothing, see PcgGraphEditorPanel's own comment).
+            // ---
             if (ImGui::BeginTabItem("PCG Graph Editor")) {
                 g_PcgGraphEditorPanel.Draw();
+
+                // Phase 7.2 (PCG editor-tooling roadmap): "PCG Point Cloud Debug Visualization" --
+                // draws renderer::ClusterRenderPipeline::RunPcgFullPipelineSmokeTest()'s own real
+                // sampler->filter point set as wireframe box gizmos in the live 3D scene (see
+                // renderer::debug::PcgPointCloudDebugView's own class comment). This tab only ever
+                // flips the config toggle + shows the live count -- the actual draw call is fully
+                // owned by ClusterRenderPipeline::RecordFrame, this UI never touches a raw
+                // pcg::PcgPoint itself.
+                ImGui::Separator();
+                ImGui::TextUnformatted("Point Cloud Debug Visualization (Phase 7.2)");
+                ImGui::Checkbox("Show Point Cloud Gizmos", &config::debugview::PCG_POINT_CLOUD_VIZ);
+                ImGui::TextDisabled("Points visualized: %u (from RunPcgFullPipelineSmokeTest's sampler->filter output)",
+                    clusterPipeline.GetDebugPcgPointCloudCount());
+
+                ImGui::Separator();
+                ImGui::TextWrapped(
+                    "Phase 7.3: Node Data Inspector -- shows live post-evaluation pin data for a small, "
+                    "SELF-CONTAINED demo graph built at startup (independent of the canvas above, which "
+                    "is still Phase 7.1's disconnected placeholder scaffold). Not yet wired to a real "
+                    "authored PCG Volume's graph -- that is a future Phase 6 integration point.");
+                if (ImGui::BeginChild("PcgNodeDataInspector_Child", ImVec2(0.0f, 320.0f), ImGuiChildFlags_Borders)) {
+                    g_PcgNodeDataInspector.Draw(g_PcgInspectorDemoGraph.graph, g_PcgInspectorDemoGraph.evalResult,
+                        &g_PcgInspectorDemoGraph.catalog);
+                }
+                ImGui::EndChild();
+
                 ImGui::EndTabItem();
             }
 

@@ -489,6 +489,16 @@ set(WORLDPARTITION_OFPA_SOURCES
     tools/WorldPartition/OfpaActor.cpp
     tools/WorldPartition/SceneIndex.cpp
 )
+# PCG roadmap Phase 6.1 ("PCG Volume Authoring"): PcgVolumeActor.cpp packs/unpacks a PcgVolumeDesc
+# into/from an ordinary worldpartition::ActorRecord (WORLDPARTITION_OFPA_SOURCES above) and computes
+# a volume's overlapping cells via worldpartition::SpatialHashGrid -- kept as its own source-list
+# variable (rather than folded into WORLDPARTITION_OFPA_SOURCES) since it additionally needs
+# SpatialHashGrid.cpp linked, which plain OFPA serialization does not.
+set(WORLDPARTITION_PCG_VOLUME_SOURCES
+    ${WORLDPARTITION_OFPA_SOURCES}
+    tools/WorldPartition/SpatialHashGrid.cpp
+    tools/WorldPartition/PcgVolumeActor.cpp
+)
 set(WORLDPARTITION_HLOD_SOURCES
     tools/WorldPartition/Uuid.cpp
     tools/WorldPartition/SpatialHashGrid.cpp
@@ -512,6 +522,14 @@ add_executable(SpatialHashGridTests
 )
 target_include_directories(SpatialHashGridTests PRIVATE src tools ${Vulkan_INCLUDE_DIRS})
 add_test(NAME SpatialHashGridTests COMMAND SpatialHashGridTests)
+
+# PCG roadmap Phase 6.1 ("PCG Volume Authoring", tools/WorldPartition/PcgVolumeActor.h/.cpp).
+add_executable(PcgVolumeActorTests
+    ${WORLDPARTITION_PCG_VOLUME_SOURCES}
+    tests/PcgVolumeActorTests.cpp
+)
+target_include_directories(PcgVolumeActorTests PRIVATE src tools ${Vulkan_INCLUDE_DIRS})
+add_test(NAME PcgVolumeActorTests COMMAND PcgVolumeActorTests)
 
 add_executable(HlodPipelineTests
     ${WORLDPARTITION_HLOD_SOURCES}
