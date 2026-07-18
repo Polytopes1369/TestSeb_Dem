@@ -499,6 +499,27 @@ set(WORLDPARTITION_PCG_VOLUME_SOURCES
     tools/WorldPartition/SpatialHashGrid.cpp
     tools/WorldPartition/PcgVolumeActor.cpp
 )
+
+# PCG roadmap Phase 7.4 ("PCG Volume Parameter Override UI",
+# src/renderer/debug/PcgVolumeInspector.h/.cpp): the ONLY place in this codebase where the offline
+# tools/WorldPartition/ toolset gets linked into the shipping DemoSceneVK target itself, rather
+# than one of the standalone tests/*.cpp executables above -- and even then, ONLY for the Debug
+# configuration (see the $<$<CONFIG:Debug>:...> generator expressions below, the exact same idiom
+# ${IMGUI_SOURCES}/${NODE_EDITOR_SOURCES} already use above for other Debug-only vendored/tooling
+# code). PcgVolumeInspector scans world_data/actors/ for authored PcgVolume .actor files at
+# Debug-build startup, which requires worldpartition::ReadActorFile/TryParsePcgVolumeDesc
+# (WORLDPARTITION_PCG_VOLUME_SOURCES above) to actually be linked in. The Release configuration
+# compiles ZERO of this: PcgVolumeInspector.h/.cpp are themselves whole-file #ifndef NDEBUG-gated,
+# AND the generator expression below drops WORLDPARTITION_PCG_VOLUME_SOURCES/the `tools` include
+# directory entirely from a Release build -- WorldPartitionTypes.h's own header comment ("never
+# linked into the shipping DemoSceneVK executable") still holds for Release, the actual shipping
+# configuration this project ships.
+target_sources(${PROJECT_NAME} PRIVATE
+    $<$<CONFIG:Debug>:${WORLDPARTITION_PCG_VOLUME_SOURCES}>
+)
+target_include_directories(${PROJECT_NAME} PRIVATE
+    $<$<CONFIG:Debug>:${CMAKE_CURRENT_SOURCE_DIR}/tools>
+)
 set(WORLDPARTITION_HLOD_SOURCES
     tools/WorldPartition/Uuid.cpp
     tools/WorldPartition/SpatialHashGrid.cpp
