@@ -206,7 +206,7 @@ namespace renderer {
 
         // Draws every alive particle (see ParticleRender.vert's own header comment) via
         // vkCmdDrawIndirect against `colorView`/`depthView` -- the SAME forward-pass color/depth
-        // attachment pair renderer::TransparentForwardPass/HeroTessellationPass/WaterForwardPass
+        // attachment pair renderer::TransparentForwardPass/TessellationPass/WaterForwardPass
         // already target (`colorImage` is needed for a trailing layout-transition barrier, same
         // convention as those passes' own RecordDraw). Depth is bound read-only (loadOp=LOAD,
         // depthWriteEnable=FALSE, VK_COMPARE_OP_GREATER reversed-Z) -- particles are correctly

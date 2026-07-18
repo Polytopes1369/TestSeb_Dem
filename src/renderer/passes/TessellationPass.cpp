@@ -1,4 +1,4 @@
-#include "renderer/passes/HeroTessellationPass.h"
+#include "renderer/passes/TessellationPass.h"
 
 #include <array>
 #include <cstring>
@@ -17,10 +17,13 @@ namespace renderer {
 
     namespace {
 
-        // Byte-for-byte mirror of HeroTessellationConstants in HeroTessellation.vert/.tesc/.tese/
-        // .frag -- flat scalar fields throughout, matching this codebase's established push-
-        // constant convention (see GlobalSDFCompositePC's own comment).
-        struct HeroTessellationConstants {
+        // Byte-for-byte mirror of TessellationConstants in Tessellation.vert/.tesc/.tese/.frag --
+        // flat scalar fields throughout, matching this codebase's established push-constant
+        // convention (see GlobalSDFCompositePC's own comment). `materialID` replaces the original
+        // hero-only layout's trailing `_pad1` float (same 4-byte slot, now a real per-draw field --
+        // see class comment on why every entity now carries its own materialID instead of this pass
+        // shading a single fixed material).
+        struct TessellationConstants {
             maths::mat4 viewProj;
             float cameraPositionWorldX = 0, cameraPositionWorldY = 0, cameraPositionWorldZ = 0;
             float _pad0 = 0;
@@ -30,23 +33,23 @@ namespace renderer {
             uint32_t entityCount = 0;
             float viewportWidth = 0, viewportHeight = 0;
             float displacementScale = 0;
-            float _pad1 = 0;
+            uint32_t materialID = 0;
         };
-        static_assert(sizeof(HeroTessellationConstants) == 112,
-            "HeroTessellationConstants must match HeroTessellation.vert/.tesc/.tese/.frag's push_constant block exactly");
-        static_assert(sizeof(HeroTessellationConstants) <= 128,
+        static_assert(sizeof(TessellationConstants) == 112,
+            "TessellationConstants must match Tessellation.vert/.tesc/.tese/.frag's push_constant block exactly");
+        static_assert(sizeof(TessellationConstants) <= 128,
             "Must stay under the Vulkan-guaranteed minimum maxPushConstantsSize (128 bytes) -- see this phase's own 'no runtime capability query' decision.");
 
-        // Byte-for-byte mirror of HeroTessellation.frag's own HeroLightingUBO (std140): only the
-        // sun fields TransparentViewParamsUBO also carries -- viewProj/cameraPos are already in
+        // Byte-for-byte mirror of Tessellation.frag's own TessellationLightingUBO (std140): only
+        // the sun fields TransparentViewParamsUBO also carries -- viewProj/cameraPos are already in
         // the push constants above (needed by the vertex/tessellation stages too), so this UBO
         // does not duplicate them.
-        struct HeroLightingUBO {
+        struct TessellationLightingUBO {
             float sunDirX = 0, sunDirY = 0, sunDirZ = 0, sunIntensity = 0;
             float sunColorR = 0, sunColorG = 0, sunColorB = 0, _pad0 = 0;
         };
-        static_assert(sizeof(HeroLightingUBO) == 32,
-            "HeroLightingUBO must match HeroTessellation.frag's own HeroLightingUBO exactly (std140 layout)");
+        static_assert(sizeof(TessellationLightingUBO) == 32,
+            "TessellationLightingUBO must match Tessellation.frag's own TessellationLightingUBO exactly (std140 layout)");
 
         // Byte-for-byte mirror of world_probe_sampling.glsl's WorldProbeGridParamsUBO (std140) --
         // identical to renderer::TransparentForwardPass's own copy.
@@ -61,12 +64,12 @@ namespace renderer {
 
     } // namespace
 
-    bool HeroTessellationPass::Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
+    bool TessellationPass::Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
         VkFormat colorFormat, VkFormat depthFormat,
         VkBuffer entityTransformBuffer,
-        const MaterialParameters& heroMaterial,
+        const std::array<MaterialParameters, kMaxMaterials>& materialTable,
         VkBuffer fallbackVertexBuffer, VkBuffer fallbackIndexBuffer,
-        const SurfaceCachePass::EntityDrawRange& heroEntityDrawRange, uint32_t heroEntityID,
+        const std::vector<TessellatedEntityDrawInfo>& entities,
         VkAccelerationStructureKHR tlasHandle, VkBuffer drawRangeBuffer,
         VkBuffer lightBuffer, VkDeviceSize lightBufferSize,
         const VirtualShadowMapPass& vsm, const WorldProbeGridPass& worldProbes,
@@ -74,8 +77,7 @@ namespace renderer {
         Shutdown();
 
         m_Device = device;
-        m_HeroEntityDrawRange = heroEntityDrawRange;
-        m_HeroEntityID = heroEntityID;
+        m_Entities = entities;
         m_FallbackVertexBuffer = fallbackVertexBuffer;
         m_FallbackIndexBuffer = fallbackIndexBuffer;
 
@@ -84,16 +86,21 @@ namespace renderer {
         // World Probe Grid, material params, entity transform (vertex-stage), shared TLAS,
         // MegaLights' light SSBO, and the fallback-geometry trio for the optional reflection
         // trace's HWRT path) -- mirrors renderer::TransparentForwardPass's own Forward set shape.
+        // Built unconditionally even if `entities` is empty -- a valid, if degenerate, pass
+        // instance whose RecordDraw() is simply always a no-op (see that method's own comment); no
+        // early-return here keeps Shutdown()/Init() symmetric regardless of entity count, matching
+        // this codebase's own established "always own valid Vulkan objects once Init() returns
+        // true" convention.
         // =====================================================================================
         VkDescriptorSetLayoutBinding bindings[14]{};
-        bindings[0] = { 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr };         // HeroLightingUBO (sun dir/intensity/color)
+        bindings[0] = { 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr };         // TessellationLightingUBO (sun dir/intensity/color)
         bindings[1] = { 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr }; // g_ShadowPhysicalAtlas
         bindings[2] = { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr };         // g_ShadowPageTable
         bindings[3] = { 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr };         // g_ShadowFeedback
         bindings[4] = { 4, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr };         // g_ShadowSunLevels
         bindings[5] = { 5, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr }; // g_WorldProbeGrid
         bindings[6] = { 6, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr };         // WorldProbeGridParamsUBO
-        bindings[7] = { 7, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr };         // MaterialParamsSSBO
+        bindings[7] = { 7, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr };         // MaterialParamsSSBO[kMaxMaterials]
         bindings[8] = { 8, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, nullptr };           // EntityTransformSSBO (vertex-stage only)
         bindings[9] = { 9, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr }; // g_TLAS (shared: MegaLights TraceShadowRay + reflection TraceHWRT)
         bindings[10] = { 10, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr };       // MegaLights g_Lights
@@ -107,12 +114,10 @@ namespace renderer {
         VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &layoutInfo, nullptr, &m_SetLayout));
 
         VkDescriptorPoolSize poolSizes[4]{};
-        poolSizes[0] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 7 };             // bindings 2,3,7,8,10,11,12,13 (7 counted below correctly: 2,3,7,8,10,11,12,13 is 8 -- see note)
+        poolSizes[0] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8 };             // bindings 2,3,7,8,10,11,12,13
         poolSizes[1] = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 3 };             // bindings 0,4,6
         poolSizes[2] = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2 };     // bindings 1,5
         poolSizes[3] = { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1 }; // binding 9
-        // STORAGE_BUFFER bindings: 2,3,7,8,10,11,12,13 = 8 total.
-        poolSizes[0].descriptorCount = 8;
         VkDescriptorPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
         poolInfo.maxSets = 1;
         poolInfo.poolSizeCount = 4;
@@ -131,7 +136,7 @@ namespace renderer {
         // everything is written once, here, mirroring renderer::TransparentForwardPass::Init's own
         // identical STEP 2.
         // =====================================================================================
-        m_ViewParamsBuffer.Create(allocator, sizeof(HeroLightingUBO),
+        m_ViewParamsBuffer.Create(allocator, sizeof(TessellationLightingUBO),
             VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
         VkDescriptorBufferInfo lightingInfo{ m_ViewParamsBuffer.Handle(), 0, m_ViewParamsBuffer.Size() };
 
@@ -157,12 +162,14 @@ namespace renderer {
             VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, VMA_MEMORY_USAGE_CPU_TO_GPU, /*mapped=*/true);
         VkDescriptorBufferInfo worldProbeGridParamsInfo{ m_WorldProbeGridParamsBuffer.Handle(), 0, m_WorldProbeGridParamsBuffer.Size() };
 
-        // Single-element MaterialParams buffer -- see Init()'s own `heroMaterial` parameter
-        // comment for why this pass doesn't share TransparentForwardPass's own full-table upload.
-        m_MaterialParamsBuffer.Create(allocator, sizeof(MaterialParameters),
+        // Full MaterialParameters[kMaxMaterials] buffer -- generalized from the original single-
+        // element hero buffer (see Init()'s own `materialTable` parameter comment and class
+        // comment); each entity's draw indexes its own slot via its push-constant materialID,
+        // exactly mirroring renderer::TransparentForwardPass::Init's own identical upload.
+        m_MaterialParamsBuffer.Create(allocator, sizeof(MaterialParameters) * kMaxMaterials,
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
         VulkanUtils::ExecuteOneShotCommands(m_Device, commandPool, queue, [&](VkCommandBuffer cmd) {
-            vkCmdUpdateBuffer(cmd, m_MaterialParamsBuffer.Handle(), 0, sizeof(MaterialParameters), &heroMaterial);
+            vkCmdUpdateBuffer(cmd, m_MaterialParamsBuffer.Handle(), 0, sizeof(MaterialParameters) * kMaxMaterials, materialTable.data());
             VulkanUtils::RecordMemoryBarrier(cmd,
                 VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
                 VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
@@ -211,7 +218,7 @@ namespace renderer {
         pushConstantRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT
             | VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
         pushConstantRange.offset = 0;
-        pushConstantRange.size = sizeof(HeroTessellationConstants);
+        pushConstantRange.size = sizeof(TessellationConstants);
 
         VkPipelineLayoutCreateInfo pipelineLayoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
         pipelineLayoutInfo.setLayoutCount = 3;
@@ -228,12 +235,15 @@ namespace renderer {
         // (patchControlPoints=3 -- the Fallback Mesh's own indexed triangle-list is reinterpreted
         // as 3-vertex patches, no index-buffer change needed), no blending (opaque), depth test
         // ENABLED and depth WRITE ENABLED (unlike glass -- see this class' own header comment),
-        // reversed-Z VK_COMPARE_OP_GREATER matching every other 3D pipeline.
+        // reversed-Z VK_COMPARE_OP_GREATER matching every other 3D pipeline. ONE pipeline is shared
+        // by every tessellated entity's draw (see RecordDraw()'s own comment) -- no per-entity
+        // pipeline variation needed, since every entity uses the same vertex layout/topology/
+        // shading algorithm, only its own materialID/entityID/geometry range differ.
         // =====================================================================================
-        VkShaderModule vertModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/HeroTessellation.vert.spv");
-        VkShaderModule tescModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/HeroTessellation.tesc.spv");
-        VkShaderModule teseModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/HeroTessellation.tese.spv");
-        VkShaderModule fragModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/HeroTessellation.frag.spv");
+        VkShaderModule vertModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/Tessellation.vert.spv");
+        VkShaderModule tescModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/Tessellation.tesc.spv");
+        VkShaderModule teseModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/Tessellation.tese.spv");
+        VkShaderModule fragModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/Tessellation.frag.spv");
 
         VkPipelineShaderStageCreateInfo stages[4]{};
         stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
@@ -270,7 +280,7 @@ namespace renderer {
         vertexInput.pVertexAttributeDescriptions = attributes;
 
         // PATCH_LIST, not TRIANGLE_LIST -- the tessellation control stage consumes 3-control-point
-        // patches (see HeroTessellation.tesc's own layout(vertices=3) out).
+        // patches (see Tessellation.tesc's own layout(vertices=3) out).
         VkPipelineInputAssemblyStateCreateInfo inputAssembly{ VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
         inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_PATCH_LIST;
         inputAssembly.primitiveRestartEnable = VK_FALSE;
@@ -311,9 +321,9 @@ namespace renderer {
 
         // Depth test AND WRITE enabled (unlike renderer::TransparentForwardPass's read-only test) --
         // this pass is fully opaque and must occupy real depth so TransparentForwardPass's own
-        // subsequent depth test correctly occludes glass against this entity's real
-        // (tessellated/displaced) surface -- see this class' own header comment and RecordDraw()'s
-        // own barrier comment for the full synchronization consequence.
+        // subsequent depth test correctly occludes glass against each tessellated entity's real
+        // (displaced) surface -- see this class' own header comment and RecordDraw()'s own barrier
+        // comment for the full synchronization consequence.
         VkPipelineDepthStencilStateCreateInfo depthStencil{ VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
         depthStencil.depthTestEnable = VK_TRUE;
         depthStencil.depthWriteEnable = VK_TRUE;
@@ -353,11 +363,11 @@ namespace renderer {
         vkDestroyShaderModule(m_Device, teseModule, nullptr);
         vkDestroyShaderModule(m_Device, fragModule, nullptr);
 
-        LOG_INFO(std::format("[HeroTessellationPass] Initialized (hero entity meshID={}).", m_HeroEntityID));
+        LOG_INFO(std::format("[TessellationPass] Initialized ({} tessellated entities).", m_Entities.size()));
         return true;
     }
 
-    void HeroTessellationPass::Shutdown() {
+    void TessellationPass::Shutdown() {
         if (m_Device != VK_NULL_HANDLE) {
             if (m_Pipeline != VK_NULL_HANDLE) vkDestroyPipeline(m_Device, m_Pipeline, nullptr);
             if (m_PipelineLayout != VK_NULL_HANDLE) vkDestroyPipelineLayout(m_Device, m_PipelineLayout, nullptr);
@@ -378,20 +388,27 @@ namespace renderer {
         m_Set = VK_NULL_HANDLE;
         m_FallbackVertexBuffer = VK_NULL_HANDLE;
         m_FallbackIndexBuffer = VK_NULL_HANDLE;
-        m_HeroEntityDrawRange = SurfaceCachePass::EntityDrawRange{};
-        m_HeroEntityID = 0;
+        m_Entities.clear();
         m_Device = VK_NULL_HANDLE;
     }
 
-    void HeroTessellationPass::RecordDraw(VkCommandBuffer cmd, const maths::mat4& viewProj, const maths::vec3& cameraPositionWorld,
+    void TessellationPass::RecordDraw(VkCommandBuffer cmd, const maths::mat4& viewProj, const maths::vec3& cameraPositionWorld,
         VkImage colorImage, VkImageView colorView, VkImage depthImage, VkImageView depthView,
         VkExtent2D extent, uint32_t traceMode, uint32_t frameIndex,
         const SurfaceCacheTraceContext& traceContext, const WorldProbeGridPass& worldProbes,
         const SceneLights& sceneLights) {
 
-        // Refresh this pass' own small sun-lighting UBO (binding 0) every call -- mirrors
-        // renderer::TransparentForwardPass::RecordDraw's own per-frame view-params refresh.
-        HeroLightingUBO lightingUBO{};
+        // No tessellated entity to draw this run (see Init()'s own comment on the empty-`entities`
+        // case) -- nothing to transition/render, mirrors TransparentForwardPass::RecordDraw's own
+        // zero-cluster early return.
+        if (m_Entities.empty()) {
+            return;
+        }
+
+        // Refresh this pass' own small sun-lighting UBO (binding 0) once per call, shared by every
+        // entity's draw below -- mirrors renderer::TransparentForwardPass::RecordDraw's own
+        // per-frame view-params refresh.
+        TessellationLightingUBO lightingUBO{};
         lightingUBO.sunDirX = sceneLights.sun.direction.x;
         lightingUBO.sunDirY = sceneLights.sun.direction.y;
         lightingUBO.sunDirZ = sceneLights.sun.direction.z;
@@ -479,6 +496,11 @@ namespace renderer {
 
         vkCmdBeginRendering(cmd, &renderingInfo);
 
+        // Pipeline/descriptor sets/vertex+index buffers are bound ONCE outside the per-entity loop
+        // below -- every tessellated entity shares the exact same pipeline and shared Fallback Mesh
+        // buffers (see class comment), only the push constants and the draw's own
+        // firstIndex/vertexOffset/indexCount change per entity, so re-binding any of this state
+        // inside the loop would be redundant work with zero behavioral difference.
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_Pipeline);
 
         VkDescriptorSet sets[3] = { m_Set, traceContext.GetMeshSdfTraceSet(), traceContext.GetSurfaceCacheSamplingSet() };
@@ -487,23 +509,6 @@ namespace renderer {
         VkDeviceSize vertexOffset = 0;
         vkCmdBindVertexBuffers(cmd, 0, 1, &m_FallbackVertexBuffer, &vertexOffset);
         vkCmdBindIndexBuffer(cmd, m_FallbackIndexBuffer, 0, VK_INDEX_TYPE_UINT32);
-
-        HeroTessellationConstants pc{};
-        pc.viewProj = viewProj;
-        pc.cameraPositionWorldX = cameraPositionWorld.x;
-        pc.cameraPositionWorldY = cameraPositionWorld.y;
-        pc.cameraPositionWorldZ = cameraPositionWorld.z;
-        pc.entityID = m_HeroEntityID;
-        pc.traceMode = traceMode;
-        pc.frameIndex = frameIndex;
-        pc.entityCount = traceContext.GetEntityCount();
-        pc.viewportWidth = static_cast<float>(extent.width);
-        pc.viewportHeight = static_cast<float>(extent.height);
-        pc.displacementScale = kDisplacementScale;
-        vkCmdPushConstants(cmd, m_PipelineLayout,
-            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT
-                | VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-            0, sizeof(pc), &pc);
 
         VkViewport viewport{};
         viewport.width = static_cast<float>(extent.width);
@@ -516,8 +521,31 @@ namespace renderer {
         scissor.extent = extent;
         vkCmdSetScissor(cmd, 0, 1, &scissor);
 
-        vkCmdDrawIndexed(cmd, m_HeroEntityDrawRange.indexCount, 1, m_HeroEntityDrawRange.firstIndex,
-            m_HeroEntityDrawRange.vertexOffset, 0);
+        // One indexed draw PER tessellated entity -- see class' own "ONE pipeline, MANY entities,
+        // ONE draw call per entity" comment for why this stays a simple loop of direct draws
+        // instead of TransparentForwardPass's own per-frame compact/indirect-multi-draw machinery.
+        for (const TessellatedEntityDrawInfo& entity : m_Entities) {
+            TessellationConstants pc{};
+            pc.viewProj = viewProj;
+            pc.cameraPositionWorldX = cameraPositionWorld.x;
+            pc.cameraPositionWorldY = cameraPositionWorld.y;
+            pc.cameraPositionWorldZ = cameraPositionWorld.z;
+            pc.entityID = entity.entityID;
+            pc.traceMode = traceMode;
+            pc.frameIndex = frameIndex;
+            pc.entityCount = traceContext.GetEntityCount();
+            pc.viewportWidth = static_cast<float>(extent.width);
+            pc.viewportHeight = static_cast<float>(extent.height);
+            pc.displacementScale = kDisplacementScale;
+            pc.materialID = entity.materialID;
+            vkCmdPushConstants(cmd, m_PipelineLayout,
+                VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT
+                    | VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                0, sizeof(pc), &pc);
+
+            vkCmdDrawIndexed(cmd, entity.drawRange.indexCount, 1, entity.drawRange.firstIndex,
+                entity.drawRange.vertexOffset, 0);
+        }
 
         vkCmdEndRendering(cmd);
 
@@ -527,13 +555,14 @@ namespace renderer {
         // restore barrier (which only ever READ depth, never wrote it, so a COMPUTE_SHADER/
         // SHADER_SAMPLED_READ source scope sufficed), THIS pass' restore barrier's source scope
         // must be EARLY/LATE_FRAGMENT_TESTS + DEPTH_STENCIL_ATTACHMENT_WRITE (what this pass
-        // itself just did), and its destination scope must cover BOTH the next fragment-tests
-        // consumer (TransparentForwardPass's own depth test) AND the later compute-shader sampled
-        // read (the HZB rebuild) -- a mechanical copy of TransparentForwardPass's own restore
-        // barrier would silently leave that depth test unsynchronized against this pass' real
-        // depth write, since that call site's own entry barrier is hardcoded assuming only a prior
-        // COMPUTE_SHADER/SHADER_SAMPLED_READ source (correct for its own no-op-if-glass-ran-first
-        // case, but not for what THIS pass just did to the SAME image). ---
+        // itself just did, across every tessellated entity's draw above), and its destination scope
+        // must cover BOTH the next fragment-tests consumer (TransparentForwardPass's own depth
+        // test) AND the later compute-shader sampled read (the HZB rebuild) -- a mechanical copy of
+        // TransparentForwardPass's own restore barrier would silently leave that depth test
+        // unsynchronized against this pass' real depth write, since that call site's own entry
+        // barrier is hardcoded assuming only a prior COMPUTE_SHADER/SHADER_SAMPLED_READ source
+        // (correct for its own no-op-if-tessellated-entity-ran-first case, but not for what THIS
+        // pass just did to the SAME image). ---
         VkImageMemoryBarrier2 restoreBarriers[2]{};
         restoreBarriers[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
         restoreBarriers[0].srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;

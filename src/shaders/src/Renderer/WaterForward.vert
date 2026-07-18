@@ -2,7 +2,7 @@
 #extension GL_GOOGLE_include_directive : enable
 
 // Phase 7c (UE5.8 parity roadmap, water/erosion): forward-rendered water plane vertex shader --
-// near-literal copy of HeroTessellation.vert's own entity-transform pattern (see
+// near-literal copy of Tessellation.vert's own entity-transform pattern (see
 // renderer::WaterForwardPass's own class comment for why this is a sibling pass, not a
 // generalization of TransparentForwardPass). The water entity is statically flat (no vertex
 // displacement -- wave perturbation is shading-only, applied to the NORMAL in WaterForward.frag,

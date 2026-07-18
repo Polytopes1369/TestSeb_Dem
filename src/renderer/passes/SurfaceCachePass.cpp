@@ -163,7 +163,7 @@ namespace renderer {
         // (diverts an entity's clusters out of the opaque Nanite candidate list at
         // ClusterLODCompact.comp), also forced true on the fully-opaque hero entity (kHeroMaterialID,
         // alpha 1.0 -- see renderer::VulkanContext::BuildEntityData()'s own comment) purely so that
-        // entity is diverted to HeroTessellationPass instead of the opaque path. Filtering cards on
+        // entity is diverted to TessellationPass instead of the opaque path. Filtering cards on
         // that flag would wrongly strip the opaque hero's own Surface Cache cards too. The entity's
         // REAL material alpha (materialTable.params[entityDataCPU[card.entityID].materialID].alpha)
         // correctly catches water (kWaterMaterialID, alpha 0.85) while correctly sparing the hero
