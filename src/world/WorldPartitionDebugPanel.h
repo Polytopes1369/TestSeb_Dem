@@ -11,7 +11,7 @@
 #include <cstdint>
 
 namespace world {
-class WorldPartition;
+class StreamingManager;
 }
 
 namespace world::debug {
@@ -25,7 +25,7 @@ public:
 
     // Render ImGui diagnostics panel for world streaming and partition grid.
     // Shows active cells, entity distribution, memory usage, and streaming throughput.
-    static void RenderImGui(const world::WorldPartition& partition);
+    static void RenderImGui(const world::StreamingManager& streaming);
 };
 
 } // namespace world::debug

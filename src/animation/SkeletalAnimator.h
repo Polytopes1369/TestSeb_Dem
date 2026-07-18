@@ -160,6 +160,15 @@ namespace animation {
         // {boneIdx * kSegmentLength, 0, 0} for any boneIdx in [0, kBoneCount).
         static maths::vec3 BindPoseBoneLocalPosition(uint32_t boneIdx);
 
+#ifndef NDEBUG
+        // Debug-only accessors for ImGui diagnostics (AnimationDebugPanel.cpp).
+        uint32_t GetBoneCount() const { return kBoneCount; }
+        const Bone& GetBone(uint32_t boneIdx) const { return m_Bones[boneIdx]; }
+        const maths::mat4& GetInverseBindWorldMatrix(uint32_t boneIdx) const { return m_InverseBindWorldMatrices[boneIdx]; }
+        float GetUndulationAmplitude() const { return kUndulationAmplitudeRadians; }
+        float GetUndulationSpeed() const { return kUndulationSpeed; }
+#endif
+
     private:
         // Builds m_Bones[0..kBoneCount) as a straight parent chain (bone i's parent is i-1, bone 0
         // is the root) with identity bind-pose rotation and bindPoseLocalTranslation ==

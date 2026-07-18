@@ -3,6 +3,7 @@
 #include "audio/AudioDebugPanel.h"
 #include "audio/AudioEngine.h"
 #include <imgui.h>
+#include <string>
 
 namespace audio::debug {
 
