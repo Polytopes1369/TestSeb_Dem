@@ -3383,6 +3383,23 @@ void VulkanContext::UpdateEntityRotations(float timeSeconds, const maths::vec3 &
       xform.centerY = kWaterLevel;
       xform.centerZ = 0.0f;
       xform._pad0 = 0.0f;
+    } else if (meshID == kCreatureEntityIndex) {
+      // Skeletal-animation creature (renderer::ClusterRenderPipeline's own m_SkeletalAnimator):
+      // static, no self-rotation here -- exactly like the procedural trees branch below, its full
+      // world placement (kCreatureClearingX/kCreatureGroundY, see GenerateGeometry()'s own CREATURE
+      // block) is already baked into restPos by geom_creature.comp's worldOffsetX/Y/Z push-constant
+      // fields, and ALL of its visible motion comes from GPU-side skinning
+      // (skeletal_animation.glsl's ApplySkeletalSkinning), not from this per-frame CPU rotation
+      // matrix. With rotation == identity, `center + rotation*(restPos - center)` reduces to exactly
+      // `restPos` regardless of center (same fact the floor/wallA/wallB/water/tree branches above
+      // already rely on) -- this branch exists purely to keep GridSlot(meshID) (below, sized for
+      // only the original 12 gallery primitives) from ever being called with kCreatureEntityIndex,
+      // which is always well outside that [0,12) range.
+      xform.rotation = maths::mat4{};
+      xform.centerX = 0.0f;
+      xform.centerY = 0.0f;
+      xform.centerZ = 0.0f;
+      xform._pad0 = 0.0f;
     } else if (meshID >= kTreeEntityIndexBase && meshID < kTreeEntityIndexBase + kTreeEntityCount) {
       // Procedural trees (renderer::ProceduralTreePass): static, no self-rotation (a real tree
       // doesn't spin like the showcase primitives below) -- `center`'s exact value is mathematically
