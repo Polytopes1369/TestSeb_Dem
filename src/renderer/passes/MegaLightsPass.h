@@ -136,6 +136,18 @@ namespace renderer {
         VkBuffer GetLightBufferHandle() const { return m_LightBuffer.Handle(); }
         VkDeviceSize GetLightBufferSize() const { return m_LightBuffer.Size(); }
 
+        // Niagara-parity render-integration roadmap, D4 (particles as light emitters): the byte
+        // offset into GetLightBufferHandle() where the kMaxParticleDerivedLights (MegaLightsTypes.h)
+        // reserved "particle-derived" light slots start -- renderer::ParticleSystemPass::
+        // RecordExtractLights binds GetLightBufferHandle() at exactly this VkDescriptorBufferInfo.
+        // offset (range = kMaxParticleDerivedLights * sizeof(MegaLight)) so its own compute shader
+        // sees a plain MegaLight[kMaxParticleDerivedLights] array starting at index 0, with no need
+        // to know this pass' own header size or static population count. See Init()'s own STEP 1
+        // comment for why these slots exist and are always safe to overwrite every frame.
+        static constexpr VkDeviceSize GetParticleLightsBufferOffset() {
+            return 16 /* header bytes -- matches Init()'s own kHeaderBytes */ + static_cast<VkDeviceSize>(kMaxMegaLights) * sizeof(MegaLight);
+        }
+
     private:
         VkDevice m_Device = VK_NULL_HANDLE;
         VmaAllocator m_Allocator = VK_NULL_HANDLE;

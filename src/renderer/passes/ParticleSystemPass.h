@@ -31,6 +31,7 @@
 #include <vk_mem_alloc.h>
 
 #include "core/maths/Maths.h"
+#include "renderer/LightingTypes.h" // SceneLights -- Niagara-parity render-integration roadmap, D3 (point-light VSM shadows).
 #include "renderer/vulkan/GpuBuffer.h"
 
 namespace renderer {
@@ -40,6 +41,9 @@ namespace renderer {
     class ClusterResolvePass;
     class VirtualShadowMapPass;
     class WorldProbeGridPass;
+    class MegaLightsPass;               // Niagara-parity render-integration roadmap, D1/D4.
+    class SurfaceCacheRayTracingPass;    // D1 (shared g_TLAS for MegaLights' shadow-visibility ray).
+    class AtmosVolumetricFogPass;        // D5 (froxel fog tint/modulation).
 
     // Byte-for-byte mirror of ParticleCommon.glsl's `Particle` struct -- 80 bytes, std430 (vec3
     // members are 16-byte aligned in std430, so the trailing scalar after each vec3 packs into the
@@ -248,13 +252,41 @@ namespace renderer {
         // same 4-resource contract as renderer::TransparentForwardPass's own SetVirtualShadowMap, but
         // taken directly as an Init() parameter here rather than a deferred setter, since
         // ClusterRenderPipeline::Init() already has `vsm` fully ready by the time it reaches this
-        // call) and `worldProbes`' grid + a ONE-TIME-uploaded WorldProbeGridParamsUBO (mirrors
-        // TransparentForwardPass's own identical "static addressing" simplification -- the grid's
-        // toroidal recentering is not re-uploaded per frame here either, see that class' own Init()
-        // comment for why that limitation already exists elsewhere in this codebase).
+        // call) and `worldProbes`' grid + a WorldProbeGridParamsUBO.
+        //
+        // D6 fix (Niagara-parity render-integration roadmap): the grid's toroidal recenter origin is
+        // now re-uploaded EVERY RecordDraw() call (see that method's own comment) instead of once
+        // here at Init() -- `worldProbes` is still taken here (unchanged contract) since its grid
+        // VIEW/SAMPLER never change, only the live origin threaded through RecordDraw does.
+        //
+        // D1 (MegaLights sampling for particles): set 3 additionally borrows `megaLights`' own light
+        // SSBO (stochastic RIS point-light draw, same MEGALIGHTS_LIGHTS_SET contract
+        // TransparentForward.frag's own inline MegaLights shading already establishes) and
+        // `rtPass`'s TLAS (the one shadow-visibility ray MegaLightsShade.comp's own algorithm also
+        // traces) -- `megaLights`/`rtPass` must already be Init'd, same borrowed/bound-once
+        // convention as `vsm`/`worldProbes` above.
+        //
+        // D3 (point-light VSM shadows): set 3 additionally borrows `vsm`'s own ShadowPointFacesUBO
+        // (shadow_point_sampling.glsl's contract) -- no extra Init() parameter needed, `vsm` already
+        // exposes it via GetPointFacesBuffer().
+        //
+        // D5 (volumetric fog interaction): set 3 additionally borrows `volumetricFog`'s integrated
+        // froxel grid (GetIntegratedFogView()/GetFogSampler()) to tint/modulate a particle's own lit
+        // color by the fog it is embedded in, mirroring PostProcessComposite.comp's own
+        // ApplyVolumetricFog reader-side contract (atmos_volumetric_fog_mapping.glsl).
+        //
+        // D4 (particles as light emitters): also builds a SEPARATE, additive compute pipeline (set 0
+        // reused unmodified, plus a new tiny set 1) that writes a bounded sample of currently-alive
+        // emissive particles directly into `megaLights`' own reserved "particle-derived" tail slots
+        // (see MegaLightsPass::GetParticleLightsBufferOffset()'s own comment) every
+        // RecordExtractLights() call -- see that method's own comment for the full mechanism and why
+        // it is scoped this way rather than a fuller (and materially riskier) redesign of MegaLights'
+        // own light-population lifecycle.
         bool Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
             const AtmosClimatePass& atmosClimate, const GlobalSDFPass& globalSDF, const ClusterResolvePass& resolvePass,
             const VirtualShadowMapPass& vsm, const WorldProbeGridPass& worldProbes,
+            const MegaLightsPass& megaLights, const SurfaceCacheRayTracingPass& rtPass,
+            const AtmosVolumetricFogPass& volumetricFog,
             VkFormat colorFormat, VkFormat depthFormat);
 
         void Shutdown();
@@ -390,6 +422,30 @@ namespace renderer {
         // including one for INDIRECT_COMMAND_READ on the indirect-draw buffer specifically).
         void RecordSort(VkCommandBuffer cmd, const float cameraPositionWorld[3], const float cameraForwardWorld[3]);
 
+        // D4 (Niagara-parity render-integration roadmap, particles as light emitters): dispatches
+        // ParticleLightExtract.comp -- a single (1,1,1) workgroup, kMaxParticleDerivedLights
+        // (MegaLightsTypes.h) threads, one per reserved MegaLights "particle-derived" light slot.
+        // Thread `i` inspects GetCurrentSet()'s ALIVE list entry `i` (NOT the sorted list -- this
+        // does not need back-to-front order, only a bounded, consistent sample of currently-alive
+        // particles, so it stays decoupled from RecordSort()'s own timing/scope): if that slot holds
+        // a live kKindEmber particle, writes a real {position, radius, color, intensity} MegaLight
+        // entry (derived from the particle's own size/color) directly into the reserved tail slot;
+        // otherwise writes an inert (zero-radius, zero-intensity) one, which
+        // MegaLightTargetWeight (megalights_ris.glsl) provably scores as exactly zero weight
+        // regardless of position -- see this method's own .cpp comment for the full write-target/
+        // BVH-placeholder derivation. Must be called AFTER RecordSimulate() (needs this frame's
+        // alive list) -- RecordSort() is not a dependency, but this codebase's own RecordFrame calls
+        // it right after RecordSort() anyway for a single obvious call-site location. Writes directly
+        // into MegaLightsPass' own m_LightBuffer at a fixed byte offset (bound once at Init(), see
+        // this class' own Init() comment) -- no MegaLightsPass parameter needed here. Caller owns
+        // the barrier before (alive-list state visible to COMPUTE_SHADER, RecordSimulate()'s own
+        // trailing barrier already covers this) and after (this call's own trailing barrier only
+        // covers a future COMPUTE_SHADER reader on the SAME queue -- MegaLightsPass::RecordShade
+        // reads the result from a LATER command-buffer submission on the same graphics queue, which
+        // this codebase already relies on same-queue submission ordering to make visible, see
+        // ClusterRenderPipeline.h's own "same-queue submission order (not a semaphore)" precedent).
+        void RecordExtractLights(VkCommandBuffer cmd);
+
         // Draws every alive particle (see ParticleRender.vert's own header comment) via
         // vkCmdDrawIndirect against `colorView`/`depthView` -- the SAME forward-pass color/depth
         // attachment pair renderer::TransparentForwardPass/TessellationPass/WaterForwardPass
@@ -422,12 +478,31 @@ namespace renderer {
         // toggle, not per-particle -- GpuParticle's already-merged 64-byte layout has no spare
         // "isRefractive" flag, and a demoscene emitter is realistically one thermal "kind" or
         // another (Subtask 6's ImGui panel will make this tunable per emitter).
+        //
+        // Niagara-parity render-integration roadmap (D1/D3/D5/D6), new parameters:
+        //   `cameraForwardWorld` (D5) -- feeds the froxel volumetric-fog view-space-depth
+        //     reconstruction (atmos_volumetric_fog_mapping.glsl's ViewZToFroxelW), same "camera
+        //     right/up already tracked, forward is not, so it is derived once at the call site and
+        //     passed down" convention this method's own cameraRight/cameraUp already establish.
+        //   `sceneLights` (D3) -- the SAME renderer::SceneLights aggregate
+        //     renderer::VirtualShadowMapPass::RecordBeginFrame/TransparentForwardPass::RecordDraw
+        //     already receive every frame; only its `pointLights`/`pointLightCount` fields are read
+        //     here (re-uploaded into this pass' own small ParticlePointLightsUBO every call, since
+        //     unlike the VSM resources themselves, the light POSITIONS/colors are ordinary per-frame
+        //     CPU data, not a borrowed GPU handle).
+        //   `worldProbeGridOrigin` (D6 fix) -- `renderer::WorldProbeGridPass::GetGridOriginWorld()`'s
+        //     CURRENT value, re-uploaded into m_WorldProbeGridParamsBuffer every call instead of the
+        //     stale one-time Init()-time value (see this class' own Init() comment on D6).
+        //   `frameIndex` (D1) -- decorrelates MegaLights' own RIS candidate draw across frames,
+        //     exactly like MegaLightsShade.comp/TransparentForward.frag's own `frameIndex` push
+        //     constant already does.
         void RecordDraw(VkCommandBuffer cmd, VkImage colorImage, VkImageView colorView, VkImageView depthView,
             VkImageView refractionOffsetView, VkExtent2D renderExtent,
             const maths::mat4& viewProj, const maths::vec3& cameraPositionWorld,
-            const maths::vec3& cameraRightWorld, const maths::vec3& cameraUpWorld,
+            const maths::vec3& cameraRightWorld, const maths::vec3& cameraUpWorld, const maths::vec3& cameraForwardWorld,
             const maths::vec3& sunDirectionWorld, const maths::vec3& sunColor, float sunIntensity,
-            float softFadeDistanceWorld, float heatShimmerStrength, float globalTimeSeconds);
+            const SceneLights& sceneLights, const maths::vec3& worldProbeGridOrigin,
+            float softFadeDistanceWorld, float heatShimmerStrength, float globalTimeSeconds, uint32_t frameIndex);
 
     private:
         VkDevice m_Device = VK_NULL_HANDLE;
@@ -539,13 +614,38 @@ namespace renderer {
         VkPipeline m_RenderPipeline = VK_NULL_HANDLE;
 
         // Subtask 5 -- ParticleRender.frag's own set 3 ("lighting"): `vsm`'s 4 Virtual Shadow Map
-        // resources (borrowed, bound once, never re-written) + `worldProbes`' grid + a one-time-
-        // uploaded WorldProbeGridParamsUBO (see Init()'s own comment on why this is a static upload,
-        // not per-frame). Same one-time-bind convention as the Subtask 2 environment set.
-        GpuBuffer m_WorldProbeGridParamsBuffer; // WorldProbeGridParamsUBO, std140, GPU_ONLY, filled once at Init().
+        // resources (borrowed, bound once, never re-written) + `worldProbes`' grid + a
+        // WorldProbeGridParamsUBO (D6 fix: re-uploaded every RecordDraw() call now, see that
+        // method's own comment -- no longer a one-time Init()-time upload).
+        //
+        // Niagara-parity render-integration roadmap extensions to this SAME set (D1/D3/D5, bindings
+        // 6-10 -- see Init()'s own comment for the full rationale of each):
+        //   6: MegaLightsSSBO (borrowed, `megaLights`'s own light buffer).
+        //   7: g_TLAS (borrowed, `rtPass`'s TLAS -- MegaLights' own shadow-visibility ray).
+        //   8: ShadowPointFacesUBO (borrowed, `vsm`'s own point-light VSM view-proj matrices).
+        //   9: ParticlePointLightsUBO (owned, re-uploaded every RecordDraw() call from `sceneLights`).
+        //   10: g_VolumetricFog (borrowed, `volumetricFog`'s integrated froxel grid).
+        GpuBuffer m_WorldProbeGridParamsBuffer; // WorldProbeGridParamsUBO, std140, GPU_ONLY, re-uploaded every RecordDraw() call (D6).
+        // D3: up to kMaxPointLights (LightingTypes.h) {position, color, intensity, radius} entries,
+        // re-uploaded every RecordDraw() call from `sceneLights.pointLights` -- ordinary per-frame
+        // CPU light data, unlike the borrowed GPU-owned resources this set otherwise only binds once.
+        GpuBuffer m_ParticlePointLightsBuffer;
         VkDescriptorSetLayout m_LightingSetLayout = VK_NULL_HANDLE;
         VkDescriptorPool m_LightingDescriptorPool = VK_NULL_HANDLE;
         VkDescriptorSet m_LightingSet = VK_NULL_HANDLE;
+
+        // D4 (particles as light emitters): a SEPARATE, additive compute pipeline -- set 0 reused
+        // unmodified from Subtask 1 (reads ParticleBuffer/AliveListBuffer/CounterBuffer to sample
+        // currently-alive particles), plus this NEW tiny set 1 (a single STORAGE_BUFFER binding: the
+        // borrowed MegaLightsPass buffer, bound with a nonzero VkDescriptorBufferInfo.offset landing
+        // exactly on its reserved "particle-derived" tail region -- see RecordExtractLights()'s own
+        // .cpp comment for why this needs no new getter/setter round-trip through MegaLightsPass
+        // beyond the offset/capacity accessors it already exposes for this exact purpose).
+        VkDescriptorSetLayout m_LightExtractSetLayout = VK_NULL_HANDLE;
+        VkDescriptorPool m_LightExtractDescriptorPool = VK_NULL_HANDLE;
+        VkDescriptorSet m_LightExtractSet = VK_NULL_HANDLE;
+        VkPipelineLayout m_LightExtractPipelineLayout = VK_NULL_HANDLE;
+        VkPipeline m_LightExtractPipeline = VK_NULL_HANDLE;
     };
 
 }
