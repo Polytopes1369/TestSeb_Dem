@@ -7,7 +7,9 @@
 // hit point, shading it (or a sky gradient on a miss) into a full-screen debug-visualization image.
 //
 // --- Why this pass builds its OWN per-entity Mesh SDF textures, not renderer::GlobalSDFPass's ---
-// GlobalSDFPass decodes each entity's Mesh SDF at a DELIBERATELY coarse kEntitySDFResolution (24^3,
+// GlobalSDFPass decodes each entity's Mesh SDF at a DELIBERATELY coarse, tier-scaled
+// kEntitySDFResolution (config::lumen::GLOBAL_SDF_ENTITY_RESOLUTION -- 24^3 by default on the
+// High tier, 16^3 to 32^3 across Low..Extrem, see EngineConfig_{Low,Medium,High,Extrem}.h;
 // "enough to drive cone tracing's coarse empty-space skipping, not fine per-object surface detail"
 // -- see that class's own comment) purely so ITS clipmap compositing has something cheap to
 // min-combine. This pass's whole point is the opposite: precise local sampling once the coarse

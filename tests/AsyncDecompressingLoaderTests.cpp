@@ -16,6 +16,7 @@
 // model comment for why the real work always happens off this polling thread.
 
 #include "io/AsyncDecompressingLoader.h"
+#include "io/AsyncFileStreamer.h"
 #include "io/BlockCodec.h"
 #include "core/LoadingManager.h"
 
@@ -168,12 +169,81 @@ namespace {
         Check(!callbackInvoked, "a rejected (unaligned) request must never invoke its callback, immediately or later");
     }
 
+    // Regression test for a real shutdown-race bug in geometry::AsyncFileStreamer::Close(): the
+    // documented contract (AsyncFileStreamer.h) promises every request submitted before Close()
+    // still gets its callback invoked, from a worker thread, before the threads are joined. The
+    // original implementation posted the IOCP shutdown packets BEFORE draining pending requests,
+    // so a worker thread could dequeue its (no-I/O-required) shutdown packet and exit while an
+    // earlier real ReadFile on the same file was still genuinely in flight on the device --
+    // leaking that request's heap-allocated StreamingRequest and silently dropping its callback.
+    // Exercises geometry::AsyncFileStreamer directly (not through AsyncDecompressingLoader) since
+    // this is purely about the low-level Close()/SubmitRead race, not decompression.
+    void TestCloseDrainsInFlightReads() {
+        // Many small reads over a reasonably large file, submitted back-to-back with NO pumping,
+        // sleeping, or waiting in between -- maximizes the chance several are still genuinely
+        // in-flight on the device at the moment Close() is called immediately afterward. Even on
+        // a run where every read happens to finish before Close() is reached (fast NVMe, warm
+        // cache, etc.), the assertions below still hold Close() to the invariant it must uphold
+        // either way: exactly one callback per successfully-launched SubmitRead, observed before
+        // Close() returns -- so this test both tries to catch the race directly and acts as a
+        // standing regression guard against the ordering being reintroduced.
+        constexpr uint32_t kBlockCount = 4096; // 16 MB at kStreamerBlockSizeBytes (4096 B) each.
+
+        std::filesystem::path scratchDir = std::filesystem::temp_directory_path() / "AsyncDecompressingLoaderTests";
+        std::error_code ec;
+        std::filesystem::create_directories(scratchDir, ec);
+        std::filesystem::path filePath = scratchDir / "close_drain.bin";
+
+        {
+            std::vector<uint8_t> block(geometry::kStreamerBlockSizeBytes, 0xABu);
+            std::ofstream out(filePath, std::ios::binary | std::ios::trunc);
+            for (uint32_t b = 0; b < kBlockCount; ++b) {
+                out.write(reinterpret_cast<const char*>(block.data()), static_cast<std::streamsize>(block.size()));
+            }
+        }
+
+        geometry::AsyncFileStreamer streamer;
+        Check(streamer.Open(filePath), "AsyncFileStreamer::Open should succeed for a file that was just written");
+
+        std::vector<void*> buffers(kBlockCount, nullptr);
+        std::atomic<uint32_t> launchedCount{ 0 };
+        std::atomic<uint32_t> callbackCount{ 0 };
+        std::atomic<uint32_t> successCount{ 0 };
+
+        for (uint32_t b = 0; b < kBlockCount; ++b) {
+            buffers[b] = geometry::AsyncFileStreamer::AllocateAlignedBuffer(geometry::kStreamerBlockSizeBytes);
+            bool launched = streamer.SubmitRead(
+                static_cast<uint64_t>(b) * geometry::kStreamerBlockSizeBytes,
+                buffers[b], geometry::kStreamerBlockSizeBytes,
+                [&callbackCount, &successCount](bool success, uint32_t) {
+                    callbackCount.fetch_add(1, std::memory_order_relaxed);
+                    if (success) successCount.fetch_add(1, std::memory_order_relaxed);
+                });
+            if (launched) launchedCount.fetch_add(1, std::memory_order_relaxed);
+        }
+
+        // The call under test: no drain performed by this test itself beforehand, on purpose --
+        // Close() alone is responsible for making this safe.
+        streamer.Close();
+
+        Check(callbackCount.load() == launchedCount.load(),
+            "every successfully-launched SubmitRead's callback must have been invoked by the time Close() returns "
+            "(a mismatch means Close() abandoned in-flight I/O, dropping callbacks and leaking StreamingRequests)");
+        Check(successCount.load() == launchedCount.load(),
+            "every successfully-launched read of this freshly-written, unmodified file should complete successfully");
+
+        for (void* buffer : buffers) {
+            geometry::AsyncFileStreamer::FreeAlignedBuffer(buffer);
+        }
+    }
+
 }
 
 int main() {
     TestSuccessfulRoundTrip();
     TestCorruptedChunkReportsFailure();
     TestMisalignedRequestRejectedImmediately();
+    TestCloseDrainsInFlightReads();
 
     if (g_failCount == 0) {
         std::cout << "[PASS] All AsyncDecompressingLoader checks passed.\n";

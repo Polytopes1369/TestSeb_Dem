@@ -36,19 +36,16 @@ constexpr uint32_t JITTER_FRAME_COUNT = 16u;
 constexpr bool ENABLED_BY_DEFAULT = true;
 } // namespace temporal
 
-namespace shadows {
-// sg.ShadowQuality=5 (Extreme Cinematic)
-constexpr uint32_t QUALITY = 5;
-constexpr bool VIRTUAL_ENABLE = true;
-// Crisp shadows with high-resolution map cache allocations
-constexpr uint32_t MAX_RESOLUTION = 8192;
-constexpr uint32_t CSM_MAX_CASCADES = 8;
-constexpr float DISTANCE_SCALE = 2.00f;
-} // namespace shadows
-
 namespace lumen {
 constexpr uint32_t CARDS_PER_FRAME_BUDGET = 32u;
 constexpr uint32_t EVICTION_FRAME_DELAY = 1200u;
+
+// Surface Cache atlas resolution -- see EngineConfig_Low.h's own comment on this value. Capped at
+// the same 2048 as High rather than scaling further: atlas resolution is not this tier's GI
+// differentiator (PROBE_GRID_RESOLUTION/MAX_TRACED_ENTITIES/RADIOSITY_BOUNCE_COUNT/
+// SURFACE_CACHE_GI_SAMPLE_COUNT above already scale GI fidelity at Extrem), and 2048 was the
+// original engine-wide fixed size, so this tier is guaranteed no worse than the pre-tiering baseline.
+constexpr uint32_t SURFACE_CACHE_ATLAS_SIZE = 2048u;
 
 // Extreme-quality 80^3 probe grid (512k probes) for flawless global illumination.
 constexpr uint32_t PROBE_GRID_RESOLUTION = 80u;
@@ -58,6 +55,14 @@ constexpr uint32_t PROBE_SAMPLE_DIRECTIONS = 24u;
 constexpr uint32_t MAX_TRACED_ENTITIES = 256u;
 constexpr uint32_t RADIOSITY_BOUNCE_COUNT = 6u;
 constexpr uint32_t SURFACE_CACHE_GI_SAMPLE_COUNT = 128u; // Extreme quality bounce GI
+
+// Global SDF clipmap quality (renderer::GlobalSDFPass): voxels per axis per clipmap level, and
+// per-entity Mesh SDF bake resolution respectively -- see config_low's own comment on these two
+// for the full rationale. Both must stay multiples of 4 (geometry::kSDFBlockDim). Entity
+// resolution matches geometry::kMeshSDFResolution (32) at this tier -- Extreme's per-entity
+// Global SDF bake is as fine as the surface-detail mesh SDF itself.
+constexpr uint32_t GLOBAL_SDF_CLIPMAP_RESOLUTION = 48u;
+constexpr uint32_t GLOBAL_SDF_ENTITY_RESOLUTION = 32u;
 
 constexpr uint32_t SCREEN_PROBE_TILE_SIZE = 4u;
 constexpr uint32_t SCREEN_PROBE_RAY_COUNT = 128u;
@@ -78,6 +83,5 @@ constexpr bool MEGALIGHTS_ENABLE = true; // Enabled to handle thousands of physi
 
 namespace postprocess {
 constexpr uint32_t EFFECTS_QUALITY = 5;
-constexpr uint32_t TRANSLUCENCY_LIGHTING_VOLUME_DIM = 128;
 } // namespace postprocess
 } // namespace config_extrem

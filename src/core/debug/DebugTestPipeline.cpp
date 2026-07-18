@@ -71,6 +71,7 @@
 #include "core/debug/DebugTestPipeline.h"
 #include "core/debug/TestReport.h"
 #include "core/debug/ValidationMessageSink.h"
+#include "core/ResourcePath.h"
 #include "renderer/debug/ScreenshotCapture.h"
 #include "renderer/vulkan/VulkanContext.h"
 #include "renderer/ClusterRenderPipeline.h"
@@ -104,7 +105,7 @@ namespace debugpipeline {
             std::snprintf(buf, sizeof(buf), "%04d%02d%02d_%02d%02d%02d",
                           localTm.tm_year + 1900, localTm.tm_mon + 1, localTm.tm_mday,
                           localTm.tm_hour, localTm.tm_min, localTm.tm_sec);
-            return std::string("test_reports/") + buf;
+            return core::ResolveExeRelativePath(std::string("test_reports/") + buf).string();
         }
 
         std::string BuildTimestampIso8601() {

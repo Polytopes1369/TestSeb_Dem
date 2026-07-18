@@ -508,6 +508,7 @@ add_executable(PcgGpuNodeExecutorTests
     src/renderer/vulkan/VmaUsage.cpp
     src/renderer/vulkan/VulkanUtils.cpp
     src/renderer/vulkan/VulkanPipeline.cpp
+    src/core/ResourcePath.cpp
     src/core/Logger.cpp
     tests/PcgGpuTestUtils.cpp
     tests/PcgGpuNodeExecutorTests.cpp
@@ -550,6 +551,7 @@ add_executable(VirtualTextureTests
     src/renderer/vulkan/VmaUsage.cpp
     src/renderer/vulkan/VulkanUtils.cpp
     src/renderer/vulkan/VulkanPipeline.cpp
+    src/core/ResourcePath.cpp
     src/core/Logger.cpp
     tests/VirtualTextureTests.cpp
 )
@@ -566,6 +568,7 @@ add_executable(VirtualTextureRenderPassTests
     src/renderer/vulkan/VmaUsage.cpp
     src/renderer/vulkan/VulkanUtils.cpp
     src/renderer/vulkan/VulkanPipeline.cpp
+    src/core/ResourcePath.cpp
     src/core/Logger.cpp
     tests/VirtualTextureRenderPassTests.cpp
 )
@@ -813,7 +816,7 @@ if(Vulkan_GLSLC_EXECUTABLE)
         # SPIR-V capabilities -- gl_InstanceCustomIndexEXT / traceRayEXT / rayPayloadEXT /
         # rayQueryEXT etc. -- are not representable in SPIR-V 1.0-1.3): the 3 .rgen/.rchit/.rmiss
         # files unconditionally, plus every .comp file that uses GL_EXT_ray_query for its inline
-        # HWRT trace path (SurfaceCacheGIInject.comp, ScreenProbeTrace.comp, WorldProbeInject.comp,
+        # HWRT trace path (SurfaceCacheGIInject.comp, WorldProbeInject.comp,
         # ReflectionTrace.comp -- Phase 2/UE5.8 parity roadmap's own inline-HWRT reflection trace;
         # MegaLightsShade.comp -- Phase A of the MegaLights native-port roadmap's own inline-HWRT
         # shadow-visibility ray, see that shader's own TraceShadowRay comment; TransparentForward.frag
@@ -831,12 +834,14 @@ if(Vulkan_GLSLC_EXECUTABLE)
         # reservoir SSBOs, no ray query of its own; ParticleRender.frag -- Niagara-parity
         # render-integration roadmap, D1 (MegaLights sampling for particles): the same inlined
         # MegaLights shadow-visibility-ray shading TransparentForward.frag/Tessellation.frag already
-        # carry their own copy of, see that shader's own TraceShadowRay comment).
+        # carry their own copy of, see that shader's own TraceShadowRay comment). ScreenProbeTrace.comp
+        # used to be in this list too -- deleted along with the rest of ScreenProbeGIPass
+        # (confirmed-dead, see ClusterRenderPipeline.h's own comment on why).
         # Every other shader stage keeps glslc's default target-env/target-spv untouched.
         get_filename_component(SHADER_EXT ${SHADER_SRC} EXT)
         set(GLSLC_EXTRA_FLAGS "")
         if(SHADER_EXT STREQUAL ".rgen" OR SHADER_EXT STREQUAL ".rchit" OR SHADER_EXT STREQUAL ".rmiss"
-                OR SHADER_NAME STREQUAL "SurfaceCacheGIInject.comp" OR SHADER_NAME STREQUAL "ScreenProbeTrace.comp"
+                OR SHADER_NAME STREQUAL "SurfaceCacheGIInject.comp"
                 OR SHADER_NAME STREQUAL "WorldProbeInject.comp" OR SHADER_NAME STREQUAL "ReflectionTrace.comp"
                 OR SHADER_NAME STREQUAL "MegaLightsShade.comp" OR SHADER_NAME STREQUAL "TransparentForward.frag"
                 OR SHADER_NAME STREQUAL "Tessellation.frag" OR SHADER_NAME STREQUAL "WaterForward.frag"

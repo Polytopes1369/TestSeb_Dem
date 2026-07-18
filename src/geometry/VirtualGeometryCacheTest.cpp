@@ -10,6 +10,7 @@
 #include "core/Logger.h"
 #include "core/EngineConfig.h"
 #include "core/LoadingManager.h"
+#include "core/ResourcePath.h"
 #include "renderer/RenderTypes.h"
 
 #include <algorithm>
@@ -399,11 +400,11 @@ namespace geometry {
         uint32_t totalVertexCount,
         uint32_t totalIndexCount,
         uint32_t entityCount) {
-        std::ifstream cfgFile("scene.cache.cfg");
+        std::ifstream cfgFile(core::ResolveExeRelativePath("scene.cache.cfg"));
         if (!cfgFile.is_open()) {
             return false;
         }
-        if (!std::filesystem::exists("scene.cache")) {
+        if (!std::filesystem::exists(core::ResolveExeRelativePath("scene.cache"))) {
             return false;
         }
         float spacing = 0.0f;
@@ -444,7 +445,7 @@ namespace geometry {
         uint32_t totalVertexCount,
         uint32_t totalIndexCount,
         uint32_t entityCount) {
-        std::ofstream cfgFile("scene.cache.cfg");
+        std::ofstream cfgFile(core::ResolveExeRelativePath("scene.cache.cfg"));
         if (cfgFile.is_open()) {
             cfgFile << config::VERTEX_SPACING << " "
                     << totalVertexCount << " "
@@ -765,7 +766,7 @@ namespace geometry {
             cardEntries.size(), kSurfaceCacheAtlasSize, kSurfaceCacheAtlasSize));
 
         // --- Write the whole scene's clusters into ONE consolidated .cache file -----------------
-        std::filesystem::path filePath = std::filesystem::path(".") / "scene.cache";
+        std::filesystem::path filePath = core::ResolveExeRelativePath("scene.cache");
         if (!cacheManager.WriteCacheFile(filePath, indexEntries, dagEntries, clusterData, fallbackMeshes, cardEntries, entitiesWithGeometry)) {
             LOG_ERROR(std::format("[GeometryCacheTest] WriteCacheFile failed for '{}'.", filePath.string()));
             return false;

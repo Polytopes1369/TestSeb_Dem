@@ -123,6 +123,16 @@ namespace renderer {
             // EntityAABBOverlapsPageNDC()'s own .cpp comment.
             bool hasSplineDeformation = false;
             bool hasEnhancedDisplacement = false;
+            // Skeletal-animation feature (VSM shadow-capture fix): true for core::EntityFlags::
+            // IsSkeletallyAnimated -- folded into isDynamicCandidate below exactly like
+            // hasSplineDeformation/hasEnhancedDisplacement already are (this flag was simply never
+            // added to that OR-chain when the skeletal-animation feature was introduced, a real
+            // integration gap: without it, a page that had already captured the creature once would
+            // never be re-rendered again, so ShadowMapCaptureAnimated.vert's own skinning fix would
+            // never actually be observed). Also used by EntityAABBOverlapsPageNDC() to inflate
+            // boundsMin/boundsMax by kCpuSkeletalMaxDeviation, mirroring the other two flags' own
+            // conservative-bound inflation exactly.
+            bool isSkeletallyAnimated = false;
         };
 
         // Reads every fallback mesh's geometry from `cacheFilePath` (mirrors ShadowMapPass::Init's
@@ -147,10 +157,14 @@ namespace renderer {
         // ProceduralMaskGenerator::GetMaskImageInfos() (Feature 3) -- bound as this descriptor set's
         // binding 4 (fragment-stage-only, COMBINED_IMAGE_SAMPLER, descriptorCount ==
         // maskImageInfos.size()), same pattern ClusterHardwareRasterPass::Init already uses.
+        // `boneMatricesBuffer` (Skeletal-animation feature, VSM shadow-capture fix:
+        // animation::SkeletalAnimator::GetBoneMatricesBuffer(), the SAME per-frame SSBO
+        // ClusterRaster.vert already binds) is bound read-only, vertex-stage-only, at this
+        // descriptor set's binding 5 -- see ShadowMapCaptureAnimated.vert's own binding comment.
         bool Init(VkPhysicalDevice physicalDevice, VkDevice device, VmaAllocator allocator,
             VkCommandPool commandPool, VkQueue queue, const std::filesystem::path& cacheFilePath,
             VkBuffer entityTransformBuffer, VkBuffer entityDataBuffer, VkBuffer wpoGlobalsBuffer,
-            VkBuffer splineControlPointsBuffer, const core::EntityData* entityDataCPU,
+            VkBuffer splineControlPointsBuffer, VkBuffer boneMatricesBuffer, const core::EntityData* entityDataCPU,
             const std::vector<VkDescriptorImageInfo>& maskImageInfos);
 
         void Shutdown();
