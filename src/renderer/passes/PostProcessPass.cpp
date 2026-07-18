@@ -31,7 +31,8 @@ namespace renderer {
 
     void PostProcessPass::Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
         VkExtent2D displayExtent, VkImageView hdrColorView, VkImageView bloomView,
-        VkImageView depthView, VkImageView refractionOffsetView, VkImageView skyViewLUTView) {
+        VkImageView depthView, VkImageView refractionOffsetView, VkImageView skyViewLUTView,
+        VkImageView volumetricFogView, VkImageView cloudsView) {
         Shutdown();
         m_Device = device;
         m_Allocator = allocator;
@@ -133,8 +134,9 @@ namespace renderer {
         std::array<VkDescriptorPoolSize, 4> poolSizes{ {
             // Histogram HDR input + Composite HDR input + Composite g_Bloom (PP2) + Composite
             // g_Depth + Composite g_RefractionOffset (both PP3) + Composite g_SkyViewLUT (Atmos
-            // Subtask 2).
-            { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 6 },
+            // Subtask 2) + Composite g_VolumetricFog (Atmos Subtask 3) + Composite g_Clouds (Atmos
+            // Subtask 4).
+            { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 8 },
             { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1 },          // Composite output.
             { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4 },
             { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 },         // Composite params.
@@ -208,7 +210,7 @@ namespace renderer {
 
         // --- Stage 3: PostProcessComposite.comp ---
         {
-            std::array<VkDescriptorSetLayoutBinding, 8> bindings{ {
+            std::array<VkDescriptorSetLayoutBinding, 10> bindings{ {
                 { 0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // g_HDRColor
                 { 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },          // g_Output
                 { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },         // ExposureStateSSBO
@@ -217,6 +219,8 @@ namespace renderer {
                 { 5, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // g_Depth (Phase PP3)
                 { 6, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // g_RefractionOffset (Phase PP3)
                 { 7, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // g_SkyViewLUT (Atmos Subtask 2)
+                { 8, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // g_VolumetricFog (Atmos Subtask 3)
+                { 9, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // g_Clouds (Atmos Subtask 4)
             } };
             VkDescriptorSetLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
             layoutInfo.bindingCount = static_cast<uint32_t>(bindings.size());
@@ -250,10 +254,14 @@ namespace renderer {
             VkDescriptorImageInfo depthInfo{ m_LinearSampler, depthView, VK_IMAGE_LAYOUT_GENERAL };
             VkDescriptorImageInfo refractionInfo{ m_LinearSampler, refractionOffsetView, VK_IMAGE_LAYOUT_GENERAL };
             VkDescriptorImageInfo skyViewInfo{ m_LinearSampler, skyViewLUTView, VK_IMAGE_LAYOUT_GENERAL };
-            std::array<VkWriteDescriptorSet, 3> writes{ {
+            VkDescriptorImageInfo volumetricFogInfo{ m_LinearSampler, volumetricFogView, VK_IMAGE_LAYOUT_GENERAL };
+            VkDescriptorImageInfo cloudsInfo{ m_LinearSampler, cloudsView, VK_IMAGE_LAYOUT_GENERAL };
+            std::array<VkWriteDescriptorSet, 5> writes{ {
                 { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_CompositeSet, 5, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &depthInfo, nullptr, nullptr },
                 { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_CompositeSet, 6, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &refractionInfo, nullptr, nullptr },
                 { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_CompositeSet, 7, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &skyViewInfo, nullptr, nullptr },
+                { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_CompositeSet, 8, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &volumetricFogInfo, nullptr, nullptr },
+                { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_CompositeSet, 9, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &cloudsInfo, nullptr, nullptr },
             } };
             vkUpdateDescriptorSets(m_Device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
         }
@@ -333,7 +341,7 @@ namespace renderer {
 
     void PostProcessPass::RecordComposite(VkCommandBuffer cmd, float deltaTimeSeconds, const Settings& settings,
         const maths::mat4& invViewProj, const maths::mat4& prevViewProj, const maths::vec3& cameraPositionWorld,
-        const maths::mat4& viewProj, const maths::vec3& sunDirection,
+        const maths::mat4& viewProj, const maths::vec3& sunDirection, const maths::vec3& cameraForward,
         float fovYRadians, float aspectRatio, uint32_t frameIndex) {
         // --- Upload this frame's params UBO ---
         PostProcessParamsUBO params{};
@@ -406,6 +414,11 @@ namespace renderer {
         params.sunDirWorldX = sunDirection.x;
         params.sunDirWorldY = sunDirection.y;
         params.sunDirWorldZ = sunDirection.z;
+
+        // Atmos weather system, Subtask 3.
+        params.cameraForwardX = cameraForward.x;
+        params.cameraForwardY = cameraForward.y;
+        params.cameraForwardZ = cameraForward.z;
 
         // Phase PP5: Panini Projection -- half-FOV tangents drive the tangent-space UV remap (see
         // PostProcessComposite.comp's own ApplyPaniniProjection comment). Matches maths::mat4::

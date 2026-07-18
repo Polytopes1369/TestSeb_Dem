@@ -1,0 +1,326 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+
+// Atmos weather system, Subtask 3 (atmos_integration_plan.md): camera-aligned Froxel Volumetric Fog.
+// Three entry points in one file, selected by `pc.mode` (same "single shader, mode branches in
+// main()" convention GlobalSDFComposite.comp / AtmosSkyLUTs.comp already establish):
+//
+//   mode == 0 (InjectMediaProps): height-fog decay + renderer::AtmosClimatePass's own dew-point/LCL
+//     ground-condensation boost + wind-scrolled fbm noise (AtmosNoiseCommon.glsl) -> per-froxel
+//     (scatteringCoeff, extinctionCoeff), stored in g_MediaPropsStorage.
+//   mode == 1 (InjectLight): sun contribution (renderer::VirtualShadowMapPass's shadow lookup,
+//     Henyey-Greenstein phase) + ONE MegaLights point light per froxel via a self-contained RIS
+//     reservoir sample (SelectVolumeLightRIS below -- isotropic weight, no surface normal, unlike
+//     megalights_ris.glsl's own surface-oriented SelectLightRIS, which this file deliberately does
+//     NOT call for exactly that reason -- see that function's own comment), stored in
+//     g_RawLightStorage.
+//   mode == 2 (AccumulateFog): one thread per (x, y) column (despite sharing this shader's single
+//     3D-shaped workgroup with modes 0/1 -- GLSL allows only one local_size declaration per file, see
+//     renderer::AtmosVolumetricFogPass::kWorkgroupSize3D's own comment), walks all
+//     ATMOS_FOG_GRID_DEPTH Z slices serially, integrating Beer-Lambert transmittance + in-scattered
+//     radiance (the standard froxel-fog prefix-sum recurrence) into g_IntegratedFogStorage, writing
+//     the RUNNING total at every slice so a consumer can sample any intermediate depth, not just the
+//     final one.
+
+#include "include/math_utils.glsl"
+#include "include/atmos_volumetric_fog_mapping.glsl"
+
+const float ATMOS_FOG_PI = 3.14159265358979323846;
+
+#define MEGALIGHTS_LIGHTS_SET 0
+#define MEGALIGHTS_LIGHTS_BINDING 6
+#include "include/megalights_ris.glsl" // Provides g_Lights/MegaLight -- NOT SelectLightRIS, see header comment.
+
+#define SHADOW_ATLAS_SET 0
+#define SHADOW_ATLAS_BINDING 7
+#define SHADOW_PAGE_TABLE_SET 0
+#define SHADOW_PAGE_TABLE_BINDING 8
+#define SHADOW_FEEDBACK_SET 0
+#define SHADOW_FEEDBACK_BINDING 9
+#define SHADOW_SUN_LEVELS_SET 0
+#define SHADOW_SUN_LEVELS_BINDING 10
+#include "include/shadow_page_table.glsl"
+#include "include/shadow_feedback.glsl"
+#include "include/shadow_atlas_sampling.glsl"
+#include "include/shadow_sun_sampling.glsl"
+
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+
+const int ATMOS_FOG_GRID_WIDTH = 160;
+const int ATMOS_FOG_GRID_HEIGHT = 90;
+const int ATMOS_FOG_GRID_DEPTH = 64;
+
+layout(rg16f, set = 0, binding = 0) uniform writeonly image3D g_MediaPropsStorage;
+layout(set = 0, binding = 1) uniform sampler3D g_MediaPropsSampler;
+layout(rgba16f, set = 0, binding = 2) uniform writeonly image3D g_RawLightStorage;
+layout(set = 0, binding = 3) uniform sampler3D g_RawLightSampler;
+layout(rgba16f, set = 0, binding = 4) uniform writeonly image3D g_IntegratedFogStorage;
+
+// std140 mirror of AtmosClimatePass.cpp's AtmosGlobalsUBO -- see AtmosNoiseCommon.glsl's own header
+// comment for the authoritative field-by-field layout this must match.
+layout(std140, set = 0, binding = 5) uniform AtmosGlobalsUBO {
+    vec3 windDirection; float windSpeed;
+    float temperature, humidity, dewPoint, condensationLCL;
+    float cloudDensityTarget, fogDensityTarget, rainStrength, time;
+    vec4 windTurbulenceParams;
+} g_AtmosGlobals;
+
+layout(push_constant) uniform AtmosVolumetricFogPC {
+    int mode;
+    float cameraPositionX, cameraPositionY, cameraPositionZ;
+    float cameraForwardX, cameraForwardY, cameraForwardZ;
+    float cameraRightX, cameraRightY, cameraRightZ;
+    float cameraUpX, cameraUpY, cameraUpZ;
+    float tanHalfFovY;
+    float aspectRatio;
+    float sunDirX, sunDirY, sunDirZ;
+    float sunColorR, sunColorG, sunColorB;
+    float sunIlluminance;
+    uint frameIndex;
+} pc;
+
+vec3 GetCameraPosition() { return vec3(pc.cameraPositionX, pc.cameraPositionY, pc.cameraPositionZ); }
+vec3 GetCameraForward() { return vec3(pc.cameraForwardX, pc.cameraForwardY, pc.cameraForwardZ); }
+vec3 GetCameraRight() { return vec3(pc.cameraRightX, pc.cameraRightY, pc.cameraRightZ); }
+vec3 GetCameraUp() { return vec3(pc.cameraUpX, pc.cameraUpY, pc.cameraUpZ); }
+vec3 GetSunDirection() { return vec3(pc.sunDirX, pc.sunDirY, pc.sunDirZ); }
+vec3 GetSunColor() { return vec3(pc.sunColorR, pc.sunColorG, pc.sunColorB); }
+
+// World-space position `coord` (a froxel index, NOT yet normalized) represents -- view-space depth
+// (distance along GetCameraForward(), NOT Euclidean ray length) comes from atmos_volumetric_fog_
+// mapping.glsl's FroxelWToViewZ(), exactly matching PostProcessComposite.comp's own consumer-side
+// ViewZToFroxelW() inverse -- see that shared include's own header comment.
+vec3 FroxelToWorld(ivec3 coord) {
+    vec2 uv = (vec2(coord.xy) + 0.5) / vec2(ATMOS_FOG_GRID_WIDTH, ATMOS_FOG_GRID_HEIGHT);
+    float ndcX = uv.x * 2.0 - 1.0;
+    float ndcY = 1.0 - uv.y * 2.0; // Y flipped -- matches SDFRayMarch.comp's own per-pixel ray convention.
+    float w = (float(coord.z) + 0.5) / float(ATMOS_FOG_GRID_DEPTH);
+    float viewZ = FroxelWToViewZ(w);
+
+    return GetCameraPosition()
+        + GetCameraForward() * viewZ
+        + GetCameraRight() * (ndcX * pc.aspectRatio * pc.tanHalfFovY * viewZ)
+        + GetCameraUp() * (ndcY * pc.tanHalfFovY * viewZ);
+}
+
+// Henyey-Greenstein phase function -- same formula as AtmosSkyLUTs.comp's own MiePhase() (duplicated,
+// not shared: these are two independent shader files, this codebase's established convention for
+// small per-shader phase/trace functions -- see megalights_ris.glsl's own header comment). `g`
+// matches atmos_integration_plan.md Subtask 3's own g ~= 0.7 for aerosol fog (vs. the sky's own
+// g = 0.8 for a hazier, more forward-scattering atmosphere).
+const float ATMOS_FOG_PHASE_G = 0.7;
+
+float HGPhase(float cosTheta, float g) {
+    float g2 = g * g;
+    float denom = 4.0 * ATMOS_FOG_PI * pow(max(1.0 + g2 - 2.0 * g * cosTheta, 1.0e-6), 1.5);
+    return (1.0 - g2) / denom;
+}
+
+// --- mode 0: InjectMediaProps -------------------------------------------------------------------
+
+// Cheap 3-octave fbm from AtmosValueNoise3D-equivalent -- inlined here (this file does NOT include
+// AtmosNoiseCommon.glsl, since it needs no wind VELOCITY, only a scalar density-modulating field;
+// duplicating one small hash/noise function is cheaper than pulling in that file's unrelated curl-
+// noise machinery for a single scalar sample).
+vec3 AtmosFogHash33(vec3 p) {
+    p = vec3(dot(p, vec3(127.1, 311.7, 74.7)),
+             dot(p, vec3(269.5, 183.3, 246.1)),
+             dot(p, vec3(113.5, 271.9, 124.6)));
+    return -1.0 + 2.0 * fract(sin(p) * 43758.5453123);
+}
+
+float AtmosFogValueNoise3D(vec3 p) {
+    vec3 i = floor(p);
+    vec3 f = fract(p);
+    vec3 u = f * f * (3.0 - 2.0 * f);
+    float n000 = AtmosFogHash33(i + vec3(0.0, 0.0, 0.0)).x;
+    float n100 = AtmosFogHash33(i + vec3(1.0, 0.0, 0.0)).x;
+    float n010 = AtmosFogHash33(i + vec3(0.0, 1.0, 0.0)).x;
+    float n110 = AtmosFogHash33(i + vec3(1.0, 1.0, 0.0)).x;
+    float n001 = AtmosFogHash33(i + vec3(0.0, 0.0, 1.0)).x;
+    float n101 = AtmosFogHash33(i + vec3(1.0, 0.0, 1.0)).x;
+    float n011 = AtmosFogHash33(i + vec3(0.0, 1.0, 1.0)).x;
+    float n111 = AtmosFogHash33(i + vec3(1.0, 1.0, 1.0)).x;
+    float nx00 = mix(n000, n100, u.x), nx10 = mix(n010, n110, u.x);
+    float nx01 = mix(n001, n101, u.x), nx11 = mix(n011, n111, u.x);
+    return mix(mix(nx00, nx10, u.y), mix(nx01, nx11, u.y), u.z);
+}
+
+float AtmosFogFbm(vec3 p) {
+    float sum = 0.0, amplitude = 0.5, freq = 1.0;
+    for (int o = 0; o < 3; ++o) {
+        sum += AtmosFogValueNoise3D(p * freq) * amplitude;
+        amplitude *= 0.5;
+        freq *= 2.0;
+    }
+    return sum;
+}
+
+// Standard exponential-height-fog falloff rate -- matches renderer::PostProcessPass::Settings' own
+// default fogHeightFalloff (0.15) so the new volumetric layer's overall vertical falloff SHAPE
+// agrees with the existing flat analytic fog it composites alongside (see PostProcessComposite.comp's
+// own consumer comment for why these two coexist rather than one replacing the other -- matches
+// Unreal Engine 5.8's own Exponential Height Fog + Volumetric Fog layering).
+const float ATMOS_FOG_HEIGHT_FALLOFF = 0.15;
+const float ATMOS_FOG_ALBEDO = 0.9; // Aerosol fog: mostly-scattering, little absorption.
+
+void InjectMediaProps(ivec3 coord) {
+    vec3 worldPos = FroxelToWorld(coord);
+
+    float heightFactor = exp(-max(worldPos.y, 0.0) * ATMOS_FOG_HEIGHT_FALLOFF);
+
+    // Ground-condensation boost (atmos_integration_plan.md Subtask 3, objective #1: "dew-point
+    // humidity condensation"): extra density below the Lifting Condensation Level, scaled by
+    // humidity -- physically, fog condenses near the ground when humidity is high and the air is
+    // cool enough (both already baked into AtmosClimatePass's own condensationLCL).
+    float condensationBoost = 1.0 + g_AtmosGlobals.humidity
+        * smoothstep(g_AtmosGlobals.condensationLCL, g_AtmosGlobals.condensationLCL - 10.0, worldPos.y);
+
+    // Wind-scrolled wispy density variation (objective #1: "wind-scrolled 3D noise").
+    vec3 windPos = worldPos * 0.3 - g_AtmosGlobals.windDirection * g_AtmosGlobals.windSpeed * g_AtmosGlobals.time * 0.05;
+    float noiseFactor = clamp(0.7 + AtmosFogFbm(windPos) * 0.6, 0.3, 1.5);
+
+    float density = max(g_AtmosGlobals.fogDensityTarget * heightFactor * condensationBoost * noiseFactor, 0.0);
+    float scatteringCoeff = density * ATMOS_FOG_ALBEDO;
+    float extinctionCoeff = density;
+
+    imageStore(g_MediaPropsStorage, coord, vec4(scatteringCoeff, extinctionCoeff, 0.0, 0.0));
+}
+
+// --- mode 1: InjectLight -------------------------------------------------------------------------
+
+// Isotropic (no surface normal -- a froxel is a point in a participating medium, not a surface)
+// single-sample RIS reservoir over g_Lights.lightCount MegaLights point lights -- same textbook WRS
+// algorithm shape as megalights_ris.glsl's own SelectLightRIS, but the target-weight proxy drops the
+// NdotL cosine term entirely (replaced with nothing -- there is no "facing direction" for a volume
+// sample point) since that term has no physical meaning here; kept as a SEPARATE function rather than
+// generalizing SelectLightRIS itself, matching this codebase's own established "duplicate small
+// per-shader weighting/trace functions rather than force a shared abstraction" convention (see
+// megalights_ris.glsl's own header comment).
+const uint kVolumeLightCandidateCount = 16u;
+
+float MegaLightVolumeWeight(MegaLight light, vec3 worldPos) {
+    vec3 toLight = light.position - worldPos;
+    float distSq = max(dot(toLight, toLight), 1.0e-4);
+    float normalizedDist = saturate(sqrt(distSq) / max(light.radius, 1.0e-4));
+    float nd2 = normalizedDist * normalizedDist;
+    float window = saturate((1.0 - nd2 * nd2) * (1.0 - nd2 * nd2));
+    float w = light.intensity / distSq * window;
+    return min(w, 50.0);
+}
+
+bool SelectVolumeLightRIS(vec3 worldPos, uint seed, uint frameIndex, out uint outLightIndex, out float outInvPdf) {
+    if (g_Lights.lightCount == 0u) {
+        outLightIndex = 0u;
+        outInvPdf = 0.0;
+        return false;
+    }
+
+    float totalWeight = 0.0;
+    uint selected = 0xFFFFFFFFu;
+    float selectedTargetWeight = 0.0;
+
+    uint baseIndex = seed * kVolumeLightCandidateCount + frameIndex * 9781u;
+    for (uint i = 0u; i < kVolumeLightCandidateCount; ++i) {
+        vec2 h = Halton23(baseIndex + i);
+        uint candidateIndex = min(uint(h.x * float(g_Lights.lightCount)), g_Lights.lightCount - 1u);
+        MegaLight candidate = g_Lights.lights[candidateIndex];
+
+        float w = MegaLightVolumeWeight(candidate, worldPos);
+        totalWeight += w;
+        float acceptProb = (totalWeight > 0.0) ? (w / totalWeight) : 0.0;
+        if (h.y < acceptProb) {
+            selected = candidateIndex;
+            selectedTargetWeight = w;
+        }
+    }
+
+    if (selected == 0xFFFFFFFFu || selectedTargetWeight <= 0.0) {
+        outLightIndex = 0u;
+        outInvPdf = 0.0;
+        return false;
+    }
+
+    outLightIndex = selected;
+    outInvPdf = (totalWeight / float(kVolumeLightCandidateCount)) / selectedTargetWeight;
+    return true;
+}
+
+void InjectLight(ivec3 coord) {
+    float scatteringCoeff = texelFetch(g_MediaPropsSampler, coord, 0).r;
+    vec3 worldPos = FroxelToWorld(coord);
+    vec3 viewDir = normalize(worldPos - GetCameraPosition());
+
+    // --- Sun ---
+    float sunVisibility = SampleSunShadowVSM(worldPos);
+    float cosThetaSun = dot(GetSunDirection(), viewDir); // Both "arrival direction" convention -- see class comment.
+    float phaseSun = HGPhase(cosThetaSun, ATMOS_FOG_PHASE_G);
+    vec3 sunContribution = vec3(scatteringCoeff * sunVisibility * phaseSun * pc.sunIlluminance) * GetSunColor();
+
+    // --- One stochastic MegaLights point light ---
+    uint seed = uint(coord.x) + uint(coord.y) * uint(ATMOS_FOG_GRID_WIDTH) + uint(coord.z) * uint(ATMOS_FOG_GRID_WIDTH * ATMOS_FOG_GRID_HEIGHT);
+    uint lightIndex; float invPdf;
+    vec3 pointContribution = vec3(0.0);
+    if (SelectVolumeLightRIS(worldPos, seed, pc.frameIndex, lightIndex, invPdf)) {
+        MegaLight light = g_Lights.lights[lightIndex];
+        vec3 toLight = light.position - worldPos;
+        float distSq = max(dot(toLight, toLight), 1.0e-4);
+        vec3 arrivalDir = -toLight / sqrt(distSq); // Direction FROM the light TOWARD worldPos -- matches GetSunDirection()'s own convention.
+        float cosThetaPoint = dot(arrivalDir, viewDir);
+        float phasePoint = HGPhase(cosThetaPoint, ATMOS_FOG_PHASE_G);
+        float normalizedDist = saturate(sqrt(distSq) / max(light.radius, 1.0e-4));
+        float nd2 = normalizedDist * normalizedDist;
+        float window = saturate((1.0 - nd2 * nd2) * (1.0 - nd2 * nd2));
+
+        pointContribution = scatteringCoeff * light.color * (light.intensity / distSq) * window * phasePoint * invPdf;
+    }
+
+    imageStore(g_RawLightStorage, coord, vec4(sunContribution + pointContribution, 0.0));
+}
+
+// --- mode 2: AccumulateFog -----------------------------------------------------------------------
+
+void AccumulateFog(ivec2 columnCoord) {
+    vec3 accumulatedLight = vec3(0.0);
+    float accumulatedTransmittance = 1.0;
+
+    for (int z = 0; z < ATMOS_FOG_GRID_DEPTH; ++z) {
+        ivec3 coord = ivec3(columnCoord, z);
+        vec2 media = texelFetch(g_MediaPropsSampler, coord, 0).rg;
+        vec3 inscatter = texelFetch(g_RawLightSampler, coord, 0).rgb;
+
+        float viewZ0 = FroxelWToViewZ(float(z) / float(ATMOS_FOG_GRID_DEPTH));
+        float viewZ1 = FroxelWToViewZ(float(z + 1) / float(ATMOS_FOG_GRID_DEPTH));
+        float deltaZ = max(viewZ1 - viewZ0, 1.0e-4);
+
+        float stepTransmittance = exp(-media.g * deltaZ);
+        accumulatedLight += inscatter * accumulatedTransmittance * deltaZ;
+        accumulatedTransmittance *= stepTransmittance;
+
+        imageStore(g_IntegratedFogStorage, coord, vec4(accumulatedLight, accumulatedTransmittance));
+    }
+}
+
+void main() {
+    ivec3 coord = ivec3(gl_GlobalInvocationID.xyz);
+
+    if (pc.mode == 2) {
+        // See renderer::AtmosVolumetricFogPass::kWorkgroupSize3D's own comment: only the first
+        // Z-local-thread of the single dispatched Z-group does real work here.
+        if (gl_LocalInvocationID.z != 0u || coord.x >= ATMOS_FOG_GRID_WIDTH || coord.y >= ATMOS_FOG_GRID_HEIGHT) {
+            return;
+        }
+        AccumulateFog(coord.xy);
+        return;
+    }
+
+    if (coord.x >= ATMOS_FOG_GRID_WIDTH || coord.y >= ATMOS_FOG_GRID_HEIGHT || coord.z >= ATMOS_FOG_GRID_DEPTH) {
+        return;
+    }
+
+    if (pc.mode == 0) {
+        InjectMediaProps(coord);
+    } else {
+        InjectLight(coord);
+    }
+}

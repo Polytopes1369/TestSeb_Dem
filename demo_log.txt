@@ -1,11 +1,11 @@
-[2026-07-17 05:05:42.087] [INFO] main.cpp:235 - Starting DemoScene Engine...
-[2026-07-17 05:05:42.102] [INFO] EngineConfig.h:589 - [EngineConfig] Loaded saved profile from local cache: Extrem
-[2026-07-17 05:05:42.102] [INFO] main.cpp:238 - [Main] Loaded saved GPU profile 'Extrem' from cache, skipping startup GPU scan.
-[2026-07-17 05:05:42.284] [INFO] VulkanContext.cpp:630 - [VulkanContext] Detected physical device: NVIDIA GeForce RTX 5080 Laptop GPU
-[2026-07-17 05:05:42.466] [INFO] VulkanContext.cpp:835 - [VulkanContext] Transfer queue: dedicated hardware copy queue (family 1)
-[2026-07-17 05:05:42.467] [INFO] VulkanContext.cpp:357 - [VulkanContext] VMA Allocator initialized successfully.
-[2026-07-17 05:05:42.468] [INFO] VulkanContext.cpp:375 - [VulkanContext] Allocated entity buffer (10000 elements).
-[2026-07-17 05:05:42.487] [INFO] VulkanContext.cpp:396 - [VulkanContext] Allocated vertex SSBO: size=2048 MB.
-[2026-07-17 05:05:42.490] [INFO] VulkanContext.cpp:409 - [VulkanContext] Allocated index SSBO: size=1024 MB.
-[2026-07-17 05:05:42.490] [INFO] VulkanContext.cpp:419 - [VulkanContext] Allocated params uniform buffer (256 bytes).
-[2026-07-17 05:05:42.765] [CRITICAL] main.cpp:273 - [Main] VulkanContext::Init threw: VulkanPipeline: failed to open SPIR-V file: shaders/geom_cone.comp.spv
+[2026-07-17 21:05:08.161] [INFO] main.cpp:264 - Starting DemoScene Engine...
+[2026-07-17 21:05:08.170] [INFO] EngineConfig.h:753 - [EngineConfig] Loaded saved profile from local cache: Extrem
+[2026-07-17 21:05:08.170] [INFO] main.cpp:267 - [Main] Loaded saved GPU profile 'Extrem' from cache, skipping startup GPU scan.
+[2026-07-17 21:05:08.313] [INFO] VulkanContext.cpp:631 - [VulkanContext] Detected physical device: NVIDIA GeForce RTX 5080 Laptop GPU
+[2026-07-17 21:05:08.445] [INFO] VulkanContext.cpp:852 - [VulkanContext] Transfer queue: dedicated hardware copy queue (family 1)
+[2026-07-17 21:05:08.447] [INFO] VulkanContext.cpp:358 - [VulkanContext] VMA Allocator initialized successfully.
+[2026-07-17 21:05:08.448] [INFO] VulkanContext.cpp:376 - [VulkanContext] Allocated entity buffer (10000 elements).
+[2026-07-17 21:05:08.453] [INFO] VulkanContext.cpp:397 - [VulkanContext] Allocated vertex SSBO: size=2048 MB.
+[2026-07-17 21:05:08.454] [INFO] VulkanContext.cpp:410 - [VulkanContext] Allocated index SSBO: size=1024 MB.
+[2026-07-17 21:05:08.455] [INFO] VulkanContext.cpp:420 - [VulkanContext] Allocated params uniform buffer (256 bytes).
+[2026-07-17 21:05:08.656] [CRITICAL] main.cpp:302 - [Main] VulkanContext::Init threw: VulkanPipeline: failed to open SPIR-V file: shaders/geom_cone.comp.spv

@@ -41,6 +41,7 @@
 #include "include/aces_tonemap.glsl"
 #include "include/math_utils.glsl"
 #include "include/atmos_sky_lut_mapping.glsl"
+#include "include/atmos_volumetric_fog_mapping.glsl"
 
 layout(local_size_x = 8, local_size_y = 8) in;
 
@@ -140,12 +141,18 @@ layout(std140, set = 0, binding = 3) uniform PostProcessParamsUBO {
     // scene), fed to SkyViewLUTUVFromDirection() on a scene miss below.
     vec3 sunDirWorld;
     float _padSky;
+
+    // Atmos weather system, Subtask 3: camera forward axis, see ViewZFromWorldPos()'s own comment.
+    vec3 cameraForward;
+    float _padFog;
 } g_Params;
 
 layout(set = 0, binding = 4) uniform sampler2D g_Bloom;
 layout(set = 0, binding = 5) uniform sampler2D g_Depth;             // renderer::ClusterResolvePass depth, render-res, bilinear-upsampled.
 layout(set = 0, binding = 6) uniform sampler2D g_RefractionOffset;  // renderer::TransparentForwardPass's own second attachment, render-res, bilinear-upsampled.
 layout(set = 0, binding = 7) uniform sampler2D g_SkyViewLUT;        // renderer::AtmosSkyPass's own Sky-View LUT (Atmos Subtask 2).
+layout(set = 0, binding = 8) uniform sampler3D g_VolumetricFog;     // renderer::AtmosVolumetricFogPass's own integrated fog grid (Atmos Subtask 3).
+layout(set = 0, binding = 9) uniform sampler2D g_Clouds;            // renderer::AtmosCloudsPass's own half-resolution cloud buffer (Atmos Subtask 4).
 
 // Radial per-channel UV offset -- red sampled slightly closer to center, blue slightly further out
 // (the classic lateral chromatic aberration look), scaled by distance-from-center squared so the
@@ -253,6 +260,19 @@ vec3 ApplyHeightFog(vec3 color, vec3 worldPos, vec3 cameraPos) {
 
     float fogFactor = clamp(1.0 - exp(-abs(opticalDepth)), 0.0, g_Params.fogMaxOpacity);
     return mix(color, g_Params.fogColor, fogFactor);
+}
+
+// Atmos weather system, Subtask 3: samples renderer::AtmosVolumetricFogPass's own integrated froxel
+// grid at this pixel's (screenUV, view-space-depth) and blends it over `color` -- see
+// atmos_volumetric_fog_mapping.glsl's own header comment for the exponential depth distribution this
+// must agree with (AtmosVolumetricFog.comp's own FroxelToWorld() is the writer-side counterpart).
+// `hitScene` misses clamp to the fog's own far distance (fully accumulated) rather than skip the
+// blend entirely -- even a sky pixel benefits from near-horizon god-ray-style in-scattering.
+vec3 ApplyVolumetricFog(vec3 color, vec2 uv, vec3 worldPos, bool hitScene) {
+    float viewZ = hitScene ? dot(worldPos - g_Params.cameraPositionWorld, g_Params.cameraForward) : ATMOS_FOG_FAR_Z;
+    float froxelW = ViewZToFroxelW(viewZ);
+    vec4 fogSample = texture(g_VolumetricFog, vec3(uv, froxelW));
+    return color * fogSample.a + fogSample.rgb;
 }
 
 // Volumetric Light Shafts / God Rays (Crepuscular Rays) -- the classic NVIDIA GPU Gems "volumetric
@@ -418,7 +438,27 @@ void main() {
         vec3 rayDir = normalize(farWorld - g_Params.cameraPositionWorld);
         vec2 skyUV = SkyViewLUTUVFromDirection(rayDir, g_Params.sunDirWorld);
         color = SanitizeHDR(texture(g_SkyViewLUT, skyUV).rgb);
+
+        // --- Atmos weather system, Subtask 4: Procedural Volumetric Clouds. Composited "behind
+        // volumetric height fog but in front of the physical sky" (atmos_integration_plan.md
+        // Subtask 4's own ordering) -- clouds only ever occlude the sky layer, so this is gated to
+        // the same !hitScene branch as the sky injection just above, blended straight over it at
+        // this same raw-HDR stage. renderer::AtmosCloudsPass's own buffer is plain screen-space
+        // (unlike the direction-parameterized Sky-View LUT), so a direct bilinear sample at
+        // `distortedUV` upsamples correctly from its half resolution -- see that pass' own class
+        // comment for why no dedicated temporal reconstruction is layered on top of that upsample. ---
+        vec4 cloudSample = texture(g_Clouds, distortedUV);
+        color = color * cloudSample.a + cloudSample.rgb;
     }
+
+    // --- Atmos weather system, Subtask 3: Froxel Volumetric Fog. Applied at this SAME raw-HDR
+    // stage as the sky injection just above (not down at the flat analytic Height Fog further
+    // below, which runs AFTER exposure/color-grading and mixes toward a pre-graded flat tint) --
+    // `fogSample.rgb` is real unexposed lux-scaled in-scattered radiance, so it must go through the
+    // same exposure/tonemap chain as any other scene radiance, exactly like the sky color above.
+    // Layered ON TOP of (not replacing) the flat Height Fog below -- matches Unreal Engine 5.8's own
+    // Exponential Height Fog + Volumetric Fog coexistence; see ApplyVolumetricFog's own comment. ---
+    color = ApplyVolumetricFog(color, distortedUV, worldPos, hitScene);
 
     // --- Physical Camera / Auto Exposure: UE's own Iso100 photometric conversion, MaxLuminance =
     // 1.2 * 2^EV100, applied scene color scale = 1 / MaxLuminance.

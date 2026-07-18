@@ -123,7 +123,9 @@
 #include "renderer/passes/GeometryDecompressionPass.h"
 #include "renderer/streaming/GeometryStreamingCoordinator.h"
 #include "renderer/passes/AtmosClimatePass.h"
+#include "renderer/passes/AtmosCloudsPass.h"
 #include "renderer/passes/AtmosSkyPass.h"
+#include "renderer/passes/AtmosVolumetricFogPass.h"
 #include "renderer/passes/GlobalSDFPass.h"
 #include "renderer/vulkan/GpuBuffer.h"
 #include "renderer/streaming/GpuGeometryPagePool.h"
@@ -788,6 +790,14 @@ namespace renderer {
         // owned À-Trous denoise -> Composite) and why it owns a DEDICATED ATrousDenoisePass instance
         // rather than inheriting m_Denoiser below.
         MegaLightsPass m_MegaLights;
+        // Atmos weather system, Subtask 3: Froxel Volumetric Fog -- see AtmosVolumetricFogPass's own
+        // class comment. Init'd after m_MegaLights (its own last dependency to become ready: also
+        // needs m_AtmosClimate and m_VirtualShadowMap, both already Init'd much earlier).
+        AtmosVolumetricFogPass m_AtmosFog;
+        // Atmos weather system, Subtask 4: Procedural Volumetric Clouds -- see AtmosCloudsPass's own
+        // class comment. Only needs m_AtmosClimate (already Init'd much earlier); Init'd here purely
+        // for proximity to the other Atmos passes, not because of any real dependency ordering.
+        AtmosCloudsPass m_AtmosClouds;
 
         // World Probe grid (Lumen "Translucency Volume" / global illumination volume): a low-
         // resolution, camera-centered 3D grid of ambient irradiance probes, fully rebuilt every
