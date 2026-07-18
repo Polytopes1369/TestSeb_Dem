@@ -179,13 +179,18 @@ namespace renderer {
             // when nonzero, this emitter's ember particles ALSO resolve a bounce/absorb response
             // against the opaque scene's reconstructed depth-buffer surface, as a fallback/supplement
             // to the Global SDF collision above (useful for camera-relative dynamic geometry the SDF
-            // clipmap has not (re)captured yet). `_padC2b`/`_padC2c` reserve the rest of this 16-byte
-            // slot for subtasks C3/C4 (Niagara-parity roadmap), which land immediately after this one
-            // in the SAME contiguous block -- matches this struct's own established per-subtask growth
-            // convention of always closing out a clean 16-byte slot (see e.g. the module-stack
-            // roadmap's own curl-noise/attractor blocks above).
+            // clipmap has not (re)captured yet).
             uint32_t depthCollisionEnabled = 0;
-            float _padC2a = 0.0f, _padC2b = 0.0f, _padC2c = 0.0f;
+            // Subtask C3 (spawn-on-mesh-surface): which entity's clusters spawnShape == 2 samples
+            // triangles from -- matches ClusterCullMetadata::entityID / geometry::ClusterIndexEntry::
+            // entityID exactly (the same index renderer::ClusterHardwareRasterPass's own vertex shader
+            // uses to look up EntityDataBuffer/EntityTransformBuffer, see ParticleSimulation.comp's own
+            // SpawnParticleCore comment for the full sampling contract). Unused by any other
+            // spawnShape. `_padC2b`/`_padC2c` reserve the rest of this 16-byte slot for subtask C4
+            // (Niagara-parity roadmap), landing immediately after this one in the same contiguous
+            // block.
+            uint32_t spawnTargetEntityId = 0;
+            float _padC2b = 0.0f, _padC2c = 0.0f;
         };
         static_assert(sizeof(EmitterParams) == 208, "EmitterParams must match ParticleCommon.glsl's EmitterParams struct exactly (std430 layout)");
 
@@ -272,9 +277,22 @@ namespace renderer {
         // the opaque scene's world position under a particle for the new screen-space depth-buffer
         // collision mode -- see EmitterParams::depthCollisionEnabled and ParticleSimulation.comp's own
         // ResolveDepthBufferCollision comment for the full contract.
+        // (Subtask C3, spawn-on-mesh-surface) Also binds 4 MORE environment-set resources, all
+        // borrowed unmodified (never re-written by this pass): `clusterMetadataBuffer` (renderer::
+        // ClusterOcclusionCullingPass::GetClusterMetadataBuffer()) and `compressedPhysicalPoolBuffer`
+        // (renderer::GpuGeometryPagePool::GetPhysicalPoolBuffer()) -- the EXACT SAME two buffers
+        // renderer::ClusterHardwareRasterPass's own ClusterRaster.vert already reads triangle geometry
+        // from (see cluster_vertex_decode.glsl's own DecodeClusterPosition) -- plus `entityTransformBuffer`/
+        // `entityDataBuffer` (the same two buffers ClusterRaster.vert also binds, needed to transform a
+        // sampled rest-pose triangle point into world space). Reusing these SAME 4 buffers (rather than
+        // building a second, bespoke mesh format) is what lets spawnShape == 2 sample real triangle
+        // surfaces of ANY already-streamed entity -- see ParticleSimulation.comp's own SpawnParticleCore
+        // comment for the full random-triangle-then-barycentric sampling algorithm.
         bool Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
             const AtmosClimatePass& atmosClimate, const GlobalSDFPass& globalSDF, const ClusterResolvePass& resolvePass,
             const VirtualShadowMapPass& vsm, const WorldProbeGridPass& worldProbes,
+            VkBuffer clusterMetadataBuffer, VkBuffer compressedPhysicalPoolBuffer,
+            VkBuffer entityTransformBuffer, VkBuffer entityDataBuffer,
             VkFormat colorFormat, VkFormat depthFormat);
 
         void Shutdown();

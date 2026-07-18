@@ -115,10 +115,13 @@ struct EmitterParams {
     // ParticleSystemPass::EmitterParams::depthCollisionEnabled (src/renderer/passes/
     // ParticleSystemPass.h) byte-for-byte, see that field's own declaration comment for the full
     // contract and ParticleSimulation.comp's own ResolveDepthBufferCollision for the consuming logic.
-    // `_padC2b`/`_padC2c` reserve the rest of this 16-byte slot for subtasks C3/C4, landing in the
-    // same contiguous block immediately after this one.
     uint depthCollisionEnabled;
-    float _padC2a, _padC2b, _padC2c;
+    // Subtask C3 (spawn-on-mesh-surface): mirrors renderer::ParticleSystemPass::EmitterParams::
+    // spawnTargetEntityId byte-for-byte -- see that field's own declaration comment. `_padC2b`/
+    // `_padC2c` reserve the rest of this 16-byte slot for subtask C4, landing immediately after this
+    // one in the same contiguous block.
+    uint spawnTargetEntityId;
+    float _padC2b, _padC2c;
 };
 
 // Particle "kind" tag, packed into Particle.randomSeed's top 2 bits (see that field's own comment).

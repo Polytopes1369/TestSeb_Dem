@@ -770,8 +770,15 @@ bool ClusterRenderPipeline::Init(
   // real depth-stencil buffer every other forward pass targets. RecordSimulate/RecordSort/
   // RecordDraw are all implemented but NOT yet called from RecordFrame (Subtask 6 wires that up),
   // so this Init() has no RecordFrame ordering consequence yet.
+  // Subtask C3 (spawn-on-mesh-surface): the SAME cluster metadata / compressed geometry pool / entity
+  // transform / entity data buffers m_HardwareRaster.Init()/m_Resolve.Init() already received above
+  // (m_OcclusionCulling and m_PagePool are both already Init'd well before this point) -- see
+  // ParticleSystemPass::Init's own header comment for why reusing these 4 buffers, rather than a
+  // second mesh format, is what lets EmitterParams::spawnTargetEntityId sample real triangle surfaces.
   if (!m_ParticleSystem.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
                              m_AtmosClimate, m_GlobalSDF, m_Resolve, m_VirtualShadowMap, m_WorldProbes,
+                             m_OcclusionCulling.GetClusterMetadataBuffer(), m_PagePool.GetPhysicalPoolBuffer(),
+                             createInfo.entityTransformBuffer, createInfo.entityDataBuffer,
                              GICompositePass::kOutputFormat, createInfo.depthFormat)) {
     LOG_ERROR("[ClusterRenderPipeline] Failed to initialize ParticleSystemPass.");
     return false;
@@ -1526,6 +1533,9 @@ void ClusterRenderPipeline::RecordFrameEarly(VkCommandBuffer cmdEarly,
         // Subtask C2 (screen-space depth-buffer collision): same "copy the live ImGui-edited config
         // value into this frame's GPU struct" pattern as every other field above.
         gpu.depthCollisionEnabled = cfg.depthCollisionEnabled ? 1u : 0u;
+        // Subtask C3 (spawn-on-mesh-surface): only meaningful when spawnShape == 2, copied
+        // unconditionally like every other field regardless (harmless when unused).
+        gpu.spawnTargetEntityId = cfg.spawnTargetEntityId;
 
         if (cfg.active) {
           m_ParticleSpawnAccumulator[i] += cfg.spawnRate * particleDeltaTimeSeconds;

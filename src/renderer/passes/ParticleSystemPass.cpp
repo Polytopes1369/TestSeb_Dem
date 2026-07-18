@@ -129,6 +129,8 @@ namespace renderer {
     bool ParticleSystemPass::Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
         const AtmosClimatePass& atmosClimate, const GlobalSDFPass& globalSDF, const ClusterResolvePass& resolvePass,
         const VirtualShadowMapPass& vsm, const WorldProbeGridPass& worldProbes,
+        VkBuffer clusterMetadataBuffer, VkBuffer compressedPhysicalPoolBuffer,
+        VkBuffer entityTransformBuffer, VkBuffer entityDataBuffer,
         VkFormat colorFormat, VkFormat depthFormat) {
         Shutdown();
 
@@ -380,25 +382,33 @@ namespace renderer {
             computeDepthSamplerInfo.unnormalizedCoordinates = VK_FALSE;
             VK_CHECK(vkCreateSampler(m_Device, &computeDepthSamplerInfo, nullptr, &m_ComputeSceneDepthSampler));
 
-            VkDescriptorSetLayoutBinding envBindings[5]{};
+            // Subtask C3 (spawn-on-mesh-surface): bindings 5-8, borrowed unmodified from the SAME 4
+            // buffers renderer::ClusterHardwareRasterPass's own ClusterRaster.vert already binds (see
+            // this class' own Init() header comment for the full "reuse existing buffers" rationale).
+            VkDescriptorSetLayoutBinding envBindings[9]{};
             envBindings[0] = { 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
             envBindings[1] = { 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, GlobalSDFPass::kLevelCount, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
             envBindings[2] = { 2, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
             envBindings[3] = { 3, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
             envBindings[4] = { 4, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+            envBindings[5] = { 5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // ClusterCullMetadataSSBO.
+            envBindings[6] = { 6, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // CompressedClusterPoolSSBO.
+            envBindings[7] = { 7, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // EntityTransformBuffer.
+            envBindings[8] = { 8, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // EntityDataBuffer.
 
             VkDescriptorSetLayoutCreateInfo envLayoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-            envLayoutInfo.bindingCount = 5;
+            envLayoutInfo.bindingCount = 9;
             envLayoutInfo.pBindings = envBindings;
             VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &envLayoutInfo, nullptr, &m_EnvironmentSetLayout));
 
-            VkDescriptorPoolSize envPoolSizes[2] = {
+            VkDescriptorPoolSize envPoolSizes[3] = {
                 { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 3 }, // AtmosGlobalsUBO (binding 0) + PrecipitationParamsUBO (binding 2) + ParticleDepthCollisionUBO (binding 3).
-                { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, GlobalSDFPass::kLevelCount + 1 } // Clipmaps (binding 1) + scene depth copy (binding 4).
+                { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, GlobalSDFPass::kLevelCount + 1 }, // Clipmaps (binding 1) + scene depth copy (binding 4).
+                { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4 } // Cluster metadata + compressed pool + entity transform + entity data (bindings 5-8).
             };
             VkDescriptorPoolCreateInfo envPoolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
             envPoolInfo.maxSets = 1;
-            envPoolInfo.poolSizeCount = 2;
+            envPoolInfo.poolSizeCount = 3;
             envPoolInfo.pPoolSizes = envPoolSizes;
             VK_CHECK(vkCreateDescriptorPool(m_Device, &envPoolInfo, nullptr, &m_EnvironmentDescriptorPool));
 
@@ -416,14 +426,22 @@ namespace renderer {
             VkDescriptorBufferInfo precipParamsInfo{ m_PrecipitationParamsBuffer.Handle(), 0, m_PrecipitationParamsBuffer.Size() };
             VkDescriptorBufferInfo depthCollisionParamsInfo{ m_DepthCollisionParamsBuffer.Handle(), 0, m_DepthCollisionParamsBuffer.Size() };
             VkDescriptorImageInfo computeSceneDepthInfo{ m_ComputeSceneDepthSampler, resolvePass.GetOutputDepthView(), VK_IMAGE_LAYOUT_GENERAL };
+            VkDescriptorBufferInfo clusterMetadataInfo{ clusterMetadataBuffer, 0, VK_WHOLE_SIZE };
+            VkDescriptorBufferInfo compressedPoolInfo{ compressedPhysicalPoolBuffer, 0, VK_WHOLE_SIZE };
+            VkDescriptorBufferInfo entityTransformInfo{ entityTransformBuffer, 0, VK_WHOLE_SIZE };
+            VkDescriptorBufferInfo entityDataInfo{ entityDataBuffer, 0, VK_WHOLE_SIZE };
 
-            VkWriteDescriptorSet envWrites[5]{};
+            VkWriteDescriptorSet envWrites[9]{};
             envWrites[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_EnvironmentSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &atmosGlobalsInfo, nullptr };
             envWrites[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_EnvironmentSet, 1, 0, GlobalSDFPass::kLevelCount, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, clipmapInfos, nullptr, nullptr };
             envWrites[2] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_EnvironmentSet, 2, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &precipParamsInfo, nullptr };
             envWrites[3] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_EnvironmentSet, 3, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &depthCollisionParamsInfo, nullptr };
             envWrites[4] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_EnvironmentSet, 4, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &computeSceneDepthInfo, nullptr, nullptr };
-            vkUpdateDescriptorSets(m_Device, 5, envWrites, 0, nullptr);
+            envWrites[5] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_EnvironmentSet, 5, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &clusterMetadataInfo, nullptr };
+            envWrites[6] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_EnvironmentSet, 6, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &compressedPoolInfo, nullptr };
+            envWrites[7] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_EnvironmentSet, 7, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &entityTransformInfo, nullptr };
+            envWrites[8] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_EnvironmentSet, 8, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &entityDataInfo, nullptr };
+            vkUpdateDescriptorSets(m_Device, 9, envWrites, 0, nullptr);
 
             VkDescriptorSetLayout simSetLayouts[2] = { m_SetLayout, m_EnvironmentSetLayout };
             VkPushConstantRange pushRange{ VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(ParticleSimulationPC) };

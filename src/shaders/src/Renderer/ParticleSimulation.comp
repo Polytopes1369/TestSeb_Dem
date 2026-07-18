@@ -56,6 +56,19 @@
 #include "include/ParticleCommon.glsl"
 #include "include/AtmosNoiseCommon.glsl"
 
+// Subtask C3 (spawn-on-mesh-surface): reuses the SAME cluster metadata/compressed-geometry-pool/
+// entity-transform/entity-data buffers renderer::ClusterHardwareRasterPass's own ClusterRaster.vert
+// already reads triangle geometry from, rather than building a second mesh format -- see
+// SpawnParticleCore's own comment for the full sampling algorithm. cluster_vertex_decode.glsl's
+// DecodeClusterPosition() decodes a vertex position directly from the COMPRESSED pool with no
+// dependency on any separately-decompressed buffer (see that header's own comment), which is exactly
+// why this compute shader can do this with no new decompression pass of its own.
+#include "include/cluster_culling_common.glsl"
+#include "include/struct_custo.glsl"
+#define COMPRESSED_POOL_SET 1
+#define COMPRESSED_POOL_BINDING 6
+#include "include/cluster_vertex_decode.glsl"
+
 layout(local_size_x = 64) in;
 
 // std140 mirror of AtmosClimatePass.cpp's AtmosGlobalsUBO -- see AtmosNoiseCommon.glsl's own header
@@ -110,6 +123,23 @@ layout(std140, set = 1, binding = 3) uniform ParticleDepthCollisionUBO {
 // ParticleRender.frag uses (a different descriptor set entirely -- see that shader's own header
 // comment for why a depth ATTACHMENT needs a separate sampled copy in the first place).
 layout(set = 1, binding = 4) uniform sampler2D g_SceneDepthCompute;
+
+// Subtask C3 (spawn-on-mesh-surface) -- the SAME 3 metadata/entity buffers ClusterRaster.vert reads
+// (binding 6, the compressed geometry pool itself, is declared by cluster_vertex_decode.glsl's own
+// COMPRESSED_POOL_SET/BINDING macros above). Anonymous block instance names (no `g_` prefix on
+// entityTransforms/entityData) deliberately match ClusterRaster.vert's own exact declaration style,
+// since these are literally the same buffers.
+layout(std430, set = 1, binding = 5) readonly buffer ClusterCullMetadataSSBO {
+    ClusterCullMetadata clusters[];
+} g_Clusters;
+
+layout(std430, set = 1, binding = 7) readonly buffer EntityTransformBuffer {
+    EntityTransform entityTransforms[];
+};
+
+layout(std430, set = 1, binding = 8) readonly buffer EntityDataBuffer {
+    EntityData entityData[];
+};
 
 layout(push_constant) uniform ParticleSimulationPC {
     float dt;
@@ -340,17 +370,113 @@ float SampleSizeCurve(EmitterParams e, float age) {
     return mix(e.sizeCurve[key0], e.sizeCurve[key0 + 1], frac);
 }
 
-void SpawnParticle(uint slotIndex, uint spawnRequestIndex, uint emitterIndex) {
-    uint seed = HashUint(pc.randomSeedBase ^ (slotIndex * 2654435761u) ^ (spawnRequestIndex * 40503u) ^ (emitterIndex * 2246822519u));
+// Subtask C3 (spawn-on-mesh-surface): uniformly-random point on the surface of `e.spawnTargetEntityId`'s
+// mesh, in WORLD space. Two-stage rejection sample, chosen as the SIMPLEST correct approach that reuses
+// existing buffers rather than building a second mesh format (per this subtask's own design brief):
+//   1. Pick a uniformly-random cluster SLOT (out of every cluster currently resident for ANY entity),
+//      retrying up to kMaxClusterPickAttempts times until one happens to belong to the target entity.
+//      This project's cluster metadata has no per-entity index (clusters for different entities are
+//      interleaved in upload order, see renderer::ClusterOcclusionCullingPass), so building one just for
+//      this feature would itself be "a second mesh format" -- a bounded-retry rejection sample is the
+//      pragmatic, minimal alternative the task's own design brief calls for. Degrades gracefully (falls
+//      through to the caller's own fallback) if the target entity is never found within the attempt
+//      budget (e.g. a very small entity lost among thousands of clusters, or an invalid ID).
+//   2. Within that cluster, pick a uniformly-random LOCAL triangle (indices decoded straight out of the
+//      SAME compressed pool the position/UV decode already reads, see CLUSTER_INDICES_BASE_BYTES's own
+//      comment in cluster_vertex_decode.glsl -- 1 byte per local vertex index, no separate decompressed
+//      index buffer needed) and a uniformly-random barycentric point on it (Osada et al.'s sqrt(r1)
+//      folding avoids the well-known corner-clustering bias of a naive (r1, r2) linear pair).
+// Returns false (leaving `outPosition` untouched) when no cluster of the target entity was found.
+bool SampleEntityMeshSurface(uint targetEntityId, inout uint seed, out vec3 outPosition) {
+    const uint kMaxClusterPickAttempts = 32u;
+    uint clusterCount = uint(g_Clusters.clusters.length());
+    if (clusterCount == 0u) {
+        return false;
+    }
+
+    bool found = false;
+    ClusterCullMetadata targetCluster;
+    for (uint attempt = 0u; attempt < kMaxClusterPickAttempts && !found; ++attempt) {
+        // Folds `attempt` into the hash directly (rather than drawing from NextRandomFloat) so this
+        // rejection loop advances independently of the rest of this particle's own spawn RNG sequence.
+        uint candidate = HashUint(seed ^ (attempt * 2654435761u) ^ 0x9E3779B9u) % clusterCount;
+        ClusterCullMetadata c = g_Clusters.clusters[candidate];
+        if (c.entityID == targetEntityId) {
+            targetCluster = c;
+            found = true;
+        }
+    }
+    if (!found || targetCluster.indexCount < 3u) {
+        return false;
+    }
+
+    uint triangleCount = targetCluster.indexCount / 3u;
+    uint triIndex = min(uint(NextRandomFloat(seed) * float(triangleCount)), triangleCount - 1u);
+    uint physicalPageIndex = targetCluster.vertexOffset / CLUSTER_MAX_VERTICES;
+    uint pageByteBase = physicalPageIndex * CLUSTER_PAGE_SIZE_BYTES;
+
+    uint i0 = ClusterLoadByte(pageByteBase + CLUSTER_INDICES_BASE_BYTES + triIndex * 3u + 0u);
+    uint i1 = ClusterLoadByte(pageByteBase + CLUSTER_INDICES_BASE_BYTES + triIndex * 3u + 1u);
+    uint i2 = ClusterLoadByte(pageByteBase + CLUSTER_INDICES_BASE_BYTES + triIndex * 3u + 2u);
+    vec3 v0 = DecodeClusterPosition(pageByteBase, i0, targetCluster.boundsMin, targetCluster.boundsMax);
+    vec3 v1 = DecodeClusterPosition(pageByteBase, i1, targetCluster.boundsMin, targetCluster.boundsMax);
+    vec3 v2 = DecodeClusterPosition(pageByteBase, i2, targetCluster.boundsMin, targetCluster.boundsMax);
+
+    float r1 = NextRandomFloat(seed);
+    float r2 = NextRandomFloat(seed);
+    float sqrtR1 = sqrt(r1);
+    float bary0 = 1.0 - sqrtR1;
+    float bary1 = sqrtR1 * (1.0 - r2);
+    float bary2 = sqrtR1 * r2;
+    vec3 restPos = v0 * bary0 + v1 * bary1 + v2 * bary2;
+
+    // Transform from the cluster's own rest-pose space into world space -- the SAME composition
+    // ClusterRaster.vert applies (rotate-about-center, then translate; see struct_custo.glsl's own
+    // EntityTransform comment). Barycentric interpolation commutes with this affine transform, so
+    // blending the 3 rest-pose vertices FIRST and transforming once is equivalent to (and cheaper than)
+    // transforming each vertex individually.
+    EntityData ed = entityData[targetCluster.entityID];
+    EntityTransform xform = entityTransforms[ed.meshID];
+    vec3 localPos = restPos - xform.center;
+    outPosition = xform.translation + xform.center + mat3(xform.rotation) * localPos;
+    return true;
+}
+
+// `centerPosition` is the spawn-volume center for shapes 0/1 (the emitter's own live position for a
+// normal spawn, mode == 1; a DEATH/COLLISION location for a subtask C4 sub-emitter trigger instead,
+// see TriggerSubEmitter's own comment) -- ignored by shape 2 (mesh surface), which always samples
+// `emitters[emitterIndex]`'s OWN spawnTargetEntityId regardless of who is spawning into this slot.
+// `isSubEmitterChild` is subtask C4's one-level-deep recursion cap -- see Particle::subEmitterChildFlag's
+// own declaration comment (ParticleSystemPass.h) for the full safety argument.
+void SpawnParticleCore(uint slotIndex, uint seed, uint emitterIndex, vec3 centerPosition, bool isSubEmitterChild) {
     EmitterParams e = emitters[emitterIndex];
 
     vec3 position;
     vec3 velocity;
-    if (e.spawnShape == 1u) {
+    if (e.spawnShape == 2u) {
+        // Subtask C3: spawn distributed across an existing entity's mesh surface instead of a simple
+        // volume/cone -- see SampleEntityMeshSurface's own comment for the full algorithm. Falls back
+        // to a small sphere-volume spawn around the emitter's own configured position (NOT
+        // `centerPosition` -- a mesh-surface spawn has no meaningful notion of a sub-emitter override
+        // location) if the target entity's clusters could not be found within the attempt budget.
+        vec3 meshPos;
+        if (SampleEntityMeshSurface(e.spawnTargetEntityId, seed, meshPos)) {
+            position = meshPos;
+        } else {
+            position = e.position + RandomInUnitSphere(seed) * max(e.shapeParam0, 0.1);
+        }
+        // Gentle upward drift -- reads as spores/pollen/embers lifting off a mesh surface, matching
+        // this project's own established "no bespoke velocity per new shape" minimalism (every other
+        // module -- curl-noise, attractor -- is still free to layer on top in UpdateParticle).
+        velocity = vec3(
+            (NextRandomFloat(seed) * 2.0 - 1.0) * 0.1,
+            0.05 + NextRandomFloat(seed) * 0.15,
+            (NextRandomFloat(seed) * 2.0 - 1.0) * 0.1);
+    } else if (e.spawnShape == 1u) {
         // Sphere volume drift (subtask A1's "Ambient Dust" default): spawn anywhere inside a sphere
-        // of radius shapeParam0 around the emitter position, gentle mostly-vertical drift instead of
+        // of radius shapeParam0 around the spawn-volume center, gentle mostly-vertical drift instead of
         // a launched burst.
-        position = e.position + RandomInUnitSphere(seed) * e.shapeParam0;
+        position = centerPosition + RandomInUnitSphere(seed) * e.shapeParam0;
         velocity = vec3(
             (NextRandomFloat(seed) * 2.0 - 1.0) * 0.15,
             NextRandomFloat(seed) * 0.3,
@@ -363,7 +489,7 @@ void SpawnParticle(uint slotIndex, uint spawnRequestIndex, uint emitterIndex) {
             NextRandomFloat(seed) * 0.5 + 0.5,
             NextRandomFloat(seed) * 2.0 - 1.0));
         float speed = 1.0 + NextRandomFloat(seed) * 2.0;
-        position = e.position + (vec3(NextRandomFloat(seed), NextRandomFloat(seed), NextRandomFloat(seed)) - 0.5) * 0.1;
+        position = centerPosition + (vec3(NextRandomFloat(seed), NextRandomFloat(seed), NextRandomFloat(seed)) - 0.5) * 0.1;
         velocity = jitterDir * speed;
     }
     float life = mix(e.lifetimeMin, e.lifetimeMax, NextRandomFloat(seed));
@@ -389,6 +515,11 @@ void SpawnParticle(uint slotIndex, uint spawnRequestIndex, uint emitterIndex) {
     // one-frame-safe default, not the value that actually reaches the render pass.
     p.baseSize = size;
     particles[slotIndex] = p;
+}
+
+void SpawnParticle(uint slotIndex, uint spawnRequestIndex, uint emitterIndex) {
+    uint seed = HashUint(pc.randomSeedBase ^ (slotIndex * 2654435761u) ^ (spawnRequestIndex * 40503u) ^ (emitterIndex * 2246822519u));
+    SpawnParticleCore(slotIndex, seed, emitterIndex, emitters[emitterIndex].position, false);
 }
 
 // Precipitation feature -- spawns one rain or snow particle inside a horizontal box "shell" centered

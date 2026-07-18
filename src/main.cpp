@@ -1120,8 +1120,22 @@ int main(int argc, char** argv) {
                         ImGui::Checkbox("Active", &cfg.active);
                         ImGui::DragFloat("Spawn Rate (particles/s)", &cfg.spawnRate, 5.0f, 0.0f, 5000.0f);
                         ImGui::DragFloat3("Position", &cfg.positionX, 0.05f);
-                        ImGui::Combo("Spawn Shape", reinterpret_cast<int*>(&cfg.spawnShape), "Cone Burst\0Sphere Volume\0\0");
+                        ImGui::Combo("Spawn Shape", reinterpret_cast<int*>(&cfg.spawnShape), "Cone Burst\0Sphere Volume\0Mesh Surface\0\0");
                         ImGui::DragFloat("Shape Param (sphere radius)", &cfg.shapeParam0, 0.02f, 0.0f, 20.0f);
+                        // Subtask C3 (spawn-on-mesh-surface): only consulted when Spawn Shape above is
+                        // "Mesh Surface" -- matches ClusterCullMetadata::entityID / geometry::
+                        // ClusterIndexEntry::entityID (the showcase scene's own entity indices, see
+                        // VulkanContext::BuildEntityData()'s call sites for which meshID each showcase
+                        // zone uses). An entity with no currently-resident clusters (streamed out, or an
+                        // out-of-range ID) simply falls back to a small sphere spawn around this
+                        // emitter's own Position above -- see ParticleSimulation.comp's own
+                        // SpawnParticleCore comment.
+                        if (cfg.spawnShape == 2u) {
+                            int targetEntityId = static_cast<int>(cfg.spawnTargetEntityId);
+                            if (ImGui::DragInt("Target Entity ID (mesh surface)", &targetEntityId, 1.0f, 0, 63)) {
+                                cfg.spawnTargetEntityId = static_cast<uint32_t>(std::max(0, targetEntityId));
+                            }
+                        }
                         ImGui::ColorEdit4("Base Color", &cfg.colorR);
                         ImGui::DragFloatRange2("Size Range", &cfg.sizeMin, &cfg.sizeMax, 0.005f, 0.001f, 5.0f);
                         ImGui::DragFloatRange2("Lifetime Range (s)", &cfg.lifetimeMin, &cfg.lifetimeMax, 0.05f, 0.1f, 30.0f);

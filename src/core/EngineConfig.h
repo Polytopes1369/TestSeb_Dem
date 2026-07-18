@@ -554,6 +554,10 @@ struct EmitterConfig {
     // member initializer rather than needing to be rewritten. See renderer::ParticleSystemPass::
     // EmitterParams::depthCollisionEnabled's own declaration comment for the full contract.
     bool depthCollisionEnabled = false;
+    // Subtask C3 (spawn-on-mesh-surface) -- same trailing-field convention as depthCollisionEnabled
+    // just above. Only meaningful when spawnShape == 2 -- see renderer::ParticleSystemPass::
+    // EmitterParams::spawnTargetEntityId's own declaration comment for the full contract.
+    uint32_t spawnTargetEntityId = 0;
 };
 
 // Slot 0 preserves the ORIGINAL single-emitter defaults exactly (same position/spawn rate/physics
