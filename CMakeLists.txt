@@ -362,6 +362,44 @@ add_executable(PcgNodePluginTests
 target_include_directories(PcgNodePluginTests PRIVATE src ${Vulkan_INCLUDE_DIRS})
 add_test(NAME PcgNodePluginTests COMMAND PcgNodePluginTests)
 
+# PCG framework roadmap, Phase 5.3 ("GPU-Resident Node Execution"): unlike every Pcg*Tests target
+# above (all pure-CPU logic), this target actually stands up a minimal headless Vulkan compute
+# context (tests/PcgGpuTestUtils.h/.cpp -- deliberately kept under tests/, NOT src/, so it never
+# reaches ALL_SOURCES's glob and never links into the shipping DemoSceneVK executable, same
+# rationale as WorldPartitionBakeTool's own tools/ placement below) and dispatches a real compute
+# shader (PcgDensityNoise.comp) against real GPU hardware. Links:
+#   - src/pcg/PcgGraph.cpp + PcgGraphEvaluator.cpp + CRUDE_JSON_SOURCES: same PCG graph engine core
+#     as PcgGraphEngineTests above (this test builds a real PcgGraph and calls
+#     PcgGraphEvaluator::EvaluateNodeGpu, not just the GPU node type in isolation).
+#   - src/pcg/PcgGpuDensityNoiseNode.cpp: the one reference GPU node type this phase implements.
+#   - src/renderer/vulkan/{GpuBuffer,VmaUsage,VulkanUtils,VulkanPipeline}.cpp + src/core/Logger.cpp:
+#     the existing Vulkan buffer/one-shot-command/shader-loading helpers this harness reuses rather
+#     than reinventing (see PcgGpuTestUtils.h's own "follow an existing convention" comment).
+add_executable(PcgGpuNodeExecutorTests
+    src/pcg/PcgGraph.cpp
+    src/pcg/PcgGraphEvaluator.cpp
+    src/pcg/PcgGpuDensityNoiseNode.cpp
+    ${CRUDE_JSON_SOURCES}
+    src/renderer/vulkan/GpuBuffer.cpp
+    src/renderer/vulkan/VmaUsage.cpp
+    src/renderer/vulkan/VulkanUtils.cpp
+    src/renderer/vulkan/VulkanPipeline.cpp
+    src/core/Logger.cpp
+    tests/PcgGpuTestUtils.cpp
+    tests/PcgGpuNodeExecutorTests.cpp
+)
+target_include_directories(PcgGpuNodeExecutorTests PRIVATE src tests ${Vulkan_INCLUDE_DIRS} vendor/vma)
+target_link_libraries(PcgGpuNodeExecutorTests PRIVATE Vulkan::Vulkan)
+# WORKING_DIRECTORY explicitly set to this target's own output directory: PcgGpuDensityNoiseNode::
+# Init() loads its shader via the hardcoded-relative-path convention every other compute pass in
+# this codebase uses ("shaders/PcgDensityNoise.comp.spv", see that method's own comment) -- pinning
+# ctest's working directory here (rather than relying on whatever directory `ctest` itself happens
+# to be invoked from) guarantees that relative path always resolves, regardless of how this test
+# suite is run. The actual shader deployment into that directory's shaders/ subfolder is wired up
+# below, once the CompileShaders target this depends on has been defined.
+add_test(NAME PcgGpuNodeExecutorTests COMMAND PcgGpuNodeExecutorTests
+    WORKING_DIRECTORY $<TARGET_FILE_DIR:PcgGpuNodeExecutorTests>)
+
 add_executable(AsyncDecompressingLoaderTests
     src/io/AsyncFileStreamer.cpp
     src/io/BlockCodec.cpp
@@ -614,6 +652,23 @@ if(Vulkan_GLSLC_EXECUTABLE)
     # Create target to ensure shaders compile before executable links
     add_custom_target(CompileShaders ALL DEPENDS ${SHADER_TARGETS})
     add_dependencies(${PROJECT_NAME} CompileShaders)
+
+    # PCG framework roadmap, Phase 5.3 ("GPU-Resident Node Execution"): PcgGpuNodeExecutorTests
+    # (defined earlier, alongside the other Pcg*Tests targets) needs its own copy of
+    # PcgDensityNoise.comp.spv deployed next to its own executable -- it is a SEPARATE target from
+    # ${PROJECT_NAME}, so the generic per-shader POST_BUILD loop above (which only ever targets
+    # ${PROJECT_NAME}) does not cover it. Mirrors that loop's own copy_if_different idiom exactly,
+    # scoped to just this one shader. Must come after CompileShaders is defined (immediately above)
+    # since add_dependencies below requires both targets to already exist.
+    add_custom_command(
+        TARGET PcgGpuNodeExecutorTests POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:PcgGpuNodeExecutorTests>/shaders"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_BINARY_DIR}/shaders_gen/$<CONFIG>/PcgDensityNoise.comp.spv"
+        "$<TARGET_FILE_DIR:PcgGpuNodeExecutorTests>/shaders/PcgDensityNoise.comp.spv"
+        COMMENT "Deploying shader PcgDensityNoise.comp.spv to PcgGpuNodeExecutorTests directory"
+    )
+    add_dependencies(PcgGpuNodeExecutorTests CompileShaders)
 
 else()
     message(FATAL_ERROR "glslc not found! Check Vulkan SDK installation.")

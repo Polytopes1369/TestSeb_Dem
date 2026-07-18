@@ -51,6 +51,21 @@
 #include <unordered_map>
 #include <vector>
 
+// Phase 5.3 ("GPU-Resident Node Execution") needs VkCommandBuffer/VkBuffer/VkDeviceSize as PLAIN
+// OPAQUE HANDLE TYPES for the PcgGpuNodeExecuteFn signature below (see that alias's own comment).
+// This costs nothing at link time (vulkan.h only declares types/prototypes; no vk* symbol is ever
+// called from this header) and every consumer of this header already has Vulkan_INCLUDE_DIRS on
+// its include path (every Pcg* CTest target does -- see the top-level CMakeLists.txt), so this does
+// not break any existing pure-CPU consumer of this file. This IS a deliberate exception to this
+// header's own long-standing "stay decoupled from a heavy optional dependency" precedent (see the
+// crude_json forward-declaration comment above): unlike crude_json (an internal serialization
+// detail with a real, non-trivial compiled dependency), Vulkan's core header is a zero-cost,
+// ubiquitous type vocabulary this entire codebase already assumes is available everywhere, and
+// keeping the GPU registration seam colocated with the CPU one (both live on PcgNodeTypeRegistry,
+// see below) is far more discoverable for a future phase than scattering it into a second,
+// disconnected registry class.
+#include <vulkan/vulkan.h>
+
 namespace pcg {
 
     // Resolved pin data for one node's inputs (as seen by its execute callback) or outputs (as
@@ -93,11 +108,105 @@ namespace pcg {
     // `.count`, not index blindly) plus its own PcgAttributeSet configuration params.
     using PcgNodeExecuteFn = std::function<PcgNodeExecuteResult(const PcgNodePinDataMap& inputs, const PcgAttributeSet& params)>;
 
+    // ------------------------------------------------------------------------------------------
+    // Phase 5.3 ("GPU-Resident Node Execution") -- an ADDITIVE, alternate execution path for node
+    // types that opt in to running entirely on the GPU (per-point operations that are naturally
+    // massively parallel: density remap, noise sampling, transform jitter -- exactly the class of
+    // work Phase 3's CPU filter nodes perform one point at a time). This sits ALONGSIDE the CPU
+    // PcgNodeExecuteFn/PcgNodeTypeRegistry contract above -- nothing above this comment block is
+    // modified, a node type may be CPU-registered, GPU-registered, or both (a caller picks which
+    // path to invoke for a given evaluation; this phase does not add automatic CPU/GPU fallback
+    // selection logic, that is a future phase's concern if it ever becomes necessary).
+    //
+    // Data-flow model: unlike the CPU path (whose PcgNodePinDataMap moves typed pcg::PcgPinData
+    // values, entirely in host memory, between nodes as the topological evaluator walks the graph),
+    // a GPU node type's execute callback operates on an ALREADY GPU-RESIDENT buffer of
+    // pcg::GpuPcgPoint entries (PcgPointData.h) -- no CPU readback, no blocking, no synchronous
+    // return value carrying real data. The callback's entire job is to RECORD compute-dispatch
+    // commands (vkCmdBindPipeline/vkCmdBindDescriptorSets/vkCmdPushConstants/vkCmdDispatch) into a
+    // caller-supplied, already-open VkCommandBuffer; the caller retains full ownership of
+    // submission, fencing, and every barrier surrounding the call (this mirrors this codebase's own
+    // RecordXxx() convention throughout src/renderer/passes/ -- see e.g.
+    // ParticleSystemPass::RecordSimulate's own header comment for the identical "caller owns the
+    // barrier before/after this call" contract).
+    //
+    // Scope of this phase: proves the registration+dispatch mechanism end-to-end with ONE real node
+    // type (src/pcg/PcgGpuDensityNoiseNode.h, "pcg.gpu.density_noise") -- it deliberately does NOT
+    // extend PcgGraphEvaluator's topological Evaluate() to walk a graph and automatically bridge
+    // CPU Points pins to GPU buffers between GPU-registered nodes (that "mixed CPU/GPU scheduling"
+    // problem -- upload/readback insertion, keeping a whole multi-node subgraph's dispatches in one
+    // command buffer, etc. -- is a substantially bigger design question than this phase's mandate,
+    // left for a future phase to tackle deliberately rather than bolted on here as an afterthought).
+    // What IS provided is a single-node GPU evaluation path, EvaluateNodeGpu() below, which resolves
+    // one specific node's params from a PcgGraph and records its GPU execute callback -- the exact
+    // seam a future multi-node scheduler would call once per GPU-registered node in topological
+    // order, once it exists.
+    // ------------------------------------------------------------------------------------------
+
+    // Descriptor for a GPU-resident buffer of pcg::GpuPcgPoint entries that a GPU node type's
+    // execute callback reads and/or writes. `buffer` must already contain `pointCount` valid
+    // GpuPcgPoint entries starting at element index `offsetElements` (i.e. byte offset
+    // `offsetElements * sizeof(GpuPcgPoint)`) -- an ELEMENT offset, not a byte offset, mirroring
+    // this project's established PrimitiveGen compute-shader convention of writing into a
+    // caller-supplied SSBO at a caller-supplied element offset (see e.g. geom_sphere.comp's own
+    // `vertexOffset` push-constant field) rather than a raw VkDescriptorBufferInfo byte offset --
+    // the latter would additionally have to satisfy the physical device's own
+    // VkPhysicalDeviceLimits::minStorageBufferOffsetAlignment for every possible offset, which an
+    // element-index-in-shader scheme sidesteps entirely (every GPU node type always binds `buffer`
+    // at descriptor offset 0, range VK_WHOLE_SIZE, and adds `offsetElements` to its own
+    // gl_GlobalInvocationID.x-derived index inside the shader instead).
+    struct PcgGpuPointBuffer {
+        VkBuffer buffer = VK_NULL_HANDLE;
+        uint32_t offsetElements = 0;
+        uint32_t pointCount = 0;
+    };
+
+    // Outcome of a GPU node type's execute callback -- deliberately the same two-field shape as the
+    // CPU PcgNodeExecuteResult's error-reporting half (`success`/`errorMessage`), but with no
+    // `outputs` map: a GPU node type's real output is whatever it recorded into `output` (a
+    // VkBuffer, inspected later by the caller, e.g. via tests/PcgGpuTestUtils.h's
+    // ReadBackGpuPoints() for a CTest), not a synchronously-returned CPU value.
+    struct PcgGpuNodeExecuteResult {
+        bool success = true;
+        std::string errorMessage; // Only meaningful when success == false.
+
+        static PcgGpuNodeExecuteResult Ok() { return PcgGpuNodeExecuteResult{}; }
+
+        static PcgGpuNodeExecuteResult Error(std::string message) {
+            PcgGpuNodeExecuteResult result;
+            result.success = false;
+            result.errorMessage = std::move(message);
+            return result;
+        }
+    };
+
+    // The GPU node-type-registration seam -- see this file's own Phase 5.3 header comment block
+    // above for the full design rationale. `cmd` is an already-open (vkBeginCommandBuffer already
+    // called) command buffer the callback ONLY records into -- it must never submit, wait on a
+    // fence, or perform any CPU readback (that would violate the whole "no CPU readback, no
+    // blocking" point of this execution path). `input` is guaranteed already visible to
+    // VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT reads by the time this callback's recorded commands
+    // execute (the caller owns that barrier, exactly like every other RecordXxx() method in this
+    // codebase). `output` MAY alias `input` (same VkBuffer, same offsetElements) for an in-place
+    // transform -- a conforming GPU node type implementation must support this (the reference
+    // implementation, PcgGpuDensityNoiseNode, does: each GPU thread only ever reads then writes its
+    // own element, so aliasing input==output is race-free by construction). `params` is this node
+    // instance's own PcgAttributeSet configuration, exactly as the CPU PcgNodeExecuteFn receives it.
+    using PcgGpuNodeExecuteFn = std::function<PcgGpuNodeExecuteResult(
+        VkCommandBuffer cmd, const PcgGpuPointBuffer& input, const PcgGpuPointBuffer& output, const PcgAttributeSet& params)>;
+
     // A simple typeId -> execute-callback map. Deliberately minimal (no unregister, no versioning,
     // no reflection of a node type's expected pin shape) -- a future Phase 5.4 native node plugin
     // API is exactly where those richer concerns belong; this phase only needs "can I look up a
     // callable for this typeId at evaluation time", which is what every one of Phase 2's future
     // sampler nodes and this phase's own synthetic test nodes need.
+    //
+    // Phase 5.3: also the GPU node-type-registration seam (RegisterGpu/IsGpuRegistered/FindGpu) --
+    // kept on this SAME class (not a second, disconnected registry type) so a future phase looking
+    // for "where do I register a new PCG node type" finds exactly one answer regardless of whether
+    // that node type executes on the CPU, the GPU, or (in principle) both. The two maps are
+    // completely independent: a typeId may be CPU-registered, GPU-registered, both, or neither --
+    // Register()/RegisterGpu() never interact with each other's map.
     class PcgNodeTypeRegistry {
     public:
         // Registers `fn` under `typeId`. Re-registering an already-known typeId overwrites the
@@ -110,8 +219,20 @@ namespace pcg {
         // Returns nullptr if `typeId` was never registered.
         const PcgNodeExecuteFn* Find(const PcgNodeTypeId& typeId) const;
 
+        // Phase 5.3: registers `fn` as `typeId`'s GPU execute callback. Same last-write-wins
+        // overwrite semantics as Register() above, and completely independent of it -- registering
+        // a GPU callback for a typeId that already has a CPU callback (or vice versa) is expected
+        // and does not replace or invalidate the other one.
+        void RegisterGpu(PcgNodeTypeId typeId, PcgGpuNodeExecuteFn fn);
+
+        bool IsGpuRegistered(const PcgNodeTypeId& typeId) const;
+
+        // Returns nullptr if `typeId` was never GPU-registered.
+        const PcgGpuNodeExecuteFn* FindGpu(const PcgNodeTypeId& typeId) const;
+
     private:
         std::unordered_map<PcgNodeTypeId, PcgNodeExecuteFn> m_Fns;
+        std::unordered_map<PcgNodeTypeId, PcgGpuNodeExecuteFn> m_GpuFns; // Phase 5.3.
     };
 
     // Evaluates a PcgGraph against a PcgNodeTypeRegistry. Stateless across calls (holds only a
@@ -146,6 +267,23 @@ namespace pcg {
         EvalResult Evaluate(const PcgGraph& graph) const {
             return EvaluateInternal(graph, {});
         }
+
+        // Phase 5.3's "new evaluation path" -- see this file's own GPU header comment block above
+        // for the full rationale on why this is deliberately a SINGLE-NODE entry point rather than
+        // a graph-walking Evaluate() counterpart. Looks `nodeId` up in `graph`, resolves its
+        // GPU-registered execute callback via m_Registry.FindGpu(node->typeId), and (if found)
+        // invokes it with `cmd`/`input`/`output` and that node's own already-authored
+        // `PcgAttributeSet params` -- i.e. this performs exactly the same "look up this node's
+        // typeId, hand it its own params" step Evaluate()'s per-node execution does for the CPU
+        // path, just without any pin resolution, topological ordering, or nodeOutputs caching
+        // (a GPU node's single input/output buffer pair is supplied directly by the caller, not
+        // resolved from upstream links -- see PcgGpuPointBuffer's own comment).
+        struct GpuEvalResult {
+            bool success = true;
+            std::string errorMessage; // Only meaningful when success == false.
+        };
+        GpuEvalResult EvaluateNodeGpu(const PcgGraph& graph, uint32_t nodeId, VkCommandBuffer cmd,
+            const PcgGpuPointBuffer& input, const PcgGpuPointBuffer& output) const;
 
     private:
         // One outer-graph-resolved value being injected into a NESTED graph's evaluation, standing
