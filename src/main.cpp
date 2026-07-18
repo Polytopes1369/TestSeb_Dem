@@ -1154,6 +1154,26 @@ int main(int argc, char** argv) {
                 ImGui::EndTabItem();
             }
 
+            // --- Tab MegaLights (UE5.8 rendering-parity gap G3: extended light-type roster) ---
+            // Debug-only, like this whole panel (#ifndef NDEBUG-gated). Tunes the live per-type
+            // enable/scale knobs (config::megalights::*) that renderer::MegaLightsPass::RecordShade
+            // threads into MegaLightsViewParamsUBO.typedLightControls every frame -- toggling a type
+            // off suppresses every spot/rect/photometric light of that kind on the opaque MegaLights
+            // path in real time, without regenerating or re-uploading the light SSBO.
+            if (ImGui::BeginTabItem("MegaLights")) {
+                ImGui::TextWrapped("Extended light types (spot / rect-area / photometric). Point lights are always on.");
+                ImGui::Separator();
+                ImGui::Checkbox("Spot Lights", &config::megalights::SPOT_LIGHTS_ENABLED);
+                ImGui::Checkbox("Rect (Area) Lights [LTC specular]", &config::megalights::RECT_LIGHTS_ENABLED);
+                ImGui::Checkbox("Photometric (IES-style) Lights", &config::megalights::PHOTOMETRIC_LIGHTS_ENABLED);
+                ImGui::DragFloat("Typed Light Intensity Scale", &config::megalights::TYPED_LIGHT_INTENSITY_SCALE, 0.02f, 0.0f, 8.0f);
+                ImGui::Separator();
+                ImGui::TextWrapped("RIS / spatial reuse (shared with point lights):");
+                ImGui::DragFloat("Spatial Bias Radius (world)", &config::megalights::SPATIAL_BIAS_RADIUS, 0.05f, 0.0f, 16.0f);
+                ImGui::DragFloat("Spatial Reuse Radius (px)", &config::megalights::SPATIAL_REUSE_RADIUS_PIXELS, 0.5f, 0.0f, 128.0f);
+                ImGui::EndTabItem();
+            }
+
             // --- Tab Postprocess ---
             if (ImGui::BeginTabItem("Postprocess")) {
                 int fxQual = static_cast<int>(config::postprocess::_EFFECTS_QUALITY);

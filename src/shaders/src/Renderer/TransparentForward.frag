@@ -255,7 +255,11 @@ void main() {
         // recalibration) -- `intensity / distSq` is the standard inverse-square illuminance-at-a-
         // point formula; EvaluateSubstrateMaterial's own contract already bakes in the /PI
         // Lambertian normalization, so no extra factor is needed here.
-        outRGB += EvaluateSubstrateMaterial(mat, n, viewDir, megaLightDir) * light.color * light.intensity / distSq * window * visibility * invPdf;
+        // G3: MegaLightAngularShaping applies the per-type cone/photometric/rect-facing window (1 for
+        // a POINT light, so pre-G3 behavior is unchanged). This forward path treats a rect light as a
+        // point at its center (no LTC specular here -- that is the opaque MegaLights path's own
+        // feature, MegaLightsFinalShade.comp); the shaping term still applies the rect's one-sided cut.
+        outRGB += EvaluateSubstrateMaterial(mat, n, viewDir, megaLightDir) * light.color * light.intensity / distSq * window * MegaLightAngularShaping(light, megaLightDir) * visibility * invPdf;
     }
 
     // --- Optional front-layer specular reflection (Lumen-style, single GGX-VNDF sample) -- gated

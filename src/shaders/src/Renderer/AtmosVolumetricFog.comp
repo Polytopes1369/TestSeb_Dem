@@ -222,10 +222,14 @@ const uint kVolumeLightCandidateCount = 16u;
 float MegaLightVolumeWeight(MegaLight light, vec3 worldPos) {
     vec3 toLight = light.position - worldPos;
     float distSq = max(dot(toLight, toLight), 1.0e-4);
-    float normalizedDist = saturate(sqrt(distSq) / max(light.radius, 1.0e-4));
+    float dist = sqrt(distSq);
+    float normalizedDist = saturate(dist / max(light.radius, 1.0e-4));
     float nd2 = normalizedDist * normalizedDist;
     float window = saturate((1.0 - nd2 * nd2) * (1.0 - nd2 * nd2));
-    float w = light.intensity / distSq * window;
+    // G3: per-type angular shaping (1 for a POINT light) so the fog's own RIS draw is biased away
+    // from a spot/photometric light whose cone/profile barely reaches this froxel, exactly as the
+    // surface RIS proxy (megalights_ris.glsl's MegaLightTargetWeight) is.
+    float w = light.intensity / distSq * window * MegaLightAngularShaping(light, toLight / dist);
     return min(w, 50.0);
 }
 
@@ -295,7 +299,9 @@ void InjectLight(ivec3 coord) {
         float nd2 = normalizedDist * normalizedDist;
         float window = saturate((1.0 - nd2 * nd2) * (1.0 - nd2 * nd2));
 
-        pointRadiance = light.color * (light.intensity / distSq) * window * phasePoint * invPdf;
+        // G3: per-type angular shaping -- `arrivalDir` is light->froxel (-L), so the surface->light
+        // direction MegaLightAngularShaping expects is -arrivalDir. 1 for a POINT light (unchanged).
+        pointRadiance = light.color * (light.intensity / distSq) * window * MegaLightAngularShaping(light, -arrivalDir) * phasePoint * invPdf;
     }
     vec3 pointContribution = scatteringCoeff * pointRadiance; // Global fog's point-light in-scatter (unchanged).
 
