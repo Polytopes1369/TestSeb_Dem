@@ -536,6 +536,16 @@ bool ClusterRenderPipeline::Init(
     return false;
   }
 
+  // Atmos weather system, Subtask 2: Physically Based Sky (Hillaire LUTs) -- also a self-contained
+  // globals producer (no dependency on any other pass' output), Init'd unconditionally here so its
+  // Sky-View LUT is available both to m_PostProcess below (Release-visible) and to m_SDFRayMarch's
+  // deferred SetAtmosSkyView() wiring further down (Debug-only block).
+  if (!m_AtmosSky.Init(createInfo.device, createInfo.allocator,
+                       createInfo.commandPool, createInfo.queue)) {
+    LOG_ERROR("[ClusterRenderPipeline] Failed to initialize AtmosSkyPass.");
+    return false;
+  }
+
   // Shared trace-scene descriptor sets (mesh SDF trace scene + Surface Cache sampling), built
   // once from m_GlobalSDF's per-entity SDF images and m_SurfaceCache's card table/atlases (both
   // already Init'd above) -- reused unmodified by m_SurfaceCacheRT/m_GIInject/m_WorldProbes.
@@ -727,7 +737,8 @@ bool ClusterRenderPipeline::Init(
   // PostProcessPass::Init's own comment).
   m_PostProcess.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
       m_DisplayExtent, m_DepthOfField.GetOutputView(), m_Bloom.GetOutputView(),
-      m_Resolve.GetOutputDepthView(), m_TransparentForward.GetRefractionOffsetView());
+      m_Resolve.GetOutputDepthView(), m_TransparentForward.GetRefractionOffsetView(),
+      m_AtmosSky.GetSkyViewLUTView());
 
 #ifndef NDEBUG
   // Two-tier SDF ray march DEBUG VISUALIZATION (see ClusterRenderPipeline.h's own comment on
@@ -743,6 +754,9 @@ bool ClusterRenderPipeline::Init(
   // One-time wiring (see SDFRayMarchPass::SetGlobalSDFViews's own comment): the 4 clipmap level
   // views never change again after GlobalSDFPass::Init().
   m_SDFRayMarch.SetGlobalSDFViews(m_GlobalSDF);
+  // Atmos weather system, Subtask 2: same deferred-wiring convention as SetGlobalSDFViews above --
+  // see SDFRayMarchPass::SetAtmosSkyView's own comment.
+  m_SDFRayMarch.SetAtmosSkyView(m_AtmosSky.GetSkyViewLUTView(), m_AtmosSky.GetLUTSampler());
 
   // Backs the ImGui "Buffer Viewer" dropdown -- see debug::DebugBufferViewPass's own class
   // comment. Sized to m_DisplayExtent (it's blitted to the swapchain the same way
@@ -947,6 +961,7 @@ void ClusterRenderPipeline::Shutdown() {
   m_TraceContext.Shutdown();
   m_GlobalSDF.Shutdown();
   m_AtmosClimate.Shutdown();
+  m_AtmosSky.Shutdown();
   // Deliberately NOT calling m_LoadingManager.Shutdown() here: this Shutdown() method runs
   // defensively as the very first line of Init() too (see the top of this function), and
   // core::LoadingManager's worker threads are meant to live for this whole pipeline object's
@@ -1272,6 +1287,10 @@ void ClusterRenderPipeline::RecordFrameEarly(VkCommandBuffer cmdEarly,
   // consumer added inside that same block always sees an already-current buffer this frame.
   // =========================================================================================
   m_AtmosClimate.RecordUpdate(cmdEarly, globalTimeSeconds);
+  // Atmos weather system, Subtask 2: Sky-View LUT refresh -- see AtmosSkyPass::RecordUpdate's own
+  // comment for the Transmittance/Multi-Scattering dirty-tracking policy. Sun direction/intensity
+  // sourced the same way m_Resolve's own sun uniform below is (m_SceneLights.sun).
+  m_AtmosSky.RecordUpdate(cmdEarly, m_SceneLights.sun.direction, m_SceneLights.sun.intensity);
 
   // =========================================================================================
   // [1z] Lumen-style GI infrastructure: Virtual Shadow Map page requests/renders (Phase 3) ->
@@ -1418,7 +1437,7 @@ void ClusterRenderPipeline::RecordFrameEarly(VkCommandBuffer cmdEarly,
     m_SDFRayMarch.RecordRayMarch(cmdEarly, m_GlobalSDF, cameraFrameInfo.position, cameraFrameInfo.forward,
                                  maths::vec3{0.0f, 1.0f, 0.0f}, cameraFrameInfo.fovYRadians,
                                  cameraFrameInfo.aspectRatio, cameraFrameInfo.nearZ, cameraFrameInfo.farZ,
-                                 cameraCopy.debugViewMode == DEBUG_VIEW_GLOBAL_SDF);
+                                 cameraCopy.debugViewMode == DEBUG_VIEW_GLOBAL_SDF, m_SceneLights.sun.direction);
 #endif
   }
 }

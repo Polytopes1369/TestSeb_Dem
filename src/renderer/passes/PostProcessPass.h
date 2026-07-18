@@ -146,9 +146,13 @@ namespace renderer {
         // GetRefractionOffsetView(), also fixed identity) are both Phase PP3: sampled through a
         // LINEAR sampler for their own implicit bilinear upsample to display resolution (this
         // pipeline has no display-resolution depth anywhere -- see DepthOfField.comp's own comment).
+        // `skyViewLUTView` (Atmos weather system, Subtask 2): renderer::AtmosSkyPass's own Sky-View
+        // LUT view, sampled read-only through this pass' own m_LinearSampler -- fixed identity for
+        // this pipeline's entire lifetime (that pass never recreates its own images after Init()),
+        // same convention as `depthView`/`refractionOffsetView` below.
         void Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
             VkExtent2D displayExtent, VkImageView hdrColorView, VkImageView bloomView,
-            VkImageView depthView, VkImageView refractionOffsetView);
+            VkImageView depthView, VkImageView refractionOffsetView, VkImageView skyViewLUTView);
 
         void Shutdown();
 
@@ -266,8 +270,13 @@ namespace renderer {
 
             uint32_t frameIndex = 0u;
             float _padPP5a = 0.0f, _padPP5b = 0.0f, _padPP5c = 0.0f;
+
+            // Atmos weather system, Subtask 2: current sun direction (points FROM the light TOWARD
+            // the scene, same convention as `sunDirection` in RecordComposite's own parameter list),
+            // fed to PostProcessComposite.comp's SkyViewLUTUVFromDirection() on a miss.
+            float sunDirWorldX = 0.0f, sunDirWorldY = 0.0f, sunDirWorldZ = 0.0f, _padSky = 0.0f;
         };
-        static_assert(sizeof(PostProcessParamsUBO) == 416,
+        static_assert(sizeof(PostProcessParamsUBO) == 432,
             "PostProcessParamsUBO must match PostProcessComposite.comp's PostProcessParamsUBO exactly (std140 layout)");
 
         // Byte-for-byte mirror of AutoExposureAdapt.comp's push_constant block.

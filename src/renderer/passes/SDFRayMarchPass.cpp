@@ -53,8 +53,14 @@ namespace renderer {
             // DEBUG_VIEW_GLOBAL_SDF's coarse-only variant -- see SDFRayMarch.comp's own comment on
             // what skipping Stage 2+3 (BVH traversal + per-entity refine) actually shows instead.
             int32_t coarseOnly;
+            // Atmos weather system, Subtask 2: sun direction for the Sky-View LUT's sun-relative
+            // azimuth mapping on a miss -- see SDFRayMarch.comp's own GetSunDirection()/binding
+            // comment. Points FROM the light TOWARD the scene (renderer::ClusterResolvePass's own
+            // convention).
+            float sunDirection[3];
+            float _pad0;
         };
-        static_assert(sizeof(SDFRayMarchPC) == 144,
+        static_assert(sizeof(SDFRayMarchPC) == 160,
             "SDFRayMarchPC must match SDFRayMarch.comp's push_constant block exactly");
 
     } // namespace
@@ -290,17 +296,20 @@ namespace renderer {
         entitySetLayoutInfo.pBindings = entityBindings;
         VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &entitySetLayoutInfo, nullptr, &m_EntitySetLayout));
 
-        VkDescriptorSetLayoutBinding clipmapBindings[2]{};
+        VkDescriptorSetLayoutBinding clipmapBindings[3]{};
         clipmapBindings[0] = { 0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, GlobalSDFPass::kLevelCount, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
         clipmapBindings[1] = { 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+        // Atmos weather system, Subtask 2: renderer::AtmosSkyPass's Sky-View LUT -- see
+        // SetAtmosSkyView()'s own comment (deferred write, same convention as binding 0 above).
+        clipmapBindings[2] = { 2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
         VkDescriptorSetLayoutCreateInfo clipmapSetLayoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-        clipmapSetLayoutInfo.bindingCount = 2;
+        clipmapSetLayoutInfo.bindingCount = 3;
         clipmapSetLayoutInfo.pBindings = clipmapBindings;
         VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &clipmapSetLayoutInfo, nullptr, &m_ClipmapSetLayout));
 
         VkDescriptorPoolSize poolSizes[3]{};
         poolSizes[0] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3 };
-        poolSizes[1] = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kMaxEntitySDFs + GlobalSDFPass::kLevelCount };
+        poolSizes[1] = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kMaxEntitySDFs + GlobalSDFPass::kLevelCount + 1 };
         poolSizes[2] = { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1 };
         VkDescriptorPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
         poolInfo.maxSets = 2;
@@ -549,9 +558,21 @@ namespace renderer {
         vkUpdateDescriptorSets(m_Device, 1, &write, 0, nullptr);
     }
 
+    void SDFRayMarchPass::SetAtmosSkyView(VkImageView skyViewLUTView, VkSampler skyViewLUTSampler) {
+        VkDescriptorImageInfo skyViewInfo{ skyViewLUTSampler, skyViewLUTView, VK_IMAGE_LAYOUT_GENERAL };
+        VkWriteDescriptorSet write{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+        write.dstSet = m_ClipmapSet;
+        write.dstBinding = 2;
+        write.descriptorCount = 1;
+        write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        write.pImageInfo = &skyViewInfo;
+        vkUpdateDescriptorSets(m_Device, 1, &write, 0, nullptr);
+    }
+
     void SDFRayMarchPass::RecordRayMarch(VkCommandBuffer cmd, const GlobalSDFPass& globalSDF,
         const maths::vec3& cameraPosition, const maths::vec3& cameraForward, const maths::vec3& cameraUp,
-        float fovYRadians, float aspectRatio, float nearZ, float farZ, bool coarseOnly) {
+        float fovYRadians, float aspectRatio, float nearZ, float farZ, bool coarseOnly,
+        const maths::vec3& sunDirectionWorld) {
 
         // Same orthonormal-basis derivation as renderer::SurfaceCachePass::UpdateVisibility (right =
         // forward x upHint, up = right x forward) -- see that method's own comment.
@@ -581,6 +602,7 @@ namespace renderer {
         pc.rootNodeIndex = m_RootNodeIndex;
         pc.entitySamplerCount = static_cast<int32_t>(std::min<size_t>(m_Entities.size(), kMaxEntitySDFs));
         pc.coarseOnly = coarseOnly ? 1 : 0;
+        pc.sunDirection[0] = sunDirectionWorld.x; pc.sunDirection[1] = sunDirectionWorld.y; pc.sunDirection[2] = sunDirectionWorld.z;
 
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_Pipeline);
         VkDescriptorSet sets[2] = { m_EntitySet, m_ClipmapSet };
