@@ -474,6 +474,7 @@ set(WORLDPARTITION_HLOD_SOURCES
     tools/WorldPartition/Uuid.cpp
     tools/WorldPartition/SpatialHashGrid.cpp
     tools/WorldPartition/HlodPipeline.cpp
+    tools/WorldPartition/ArchetypeMeshLibrary.cpp
     src/geometry/MeshSimplifier.cpp
     src/core/Logger.cpp
 )
