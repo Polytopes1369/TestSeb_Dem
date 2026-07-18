@@ -175,8 +175,22 @@ namespace renderer {
         // 4 levels' currently-covered windows recenter every frame as the camera moves -- mirrors
         // renderer::SDFRayMarchPass::RecordRayMarch's own identical "views bound once, per-frame
         // window data passed fresh each call" split.
+        // Rivers/waterfalls feature: `secondarySpawnCount` (default 0, a no-op -- existing call
+        // sites need no change) optionally spawns a SECOND emitter's particles THIS SAME call, at
+        // `secondaryEmitterPositionWorld` with visual recipe `secondarySpawnMode` (see
+        // ParticleSimulation.comp's own SpawnParticle()/SpawnMistParticle() comment for the
+        // recipes mode selects between) -- e.g. renderer::ClusterRenderPipeline's waterfall mist
+        // alongside the scene's existing default emitter. Implemented as a SECOND Spawn (mode == 1)
+        // dispatch, barrier-separated from the first, before the single shared Update (mode == 0)
+        // dispatch that already covers every slot once -- deliberately NOT a second full
+        // RecordSimulate() call, which would double-integrate every pre-existing particle's physics
+        // this frame (Update touches every slot unconditionally, see this class' own header comment
+        // on why aliveCount's reset-then-rebuild only stays correct with exactly one Update pass per
+        // frame).
         void RecordSimulate(VkCommandBuffer cmd, const GlobalSDFPass& globalSDF, float dt, float time,
-            const float emitterPositionWorld[3], uint32_t spawnCount);
+            const float emitterPositionWorld[3], uint32_t spawnCount,
+            const float secondaryEmitterPositionWorld[3] = nullptr, uint32_t secondarySpawnCount = 0,
+            uint32_t secondarySpawnMode = 0);
 
         // Sorted {particleIndex, depthKey} pairs, back-to-front (farthest first) among the first
         // GetCounterBufferHandle()-reported aliveCount entries -- see ParticleSort.comp's own header

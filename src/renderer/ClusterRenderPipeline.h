@@ -719,6 +719,12 @@ namespace renderer {
         // is exact over time regardless of framerate (e.g. 200/s at 300 fps spawns 0 or 1 particle
         // most frames, never silently rounding every fractional request down to 0).
         float m_ParticleSpawnAccumulator = 0.0f;
+        // Rivers/waterfalls feature: identical fractional carry-over as m_ParticleSpawnAccumulator
+        // above, own accumulator since the waterfall mist emitter (config::particles::
+        // WATERFALL_SPAWN_RATE_PER_SECOND) runs at a different rate than the scene's original ember
+        // emitter and both are spawned within the SAME RecordSimulate() call this frame (see that
+        // method's own secondary-emitter parameters) -- see RecordFrameEarly()'s own particle block.
+        float m_MistSpawnAccumulator = 0.0f;
 
         // Lumen-style GI infrastructure -- unlike the debug-only stats/overlay block below, these
         // are real (if not yet light-transport-consuming) systems, not visualization tools, so

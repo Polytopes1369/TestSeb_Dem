@@ -41,8 +41,10 @@ namespace renderer {
             uint32_t spawnCount = 0;
             uint32_t randomSeedBase = 0;
             int32_t mode = 0;
+            // Rivers/waterfalls feature -- see ParticleSimulation.comp's own field comment.
+            uint32_t spawnMode = 0;
         };
-        static_assert(sizeof(ParticleSimulationPC) == 116, "ParticleSimulationPC must match ParticleSimulation.comp's own push-constant block exactly");
+        static_assert(sizeof(ParticleSimulationPC) == 120, "ParticleSimulationPC must match ParticleSimulation.comp's own push-constant block exactly");
 
         // Byte-for-byte mirror of ParticleSort.comp's own SortedPair struct -- 8 bytes, std430
         // (two 4-byte scalars, no padding needed).
@@ -630,14 +632,18 @@ namespace renderer {
     }
 
     void ParticleSystemPass::RecordSimulate(VkCommandBuffer cmd, const GlobalSDFPass& globalSDF, float dt, float time,
-        const float emitterPositionWorld[3], uint32_t spawnCount) {
-        // Reset aliveCount to 0 (offset 4) and set spawnQueue to spawnCount (offset 8) -- leaves
+        const float emitterPositionWorld[3], uint32_t spawnCount,
+        const float secondaryEmitterPositionWorld[3], uint32_t secondarySpawnCount, uint32_t secondarySpawnMode) {
+        // Reset aliveCount to 0 (offset 4) and set spawnQueue to the TOTAL requested this call
+        // (primary + secondary, purely informational -- see ParticleSimulation.comp's own header
+        // comment on why the shader itself reads pc.spawnCount, not this buffer field) -- leaves
         // deadCount (offset 0) and _pad0 (offset 12) untouched, since only the GPU itself tracks
         // deadCount's true current value (see this method's own header comment for why aliveCount's
         // reset-then-rebuild is correct here).
         uint32_t zero = 0u;
+        uint32_t totalSpawnCount = spawnCount + secondarySpawnCount;
         vkCmdUpdateBuffer(cmd, m_CounterBuffer.Handle(), 4, sizeof(uint32_t), &zero);
-        vkCmdUpdateBuffer(cmd, m_CounterBuffer.Handle(), 8, sizeof(uint32_t), &spawnCount);
+        vkCmdUpdateBuffer(cmd, m_CounterBuffer.Handle(), 8, sizeof(uint32_t), &totalSpawnCount);
 
         VulkanUtils::RecordMemoryBarrier(cmd, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
@@ -667,6 +673,7 @@ namespace renderer {
         pc.clipmapResolution = static_cast<int32_t>(GlobalSDFPass::kClipmapResolution);
         pc.spawnCount = spawnCount;
         pc.randomSeedBase = static_cast<uint32_t>(time * 1000.0f) * 2654435761u;
+        pc.spawnMode = 0;
 
         if (spawnCount > 0) {
             pc.mode = 1;
@@ -677,6 +684,27 @@ namespace renderer {
             // Spawn wrote fresh particles into slots the update dispatch below is about to read (and
             // mutated deadCount) -- both dispatches are COMPUTE_SHADER-stage, so a same-stage
             // execution + memory barrier is all that is needed between them.
+            VulkanUtils::RecordMemoryBarrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+        }
+
+        // Rivers/waterfalls feature: optional SECOND Spawn dispatch (e.g. waterfall mist) -- see
+        // this method's own header comment for why this is a second Spawn dispatch rather than a
+        // second whole RecordSimulate() call. Own randomSeedBase salt (XOR, not a fresh hash of a
+        // different quantity) so this dispatch's PRNG stream never exactly repeats the primary
+        // dispatch's, while staying just as deterministic-per-frame.
+        if (secondarySpawnCount > 0 && secondaryEmitterPositionWorld != nullptr) {
+            pc.emitterPosition[0] = secondaryEmitterPositionWorld[0];
+            pc.emitterPosition[1] = secondaryEmitterPositionWorld[1];
+            pc.emitterPosition[2] = secondaryEmitterPositionWorld[2];
+            pc.spawnCount = secondarySpawnCount;
+            pc.spawnMode = secondarySpawnMode;
+            pc.randomSeedBase ^= 0x9E3779B9u;
+            pc.mode = 1;
+            vkCmdPushConstants(cmd, m_SimPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+            uint32_t spawnGroups = (secondarySpawnCount + 63u) / 64u;
+            vkCmdDispatch(cmd, spawnGroups, 1, 1);
+
             VulkanUtils::RecordMemoryBarrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
                 VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
         }

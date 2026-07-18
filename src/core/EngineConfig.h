@@ -390,6 +390,19 @@ inline float DRAG_COEFFICIENT = 0.5f; // How strongly velocity relaxes toward th
 inline float SOFT_FADE_DISTANCE = 0.5f; // World units -- see ParticleRender.frag's own softFade comment.
 inline bool HEAT_SHIMMER_ENABLED = false;
 inline float HEAT_SHIMMER_STRENGTH = 0.02f; // Only applied when HEAT_SHIMMER_ENABLED is true -- see ParticleSystemPass::RecordDraw's own comment on why this is a per-draw-call, not per-particle, toggle.
+
+// Rivers/waterfalls feature: a SECOND, independent emitter (mist/foam, ParticleSimulation.comp's
+// own pc.spawnMode == 1 recipe) spawned at the waterfall's own base every frame alongside the
+// scene's original ember emitter above -- see renderer::ClusterRenderPipeline's own
+// m_MistSpawnAccumulator comment for the call site. Position MUST match river_spline.glsl's own
+// kRiverControlXZ[3]/kRiverControlHeight[3] (the waterfall base control point) -- kept here as a
+// separate, explicitly-documented mirror (same "keep in sync" convention as water_params.glsl's
+// own kWaterLevel vs. VulkanContext.cpp's identical literal) rather than plumbing the GLSL-side
+// spline data back into C++, since this is the only C++ call site that needs it.
+inline float WATERFALL_SPAWN_RATE_PER_SECOND = 60.0f;
+inline float WATERFALL_EMITTER_POSITION_X = 12.0f;
+inline float WATERFALL_EMITTER_POSITION_Y = -0.6f; // Roughly midway down the P2->P3 drop (0.8 to -1.0), where the falling sheet breaks up into mist.
+inline float WATERFALL_EMITTER_POSITION_Z = 12.0f;
 } // namespace particles
 
 // Active loaded state

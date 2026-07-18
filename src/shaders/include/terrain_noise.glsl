@@ -7,6 +7,10 @@
 // differs, since a heightfield needs a mountainous silhouette a plain smooth fbm alone can't give
 // (a smooth fbm reads as "rolling hills", not "mountains").
 #include "displacement_noise.glsl"
+// Rivers/waterfalls feature: shared river-path math (control points, closest-point-on-polyline,
+// channel blend mask) -- see that file's own header comment for why SampleTerrainHeight below is
+// one of its three required call sites.
+#include "river_spline.glsl"
 
 // Kept low enough that the HIGHEST octave's wavelength still comfortably exceeds the terrain
 // entity's own vertex spacing (VulkanContext::GenerateGeometry()'s terrain call site uses
@@ -92,8 +96,27 @@ float TerrainHeightFbm(vec2 xz) {
 // Public entry point: local-space height at local (x,z), in world units. Callers add their own
 // world-space vertical anchor (this codebase's floor sits at kFloorTopY, not 0.0 -- see
 // VulkanContext::GenerateGeometry()'s terrain call site) on top of this.
+//
+// Rivers/waterfalls feature: blends the ambient fbm toward river_spline.glsl's own authored,
+// monotonic-downhill profile (RiverBedHeight) near the river path -- RiverChannelMask fades this
+// from full effect at the channel centerline back to 0 (pure ambient fbm, unchanged) over
+// kRiverBandOuterHalfWidth world units, comfortably wider than this terrain's own 4-world-unit
+// generation vertex spacing (VulkanContext::GenerateGeometry's kTerrainVertexSpacing), so the
+// blend itself never introduces a per-vertex-aliased discontinuity the way the old ridged-noise
+// regression did (see kTerrainRidgeWeight's own comment) -- this is a deliberate, wide, low-
+// frequency terrain-scale feature, not high-frequency noise. Blends toward the river profile in
+// BOTH directions (raising ground near the hillside spring, lowering it into the valley/waterfall)
+// rather than a one-sided "carve down only" clamp, since the spring's own authored height (2.2)
+// sits well above the ambient terrain there -- see river_spline.glsl's own kRiverControlHeight
+// comment.
 float SampleTerrainHeight(vec2 xz) {
-    return TerrainHeightFbm(xz) * kTerrainAmplitude;
+    float ambient = TerrainHeightFbm(xz) * kTerrainAmplitude;
+    float mask = RiverChannelMask(xz);
+    if (mask <= 0.0) {
+        return ambient;
+    }
+    float bed = RiverBedHeight(xz);
+    return mix(ambient, bed, mask);
 }
 
 #endif // TERRAIN_NOISE_GLSL

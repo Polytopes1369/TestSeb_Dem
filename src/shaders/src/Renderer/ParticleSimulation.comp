@@ -65,6 +65,13 @@ layout(push_constant) uniform ParticleSimulationPC {
     uint spawnCount;
     uint randomSeedBase;      // Per-call PRNG salt (e.g. frame index) so repeated spawns don't reuse the same jitter sequence.
     int mode;                 // 0 = update existing particles, 1 = spawn new particles.
+    // Rivers/waterfalls feature: only meaningful when mode == 1 (Spawn) -- selects which visual
+    // recipe SpawnParticle() initializes the new particle with. 0 = the original embers/sparks
+    // default; 1 = waterfall mist/foam (see SpawnParticle()'s own comment). A renderer::
+    // ParticleSystemPass::RecordSimulate() call issues up to TWO back-to-back Spawn dispatches
+    // (primary + an optional secondary emitter, see that method's own comment) before the single
+    // shared Update dispatch below -- each Spawn dispatch carries its own spawnMode value.
+    uint spawnMode;
 } pc;
 
 vec3 GetEmitterPosition() { return vec3(pc.emitterPosition[0], pc.emitterPosition[1], pc.emitterPosition[2]); }
@@ -125,25 +132,69 @@ float NextRandomFloat(inout uint seed) {
     return float(seed) / 4294967296.0;
 }
 
+// Rivers/waterfalls feature: pc.spawnMode == 1, waterfall mist/foam -- spawned in a wide, mostly-
+// horizontal jitter box around the emitter position (renderer::ClusterRenderPipeline places that
+// position at the waterfall's own base, config::particles::WATERFALL_EMITTER_POSITION_*, see that
+// constant's own comment) so particles appear to rise along the whole base of the falls rather
+// than from one single point, drifting gently upward/outward (a soft billow, not a ballistic
+// spark arc), pale near-white/blue, short-lived (mist dissipates quickly), and larger/softer than
+// an ember for a diffuse look via ParticleRender's existing billboard-sprite path.
+void SpawnMistParticle(inout uint seed, out vec3 outPosition, out float outLife, out vec3 outVelocity,
+    out vec4 outColor, out vec2 outSize) {
+    vec3 positionJitter = vec3(
+        (NextRandomFloat(seed) - 0.5) * 2.4,  // Wide spread along the falls' own base width.
+        NextRandomFloat(seed) * 0.3,
+        (NextRandomFloat(seed) - 0.5) * 2.4);
+    outPosition = GetEmitterPosition() + positionJitter;
+
+    vec3 driftDir = normalize(vec3(
+        NextRandomFloat(seed) * 2.0 - 1.0,
+        NextRandomFloat(seed) * 0.6 + 0.3,
+        NextRandomFloat(seed) * 2.0 - 1.0));
+    float speed = 0.3 + NextRandomFloat(seed) * 0.6;
+    outVelocity = driftDir * speed;
+
+    outLife = 0.8 + NextRandomFloat(seed) * 0.9;
+    outColor = vec4(0.85, 0.92, 1.0, 0.55 + NextRandomFloat(seed) * 0.2);
+    float size = 0.18 + NextRandomFloat(seed) * 0.22;
+    outSize = vec2(size, size);
+}
+
 void SpawnParticle(uint slotIndex, uint spawnRequestIndex) {
     uint seed = HashUint(pc.randomSeedBase ^ (slotIndex * 2654435761u) ^ (spawnRequestIndex * 40503u));
 
-    // Small conical launch jitter around a mostly-upward initial velocity -- a generic "embers/
-    // sparks" default; Subtask 6's ImGui emitter panel is where this becomes user-tunable.
-    vec3 jitterDir = normalize(vec3(
-        NextRandomFloat(seed) * 2.0 - 1.0,
-        NextRandomFloat(seed) * 0.5 + 0.5,
-        NextRandomFloat(seed) * 2.0 - 1.0));
-    float speed = 1.0 + NextRandomFloat(seed) * 2.0;
-    float life = 2.0 + NextRandomFloat(seed) * 2.0;
-
     Particle p;
-    p.position = GetEmitterPosition() + (vec3(NextRandomFloat(seed), NextRandomFloat(seed), NextRandomFloat(seed)) - 0.5) * 0.1;
-    p.life = life;
-    p.velocity = jitterDir * speed;
-    p.maxLife = life;
-    p.color = vec4(1.0, 0.7, 0.3, 1.0);
-    p.size = vec2(0.1, 0.1);
+
+    if (pc.spawnMode == 1u) {
+        vec3 position, velocity;
+        vec4 color;
+        vec2 size;
+        float life;
+        SpawnMistParticle(seed, position, life, velocity, color, size);
+        p.position = position;
+        p.life = life;
+        p.velocity = velocity;
+        p.maxLife = life;
+        p.color = color;
+        p.size = size;
+    } else {
+        // Small conical launch jitter around a mostly-upward initial velocity -- a generic "embers/
+        // sparks" default; Subtask 6's ImGui emitter panel is where this becomes user-tunable.
+        vec3 jitterDir = normalize(vec3(
+            NextRandomFloat(seed) * 2.0 - 1.0,
+            NextRandomFloat(seed) * 0.5 + 0.5,
+            NextRandomFloat(seed) * 2.0 - 1.0));
+        float speed = 1.0 + NextRandomFloat(seed) * 2.0;
+        float life = 2.0 + NextRandomFloat(seed) * 2.0;
+
+        p.position = GetEmitterPosition() + (vec3(NextRandomFloat(seed), NextRandomFloat(seed), NextRandomFloat(seed)) - 0.5) * 0.1;
+        p.life = life;
+        p.velocity = jitterDir * speed;
+        p.maxLife = life;
+        p.color = vec4(1.0, 0.7, 0.3, 1.0);
+        p.size = vec2(0.1, 0.1);
+    }
+
     p.rotation = NextRandomFloat(seed) * 6.28318530718;
     p.randomSeed = seed;
     particles[slotIndex] = p;

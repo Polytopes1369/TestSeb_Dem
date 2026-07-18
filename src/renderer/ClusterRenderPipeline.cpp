@@ -1432,8 +1432,24 @@ void ClusterRenderPipeline::RecordFrameEarly(VkCommandBuffer cmdEarly,
 
       float particleEmitterPosition[3] = {
           config::particles::EMITTER_POSITION_X, config::particles::EMITTER_POSITION_Y, config::particles::EMITTER_POSITION_Z };
+
+      // Rivers/waterfalls feature: waterfall mist/foam, a second independent emitter spawned
+      // alongside the scene's original ember emitter above -- own fractional accumulator
+      // (m_MistSpawnAccumulator), same exact-over-time formula, since it runs at its own rate
+      // (config::particles::WATERFALL_SPAWN_RATE_PER_SECOND). Passed into the SAME RecordSimulate()
+      // call as a secondary emitter (see that method's own header comment) rather than a second
+      // call, so this frame's existing alive particles are integrated exactly once.
+      m_MistSpawnAccumulator += config::particles::WATERFALL_SPAWN_RATE_PER_SECOND * particleDeltaTimeSeconds;
+      uint32_t mistSpawnCount = static_cast<uint32_t>(m_MistSpawnAccumulator);
+      m_MistSpawnAccumulator -= static_cast<float>(mistSpawnCount);
+
+      float mistEmitterPosition[3] = {
+          config::particles::WATERFALL_EMITTER_POSITION_X, config::particles::WATERFALL_EMITTER_POSITION_Y,
+          config::particles::WATERFALL_EMITTER_POSITION_Z };
+
       m_ParticleSystem.RecordSimulate(cmdEarly, m_GlobalSDF, particleDeltaTimeSeconds, globalTimeSeconds,
-          particleEmitterPosition, particleSpawnCount);
+          particleEmitterPosition, particleSpawnCount,
+          mistEmitterPosition, mistSpawnCount, /*secondarySpawnMode=*/1u);
 
       float particleCameraPosition[3] = { cameraFrameInfo.position.x, cameraFrameInfo.position.y, cameraFrameInfo.position.z };
       float particleCameraForward[3] = { cameraFrameInfo.forward.x, cameraFrameInfo.forward.y, cameraFrameInfo.forward.z };
