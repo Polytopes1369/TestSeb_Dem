@@ -780,8 +780,13 @@ bool ClusterRenderPipeline::Init(
   // real depth-stencil buffer every other forward pass targets. RecordSimulate/RecordSort/
   // RecordDraw are all implemented but NOT yet called from RecordFrame (Subtask 6 wires that up),
   // so this Init() has no RecordFrame ordering consequence yet.
+  // Niagara-parity render-integration roadmap: also borrows m_MegaLights (D1 RIS point-light SSBO +
+  // D4's reserved particle-derived light tail), m_SurfaceCacheRT (D1's shared g_TLAS for MegaLights'
+  // own shadow-visibility ray), and m_AtmosFog (D5's integrated froxel grid) -- all three already
+  // Init'd above (m_SurfaceCacheRT at STEP 7's own earlier call, m_MegaLights/m_AtmosFog just above).
   if (!m_ParticleSystem.Init(createInfo.physicalDevice, createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
                              m_AtmosClimate, m_GlobalSDF, m_Resolve, m_VirtualShadowMap, m_WorldProbes,
+                             m_MegaLights, m_SurfaceCacheRT, m_AtmosFog,
                              GICompositePass::kOutputFormat, createInfo.depthFormat)) {
     LOG_ERROR("[ClusterRenderPipeline] Failed to initialize ParticleSystemPass.");
     return false;
@@ -1759,6 +1764,15 @@ void ClusterRenderPipeline::RecordFrameEarly(VkCommandBuffer cmdEarly,
       float particleCameraPosition[3] = { cameraFrameInfo.position.x, cameraFrameInfo.position.y, cameraFrameInfo.position.z };
       float particleCameraForward[3] = { cameraFrameInfo.forward.x, cameraFrameInfo.forward.y, cameraFrameInfo.forward.z };
       m_ParticleSystem.RecordSort(cmdEarly, particleCameraPosition, particleCameraForward);
+
+      // Niagara-parity render-integration roadmap, D4 (particles as light emitters): samples this
+      // frame's freshly-rebuilt alive list into m_MegaLights' own reserved particle-derived light
+      // tail -- see ParticleSystemPass::RecordExtractLights' own comment for why this only needs to
+      // run after RecordSimulate (not specifically after RecordSort) and why it is placed here
+      // anyway (one obvious call-site location, same command buffer). m_MegaLights.RecordShade
+      // (RecordFrameLate, later this same frame) reads the result via same-queue submission
+      // ordering -- see that method's own comment.
+      m_ParticleSystem.RecordExtractLights(cmdEarly);
     }
 
     // 4. Secondary-bounce injection into m_SurfaceCache's own radiance atlas + the TLAS refit that
@@ -2726,9 +2740,17 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
     // before post-process" top layer. Draws onto the SAME transparentTargetImage/View + real depth
     // buffer every forward pass above targets, and into m_TransparentForward's own shared
     // heat-distortion image (see ParticleSystemPass::RecordDraw's own comment on why that's safe
-    // with no extra barrier). cameraRight/cameraUp are not tracked anywhere in CameraFrameInfo (see
-    // that struct's own field list) -- derived here via the same forward-cross-worldUp formula
-    // renderer::AtmosVolumetricFogPass::RecordUpdate/SDFRayMarchPass::RecordRayMarch already use.
+    // with no extra barrier). cameraRight/cameraUp/cameraForward are not tracked anywhere in
+    // CameraFrameInfo (see that struct's own field list) -- right/up are derived here via the same
+    // forward-cross-worldUp formula renderer::AtmosVolumetricFogPass::RecordUpdate/
+    // SDFRayMarchPass::RecordRayMarch already use; forward (D5) is simply cameraFrameInfo.forward
+    // itself, already tracked.
+    //
+    // Niagara-parity render-integration roadmap: `m_SceneLights` (D3 point lights) and
+    // `m_WorldProbes.GetGridOriginWorld()` (D6 fix -- this frame's CURRENT toroidal-recenter origin,
+    // not a stale Init()-time snapshot) and `m_FrameIndex` (D1 MegaLights RIS decorrelation) are all
+    // already tracked/available at this call site, same values every other consumer below/above
+    // already reads.
     {
       const maths::vec3 worldUpHint{0.0f, 1.0f, 0.0f};
       const maths::vec3 particleCameraRight = cameraFrameInfo.forward.Cross(worldUpHint).Normalize();
@@ -2736,9 +2758,10 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
       float particleHeatShimmerStrength = config::particles::HEAT_SHIMMER_ENABLED ? config::particles::HEAT_SHIMMER_STRENGTH : 0.0f;
       m_ParticleSystem.RecordDraw(cmdLate, transparentTargetImage, transparentTargetView, m_DepthImageView,
           m_TransparentForward.GetRefractionOffsetView(), m_RenderExtent,
-          viewProj, cameraFrameInfo.position, particleCameraRight, particleCameraUp,
+          viewProj, cameraFrameInfo.position, particleCameraRight, particleCameraUp, cameraFrameInfo.forward,
           m_SceneLights.sun.direction, m_SceneLights.sun.color, m_SceneLights.sun.intensity,
-          config::particles::SOFT_FADE_DISTANCE, particleHeatShimmerStrength, globalTimeSeconds);
+          m_SceneLights, m_WorldProbes.GetGridOriginWorld(),
+          config::particles::SOFT_FADE_DISTANCE, particleHeatShimmerStrength, globalTimeSeconds, m_FrameIndex);
     }
   }
 

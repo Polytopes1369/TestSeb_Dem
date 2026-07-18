@@ -5,9 +5,13 @@
 #include <vector>
 
 #include "core/Logger.h"
+#include "renderer/MegaLightsTypes.h" // renderer::MegaLight/kMaxParticleDerivedLights -- D1/D4.
 #include "renderer/passes/AtmosClimatePass.h"
+#include "renderer/passes/AtmosVolumetricFogPass.h" // D5.
 #include "renderer/passes/ClusterResolvePass.h"
 #include "renderer/passes/GlobalSDFPass.h"
+#include "renderer/passes/MegaLightsPass.h" // D1/D4.
+#include "renderer/passes/SurfaceCacheRayTracingPass.h" // D1 (shared g_TLAS).
 #include "renderer/passes/VirtualShadowMapPass.h"
 #include "renderer/passes/WorldProbeGridPass.h"
 #include "renderer/vulkan/VulkanPipeline.h"
@@ -98,9 +102,13 @@ namespace renderer {
             // Subtask 5.
             float sunDirectionX = 0.0f, sunDirectionY = 0.0f, sunDirectionZ = 0.0f, sunIntensity = 0.0f;
             float sunColorR = 0.0f, sunColorG = 0.0f, sunColorB = 0.0f, _pad3 = 0.0f;
-            float heatShimmerStrength = 0.0f, _pad4 = 0.0f, _pad5 = 0.0f, _pad6 = 0.0f;
+            // D5: repurposes what used to be 3 unused trailing pad floats -- see ParticleRender.frag's
+            // own identical comment on this exact struct.
+            float heatShimmerStrength = 0.0f, cameraForwardX = 0.0f, cameraForwardY = 0.0f, cameraForwardZ = 0.0f;
+            // D1: new trailing 16-byte block.
+            uint32_t frameIndex = 0; float _pad7 = 0.0f, _pad8 = 0.0f, _pad9 = 0.0f;
         };
-        static_assert(sizeof(ParticleRenderParamsUBO) == 240, "ParticleRenderParamsUBO must match ParticleRender.vert/.frag's own UBO exactly (std140 layout)");
+        static_assert(sizeof(ParticleRenderParamsUBO) == 256, "ParticleRenderParamsUBO must match ParticleRender.vert/.frag's own UBO exactly (std140 layout)");
 
         // Byte-for-byte mirror of world_probe_sampling.glsl's WorldProbeGridParamsUBO (std140) --
         // identical to renderer::TessellationPass's own copy (see that class' own comment).
@@ -112,11 +120,30 @@ namespace renderer {
         };
         static_assert(sizeof(WorldProbeGridParamsUBO) == 32, "WorldProbeGridParamsUBO must match world_probe_sampling.glsl's own UBO exactly (std140 layout)");
 
+        // D3 (point-light VSM shadows): byte-for-byte mirror of ParticleRender.frag's own
+        // ParticlePointLightsUBO/ParticlePointLight (std140) -- flat scalars throughout, same
+        // vec3-alignment-avoidance convention as every other UBO mirror in this file.
+        struct ParticlePointLight {
+            float positionX = 0.0f, positionY = 0.0f, positionZ = 0.0f, _padA = 0.0f;
+            float colorR = 0.0f, colorG = 0.0f, colorB = 0.0f, intensity = 0.0f;
+            float radius = 0.0f, _padB = 0.0f, _padC = 0.0f, _padD = 0.0f;
+        };
+        static_assert(sizeof(ParticlePointLight) == 48, "ParticlePointLight must match ParticleRender.frag's own struct exactly (std140 layout)");
+
+        struct ParticlePointLightsUBO {
+            ParticlePointLight lights[kMaxPointLights]{};
+            uint32_t pointLightCount = 0;
+            float _pad0 = 0.0f, _pad1 = 0.0f, _pad2 = 0.0f;
+        };
+        static_assert(sizeof(ParticlePointLightsUBO) == 400, "ParticlePointLightsUBO must match ParticleRender.frag's own UBO exactly (std140 layout)");
+
     } // namespace
 
     bool ParticleSystemPass::Init(VkPhysicalDevice physicalDevice, VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
         const AtmosClimatePass& atmosClimate, const GlobalSDFPass& globalSDF, const ClusterResolvePass& resolvePass,
         const VirtualShadowMapPass& vsm, const WorldProbeGridPass& worldProbes,
+        const MegaLightsPass& megaLights, const SurfaceCacheRayTracingPass& rtPass,
+        const AtmosVolumetricFogPass& volumetricFog,
         VkFormat colorFormat, VkFormat depthFormat) {
         Shutdown();
 
@@ -525,46 +552,59 @@ namespace renderer {
         }
 
         // =====================================================================================
-        // STEP 6b (Subtask 5) -- ParticleRender.frag's own set 3 ("lighting"): `vsm`'s 4 Virtual
-        // Shadow Map resources + `worldProbes`' grid + a one-time-uploaded WorldProbeGridParamsUBO
-        // -- see Init()'s own comment for the full rationale. Binding indices mirror
-        // ParticleRender.frag's own SHADOW_*/WORLD_PROBE_GRID_* macro definitions exactly (0-3 = VSM,
-        // 4-5 = World Probe Grid).
+        // STEP 6b (Subtask 5, extended by the Niagara-parity render-integration roadmap's D1/D3/D5/
+        // D6) -- ParticleRender.frag's own set 3 ("lighting"): `vsm`'s 4 Virtual Shadow Map resources
+        // + `worldProbes`' grid + a WorldProbeGridParamsUBO (D6 fix: only CREATED here now, no
+        // longer filled here -- RecordDraw() re-uploads its live content every call, see that
+        // method's own comment for why the one-time Init()-time upload was the "static addressing"
+        // bug this roadmap step exists to fix) + D1's MegaLightsSSBO/g_TLAS + D3's
+        // ShadowPointFacesUBO/ParticlePointLightsUBO + D5's g_VolumetricFog. Binding indices mirror
+        // ParticleRender.frag's own SHADOW_*/WORLD_PROBE_GRID_*/MEGALIGHTS_*/SHADOW_POINT_FACES_*
+        // macro definitions exactly (0-3 = VSM sun, 4-5 = World Probe Grid, 6 = MegaLights SSBO,
+        // 7 = shared g_TLAS, 8 = VSM point-light faces, 9 = this pass' own point-light UBO,
+        // 10 = volumetric fog).
         // =====================================================================================
         {
+            // D6: buffer is only ALLOCATED here now -- RecordDraw() fills it every call (see that
+            // method's own comment), so no seed upload is needed at Init() time (same "always
+            // written before any shader reads it" reasoning as m_RenderParamsBuffer's own comment).
             m_WorldProbeGridParamsBuffer.Create(allocator, sizeof(WorldProbeGridParamsUBO),
                 VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
-            WorldProbeGridParamsUBO gridParams{};
-            gridParams.gridOriginX = worldProbes.GetGridOriginWorld().x;
-            gridParams.gridOriginY = worldProbes.GetGridOriginWorld().y;
-            gridParams.gridOriginZ = worldProbes.GetGridOriginWorld().z;
-            gridParams.probeSpacing = WorldProbeGridPass::kProbeSpacing;
-            gridParams.gridResolution = static_cast<float>(WorldProbeGridPass::kGridResolution);
-            VulkanUtils::ExecuteOneShotCommands(m_Device, commandPool, queue, [&](VkCommandBuffer cmd) {
-                vkCmdUpdateBuffer(cmd, m_WorldProbeGridParamsBuffer.Handle(), 0, sizeof(gridParams), &gridParams);
-                });
 
-            VkDescriptorSetLayoutBinding lightingBindings[6]{};
+            // D3: this pass' OWN per-frame point-light UBO (re-uploaded every RecordDraw() call,
+            // same GPU_ONLY + vkCmdUpdateBuffer convention as m_RenderParamsBuffer -- unlike the
+            // borrowed VSM/MegaLights/fog resources in this same set, this buffer's CONTENTS are
+            // ordinary CPU light data, not a stable handle from another already-Init'd pass).
+            m_ParticlePointLightsBuffer.Create(allocator, sizeof(ParticlePointLightsUBO),
+                VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
+
+            VkDescriptorSetLayoutBinding lightingBindings[11]{};
             lightingBindings[0] = { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr };          // Shadow page table.
             lightingBindings[1] = { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr };          // Shadow feedback.
             lightingBindings[2] = { 2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr };  // Shadow physical atlas.
             lightingBindings[3] = { 3, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr };         // Shadow sun clipmap levels.
             lightingBindings[4] = { 4, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr }; // World Probe Grid.
             lightingBindings[5] = { 5, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr };         // World Probe Grid params.
+            lightingBindings[6] = { 6, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr };         // D1: MegaLights SSBO.
+            lightingBindings[7] = { 7, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr }; // D1: shared g_TLAS.
+            lightingBindings[8] = { 8, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr };         // D3: VSM point-light faces.
+            lightingBindings[9] = { 9, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr };         // D3: this pass' own point-light UBO.
+            lightingBindings[10] = { 10, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr }; // D5: volumetric fog.
 
             VkDescriptorSetLayoutCreateInfo lightingLayoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-            lightingLayoutInfo.bindingCount = 6;
+            lightingLayoutInfo.bindingCount = 11;
             lightingLayoutInfo.pBindings = lightingBindings;
             VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &lightingLayoutInfo, nullptr, &m_LightingSetLayout));
 
-            VkDescriptorPoolSize lightingPoolSizes[3] = {
-                { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 },
-                { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2 },
-                { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2 }
+            VkDescriptorPoolSize lightingPoolSizes[4] = {
+                { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3 },              // Page table, feedback, D1 MegaLights SSBO.
+                { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3 },      // Atlas, World Probe Grid, D5 volumetric fog.
+                { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 4 },              // Sun levels, World Probe Grid params, D3 VSM point faces, D3 point-light UBO.
+                { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1 }   // D1 shared g_TLAS.
             };
             VkDescriptorPoolCreateInfo lightingPoolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
             lightingPoolInfo.maxSets = 1;
-            lightingPoolInfo.poolSizeCount = 3;
+            lightingPoolInfo.poolSizeCount = 4;
             lightingPoolInfo.pPoolSizes = lightingPoolSizes;
             VK_CHECK(vkCreateDescriptorPool(m_Device, &lightingPoolInfo, nullptr, &m_LightingDescriptorPool));
 
@@ -580,15 +620,97 @@ namespace renderer {
             VkDescriptorBufferInfo sunLevelsInfo{ vsm.GetSunLevelsBuffer(), 0, VK_WHOLE_SIZE };
             VkDescriptorImageInfo worldProbeGridInfo{ worldProbes.GetGridSampler(), worldProbes.GetGridView(), VK_IMAGE_LAYOUT_GENERAL };
             VkDescriptorBufferInfo worldProbeGridParamsInfo{ m_WorldProbeGridParamsBuffer.Handle(), 0, m_WorldProbeGridParamsBuffer.Size() };
+            VkDescriptorBufferInfo megaLightsInfo{ megaLights.GetLightBufferHandle(), 0, megaLights.GetLightBufferSize() };
+            VkDescriptorBufferInfo shadowPointFacesInfo{ vsm.GetPointFacesBuffer(), 0, VK_WHOLE_SIZE };
+            VkDescriptorBufferInfo particlePointLightsInfo{ m_ParticlePointLightsBuffer.Handle(), 0, m_ParticlePointLightsBuffer.Size() };
+            VkDescriptorImageInfo volumetricFogInfo{ volumetricFog.GetFogSampler(), volumetricFog.GetIntegratedFogView(), VK_IMAGE_LAYOUT_GENERAL };
 
-            VkWriteDescriptorSet lightingWrites[6]{};
+            VkWriteDescriptorSet lightingWrites[10]{};
             lightingWrites[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_LightingSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &pageTableInfo, nullptr };
             lightingWrites[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_LightingSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &feedbackInfo, nullptr };
             lightingWrites[2] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_LightingSet, 2, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &atlasInfo, nullptr, nullptr };
             lightingWrites[3] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_LightingSet, 3, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &sunLevelsInfo, nullptr };
             lightingWrites[4] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_LightingSet, 4, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &worldProbeGridInfo, nullptr, nullptr };
             lightingWrites[5] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_LightingSet, 5, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &worldProbeGridParamsInfo, nullptr };
-            vkUpdateDescriptorSets(m_Device, 6, lightingWrites, 0, nullptr);
+            lightingWrites[6] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_LightingSet, 6, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &megaLightsInfo, nullptr };
+            lightingWrites[7] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_LightingSet, 8, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &shadowPointFacesInfo, nullptr };
+            lightingWrites[8] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_LightingSet, 9, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &particlePointLightsInfo, nullptr };
+            lightingWrites[9] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_LightingSet, 10, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &volumetricFogInfo, nullptr, nullptr };
+            vkUpdateDescriptorSets(m_Device, 10, lightingWrites, 0, nullptr);
+
+            // Binding 7 (shared g_TLAS) needs its own pNext chain, issued as a separate
+            // vkUpdateDescriptorSets call -- same pattern renderer::MegaLightsPass::Init()/
+            // renderer::TransparentForwardPass::Init() already use.
+            VkAccelerationStructureKHR tlas = rtPass.GetTLASHandle();
+            VkWriteDescriptorSetAccelerationStructureKHR accelWrite{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR };
+            accelWrite.accelerationStructureCount = 1;
+            accelWrite.pAccelerationStructures = &tlas;
+            VkWriteDescriptorSet accelDescriptorWrite{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+            accelDescriptorWrite.pNext = &accelWrite;
+            accelDescriptorWrite.dstSet = m_LightingSet;
+            accelDescriptorWrite.dstBinding = 7;
+            accelDescriptorWrite.descriptorCount = 1;
+            accelDescriptorWrite.descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+            vkUpdateDescriptorSets(m_Device, 1, &accelDescriptorWrite, 0, nullptr);
+        }
+
+        // =====================================================================================
+        // STEP 6d -- D4 (particles as light emitters): a SEPARATE, additive compute pipeline that
+        // writes a bounded sample of currently-alive emissive particles into `megaLights`' own
+        // reserved "particle-derived" tail slots every RecordExtractLights() call. Set 0 is
+        // m_SetLayout, REUSED unmodified (reads ParticleBuffer/AliveListBuffer/CounterBuffer, same
+        // convention as every other particle-system compute pipeline in this class); set 1 is a
+        // NEW, single-binding set targeting `megaLights`' own light buffer at a nonzero
+        // VkDescriptorBufferInfo.offset (GetParticleLightsBufferOffset()) so ParticleLightExtract
+        // .comp's own declaration sees a plain zero-indexed MegaLight[kMaxParticleDerivedLights]
+        // array -- see that shader's own header comment and MegaLightsPass::
+        // GetParticleLightsBufferOffset()'s own comment for the full derivation of why this is safe
+        // (an inert slot -- the default whenever no live ember particle occupies that alive-list
+        // index this frame -- provably contributes zero weight to any RIS draw that lands on it).
+        // =====================================================================================
+        {
+            VkDescriptorSetLayoutBinding lightExtractBinding{ 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+            VkDescriptorSetLayoutCreateInfo lightExtractLayoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+            lightExtractLayoutInfo.bindingCount = 1;
+            lightExtractLayoutInfo.pBindings = &lightExtractBinding;
+            VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &lightExtractLayoutInfo, nullptr, &m_LightExtractSetLayout));
+
+            VkDescriptorPoolSize lightExtractPoolSize{ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1 };
+            VkDescriptorPoolCreateInfo lightExtractPoolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
+            lightExtractPoolInfo.maxSets = 1;
+            lightExtractPoolInfo.poolSizeCount = 1;
+            lightExtractPoolInfo.pPoolSizes = &lightExtractPoolSize;
+            VK_CHECK(vkCreateDescriptorPool(m_Device, &lightExtractPoolInfo, nullptr, &m_LightExtractDescriptorPool));
+
+            VkDescriptorSetAllocateInfo lightExtractSetAllocInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+            lightExtractSetAllocInfo.descriptorPool = m_LightExtractDescriptorPool;
+            lightExtractSetAllocInfo.descriptorSetCount = 1;
+            lightExtractSetAllocInfo.pSetLayouts = &m_LightExtractSetLayout;
+            VK_CHECK(vkAllocateDescriptorSets(m_Device, &lightExtractSetAllocInfo, &m_LightExtractSet));
+
+            VkDescriptorBufferInfo particleLightsTailInfo{
+                megaLights.GetLightBufferHandle(),
+                megaLights.GetParticleLightsBufferOffset(),
+                static_cast<VkDeviceSize>(kMaxParticleDerivedLights) * sizeof(MegaLight)
+            };
+            VkWriteDescriptorSet lightExtractWrite{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_LightExtractSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &particleLightsTailInfo, nullptr };
+            vkUpdateDescriptorSets(m_Device, 1, &lightExtractWrite, 0, nullptr);
+
+            VkDescriptorSetLayout lightExtractSetLayouts[2] = { m_SetLayout, m_LightExtractSetLayout };
+            VkPipelineLayoutCreateInfo lightExtractPipelineLayoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+            lightExtractPipelineLayoutInfo.setLayoutCount = 2;
+            lightExtractPipelineLayoutInfo.pSetLayouts = lightExtractSetLayouts;
+            VK_CHECK(vkCreatePipelineLayout(m_Device, &lightExtractPipelineLayoutInfo, nullptr, &m_LightExtractPipelineLayout));
+
+            VkShaderModule lightExtractShaderModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/ParticleLightExtract.comp.spv");
+            VkComputePipelineCreateInfo lightExtractPipelineInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
+            lightExtractPipelineInfo.layout = m_LightExtractPipelineLayout;
+            lightExtractPipelineInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+            lightExtractPipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+            lightExtractPipelineInfo.stage.module = lightExtractShaderModule;
+            lightExtractPipelineInfo.stage.pName = "main";
+            VK_CHECK(vkCreateComputePipelines(m_Device, VK_NULL_HANDLE, 1, &lightExtractPipelineInfo, nullptr, &m_LightExtractPipeline));
+            vkDestroyShaderModule(m_Device, lightExtractShaderModule, nullptr);
         }
 
         // =====================================================================================
@@ -1069,6 +1191,27 @@ namespace renderer {
 #endif
     }
 
+    void ParticleSystemPass::RecordExtractLights(VkCommandBuffer cmd) {
+        // No barrier needed BEFORE this dispatch: RecordSimulate()'s own trailing barrier already
+        // makes this frame's ParticleBuffer/AliveListBuffer/CounterBuffer writes visible to
+        // COMPUTE_SHADER reads (see this method's own header comment on why RecordSort() is not a
+        // hard dependency, even though this codebase's own RecordFrame calls it right after anyway).
+        VkDescriptorSet sets[2] = { GetCurrentSet(), m_LightExtractSet };
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_LightExtractPipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_LightExtractPipelineLayout, 0, 2, sets, 0, nullptr);
+        vkCmdDispatch(cmd, 1, 1, 1); // A single workgroup, kMaxParticleDerivedLights threads (ParticleLightExtract.comp's own local_size_x).
+
+        // Trailing barrier: renderer::MegaLightsPass::RecordShade reads the reserved tail slots this
+        // dispatch just wrote from a LATER command-buffer submission on the SAME graphics queue --
+        // this codebase already relies on same-queue submission ordering to make a same-queue,
+        // cross-submission write visible to a later read with no semaphore (see
+        // ClusterRenderPipeline.h's own "same-queue submission order (not a semaphore)" precedent);
+        // this barrier is still recorded so the dependency is explicit within this command buffer's
+        // own scope, matching every other RecordXxx() method's own trailing-barrier convention here.
+        VulkanUtils::RecordMemoryBarrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+    }
+
 #ifndef NDEBUG
     uint32_t ParticleSystemPass::GetLastAliveCountApprox() const {
         if (m_AliveCountReadbackBuffer.MappedData() == nullptr) {
@@ -1132,9 +1275,10 @@ namespace renderer {
     void ParticleSystemPass::RecordDraw(VkCommandBuffer cmd, VkImage colorImage, VkImageView colorView, VkImageView depthView,
         VkImageView refractionOffsetView, VkExtent2D renderExtent,
         const maths::mat4& viewProj, const maths::vec3& cameraPositionWorld,
-        const maths::vec3& cameraRightWorld, const maths::vec3& cameraUpWorld,
+        const maths::vec3& cameraRightWorld, const maths::vec3& cameraUpWorld, const maths::vec3& cameraForwardWorld,
         const maths::vec3& sunDirectionWorld, const maths::vec3& sunColor, float sunIntensity,
-        float softFadeDistanceWorld, float heatShimmerStrength, float globalTimeSeconds) {
+        const SceneLights& sceneLights, const maths::vec3& worldProbeGridOrigin,
+        float softFadeDistanceWorld, float heatShimmerStrength, float globalTimeSeconds, uint32_t frameIndex) {
 #ifndef NDEBUG
         // Subtask E2: DrawStart (query 4) -- this runs on cmdLate, a DIFFERENT primary command
         // buffer than RecordSimulate()/RecordSort()'s own cmdEarly (see
@@ -1161,12 +1305,43 @@ namespace renderer {
         ubo.sunIntensity = sunIntensity;
         ubo.sunColorR = sunColor.x; ubo.sunColorG = sunColor.y; ubo.sunColorB = sunColor.z;
         ubo.heatShimmerStrength = heatShimmerStrength;
+        // D5.
+        ubo.cameraForwardX = cameraForwardWorld.x; ubo.cameraForwardY = cameraForwardWorld.y; ubo.cameraForwardZ = cameraForwardWorld.z;
+        // D1.
+        ubo.frameIndex = frameIndex;
         vkCmdUpdateBuffer(cmd, m_RenderParamsBuffer.Handle(), 0, sizeof(ubo), &ubo);
 
-        // Covers both this UBO update AND Subtask 3's own trailing barrier scope gap (RecordSort's
-        // own trailing barrier only makes the sorted-pair/indirect-draw data visible to
-        // COMPUTE_SHADER, not to this draw's VERTEX_SHADER/DRAW_INDIRECT reads -- see RecordSort's
-        // own comment).
+        // D6 fix: re-upload the World Probe Grid's CURRENT toroidal-recenter origin every call,
+        // instead of the stale one-time value Init() used to seed this buffer with -- see this
+        // class' own Init() comment (STEP 6b) and renderer::WorldProbeGridPass::GetGridOriginWorld()'s
+        // own comment for why that origin is only valid "as of the most recent RecordUpdate() call".
+        WorldProbeGridParamsUBO gridParams{};
+        gridParams.gridOriginX = worldProbeGridOrigin.x;
+        gridParams.gridOriginY = worldProbeGridOrigin.y;
+        gridParams.gridOriginZ = worldProbeGridOrigin.z;
+        gridParams.probeSpacing = WorldProbeGridPass::kProbeSpacing;
+        gridParams.gridResolution = static_cast<float>(WorldProbeGridPass::kGridResolution);
+        vkCmdUpdateBuffer(cmd, m_WorldProbeGridParamsBuffer.Handle(), 0, sizeof(gridParams), &gridParams);
+
+        // D3: re-upload this frame's point-light population (position/color/intensity/radius) --
+        // ordinary per-frame CPU light data, same "always re-upload the live-tunable struct wholesale"
+        // convention as e.g. RecordSimulate()'s own EmitterParams upload.
+        ParticlePointLightsUBO pointLightsUbo{};
+        pointLightsUbo.pointLightCount = sceneLights.pointLightCount;
+        for (uint32_t i = 0; i < sceneLights.pointLightCount && i < kMaxPointLights; ++i) {
+            const PointLight& src = sceneLights.pointLights[i];
+            ParticlePointLight& dst = pointLightsUbo.lights[i];
+            dst.positionX = src.position.x; dst.positionY = src.position.y; dst.positionZ = src.position.z;
+            dst.colorR = src.color.x; dst.colorG = src.color.y; dst.colorB = src.color.z;
+            dst.intensity = src.intensity;
+            dst.radius = src.radius;
+        }
+        vkCmdUpdateBuffer(cmd, m_ParticlePointLightsBuffer.Handle(), 0, sizeof(pointLightsUbo), &pointLightsUbo);
+
+        // Covers this call's 3 UBO updates (render params, World Probe Grid params, point lights)
+        // AND Subtask 3's own trailing barrier scope gap (RecordSort's own trailing barrier only
+        // makes the sorted-pair/indirect-draw data visible to COMPUTE_SHADER, not to this draw's
+        // VERTEX_SHADER/DRAW_INDIRECT reads -- see RecordSort's own comment).
         VulkanUtils::RecordMemoryBarrier(cmd, VK_PIPELINE_STAGE_2_TRANSFER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
             VK_ACCESS_2_TRANSFER_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
             VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
@@ -1281,6 +1456,14 @@ namespace renderer {
 
     void ParticleSystemPass::Shutdown() {
         if (m_Device != VK_NULL_HANDLE) {
+            // D4: light-extraction compute pipeline -- destroyed first (mirrors this method's own
+            // "later-added subsystem first" ordering the lighting-set block right below already
+            // establishes relative to Subtask 4's render pipeline).
+            if (m_LightExtractPipeline != VK_NULL_HANDLE) vkDestroyPipeline(m_Device, m_LightExtractPipeline, nullptr);
+            if (m_LightExtractPipelineLayout != VK_NULL_HANDLE) vkDestroyPipelineLayout(m_Device, m_LightExtractPipelineLayout, nullptr);
+            if (m_LightExtractDescriptorPool != VK_NULL_HANDLE) vkDestroyDescriptorPool(m_Device, m_LightExtractDescriptorPool, nullptr);
+            if (m_LightExtractSetLayout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(m_Device, m_LightExtractSetLayout, nullptr);
+
             if (m_LightingDescriptorPool != VK_NULL_HANDLE) vkDestroyDescriptorPool(m_Device, m_LightingDescriptorPool, nullptr);
             if (m_LightingSetLayout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(m_Device, m_LightingSetLayout, nullptr);
 
@@ -1336,10 +1519,17 @@ namespace renderer {
         m_PrecipitationParamsBuffer.Destroy();
         m_RenderParamsBuffer.Destroy();
         m_WorldProbeGridParamsBuffer.Destroy();
+        m_ParticlePointLightsBuffer.Destroy();
 
         m_LightingDescriptorPool = VK_NULL_HANDLE;
         m_LightingSetLayout = VK_NULL_HANDLE;
         m_LightingSet = VK_NULL_HANDLE;
+
+        m_LightExtractPipeline = VK_NULL_HANDLE;
+        m_LightExtractPipelineLayout = VK_NULL_HANDLE;
+        m_LightExtractDescriptorPool = VK_NULL_HANDLE;
+        m_LightExtractSetLayout = VK_NULL_HANDLE;
+        m_LightExtractSet = VK_NULL_HANDLE;
 
         m_RenderPipeline = VK_NULL_HANDLE;
         m_RenderPipelineLayout = VK_NULL_HANDLE;
