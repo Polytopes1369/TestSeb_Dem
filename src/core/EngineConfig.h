@@ -371,7 +371,25 @@ inline float WIND_TURBULENCE_SCALE = 1.0f;
 inline float WIND_TURBULENCE_ROUGHNESS = 0.5f;
 inline float CLOUD_DENSITY_TARGET = 0.5f; // [0,1] -- unconsumed until Subtask 4 (Volumetric Clouds).
 inline float FOG_DENSITY_TARGET = 0.1f; // [0,1] -- unconsumed until Subtask 3 (Froxel Volumetric Fog).
-inline float RAIN_STRENGTH = 0.0f; // [0,1] -- unconsumed until a future precipitation pass.
+
+// Precipitation feature (rain/snow particle emission tied to the climate simulation, Ubisoft
+// "Atmos"-style) -- 0 = no precipitation at all (no spawn dispatch is even issued, see
+// renderer::ClusterRenderPipeline::RecordFrameEarly's own precipitation spawn-accumulator comment).
+// Renamed from the earlier placeholder RAIN_STRENGTH (which already fed AtmosGlobalsUBO.rainStrength
+// -- see AtmosClimatePass::RecordUpdate -- but nothing consumed it yet): this IS that future
+// precipitation pass, so the one knob now does double duty as both the GPU UBO field every
+// Atmos shader already mirrors and the actual particle spawn-rate driver below, rather than adding a
+// second, confusingly-overlapping slider.
+inline float PRECIPITATION_INTENSITY = 0.0f; // [0,1].
+inline float PRECIPITATION_MAX_SPAWN_RATE_PER_SECOND = 900.0f; // Particles/second at PRECIPITATION_INTENSITY == 1.0 -- scaled linearly below that.
+inline float PRECIPITATION_SNOW_TEMPERATURE_THRESHOLD_CELSIUS = 2.0f; // config::atmos::TEMPERATURE_CELSIUS below this spawns snow instead of rain (see renderer::ClusterRenderPipeline's own precipitation-kind-selection comment).
+inline float PRECIPITATION_SPAWN_RADIUS_METERS = 22.0f; // Half-extent (X/Z) of the horizontal spawn-shell box centered on the camera.
+inline float PRECIPITATION_SPAWN_HEIGHT_ABOVE_CAMERA_METERS = 16.0f; // How far above the camera the spawn band's midpoint sits.
+inline float PRECIPITATION_SPAWN_BAND_THICKNESS_METERS = 4.0f; // Vertical thickness of the spawn band (particles jitter +/- half this around the height above).
+inline float PRECIPITATION_FLOOR_BELOW_CAMERA_METERS = 20.0f; // A precip particle sinking this far below the camera is force-recycled even with no Global SDF geometry underneath (open sky/ocean/unstreamed regions).
+inline float PRECIPITATION_RAIN_FALL_SPEED_MPS = 9.0f; // Real-world raindrop terminal velocity is roughly 5-10 m/s depending on droplet size.
+inline float PRECIPITATION_SNOW_FALL_SPEED_MPS = 1.2f; // Real-world snowflake terminal velocity is roughly 0.5-1.5 m/s -- much slower than rain, see ParticleSimulation.comp's own fall-speed-relaxation comment.
+inline float PRECIPITATION_SNOW_WOBBLE_STRENGTH = 0.5f; // m/s -- horizontal sine-wobble amplitude added on top of wind drift, snow only.
 } // namespace atmos
 
 // GPU particle system (particle_system_integration_plan.md, Subtask 6: Final Integration) -- live

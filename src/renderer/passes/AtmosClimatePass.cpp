@@ -86,7 +86,7 @@ namespace renderer {
         ubo.condensationLCL = lclHeight;
         ubo.cloudDensityTarget = config::atmos::CLOUD_DENSITY_TARGET;
         ubo.fogDensityTarget = config::atmos::FOG_DENSITY_TARGET;
-        ubo.rainStrength = config::atmos::RAIN_STRENGTH;
+        ubo.rainStrength = config::atmos::PRECIPITATION_INTENSITY; // GPU field name kept as `rainStrength` (byte-for-byte mirrored across AtmosVolumetricFog.comp/AtmosCloudShadows.comp/AtmosClouds.comp/ParticleSimulation.comp) -- only the CPU-side config knob was renamed, see that variable's own comment.
         ubo.time = globalTimeSeconds;
         ubo.windTurbulenceFrequency = config::atmos::WIND_TURBULENCE_FREQUENCY;
         ubo.windTurbulenceOctaves = config::atmos::WIND_TURBULENCE_OCTAVES;

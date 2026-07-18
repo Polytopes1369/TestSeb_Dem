@@ -996,9 +996,28 @@ int main(int argc, char** argv) {
                 ImGui::DragFloat("Wind Turbulence Roughness", &config::atmos::WIND_TURBULENCE_ROUGHNESS, 0.01f, 0.0f, 1.0f);
                 ImGui::DragFloat("Cloud Density Target", &config::atmos::CLOUD_DENSITY_TARGET, 0.01f, 0.0f, 1.0f);
                 ImGui::DragFloat("Fog Density Target", &config::atmos::FOG_DENSITY_TARGET, 0.01f, 0.0f, 1.0f);
-                ImGui::DragFloat("Rain Strength", &config::atmos::RAIN_STRENGTH, 0.01f, 0.0f, 1.0f);
                 ImGui::TextDisabled("Dew Point: %.2f C", clusterPipeline.GetAtmosClimate().GetLastDewPointCelsius());
                 ImGui::TextDisabled("LCL Height: %.1f m", clusterPipeline.GetAtmosClimate().GetLastLCLHeightMeters());
+
+                // --- Precipitation (rain/snow particle emission tied to the climate simulation
+                // above, Ubisoft "Atmos"-style) -- live sliders over config::atmos::PRECIPITATION_*,
+                // consumed every frame by renderer::ClusterRenderPipeline::RecordFrameEarly's own
+                // precipitation spawn-accumulator + renderer::ParticleSystemPass::RecordSimulate.
+                // Grouped here (not in the "Particles" tab below) since the driving input is
+                // TEMPERATURE_CELSIUS just above, not a manual emitter toggle. ---
+                ImGui::Separator();
+                ImGui::TextUnformatted("Precipitation");
+                ImGui::SliderFloat("Precipitation Intensity", &config::atmos::PRECIPITATION_INTENSITY, 0.0f, 1.0f);
+                ImGui::DragFloat("Max Spawn Rate (particles/s)", &config::atmos::PRECIPITATION_MAX_SPAWN_RATE_PER_SECOND, 5.0f, 0.0f, 4000.0f);
+                ImGui::DragFloat("Snow Threshold (C)", &config::atmos::PRECIPITATION_SNOW_TEMPERATURE_THRESHOLD_CELSIUS, 0.2f, -20.0f, 20.0f);
+                ImGui::DragFloat("Spawn Radius (m)", &config::atmos::PRECIPITATION_SPAWN_RADIUS_METERS, 0.5f, 1.0f, 200.0f);
+                ImGui::DragFloat("Spawn Height Above Camera (m)", &config::atmos::PRECIPITATION_SPAWN_HEIGHT_ABOVE_CAMERA_METERS, 0.2f, 0.0f, 100.0f);
+                ImGui::DragFloat("Spawn Band Thickness (m)", &config::atmos::PRECIPITATION_SPAWN_BAND_THICKNESS_METERS, 0.2f, 0.5f, 50.0f);
+                ImGui::DragFloat("Floor Below Camera (m)", &config::atmos::PRECIPITATION_FLOOR_BELOW_CAMERA_METERS, 0.5f, 1.0f, 200.0f);
+                ImGui::DragFloat("Rain Fall Speed (m/s)", &config::atmos::PRECIPITATION_RAIN_FALL_SPEED_MPS, 0.1f, 0.5f, 30.0f);
+                ImGui::DragFloat("Snow Fall Speed (m/s)", &config::atmos::PRECIPITATION_SNOW_FALL_SPEED_MPS, 0.05f, 0.1f, 10.0f);
+                ImGui::DragFloat("Snow Wobble Strength", &config::atmos::PRECIPITATION_SNOW_WOBBLE_STRENGTH, 0.02f, 0.0f, 5.0f);
+                ImGui::TextDisabled("Kind: %s", (config::atmos::TEMPERATURE_CELSIUS < config::atmos::PRECIPITATION_SNOW_TEMPERATURE_THRESHOLD_CELSIUS) ? "Snow" : "Rain");
 
                 ImGui::EndTabItem();
             }

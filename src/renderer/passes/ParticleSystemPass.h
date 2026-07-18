@@ -54,6 +54,10 @@ namespace renderer {
         float colorR = 0.0f, colorG = 0.0f, colorB = 0.0f, colorA = 0.0f;
         float sizeX = 0.0f, sizeY = 0.0f;
         float rotation = 0.0f;
+        // Precipitation feature: top 2 bits are a particle "kind" tag (see ParticleCommon.glsl's
+        // PackParticleSeed/UnpackParticleKind) -- this field is otherwise dead after GPU-side spawn
+        // (no CPU reader, no other GPU consumer treats it as a raw PRNG value again), so it is the
+        // only place a per-particle kind can live without growing this already byte-exact struct.
         uint32_t randomSeed = 0;
     };
     static_assert(sizeof(GpuParticle) == 64, "GpuParticle must match ParticleCommon.glsl's Particle struct exactly (std430 layout)");
@@ -148,23 +152,44 @@ namespace renderer {
         uint32_t GetLastAliveCountApprox() const;
 #endif
 
-        // Dispatches ParticleSimulation.comp in two passes against GetCurrentSet() (see that
+        // Dispatches ParticleSimulation.comp in up to three passes against GetCurrentSet() (see that
         // shader's own header comment for the full spawn/update contract):
-        //   1. Spawn: resets CounterBuffer.aliveCount to 0 (full rebuild, see below) and
+        //   1. Spawn embers: resets CounterBuffer.aliveCount to 0 (full rebuild, see below) and
         //      CounterBuffer.spawnQueue to `spawnCount` via two small vkCmdUpdateBuffer calls, then
         //      dispatches ceil(spawnCount / 64) workgroups that each pop one dead-list slot and
         //      initialize a fresh particle there (position/velocity jittered around
-        //      `emitterPositionWorld`, life = maxLife). Does NOT touch the alive-list.
-        //   2. Update: dispatches ceil(kMaxParticles / 64) workgroups, one thread per particle SLOT
+        //      `emitterPositionWorld`, life = maxLife). Does NOT touch the alive-list. Skipped
+        //      entirely when spawnCount == 0.
+        //   2. Spawn precipitation (rain/snow -- Atmos weather system precipitation feature): first
+        //      uploads `precipCenterWorld`/the fall-speed and spawn-geometry constants into this
+        //      pass' own PrecipitationParamsUBO (m_PrecipitationParamsBuffer, environment set binding
+        //      2), then dispatches ceil(precipSpawnCount / 64) workgroups against ParticleSimulation.
+        //      comp's mode == 2, each popping one dead-list slot (the SAME shared free-list step 1
+        //      above draws from -- see ParticleSimulation.comp's own TryPopDeadListSlot comment for
+        //      why this is exactly the "share the pool, back off gracefully under pressure" contract
+        //      the particle-budget requirement asks for) and spawning a rain/snow particle inside a
+        //      horizontal box "shell" centered on `precipCenterWorld`'s XZ (see ParticleSimulation.
+        //      comp's own SpawnPrecipitationParticle comment). `precipKind` (kParticleKindRain/Snow,
+        //      ParticleCommon.glsl) is resolved by the CALLER from the current Atmos temperature --
+        //      this method does not read config::atmos:: itself, matching the existing convention
+        //      that config values are read once at the call site (renderer::ClusterRenderPipeline)
+        //      and passed down as plain parameters, same as `emitterPositionWorld`/`spawnCount` above
+        //      already are for embers. Skipped entirely when precipSpawnCount == 0.
+        //   3. Update: dispatches ceil(kMaxParticles / 64) workgroups, one thread per particle SLOT
         //      (not per alive-list entry -- covers pre-existing AND just-spawned particles
-        //      uniformly). A dead slot (life <= 0) is skipped outright. A live slot integrates
-        //      gravity + wind (AtmosNoiseCommon.glsl's SampleWindVelocity, fed by `atmosClimate`'s
-        //      AtmosGlobalsUBO) + drag, resolves Global SDF collisions (central-difference normal,
-        //      reflect() split into elastic-normal/frictional-tangential components), then either
-        //      returns its index to the dead-list (life just expired) or appends it to the
-        //      alive-list (still alive) -- this is the ONLY place either list is written from an
-        //      existing particle, so aliveCount's reset-to-0-then-rebuild above is exactly correct
-        //      (never double-counts a particle spawn() also touched).
+        //      uniformly, from EITHER spawn pass above). A dead slot (life <= 0) is skipped outright.
+        //      A live slot's physics branches on its own stored kind (ParticleCommon.glsl's
+        //      UnpackParticleKind): embers integrate gravity + wind (AtmosNoiseCommon.glsl's
+        //      SampleWindVelocity, fed by `atmosClimate`'s AtmosGlobalsUBO) + drag and resolve Global
+        //      SDF collisions with a bounce (central-difference normal, reflect() split into
+        //      elastic-normal/frictional-tangential components); rain/snow instead relax toward a
+        //      fixed fall speed (+ wind drift, + a sine wobble for snow) and are simply absorbed (no
+        //      bounce) on any Global SDF contact or once they sink below the camera-relative recycle
+        //      floor. Either way the particle then either returns its index to the dead-list (life
+        //      just expired) or appends it to the alive-list (still alive) -- this is the ONLY place
+        //      either list is written from an existing particle, so aliveCount's reset-to-0-then-
+        //      rebuild above is exactly correct (never double-counts a particle either spawn pass
+        //      also touched).
         // `time` feeds both wind domain-scrolling and is stored nowhere -- purely a per-call input.
         // Caller owns every barrier before (environment/GlobalSDF data visible to COMPUTE_SHADER)
         // and after (this call's own trailing VkMemoryBarrier2 only covers COMPUTE_SHADER-stage
@@ -176,7 +201,11 @@ namespace renderer {
         // renderer::SDFRayMarchPass::RecordRayMarch's own identical "views bound once, per-frame
         // window data passed fresh each call" split.
         void RecordSimulate(VkCommandBuffer cmd, const GlobalSDFPass& globalSDF, float dt, float time,
-            const float emitterPositionWorld[3], uint32_t spawnCount);
+            const float emitterPositionWorld[3], uint32_t spawnCount,
+            const float precipCenterWorld[3], uint32_t precipSpawnCount, uint32_t precipKind,
+            float precipSpawnRadiusMeters, float precipSpawnHeightAboveCenterMeters,
+            float precipSpawnBandThicknessMeters, float precipFloorBelowCenterMeters,
+            float precipRainFallSpeedMps, float precipSnowFallSpeedMps, float precipSnowWobbleStrength);
 
         // Sorted {particleIndex, depthKey} pairs, back-to-front (farthest first) among the first
         // GetCounterBufferHandle()-reported aliveCount entries -- see ParticleSort.comp's own header
@@ -280,6 +309,14 @@ namespace renderer {
         VkDescriptorSetLayout m_EnvironmentSetLayout = VK_NULL_HANDLE;
         VkDescriptorPool m_EnvironmentDescriptorPool = VK_NULL_HANDLE;
         VkDescriptorSet m_EnvironmentSet = VK_NULL_HANDLE;
+
+        // Precipitation feature -- environment set binding 2 (PrecipitationParamsUBO). Unlike
+        // AtmosGlobalsUBO/the clipmaps above (borrowed from other passes, written once at Init() and
+        // never again by THIS class), this buffer is owned AND updated by ParticleSystemPass itself,
+        // every single RecordSimulate() call (camera-relative spawn-shell center changes every frame)
+        // -- see that method's own comment. 48 bytes, GPU_ONLY, same vkCmdUpdateBuffer-then-barrier
+        // idiom as AtmosClimatePass::RecordUpdate's own AtmosGlobalsUBO upload.
+        GpuBuffer m_PrecipitationParamsBuffer;
 
         VkPipelineLayout m_SimPipelineLayout = VK_NULL_HANDLE;
         VkPipeline m_SimPipeline = VK_NULL_HANDLE;

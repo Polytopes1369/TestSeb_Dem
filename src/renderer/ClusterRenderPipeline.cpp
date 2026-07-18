@@ -1432,8 +1432,32 @@ void ClusterRenderPipeline::RecordFrameEarly(VkCommandBuffer cmdEarly,
 
       float particleEmitterPosition[3] = {
           config::particles::EMITTER_POSITION_X, config::particles::EMITTER_POSITION_Y, config::particles::EMITTER_POSITION_Z };
+
+      // Precipitation feature (Ubisoft "Atmos"-style: rain/snow tied directly to the climate
+      // simulation, not a manual toggle) -- spawn rate scales with config::atmos::
+      // PRECIPITATION_INTENSITY (0 = no precipitation, no dispatch is even issued below), and the
+      // rain-vs-snow KIND is resolved here, every frame, purely from the live simulated temperature
+      // (renderer::AtmosClimatePass's own config::atmos::TEMPERATURE_CELSIUS input) -- below
+      // PRECIPITATION_SNOW_TEMPERATURE_THRESHOLD_CELSIUS (default 2.0 C, matching real-world sleet/
+      // snow transition) spawns snow, otherwise rain. Same fractional-accumulator idiom as the
+      // embers emitter just above (see m_PrecipSpawnAccumulator's own declaration comment).
+      m_PrecipSpawnAccumulator += config::atmos::PRECIPITATION_INTENSITY * config::atmos::PRECIPITATION_MAX_SPAWN_RATE_PER_SECOND * particleDeltaTimeSeconds;
+      uint32_t precipSpawnCount = static_cast<uint32_t>(m_PrecipSpawnAccumulator);
+      m_PrecipSpawnAccumulator -= static_cast<float>(precipSpawnCount);
+
+      uint32_t precipKind = (config::atmos::TEMPERATURE_CELSIUS < config::atmos::PRECIPITATION_SNOW_TEMPERATURE_THRESHOLD_CELSIUS)
+          ? 2u  // kParticleKindSnow (ParticleCommon.glsl) -- mirrored as a plain literal here since this is a CPU-side .cpp file, not a GLSL includer.
+          : 1u; // kParticleKindRain
+
+      float precipCenterWorld[3] = { cameraFrameInfo.position.x, cameraFrameInfo.position.y, cameraFrameInfo.position.z };
+
       m_ParticleSystem.RecordSimulate(cmdEarly, m_GlobalSDF, particleDeltaTimeSeconds, globalTimeSeconds,
-          particleEmitterPosition, particleSpawnCount);
+          particleEmitterPosition, particleSpawnCount,
+          precipCenterWorld, precipSpawnCount, precipKind,
+          config::atmos::PRECIPITATION_SPAWN_RADIUS_METERS, config::atmos::PRECIPITATION_SPAWN_HEIGHT_ABOVE_CAMERA_METERS,
+          config::atmos::PRECIPITATION_SPAWN_BAND_THICKNESS_METERS, config::atmos::PRECIPITATION_FLOOR_BELOW_CAMERA_METERS,
+          config::atmos::PRECIPITATION_RAIN_FALL_SPEED_MPS, config::atmos::PRECIPITATION_SNOW_FALL_SPEED_MPS,
+          config::atmos::PRECIPITATION_SNOW_WOBBLE_STRENGTH);
 
       float particleCameraPosition[3] = { cameraFrameInfo.position.x, cameraFrameInfo.position.y, cameraFrameInfo.position.z };
       float particleCameraForward[3] = { cameraFrameInfo.forward.x, cameraFrameInfo.forward.y, cameraFrameInfo.forward.z };
