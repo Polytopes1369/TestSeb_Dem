@@ -1122,6 +1122,33 @@ int main(int argc, char** argv) {
                         ImGui::DragFloat("Attractor Strength (+attract/-repel)", &cfg.attractorStrength, 0.05f, -20.0f, 20.0f);
                         ImGui::DragFloat("Attractor Falloff Radius (m)", &cfg.attractorRadius, 0.05f, 0.05f, 50.0f);
 
+                        // Subtask A4 (color-over-life / size-over-life curves): 4 keyframes each,
+                        // evenly spaced across a particle's normalized age -- see config::particles::
+                        // EmitterConfig::colorCurve/sizeCurve's own declaration comment for the full
+                        // evaluation contract (color is DIRECT/authoritative, overriding "Base Color"
+                        // above once edited here; size is a MULTIPLIER on top of "Size Range" above).
+                        // Only meaningful for ember-kind particles -- precipitation (rain/snow) never
+                        // reads these fields at all (see ParticleSimulation.comp's own UpdateParticle
+                        // comment).
+                        ImGui::Separator();
+                        ImGui::TextUnformatted("Color / Size Over Life (subtask A4)");
+                        ImGui::TextDisabled("4 keys at normalized age 0.00 / 0.33 / 0.67 / 1.00, linearly interpolated.");
+                        static const char* kCurveKeyLabels[4] = { "Age 0.00", "Age 0.33", "Age 0.67", "Age 1.00" };
+                        ImGui::PushID("ColorCurve");
+                        for (uint32_t k = 0; k < 4; ++k) {
+                            ImGui::PushID(static_cast<int>(k));
+                            ImGui::ColorEdit4(kCurveKeyLabels[k], cfg.colorCurve[k]);
+                            ImGui::PopID();
+                        }
+                        ImGui::PopID();
+                        ImGui::PushID("SizeCurve");
+                        for (uint32_t k = 0; k < 4; ++k) {
+                            ImGui::PushID(static_cast<int>(k));
+                            ImGui::DragFloat(kCurveKeyLabels[k], &cfg.sizeCurve[k], 0.01f, 0.0f, 5.0f, "%.2fx");
+                            ImGui::PopID();
+                        }
+                        ImGui::PopID();
+
                         // Multi-emitter roadmap (subtask A1) validation/debug instrumentation: proves
                         // this emitter is independently alive/producing particles, not just that the
                         // aggregate total below is nonzero.

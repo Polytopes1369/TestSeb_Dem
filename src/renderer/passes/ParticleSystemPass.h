@@ -63,7 +63,19 @@ namespace renderer {
         // back every UpdateParticle() invocation so a particle's physics response stays tied to its
         // OWN emitter's (live-tunable) gravity/bounce/friction/drag, not a single global value.
         uint32_t emitterIndex = 0;
-        float _pad0 = 0.0f, _pad1 = 0.0f, _pad2 = 0.0f;
+        // Subtask A4 (color-over-life / size-over-life curves): this particle's own spawn-time BASE
+        // size -- the mix(sizeMin, sizeMax, random) roll SpawnParticle drew (ParticleSimulation.comp)
+        // -- preserved here, separate from `sizeX`/`sizeY` above, because UpdateParticle now
+        // overwrites sizeX/sizeY every single frame with `baseSize * SampleSizeCurve(age)`. Without a
+        // separately stored base, next frame's multiply would compound against an ALREADY-curve-
+        // modulated value instead of the original per-particle roll, drifting the size every frame
+        // instead of following the curve. Repurposes what was `_pad0` (this struct's total size does
+        // not change) -- only meaningful for kKindEmber particles; precipitation's own rain/snow sizes
+        // are asymmetric width/length (see ParticleSimulation.comp's own SpawnPrecipitationParticle
+        // comment) and never reach the curve-evaluation code path at all (see UpdateParticle's own
+        // comment on why that branch is ember-only).
+        float baseSize = 0.0f;
+        float _pad1 = 0.0f, _pad2 = 0.0f;
     };
     static_assert(sizeof(GpuParticle) == 80, "GpuParticle must match ParticleCommon.glsl's Particle struct exactly (std430 layout)");
 
@@ -119,8 +131,50 @@ namespace renderer {
             float attractorRadius = 1.0f;    // World units -- force falls off smoothly (smoothstep) to zero at this distance.
             uint32_t attractorEnabled = 0;
             float _pad0 = 0.0f, _pad1 = 0.0f;
+
+            // Subtask A4 (Niagara-parity roadmap: color-over-life / size-over-life curves): 4
+            // evenly-spaced keyframes at normalized age 0.0/0.33/0.67/1.0, linearly interpolated
+            // between the two bracketing keys every UpdateParticle() call in ParticleSimulation.comp
+            // (see that file's own SampleColorCurve/SampleSizeCurve comment) -- lets an emitter fade,
+            // shrink, or recolor over a particle's lifetime instead of holding one fixed appearance
+            // from spawn to death, exactly as `color`/`sizeMin`/`sizeMax` above used to do alone.
+            //
+            // colorCurve is DIRECT/authoritative, NOT a multiplier on `color` above: UpdateParticle
+            // assigns p.color = SampleColorCurve(age) outright every frame for ember-kind particles,
+            // matching real Niagara "Color over Life" module semantics (a later module in the stack
+            // overrides an earlier one's output, it does not tint it) -- keeping every key within
+            // [0,1] per channel also matches plain ImGui::ColorEdit4's own normalized display range
+            // (no HDR authoring UI needed). `color` above still matters as this curve's sensible
+            // "flat" default (see config::particles::EMITTERS[]'s own comment) and as the one-frame
+            // spawn-instant value SpawnParticle sets before this same call's Update dispatch
+            // immediately overwrites it -- but editing `color` alone no longer changes steady-state
+            // appearance once a custom curve is set, exactly like adding a Niagara module downstream
+            // of Initialize Particle.
+            //
+            // sizeCurve IS a multiplier (per this roadmap step's own explicit design), applied on top
+            // of the existing mix(sizeMin, sizeMax, random) per-particle roll at spawn -- see
+            // GpuParticle::baseSize's own declaration comment for why that roll must be preserved
+            // per-particle rather than re-derived from sizeMin/sizeMax alone (they only bound the
+            // RANGE, not which value THIS particle actually drew). All-ones is a universally safe,
+            // no-op default regardless of an emitter's own sizeMin/sizeMax -- unlike colorCurve, whose
+            // safe default must equal `color` above exactly, a multiplier's neutral element does not
+            // depend on the base value it multiplies, so no OTHER emitter slot needs an explicit
+            // override to stay visually unchanged by this feature.
+            //
+            // Flat C arrays (key-major, channel-minor for colorCurve) rather than maths::vec4[4] or
+            // std::array, matching this codebase's own established "flat float array" struct
+            // convention (see e.g. ParticleSimulationPC::levelVoxelSize/levelCenterVoxel in
+            // ParticleSystemPass.cpp) -- guarantees the byte layout mirrors ParticleCommon.glsl's own
+            // `vec4 colorCurve[4]` / `float sizeCurve[4]` std430 arrays exactly (tightly packed, no
+            // vec4-rounding of the float array: std430, unlike std140, does not round a scalar array's
+            // stride up to 16 bytes per element).
+            float colorCurve[4][4] = {
+                { 1.0f, 1.0f, 1.0f, 1.0f }, { 1.0f, 1.0f, 1.0f, 1.0f },
+                { 1.0f, 1.0f, 1.0f, 1.0f }, { 1.0f, 1.0f, 1.0f, 1.0f }
+            };
+            float sizeCurve[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
         };
-        static_assert(sizeof(EmitterParams) == 112, "EmitterParams must match ParticleCommon.glsl's EmitterParams struct exactly (std430 layout)");
+        static_assert(sizeof(EmitterParams) == 192, "EmitterParams must match ParticleCommon.glsl's EmitterParams struct exactly (std430 layout)");
 
         // Maximum simultaneous emitter slots (multi-emitter roadmap, subtask A1) -- small and fixed
         // (unlike kMaxParticles, no sort/perf pressure motivates a larger number yet; a future

@@ -43,14 +43,26 @@ struct Particle {
     // the kind-branch in UpdateParticle) never reads this field, it uses randomSeed's packed kind tag
     // and the separate PrecipitationParamsUBO instead.
     uint emitterIndex;
-    float _pad0, _pad1, _pad2;
+    // Subtask A4 (color-over-life / size-over-life curves): this particle's own spawn-time BASE size
+    // -- the mix(sizeMin, sizeMax, random) roll SpawnParticle drew -- preserved here, separate from
+    // `size` above, because UpdateParticle now overwrites `size` every single frame with
+    // `baseSize * SampleSizeCurve(age)`. Without a separately stored base, next frame's multiply would
+    // compound against an ALREADY-curve-modulated value instead of the original per-particle roll,
+    // drifting the size every frame instead of following the curve. Mirrors renderer::GpuParticle::
+    // baseSize (src/renderer/passes/ParticleSystemPass.h) byte-for-byte -- repurposes what was `_pad0`
+    // there (this struct's total size does not change). Only meaningful for kKindEmber particles --
+    // precipitation's own rain/snow sizes are asymmetric width/length (see this file's own
+    // SpawnPrecipitationParticle comment in ParticleSimulation.comp) and never reach the curve-
+    // evaluation code path at all (see UpdateParticle's own comment on why that branch is ember-only).
+    float baseSize;
+    float _pad1, _pad2;
 };
 
 // Per-emitter, live-tunable spawn/physics parameters -- one instance per active emitter slot (see
 // renderer::ParticleSystemPass::kMaxEmitters), re-uploaded in full every RecordSimulate() call since
 // every field is directly editable via main.cpp's Particles ImGui tab
 // (config::particles::EMITTERS[]). Mirrors renderer::ParticleSystemPass::EmitterParams byte-for-byte
-// -- 112 bytes, std430, same "flat floats, vec3 packs with trailing scalar" layout as Particle above.
+// -- 192 bytes, std430, same "flat floats, vec3 packs with trailing scalar" layout as Particle above.
 // Only consumed for kKindEmber particles -- precipitation (rain/snow) has its own dedicated
 // PrecipitationParamsUBO (this file's own binding declarations further down) instead.
 //
@@ -84,6 +96,20 @@ struct EmitterParams {
     float attractorRadius;   // World units -- force falls off smoothly (smoothstep) to zero at this distance.
     uint attractorEnabled;
     float _pad0, _pad1;
+    // Subtask A4 (color-over-life / size-over-life curves): 4 evenly-spaced keyframes at normalized
+    // age 0.0/0.33/0.67/1.0 -- UpdateParticle (ParticleSimulation.comp) linearly interpolates between
+    // the two bracketing keys every frame from the particle's own (maxLife - life) / maxLife, instead
+    // of SpawnParticle picking one fixed color/size for the particle's entire life. Mirrors renderer::
+    // ParticleSystemPass::EmitterParams::colorCurve/sizeCurve (src/renderer/passes/
+    // ParticleSystemPass.h) byte-for-byte -- see that field's own declaration comment for the full
+    // "colorCurve is direct/authoritative, sizeCurve is a multiplier on sizeMin/sizeMax's own
+    // per-particle roll" rationale. Tightly packed under std430 (this SSBO's own layout qualifier,
+    // see this file's own header comment) -- `vec4 colorCurve[4]` is 64 bytes with no slack (vec4 is
+    // already 16-byte aligned/sized), and `float sizeCurve[4]` is 16 bytes, NOT expanded to 16
+    // bytes-per-element the way std140 would: std430 does not round a scalar array's stride up to a
+    // vec4 multiple.
+    vec4 colorCurve[4];
+    float sizeCurve[4];
 };
 
 // Particle "kind" tag, packed into Particle.randomSeed's top 2 bits (see that field's own comment).

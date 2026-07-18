@@ -196,6 +196,43 @@ vec3 SampleCurlTurbulence(vec3 worldPos, float time, float scale) {
     return AtmosFractalCurlNoise3D(scrolledPos, 1.0, 3.0, 0.5);
 }
 
+// Subtask A4 (color-over-life / size-over-life curves): shared bracketing-key math for both
+// SampleColorCurve and SampleSizeCurve below -- 4 fixed keyframes evenly spaced across [0,1] (age
+// 0.0/0.33/0.67/1.0) means exactly 3 equal intervals, so `age * 3` directly gives a continuous
+// "which interval, and how far across it" value with no division needed. Returns the lower key index
+// (already clamped so key+1 never overruns the last index, 3) and the fractional position within that
+// interval via `outFrac`. Deliberately NOT a texture-based gradient LUT -- this project has zero
+// on-disk texture assets by design (see e.g. ParticleRender.frag's own header comment) -- and
+// deliberately a fixed small key count rather than a runtime-sized array, keeping EmitterParams'
+// own byte layout static and std430-mirror-able, matching this codebase's own "fixed small array, not
+// a runtime-length buffer" convention already established by e.g. ParticleSimulationPC's own
+// levelVoxelSize[4]/levelCenterVoxel[12].
+int CurveBracketKey(float age, out float outFrac) {
+    const float kIntervalCount = 3.0; // 4 keys -> 3 intervals, each covering 1/3 of [0,1].
+    float t = clamp(age, 0.0, 1.0) * kIntervalCount;
+    int key0 = clamp(int(floor(t)), 0, 2);
+    outFrac = clamp(t - float(key0), 0.0, 1.0);
+    return key0;
+}
+
+// Samples EmitterParams.colorCurve[4] at the given normalized age via linear interpolation between
+// the two bracketing keys -- see EmitterParams::colorCurve's own declaration comment (ParticleCommon.
+// glsl) for why this is DIRECT/authoritative output, not a multiplier on `e.color`.
+vec4 SampleColorCurve(EmitterParams e, float age) {
+    float frac;
+    int key0 = CurveBracketKey(age, frac);
+    return mix(e.colorCurve[key0], e.colorCurve[key0 + 1], frac);
+}
+
+// Same bracketing-key interpolation as SampleColorCurve above, over EmitterParams.sizeCurve[4]
+// instead -- see that field's own declaration comment for why this result is a MULTIPLIER applied on
+// top of the particle's own spawn-time base size, not an absolute size.
+float SampleSizeCurve(EmitterParams e, float age) {
+    float frac;
+    int key0 = CurveBracketKey(age, frac);
+    return mix(e.sizeCurve[key0], e.sizeCurve[key0 + 1], frac);
+}
+
 void SpawnParticle(uint slotIndex, uint spawnRequestIndex, uint emitterIndex) {
     uint seed = HashUint(pc.randomSeedBase ^ (slotIndex * 2654435761u) ^ (spawnRequestIndex * 40503u) ^ (emitterIndex * 2246822519u));
     EmitterParams e = emitters[emitterIndex];
@@ -235,6 +272,15 @@ void SpawnParticle(uint slotIndex, uint spawnRequestIndex, uint emitterIndex) {
     p.rotation = NextRandomFloat(seed) * 6.28318530718;
     p.randomSeed = PackParticleSeed(kParticleKindEmber, seed);
     p.emitterIndex = emitterIndex;
+    // Subtask A4: preserve this particle's own randomized base size -- see Particle::baseSize's own
+    // declaration comment (ParticleCommon.glsl) for why UpdateParticle needs this stored separately
+    // from `size` above rather than re-deriving it from sizeMin/sizeMax (which only bound the RANGE,
+    // not which value THIS particle actually drew). `p.color`/`p.size` above are still set to their
+    // old plain spawn values regardless -- this same RecordSimulate() call's mode == 0 Update dispatch
+    // (which covers every particle spawned by mode == 1 THIS call too, see this file's own header
+    // comment) immediately re-evaluates both from the curves at age ~= 0, so this is purely a sane
+    // one-frame-safe default, not the value that actually reaches the render pass.
+    p.baseSize = size;
     particles[slotIndex] = p;
 }
 
@@ -290,6 +336,11 @@ void SpawnPrecipitationParticle(uint slotIndex, uint spawnRequestIndex) {
     p.rotation = 0.0; // Unused for rain/snow -- ParticleRender.vert derives the streak/flake orientation from velocity/kind instead, see that shader's own comment.
     p.randomSeed = PackParticleSeed(pc.precipKind, seed);
     p.emitterIndex = 0; // Unused by precipitation (see UpdateParticle's own comment) -- explicit default, not read GPU memory.
+    // Subtask A4: unused by precipitation -- rain/snow sizes are asymmetric width/length (`size`
+    // above), which a single symmetric baseSize float could not represent anyway, and UpdateParticle's
+    // curve-evaluation code path never runs for precipitation kinds (see that function's own comment).
+    // Explicit default, not read GPU memory, same convention as p.emitterIndex above.
+    p.baseSize = 0.0;
     particles[slotIndex] = p;
 }
 
@@ -394,6 +445,21 @@ void UpdateParticle(uint slotIndex) {
             vec3 tangentVelocity = reflected - n * normalSpeed;
             p.velocity = n * normalSpeed * e.bounceElasticity + tangentVelocity * e.friction;
         }
+
+        // --- Subtask A4: color-over-life / size-over-life curves ---
+        // Evaluated every frame (not just once at spawn, see SpawnParticle's own comment) from this
+        // particle's own normalized age, so an ember visibly fades/recolors/shrinks over its lifetime
+        // instead of holding one fixed appearance until it disappears. `age` uses `p.life - pc.dt`
+        // (this frame's remaining life BEFORE the shared decrement a few lines below runs) so the
+        // curve reflects THIS frame's end-of-step age without needing to hoist that decrement or
+        // re-fetch `e` after this if/else block. Gated to this ember branch only -- precipitation
+        // (rain/snow) has its own fixed per-kind appearance set once at spawn
+        // (SpawnPrecipitationParticle) and is deliberately excluded: its own size is an asymmetric
+        // width/length streak (see that function's own comment), which a single baseSize float could
+        // not represent, and it has no EmitterParams of its own to curve against in the first place.
+        float age = clamp((p.maxLife - (p.life - pc.dt)) / max(p.maxLife, 1.0e-5), 0.0, 1.0);
+        p.color = SampleColorCurve(e, age);
+        p.size = vec2(p.baseSize, p.baseSize) * SampleSizeCurve(e, age);
     }
     p.position = newPosition;
 

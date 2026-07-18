@@ -1512,6 +1512,17 @@ void ClusterRenderPipeline::RecordFrameEarly(VkCommandBuffer cmdEarly,
         gpu.attractorStrength = cfg.attractorStrength;
         gpu.attractorRadius = cfg.attractorRadius;
 
+        // Subtask A4 (color-over-life / size-over-life curves): copied wholesale every frame, same
+        // "always re-upload the full live-tunable struct" convention as every other EmitterParams
+        // field above -- see config::particles::EmitterConfig::colorCurve/sizeCurve's own declaration
+        // comment for the full evaluation contract.
+        for (uint32_t key = 0; key < 4; ++key) {
+            for (uint32_t channel = 0; channel < 4; ++channel) {
+                gpu.colorCurve[key][channel] = cfg.colorCurve[key][channel];
+            }
+            gpu.sizeCurve[key] = cfg.sizeCurve[key];
+        }
+
         if (cfg.active) {
           m_ParticleSpawnAccumulator[i] += cfg.spawnRate * particleDeltaTimeSeconds;
         }
