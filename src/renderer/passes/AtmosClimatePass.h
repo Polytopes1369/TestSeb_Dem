@@ -64,6 +64,23 @@ namespace renderer {
         float GetLastDewPointCelsius() const { return m_LastDewPointCelsius; }
         float GetLastLCLHeightMeters() const { return m_LastLCLHeightMeters; }
 
+        // Surface weather response state (Substrate material parity extension, UE5.8/Ubisoft Atmos-
+        // style dynamic wet/snow surfaces): [0,1] scalars RecordUpdate() integrates every frame from
+        // config::atmos::RAIN_STRENGTH/RELATIVE_HUMIDITY/TEMPERATURE_CELSIUS via an exponential-decay
+        // time integration (see RecordUpdate()'s own comment for the exact formula/time-constants).
+        // Global, not per-material/per-surface: this is a demoscene-scale approximation ("every
+        // exposed surface reacts uniformly to the current climate"), not a per-instance puddle/
+        // runoff/snowdrift simulation -- see the Substrate BSDF consumer (substrate_bsdf.glsl's
+        // ApplySurfaceWeather) for how these two scalars modulate albedo/roughness/F0, masked by
+        // surface normal for snow. Consumed by renderer::ClusterRenderPipeline::RecordFrame, which
+        // threads these two floats straight into ClusterResolvePass::RecordResolve/RecordResolveBinned's
+        // own ResolveViewParamsUBO (repurposing that struct's previously-unused std140 padding floats
+        // -- see that UBO's own comment) rather than growing AtmosGlobalsUBO itself, since no other
+        // consumer of AtmosGlobalsUBO (AtmosCloudsPass/AtmosVolumetricFogPass raymarchers) needs this
+        // state and growing a UBO every one of THEIR shaders binds would be needless blast radius.
+        float GetSurfaceWetness() const { return m_SurfaceWetness; }
+        float GetSnowCoverage() const { return m_SnowCoverage; }
+
     private:
         VkDevice m_Device = VK_NULL_HANDLE;
         VmaAllocator m_Allocator = VK_NULL_HANDLE;
@@ -72,6 +89,14 @@ namespace renderer {
 
         float m_LastDewPointCelsius = 0.0f;
         float m_LastLCLHeightMeters = 0.0f;
+
+        // Surface weather response accumulator state -- see GetSurfaceWetness()/GetSnowCoverage()'s
+        // own comment. m_LastWeatherUpdateTimeSeconds < 0.0f is the "no previous frame yet" sentinel
+        // (first-ever RecordUpdate() call), so the very first frame integrates zero elapsed time
+        // instead of jumping the accumulator by whatever `globalTimeSeconds` happens to already be.
+        float m_SurfaceWetness = 0.0f;
+        float m_SnowCoverage = 0.0f;
+        float m_LastWeatherUpdateTimeSeconds = -1.0f;
     };
 
 }
