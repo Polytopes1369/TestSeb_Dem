@@ -41,7 +41,7 @@ namespace renderer {
     class VirtualShadowMapPass;
     class WorldProbeGridPass;
 
-    // Byte-for-byte mirror of ParticleCommon.glsl's `Particle` struct -- 64 bytes, std430 (vec3
+    // Byte-for-byte mirror of ParticleCommon.glsl's `Particle` struct -- 80 bytes, std430 (vec3
     // members are 16-byte aligned in std430, so the trailing scalar after each vec3 packs into the
     // same 16-byte slot with no manual padding needed; see ParticleCommon.glsl's own comment for the
     // full layout rationale). Named `GpuParticle`, not `Particle`, to avoid colliding with any
@@ -59,8 +59,13 @@ namespace renderer {
         // (no CPU reader, no other GPU consumer treats it as a raw PRNG value again), so it is the
         // only place a per-particle kind can live without growing this already byte-exact struct.
         uint32_t randomSeed = 0;
+        // Multi-emitter roadmap (subtask A1): which EmitterParams slot spawned this particle -- read
+        // back every UpdateParticle() invocation so a particle's physics response stays tied to its
+        // OWN emitter's (live-tunable) gravity/bounce/friction/drag, not a single global value.
+        uint32_t emitterIndex = 0;
+        float _pad0 = 0.0f, _pad1 = 0.0f, _pad2 = 0.0f;
     };
-    static_assert(sizeof(GpuParticle) == 64, "GpuParticle must match ParticleCommon.glsl's Particle struct exactly (std430 layout)");
+    static_assert(sizeof(GpuParticle) == 80, "GpuParticle must match ParticleCommon.glsl's Particle struct exactly (std430 layout)");
 
     class ParticleSystemPass {
     public:
@@ -68,6 +73,32 @@ namespace renderer {
 
         ParticleSystemPass(const ParticleSystemPass&) = delete;
         ParticleSystemPass& operator=(const ParticleSystemPass&) = delete;
+
+        // Byte-for-byte mirror of ParticleCommon.glsl's `EmitterParams` struct -- 80 bytes, std430,
+        // same flat-float convention as GpuParticle above (avoids vec3's implicit alignment surprises
+        // when reasoning about the byte layout by eye). One instance per emitter slot (kMaxEmitters
+        // below); renderer::ClusterRenderPipeline builds a full kMaxEmitters-length array of these
+        // from config::particles::EMITTERS[] every frame and passes it to RecordSimulate(), which
+        // re-uploads it wholesale (see that method's own comment) -- every field here is meant to be
+        // edited live via main.cpp's Particles ImGui tab with no restart required.
+        struct EmitterParams {
+            float positionX = 0.0f, positionY = 0.0f, positionZ = 0.0f;
+            float shapeParam0 = 0.0f;
+            float colorR = 1.0f, colorG = 1.0f, colorB = 1.0f, colorA = 1.0f;
+            float sizeMin = 0.1f, sizeMax = 0.1f;
+            float lifetimeMin = 2.0f, lifetimeMax = 4.0f;
+            float gravityY = -9.8f, bounceElasticity = 0.4f, friction = 0.85f, dragCoefficient = 0.5f;
+            uint32_t spawnShape = 0;
+            float _pad0 = 0.0f, _pad1 = 0.0f, _pad2 = 0.0f;
+        };
+        static_assert(sizeof(EmitterParams) == 80, "EmitterParams must match ParticleCommon.glsl's EmitterParams struct exactly (std430 layout)");
+
+        // Maximum simultaneous emitter slots (multi-emitter roadmap, subtask A1) -- small and fixed
+        // (unlike kMaxParticles, no sort/perf pressure motivates a larger number yet; a future
+        // subtask can raise this independently of the particle budget itself). Must match
+        // config::particles::EMITTERS[]'s own array length exactly (EngineConfig.h intentionally
+        // does NOT include this renderer-layer header -- see that array's own declaration comment).
+        static constexpr uint32_t kMaxEmitters = 4;
 
         // Total particle-buffer capacity (both the alive and dead lists are sized to this, and the
         // dead-list is fully populated with indices 0..kMaxParticles-1 at Init() time -- see Init's
@@ -150,6 +181,13 @@ namespace renderer {
         // stats-overlay exclusion rule, this whole accessor and its backing buffer exist only in
         // Debug builds; RecordSort()'s own copy into that buffer is equally `#ifndef NDEBUG`-guarded.
         uint32_t GetLastAliveCountApprox() const;
+
+        // Multi-emitter roadmap (subtask A1) validation/debug instrumentation: same staleness
+        // contract as GetLastAliveCountApprox() above, but broken down per emitter slot -- lets a
+        // developer visually confirm (main.cpp's Particles ImGui tab) that each emitter is
+        // independently spawning/alive, not just that the aggregate total is nonzero. `emitterIndex`
+        // must be < kMaxEmitters.
+        uint32_t GetLastPerEmitterAliveCountApprox(uint32_t emitterIndex) const;
 #endif
 
         // Dispatches ParticleSimulation.comp in up to three passes against GetCurrentSet() (see that
@@ -200,26 +238,29 @@ namespace renderer {
         // 4 levels' currently-covered windows recenter every frame as the camera moves -- mirrors
         // renderer::SDFRayMarchPass::RecordRayMarch's own identical "views bound once, per-frame
         // window data passed fresh each call" split.
-        // Rivers/waterfalls feature: `secondarySpawnCount` (default 0, a no-op -- existing call
-        // sites need no change) optionally spawns a SECOND emitter's particles THIS SAME call, at
-        // `secondaryEmitterPositionWorld` with visual recipe `secondarySpawnMode` (see
-        // ParticleSimulation.comp's own SpawnParticle()/SpawnMistParticle() comment for the
-        // recipes mode selects between) -- e.g. renderer::ClusterRenderPipeline's waterfall mist
-        // alongside the scene's existing default emitter. Implemented as a SECOND Spawn (mode == 1)
-        // dispatch, barrier-separated from the first, before the single shared Update (mode == 0)
-        // dispatch that already covers every slot once -- deliberately NOT a second full
-        // RecordSimulate() call, which would double-integrate every pre-existing particle's physics
-        // this frame (Update touches every slot unconditionally, see this class' own header comment
-        // on why aliveCount's reset-then-rebuild only stays correct with exactly one Update pass per
-        // frame).
+        //
+        // Multi-emitter roadmap (subtask A1): `emitters` is the FULL kMaxEmitters-length array of
+        // this frame's (possibly ImGui-edited) per-emitter parameters -- uploaded wholesale into
+        // m_EmitterParamsBuffer at the start of this call. `spawnCounts` is how many new particles
+        // EACH emitter slot should attempt to spawn this call (the caller -- ClusterRenderPipeline --
+        // owns one fractional spawn-rate accumulator per emitter, same "exact over time at any
+        // framerate" idiom the old single-emitter accumulator already used); a zero entry costs one
+        // skipped dispatch, not a wasted one. One spawn dispatch is issued per emitter with a nonzero
+        // count (each with its own emitterIndex/spawnCount push-constant pair), all popping from the
+        // SAME shared dead-list (see this class' own header comment on why the free-lists are not
+        // per-emitter), followed by the usual single update dispatch over every particle slot.
+        //
+        // Rivers/waterfalls feature: the waterfall mist/foam emitter (config::particles::EMITTERS[3]
+        // by convention -- see that array's own comment) rides this SAME per-emitter `emitters`/
+        // `spawnCounts` mechanism above, not a separate dispatch -- it is authored with a low-gravity,
+        // high-drag "Sphere volume drift" recipe (spawnShape == 1, same shape kind as the "Ambient
+        // Dust" emitter) positioned at the falls' own base, so it needs no shader-side special case.
         void RecordSimulate(VkCommandBuffer cmd, const GlobalSDFPass& globalSDF, float dt, float time,
-            const float emitterPositionWorld[3], uint32_t spawnCount,
+            const EmitterParams emitters[kMaxEmitters], const uint32_t spawnCounts[kMaxEmitters],
             const float precipCenterWorld[3], uint32_t precipSpawnCount, uint32_t precipKind,
             float precipSpawnRadiusMeters, float precipSpawnHeightAboveCenterMeters,
             float precipSpawnBandThicknessMeters, float precipFloorBelowCenterMeters,
-            float precipRainFallSpeedMps, float precipSnowFallSpeedMps, float precipSnowWobbleStrength,
-            const float secondaryEmitterPositionWorld[3] = nullptr, uint32_t secondarySpawnCount = 0,
-            uint32_t secondarySpawnMode = 0);
+            float precipRainFallSpeedMps, float precipSnowFallSpeedMps, float precipSnowWobbleStrength);
 
         // Sorted {particleIndex, depthKey} pairs, back-to-front (farthest first) among the first
         // GetCounterBufferHandle()-reported aliveCount entries -- see ParticleSort.comp's own header
@@ -302,6 +343,26 @@ namespace renderer {
         // Single 16-byte {deadCount, aliveCount, spawnQueue, _pad0} block -- see ParticleCommon.glsl's
         // own CounterBuffer comment.
         GpuBuffer m_CounterBuffer;
+        // Multi-emitter roadmap (subtask A1): kMaxEmitters * sizeof(EmitterParams) bytes, GPU_ONLY,
+        // shared (NOT ping-ponged, same reasoning as the dead/alive lists above -- every particle
+        // shader that reads it wants the SAME single array regardless of which m_ParticleBuffer[i] is
+        // "current"). Fully re-uploaded every RecordSimulate() call via vkCmdUpdateBuffer (see that
+        // method's own comment) -- never seeded at Init() since it is always written before any
+        // shader reads it within the same call.
+        GpuBuffer m_EmitterParamsBuffer;
+        // Debug/test instrumentation only (multi-emitter roadmap, subtask A1's own validation step) --
+        // kMaxEmitters * 4 bytes, always allocated (a fixed descriptor-set binding, see this class'
+        // own STEP 3 comment) but only ever WRITTEN by ParticleSimulation.comp's own `#ifdef _DEBUG`-
+        // guarded atomic increment -- see PerEmitterAliveCountBuffer's own declaration comment in
+        // ParticleCommon.glsl for why this stays harmless in Release.
+        GpuBuffer m_PerEmitterAliveCountBuffer;
+
+#ifndef NDEBUG
+        // Debug-only readback for GetLastPerEmitterAliveCountApprox() -- kMaxEmitters * 4 bytes,
+        // CPU_TO_GPU, persistently mapped, filled via the same stale-tolerant vkCmdCopyBuffer
+        // convention as m_AliveCountReadbackBuffer below.
+        GpuBuffer m_PerEmitterAliveCountReadbackBuffer;
+#endif
         // sizeof(VkDrawIndirectCommand), GPU_ONLY -- Subtask 3/4's sort/compact step writes
         // `instanceCount` from the current aliveCount each frame; `vertexCount` is fixed at 6 (one
         // unindexed billboard quad, two triangles) and never changes after Init().
