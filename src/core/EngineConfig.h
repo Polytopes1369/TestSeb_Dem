@@ -1,5 +1,6 @@
 #pragma once
 #include "core/Logger.h"
+#include "core/ResourcePath.h"
 #include <cctype>
 #include <cstdint>
 #include <filesystem>
@@ -967,7 +968,7 @@ inline void ApplyProfile(std::string_view profileName) {
 }
 
 inline void SaveProfileLocal(std::string_view profileName) {
-  std::ofstream outFile("gpu_profile.cfg");
+  std::ofstream outFile(core::ResolveExeRelativePath("gpu_profile.cfg"));
   if (outFile.is_open()) {
     outFile << profileName;
     outFile.close();
@@ -991,7 +992,7 @@ inline bool LoadProfileLocal() {
     return true;
   }
 
-  std::ifstream inFile("gpu_profile.cfg");
+  std::ifstream inFile(core::ResolveExeRelativePath("gpu_profile.cfg"));
   if (inFile.is_open()) {
     std::string profileName;
     inFile >> profileName;

@@ -4,6 +4,7 @@
 #include "core/EntityData.h"
 #include "core/InstanceRegistry.h"
 #include "core/Logger.h"
+#include "core/ResourcePath.h"
 #include "renderer/MaterialParameterTable.h"
 #include "renderer/RenderTypes.h"
 #include "renderer/passes/ProceduralTreePass.h"
@@ -420,7 +421,7 @@ void VulkanContext::Init(std::string_view appName, GLFWwindow *window) {
   // convention (see world::CellManifest::Load()'s own header comment and main.cpp's own identical
   // fallback log): every dedicated-unit lookup below then simply finds nothing and every streaming
   // unit falls back to the pre-Phase-5 shared 4-archetype rotation, exactly as before this feature.
-  if (m_CellManifest.Load(world::kDefaultManifestPath)) {
+  if (m_CellManifest.Load(core::ResolveExeRelativePath(world::kDefaultManifestPath))) {
     LOG_INFO(std::format("[VulkanContext] Loaded {} authored cells from '{}' for HLOD proxy bake-in "
                          "(kStreamingUnitCount={}).", m_CellManifest.RecordCount(),
                          world::kDefaultManifestPath, kStreamingUnitCount));

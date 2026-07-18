@@ -114,6 +114,7 @@
 #include "core/EngineConfig.h"
 #include "core/EntityData.h" // core::EntityTransformCPU
 #include "core/LoadingManager.h"
+#include "core/ResourcePath.h"
 #include "core/maths/Maths.h"
 #include "geometry/ClusterFormat.h" // geometry::ClusterIndexEntry / DAGNodeEntry -- Phase 0.2 debug copy, see m_DebugIndexEntriesCopy's own comment.
 #include "renderer/passes/ATrousDenoisePass.h"
@@ -233,7 +234,8 @@ namespace renderer {
         VkFormat depthFormat = VK_FORMAT_UNDEFINED;
 
         // The consolidated scene cache written at startup (geometry::RunVirtualGeometryCacheTest).
-        std::filesystem::path cacheFilePath = "scene.cache";
+        // Resolved against the exe's own directory (not CWD) -- see core::ResolveExeRelativePath.
+        std::filesystem::path cacheFilePath = core::ResolveExeRelativePath("scene.cache");
 
         // Entity transform and data buffers for dynamic primitive rotations
         VkBuffer entityTransformBuffer = VK_NULL_HANDLE;

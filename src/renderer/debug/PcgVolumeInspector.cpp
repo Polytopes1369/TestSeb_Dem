@@ -2,6 +2,7 @@
 #ifndef NDEBUG
 
 #include "core/Logger.h"
+#include "core/ResourcePath.h"
 #include "pcg/PcgGraph.h"
 #include "WorldPartition/OfpaActor.h"
 
@@ -50,7 +51,11 @@ namespace renderer::debug {
     // --- Init / scanning -----------------------------------------------------------------------
 
     void PcgVolumeInspector::Init(const std::filesystem::path& actorsRootDir) {
-        m_Volumes = ScanActorsDirectory(actorsRootDir);
+        // actorsRootDir defaults to a bare relative literal (kDefaultPcgVolumeActorsRootDir) --
+        // resolved against the exe's own directory, not CWD, same as every other baked-in resource
+        // path in this engine.
+        const std::filesystem::path resolvedRootDir = core::ResolveExeRelativePath(actorsRootDir);
+        m_Volumes = ScanActorsDirectory(resolvedRootDir);
         m_UsedSyntheticFallback = m_Volumes.empty();
 
         if (m_UsedSyntheticFallback) {
@@ -58,11 +63,11 @@ namespace renderer::debug {
                 "[PcgVolumeInspector] No real PcgVolume actor files found under '{}' (expected on a "
                 "fresh checkout -- nothing authors real ones yet, see BakeDemoWorld.cpp's own "
                 "kArchetypeClassNames). Falling back to 3 synthetic in-memory demo volumes.",
-                actorsRootDir.string()));
+                resolvedRootDir.string()));
             m_Volumes = BuildSyntheticDemoVolumes();
         } else {
             LOG_INFO(std::format("[PcgVolumeInspector] Discovered {} real PcgVolume actor file(s) under '{}'.",
-                m_Volumes.size(), actorsRootDir.string()));
+                m_Volumes.size(), resolvedRootDir.string()));
         }
 
         for (PcgVolumeInspectorEntry& entry : m_Volumes) {
@@ -147,7 +152,7 @@ namespace renderer::debug {
                 LOG_WARNING("[PcgVolumeInspector] BuildSyntheticDemoVolumes: link Density Filter -> Mesh Spawner failed: " + linkMessage);
             }
 
-            const std::filesystem::path graphAssetDir = kDemoGraphAssetOutputDir;
+            const std::filesystem::path graphAssetDir = core::ResolveExeRelativePath(kDemoGraphAssetOutputDir);
             std::error_code ec;
             std::filesystem::create_directories(graphAssetDir, ec);
             const std::filesystem::path graphAssetPath = graphAssetDir / "demo_meadow_scatter.pcggraph.json";
@@ -167,7 +172,7 @@ namespace renderer::debug {
                     "will show a 'graph asset not found' state instead.", graphAssetPath.string()));
             }
 
-            entry.actorFilePath = worldpartition::MakeActorFilePath(kDefaultPcgVolumeActorsRootDir, entry.uuid);
+            entry.actorFilePath = worldpartition::MakeActorFilePath(core::ResolveExeRelativePath(kDefaultPcgVolumeActorsRootDir), entry.uuid);
             result.push_back(std::move(entry));
         }
 
@@ -181,8 +186,8 @@ namespace renderer::debug {
             entry.isSynthetic = true;
             entry.desc.bounds = worldpartition::AABB{ maths::vec3{20.0f, 0.0f, -15.0f}, maths::vec3{45.0f, 8.0f, 5.0f} };
             entry.desc.seed = 67890u;
-            entry.desc.graphAssetPath = (std::filesystem::path(kDemoGraphAssetOutputDir) / "forest_understory.pcggraph.json").string(); // Never written -- intentional, see this block's own comment.
-            entry.actorFilePath = worldpartition::MakeActorFilePath(kDefaultPcgVolumeActorsRootDir, entry.uuid);
+            entry.desc.graphAssetPath = (core::ResolveExeRelativePath(kDemoGraphAssetOutputDir) / "forest_understory.pcggraph.json").string(); // Never written -- intentional, see this block's own comment.
+            entry.actorFilePath = worldpartition::MakeActorFilePath(core::ResolveExeRelativePath(kDefaultPcgVolumeActorsRootDir), entry.uuid);
             result.push_back(std::move(entry));
         }
 
@@ -194,8 +199,8 @@ namespace renderer::debug {
             entry.isSynthetic = true;
             entry.desc.bounds = worldpartition::AABB{ maths::vec3{-30.0f, -1.0f, 40.0f}, maths::vec3{-5.0f, 2.0f, 60.0f} };
             entry.desc.seed = 424242u;
-            entry.desc.graphAssetPath = (std::filesystem::path(kDemoGraphAssetOutputDir) / "shoreline_debris.pcggraph.json").string(); // Never written -- intentional.
-            entry.actorFilePath = worldpartition::MakeActorFilePath(kDefaultPcgVolumeActorsRootDir, entry.uuid);
+            entry.desc.graphAssetPath = (core::ResolveExeRelativePath(kDemoGraphAssetOutputDir) / "shoreline_debris.pcggraph.json").string(); // Never written -- intentional.
+            entry.actorFilePath = worldpartition::MakeActorFilePath(core::ResolveExeRelativePath(kDefaultPcgVolumeActorsRootDir), entry.uuid);
             result.push_back(std::move(entry));
         }
 
