@@ -423,48 +423,63 @@ private:
     void CreatePipelinesAndDescriptors();
     void GenerateGeometry();
 
+    // Startup-latency fix (see DispatchGeometryCompute's own comment for the full rationale): every
+    // Generate*() below now takes the caller's own `cmd` and records into it instead of opening its
+    // own one-shot command buffer per call -- GenerateGeometry() batches its entire startup pass
+    // (12 gallery primitives + 2 walls + terrain + water + the streaming-pool archetypes) into ONE
+    // shared command buffer, submitted and waited on once, instead of one blocking GPU round-trip
+    // per primitive (previously hundreds).
     void GenerateBox(
+        VkCommandBuffer cmd,
         float Width, float Length, float Height,
         uint32_t meshID, maths::vec2 slot,
         uint32_t& runningVertexOffset, uint32_t& runningIndexOffset);
 
     void GenerateCone(
+        VkCommandBuffer cmd,
         float Radius1, float Radius2, float Height,
         uint32_t meshID, maths::vec2 slot,
         uint32_t& runningVertexOffset, uint32_t& runningIndexOffset);
 
     void GenerateSphere(
+        VkCommandBuffer cmd,
         float Radius,
         uint32_t meshID, maths::vec2 slot,
         uint32_t& runningVertexOffset, uint32_t& runningIndexOffset);
 
     void GenerateIcosphere(
+        VkCommandBuffer cmd,
         float Radius, bool Tetra, bool Octa, bool Icosa,
         uint32_t meshID, maths::vec2 slot,
         uint32_t& runningVertexOffset, uint32_t& runningIndexOffset,
         uint32_t& outBaseFaceCount, uint32_t& outVertsPerFace);
 
     void GenerateCylinder(
+        VkCommandBuffer cmd,
         float Radius, float Height,
         uint32_t meshID, maths::vec2 slot,
         uint32_t& runningVertexOffset, uint32_t& runningIndexOffset);
 
     void GenerateTube(
+        VkCommandBuffer cmd,
         float Radius1, float Radius2, float Height,
         uint32_t meshID, maths::vec2 slot,
         uint32_t& runningVertexOffset, uint32_t& runningIndexOffset);
 
     void GenerateTorus(
+        VkCommandBuffer cmd,
         float Radius1, float Radius2, float Rotation, float Twist,
         uint32_t meshID, maths::vec2 slot,
         uint32_t& runningVertexOffset, uint32_t& runningIndexOffset);
 
     void GeneratePyramid(
+        VkCommandBuffer cmd,
         float Width, float Depth, float Height,
         uint32_t meshID, maths::vec2 slot,
         uint32_t& runningVertexOffset, uint32_t& runningIndexOffset);
 
     void GeneratePlane(
+        VkCommandBuffer cmd,
         float Length, float Width,
         uint32_t meshID, maths::vec2 slot,
         uint32_t& runningVertexOffset, uint32_t& runningIndexOffset,
@@ -475,6 +490,7 @@ private:
     // Params UBO is byte-identical) since the terrain entity replaces what used to be a flat
     // GeneratePlane() call at the floor slot -- see GenerateGeometry()'s own floor block.
     void GenerateTerrain(
+        VkCommandBuffer cmd,
         float Length, float Width,
         uint32_t meshID, maths::vec2 slot,
         uint32_t& runningVertexOffset, uint32_t& runningIndexOffset,
@@ -485,11 +501,13 @@ private:
     // not an addition on top of a sampled height. Zero new shader/pipeline: reuses the exact
     // pipeline already created for GeneratePlane's own dielectric-plane entity.
     void GenerateWaterPlane(
+        VkCommandBuffer cmd,
         float Width, float Length, uint32_t WidthSegments, uint32_t LengthSegments,
         uint32_t meshID, maths::vec2 slot, float worldOffsetY,
         uint32_t& runningVertexOffset, uint32_t& runningIndexOffset);
 
     void GenerateCapsule(
+        VkCommandBuffer cmd,
         float Radius, float Height,
         uint32_t meshID, maths::vec2 slot,
         uint32_t& runningVertexOffset, uint32_t& runningIndexOffset);
@@ -523,14 +541,35 @@ private:
     // zone -> feature mapping.
     maths::vec2 GridSlot(int slotIndex) const;
 
-    // Records, submits, and blocks on a single one-shot compute dispatch that generates one
-    // primitive (or one box face) into the shared Vertex/Index SSBOs. Exactly one of
-    // uboParamsData / pushConstantData must be non-null, matching how the target shader
-    // expects its Params block: every primitive except the box reads a UBO (binding = 2,
-    // copied here into m_ParamsBuffer); the box reads push constants instead (see
-    // geom_box.comp). Blocking (vkQueueWaitIdle) between dispatches keeps this simple and
-    // correct for a one-time startup pass, matching the pre-existing single-primitive path.
+    // Records a single compute dispatch that generates one primitive (or one box face) into the
+    // shared Vertex/Index SSBOs, directly into the caller's `cmd` -- does NOT allocate, submit, or
+    // wait on anything itself (see GenerateGeometry()'s own comment for why: batching hundreds of
+    // these into one shared command buffer + one submit/wait is the entire point of this fix).
+    // Exactly one of uboParamsData / pushConstantData must be non-null, matching how the target
+    // shader expects its Params block: every primitive except the box reads a UBO (binding = 2,
+    // written here via vkCmdUpdateBuffer into m_ParamsBuffer -- NOT a host-mapped memcpy, precisely
+    // because this call may be one of many recorded into the same command buffer before any of them
+    // actually execute on the GPU: vkCmdUpdateBuffer's data is copied into the command buffer's own
+    // storage at record time, so each dispatch keeps its own correct snapshot of Params regardless
+    // of how many later calls overwrite m_ParamsBuffer's bytes before this one's turn to run -- a
+    // plain memcpy into persistently-mapped memory would NOT have this property, since every call's
+    // CPU-side write would land before the GPU had executed ANY of the batched dispatches, leaving
+    // m_ParamsBuffer holding only the last call's data by the time the GPU actually reads it); the
+    // box reads push constants instead (see geom_box.comp), which are already copied into the
+    // command buffer by vkCmdPushConstants and therefore always safe to batch without this concern.
+    //
+    // Barriers recorded around the dispatch: (1) if a UBO was just written, a transfer-write ->
+    // compute-shader-read barrier makes it visible before the dispatch that consumes it (RAW); (2)
+    // after the dispatch, a compute-shader-write -> {vertex-shader, compute-shader, transfer}-read
+    // barrier makes its Vertex/Index SSBO writes visible to later draw calls AND to any later
+    // compute dispatch batched into this same `cmd` that reads them (concretely, GenerateGeometry()'s
+    // AUTOSMOOTH post-pass, which reads every vertex written by every call that precedes it in the
+    // batch) AND orders this dispatch's own Params-UBO read before the NEXT call's vkCmdUpdateBuffer
+    // is allowed to overwrite the same bytes (write-after-read; needs only the execution ordering a
+    // barrier already provides, so it is folded into this same barrier rather than issuing a second
+    // one).
     void DispatchGeometryCompute(
+        VkCommandBuffer cmd,
         VkPipeline pipeline,
         VkPipelineLayout layout,
         const void* uboParamsData,

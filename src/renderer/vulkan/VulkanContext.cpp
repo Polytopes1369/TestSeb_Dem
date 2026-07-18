@@ -415,7 +415,10 @@ void VulkanContext::Init(std::string_view appName, GLFWwindow *window) {
 
   VkBufferCreateInfo pInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
   pInfo.size = 256;
-  pInfo.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
+  // TRANSFER_DST_BIT added for the startup-batching fix: DispatchGeometryCompute() now writes each
+  // dispatch's Params block via vkCmdUpdateBuffer (recorded into a shared command buffer alongside
+  // many other dispatches) instead of a host-mapped memcpy -- see that function's own comment.
+  pInfo.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
   VmaAllocationCreateInfo pAlloc{.usage = VMA_MEMORY_USAGE_CPU_TO_GPU};
   if (vmaCreateBuffer(m_Allocator, &pInfo, &pAlloc, &m_ParamsBuffer,
                       &m_ParamsAllocation, nullptr) != VK_SUCCESS) {
@@ -1432,49 +1435,77 @@ void VulkanContext::CreatePipelinesAndDescriptors() {
 }
 
 void VulkanContext::DispatchGeometryCompute(
+    VkCommandBuffer cmd,
     VkPipeline pipeline, VkPipelineLayout layout, const void *uboParamsData,
     size_t uboParamsSize, const void *pushConstantData, size_t pushConstantSize,
     uint32_t groupCountX, uint32_t groupCountY, uint32_t groupCountZ) {
-  // Every primitive except the box drives geom_*.comp through the shared Params
-  // UBO (binding = 2): overwrite it with this dispatch's parameters before
-  // recording the command buffer that reads it.
+  // Every primitive except the box drives geom_*.comp through the shared Params UBO (binding = 2):
+  // overwrite it with this dispatch's parameters before recording the dispatch that reads it.
+  //
+  // Startup-latency fix: this used to be a host-mapped vmaMapMemory()+memcpy, safe only because
+  // every call was ALSO its own one-shot submit+vkQueueWaitIdle (so the write for call N+1 could
+  // never happen until the GPU had already finished reading call N's data). Now that many calls are
+  // batched into one shared `cmd` and submitted together (see this function's own header comment in
+  // VulkanContext.h), that assumption no longer holds: every CPU-side memcpy would happen before the
+  // GPU executes ANY of them, leaving m_ParamsBuffer holding only the LAST call's bytes by the time
+  // the GPU actually runs. vkCmdUpdateBuffer avoids this entirely -- its source data is copied into
+  // the command buffer's own storage immediately at record time (same semantics already relied on by
+  // FlushPendingEntityDataPatches()-style updates elsewhere in this codebase), so each dispatch keeps
+  // its own correct snapshot no matter how many later calls reuse the same buffer bytes afterward.
   if (uboParamsData != nullptr) {
-    void *mapped = nullptr;
-    if (vmaMapMemory(m_Allocator, m_ParamsAllocation, &mapped) != VK_SUCCESS) {
-      throw std::runtime_error(
-          "Failed to map Params UBO for geometry dispatch!");
-    }
-    std::memcpy(mapped, uboParamsData, uboParamsSize);
-    vmaUnmapMemory(m_Allocator, m_ParamsAllocation);
+    vkCmdUpdateBuffer(cmd, m_ParamsBuffer, 0, static_cast<VkDeviceSize>(uboParamsSize), uboParamsData);
+
+    // RAW barrier: the update above must be visible to the compute dispatch below, which reads it
+    // through the Params UBO. srcStageMask = CLEAR_BIT (not TRANSFER_BIT) because vkCmdUpdateBuffer
+    // is classified under VK_PIPELINE_STAGE_2_CLEAR_BIT by the Vulkan spec's pipeline-stage table --
+    // same classification this codebase's own per-frame EntityData patch path already relies on.
+    VkMemoryBarrier2 uboWriteBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    uboWriteBarrier.srcStageMask = VK_PIPELINE_STAGE_2_CLEAR_BIT;
+    uboWriteBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    uboWriteBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    uboWriteBarrier.dstAccessMask = VK_ACCESS_2_UNIFORM_READ_BIT;
+
+    VkDependencyInfo uboWriteDep{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    uboWriteDep.memoryBarrierCount = 1;
+    uboWriteDep.pMemoryBarriers = &uboWriteBarrier;
+    vkCmdPipelineBarrier2(cmd, &uboWriteDep);
   }
 
-  renderer::VulkanUtils::ExecuteOneShotCommands(m_Device, m_CommandPool, m_GraphicsQueue, [&](VkCommandBuffer cmd) {
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1,
-                            &m_GeometryDescriptorSet, 0, nullptr);
+  vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+  vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1,
+                          &m_GeometryDescriptorSet, 0, nullptr);
 
-    if (pushConstantData != nullptr) {
-      vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
-                         static_cast<uint32_t>(pushConstantSize),
-                         pushConstantData);
-    }
+  if (pushConstantData != nullptr) {
+    vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                       static_cast<uint32_t>(pushConstantSize),
+                       pushConstantData);
+  }
 
-    vkCmdDispatch(cmd, groupCountX, groupCountY, groupCountZ);
+  vkCmdDispatch(cmd, groupCountX, groupCountY, groupCountZ);
 
-    // Memory layout safe transition barrier execution: compute writes to the
-    // shared Vertex/Index SSBOs must be visible to the vertex shader stage that
-    // reads them at draw time.
-    VkMemoryBarrier2 memBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
-    memBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-    memBarrier.srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT;
-    memBarrier.dstStageMask = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT;
-    memBarrier.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
+  // Memory layout safe transition barrier execution: compute writes to the shared Vertex/Index
+  // SSBOs must be visible to (a) the vertex shader stage that reads them at draw time [pre-existing
+  // purpose], (b) any LATER compute dispatch batched into this same `cmd` that also reads them --
+  // concretely GenerateGeometry()'s AUTOSMOOTH post-pass, which reads every vertex written by every
+  // call that precedes it in the batch, hence COMPUTE_SHADER_BIT added to dstStageMask below (a
+  // dispatch-write -> vertex-shader-read-only barrier would silently under-synchronize that pass
+  // once per-call vkQueueWaitIdle stopped papering over it), and (c) this dispatch's own Params-UBO
+  // read (if any, see above) must fully finish before the NEXT call's vkCmdUpdateBuffer is allowed to
+  // overwrite the same m_ParamsBuffer bytes -- a write-after-read hazard needing only the execution
+  // ordering a barrier already provides, so CLEAR_BIT is folded into this same barrier's dstStageMask
+  // rather than issuing a separate one.
+  VkMemoryBarrier2 memBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+  memBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+  memBarrier.srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT;
+  memBarrier.dstStageMask = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT |
+                            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
+                            VK_PIPELINE_STAGE_2_CLEAR_BIT;
+  memBarrier.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT;
 
-    VkDependencyInfo depInfo{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
-    depInfo.memoryBarrierCount = 1;
-    depInfo.pMemoryBarriers = &memBarrier;
-    vkCmdPipelineBarrier2(cmd, &depInfo);
-  });
+  VkDependencyInfo depInfo{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+  depInfo.memoryBarrierCount = 1;
+  depInfo.pMemoryBarriers = &memBarrier;
+  vkCmdPipelineBarrier2(cmd, &depInfo);
 }
 
 maths::vec2 VulkanContext::GridSlot(int slotIndex) const {
@@ -1689,6 +1720,7 @@ void VulkanContext::UploadEntityData() {
 }
 
 void VulkanContext::GenerateBox(
+    VkCommandBuffer cmd,
     float Width, float Length, float Height,
     uint32_t meshID, maths::vec2 slot,
     uint32_t& runningVertexOffset, uint32_t& runningIndexOffset) {
@@ -1736,7 +1768,7 @@ void VulkanContext::GenerateBox(
     uint32_t groupCountX = (uSegsCount + kLocalSizeXY - 1u) / kLocalSizeXY;
     uint32_t groupCountY = (vSegsCount + kLocalSizeXY - 1u) / kLocalSizeXY;
 
-    DispatchGeometryCompute(m_BoxFacePipelines[face],
+    DispatchGeometryCompute(cmd, m_BoxFacePipelines[face],
                             m_BoxComputePipelineLayout, nullptr, 0, &params,
                             sizeof(params), groupCountX, groupCountY, 1);
 
@@ -1746,6 +1778,7 @@ void VulkanContext::GenerateBox(
 }
 
 void VulkanContext::GenerateCone(
+    VkCommandBuffer cmd,
     float Radius1, float Radius2, float Height,
     uint32_t meshID, maths::vec2 slot,
     uint32_t& runningVertexOffset, uint32_t& runningIndexOffset) {
@@ -1782,7 +1815,7 @@ void VulkanContext::GenerateCone(
   constexpr uint32_t kLocalSizeX = 64u;
   uint32_t groupCount = (totalVerts + kLocalSizeX - 1u) / kLocalSizeX;
 
-  DispatchGeometryCompute(m_ConePipeline, m_ComputePipelineLayout, &params,
+  DispatchGeometryCompute(cmd, m_ConePipeline, m_ComputePipelineLayout, &params,
                           sizeof(params), nullptr, 0, groupCount, 1, 1);
 
   runningVertexOffset += totalVerts;
@@ -1794,6 +1827,7 @@ void VulkanContext::GenerateCone(
 }
 
 void VulkanContext::GenerateSphere(
+    VkCommandBuffer cmd,
     float Radius,
     uint32_t meshID, maths::vec2 slot,
     uint32_t& runningVertexOffset, uint32_t& runningIndexOffset) {
@@ -1820,7 +1854,7 @@ void VulkanContext::GenerateSphere(
   constexpr uint32_t kLocalSizeX = 64u; // geom_sphere.comp local_size_x = 64
   uint32_t groupCount = (vertCount + kLocalSizeX - 1u) / kLocalSizeX;
 
-  DispatchGeometryCompute(m_SpherePipeline, m_ComputePipelineLayout, &params,
+  DispatchGeometryCompute(cmd, m_SpherePipeline, m_ComputePipelineLayout, &params,
                           sizeof(params), nullptr, 0, groupCount, 1, 1);
 
   runningVertexOffset += vertCount;
@@ -1828,6 +1862,7 @@ void VulkanContext::GenerateSphere(
 }
 
 void VulkanContext::GenerateIcosphere(
+    VkCommandBuffer cmd,
     float Radius, bool Tetra, bool Octa, bool Icosa,
     uint32_t meshID, maths::vec2 slot,
     uint32_t& runningVertexOffset, uint32_t& runningIndexOffset,
@@ -1862,7 +1897,7 @@ void VulkanContext::GenerateIcosphere(
   uint32_t gridExtent = params.segments + 1u; // valid i,j range is [0, segments] inclusive
   uint32_t groupCountXY = (gridExtent + kLocalSizeXY - 1u) / kLocalSizeXY;
 
-  DispatchGeometryCompute(m_IcospherePipeline, m_ComputePipelineLayout,
+  DispatchGeometryCompute(cmd, m_IcospherePipeline, m_ComputePipelineLayout,
                           &params, sizeof(params), nullptr, 0, groupCountXY,
                           groupCountXY, outBaseFaceCount);
 
@@ -1875,6 +1910,7 @@ void VulkanContext::GenerateIcosphere(
 }
 
 void VulkanContext::GenerateCylinder(
+    VkCommandBuffer cmd,
     float Radius, float Height,
     uint32_t meshID, maths::vec2 slot,
     uint32_t& runningVertexOffset, uint32_t& runningIndexOffset) {
@@ -1908,7 +1944,7 @@ void VulkanContext::GenerateCylinder(
   constexpr uint32_t kLocalSizeX = 64u; // geom_cylinder.comp local_size_x = 64
   uint32_t groupCount = (totalVerts + kLocalSizeX - 1u) / kLocalSizeX;
 
-  DispatchGeometryCompute(m_CylinderPipeline, m_ComputePipelineLayout,
+  DispatchGeometryCompute(cmd, m_CylinderPipeline, m_ComputePipelineLayout,
                           &params, sizeof(params), nullptr, 0, groupCount, 1, 1);
 
   runningVertexOffset += totalVerts;
@@ -1920,6 +1956,7 @@ void VulkanContext::GenerateCylinder(
 }
 
 void VulkanContext::GenerateTube(
+    VkCommandBuffer cmd,
     float Radius1, float Radius2, float Height,
     uint32_t meshID, maths::vec2 slot,
     uint32_t& runningVertexOffset, uint32_t& runningIndexOffset) {
@@ -1960,7 +1997,7 @@ void VulkanContext::GenerateTube(
   constexpr uint32_t kLocalSizeX = 64u;
   uint32_t groupCount = (totalVerts + kLocalSizeX - 1u) / kLocalSizeX;
 
-  DispatchGeometryCompute(m_TubePipeline, m_ComputePipelineLayout, &params,
+  DispatchGeometryCompute(cmd, m_TubePipeline, m_ComputePipelineLayout, &params,
                           sizeof(params), nullptr, 0, groupCount, 1, 1);
 
   runningVertexOffset += totalVerts;
@@ -1969,6 +2006,7 @@ void VulkanContext::GenerateTube(
 }
 
 void VulkanContext::GenerateTorus(
+    VkCommandBuffer cmd,
     float Radius1, float Radius2, float Rotation, float Twist,
     uint32_t meshID, maths::vec2 slot,
     uint32_t& runningVertexOffset, uint32_t& runningIndexOffset) {
@@ -2000,7 +2038,7 @@ void VulkanContext::GenerateTorus(
   constexpr uint32_t kLocalSizeX = 64u;
   uint32_t groupCount = (vertCount + kLocalSizeX - 1u) / kLocalSizeX;
 
-  DispatchGeometryCompute(m_TorusPipeline, m_ComputePipelineLayout, &params,
+  DispatchGeometryCompute(cmd, m_TorusPipeline, m_ComputePipelineLayout, &params,
                           sizeof(params), nullptr, 0, groupCount, 1, 1);
 
   runningVertexOffset += vertCount;
@@ -2008,6 +2046,7 @@ void VulkanContext::GenerateTorus(
 }
 
 void VulkanContext::GeneratePyramid(
+    VkCommandBuffer cmd,
     float Width, float Depth, float Height,
     uint32_t meshID, maths::vec2 slot,
     uint32_t& runningVertexOffset, uint32_t& runningIndexOffset) {
@@ -2051,7 +2090,7 @@ void VulkanContext::GeneratePyramid(
   constexpr uint32_t kLocalSizeX = 64u;
   uint32_t groupCount = (totalVerts + kLocalSizeX - 1u) / kLocalSizeX;
 
-  DispatchGeometryCompute(m_PyramidPipeline, m_ComputePipelineLayout, &params,
+  DispatchGeometryCompute(cmd, m_PyramidPipeline, m_ComputePipelineLayout, &params,
                           sizeof(params), nullptr, 0, groupCount, 1, 1);
 
   runningVertexOffset += totalVerts;
@@ -2067,6 +2106,7 @@ void VulkanContext::GeneratePyramid(
 }
 
 void VulkanContext::GeneratePlane(
+    VkCommandBuffer cmd,
     float Length, float Width,
     uint32_t meshID, maths::vec2 slot,
     uint32_t& runningVertexOffset, uint32_t& runningIndexOffset,
@@ -2096,7 +2136,7 @@ void VulkanContext::GeneratePlane(
   uint32_t groupCountX = (params.widthSegments + kLocalSizeXY - 1u) / kLocalSizeXY;
   uint32_t groupCountY = (params.lengthSegments + kLocalSizeXY - 1u) / kLocalSizeXY;
 
-  DispatchGeometryCompute(m_PlanePipeline, m_ComputePipelineLayout, &params,
+  DispatchGeometryCompute(cmd, m_PlanePipeline, m_ComputePipelineLayout, &params,
                           sizeof(params), nullptr, 0, groupCountX, groupCountY, 1);
 
   runningVertexOffset += totalVerts;
@@ -2104,6 +2144,7 @@ void VulkanContext::GeneratePlane(
 }
 
 void VulkanContext::GenerateTerrain(
+    VkCommandBuffer cmd,
     float Length, float Width,
     uint32_t meshID, maths::vec2 slot,
     uint32_t& runningVertexOffset, uint32_t& runningIndexOffset,
@@ -2139,7 +2180,7 @@ void VulkanContext::GenerateTerrain(
   uint32_t groupCountX = (params.widthSegments + kLocalSizeXY - 1u) / kLocalSizeXY;
   uint32_t groupCountY = (params.lengthSegments + kLocalSizeXY - 1u) / kLocalSizeXY;
 
-  DispatchGeometryCompute(m_TerrainPipeline, m_ComputePipelineLayout, &params,
+  DispatchGeometryCompute(cmd, m_TerrainPipeline, m_ComputePipelineLayout, &params,
                           sizeof(params), nullptr, 0, groupCountX, groupCountY, 1);
 
   runningVertexOffset += totalVerts;
@@ -2147,6 +2188,7 @@ void VulkanContext::GenerateTerrain(
 }
 
 void VulkanContext::GenerateWaterPlane(
+    VkCommandBuffer cmd,
     float Width, float Length, uint32_t WidthSegments, uint32_t LengthSegments,
     uint32_t meshID, maths::vec2 slot, float worldOffsetY,
     uint32_t& runningVertexOffset, uint32_t& runningIndexOffset) {
@@ -2175,7 +2217,7 @@ void VulkanContext::GenerateWaterPlane(
   uint32_t groupCountX = (params.widthSegments + kLocalSizeXY - 1u) / kLocalSizeXY;
   uint32_t groupCountY = (params.lengthSegments + kLocalSizeXY - 1u) / kLocalSizeXY;
 
-  DispatchGeometryCompute(m_PlanePipeline, m_ComputePipelineLayout, &params,
+  DispatchGeometryCompute(cmd, m_PlanePipeline, m_ComputePipelineLayout, &params,
                           sizeof(params), nullptr, 0, groupCountX, groupCountY, 1);
 
   runningVertexOffset += totalVerts;
@@ -2183,6 +2225,7 @@ void VulkanContext::GenerateWaterPlane(
 }
 
 void VulkanContext::GenerateCapsule(
+    VkCommandBuffer cmd,
     float Radius, float Height,
     uint32_t meshID, maths::vec2 slot,
     uint32_t& runningVertexOffset, uint32_t& runningIndexOffset) {
@@ -2215,7 +2258,7 @@ void VulkanContext::GenerateCapsule(
   constexpr uint32_t kLocalSizeX = 64u; // geom_capsule.comp local_size_x = 64
   uint32_t groupCount = (totalVerts + kLocalSizeX - 1u) / kLocalSizeX;
 
-  DispatchGeometryCompute(m_CapsulePipeline, m_ComputePipelineLayout, &params,
+  DispatchGeometryCompute(cmd, m_CapsulePipeline, m_ComputePipelineLayout, &params,
                           sizeof(params), nullptr, 0, groupCount, 1, 1);
 
   runningVertexOffset += totalVerts;
@@ -2235,6 +2278,40 @@ void VulkanContext::GenerateGeometry() {
   // DebugReadbackGeometrySample's fixed sampling window — designed around a single icosphere
   // living at the start of the buffers — valid unchanged); each primitive's gallery *position* is
   // independent of generation order and set via GridSlot(slotIndex) below.
+  //
+  // Startup-latency fix: every primitive generator below used to be its own blocking one-shot GPU
+  // submission (allocate command buffer -> record -> submit -> vkQueueWaitIdle -> free), via
+  // DispatchGeometryCompute()'s former internal ExecuteOneShotCommands call -- hundreds of full
+  // CPU/GPU round-trips in a row just for this function (12 gallery primitives, several needing
+  // multiple dispatches -- the box alone is 6 faces -- plus 2 walls, terrain, water, and
+  // kStreamingUnitCount streaming-pool archetypes at up to 7 dispatches apiece). None of these
+  // calls has any GPU-side data dependency on another: every one writes into a CPU-computed,
+  // disjoint sub-range of the same fixed-size m_VertexBuffer/m_IndexBuffer SSBOs
+  // (runningVertexOffset/runningIndexOffset are plain CPU counters threaded through by reference,
+  // advanced synchronously with no GPU readback involved), and every downstream consumer
+  // (BuildClusterDAG, the AUTOSMOOTH pass below) selects by meshID tag or world-space position,
+  // never by buffer-layout adjacency or call order. They are therefore now batched into ONE shared
+  // command buffer below (the "GALLERY + STREAMING POOL BATCH"), submitted and waited on ONCE
+  // instead of once per call -- see DispatchGeometryCompute()'s own header comment for how its
+  // Params-UBO write was made safe to batch this way (vkCmdUpdateBuffer instead of a host memcpy)
+  // and how its trailing barrier was widened to keep the AUTOSMOOTH cross-dependency below correct.
+  //
+  // Two real exceptions, both preserved exactly as before:
+  //  1. The icosphere is generated in its OWN one-shot submission, separate from the batch below,
+  //     because DebugReadbackGeometrySample() right after it does an immediate CPU-side GPU
+  //     readback that hard-depends on the icosphere's compute writes already being complete and
+  //     visible (see that function's own comment: "GenerateGeometry() already vkQueueWaitIdle'd
+  //     after the compute dispatch before calling this function"). Deferring it into the batch
+  //     below (which is not submitted until everything else has also been recorded) would make that
+  //     readback race a still-unsubmitted, unexecuted dispatch and read stale/garbage data. Since
+  //     the icosphere is a single dispatch anyway, no batching win is being given up here.
+  //  2. The AUTOSMOOTH post-pass genuinely depends on every OTHER dispatch's vertex writes (it
+  //     welds normals across the ENTIRE accumulated vertex buffer, see its own block below) -- a
+  //     real cross-dispatch data dependency, not just a shared-buffer-region false alarm. It is
+  //     still safe to fold into the SAME batch as everything else (rather than needing its own
+  //     submission) because it is recorded strictly after every generator call it depends on, and
+  //     DispatchGeometryCompute()'s trailing barrier now also orders any later COMPUTE_SHADER_BIT
+  //     consumer batched into the same command buffer, not just VERTEX_SHADER_BIT draw-time reads.
   auto gridSlot = [this](int slotIndex) -> maths::vec2 {
     return GridSlot(slotIndex);
   };
@@ -2246,8 +2323,8 @@ void VulkanContext::GenerateGeometry() {
            "feature-showcase gallery, plus the Lumen-corner walls and floor...");
 
   // -------------------------------------------------------------------------
-  // ICOSPHERE (slot 2 visually) — generated first so it occupies buffer offset
-  // 0.
+  // ICOSPHERE (slot 2 visually) — generated first so it occupies buffer offset 0. Kept as its own
+  // one-shot submission -- see this function's own header comment (point 1) for why.
   // -------------------------------------------------------------------------
   uint32_t icosphereVertsPerFace = 0;
   uint32_t icosphereIndexCount = 0;
@@ -2262,10 +2339,12 @@ void VulkanContext::GenerateGeometry() {
     bool Octa = false;
     bool Icosa = true;
 
-    GenerateIcosphere(Radius, Tetra, Octa, Icosa,
-                      m_EntityData[2].meshID, slot,
-                      runningVertexOffset, runningIndexOffset,
-                      icosphereBaseFaceCount, icosphereVertsPerFace);
+    renderer::VulkanUtils::ExecuteOneShotCommands(m_Device, m_CommandPool, m_GraphicsQueue, [&](VkCommandBuffer cmd) {
+      GenerateIcosphere(cmd, Radius, Tetra, Octa, Icosa,
+                        m_EntityData[2].meshID, slot,
+                        runningVertexOffset, runningIndexOffset,
+                        icosphereBaseFaceCount, icosphereVertsPerFace);
+    });
 
     float edgeLength = (Icosa ? 1.05f : (Octa ? 1.41f : 1.63f)) * Radius;
     uint32_t Segments = std::max(1u, static_cast<uint32_t>(std::round(edgeLength / config::VERTEX_SPACING)));
@@ -2277,12 +2356,19 @@ void VulkanContext::GenerateGeometry() {
   DebugReadbackGeometrySample(icosphereVertsPerFace, icosphereIndexCount);
 
   // -------------------------------------------------------------------------
+  // GALLERY + STREAMING POOL BATCH -- every remaining primitive generator call in this function
+  // (Box through the streaming pool's archetypes) plus the AUTOSMOOTH post-pass, all recorded into
+  // ONE shared command buffer and submitted/waited on exactly once -- see this function's own
+  // header comment for why this is safe.
+  // -------------------------------------------------------------------------
+  renderer::VulkanUtils::ExecuteOneShotCommands(m_Device, m_CommandPool, m_GraphicsQueue, [&](VkCommandBuffer cmd) {
+  // -------------------------------------------------------------------------
   // BOX (slot 0) — 6 compute dispatches, one per cube face, chained onto the
   // same meshID.
   // -------------------------------------------------------------------------
   {
     maths::vec2 slot = gridSlot(0);
-    GenerateBox(1.4f, 1.4f, 1.4f, m_EntityData[0].meshID, slot, runningVertexOffset, runningIndexOffset);
+    GenerateBox(cmd, 1.4f, 1.4f, 1.4f, m_EntityData[0].meshID, slot, runningVertexOffset, runningIndexOffset);
   }
 
   // -------------------------------------------------------------------------
@@ -2290,7 +2376,7 @@ void VulkanContext::GenerateGeometry() {
   // -------------------------------------------------------------------------
   {
     maths::vec2 slot = gridSlot(1);
-    GenerateCone(0.7f, 0.35f, 1.4f, m_EntityData[1].meshID, slot, runningVertexOffset, runningIndexOffset);
+    GenerateCone(cmd, 0.7f, 0.35f, 1.4f, m_EntityData[1].meshID, slot, runningVertexOffset, runningIndexOffset);
   }
 
   // -------------------------------------------------------------------------
@@ -2304,7 +2390,7 @@ void VulkanContext::GenerateGeometry() {
     float Length = 1.4f;
     float Width = 1.4f;
 
-    GeneratePlane(Length, Width,
+    GeneratePlane(cmd, Length, Width,
                   m_EntityData[3].meshID, slot,
                   runningVertexOffset, runningIndexOffset);
   }
@@ -2314,7 +2400,7 @@ void VulkanContext::GenerateGeometry() {
   // -------------------------------------------------------------------------
   {
     maths::vec2 slot = gridSlot(4);
-    GenerateSphere(0.8f, m_EntityData[4].meshID, slot, runningVertexOffset, runningIndexOffset);
+    GenerateSphere(cmd, 0.8f, m_EntityData[4].meshID, slot, runningVertexOffset, runningIndexOffset);
   }
 
   // -------------------------------------------------------------------------
@@ -2330,7 +2416,7 @@ void VulkanContext::GenerateGeometry() {
     float Rotation = 0.0f;
     float Twist = 0.0f;
 
-    GenerateTorus(Radius1, Radius2, Rotation, Twist,
+    GenerateTorus(cmd, Radius1, Radius2, Rotation, Twist,
                   m_EntityData[5].meshID, slot,
                   runningVertexOffset, runningIndexOffset);
   }
@@ -2348,7 +2434,7 @@ void VulkanContext::GenerateGeometry() {
     float Radius2 = 0.5f; // inner
     float Height = 1.4f;
 
-    GenerateTube(Radius1, Radius2, Height,
+    GenerateTube(cmd, Radius1, Radius2, Height,
                  m_EntityData[6].meshID, slot,
                  runningVertexOffset, runningIndexOffset);
   }
@@ -2364,7 +2450,7 @@ void VulkanContext::GenerateGeometry() {
     float Radius = 0.5f;
     float Height = 0.8f; // cylindrical body length
 
-    GenerateCapsule(Radius, Height,
+    GenerateCapsule(cmd, Radius, Height,
                     m_EntityData[7].meshID, slot,
                     runningVertexOffset, runningIndexOffset);
   }
@@ -2380,7 +2466,7 @@ void VulkanContext::GenerateGeometry() {
     float Radius = 0.7f;
     float Height = 1.4f;
 
-    GenerateCylinder(Radius, Height,
+    GenerateCylinder(cmd, Radius, Height,
                      m_EntityData[8].meshID, slot,
                      runningVertexOffset, runningIndexOffset);
   }
@@ -2398,7 +2484,7 @@ void VulkanContext::GenerateGeometry() {
     float Depth = 1.4f;
     float Height = 1.2f;
 
-    GeneratePyramid(Width, Depth, Height,
+    GeneratePyramid(cmd, Width, Depth, Height,
                     m_EntityData[9].meshID, slot,
                     runningVertexOffset, runningIndexOffset);
   }
@@ -2413,7 +2499,7 @@ void VulkanContext::GenerateGeometry() {
     params.tube = 0.15f;
     params.p = 2u;
     params.q = 3u;
-    
+
     // Calculate segments based on density: 1 vertex per 0.01m
     constexpr float PI = 3.1415926535f;
     float curveLength = 2.0f * PI * params.radius * std::max(params.p, params.q);
@@ -2434,7 +2520,7 @@ void VulkanContext::GenerateGeometry() {
         64u; // geom_TorusKnot.comp local_size_x = 64
     uint32_t groupCount = (vertCount + kLocalSizeX - 1u) / kLocalSizeX;
 
-    DispatchGeometryCompute(m_TorusKnotPipeline, m_ComputePipelineLayout,
+    DispatchGeometryCompute(cmd, m_TorusKnotPipeline, m_ComputePipelineLayout,
                             &params, sizeof(params), nullptr, 0, groupCount, 1,
                             1);
 
@@ -2451,7 +2537,7 @@ void VulkanContext::GenerateGeometry() {
     params.width = 1.4f;
     params.height = 1.4f;
     params.depth = 1.4f;
-    
+
     // Calculate segments based on density: 1 vertex per 0.01m
     params.heightSegs = std::max(3u, static_cast<uint32_t>(std::round(params.height / config::VERTEX_SPACING)));
     params.sideSegs = std::max(3u, static_cast<uint32_t>(std::round(2.0f * (params.width + params.depth) / config::VERTEX_SPACING)));
@@ -2474,7 +2560,7 @@ void VulkanContext::GenerateGeometry() {
         64u; // geom_chamferBox.comp local_size_x = 64
     uint32_t groupCount = (vertCount + kLocalSizeX - 1u) / kLocalSizeX;
 
-    DispatchGeometryCompute(m_ChamferBoxPipeline, m_ComputePipelineLayout,
+    DispatchGeometryCompute(cmd, m_ChamferBoxPipeline, m_ComputePipelineLayout,
                             &params, sizeof(params), nullptr, 0, groupCount, 1,
                             1);
 
@@ -2514,7 +2600,7 @@ void VulkanContext::GenerateGeometry() {
     // pinned), which is why the wall's OWN world-space X position comes from `slot.x` below.
     {
       maths::vec2 slot = {-1.8f, 0.0f};
-      GeneratePlane(kWallSpan, kWallSpan, m_EntityData[kWallEntityIndexA].meshID, slot,
+      GeneratePlane(cmd, kWallSpan, kWallSpan, m_EntityData[kWallEntityIndexA].meshID, slot,
                     runningVertexOffset, runningIndexOffset, kWallCenterY,
                     config::FLOOR_VERTEX_SPACING);
     }
@@ -2524,7 +2610,7 @@ void VulkanContext::GenerateGeometry() {
     // leaving X and Z pinned) -- perpendicular to Wall A, closing the corner.
     {
       maths::vec2 slot = {0.0f, -1.8f};
-      GeneratePlane(kWallSpan, kWallSpan, m_EntityData[kWallEntityIndexB].meshID, slot,
+      GeneratePlane(cmd, kWallSpan, kWallSpan, m_EntityData[kWallEntityIndexB].meshID, slot,
                     runningVertexOffset, runningIndexOffset, kWallCenterY,
                     config::FLOOR_VERTEX_SPACING);
     }
@@ -2554,7 +2640,7 @@ void VulkanContext::GenerateGeometry() {
     // own mesh sidesteps it entirely: 4x coarser (75x75 = 5625 vertices) still reads as a genuine
     // rolling backdrop at this terrain's own small kTerrainAmplitude.
     constexpr float kTerrainVertexSpacing = 4.0f;
-    GenerateTerrain(300.0f, 300.0f, m_EntityData[kFloorEntityIndex].meshID, slot,
+    GenerateTerrain(cmd, 300.0f, 300.0f, m_EntityData[kFloorEntityIndex].meshID, slot,
                   runningVertexOffset, runningIndexOffset, -0.8f,
                   kTerrainVertexSpacing);
   }
@@ -2572,7 +2658,7 @@ void VulkanContext::GenerateGeometry() {
     maths::vec2 slot = {0.0f, 0.0f}; // centered at the world origin, same as the terrain itself
     constexpr float kWaterPlaneSpan = 24.0f; // Mirrors the zone-grid's own ~16-unit extent with margin.
     constexpr float kWaterLevel = -1.0f; // Mirrors water_params.glsl's kWaterLevel -- keep in sync.
-    GenerateWaterPlane(kWaterPlaneSpan, kWaterPlaneSpan, 2u, 2u, m_EntityData[kWaterEntityIndex].meshID, slot,
+    GenerateWaterPlane(cmd, kWaterPlaneSpan, kWaterPlaneSpan, 2u, 2u, m_EntityData[kWaterEntityIndex].meshID, slot,
                        kWaterLevel, runningVertexOffset, runningIndexOffset);
   }
 
@@ -2602,25 +2688,25 @@ void VulkanContext::GenerateGeometry() {
 
       uint32_t coarseIdx = StreamingUnitCoarseSlot(unit);
       maths::vec2 coarseSlot{ kParkBaseX + static_cast<float>(coarseIdx) * kParkSpacing, kParkBaseZ };
-      GenerateBox(0.6f, 0.6f, 0.6f, m_EntityData[coarseIdx].meshID, coarseSlot, runningVertexOffset, runningIndexOffset);
+      GenerateBox(cmd, 0.6f, 0.6f, 0.6f, m_EntityData[coarseIdx].meshID, coarseSlot, runningVertexOffset, runningIndexOffset);
 
       uint32_t fineIdx = StreamingUnitFineSlot(unit);
       maths::vec2 fineSlot{ kParkBaseX + static_cast<float>(fineIdx) * kParkSpacing, kParkBaseZ };
       switch (shape) {
         case 0: { // Rock: icosphere.
           uint32_t baseFaceCount = 20u, vertsPerFace = 0u;
-          GenerateIcosphere(0.5f, false, false, true, m_EntityData[fineIdx].meshID, fineSlot,
+          GenerateIcosphere(cmd, 0.5f, false, false, true, m_EntityData[fineIdx].meshID, fineSlot,
                              runningVertexOffset, runningIndexOffset, baseFaceCount, vertsPerFace);
           break;
         }
         case 1: // Bush: UV sphere.
-          GenerateSphere(0.5f, m_EntityData[fineIdx].meshID, fineSlot, runningVertexOffset, runningIndexOffset);
+          GenerateSphere(cmd, 0.5f, m_EntityData[fineIdx].meshID, fineSlot, runningVertexOffset, runningIndexOffset);
           break;
         case 2: // Tree: capsule (trunk + canopy silhouette stand-in).
-          GenerateCapsule(0.25f, 0.8f, m_EntityData[fineIdx].meshID, fineSlot, runningVertexOffset, runningIndexOffset);
+          GenerateCapsule(cmd, 0.25f, 0.8f, m_EntityData[fineIdx].meshID, fineSlot, runningVertexOffset, runningIndexOffset);
           break;
         default: // Debris: torus (irregular scrap silhouette stand-in).
-          GenerateTorus(0.35f, 0.12f, 0.0f, 0.0f, m_EntityData[fineIdx].meshID, fineSlot, runningVertexOffset, runningIndexOffset);
+          GenerateTorus(cmd, 0.35f, 0.12f, 0.0f, 0.0f, m_EntityData[fineIdx].meshID, fineSlot, runningVertexOffset, runningIndexOffset);
           break;
       }
     }
@@ -2630,7 +2716,9 @@ void VulkanContext::GenerateGeometry() {
   m_TotalIndexCount = runningIndexOffset;
 
   // -------------------------------------------------------------------------
-  // AUTOSMOOTH POST-PASS (autosmooth at 45.0 degrees)
+  // AUTOSMOOTH POST-PASS (autosmooth at 45.0 degrees) -- reads every vertex written by every call
+  // above (all recorded into this SAME command buffer) -- see this function's own header comment
+  // (point 2) for why it is safe to fold into this batch instead of needing its own submission.
   // -------------------------------------------------------------------------
   if (m_AutosmoothPipeline != VK_NULL_HANDLE) {
     struct AutosmoothParams {
@@ -2643,10 +2731,16 @@ void VulkanContext::GenerateGeometry() {
     constexpr uint32_t kLocalSizeX = 64u;
     uint32_t groupCount = (m_TotalVertexCount + kLocalSizeX - 1u) / kLocalSizeX;
 
-    DispatchGeometryCompute(m_AutosmoothPipeline, m_ComputePipelineLayout,
+    DispatchGeometryCompute(cmd, m_AutosmoothPipeline, m_ComputePipelineLayout,
                             &params, sizeof(params), nullptr, 0,
                             groupCount, 1, 1);
   }
+  }); // end GALLERY + STREAMING POOL BATCH: single submit + single vkQueueWaitIdle for everything
+      // recorded into `cmd` above, executed synchronously before ExecuteOneShotCommands() returns --
+      // GenerateGeometry() (and therefore VulkanContext::Init(), which calls it last) still only
+      // returns once every byte of procedural geometry is fully generated and GPU-visible, exactly
+      // as before batching: RunVirtualGeometryCacheTest()'s ReadbackFullGeometry() (called from
+      // main.cpp right after Init() returns) still finds the Vertex/Index SSBOs completely populated.
 
   const VkDeviceSize vertexBytesUsed =
       static_cast<VkDeviceSize>(m_TotalVertexCount) * sizeof(renderer::Vertex);
