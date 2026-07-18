@@ -1,6 +1,8 @@
 #include "io/AsyncDecompressingLoader.h"
 #include "io/BlockCodec.h"
+#include "core/Logger.h"
 
+#include <format>
 #include <utility>
 
 namespace io {
@@ -69,6 +71,9 @@ namespace io {
                 // Runs on an AsyncFileStreamer IOCP worker thread -- must stay minimal (see this
                 // file's header comment on why decompression must NOT happen here).
                 if (!readSuccess || bytesTransferred < req.compressedSizeBytes) {
+                    LOG_WARNING(std::format(
+                        "[AsyncDecompressingLoader] Chunk read failed or short at offset {}: success={}, bytesTransferred={}, expected={}.",
+                        req.fileOffset, readSuccess, bytesTransferred, req.compressedSizeBytes));
                     // Still routed through m_WorkerPool so the caller's callback is ALWAYS invoked
                     // from the same place (a PumpCompletions() drain), success or failure alike --
                     // never invoked directly from this IOCP thread.
@@ -87,6 +92,10 @@ namespace io {
                             result->success = true;
                             result->data = std::move(decompressed);
                             result->sizeBytes = req.decompressedSizeBytes;
+                        } else {
+                            LOG_ERROR(std::format(
+                                "[AsyncDecompressingLoader] Decompression mismatch at offset {}: produced {} bytes, expected {} -- corrupt or truncated block.",
+                                req.fileOffset, written, req.decompressedSizeBytes));
                         }
                     },
                     [callback, result] {

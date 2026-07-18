@@ -3,3 +3,15 @@ build/
 out/
 *.obj
 *.cache
+
+# Runtime-generated files (recreated next run at the executable's cwd, not source)
+demo_log.txt
+gpu_profile.cfg
+test_reports/
+
+# Ad-hoc build/verify transcripts -- keep these under logs/archive/ if worth preserving,
+# never re-tracked loose at the repo root.
+/*_log.txt
+/*_log_*.txt
+/build_*.txt
+/run_stdout*.txt
