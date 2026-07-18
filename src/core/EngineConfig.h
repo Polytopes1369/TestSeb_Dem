@@ -145,6 +145,15 @@ namespace megalights {
 // the MegaLights showcase zone) while excluding neighboring zones, which sit >= kZonePitch (4.0
 // units, MegaLightsTypes.cpp) away.
 inline float SPATIAL_BIAS_RADIUS = 3.25f;
+
+// Spatial reuse follow-up (still Phase 4): screen-space PIXEL radius (not a world-space one, unlike
+// SPATIAL_BIAS_RADIUS above -- this biases which NEIGHBORING SCREEN PIXELS' reservoirs
+// MegaLightsSpatialReuse.comp resamples, not which lights) the golden-angle Vogel-disk neighbor
+// pattern scales against. Kept modest: large enough to meaningfully reduce single-frame variance,
+// small enough that the geometry-similarity reject (world-space distance + normal cosine, same
+// heuristic/thresholds as the temporal reuse disocclusion test) still passes for most of a
+// continuous surface at this demo's typical view distances.
+inline float SPATIAL_REUSE_RADIUS_PIXELS = 24.0f;
 } // namespace megalights
 
 namespace reflections {

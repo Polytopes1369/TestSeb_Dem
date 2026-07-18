@@ -38,6 +38,24 @@
 // The mandatory shadow-visibility ray is still traced exactly once per pixel per frame, now toward
 // the TEMPORALLY-COMBINED reservoir's winning light instead of the raw single-frame RIS winner.
 //
+// --- Spatial reuse follow-up (still Phase 4 of the "Nanite advanced" roadmap) ---
+// RecordShade's single Shade dispatch above split into THREE compute dispatches, each separated by
+// an explicit VkMemoryBarrier2 (see MegaLightsShade.comp/MegaLightsSpatialReuse.comp/
+// MegaLightsFinalShade.comp's own header comments for the full per-stage derivation):
+//   Stage 1 (MegaLightsShade.comp, pipeline members unchanged/reused as-is): BVH-biased RIS +
+//     temporal ReSTIR combine only -- writes the TEMPORAL-only combined reservoir into
+//     m_ReservoirBuffers[m_CurrentReservoirSlotIndex] (still the ping-pong pair, still what becomes
+//     next frame's history), no shading, no shadow ray.
+//   Stage 2 (MegaLightsSpatialReuse.comp, m_SpatialReuse* members below): reads that SAME buffer
+//     (now barrier-visible) for this pixel and ~5 golden-angle-spaced screen-space neighbors,
+//     streaming-resamples them into m_SpatialReservoirBuffer -- a single, non-ping-ponged, fully-
+//     overwritten-every-frame buffer (deliberately never fed back into next frame's temporal
+//     history, see MegaLightsShade.comp's own header comment on why).
+//   Stage 3 (MegaLightsFinalShade.comp, m_FinalShade* members below): reads m_SpatialReservoirBuffer,
+//     traces the one mandatory shadow-visibility ray toward its winning light, evaluates the
+//     Substrate BSDF, and writes m_RawRadianceImage -- exactly what Stage 1 used to do at its own
+//     tail before this split.
+//
 // --- Per-frame call order a caller must follow ---
 //   1. RecordShade(cmd, viewProj, prevViewProj, cameraPositionWorld, frameIndex) -- needs
 //      renderer::ClusterResolvePass's GBuffer (normal/depth/albedo/roughness-metallic) already
@@ -48,9 +66,10 @@
 //      reservoir history fetch is additionally sentinel-gated (lightIndex == 0xFFFFFFFFu, the
 //      zero-initialized fill pattern every reservoir slot starts at), so an identity prevViewProj
 //      on frame 0 never actually risks reading garbage history, only ever a harmless miss. Runs
-//      Shade -> internal ATrous denoise -> Composite as one call (no caller-visible per-stage
-//      state beyond the reservoir ping-pong flip, which this method manages internally -- unlike
-//      ReflectionPass's own 3-call contract, there is nothing else here for a caller to sequence).
+//      Stage 1 -> Stage 2 -> Stage 3 -> internal ATrous denoise -> Composite as one call (no
+//      caller-visible per-stage state beyond the reservoir ping-pong flip, which this method
+//      manages internally -- unlike ReflectionPass's own 3-call contract, there is nothing else
+//      here for a caller to sequence).
 //      Ends with a trailing VkMemoryBarrier2 making the composited color image visible to whatever
 //      the caller records next (matches ReflectionPass::RecordGather's own contract).
 
@@ -170,6 +189,38 @@ namespace renderer {
         VkDescriptorSet m_ShadeSet[2]{};
         VkPipelineLayout m_ShadePipelineLayout = VK_NULL_HANDLE;
         VkPipeline m_ShadePipeline = VK_NULL_HANDLE;
+
+        // Spatial reuse follow-up: this frame's Stage 2 output -- a SINGLE GPU_ONLY SSBO (NOT
+        // ping-ponged, unlike m_ReservoirBuffers above), sized identically (renderExtent.width *
+        // height * sizeof(MegaLightReservoir)). Fully overwritten every frame by
+        // MegaLightsSpatialReuse.comp's own full-resolution dispatch before Stage 3 ever reads it,
+        // so (unlike m_ReservoirBuffers) it needs no sentinel-fill at Init -- there is no "first
+        // frame before the first write" read path for this buffer, RecordShade always writes it
+        // before reading it within the same call. Deliberately never ping-ponged/persisted across
+        // frames -- see this class' own header comment on why feeding a spatially-resampled
+        // reservoir back into next frame's temporal history would compound bias.
+        GpuBuffer m_SpatialReservoirBuffer;
+
+        // Stage 2 (MegaLightsSpatialReuse.comp): 2 descriptor-set variants, same reason Stage 1's
+        // m_ShadeSet needs 2 -- binding 0 (its TEMPORAL reservoir INPUT) must track whichever
+        // physical buffer m_CurrentReservoirSlotIndex points at THIS frame (Stage 1's own write
+        // target), so this pipeline's descriptor set is re-selected by the same index at record
+        // time. Binding 1 (m_SpatialReservoirBuffer, its OUTPUT) is identical across both variants.
+        VkDescriptorSetLayout m_SpatialReuseSetLayout = VK_NULL_HANDLE;
+        VkDescriptorPool m_SpatialReuseDescriptorPool = VK_NULL_HANDLE;
+        VkDescriptorSet m_SpatialReuseSet[2]{};
+        VkPipelineLayout m_SpatialReusePipelineLayout = VK_NULL_HANDLE;
+        VkPipeline m_SpatialReusePipeline = VK_NULL_HANDLE;
+
+        // Stage 3 (MegaLightsFinalShade.comp): a SINGLE descriptor-set variant is sufficient here
+        // (unlike Stage 1/Stage 2) -- every one of its inputs (m_RawRadianceImage, the GBuffer
+        // views, the TLAS, m_LightBuffer, m_ViewParamsBuffer, the material bindings, and
+        // m_SpatialReservoirBuffer) is a frame-invariant handle; nothing it reads flips per frame.
+        VkDescriptorSetLayout m_FinalShadeSetLayout = VK_NULL_HANDLE;
+        VkDescriptorPool m_FinalShadeDescriptorPool = VK_NULL_HANDLE;
+        VkDescriptorSet m_FinalShadeSet = VK_NULL_HANDLE;
+        VkPipelineLayout m_FinalShadePipelineLayout = VK_NULL_HANDLE;
+        VkPipeline m_FinalShadePipeline = VK_NULL_HANDLE;
 
         VkDescriptorSetLayout m_CompositeSetLayout = VK_NULL_HANDLE;
         VkDescriptorPool m_CompositeDescriptorPool = VK_NULL_HANDLE;

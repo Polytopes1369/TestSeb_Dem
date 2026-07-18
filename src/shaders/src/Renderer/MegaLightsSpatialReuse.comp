@@ -1,0 +1,222 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+
+// Spatial reuse follow-up to Phase 4 of the "Nanite advanced" roadmap (light BVH for RIS spatial
+// bias + temporal ReSTIR -- see MegaLightsShade.comp's own header comment for that phase's full
+// derivation). Stage 2 of MegaLightsPass' now-3-stage pipeline: one invocation per pixel, full
+// resolution, run strictly AFTER MegaLightsShade.comp (Stage 1, temporal combine) has finished and
+// its reservoir writes have been made visible via a VkMemoryBarrier2 (renderer::MegaLightsPass::
+// RecordShade's own barrier between the two dispatches) and strictly BEFORE MegaLightsFinalShade.
+// comp (Stage 3, shading + the mandatory shadow ray).
+//
+// WHY a genuinely separate dispatch (unlike Stage 1's own temporal combine, which is fused into a
+// single shader with no second pass): this pass resamples OTHER pixels' reservoirs -- a few
+// screen-space neighbors around each pixel -- which means every invocation both WRITES its own
+// pixel's result and READS several neighboring invocations' inputs. Those neighbors may belong to a
+// different workgroup that hasn't even launched yet at the point a given invocation wants to read
+// it, a genuine intra-dispatch data race with no single-dispatch fix (the exact same reason
+// ReflectionTemporal.comp's own 3x3 neighborhood read needs its own pass -- see that file's header
+// comment, referenced from MegaLightsShade.comp's own header too). Splitting cleanly into
+// Stage 1 (write) -> barrier -> Stage 2 (read neighbors, write) -> barrier -> Stage 3 (read, shade)
+// is the standard, simplest-correct fix.
+//
+// Algorithm: standard ReSTIR spatial resampling (Bitterli et al.), specialized for this codebase's
+// DISCRETE light-index reservoirs (no area-light surface-point sampling anywhere in MegaLights --
+// see megalights_ris.glsl's own MegaLightTargetWeight, which only ever needs a light INDEX, never a
+// specific point ON a light's surface). Because of that, no geometric Jacobian reweighting is
+// required when reusing a neighbor's reservoir at THIS pixel's own shading point (the Jacobian
+// correction ReSTIR papers describe is for re-parameterizing a SAMPLED POINT under a different
+// shading point's solid angle -- MegaLights never samples a point, only ever a light INDEX, so that
+// correction term is identically 1 here) -- only the target PDF needs re-evaluating at this pixel's
+// own worldPos/normal, exactly the same principle MegaLightsShade.comp's own CombineTemporalReservoir
+// already applies for the cross-FRAME case. This shader applies it iteratively, streaming each of a
+// small, golden-angle-spaced neighbor set into a running combined reservoir (textbook weighted
+// reservoir sampling: maintain a running weight sum, accept a new candidate with probability
+// candidateWeight / runningWeightSum) -- algebraically equivalent to (not a new algorithm from)
+// CombineTemporalReservoir's own 2-candidate special case, generalized to N candidates.
+//
+// Each neighbor is geometry-similarity-tested (world-space distance + normal cosine, same two-term
+// heuristic/thresholds as MegaLightsShade.comp's own temporal disocclusion test) using the
+// neighbor's OWN stored worldPos/normal -- reservoirs already carry that data (see
+// MegaLightReservoir's own comment below), so this needs no extra GBuffer binding here at all,
+// unlike a from-scratch neighbor lookup would.
+//
+// Reads Stage 1's TEMPORAL-only reservoir buffer (never itself spatially mixed), writes into a
+// SEPARATE, non-ping-ponged, per-frame-only buffer (renderer::MegaLightsPass::m_SpatialReservoirBuffer)
+// that Stage 3 alone consumes -- deliberately never fed back as next frame's temporal history (see
+// MegaLightsShade.comp's own header comment for why: mixing an already-spatially-resampled
+// reservoir back into temporal reuse would let spatial correlation compound frame over frame, a
+// known ReSTIR "boiling" bias-accumulation failure mode).
+
+#include "include/math_utils.glsl"
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+// Binding 0: Stage 1's OWN write target for this frame (renderer::MegaLightsPass binds whichever of
+// its two ping-pong buffers m_CurrentReservoirSlotIndex just flipped to -- same physical buffer
+// Stage 1 wrote into, now fully populated and barrier-visible). Read-only here: this pass never
+// mutates the temporal buffer, only samples from it, which is exactly what keeps the temporal
+// history buffer itself spatially-unmixed (see this file's own header comment).
+#define MEGALIGHTS_LIGHTS_SET 0
+#define MEGALIGHTS_LIGHTS_BINDING 3
+#include "include/megalights_ris.glsl"
+
+// Feature 2 (Phase 4): byte-for-byte mirror of renderer::MegaLightReservoir -- see
+// MegaLightsShade.comp's own copy of this same struct for the full field-by-field derivation (kept
+// duplicated per this codebase's own established "byte-for-byte mirror, one copy per consuming
+// shader" convention, not shared via an include, since GLSL has no way to share a UBO/SSBO block
+// layout declaration across files without the caller redeclaring the binding anyway).
+struct MegaLightReservoir {
+    vec3 worldPos;
+    float M;
+    vec3 normal;
+    float W;
+    uint lightIndex;
+    float _pad0, _pad1, _pad2;
+};
+
+layout(std430, set = 0, binding = 0) readonly buffer TemporalReservoirBuffer {
+    MegaLightReservoir temporalReservoirs[];
+};
+
+// Binding 1: this frame's spatially-resampled OUTPUT -- a single, non-ping-ponged buffer (unlike
+// bindings 12/13 above), since it never needs to survive into next frame (see this file's own
+// header comment). Every foreground AND background pixel is written unconditionally by this
+// dispatch's own full-resolution coverage, so Stage 3 never reads an uninitialized slot.
+layout(std430, set = 0, binding = 1) buffer SpatialReservoirBuffer {
+    MegaLightReservoir spatialReservoirs[];
+};
+
+// Binding 2: same physical UBO/std140 layout as MegaLightsShade.comp's own MegaLightsViewParamsUBO
+// (renderer::MegaLightsPass binds the SAME m_ViewParamsBuffer handle to both pipelines) -- only
+// viewportSize and spatialReuseRadiusPixels are actually read here, but every field must stay
+// declared in the exact same order/size so this shader's struct mirror matches the real buffer's
+// byte layout (the other fields are simply unused, same "declared but unread" convention
+// MegaLightsShade.comp itself already uses for e.g. cameraPositionWorld).
+layout(std140, set = 0, binding = 2) uniform MegaLightsViewParamsUBO {
+    mat4 invViewProj;
+    mat4 prevViewProj;
+    vec2 viewportSize;
+    float spatialBiasRadius;
+    float spatialReuseRadiusPixels;
+    vec3 cameraPositionWorld;
+    float _pad2;
+} g_ViewParams;
+
+layout(push_constant) uniform MegaLightsPushConstants {
+    uint frameIndex;
+} pc;
+
+// Same two-term world-space-distance + normal-cosine similarity heuristic as MegaLightsShade.comp's
+// own temporal disocclusion test (kMegaLightsDisocclusionDistanceThreshold/CosThreshold there) --
+// reused verbatim here as the spatial-reuse neighbor-validity gate: a neighbor whose OWN stored
+// shading point is too far away, or whose surface normal diverges too much from this pixel's own,
+// sits across a geometric discontinuity (a different object, a silhouette edge, a wall corner) and
+// must not be allowed to leak its light choice into this pixel.
+const float kMegaLightsSpatialDistanceThreshold = 0.5;
+const float kMegaLightsSpatialCosThreshold = 0.5; // ~60 degrees.
+
+// Small, fixed neighbor count (task calls for "4-5") -- kept a compile-time constant (not UBO-
+// tunable like spatialReuseRadiusPixels) since it also bounds this loop's unrolled ray-budget-free
+// cost; changing it needs a shader recompile, unlike the purely numeric radius.
+const uint kMegaLightsSpatialSampleCount = 5u;
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 viewportSize = ivec2(g_ViewParams.viewportSize);
+    if (pixel.x >= viewportSize.x || pixel.y >= viewportSize.y) {
+        return;
+    }
+
+    uint pixelIndex = uint(pixel.y) * uint(viewportSize.x) + uint(pixel.x);
+    MegaLightReservoir own = temporalReservoirs[pixelIndex];
+
+    // Background / no-valid-sample pixel: nothing to spatially resample around (no real worldPos/
+    // normal to re-evaluate a target PDF against) -- pass the invalid sentinel straight through,
+    // matching Stage 1's own "never trust an invalid reservoir" design.
+    if (own.lightIndex == 0xFFFFFFFFu) {
+        spatialReservoirs[pixelIndex] = own;
+        return;
+    }
+
+    vec3 worldPos = own.worldPos;
+    vec3 normal = own.normal;
+
+    // Seed the running streaming-resample state with this pixel's OWN reservoir (candidate index 0
+    // of the combine, same role MegaLightsShade.comp's own "new" candidate plays in
+    // CombineTemporalReservoir) -- its target PDF is trivially re-evaluated at its own worldPos/
+    // normal (an identity re-evaluation, since it IS this pixel), kept explicit rather than special-
+    // cased for symmetry with every neighbor's own re-evaluation below.
+    uint runningLightIndex = own.lightIndex;
+    float runningM = own.M;
+    float ownTargetPdf = MegaLightTargetWeight(g_Lights.lights[own.lightIndex], worldPos, normal);
+    float wsum = ownTargetPdf * own.W * own.M;
+
+    // Golden-angle Vogel-disk neighbor pattern, rotated by a per-pixel/per-frame hash so the fixed
+    // sample directions decorrelate across BOTH space (no visible ring/spoke artifact from a static
+    // pattern) and time (no static bias baked into any one pixel across many frames) -- same
+    // decorrelation goal as SelectLightRIS's own per-frame Halton offset, different mechanism suited
+    // to a small fixed-radius disk instead of a large 1D candidate population.
+    vec2 rotHash = Hash2(vec2(pixel) + vec2(float(pc.frameIndex) * 17.0, float(pc.frameIndex) * 31.0));
+    float rotAngle = rotHash.x * 6.28318530718;
+    const float kGoldenAngle = 2.39996323;
+
+    for (uint i = 0u; i < kMegaLightsSpatialSampleCount; ++i) {
+        float t = (float(i) + 0.5) / float(kMegaLightsSpatialSampleCount);
+        float radius = sqrt(t) * max(g_ViewParams.spatialReuseRadiusPixels, 0.0);
+        float angle = rotAngle + float(i) * kGoldenAngle;
+        ivec2 offset = ivec2(round(vec2(cos(angle), sin(angle)) * radius));
+        ivec2 neighborPixel = pixel + offset;
+        if (neighborPixel.x < 0 || neighborPixel.y < 0 ||
+            neighborPixel.x >= viewportSize.x || neighborPixel.y >= viewportSize.y) {
+            continue;
+        }
+
+        uint neighborIndex = uint(neighborPixel.y) * uint(viewportSize.x) + uint(neighborPixel.x);
+        MegaLightReservoir neighbor = temporalReservoirs[neighborIndex];
+        if (neighbor.lightIndex == 0xFFFFFFFFu) {
+            continue;
+        }
+
+        bool similar = distance(neighbor.worldPos, worldPos) <= kMegaLightsSpatialDistanceThreshold
+            && dot(neighbor.normal, normal) >= kMegaLightsSpatialCosThreshold;
+        if (!similar) {
+            continue;
+        }
+
+        // Same temporal-age clamp Stage 1's own CombineTemporalReservoir applies to a history
+        // reservoir's M -- a neighbor's reservoir may itself already carry a large temporally-
+        // accumulated M, and without this clamp a single long-lived neighbor could dominate this
+        // pixel's own fresh candidate just as badly as an unclamped temporal history would.
+        float clampedNeighborM = min(neighbor.M, kMegaLightsTemporalHistoryMaxM);
+        // Re-evaluate the neighbor's chosen light's target PDF at THIS pixel's own worldPos/normal
+        // (never the neighbor's stored one) -- the whole point of resampling, and (per this file's
+        // own header comment) needs no Jacobian correction since MegaLights reservoirs only ever
+        // carry a discrete light INDEX, not a sampled point on the light.
+        float targetAtOwn = MegaLightTargetWeight(g_Lights.lights[neighbor.lightIndex], worldPos, normal);
+        float weight = targetAtOwn * neighbor.W * clampedNeighborM;
+
+        wsum += weight;
+        runningM += clampedNeighborM;
+
+        // Streaming/weighted-reservoir accept step: candidate i replaces the running winner with
+        // probability weight_i / runningWsum -- the textbook online algorithm that reproduces the
+        // exact categorical distribution over all accumulated weights so far (Chao's algorithm),
+        // the same principle CombineTemporalReservoir applies for its own (fixed at 2) candidates.
+        vec2 rr = Halton23(pixelIndex * 97u + i * 131u + pc.frameIndex * 7919u);
+        if (weight > 0.0 && rr.x < weight / wsum) {
+            runningLightIndex = neighbor.lightIndex;
+        }
+    }
+
+    float finalTargetPdf = MegaLightTargetWeight(g_Lights.lights[runningLightIndex], worldPos, normal);
+
+    MegaLightReservoir result;
+    result.worldPos = worldPos;
+    result.M = runningM;
+    result.normal = normal;
+    result.W = (finalTargetPdf > 0.0 && runningM > 0.0) ? (wsum / (runningM * finalTargetPdf)) : 0.0;
+    result.lightIndex = runningLightIndex;
+    result._pad0 = 0.0; result._pad1 = 0.0; result._pad2 = 0.0;
+    spatialReservoirs[pixelIndex] = result;
+}
