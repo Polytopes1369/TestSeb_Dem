@@ -379,7 +379,8 @@ inline float FOG_DENSITY_TARGET = 0.1f; // [0,1] -- unconsumed until Subtask 3 (
 // -- see AtmosClimatePass::RecordUpdate -- but nothing consumed it yet): this IS that future
 // precipitation pass, so the one knob now does double duty as both the GPU UBO field every
 // Atmos shader already mirrors and the actual particle spawn-rate driver below, rather than adding a
-// second, confusingly-overlapping slider.
+// second, confusingly-overlapping slider. Also the baseline the Dynamic Weather Simulation below
+// drifts around when enabled (see that section's own comment).
 inline float PRECIPITATION_INTENSITY = 0.0f; // [0,1].
 inline float PRECIPITATION_MAX_SPAWN_RATE_PER_SECOND = 900.0f; // Particles/second at PRECIPITATION_INTENSITY == 1.0 -- scaled linearly below that.
 inline float PRECIPITATION_SNOW_TEMPERATURE_THRESHOLD_CELSIUS = 2.0f; // config::atmos::TEMPERATURE_CELSIUS below this spawns snow instead of rain (see renderer::ClusterRenderPipeline's own precipitation-kind-selection comment).
@@ -390,6 +391,20 @@ inline float PRECIPITATION_FLOOR_BELOW_CAMERA_METERS = 20.0f; // A precip partic
 inline float PRECIPITATION_RAIN_FALL_SPEED_MPS = 9.0f; // Real-world raindrop terminal velocity is roughly 5-10 m/s depending on droplet size.
 inline float PRECIPITATION_SNOW_FALL_SPEED_MPS = 1.2f; // Real-world snowflake terminal velocity is roughly 0.5-1.5 m/s -- much slower than rain, see ParticleSimulation.comp's own fall-speed-relaxation comment.
 inline float PRECIPITATION_SNOW_WOBBLE_STRENGTH = 0.5f; // m/s -- horizontal sine-wobble amplitude added on top of wind drift, snow only.
+
+// --- Dynamic Weather Simulation (post-Subtask-1 addition, see AtmosClimatePass.h's own class
+// comment) -- when DYNAMIC_WEATHER_ENABLED, TEMPERATURE_CELSIUS/RELATIVE_HUMIDITY/WIND_SPEED_MPS/
+// CLOUD_DENSITY_TARGET/FOG_DENSITY_TARGET/PRECIPITATION_INTENSITY above are REINTERPRETED as
+// baseline "centers" the autonomous simulation drifts around, rather than literal per-frame state;
+// the fields below are the simulation's own parameters (front cadence, smoothing, season length/
+// amplitude), all still live ImGui sliders (main.cpp's Volumetric tab). ---
+inline bool DYNAMIC_WEATHER_ENABLED = true; // Master toggle: ON = autonomous drift, OFF = original static-read path (manual sliders take full, literal effect).
+inline float WEATHER_FRONT_TAU_SECONDS = 45.0f; // Exponential-approach smoothing time constant for weather-front drift (current += (target-current)*(1-exp(-dt/tau))) -- tens of seconds, so fronts are gradual, not per-frame twitchy.
+inline float WEATHER_FRONT_FREQUENCY = 0.015f; // How fast the clear/overcast/stormy blend weights drift, in noise-cycles per simulated second -- low-frequency by design (see AtmosClimatePass.cpp's own AtmosFbm1D), never an obviously-looping sine.
+inline float YEAR_LENGTH_SECONDS = 180.0f; // Simulated seconds per full seasonal cycle (winter->summer->winter) -- default 3 minutes so a demo session can actually observe a season change; a periodic function IS correct here (unlike weather fronts).
+inline float SEASONAL_TEMPERATURE_AMPLITUDE_CELSIUS = 12.0f; // Peak-to-baseline swing the seasonal cycle adds/subtracts from TEMPERATURE_CELSIUS (summer = +amplitude, winter = -amplitude).
+inline float SEASONAL_PRECIP_AMPLITUDE = 0.35f; // Peak-to-baseline swing the seasonal cycle adds/subtracts from PRECIPITATION_INTENSITY's target (winter = wetter, summer = drier).
+inline float SEASONAL_SUN_ELEVATION_AMPLITUDE_DEGREES = 15.0f; // Peak seasonal sweep applied to the scene's fixed base sun elevation angle (see ClusterRenderPipeline::Init()'s own sun-direction comment) -- a modest elevation-only sweep, no azimuth/axial-tilt astronomy.
 } // namespace atmos
 
 // GPU particle system (particle_system_integration_plan.md, Subtask 6: Final Integration) -- live
