@@ -77,9 +77,13 @@
 // "wasVisibleLastFrame" branch on frame 1, so every single candidate is deferred to the pending
 // list regardless of what garbage the stale HZB contains. The early draw list is therefore empty,
 // the depth buffer entering step 5 is exactly the frame's own clear value, and the late pass
-// re-tests everything against an HZB honestly built from that (assumed cleared to 1.0, this
-// engine's non-reversed [0, 1] depth convention -- see maths::mat4::PerspectiveVulkan) empty depth
-// buffer, which is maximally permissive and correctly lets everything draw.
+// re-tests everything against an HZB honestly built from that empty depth buffer -- cleared to
+// 0.0, the far-plane sentinel under this engine's reversed-Z convention (see
+// maths::mat4::PerspectiveVulkan and VulkanPipeline.cpp's VK_COMPARE_OP_GREATER), so every HZB
+// texel's reduced min/max is 0.0 too. This is still maximally permissive and correctly lets
+// everything draw: IsClusterOccluded()'s nearestDepth starts at 0.0 and only ever increases (via
+// max()), so it can never satisfy nearestDepth < storedFarthestDepth against a stored value
+// that's itself already 0.0, for any cluster with a valid clip.w.
 
 #include <array>
 #include <cstdint>

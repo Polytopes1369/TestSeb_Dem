@@ -28,10 +28,17 @@
 #include <vk_mem_alloc.h>
 
 #include "core/maths/Maths.h"
+#include "renderer/vulkan/RenderPass.h"
 
 namespace renderer {
 
-    class AtmosSkyPass {
+    // Migrated to RenderPass<Derived> (see renderer/vulkan/RenderPass.h): Init()/Shutdown() are
+    // inherited -- InitImpl() below registers each resource's cleanup right after creating it, in
+    // creation order, and the base class's Shutdown() runs those cleanups in reverse. Behavior is
+    // unchanged from the hand-written Shutdown() this replaced; only the bookkeeping moved.
+    class AtmosSkyPass : public RenderPass<AtmosSkyPass> {
+        friend class RenderPass<AtmosSkyPass>; // Lets Init() call our private InitImpl().
+
     public:
         AtmosSkyPass() = default;
 
@@ -48,9 +55,8 @@ namespace renderer {
         // Transmittance/Multi-Scattering are considered dirty -- see class comment's cache policy.
         static constexpr float kSunDirtyDotThreshold = 0.9999f;
 
-        bool Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue);
-
-        void Shutdown();
+        // Init(VkDevice, VmaAllocator, VkCommandPool, VkQueue) -> bool and Shutdown() are inherited
+        // from RenderPass<AtmosSkyPass>; see InitImpl() in the private section below.
 
         // `sunDirectionWorld` points FROM the light TOWARD the scene (renderer::ClusterResolvePass's
         // own convention, matches renderer::SceneLights::sun.direction). `sunIlluminanceLux` is the
@@ -70,11 +76,12 @@ namespace renderer {
             VkImageView view = VK_NULL_HANDLE;
         };
 
+        bool InitImpl(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue);
+
         void DispatchMode(VkCommandBuffer cmd, int32_t mode, VkExtent2D extent,
             const maths::vec3& sunDirectionWorld, float sunIlluminanceLux);
 
-        VkDevice m_Device = VK_NULL_HANDLE;
-        VmaAllocator m_Allocator = VK_NULL_HANDLE;
+        // m_Device / m_Allocator are inherited (protected) from RenderPass<AtmosSkyPass>.
 
         LUTImage m_Transmittance;
         LUTImage m_MultiScattering;

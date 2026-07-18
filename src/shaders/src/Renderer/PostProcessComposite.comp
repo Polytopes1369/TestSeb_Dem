@@ -467,15 +467,14 @@ void main() {
 
     // --- Bloom (+ Lens Flare / Anamorphic Lens Flare / Lens Dirt, already baked into
     // renderer::BloomPass's own output -- see that pass' own class comment) -- added at the same
-    // exposed scale as the rest of the scene color. Re-guarded with SanitizeHDR here too,
-    // independently of BloomDownsample.comp's/BloomUpsampleComposite.comp's own per-tap guards --
-    // exactly like g_HDRColor above: those guards clamp each individual tap to 50000, but
-    // BloomUpsampleComposite.comp's `detail + blurred` sum (two independently-clamped-to-50000
-    // terms) can still reach up to 100000 in the float32 compute intermediate, which silently
-    // overflows to +Infinity when written into that pass' rgba16f output image (fp16's finite max
-    // is 65504) -- a store-time truncation no READ-side tap clamp upstream can catch. Left
-    // unguarded, that single Inf texel would otherwise poison the entire frame via
-    // clamp(Inf, 0, 1)'s implementation-defined result once it reaches ACES tonemap/gamma below. ---
+    // exposed scale as the rest of the scene color. The g_Bloom read is SanitizeHDR-guarded exactly
+    // like every other HDR read in this shader (g_HDRColor via SampleWithChromaticAberration,
+    // g_SkyViewLUT above) -- this guard was previously MISSING on the bloom path alone, which let a
+    // non-finite bloom texel poison `color`, survive ACES tonemapping as NaN, and collapse the whole
+    // frame to black at the final clamp(color, 0, 1). Sanitizing here also makes the Bloom-disabled
+    // case (bloomIntensity == 0) safe: a raw +Inf times 0.0 is NaN, but SanitizeHDR(+Inf) is 0, so
+    // 0 * exposureMultiplier * 0 stays a clean 0. (BloomUpsampleComposite.comp now also clamps its
+    // own store so a +Inf should no longer reach this point at all -- this is defense in depth.) ---
     color += SanitizeHDR(texture(g_Bloom, distortedUV).rgb) * exposureMultiplier * g_Params.bloomIntensity;
 
     // --- Volumetric Light Shafts / God Rays: sampled from `screenUV` (the TRUE rectilinear screen

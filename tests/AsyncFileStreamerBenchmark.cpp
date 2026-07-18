@@ -1,5 +1,5 @@
 // Standalone correctness check + bandwidth benchmark for geometry::AsyncFileStreamer
-// (src/geometry/AsyncFileStreamer.h/.cpp). No Vulkan/GLFW dependency.
+// (src/io/AsyncFileStreamer.h/.cpp). No Vulkan/GLFW dependency.
 //
 // What it does:
 //   1. Writes a deterministic, per-block-verifiable benchmark file via a plain buffered write.
@@ -14,7 +14,7 @@
 // pass/fail condition -- achievable bandwidth is hardware-dependent), non-zero otherwise, so it
 // can be registered with CTest without pulling in any external test/benchmark framework.
 
-#include "geometry/AsyncFileStreamer.h"
+#include "io/AsyncFileStreamer.h"
 
 #include <atomic>
 #include <chrono>

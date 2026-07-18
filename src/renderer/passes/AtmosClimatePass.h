@@ -37,24 +37,30 @@
 
 #include "core/EngineConfig.h"
 #include "renderer/vulkan/GpuBuffer.h"
+#include "renderer/vulkan/RenderPass.h"
 
 namespace renderer {
 
-    class AtmosClimatePass {
+    // Migrated to RenderPass<Derived> (see renderer/vulkan/RenderPass.h): Init()/Shutdown() are
+    // inherited -- InitImpl() registers m_GlobalsBuffer's teardown plus the Dynamic Weather
+    // Simulation state reset (see that reset's own comment in the .cpp: a Shutdown()/Init() cycle,
+    // e.g. device-lost recovery, must restart the simulation cleanly from t=0).
+    class AtmosClimatePass : public RenderPass<AtmosClimatePass> {
+        friend class RenderPass<AtmosClimatePass>; // Lets Init() call our private InitImpl().
+
     public:
         AtmosClimatePass() = default;
 
         AtmosClimatePass(const AtmosClimatePass&) = delete;
         AtmosClimatePass& operator=(const AtmosClimatePass&) = delete;
 
-        // Allocates the 64-byte AtmosGlobalsUBO (GPU_ONLY, updated every frame via vkCmdUpdateBuffer
-        // -- identical memory-usage choice to MegaLightsPass::m_ViewParamsBuffer, which the same
+        // Init(VkDevice, VmaAllocator, VkCommandPool, VkQueue) -> bool and Shutdown() are inherited
+        // from RenderPass<AtmosClimatePass>; see InitImpl() in the private section below. Allocates
+        // the 64-byte AtmosGlobalsUBO (GPU_ONLY, updated every frame via vkCmdUpdateBuffer --
+        // identical memory-usage choice to MegaLightsPass::m_ViewParamsBuffer, which the same
         // per-frame vkCmdUpdateBuffer pattern already justifies there). Never fails (no file I/O, no
         // descriptor allocation) -- returns bool only for call-site consistency with every other
         // pass' Init() in ClusterRenderPipeline::Init().
-        bool Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue);
-
-        void Shutdown();
 
         // Recomputes dew point (Magnus-Tetens) + Lifting Condensation Level height, then uploads the
         // full AtmosGlobalsUBO (wind, turbulence params, climate scalars, `globalTimeSeconds`) via
@@ -139,9 +145,22 @@ namespace renderer {
         // simulation is actually driving, not just the manual baseline slider.
         float GetEffectiveTemperatureCelsius() const { return m_HasLastFrameTime ? (config::atmos::DYNAMIC_WEATHER_ENABLED ? m_CurrentTemperatureCelsius : config::atmos::TEMPERATURE_CELSIUS) : config::atmos::TEMPERATURE_CELSIUS; }
 
+        // Effective relative humidity ([0,1] fraction) this frame's AtmosGlobalsUBO was built from --
+        // added for the PCG framework roadmap's Phase 8.3 ("Climate-Driven Biome Selection",
+        // src/pcg/PcgClimateBiomeSelector.h/.cpp), which needed a CPU-side humidity/moisture read-back
+        // the same way GetEffectiveTemperatureCelsius() already provided one for temperature, but no
+        // such getter existed yet (only the raw config::atmos::RELATIVE_HUMIDITY baseline was
+        // reachable from outside this class). Mirrors GetEffectiveTemperatureCelsius()'s own exact
+        // ternary pattern byte-for-byte: the simulation's smoothed/seasonally-offset value when
+        // config::atmos::DYNAMIC_WEATHER_ENABLED, or the raw config::atmos::RELATIVE_HUMIDITY slider
+        // otherwise (including before the very first RecordUpdate() call, i.e. m_HasLastFrameTime is
+        // still false).
+        float GetEffectiveRelativeHumidity() const { return m_HasLastFrameTime ? (config::atmos::DYNAMIC_WEATHER_ENABLED ? m_CurrentRelativeHumidity : config::atmos::RELATIVE_HUMIDITY) : config::atmos::RELATIVE_HUMIDITY; }
+
     private:
-        VkDevice m_Device = VK_NULL_HANDLE;
-        VmaAllocator m_Allocator = VK_NULL_HANDLE;
+        bool InitImpl(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue);
+
+        // m_Device / m_Allocator are inherited (protected) from RenderPass<AtmosClimatePass>.
 
         GpuBuffer m_GlobalsBuffer; // AtmosGlobalsUBO, std140, GPU_ONLY -- see class comment.
 

@@ -37,6 +37,7 @@
 
 #include "core/maths/Maths.h"
 #include "renderer/vulkan/GpuBuffer.h"
+#include "renderer/vulkan/RenderPass.h"
 
 namespace renderer {
 
@@ -45,7 +46,16 @@ namespace renderer {
     class SurfaceCacheRayTracingPass;
     class ClusterResolvePass;
 
-    class ReflectionPass {
+    // Migrated to RenderPass<Derived> (see renderer/vulkan/RenderPass.h): Init()/Shutdown() are
+    // inherited. Note InitImpl() still calls the inherited Shutdown() as its own first statement
+    // (self-reinit, same pattern/reason as ShadowMapPass's own migration comment). The 3 descriptor
+    // pools here (Trace/Temporal/Gather) each allocate 2 sets (maxSets=2, one per ping-pong slot) --
+    // VulkanUtils::CreateDescriptorSetLayoutPoolAndSet only covers the far more common maxSets=1
+    // case, so these 3 stay raw vkCreateDescriptorSetLayout/Pool/AllocateDescriptorSets calls,
+    // wrapped in RegisterResource() rather than routed through that helper.
+    class ReflectionPass : public RenderPass<ReflectionPass> {
+        friend class RenderPass<ReflectionPass>; // Lets Init() call our private InitImpl().
+
     public:
         ReflectionPass() = default;
 
@@ -79,12 +89,10 @@ namespace renderer {
         // `traceContext`/`surfaceCache`/`rtPass`/`resolvePass` must all already be Init'd and must
         // outlive this pass -- their resources are bound into this pass' own descriptor sets
         // unmodified (mirrors renderer::ScreenProbeGIPass's own borrowing convention).
-        bool Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
-            VkExtent2D renderExtent, const SurfaceCacheTraceContext& traceContext,
-            const SurfaceCachePass& surfaceCache, const SurfaceCacheRayTracingPass& rtPass,
-            const ClusterResolvePass& resolvePass);
-
-        void Shutdown();
+        // Init(VkDevice, VmaAllocator, VkCommandPool, VkQueue, VkExtent2D,
+        // const SurfaceCacheTraceContext&, const SurfaceCachePass&, const SurfaceCacheRayTracingPass&,
+        // const ClusterResolvePass&) -> bool and Shutdown() are inherited from
+        // RenderPass<ReflectionPass>; see InitImpl() below.
 
         // Uploads this frame's ReflectionViewParamsUBO (invViewProj, prevViewProj,
         // cameraPositionWorld, viewport size) -- `viewProj` is this frame's combined matrix (its
@@ -132,8 +140,12 @@ namespace renderer {
             VkImage normalImage = VK_NULL_HANDLE; VmaAllocation normalAllocation = VK_NULL_HANDLE; VkImageView normalView = VK_NULL_HANDLE;
         };
 
-        VkDevice m_Device = VK_NULL_HANDLE;
-        VmaAllocator m_Allocator = VK_NULL_HANDLE;
+        bool InitImpl(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
+            VkExtent2D renderExtent, const SurfaceCacheTraceContext& traceContext,
+            const SurfaceCachePass& surfaceCache, const SurfaceCacheRayTracingPass& rtPass,
+            const ClusterResolvePass& resolvePass);
+
+        // m_Device / m_Allocator are inherited (protected) from RenderPass<ReflectionPass>.
 
         VkExtent2D m_RenderExtent{ 0, 0 };
 

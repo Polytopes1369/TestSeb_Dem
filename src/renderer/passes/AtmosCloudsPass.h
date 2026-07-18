@@ -41,12 +41,19 @@
 #include <vk_mem_alloc.h>
 
 #include "core/maths/Maths.h"
+#include "renderer/vulkan/RenderPass.h"
 
 namespace renderer {
 
     class AtmosClimatePass;
 
-    class AtmosCloudsPass {
+    // Migrated to RenderPass<Derived> (see renderer/vulkan/RenderPass.h): Init()/Shutdown() are
+    // inherited -- InitImpl() registers each resource's cleanup right after creating it, in creation
+    // order (noise images -> cloud output/shadow map images -> samplers -> raymarch descriptor
+    // set/pipeline -> cloud-shadow descriptor set/pipeline), and Shutdown() runs those in reverse.
+    class AtmosCloudsPass : public RenderPass<AtmosCloudsPass> {
+        friend class RenderPass<AtmosCloudsPass>; // Lets Init() call our private InitImpl().
+
     public:
         AtmosCloudsPass() = default;
 
@@ -73,10 +80,8 @@ namespace renderer {
         // directly into this pass' own descriptor set. Dispatches the 2 one-time noise-generation
         // kernels here (GenerateShapeNoise, GenerateDetailNoise); RecordUpdate() never re-dispatches
         // them.
-        bool Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
-            VkExtent2D renderExtent, const AtmosClimatePass& atmosClimate);
-
-        void Shutdown();
+        // Init(VkDevice, VmaAllocator, VkCommandPool, VkQueue, VkExtent2D, const AtmosClimatePass&)
+        // -> bool and Shutdown() are inherited from RenderPass<AtmosCloudsPass>; see InitImpl() below.
 
         // `cameraPosition`/`cameraForward`/`upHint` and `sunDirectionWorld`/`sunColor`/
         // `sunIlluminanceLux` follow the exact same conventions as renderer::
@@ -108,13 +113,15 @@ namespace renderer {
             VkImageView view = VK_NULL_HANDLE;
         };
 
+        bool InitImpl(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
+            VkExtent2D renderExtent, const AtmosClimatePass& atmosClimate);
+
         void DispatchMode(VkCommandBuffer cmd, int32_t mode, const maths::vec3& cameraPosition,
             const maths::vec3& cameraForward, const maths::vec3& cameraRight, const maths::vec3& cameraUp,
             float tanHalfFovY, float aspectRatio, const maths::vec3& sunDirectionWorld,
             const maths::vec3& sunColor, float sunIlluminanceLux);
 
-        VkDevice m_Device = VK_NULL_HANDLE;
-        VmaAllocator m_Allocator = VK_NULL_HANDLE;
+        // m_Device / m_Allocator are inherited (protected) from RenderPass<AtmosCloudsPass>.
         VkExtent2D m_OutputExtent{ 0, 0 };
 
         Image3D m_ShapeNoise;

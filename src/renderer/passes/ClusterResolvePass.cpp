@@ -24,11 +24,19 @@ namespace renderer {
         // to a 16-byte boundary (160 bytes) + vec3 sunColor + 1 float sunIntensity (real LUX, see
         // renderer::DirectionalLight's own comment -- physically-based recalibration, 2026-07-17)
         // rounding up to 176 bytes + vec3 cameraPositionWorld (Substrate integration:
-        // EvaluateSubstrateMaterial's view-direction term) + 1 pad float rounding up to 192 bytes
+        // EvaluateSubstrateMaterial's view-direction term) + glintIntensityScale (gap G5, which
+        // reused what had been that trailing pad float) rounding up to 192 bytes. Gap G6 (horizontal
+        // mixing) then appends mixMaskSharpnessScale + 3 explicit pad floats -- the first field to
+        // actually grow this UBO, since no dead padding remained to reuse -- rounding it to 208 bytes
         // total. The 2 floats immediately after viewportWidth/viewportHeight were originally dead
         // std140 padding (still needed to round vec2 up to a 16-byte boundary) -- Atmos weather
         // system's surface response extension repurposes them as real data (surfaceWetness/
         // snowCoverage, see ClusterResolve.comp's own field comment) instead of growing the UBO.
+        // Wave 2 (UE5.8 caustics/light-function parity): timeSeconds joins the 16-byte block G6's
+        // mixMaskSharpnessScale opens below (2 of its 4 floats now real data, 2 remain dead padding)
+        // rather than growing the UBO with a further block -- feeds the procedural (texture-free)
+        // underwater caustics term and the sun's light-function modulation, both in ClusterResolve.
+        // comp/ClusterResolveBinned.comp.
         struct ResolveViewParams {
             maths::mat4 viewProj;
             maths::mat4 prevViewProj;
@@ -39,7 +47,12 @@ namespace renderer {
             float sunDirectionX = 0.0f;
             float sunDirectionY = 0.0f;
             float sunDirectionZ = 0.0f;
-            float _pad2 = 0.0f;
+            // Glint / sparkle (UE5.8 rendering-parity gap G5): Debug-only per-material glintDensity
+            // tuning multiplier, occupying what was dead std140 padding after the vec3 sunDirection
+            // (same "reuse dead padding" pattern as surfaceWetness/snowCoverage above) -- 1.0 in
+            // Release, driven by the Post FX ImGui "Glint Density" slider in Debug. See
+            // ClusterResolve.comp's own glintDensityScale field comment.
+            float glintDensityScale = 1.0f;
             float sunColorR = 0.0f;
             float sunColorG = 0.0f;
             float sunColorB = 0.0f;
@@ -49,9 +62,24 @@ namespace renderer {
             float cameraPositionWorldX = 0.0f;
             float cameraPositionWorldY = 0.0f;
             float cameraPositionWorldZ = 0.0f;
-            float _pad3 = 0.0f;
+            // Glint / sparkle (UE5.8 rendering-parity gap G5): Debug-only per-material glintIntensity
+            // tuning multiplier, occupying what was the trailing dead pad float -- 1.0 in Release,
+            // driven by the Post FX ImGui "Glint Intensity" slider in Debug.
+            float glintIntensityScale = 1.0f;
+            // Substrate horizontal mixing (UE5.8 rendering-parity gap G6): Debug-only per-material
+            // blend-sharpness tuning multiplier. The FIRST field to actually GROW this UBO past its
+            // previously-fully-packed 192 bytes -- glintIntensityScale above already consumed the last
+            // dead pad float, so this opens a fresh std140 16-byte block. 1.0 in Release, driven by the
+            // Post FX ImGui "Mix Sharpness" slider in Debug. See ClusterResolve.comp's own field comment.
+            float mixMaskSharpnessScale = 1.0f;
+            // Wave 2 (UE5.8 caustics/light-function parity): real elapsed time, joining this same
+            // freshly-opened block (see this struct's own top comment) -- see ClusterResolve.comp's
+            // own timeSeconds field comment.
+            float timeSeconds = 0.0f;
+            float _padMix1 = 0.0f;
+            float _padMix2 = 0.0f;
         };
-        static_assert(sizeof(ResolveViewParams) == 192,
+        static_assert(sizeof(ResolveViewParams) == 208,
             "ResolveViewParams must match ResolveViewParamsUBO in ClusterResolve.comp exactly (std140 layout)");
 
         // Step 4: byte-for-byte mirror of VirtualTextureVolumeUBO in ClusterResolve.comp/
@@ -204,7 +232,9 @@ namespace renderer {
             // own doc comment), not a per-frame value -- filled once, here, in the same one-time
             // command buffer as the image transitions above (no ordering dependency between them,
             // so recording order doesn't matter). Well under vkCmdUpdateBuffer's 65536-byte limit
-            // (kMaxMaterials * sizeof(MaterialParameters) = 32 * 208 = 6656 bytes). No intra-
+            // (kMaxMaterials * sizeof(MaterialParameters) = 32 * 336 = 10752 bytes, after gap G6's
+            // horizontal-mix additions and the later Substrate iridescence layer grew the struct from
+            // 208 to 336 bytes total -- see MaterialParameterTable.h's own static_assert). No intra-
             // command-buffer barrier is needed after this write -- ExecuteOneShotCommands' own
             // vkQueueWaitIdle fully orders it before any later-submitted command buffer's reads,
             // exactly like ClusterRenderPipeline::Init()'s own one-time setup submit.
@@ -501,7 +531,8 @@ namespace renderer {
 
     void ClusterResolvePass::RecordResolve(VkCommandBuffer cmd, const maths::mat4& viewProj, const maths::mat4& prevViewProj,
         const DirectionalLight& sun, const maths::vec3& cameraPositionWorld, float surfaceWetness, float snowCoverage,
-        uint32_t debugViewMode) {
+        float glintDensityScale, float glintIntensityScale, float mixMaskSharpnessScale,
+        float globalTimeSeconds, uint32_t debugViewMode) {
         ResolveViewParams viewParams{};
         viewParams.viewProj = viewProj;
         viewParams.prevViewProj = prevViewProj;
@@ -509,6 +540,13 @@ namespace renderer {
         viewParams.viewportHeight = static_cast<float>(m_RenderExtent.height);
         viewParams.surfaceWetness = surfaceWetness;
         viewParams.snowCoverage = snowCoverage;
+        // Glint / sparkle (UE5.8 rendering-parity gap G5): Debug-only tuning multipliers (1.0 in
+        // Release) -- see the ResolveViewParams struct's own field comments above.
+        viewParams.glintDensityScale = glintDensityScale;
+        viewParams.glintIntensityScale = glintIntensityScale;
+        // Substrate horizontal mixing (UE5.8 rendering-parity gap G6): Debug-only blend-sharpness
+        // multiplier (1.0 in Release) -- see the ResolveViewParams struct's own field comment above.
+        viewParams.mixMaskSharpnessScale = mixMaskSharpnessScale;
         viewParams.sunDirectionX = sun.direction.x;
         viewParams.sunDirectionY = sun.direction.y;
         viewParams.sunDirectionZ = sun.direction.z;
@@ -519,6 +557,7 @@ namespace renderer {
         viewParams.cameraPositionWorldX = cameraPositionWorld.x;
         viewParams.cameraPositionWorldY = cameraPositionWorld.y;
         viewParams.cameraPositionWorldZ = cameraPositionWorld.z;
+        viewParams.timeSeconds = globalTimeSeconds;
         vkCmdUpdateBuffer(cmd, m_ViewParamsBuffer.Handle(), 0, sizeof(ResolveViewParams), &viewParams);
 
         VulkanUtils::RecordMemoryBarrier(cmd,
@@ -690,7 +729,8 @@ namespace renderer {
 
     void ClusterResolvePass::RecordResolveBinned(VkCommandBuffer cmd, const maths::mat4& viewProj,
         const DirectionalLight& sun, const maths::vec3& cameraPositionWorld, float surfaceWetness, float snowCoverage,
-        const ClusterShadingBinPass& shadingBinPass) {
+        float glintDensityScale, float glintIntensityScale, float mixMaskSharpnessScale,
+        float globalTimeSeconds, const ClusterShadingBinPass& shadingBinPass) {
         // prevViewProj is never read by ClusterResolveBinned.comp (this path never serves
         // DEBUG_VIEW_MOTION_VECTORS) -- `viewProj` itself is reused as a harmless placeholder value
         // rather than introducing a separate identity-matrix concept for an otherwise-dead field.
@@ -701,6 +741,14 @@ namespace renderer {
         viewParams.viewportHeight = static_cast<float>(m_RenderExtent.height);
         viewParams.surfaceWetness = surfaceWetness;
         viewParams.snowCoverage = snowCoverage;
+        // Glint / sparkle (UE5.8 rendering-parity gap G5): Debug-only tuning multipliers (1.0 in
+        // Release, so the material's authored sparkle renders unchanged on this Release path).
+        viewParams.glintDensityScale = glintDensityScale;
+        viewParams.glintIntensityScale = glintIntensityScale;
+        // Substrate horizontal mixing (UE5.8 rendering-parity gap G6): Debug-only blend-sharpness
+        // multiplier (1.0 in Release, so a horizontally-mixed material blends at its authored
+        // mixContrast on this Release path) -- see the ResolveViewParams struct's own field comment.
+        viewParams.mixMaskSharpnessScale = mixMaskSharpnessScale;
         viewParams.sunDirectionX = sun.direction.x;
         viewParams.sunDirectionY = sun.direction.y;
         viewParams.sunDirectionZ = sun.direction.z;
@@ -711,6 +759,7 @@ namespace renderer {
         viewParams.cameraPositionWorldX = cameraPositionWorld.x;
         viewParams.cameraPositionWorldY = cameraPositionWorld.y;
         viewParams.cameraPositionWorldZ = cameraPositionWorld.z;
+        viewParams.timeSeconds = globalTimeSeconds;
         vkCmdUpdateBuffer(cmd, m_ViewParamsBuffer.Handle(), 0, sizeof(ResolveViewParams), &viewParams);
 
         VulkanUtils::RecordMemoryBarrier(cmd,

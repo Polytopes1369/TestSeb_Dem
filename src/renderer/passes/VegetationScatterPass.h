@@ -34,6 +34,7 @@
 
 #include "core/maths/Maths.h"
 #include "renderer/vulkan/GpuBuffer.h"
+#include "renderer/vulkan/RenderPass.h"
 
 namespace renderer {
 
@@ -53,7 +54,16 @@ namespace renderer {
     static_assert(sizeof(GpuVegetationInstance) == 32,
         "GpuVegetationInstance must match VegetationCommon.glsl's VegetationInstance exactly (std430 layout)");
 
-    class VegetationScatterPass {
+    // Migrated to RenderPass<Derived> (see renderer/vulkan/RenderPass.h): Init()/Shutdown() are
+    // inherited. One shared descriptor pool allocates 6 DIFFERENT-layout sets -- same reasoning as
+    // ReflectionPass/SurfaceCacheTraceContext/MegaLightsPass: left as raw Vulkan calls wrapped in
+    // RegisterResource() rather than extending the single-set helper. m_CommandPool/m_Queue are
+    // borrowed (not owned) handles, and m_HZBMip0Extent/m_HZBMipCount/m_Ranges were never reset by
+    // the original Shutdown() either -- preserved exactly, not "fixed", to avoid a scope-creeping
+    // behavior change during a mechanical migration.
+    class VegetationScatterPass : public RenderPass<VegetationScatterPass> {
+        friend class RenderPass<VegetationScatterPass>; // Lets Init() call our private InitImpl().
+
     public:
         VegetationScatterPass() = default;
         VegetationScatterPass(const VegetationScatterPass&) = delete;
@@ -74,12 +84,9 @@ namespace renderer {
         // ClusterRenderPipeline reaches this pass), sampled by the per-instance occlusion cull.
         // `colorFormat`/`depthFormat` match the shared forward color/depth target every other forward
         // pass draws onto.
-        bool Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
-            const VirtualShadowMapPass& vsm, const WorldProbeGridPass& worldProbes,
-            VkImageView hzbView, VkExtent2D hzbMip0Extent, uint32_t hzbMipCount,
-            VkFormat colorFormat, VkFormat depthFormat);
-
-        void Shutdown();
+        // Init(VkDevice, VmaAllocator, VkCommandPool, VkQueue, const VirtualShadowMapPass&,
+        // const WorldProbeGridPass&, VkImageView, VkExtent2D, uint32_t, VkFormat, VkFormat) -> bool
+        // and Shutdown() are inherited from RenderPass<VegetationScatterPass>; see InitImpl() below.
 
         // (Re)generates the per-instance scatter buffer from the current config::vegetation:: knobs,
         // via a single blocking one-shot submit (mirrors ProceduralTreePass's own bake-time
@@ -110,8 +117,12 @@ namespace renderer {
         uint32_t GetInstanceCount() const { return m_InstanceCount; }
 
     private:
-        VkDevice m_Device = VK_NULL_HANDLE;
-        VmaAllocator m_Allocator = VK_NULL_HANDLE;
+        bool InitImpl(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
+            const VirtualShadowMapPass& vsm, const WorldProbeGridPass& worldProbes,
+            VkImageView hzbView, VkExtent2D hzbMip0Extent, uint32_t hzbMipCount,
+            VkFormat colorFormat, VkFormat depthFormat);
+
+        // m_Device / m_Allocator are inherited (protected) from RenderPass<VegetationScatterPass>.
         VkCommandPool m_CommandPool = VK_NULL_HANDLE;
         VkQueue m_Queue = VK_NULL_HANDLE;
 

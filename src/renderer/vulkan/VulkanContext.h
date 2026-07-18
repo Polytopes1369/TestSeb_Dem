@@ -206,6 +206,20 @@ public:
     // needing special-casing in every one of those passes.
     uint32_t GetEntityCount() const { return kTotalEntityCount; }
     VkBuffer GetEntityTransformBuffer() const { return m_EntityTransformBuffer; }
+
+    // UE5.8 rendering-parity gap G10a (renderer::FurStrandPass): the skinned creature's bind-pose
+    // placement, exposed so fur-strand roots are baked onto the EXACT analytic surface geom_creature.
+    // comp emitted for it. Thin public accessors over the private kCreature* single-source-of-truth
+    // constants (see their own comment / GenerateGeometry()'s CREATURE block) -- keeps those constants
+    // encapsulated while giving main.cpp what it needs to fill ClusterRenderPipelineCreateInfo::
+    // creatureFurGeometry. GetCreatureBakeWorldOffset() returns exactly geom_creature.comp's
+    // worldOffsetX/Y/Z for this creature (grid-slot XZ + belly-on-ground Y).
+    uint32_t GetCreatureEntityIndex() const { return kCreatureEntityIndex; }
+    maths::vec3 GetCreatureBakeWorldOffset() const {
+        return maths::vec3{ kCreatureClearingX, kCreatureGroundY + kCreatureRadiusMax, kCreatureClearingZ };
+    }
+    float GetCreatureRadiusMin() const { return kCreatureRadiusMin; }
+    float GetCreatureRadiusMax() const { return kCreatureRadiusMax; }
     // Phase 4 integration (UE5.8 parity roadmap, dynamic scenes onto main): CPU-readable mirror of
     // this frame's per-entity rotation, refreshed every UpdateEntityRotations() call alongside its
     // GPU SSBO upload. Consumed by renderer:: passes that need the ACTUAL rotation matrix (not just
@@ -303,6 +317,24 @@ public:
     // Init() has run BuildEntityData() -- main.cpp calls it exactly once, right after
     // VulkanContext::Init() returns.
     bool RunInstanceRegistrySmokeTest();
+
+    // Phase 9.2 (test-pipeline integration roadmap): captured outcome of the most recent
+    // RunInstanceRegistrySmokeTest() run. main.cpp calls that smoke test exactly once, right after
+    // Init() returns -- well before DebugTestPipeline::RunAll() ever executes (see main.cpp's own
+    // call ordering: the smoke test at line ~421, RunAll() only reachable at the --test-pipeline
+    // early-return much further down) -- so RunAll() has no way to observe its result except by
+    // querying this getter after the fact. `ran` stays false until the smoke test has actually run
+    // once; `details` mirrors real evidence from that run: the exact PASSED message (probe count,
+    // live entity count) on success, or a pointer to demo_log.txt's own more specific LOG_ERROR line
+    // on failure (matching this codebase's established AudioEngine-smoke-test convention in
+    // DebugTestPipeline.cpp -- granular per-check failure text already exists in the log, this
+    // struct does not duplicate it check-by-check).
+    struct InstanceRegistrySmokeTestResult {
+        bool ran = false;
+        bool passed = false;
+        std::string details;
+    };
+    const InstanceRegistrySmokeTestResult& GetInstanceRegistrySmokeTestResult() const { return m_InstanceRegistrySmokeTestResult; }
 #endif
 
 private:
@@ -481,6 +513,21 @@ private:
     // one new entity by bumping the base (16 -> 17 above) shifts all of them down by exactly one
     // slot automatically, with no other constant needing to change.
     static constexpr uint32_t kCreatureEntityIndex = kEntityCount - 5;
+    // Creature bind-pose/placement geometry constants -- the SINGLE SOURCE OF TRUTH for how the
+    // procedural creature is baked (see GenerateGeometry()'s own CREATURE block, which references
+    // these). Exposed to renderer::FurStrandPass (UE5.8 rendering-parity gap G10a) via the public
+    // GetCreature* accessors above so fur-strand roots are baked onto the EXACT same analytic bind-
+    // pose surface the creature's own vertices occupy (same "single source of truth shared between the
+    // generator and its consumer" convention animation::SkeletalAnimator::kBoneCount/kSegmentLength
+    // already establish). kCreatureClearingX/Z
+    // are the creature's grid-slot XZ; kCreatureGroundY its ground level; the baked worldOffsetY is
+    // kCreatureGroundY + kCreatureRadiusMax (belly on the terrain). radiusMin/Max drive the spine's
+    // RadiusProfile (geom_creature.comp).
+    static constexpr float kCreatureClearingX = -10.0f;
+    static constexpr float kCreatureClearingZ = 0.0f;
+    static constexpr float kCreatureGroundY = -0.8f;
+    static constexpr float kCreatureRadiusMin = 0.06f;
+    static constexpr float kCreatureRadiusMax = 0.30f;
     // The 2 static walls that form the Lumen/GI showcase corner (see GenerateGeometry()'s wall
     // blocks and UpdateEntityRotations()'s fixed-rotation branch for them) -- generated right
     // before the floor. Deliberately offset from kEntityCount by 4/3 (not 3/2, as before Phase 7c)
@@ -593,6 +640,12 @@ private:
     // Debug-only headroom capacity above that count. Data()/TransformData() give the exact same
     // contiguous-array pointer semantics GetEntityData()/GetEntityTransformsCPU() always returned.
     core::InstanceRegistry<kInstanceRegistryCapacity> m_InstanceRegistry;
+
+#ifndef NDEBUG
+    // Backing storage for GetInstanceRegistrySmokeTestResult() above -- see that struct's own
+    // declaration-site comment. Zero-sized/never referenced in Release (whole member compiled out).
+    InstanceRegistrySmokeTestResult m_InstanceRegistrySmokeTestResult;
+#endif
 
     // Phase 5 (Streaming & Monde roadmap, Part 2, Gap 3) BUG FIX: per-SLOT (not per-unit as before
     // this fix), indexed by physical slot (StreamingUnitCoarseSlot(unit)/StreamingUnitFineSlot(unit)

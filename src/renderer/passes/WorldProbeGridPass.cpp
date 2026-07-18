@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <format>
+#include <span>
 #include <stdexcept>
 #include <vector>
 
@@ -77,13 +78,16 @@ namespace renderer {
 
     } // namespace
 
-    bool WorldProbeGridPass::Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
+    bool WorldProbeGridPass::InitImpl(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
         const SurfaceCacheTraceContext& traceContext, const SurfaceCachePass& surfaceCache,
         const SurfaceCacheRayTracingPass& rtPass) {
         kGridResolution = config::lumen::PROBE_GRID_RESOLUTION;
         kProbeSpacing = config::lumen::PROBE_SPACING;
         kProbeSampleDirections = config::lumen::PROBE_SAMPLE_DIRECTIONS;
 
+        // Self-reinit (see ShadowMapPass's own migration comment for the identical pattern):
+        // Shutdown() clears m_Device/m_Allocator, which RenderPass<WorldProbeGridPass>::Init()
+        // already set to this call's values just before invoking this function -- restore them.
         Shutdown();
         m_Device = device;
         m_Allocator = allocator;
@@ -115,6 +119,13 @@ namespace renderer {
         viewInfo.format = kGridFormat;
         viewInfo.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
         VK_CHECK(vkCreateImageView(m_Device, &viewInfo, nullptr, &m_GridView));
+        RegisterResource([this] {
+            vkDestroyImageView(m_Device, m_GridView, nullptr);
+            vmaDestroyImage(m_Allocator, m_GridImage, m_GridAllocation);
+            m_GridView = VK_NULL_HANDLE;
+            m_GridImage = VK_NULL_HANDLE;
+            m_GridAllocation = VK_NULL_HANDLE;
+        });
 
         // Phase 6 (UE5.8 parity roadmap): NEAREST, not LINEAR -- now that the grid is addressed
         // TOROIDALLY (see the class comment), hardware trilinear filtering would incorrectly blend
@@ -137,6 +148,7 @@ namespace renderer {
         samplerInfo.compareEnable = VK_FALSE;
         samplerInfo.unnormalizedCoordinates = VK_FALSE;
         VK_CHECK(vkCreateSampler(m_Device, &samplerInfo, nullptr, &m_GridSampler));
+        RegisterResource([this] { vkDestroySampler(m_Device, m_GridSampler, nullptr); m_GridSampler = VK_NULL_HANDLE; });
 
         // One-time UNDEFINED -> GENERAL transition (mirrors ClusterResolvePass::Init's own one-shot
         // pattern) -- stays GENERAL for this image's entire lifetime.
@@ -159,28 +171,24 @@ namespace renderer {
         // Atmos weather system, Subtask 5 -- see SetAtmosSkyView()'s own comment.
         bindings[5] = { 5, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
 
-        VkDescriptorSetLayoutCreateInfo setLayoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-        setLayoutInfo.bindingCount = 6;
-        setLayoutInfo.pBindings = bindings;
-        VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &setLayoutInfo, nullptr, &m_SetLayout));
-
         VkDescriptorPoolSize poolSizes[4] = {
             { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1 },
             { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1 },
             { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3 },
             { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1 }, // g_SkyViewLUT (Atmos Subtask 5).
         };
-        VkDescriptorPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
-        poolInfo.maxSets = 1;
-        poolInfo.poolSizeCount = 4;
-        poolInfo.pPoolSizes = poolSizes;
-        VK_CHECK(vkCreateDescriptorPool(m_Device, &poolInfo, nullptr, &m_DescriptorPool));
-
-        VkDescriptorSetAllocateInfo setAllocInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-        setAllocInfo.descriptorPool = m_DescriptorPool;
-        setAllocInfo.descriptorSetCount = 1;
-        setAllocInfo.pSetLayouts = &m_SetLayout;
-        VK_CHECK(vkAllocateDescriptorSets(m_Device, &setAllocInfo, &m_Set));
+        auto descSet = VulkanUtils::CreateDescriptorSetLayoutPoolAndSet(m_Device,
+            std::span{ bindings, 6 }, std::span{ poolSizes, 4 });
+        m_SetLayout = descSet.layout;
+        m_DescriptorPool = descSet.pool;
+        m_Set = descSet.set;
+        RegisterResource([this] {
+            vkDestroyDescriptorPool(m_Device, m_DescriptorPool, nullptr);
+            vkDestroyDescriptorSetLayout(m_Device, m_SetLayout, nullptr);
+            m_DescriptorPool = VK_NULL_HANDLE;
+            m_SetLayout = VK_NULL_HANDLE;
+            m_Set = VK_NULL_HANDLE;
+        });
 
         VkDescriptorImageInfo gridStorageInfo{ VK_NULL_HANDLE, m_GridView, VK_IMAGE_LAYOUT_GENERAL };
 
@@ -216,6 +224,7 @@ namespace renderer {
         layoutInfo.pushConstantRangeCount = 1;
         layoutInfo.pPushConstantRanges = &pushConstantRange;
         VK_CHECK(vkCreatePipelineLayout(m_Device, &layoutInfo, nullptr, &m_PipelineLayout));
+        RegisterResource([this] { vkDestroyPipelineLayout(m_Device, m_PipelineLayout, nullptr); m_PipelineLayout = VK_NULL_HANDLE; });
 
         VkShaderModule shaderModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/WorldProbeInject.comp.spv");
         VkComputePipelineCreateInfo pipelineInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
@@ -226,12 +235,23 @@ namespace renderer {
         pipelineInfo.stage.pName = "main";
         VK_CHECK(vkCreateComputePipelines(m_Device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_Pipeline));
         vkDestroyShaderModule(m_Device, shaderModule, nullptr);
+        RegisterResource([this] { vkDestroyPipeline(m_Device, m_Pipeline, nullptr); m_Pipeline = VK_NULL_HANDLE; });
 
         m_GridOriginWorld = maths::vec3{ 0.0f, 0.0f, 0.0f };
         m_FrameIndex = 0;
         m_SnappedCenterProbe[0] = m_SnappedCenterProbe[1] = m_SnappedCenterProbe[2] = 0;
         m_HasValidWindow = false;
         m_PendingSlabs.clear();
+        // Re-registered so a LATER Shutdown() call (not just this InitImpl's own leading
+        // self-reinit Shutdown()) still resets this POD state, matching the original Shutdown()'s
+        // own unconditional reset of it.
+        RegisterResource([this] {
+            m_GridOriginWorld = maths::vec3{};
+            m_FrameIndex = 0;
+            m_SnappedCenterProbe[0] = m_SnappedCenterProbe[1] = m_SnappedCenterProbe[2] = 0;
+            m_HasValidWindow = false;
+            m_PendingSlabs.clear();
+        });
 
         LOG_INFO(std::format("[WorldProbeGridPass] Initialized: {}^3 grid, {} world-unit spacing (toroidal streaming).",
             kGridResolution, kProbeSpacing));
@@ -246,36 +266,10 @@ namespace renderer {
         vkUpdateDescriptorSets(m_Device, 1, &write, 0, nullptr);
     }
 
-    void WorldProbeGridPass::Shutdown() {
-        if (m_Device != VK_NULL_HANDLE) {
-            if (m_Pipeline != VK_NULL_HANDLE) vkDestroyPipeline(m_Device, m_Pipeline, nullptr);
-            if (m_PipelineLayout != VK_NULL_HANDLE) vkDestroyPipelineLayout(m_Device, m_PipelineLayout, nullptr);
-            if (m_DescriptorPool != VK_NULL_HANDLE) vkDestroyDescriptorPool(m_Device, m_DescriptorPool, nullptr);
-            if (m_SetLayout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(m_Device, m_SetLayout, nullptr);
-            if (m_GridSampler != VK_NULL_HANDLE) vkDestroySampler(m_Device, m_GridSampler, nullptr);
-            if (m_GridView != VK_NULL_HANDLE) vkDestroyImageView(m_Device, m_GridView, nullptr);
-        }
-        if (m_Allocator != VK_NULL_HANDLE) {
-            vmaDestroyImage(m_Allocator, m_GridImage, m_GridAllocation);
-        }
-
-        m_Pipeline = VK_NULL_HANDLE;
-        m_PipelineLayout = VK_NULL_HANDLE;
-        m_DescriptorPool = VK_NULL_HANDLE;
-        m_SetLayout = VK_NULL_HANDLE;
-        m_Set = VK_NULL_HANDLE;
-        m_GridSampler = VK_NULL_HANDLE;
-        m_GridView = VK_NULL_HANDLE;
-        m_GridImage = VK_NULL_HANDLE;
-        m_GridAllocation = VK_NULL_HANDLE;
-        m_GridOriginWorld = maths::vec3{};
-        m_FrameIndex = 0;
-        m_SnappedCenterProbe[0] = m_SnappedCenterProbe[1] = m_SnappedCenterProbe[2] = 0;
-        m_HasValidWindow = false;
-        m_PendingSlabs.clear();
-        m_Allocator = VK_NULL_HANDLE;
-        m_Device = VK_NULL_HANDLE;
-    }
+    // Shutdown() is inherited from RenderPass<WorldProbeGridPass>: runs the RegisterResource()
+    // cleanups above in reverse (POD state reset -> pipeline -> pipeline layout -> descriptor
+    // pool+layout -> sampler -> grid view+image), the same dependency-safe order the hand-written
+    // Shutdown() used.
 
     void WorldProbeGridPass::EnqueueDirtyRegionsForGrid(const maths::vec3& cameraPositionWorld) {
         const int32_t res = static_cast<int32_t>(kGridResolution);

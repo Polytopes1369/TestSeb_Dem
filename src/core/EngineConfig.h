@@ -1,5 +1,6 @@
 #pragma once
 #include "core/Logger.h"
+#include "core/ResourcePath.h"
 #include <cctype>
 #include <cstdint>
 #include <filesystem>
@@ -31,9 +32,6 @@ inline float FLOOR_VERTEX_SPACING = 1.0f;
 // Temporary kill-switch
 inline bool ENTITY_SELF_ROTATION_ENABLED = false;
 
-// --- VIEW DISTANCE ---
-inline uint32_t _VIEW_DISTANCE_QUALITY = 4;
-
 namespace nanite {
 // Lower threshold shifts more tiny triangles to the software rasterizer.
 inline float SOFTWARE_RASTER_THRESHOLD_PIXELS = 8.0f;
@@ -49,13 +47,7 @@ constexpr uint32_t PAGE_SIZE_BYTES = 4096u;
 // Allocated buffer sizes
 inline uint64_t VERTEX_BUFFER_BYTES = 1024 * 1024 * 1024;
 inline uint64_t INDEX_BUFFER_BYTES = 512 * 1024 * 1024;
-
-inline float _MAX_PIXELS_PER_EDGE = 1.0f;
 } // namespace nanite
-
-namespace streaming {
-inline uint32_t _POOL_SIZE_MB = 8000;
-} // namespace streaming
 
 namespace temporal {
 inline float RENDER_SCALE = 1.000f;
@@ -64,13 +56,6 @@ inline float BLEND_ALPHA_STATIC = 0.20f;
 inline float VARIANCE_CLAMP_FACTOR = 1.5f;
 inline uint32_t JITTER_FRAME_COUNT = 16u;
 inline bool ENABLED_BY_DEFAULT = true;
-
-inline uint32_t _ANTI_ALIASING_QUALITY = 4;
-inline uint32_t _ANTI_ALIASING_METHOD = 4;
-inline float _SCREEN_PERCENTAGE = 100.0f;
-inline uint32_t _TEMPORAL_AA_UPSCALER = 1;
-inline float _TSR_HISTORY_SCREEN_PERCENTAGE = 100.0f;
-inline uint32_t _TSR_VELOCITY_HEADING_CONVECTIVE = 1;
 } // namespace temporal
 
 namespace lumen {
@@ -127,12 +112,12 @@ inline uint32_t VSM_MAX_PAGES_RENDERED_PER_FRAME = 512u;
 // resident page count is small enough that a single generous default covers every profile.
 inline uint32_t VSM_MAX_DYNAMIC_PAGES_RENDERED_PER_FRAME = 512u;
 
-inline uint32_t _GI_QUALITY = 4;
 inline bool _HARDWARE_RAYTRACING = true;
-inline bool _TRACE_MESH_SDF = true;
-inline bool _REFLECTIONS_ALLOW = true;
-inline uint32_t _REFLECTIONS_DOWNSAMPLE_FACTOR = 1;
-inline bool _HARDWARE_RAYTRACING_NANITE_MODE = true;
+// _TRACE_MESH_SDF/_REFLECTIONS_ALLOW/_REFLECTIONS_DOWNSAMPLE_FACTOR/_HARDWARE_RAYTRACING_NANITE_MODE
+// removed (2026-07-18 merge reconciliation): verified zero real consumers anywhere in the codebase
+// (only self-referential ApplyProfile() assignment + a decorative ImGui checkbox in main.cpp that
+// wrote them but nothing downstream ever read them) -- same "disconnected cvar" pattern as the
+// broader main-branch cvar cleanup sweep (feedback_wire_in_vs_remove_heuristic).
 inline bool _MEGALIGHTS_ENABLE = true;
 } // namespace lumen
 
@@ -158,18 +143,27 @@ inline float SPATIAL_BIAS_RADIUS = 3.25f;
 // heuristic/thresholds as the temporal reuse disocclusion test) still passes for most of a
 // continuous surface at this demo's typical view distances.
 inline float SPATIAL_REUSE_RADIUS_PIXELS = 24.0f;
+
+// UE5.8 rendering-parity gap G3 (extended light-type roster: spot / rect-area / photometric). Live,
+// Debug-tunable per-TYPE enable switches + a global intensity multiplier for the new (non-point)
+// types -- threaded into MegaLightsViewParamsUBO.typedLightControls every frame by
+// renderer::MegaLightsPass::RecordShade and consumed by MegaLightsFinalShade.comp. Not a
+// hardware-quality tier (same rationale as SPATIAL_BIAS_RADIUS above), so NOT mirrored into the
+// per-profile EngineConfig_{Low,...}.h overrides. Defaults keep every new type ON at unit intensity,
+// so a Release build (which never opens the Debug ImGui panel that mutates these) always shows the
+// full roster exactly as authored.
+inline bool SPOT_LIGHTS_ENABLED = true;
+inline bool RECT_LIGHTS_ENABLED = true;
+inline bool PHOTOMETRIC_LIGHTS_ENABLED = true;
+inline float TYPED_LIGHT_INTENSITY_SCALE = 1.0f;
 } // namespace megalights
 
-namespace reflections {
-inline uint32_t _QUALITY = 4;
-inline uint32_t _METHOD = 2;
-inline bool _SCREEN_SPACE_REFLECTIONS = true;
-} // namespace reflections
-
 namespace postprocess {
-inline uint32_t _QUALITY = 4;
 inline uint32_t _EFFECTS_QUALITY = 4;
-inline uint32_t _REFRACTION_QUALITY = 3;
+// _REFRACTION_QUALITY (this branch) and _TRANSLUCENCY_LIGHTING_VOLUME_DIM (main) both removed
+// (2026-07-18 merge reconciliation): verified neither has a real downstream consumer -- each was
+// only round-tripped through ApplyProfile()/a main.cpp startup-reload-detection struct/an ImGui
+// slider, with nothing in any renderer:: pass or shader ever reading either value.
 
 // --- Phase PP1 (post-process stack roadmap): Physical Camera / Auto Exposure / White Balance /
 // Color Correction / Tone Mapping / Gamma Correction -- renderer::PostProcessPass's own tunable
@@ -182,7 +176,24 @@ inline uint32_t _REFRACTION_QUALITY = 3;
 
 // Physical Camera
 inline float EXPOSURE_APERTURE = 4.0f;             // f-stop.
-inline float EXPOSURE_SHUTTER_SPEED_SECONDS = 1.0f / 60.0f;
+// 1/8000s (was 1/60s) as of the 2026-07-18 exposure re-tuning pass: the 2026-07-17 lighting
+// recalibration (LightingTypes.h's DirectionalLight::intensity) moved the sun to a real 10,000 lux,
+// but this manual EV100 (aperture/shutter/ISO -> log2(N^2/t * 100/ISO), see PostProcessPass.cpp's
+// ComputeManualEV100) was left at its old pre-recalibration value (EV100 ~9.9, MaxLuminance =
+// 1.2*2^EV100 ~= 1152), washing DEBUG_VIEW_NORMAL out toward white independently of Bloom state.
+// A first-pass theoretical correction (1/500s, EV100 ~13.0) accounted only for the direct sun term
+// (ClusterResolve.comp's `directResponse * sunRadiance`) and proved nowhere near enough once
+// measured -- ClusterResolve.comp's `diffuseAlbedo * skyAmbient` sky-view-LUT ambient term plus the
+// multi-bounce GI passes (Surface Cache / Screen Trace / World Probes) stack substantial additional
+// real-lux-scale radiance on top of direct lighting, pushing total scene luminance far past what a
+// direct-only estimate predicts. Retuned empirically instead (rebuild + --test-pipeline +
+// pixel-sampled luminance histogram of the DEBUG_VIEW_NORMAL screenshots, tests #8-10): 1/8000s
+// raises EV100 to ~17.0 (MaxLuminance ~153600), landing mid-scene luminance at ~160/255 (avg,
+// sampled) with zero clipped (255) pixels and real highlight/shadow contrast -- correctly exposed
+// with headroom above for specular highlights. Aperture left untouched (EXPOSURE_APERTURE also
+// drives DepthOfField.comp's circle-of-confusion f-stop, so changing it would shift DoF blur
+// strength as a side effect); 1/8000s is a realistic, if fast, daylight electronic-shutter speed.
+inline float EXPOSURE_SHUTTER_SPEED_SECONDS = 1.0f / 8000.0f;
 inline float EXPOSURE_ISO = 100.0f;
 // Manual (not Auto) for now: renderer::MegaLightsPass (Phase A) has no temporal reservoir reuse
 // yet (per-frame RIS re-samples a different light, spatially but not temporally denoised -- see
@@ -221,47 +232,29 @@ inline float DISPLAY_GAMMA = 2.2f;
 // Bloom
 inline float BLOOM_THRESHOLD = 1.0f;        // Bright-pass threshold, linear HDR luminance.
 inline float BLOOM_SOFT_KNEE = 0.5f;
-// Re-enabled (2026-07-18) at its original 1.0f, following the light-unit recalibration black-
-// screen bug (see project_light_units_ue58_recalibration memory for the original investigation).
-// Root cause: PostProcessComposite.comp read g_Bloom (BloomPass's own output) with NO SanitizeHDR
-// guard, unlike its g_HDRColor read a few hundred lines earlier in the same file. The prior
-// session's SanitizeHDR guards on BloomDownsample.comp/BloomUpsampleComposite.comp clamp every
-// individual texture TAP to a max of 50000, but BloomUpsampleComposite.comp's own
-// `result = detail + blurred` sums TWO independently-clamped-to-50000 terms, which can reach up to
-// 100000 in the float32 compute intermediate -- silently overflowing to +Infinity when written
-// into that pass' rgba16f output image (fp16's finite max is 65504). That store-time truncation
-// was never visible to any read-side tap clamp upstream, so the resulting Inf texel reached
-// PostProcessComposite.comp unguarded and crushed the whole frame to black via
-// clamp(Inf, 0, 1)'s implementation-defined result. Fixed by wrapping the g_Bloom read in
-// SanitizeHDR() too (PostProcessComposite.comp), mirroring the g_HDRColor pattern.
+// Re-enabled (2026-07-18, fix/bloom-hdr-overflow): restored to the original 1.0 pre-workaround
+// default now that the "BloomPass crushes the whole frame to black once the scene reached real
+// UE5.8-parity lux/candela brightness" bug is root-caused and fixed. Root cause was an fp16 (+Inf)
+// overflow in the bloom mip chain -- NOT the per-mip barriers (which were correct):
+// BloomUpsampleComposite.comp's `result = detail + blurred` is a raw ADDITION of two terms each only
+// INDIVIDUALLY clamped to 50000 by the existing SanitizeHDR guards (those guards were sized for the
+// box/tent filters' normalized averages, not this sum), so it reached ~100000 and the imageStore
+// into the R16G16B16A16_SFLOAT bloom image wrote +Inf. That +Inf then flowed into
+// PostProcessComposite.comp's g_Bloom read -- the ONE HDR read in that shader that was (unlike
+// g_HDRColor / g_SkyViewLUT) NOT SanitizeHDR-guarded -- became NaN through the ACES tonemap, and
+// clamp(NaN, 0, 1) collapsed the entire frame to black. THAT is why the earlier SanitizeHDR guards
+// did not help: they clamp per-input-tap, upstream of the overflow-producing sum and the unguarded
+// read. Fixed at both real points: BloomUpsampleComposite.comp now clamps its store to a finite
+// fp16-safe range, and PostProcessComposite.comp now SanitizeHDR-wraps the bloom read. Restoring 1.0
+// was verified safe: with the fix, toggling bloom fully off vs. on at 1.0 produces an identical final
+// image in --test-pipeline, i.e. bloom no longer introduces any non-finite value (the pre-existing
+// overexposure of that fixed test camera's framing is a separate, bloom-independent matter).
 //
-// Verified via two Debug --test-pipeline runs (BLOOM_INTENSITY=1.0 and, as an isolation check,
-// =0.0) plus manual screenshot inspection of DEBUG_VIEW_NORMAL captures (08_reflections_on.bmp/
-// 09_radiosity_ssrt_on.bmp/10_taatsr.bmp): the scene no longer goes black with Bloom active, and
-// both runs report zero new Vulkan Validation Layer messages (9/10 --test-pipeline features pass
-// in both runs; the one pre-existing failure, "Global SDF Bake + Ray March View", is an unrelated
-// VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT image-creation bug in SDFRayMarchPass/GlobalSDFPass -- that
-// debug view swaps to a completely different, non-post-processed blitSourceImage and never touches
-// BloomPass/PostProcessComposite.comp at all, and the failure is byte-for-byte identical at both
-// BLOOM_INTENSITY values, so it cannot be this change; flagged separately, left untouched here as
-// out of this scoped bug-fix's scope).
-//
-// IMPORTANT CAVEAT found during verification, NOT fixed here (separate, pre-existing, and
-// independent of Bloom -- confirmed by the =0.0 isolation run above still showing the same
-// washed-out result): at this "Extrem" profile's fixed manual exposure (EXPOSURE_APERTURE=4.0,
-// EXPOSURE_SHUTTER_SPEED_SECONDS=1/60, EXPOSURE_ISO=100, EXPOSURE_USE_AUTO=false -- see those
-// fields' own declarations above), DEBUG_VIEW_NORMAL now renders visibly overexposed/washed
-// toward white (NOT black -- ACESFilmicTonemap correctly compresses large-but-finite HDR input
-// toward 1.0, which is the expected, non-buggy behavior of a saturating tonemap curve) with Bloom
-// re-enabled, and is ALREADY visibly overexposed (just less severely) even with BLOOM_INTENSITY
-// pinned to 0.0. This points at the fixed exposure triplet never having been re-tuned for the
-// same 2026-07-17 real-lux/candela recalibration that prompted this whole investigation (see
-// commit 6669234's own message) -- real sun-level illuminance through this aperture/shutter/ISO
-// combo is plausibly still over a physically-"bright indoor" EV100, not a sunlit-exterior one.
-// Needs its own follow-up pass (re-tune EXPOSURE_APERTURE/SHUTTER/ISO or EXPOSURE_COMPENSATION_EV
-// for the recalibrated lighting scale, or revisit EXPOSURE_USE_AUTO now that the MegaLights
-// auto-exposure flicker that motivated disabling it -- project_taa_megalights_flicker_fix memory
-// -- may interact differently); out of scope for this task.
+// Independently re-discovered and re-fixed by a concurrent branch (code-audit-optimization) via a
+// read-side-only SanitizeHDR guard in PostProcessComposite.comp -- that fix is a strict subset of
+// this one (it stops the NaN from propagating past the read but does not stop the store-time +Inf
+// itself); this more complete store-clamp + read-guard combination is kept. See EXPOSURE_APERTURE's
+// own comment for a separate, still-open overexposure follow-up unrelated to this bug.
 inline float BLOOM_INTENSITY = 1.0f;
 inline float BLOOM_UPSAMPLE_RADIUS = 1.0f;
 
@@ -395,14 +388,29 @@ inline int SELECTED_BUFFER_INDEX = 0;
 // ImGui checkbox and the RecordUpdate read that drives the shader flag are both gated), so this
 // never contributes any GPU work in a Release build -- see AtmosVolumetricFogPass::RecordUpdate.
 inline bool LOCAL_FOG_VOLUME_BOUNDS_VIZ = false;
+// Debug-only (ImGui "PCG Graph Editor" tab, main.cpp) -- when true, renderer::ClusterRenderPipeline
+// draws every point in its own RunPcgFullPipelineSmokeTest()-produced point set (sampler->filter
+// output) as a wireframe box gizmo (renderer::debug::PcgPointCloudDebugView, PCG editor-tooling
+// roadmap Phase 7.2) directly in the live 3D scene. Read ONLY inside #ifndef NDEBUG blocks (its
+// ImGui checkbox and the RecordFrame read that drives the actual draw call are both gated), so
+// this never contributes any GPU work in a Release build -- same convention as
+// LOCAL_FOG_VOLUME_BOUNDS_VIZ just above.
+inline bool PCG_POINT_CLOUD_VIZ = false;
+#ifndef NDEBUG
+// UE5.8 rendering-parity gap G10b (ImGui "Path Tracer" tab, main.cpp) -- when true, renderer::
+// ClusterRenderPipeline runs its reference offline Path Tracer (renderer::PathTracerPass) and blits
+// its progressively-accumulated, tonemapped result to the swapchain in place of the real-time
+// Lumen/MegaLights composite, as a ground-truth validation view (exactly what UE5.8's own Path
+// Tracer render mode is for). Wrapped in #ifndef NDEBUG (a "mode de visualisation", CLAUDE.md rule
+// 8 -- same strict Release-exclusion convention as config::vegetation::WIREFRAME): read ONLY inside
+// #ifndef NDEBUG blocks, so it contributes zero code/symbols to a Release build.
+inline bool PATH_TRACER_ENABLED = false;
+#endif
 } // namespace debugview
 
-namespace volumetrics {
-inline uint32_t _TEXTURE_QUALITY = 4;
-inline uint32_t _SKY_ATMOSPHERE_QUALITY = 3;
-inline bool _VOLUMETRIC_FOG_ENABLE = true;
-} // namespace volumetrics
-
+// namespace volumetrics { _TEXTURE_QUALITY/_SKY_ATMOSPHERE_QUALITY/_VOLUMETRIC_FOG_ENABLE } removed
+// (2026-07-18 merge reconciliation): verified zero real consumers -- same disconnected-cvar pattern
+// as the main-branch cvar cleanup sweep; only a decorative ImGui "Volumetric" tab wrote them.
 // Local Fog Volumes (UE5.8 rendering-parity gap G8) -- localized, oriented-box or sphere fog
 // regions, each with its own density/color/vertical-falloff and an optional shadowed sun
 // contribution, injected ADDITIVELY into renderer::AtmosVolumetricFogPass's froxel grid on top of
@@ -410,8 +418,7 @@ inline bool _VOLUMETRIC_FOG_ENABLE = true;
 // content (like config::particles::EMITTERS[] and the VulkanContext zone layout), read ONCE at
 // AtmosVolumetricFogPass::Init to build a small std430 SSBO -- so unlike the postprocess::FOG_*
 // analytic knobs above these are NOT live-tunable per-parameter; only the master ENABLE toggle
-// below takes effect at runtime (it zeroes the injected count for one frame). Same live-toggle
-// convention as volumetrics::_VOLUMETRIC_FOG_ENABLE.
+// below takes effect at runtime (it zeroes the injected count for one frame).
 namespace localfog {
 
 // SSBO capacity. Only the first `active` entries of VOLUMES[] below are uploaded/injected.
@@ -710,6 +717,30 @@ inline bool WIREFRAME = false;               // Debug-only wireframe/bounds visu
 #endif
 } // namespace vegetation
 
+// Hair/Fur shading model (UE5.8 rendering-parity gap G10a) -- GPU-instanced procedural fur strands
+// grown off the skinned creature entity's surface (renderer::FurStrandPass). Same "runtime state,
+// not a hardware-quality tier" convention as config::vegetation:: above (NOT mirrored into
+// EngineConfig_{Low,Medium,High,Extrem}.h). ENABLED / OCCLUSION_CULL_ENABLED / the appearance knobs
+// take effect live every frame; the strand-count/length/geometry knobs are consumed only when the
+// strands are (re)generated -- the Debug "Fur / Hair" ImGui tab exposes a Regenerate button that
+// reapplies them at runtime.
+namespace fur {
+inline bool ENABLED = true;                  // Master runtime toggle -- skip the per-frame cull+draw entirely.
+inline bool OCCLUSION_CULL_ENABLED = true;   // Per-strand HZB occlusion test (frustum culling always on).
+inline uint32_t STRAND_COUNT = 14000u;       // Strands baked onto the creature (clamped to FurStrandPass::kMaxStrands). Consumed on (re)generate.
+inline float LENGTH = 0.16f;                 // Base strand length, world units. Consumed on (re)generate (via lengthScale baking) + live at draw.
+inline float LENGTH_JITTER = 0.35f;          // [0,1] per-strand length variation half-range. Consumed on (re)generate.
+inline float WIDTH = 0.020f;                 // Ribbon width, world units (live at draw).
+inline float CURL_AMOUNT = 0.35f;            // Gravity droop + curl strength as a fraction of length (live at draw).
+inline float ROOT_LIFT = 0.008f;             // Outward root offset so a strand's base sits just clear of the skin. Consumed on (re)generate.
+inline float SPEC_INTENSITY = 0.55f;         // Overall hair specular scale (live at draw).
+inline float TRT_INTENSITY = 0.55f;          // Weight of the colored secondary (TRT) highlight (live at draw).
+inline uint32_t SEED = 1337u;                // Global determinism seed. Consumed on (re)generate.
+#ifndef NDEBUG
+inline bool WIREFRAME = false;               // Debug-only wireframe/bounds visualization (gated out of Release per CLAUDE.md rule 8).
+#endif
+} // namespace fur
+
 // Procedural 3D Audio Engine (src/audio/, closes the "moteur de son 3D + style FL studio" gap in
 // this project's own CLAUDE.md design brief -- a fully procedural, real-time-streamed-synthesis
 // audio subsystem, zero .wav/.ogg assets, see audio::AudioEngine's own class comment) -- live-
@@ -761,15 +792,12 @@ inline void ApplyProfile(std::string_view profileName) {
     WINDOW_HEIGHT = config_extrem::WINDOW_HEIGHT;
     TARGET_FPS = config_extrem::TARGET_FPS;
     VERTEX_SPACING = config_extrem::VERTEX_SPACING;
-    _VIEW_DISTANCE_QUALITY = config_extrem::VIEW_DISTANCE_QUALITY;
     nanite::SOFTWARE_RASTER_THRESHOLD_PIXELS =
         config_extrem::nanite::SOFTWARE_RASTER_THRESHOLD_PIXELS;
     nanite::LOD_PIXEL_ERROR_THRESHOLD =
         config_extrem::nanite::LOD_PIXEL_ERROR_THRESHOLD;
     nanite::VERTEX_BUFFER_BYTES = config_extrem::nanite::VERTEX_BUFFER_BYTES;
     nanite::INDEX_BUFFER_BYTES = config_extrem::nanite::INDEX_BUFFER_BYTES;
-    nanite::_MAX_PIXELS_PER_EDGE = config_extrem::nanite::MAX_PIXELS_PER_EDGE;
-    streaming::_POOL_SIZE_MB = config_extrem::streaming::POOL_SIZE_MB;
     temporal::RENDER_SCALE = config_extrem::temporal::RENDER_SCALE;
     temporal::BLEND_ALPHA = config_extrem::temporal::BLEND_ALPHA;
     temporal::BLEND_ALPHA_STATIC = config_extrem::temporal::BLEND_ALPHA_STATIC;
@@ -777,17 +805,10 @@ inline void ApplyProfile(std::string_view profileName) {
         config_extrem::temporal::VARIANCE_CLAMP_FACTOR;
     temporal::JITTER_FRAME_COUNT = config_extrem::temporal::JITTER_FRAME_COUNT;
     temporal::ENABLED_BY_DEFAULT = config_extrem::temporal::ENABLED_BY_DEFAULT;
-    temporal::_ANTI_ALIASING_QUALITY =
-        config_extrem::temporal::ANTI_ALIASING_QUALITY;
-    temporal::_ANTI_ALIASING_METHOD =
-        config_extrem::temporal::ANTI_ALIASING_METHOD;
-    temporal::_SCREEN_PERCENTAGE = config_extrem::temporal::SCREEN_PERCENTAGE;
-    temporal::_TEMPORAL_AA_UPSCALER =
-        config_extrem::temporal::TEMPORAL_AA_UPSCALER;
-    temporal::_TSR_HISTORY_SCREEN_PERCENTAGE =
-        config_extrem::temporal::TSR_HISTORY_SCREEN_PERCENTAGE;
-    temporal::_TSR_VELOCITY_HEADING_CONVECTIVE =
-        config_extrem::temporal::TSR_VELOCITY_HEADING_CONVECTIVE;
+    // temporal::_ANTI_ALIASING_* (this branch) and shadows::_* (main) both removed (2026-07-18
+    // merge reconciliation): their config_extrem:: source fields were independently removed by
+    // both branches' own dead-cvar sweeps (see EngineConfig_Extrem.h), and neither destination
+    // field has a real consumer anywhere outside this now-deleted round trip.
     lumen::CARDS_PER_FRAME_BUDGET =
         config_extrem::lumen::CARDS_PER_FRAME_BUDGET;
     lumen::EVICTION_FRAME_DELAY = config_extrem::lumen::EVICTION_FRAME_DELAY;
@@ -818,42 +839,20 @@ inline void ApplyProfile(std::string_view profileName) {
         config_extrem::lumen::VSM_PHYSICAL_PAGE_CAPACITY;
     lumen::VSM_MAX_PAGES_RENDERED_PER_FRAME =
         config_extrem::lumen::VSM_MAX_PAGES_RENDERED_PER_FRAME;
-    lumen::_GI_QUALITY = config_extrem::lumen::GI_QUALITY;
     lumen::_HARDWARE_RAYTRACING = config_extrem::lumen::HARDWARE_RAYTRACING;
-    lumen::_TRACE_MESH_SDF = config_extrem::lumen::TRACE_MESH_SDF;
-    lumen::_REFLECTIONS_ALLOW = config_extrem::lumen::REFLECTIONS_ALLOW;
-    lumen::_REFLECTIONS_DOWNSAMPLE_FACTOR =
-        config_extrem::lumen::REFLECTIONS_DOWNSAMPLE_FACTOR;
-    lumen::_HARDWARE_RAYTRACING_NANITE_MODE =
-        config_extrem::lumen::HARDWARE_RAYTRACING_NANITE_MODE;
     lumen::_MEGALIGHTS_ENABLE = config_extrem::lumen::MEGALIGHTS_ENABLE;
-    reflections::_QUALITY = config_extrem::reflections::QUALITY;
-    reflections::_METHOD = config_extrem::reflections::METHOD;
-    reflections::_SCREEN_SPACE_REFLECTIONS =
-        config_extrem::reflections::SCREEN_SPACE_REFLECTIONS;
-    postprocess::_QUALITY = config_extrem::postprocess::QUALITY;
     postprocess::_EFFECTS_QUALITY = config_extrem::postprocess::EFFECTS_QUALITY;
-    postprocess::_REFRACTION_QUALITY =
-        config_extrem::postprocess::REFRACTION_QUALITY;
-    volumetrics::_TEXTURE_QUALITY = config_extrem::volumetrics::TEXTURE_QUALITY;
-    volumetrics::_SKY_ATMOSPHERE_QUALITY =
-        config_extrem::volumetrics::SKY_ATMOSPHERE_QUALITY;
-    volumetrics::_VOLUMETRIC_FOG_ENABLE =
-        config_extrem::volumetrics::VOLUMETRIC_FOG_ENABLE;
   } else if (profileName == "High") {
     WINDOW_WIDTH = config_high::WINDOW_WIDTH;
     WINDOW_HEIGHT = config_high::WINDOW_HEIGHT;
     TARGET_FPS = config_high::TARGET_FPS;
     VERTEX_SPACING = config_high::VERTEX_SPACING;
-    _VIEW_DISTANCE_QUALITY = config_high::VIEW_DISTANCE_QUALITY;
     nanite::SOFTWARE_RASTER_THRESHOLD_PIXELS =
         config_high::nanite::SOFTWARE_RASTER_THRESHOLD_PIXELS;
     nanite::LOD_PIXEL_ERROR_THRESHOLD =
         config_high::nanite::LOD_PIXEL_ERROR_THRESHOLD;
     nanite::VERTEX_BUFFER_BYTES = config_high::nanite::VERTEX_BUFFER_BYTES;
     nanite::INDEX_BUFFER_BYTES = config_high::nanite::INDEX_BUFFER_BYTES;
-    nanite::_MAX_PIXELS_PER_EDGE = config_high::nanite::MAX_PIXELS_PER_EDGE;
-    streaming::_POOL_SIZE_MB = config_high::streaming::POOL_SIZE_MB;
     temporal::RENDER_SCALE = config_high::temporal::RENDER_SCALE;
     temporal::BLEND_ALPHA = config_high::temporal::BLEND_ALPHA;
     temporal::BLEND_ALPHA_STATIC = config_high::temporal::BLEND_ALPHA_STATIC;
@@ -861,17 +860,8 @@ inline void ApplyProfile(std::string_view profileName) {
         config_high::temporal::VARIANCE_CLAMP_FACTOR;
     temporal::JITTER_FRAME_COUNT = config_high::temporal::JITTER_FRAME_COUNT;
     temporal::ENABLED_BY_DEFAULT = config_high::temporal::ENABLED_BY_DEFAULT;
-    temporal::_ANTI_ALIASING_QUALITY =
-        config_high::temporal::ANTI_ALIASING_QUALITY;
-    temporal::_ANTI_ALIASING_METHOD =
-        config_high::temporal::ANTI_ALIASING_METHOD;
-    temporal::_SCREEN_PERCENTAGE = config_high::temporal::SCREEN_PERCENTAGE;
-    temporal::_TEMPORAL_AA_UPSCALER =
-        config_high::temporal::TEMPORAL_AA_UPSCALER;
-    temporal::_TSR_HISTORY_SCREEN_PERCENTAGE =
-        config_high::temporal::TSR_HISTORY_SCREEN_PERCENTAGE;
-    temporal::_TSR_VELOCITY_HEADING_CONVECTIVE =
-        config_high::temporal::TSR_VELOCITY_HEADING_CONVECTIVE;
+    // temporal::_ANTI_ALIASING_* / shadows::_* removed -- see the "Extrem" branch above's own
+    // comment for the full rationale (identical reasoning applies at every tier).
     lumen::CARDS_PER_FRAME_BUDGET = config_high::lumen::CARDS_PER_FRAME_BUDGET;
     lumen::EVICTION_FRAME_DELAY = config_high::lumen::EVICTION_FRAME_DELAY;
     lumen::SURFACE_CACHE_ATLAS_SIZE = config_high::lumen::SURFACE_CACHE_ATLAS_SIZE;
@@ -897,42 +887,20 @@ inline void ApplyProfile(std::string_view profileName) {
         config_high::lumen::VSM_PHYSICAL_PAGE_CAPACITY;
     lumen::VSM_MAX_PAGES_RENDERED_PER_FRAME =
         config_high::lumen::VSM_MAX_PAGES_RENDERED_PER_FRAME;
-    lumen::_GI_QUALITY = config_high::lumen::GI_QUALITY;
     lumen::_HARDWARE_RAYTRACING = config_high::lumen::HARDWARE_RAYTRACING;
-    lumen::_TRACE_MESH_SDF = config_high::lumen::TRACE_MESH_SDF;
-    lumen::_REFLECTIONS_ALLOW = config_high::lumen::REFLECTIONS_ALLOW;
-    lumen::_REFLECTIONS_DOWNSAMPLE_FACTOR =
-        config_high::lumen::REFLECTIONS_DOWNSAMPLE_FACTOR;
-    lumen::_HARDWARE_RAYTRACING_NANITE_MODE =
-        config_high::lumen::HARDWARE_RAYTRACING_NANITE_MODE;
     lumen::_MEGALIGHTS_ENABLE = config_high::lumen::MEGALIGHTS_ENABLE;
-    reflections::_QUALITY = config_high::reflections::QUALITY;
-    reflections::_METHOD = config_high::reflections::METHOD;
-    reflections::_SCREEN_SPACE_REFLECTIONS =
-        config_high::reflections::SCREEN_SPACE_REFLECTIONS;
-    postprocess::_QUALITY = config_high::postprocess::QUALITY;
     postprocess::_EFFECTS_QUALITY = config_high::postprocess::EFFECTS_QUALITY;
-    postprocess::_REFRACTION_QUALITY =
-        config_high::postprocess::REFRACTION_QUALITY;
-    volumetrics::_TEXTURE_QUALITY = config_high::volumetrics::TEXTURE_QUALITY;
-    volumetrics::_SKY_ATMOSPHERE_QUALITY =
-        config_high::volumetrics::SKY_ATMOSPHERE_QUALITY;
-    volumetrics::_VOLUMETRIC_FOG_ENABLE =
-        config_high::volumetrics::VOLUMETRIC_FOG_ENABLE;
   } else if (profileName == "Medium") {
     WINDOW_WIDTH = config_medium::WINDOW_WIDTH;
     WINDOW_HEIGHT = config_medium::WINDOW_HEIGHT;
     TARGET_FPS = config_medium::TARGET_FPS;
     VERTEX_SPACING = config_medium::VERTEX_SPACING;
-    _VIEW_DISTANCE_QUALITY = config_medium::VIEW_DISTANCE_QUALITY;
     nanite::SOFTWARE_RASTER_THRESHOLD_PIXELS =
         config_medium::nanite::SOFTWARE_RASTER_THRESHOLD_PIXELS;
     nanite::LOD_PIXEL_ERROR_THRESHOLD =
         config_medium::nanite::LOD_PIXEL_ERROR_THRESHOLD;
     nanite::VERTEX_BUFFER_BYTES = config_medium::nanite::VERTEX_BUFFER_BYTES;
     nanite::INDEX_BUFFER_BYTES = config_medium::nanite::INDEX_BUFFER_BYTES;
-    nanite::_MAX_PIXELS_PER_EDGE = config_medium::nanite::MAX_PIXELS_PER_EDGE;
-    streaming::_POOL_SIZE_MB = config_medium::streaming::POOL_SIZE_MB;
     temporal::RENDER_SCALE = config_medium::temporal::RENDER_SCALE;
     temporal::BLEND_ALPHA = config_medium::temporal::BLEND_ALPHA;
     temporal::BLEND_ALPHA_STATIC = config_medium::temporal::BLEND_ALPHA_STATIC;
@@ -940,17 +908,8 @@ inline void ApplyProfile(std::string_view profileName) {
         config_medium::temporal::VARIANCE_CLAMP_FACTOR;
     temporal::JITTER_FRAME_COUNT = config_medium::temporal::JITTER_FRAME_COUNT;
     temporal::ENABLED_BY_DEFAULT = config_medium::temporal::ENABLED_BY_DEFAULT;
-    temporal::_ANTI_ALIASING_QUALITY =
-        config_medium::temporal::ANTI_ALIASING_QUALITY;
-    temporal::_ANTI_ALIASING_METHOD =
-        config_medium::temporal::ANTI_ALIASING_METHOD;
-    temporal::_SCREEN_PERCENTAGE = config_medium::temporal::SCREEN_PERCENTAGE;
-    temporal::_TEMPORAL_AA_UPSCALER =
-        config_medium::temporal::TEMPORAL_AA_UPSCALER;
-    temporal::_TSR_HISTORY_SCREEN_PERCENTAGE =
-        config_medium::temporal::TSR_HISTORY_SCREEN_PERCENTAGE;
-    temporal::_TSR_VELOCITY_HEADING_CONVECTIVE =
-        config_medium::temporal::TSR_VELOCITY_HEADING_CONVECTIVE;
+    // temporal::_ANTI_ALIASING_* / shadows::_* removed -- see the "Extrem" branch above's own
+    // comment for the full rationale (identical reasoning applies at every tier).
     lumen::CARDS_PER_FRAME_BUDGET =
         config_medium::lumen::CARDS_PER_FRAME_BUDGET;
     lumen::EVICTION_FRAME_DELAY = config_medium::lumen::EVICTION_FRAME_DELAY;
@@ -981,42 +940,20 @@ inline void ApplyProfile(std::string_view profileName) {
         config_medium::lumen::VSM_PHYSICAL_PAGE_CAPACITY;
     lumen::VSM_MAX_PAGES_RENDERED_PER_FRAME =
         config_medium::lumen::VSM_MAX_PAGES_RENDERED_PER_FRAME;
-    lumen::_GI_QUALITY = config_medium::lumen::GI_QUALITY;
     lumen::_HARDWARE_RAYTRACING = config_medium::lumen::HARDWARE_RAYTRACING;
-    lumen::_TRACE_MESH_SDF = config_medium::lumen::TRACE_MESH_SDF;
-    lumen::_REFLECTIONS_ALLOW = config_medium::lumen::REFLECTIONS_ALLOW;
-    lumen::_REFLECTIONS_DOWNSAMPLE_FACTOR =
-        config_medium::lumen::REFLECTIONS_DOWNSAMPLE_FACTOR;
-    lumen::_HARDWARE_RAYTRACING_NANITE_MODE =
-        config_medium::lumen::HARDWARE_RAYTRACING_NANITE_MODE;
     lumen::_MEGALIGHTS_ENABLE = config_medium::lumen::MEGALIGHTS_ENABLE;
-    reflections::_QUALITY = config_medium::reflections::QUALITY;
-    reflections::_METHOD = config_medium::reflections::METHOD;
-    reflections::_SCREEN_SPACE_REFLECTIONS =
-        config_medium::reflections::SCREEN_SPACE_REFLECTIONS;
-    postprocess::_QUALITY = config_medium::postprocess::QUALITY;
     postprocess::_EFFECTS_QUALITY = config_medium::postprocess::EFFECTS_QUALITY;
-    postprocess::_REFRACTION_QUALITY =
-        config_medium::postprocess::REFRACTION_QUALITY;
-    volumetrics::_TEXTURE_QUALITY = config_medium::volumetrics::TEXTURE_QUALITY;
-    volumetrics::_SKY_ATMOSPHERE_QUALITY =
-        config_medium::volumetrics::SKY_ATMOSPHERE_QUALITY;
-    volumetrics::_VOLUMETRIC_FOG_ENABLE =
-        config_medium::volumetrics::VOLUMETRIC_FOG_ENABLE;
   } else if (profileName == "Low") {
     WINDOW_WIDTH = config_low::WINDOW_WIDTH;
     WINDOW_HEIGHT = config_low::WINDOW_HEIGHT;
     TARGET_FPS = config_low::TARGET_FPS;
     VERTEX_SPACING = config_low::VERTEX_SPACING;
-    _VIEW_DISTANCE_QUALITY = config_low::VIEW_DISTANCE_QUALITY;
     nanite::SOFTWARE_RASTER_THRESHOLD_PIXELS =
         config_low::nanite::SOFTWARE_RASTER_THRESHOLD_PIXELS;
     nanite::LOD_PIXEL_ERROR_THRESHOLD =
         config_low::nanite::LOD_PIXEL_ERROR_THRESHOLD;
     nanite::VERTEX_BUFFER_BYTES = config_low::nanite::VERTEX_BUFFER_BYTES;
     nanite::INDEX_BUFFER_BYTES = config_low::nanite::INDEX_BUFFER_BYTES;
-    nanite::_MAX_PIXELS_PER_EDGE = config_low::nanite::MAX_PIXELS_PER_EDGE;
-    streaming::_POOL_SIZE_MB = config_low::streaming::POOL_SIZE_MB;
     temporal::RENDER_SCALE = config_low::temporal::RENDER_SCALE;
     temporal::BLEND_ALPHA = config_low::temporal::BLEND_ALPHA;
     temporal::BLEND_ALPHA_STATIC = config_low::temporal::BLEND_ALPHA_STATIC;
@@ -1024,17 +961,8 @@ inline void ApplyProfile(std::string_view profileName) {
         config_low::temporal::VARIANCE_CLAMP_FACTOR;
     temporal::JITTER_FRAME_COUNT = config_low::temporal::JITTER_FRAME_COUNT;
     temporal::ENABLED_BY_DEFAULT = config_low::temporal::ENABLED_BY_DEFAULT;
-    temporal::_ANTI_ALIASING_QUALITY =
-        config_low::temporal::ANTI_ALIASING_QUALITY;
-    temporal::_ANTI_ALIASING_METHOD =
-        config_low::temporal::ANTI_ALIASING_METHOD;
-    temporal::_SCREEN_PERCENTAGE = config_low::temporal::SCREEN_PERCENTAGE;
-    temporal::_TEMPORAL_AA_UPSCALER =
-        config_low::temporal::TEMPORAL_AA_UPSCALER;
-    temporal::_TSR_HISTORY_SCREEN_PERCENTAGE =
-        config_low::temporal::TSR_HISTORY_SCREEN_PERCENTAGE;
-    temporal::_TSR_VELOCITY_HEADING_CONVECTIVE =
-        config_low::temporal::TSR_VELOCITY_HEADING_CONVECTIVE;
+    // temporal::_ANTI_ALIASING_* / shadows::_* removed -- see the "Extrem" branch above's own
+    // comment for the full rationale (identical reasoning applies at every tier).
     lumen::CARDS_PER_FRAME_BUDGET = config_low::lumen::CARDS_PER_FRAME_BUDGET;
     lumen::EVICTION_FRAME_DELAY = config_low::lumen::EVICTION_FRAME_DELAY;
     lumen::SURFACE_CACHE_ATLAS_SIZE = config_low::lumen::SURFACE_CACHE_ATLAS_SIZE;
@@ -1059,33 +987,14 @@ inline void ApplyProfile(std::string_view profileName) {
         config_low::lumen::VSM_PHYSICAL_PAGE_CAPACITY;
     lumen::VSM_MAX_PAGES_RENDERED_PER_FRAME =
         config_low::lumen::VSM_MAX_PAGES_RENDERED_PER_FRAME;
-    lumen::_GI_QUALITY = config_low::lumen::GI_QUALITY;
     lumen::_HARDWARE_RAYTRACING = config_low::lumen::HARDWARE_RAYTRACING;
-    lumen::_TRACE_MESH_SDF = config_low::lumen::TRACE_MESH_SDF;
-    lumen::_REFLECTIONS_ALLOW = config_low::lumen::REFLECTIONS_ALLOW;
-    lumen::_REFLECTIONS_DOWNSAMPLE_FACTOR =
-        config_low::lumen::REFLECTIONS_DOWNSAMPLE_FACTOR;
-    lumen::_HARDWARE_RAYTRACING_NANITE_MODE =
-        config_low::lumen::HARDWARE_RAYTRACING_NANITE_MODE;
     lumen::_MEGALIGHTS_ENABLE = config_low::lumen::MEGALIGHTS_ENABLE;
-    reflections::_QUALITY = config_low::reflections::QUALITY;
-    reflections::_METHOD = config_low::reflections::METHOD;
-    reflections::_SCREEN_SPACE_REFLECTIONS =
-        config_low::reflections::SCREEN_SPACE_REFLECTIONS;
-    postprocess::_QUALITY = config_low::postprocess::QUALITY;
     postprocess::_EFFECTS_QUALITY = config_low::postprocess::EFFECTS_QUALITY;
-    postprocess::_REFRACTION_QUALITY =
-        config_low::postprocess::REFRACTION_QUALITY;
-    volumetrics::_TEXTURE_QUALITY = config_low::volumetrics::TEXTURE_QUALITY;
-    volumetrics::_SKY_ATMOSPHERE_QUALITY =
-        config_low::volumetrics::SKY_ATMOSPHERE_QUALITY;
-    volumetrics::_VOLUMETRIC_FOG_ENABLE =
-        config_low::volumetrics::VOLUMETRIC_FOG_ENABLE;
   }
 }
 
 inline void SaveProfileLocal(std::string_view profileName) {
-  std::ofstream outFile("gpu_profile.cfg");
+  std::ofstream outFile(core::ResolveExeRelativePath("gpu_profile.cfg"));
   if (outFile.is_open()) {
     outFile << profileName;
     outFile.close();
@@ -1109,7 +1018,7 @@ inline bool LoadProfileLocal() {
     return true;
   }
 
-  std::ifstream inFile("gpu_profile.cfg");
+  std::ifstream inFile(core::ResolveExeRelativePath("gpu_profile.cfg"));
   if (inFile.is_open()) {
     std::string profileName;
     inFile >> profileName;

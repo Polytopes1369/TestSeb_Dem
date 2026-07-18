@@ -7,6 +7,7 @@
 #include "core/Camera.h"
 #include "core/EntityData.h"
 #include "core/EngineConfig.h"
+#include "core/ResourcePath.h"
 #include "geometry/VirtualGeometryCacheTest.h"
 #include "world/StreamingManager.h"
 #include "world/CellManifest.h"
@@ -34,6 +35,13 @@
 // Phase 7.1 (PCG editor-tooling roadmap): "PCG Graph Editor" tab scaffold, see that header's own
 // comment for what it does/doesn't do yet.
 #include "renderer/debug/PcgGraphEditorPanel.h"
+// Phase 7.3 (PCG editor-tooling roadmap): "Node Data Inspector" panel drawn alongside the canvas
+// above, plus its own self-contained demo PcgGraph (see that header's DemoGraphState comment).
+#include "renderer/debug/PcgNodeDataInspector.h"
+// Phase 7.4 (PCG editor-tooling roadmap, closes out Phase 7): "PCG Volume Inspector" -- browses
+// authored (or synthetic-demo fallback) PCG Volumes and edits seed/bounds/graph-asset-path in
+// memory. See that header's own comment for the full scope rationale.
+#include "renderer/debug/PcgVolumeInspector.h"
 #endif
 
 // Unreal-editor style viewport navigation: hold the Right Mouse Button to enable FPS-style
@@ -73,11 +81,14 @@ struct DebugState {
     uint32_t naniteSubMode = 1; // 1 to 7 for Nanite modes
     // renderer::ClusterRenderPipeline::SetDebugTraceMode -- 0 = SWRT (mesh SDF sphere tracing),
     // 1 = HWRT (inline rayQueryEXT). Shared by SurfaceCacheGIInjectPass and WorldProbeGridPass's
-    // own trace pass so both ray tracing back-ends stay exercised. Defaults to HWRT, matching
-    // Release's own fixed choice (see ClusterRenderPipeline::RecordFrame's own comment). Set by two
-    // explicit keys ('T'/'Y' below) rather than a single flip-toggle, matching how UE5.8 Lumen
-    // itself exposes this as one explicit project-wide back-end choice, never simultaneous
-    // dual-tracing.
+    // own trace pass so both ray tracing back-ends stay exercised. In-class default of 1 (HWRT)
+    // below is only a placeholder for the brief window before main()'s startup code overwrites it
+    // with the resolved quality tier's own config::lumen::_HARDWARE_RAYTRACING choice (see that
+    // seed's own comment, right before the frame loop) -- Release has no debug toggle at all and
+    // reads the same cvar directly every frame (see ClusterRenderPipeline::RecordFrameEarly's own
+    // traceMode comment). Set by two explicit keys ('T'/'Y' below) rather than a single flip-
+    // toggle, matching how UE5.8 Lumen itself exposes this as one explicit project-wide back-end
+    // choice, never simultaneous dual-tracing.
     uint32_t traceMode = 1;
     // renderer::ClusterRenderPipeline::SetDebugRadiosityEnabled -- gates the intra-frame
     // multi-bounce radiosity loop ([1z] in RecordFrame) so its cost/contribution can be A/B'd.
@@ -118,6 +129,22 @@ struct DebugState {
     // diffusion radius as a live tuning knob. Both driven from the Post FX ImGui tab below.
     bool sssEnabled = true;
     float sssRadiusScale = 1.0f;
+    // UE5.8 rendering-parity gap G5 (Substrate Glint/sparkle): renderer::ClusterRenderPipeline::
+    // SetDebugGlintDensityScale/SetDebugGlintIntensityScale tune every material's authored
+    // SubstrateSlab::glintDensity/glintIntensity live (the discrete-microfacet "flake" specular, see
+    // substrate_bsdf.glsl's EvaluateSubstrateGlint). glintEnabled is an A/B toggle that zeroes the
+    // intensity scale when off. All driven from the Post FX ImGui tab below; Release always renders at
+    // the authored value (scale 1.0, no toggle), matching sssEnabled/sssRadiusScale above.
+    bool glintEnabled = true;
+    float glintDensityScale = 1.0f;
+    float glintIntensityScale = 1.0f;
+    // UE5.8 rendering-parity gap G6 (Substrate horizontal mixing): renderer::ClusterRenderPipeline::
+    // SetDebugMixMaskSharpnessScale tunes the A/B blend sharpness of every horizontally-mixed
+    // material live (multiplies its authored mixContrast, see substrate_bsdf.glsl's
+    // EvaluateSubstrateMixMask). Driven from the Post FX ImGui tab below; Release always renders at
+    // the authored value (scale 1.0, no toggle), matching glint*/sss* above. The raw mix mask itself
+    // is inspected via the DEBUG_VIEW_SUBSTRATE_MIXING view mode (keyboard 'N'), not this scalar.
+    float mixSharpnessScale = 1.0f;
     // Phase 1 (Nanite advanced): renderer::ClusterRenderPipeline::SetDebugEnhancedDisplacementEnabled
     // -- gates the multi-octave procedural noise displacement on entity 2 (Icosphere, see
     // enhanced_displacement.glsl). Key 'J' -- moved off 'B' (this branch's original key) during the
@@ -147,6 +174,10 @@ struct DebugState {
     // Defaults to 0.0f (diagnostic inert, zero cost) -- set via the ImGui slider in the Streaming
     // panel below.
     float simulatedLwcOffsetKm = 0.0f;
+    // UE5.8-parity gap G1 (Decal system): renderer::ClusterRenderPipeline::SetDebugShowDecalBounds --
+    // when on, DecalProject.comp outlines every projected decal's oriented box (bright cyan) so decal
+    // placement/extent is directly verifiable. Off by default; driven from the Post FX ImGui tab below.
+    bool showDecalBounds = false;
 };
 static DebugState g_DebugState;
 
@@ -155,6 +186,25 @@ static DebugState g_DebugState;
 // for exactly what it does/doesn't do yet. Initialized once right after ImGui_ImplVulkan_Init()
 // below, drawn from inside ConfigTabs, torn down alongside every other ImGui teardown call.
 static renderer::debug::PcgGraphEditorPanel g_PcgGraphEditorPanel;
+
+// Phase 7.3 (PCG editor-tooling roadmap): the "Node Data Inspector" panel drawn right alongside
+// g_PcgGraphEditorPanel's own canvas above, inside the same "PCG Graph Editor" tab (see
+// renderer::debug::PcgNodeDataInspector's own header comment). g_PcgInspectorDemoGraph is a small,
+// entirely SELF-CONTAINED PcgGraph + PcgGraphEvaluator::EvalResult pair built and evaluated exactly
+// once (renderer::debug::BuildDemoInspectorGraph(), called right after g_PcgGraphEditorPanel.Init()
+// below) purely so this panel has real, non-empty data to display -- Phase 7.1's own canvas has no
+// real backing PcgGraph at all yet. NOT wired to a real authored PCG Volume's graph; that is a
+// future Phase 6 integration point (see tools/WorldPartition/PcgVolumeActor.h, developed elsewhere
+// in this roadmap).
+static renderer::debug::PcgNodeDataInspector g_PcgNodeDataInspector;
+static renderer::debug::DemoGraphState g_PcgInspectorDemoGraph;
+
+// Phase 7.4 (PCG editor-tooling roadmap): the "PCG Volume Inspector" section drawn right below
+// g_PcgNodeDataInspector's own child region above, inside the same "PCG Graph Editor" tab -- the
+// 4th and final section of Phase 7 (see renderer::debug::PcgVolumeInspector's own header comment
+// for the full scope rationale: browses/edits authored-or-synthetic-demo PCG Volumes' top-level
+// fields, in memory only). Initialized once right after g_PcgInspectorDemoGraph above.
+static renderer::debug::PcgVolumeInspector g_PcgVolumeInspector;
 
 static void KeyCallback(GLFWwindow* window, int key, int scancode, int action, int mods) {
     if (action != GLFW_PRESS) return;
@@ -282,6 +332,14 @@ static void KeyCallback(GLFWwindow* window, int key, int scancode, int action, i
         // already claimed" situation as 'M' above.
         g_DebugState.viewMode = DEBUG_VIEW_SUBSTRATE_SLABS;
         LOG_INFO("[Debug] View Mode: SUBSTRATE SLABS");
+        break;
+    case GLFW_KEY_N:
+        // Substrate horizontal mixing (UE5.8 rendering-parity gap G6): 'N' for "mixiNg" -- same
+        // "plain letter key, every numpad slot already claimed" situation as 'B'/'M' above.
+        // Visualizes the raw per-pixel A/B mix mask (blue = base "A" slab, red = mixB "B" slab) --
+        // see ClusterResolve.comp's own viewMode==17 branch.
+        g_DebugState.viewMode = DEBUG_VIEW_SUBSTRATE_MIXING;
+        LOG_INFO("[Debug] View Mode: SUBSTRATE MIXING");
         break;
     case GLFW_KEY_K:
         // See renderer::ClusterRenderPipeline::RequestDebugDAGCutGapsDump()'s own comment: this
@@ -439,6 +497,15 @@ int main(int argc, char** argv) {
     // Phase 7.1 (PCG editor-tooling roadmap): create the node-editor context once ImGui itself is
     // fully up -- see g_PcgGraphEditorPanel's own declaration-site comment.
     g_PcgGraphEditorPanel.Init();
+
+    // Phase 7.3 (PCG editor-tooling roadmap): build + evaluate the Node Data Inspector's own
+    // self-contained demo graph once -- see g_PcgInspectorDemoGraph's own declaration-site comment.
+    g_PcgInspectorDemoGraph = renderer::debug::BuildDemoInspectorGraph();
+
+    // Phase 7.4 (PCG editor-tooling roadmap): scan world_data/actors/ for real PcgVolume actors
+    // (falling back to 3 synthetic in-memory demo volumes if none exist yet) -- see
+    // g_PcgVolumeInspector's own declaration-site comment.
+    g_PcgVolumeInspector.Init();
 #endif
 
     // Builds the consolidated virtual geometry .cache file (scene.cache): reads back the spawned
@@ -451,7 +518,6 @@ int main(int argc, char** argv) {
         LOG_INFO("[Main] scene.cache is up to date with current parameters. Skipping geometry cache build.");
     } else {
         LOG_INFO("[Main] scene.cache is missing or out of date. Rebuilding geometry cache...");
-
         // RunVirtualGeometryCacheTest is one monolithic, synchronous call (full GPU geometry
         // readback + a per-entity cluster DAG build -- see ClusterDAG.h/VirtualGeometryCacheTest.h's
         // own comments) that can block for minutes on a cold/mismatched cache. Calling it directly
@@ -547,7 +613,7 @@ int main(int argc, char** argv) {
     pipelineInfo.depthImage = vkContext.GetDepthImage();
     pipelineInfo.depthImageView = vkContext.GetDepthImageView();
     pipelineInfo.depthFormat = vkContext.GetDepthFormat();
-    pipelineInfo.cacheFilePath = "scene.cache";
+    pipelineInfo.cacheFilePath = core::ResolveExeRelativePath("scene.cache");
     pipelineInfo.entityTransformBuffer = vkContext.GetEntityTransformBuffer();
     pipelineInfo.entityDataBuffer = vkContext.GetEntityBuffer();
     pipelineInfo.materialTable = vkContext.GetMaterialTable();
@@ -556,17 +622,62 @@ int main(int argc, char** argv) {
     // SurfaceCachePass::Init() to prune translucent-material cards at load time.
     pipelineInfo.entityDataCPU = vkContext.GetEntityData();
 
-    // Init is wrapped so an uncaught std::runtime_error (GpuBuffer allocation failure, missing
-    // SPIR-V file, ...) surfaces as a logged message instead of a silent std::terminate -- the
-    // console/log otherwise shows nothing at all for an exception escaping main.
+    // Hair/Fur shading model (UE5.8 rendering-parity gap G10a): tell renderer::FurStrandPass where the
+    // skinned creature's bind-pose surface lives, sourced from VulkanContext's own single-source-of-
+    // truth creature constants + animation::SkeletalAnimator's skeleton constants, so fur roots land
+    // on exactly the surface geom_creature.comp baked. creatureMeshID indexes the EntityTransform
+    // buffer for the creature (== its meshID) so the pass re-skins each root through the same
+    // transform ClusterRaster.vert uses for the creature's own vertices.
+    pipelineInfo.creatureFurGeometry.worldOffset = vkContext.GetCreatureBakeWorldOffset();
+    pipelineInfo.creatureFurGeometry.radiusMin = vkContext.GetCreatureRadiusMin();
+    pipelineInfo.creatureFurGeometry.radiusMax = vkContext.GetCreatureRadiusMax();
+    pipelineInfo.creatureFurGeometry.segmentLength = animation::SkeletalAnimator::kSegmentLength;
+    pipelineInfo.creatureFurGeometry.boneCount = animation::SkeletalAnimator::kBoneCount;
+    pipelineInfo.creatureFurGeometry.creatureMeshID =
+        vkContext.GetEntityData()[vkContext.GetCreatureEntityIndex()].meshID;
+
+    // ClusterRenderPipeline::Init() sequentially creates ~40 render passes' worth of GPU buffers/
+    // images/pipelines (many involving first-time driver-side SPIR-V pipeline compilation -- there
+    // is no persisted VkPipelineCache anywhere in this codebase, so this cost is paid fresh on
+    // EVERY launch, not just a cold scene.cache) plus several one-shot staged uploads, all on
+    // whichever thread calls it. It has no GLFW dependency of its own (every handle it touches --
+    // device/allocator/queue/commandPool/images -- was already created by VulkanContext::Init()
+    // above) and, like geometry::RunVirtualGeometryCacheTest() before it, is a single self-contained
+    // call that returns a bool. Calling it directly here -- right after the cache-build wait, which
+    // already had this exact problem -- would again stop glfwPollEvents() from running for the
+    // whole 20-30+ second duration, so Win32 ghosts the window as "Not Responding" a second time.
+    // Same worker-thread + polling-pump pattern as the cache-build wait above, reused verbatim
+    // (including the try/catch, since GpuBuffer allocation failures/missing SPIR-V files can still
+    // throw std::runtime_error here).
     renderer::ClusterRenderPipeline clusterPipeline;
+    std::atomic<bool> pipelineInitDone{ false };
     bool pipelineInitOk = false;
-    try {
-        pipelineInitOk = clusterPipeline.Init(pipelineInfo);
+    std::thread pipelineInitThread([&]() {
+        try {
+            pipelineInitOk = clusterPipeline.Init(pipelineInfo);
+        }
+        catch (const std::exception& e) {
+            LOG_CRITICAL(std::format("[Main] ClusterRenderPipeline::Init threw: {}", e.what()));
+            pipelineInitOk = false;
+        }
+        // Release-store: publishes pipelineInitOk to the polling loop's acquire-load below before
+        // that loop can stop and join this thread.
+        pipelineInitDone.store(true, std::memory_order_release);
+    });
+
+    static const char* kPipelineInitSpinnerFrames[] = { "|", "/", "-", "\\" };
+    uint32_t pipelineInitSpinnerIndex = 0;
+    while (!pipelineInitDone.load(std::memory_order_acquire)) {
+        glfwPollEvents();
+        std::string waitTitle = std::string("Vulkan 1.3 Bindless Demoscene - Initializing render pipeline ")
+            + kPipelineInitSpinnerFrames[pipelineInitSpinnerIndex] + " (please wait)";
+        glfwSetWindowTitle(window, waitTitle.c_str());
+        pipelineInitSpinnerIndex = (pipelineInitSpinnerIndex + 1) % 4;
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
-    catch (const std::exception& e) {
-        LOG_CRITICAL(std::format("[Main] ClusterRenderPipeline::Init threw: {}", e.what()));
-    }
+    pipelineInitThread.join();
+    glfwSetWindowTitle(window, "Vulkan 1.3 Bindless Demoscene");
+
     if (!pipelineInitOk) {
         LOG_CRITICAL("[Main] ClusterRenderPipeline initialization FAILED.");
         clusterPipeline.Shutdown();
@@ -603,6 +714,57 @@ int main(int argc, char** argv) {
         }
         if (!clusterPipeline.RunPcgInstanceDrawSmokeTest(pcgSmokeInstances, vkContext.GetCommandPool(), vkContext.GetGraphicsQueue())) {
             LOG_ERROR("[Main] PcgInstanceDrawPass smoke test FAILED -- see log above for the specific check.");
+        }
+    }
+
+    // Phase 4.2 (PCG roadmap, "Spawner-to-DrawPass Glue" capstone): the real, first-ever end-to-end
+    // run of the FULL PCG pipeline (sampler -> filter -> spawner -> this phase's own glue -> Phase
+    // 0.2's draw path -> a rendered pixel) -- see ClusterRenderPipeline::RunPcgFullPipelineSmokeTest's
+    // own comment for exactly what it checks at each stage. Reuses the SAME 3 already-resident World
+    // Partition streaming archetype meshes (Rock/Bush/Tree fine variants) the smoke test just above
+    // already resolves via VulkanContext::GetStreamingArchetypeFineMeshInfo, now supplied as a
+    // weighted mesh palette (equal 1.0 weight each) for pcg::SpawnFromPoints to pick from -- this
+    // class has no VulkanContext dependency of its own, see PcgFullPipelineSmokeTestMeshDesc's own
+    // comment. Not fatal on failure (logged only), matching every other smoke test's own convention.
+    {
+        std::vector<renderer::ClusterRenderPipeline::PcgFullPipelineSmokeTestMeshDesc> pcgFullPipelineMeshes;
+        static constexpr uint32_t kFullPipelineUnits[3] = { 0u, 1u, 2u }; // Rock, Bush, Tree (same units as above).
+        for (uint32_t i = 0; i < 3u; ++i) {
+            VulkanContext::StreamingArchetypeMeshInfo meshInfo = vkContext.GetStreamingArchetypeFineMeshInfo(kFullPipelineUnits[i]);
+            renderer::ClusterRenderPipeline::PcgFullPipelineSmokeTestMeshDesc desc{};
+            desc.meshID = meshInfo.meshID;
+            desc.materialID = meshInfo.materialID;
+            desc.weight = 1.0f;
+            pcgFullPipelineMeshes.push_back(desc);
+        }
+        if (!clusterPipeline.RunPcgFullPipelineSmokeTest(pcgFullPipelineMeshes, vkContext.GetCommandPool(), vkContext.GetGraphicsQueue())) {
+            LOG_ERROR("[Main] PCG full-pipeline smoke test FAILED -- see log above for the specific check.");
+        }
+    }
+
+    // PCG roadmap Phase 6.3 ("Runtime Generator Hook", world::PcgCellLoader): proves the LIVE
+    // streaming-triggered generation path -- world::IWorldCellLoader::LoadCellFullDetail()/
+    // UnloadCell() -> pcg::GeneratePcgContentForCell() -> world::PcgCellLoader::Pump() ->
+    // pcg::PcgInstanceSpawnManager -- actually runs end-to-end, simulating exactly what
+    // world::StreamingManager would trigger from a worker thread. See
+    // ClusterRenderPipeline::RunPcgCellLoaderSmokeTest's own comment for exactly what it checks at
+    // each stage. Reuses the SAME 3 already-resident World Partition streaming archetype meshes as
+    // both smoke tests above (this class has no VulkanContext dependency of its own, same reason as
+    // PcgFullPipelineSmokeTestMeshDesc's own comment). Not fatal on failure (logged only), matching
+    // every other smoke test's own convention.
+    {
+        std::vector<renderer::ClusterRenderPipeline::PcgFullPipelineSmokeTestMeshDesc> pcgCellLoaderMeshes;
+        static constexpr uint32_t kCellLoaderUnits[3] = { 0u, 1u, 2u }; // Rock, Bush, Tree (same units as above).
+        for (uint32_t i = 0; i < 3u; ++i) {
+            VulkanContext::StreamingArchetypeMeshInfo meshInfo = vkContext.GetStreamingArchetypeFineMeshInfo(kCellLoaderUnits[i]);
+            renderer::ClusterRenderPipeline::PcgFullPipelineSmokeTestMeshDesc desc{};
+            desc.meshID = meshInfo.meshID;
+            desc.materialID = meshInfo.materialID;
+            desc.weight = 1.0f;
+            pcgCellLoaderMeshes.push_back(desc);
+        }
+        if (!clusterPipeline.RunPcgCellLoaderSmokeTest(pcgCellLoaderMeshes, vkContext.GetCommandPool(), vkContext.GetGraphicsQueue())) {
+            LOG_ERROR("[Main] PCG cell-loader smoke test FAILED -- see log above for the specific check.");
         }
     }
 #endif
@@ -691,7 +853,7 @@ int main(int argc, char** argv) {
     // gracefully disabled (the fixed showcase gallery still renders normally) rather than treated
     // as a fatal error, unlike scene.cache above: streaming is additive, not load-bearing. ---
     world::CellManifest cellManifest;
-    bool streamingEnabled = cellManifest.Load(world::kDefaultManifestPath);
+    bool streamingEnabled = cellManifest.Load(core::ResolveExeRelativePath(world::kDefaultManifestPath));
     if (streamingEnabled) {
         LOG_INFO(std::format("[Main] World Partition streaming ENABLED: {} authored cells (cellSize={:.1f}).",
                               cellManifest.RecordCount(), cellManifest.CellSize()));
@@ -785,6 +947,22 @@ int main(int argc, char** argv) {
     // the update call site below.
     world::LwcOrigin lwcOrigin;
 
+#ifndef NDEBUG
+    // Seed the live Debug trace-mode toggle from the resolved quality tier's own
+    // config::lumen::_HARDWARE_RAYTRACING choice (see EngineConfig_Low.h's own HARDWARE_RAYTRACING
+    // comment: Low is meant to run SWRT-only on weaker hardware) instead of always starting at
+    // DebugState::traceMode's HWRT in-class default -- 'T'/'Y' below still override this live for
+    // the rest of the session (see ClusterRenderPipeline::RecordFrameEarly's own traceMode
+    // comment), this one-time seed only fixes the SESSION-START default so a fresh Debug launch
+    // actually reflects the active tier instead of ignoring it entirely, as every tier did before
+    // this fix. Placed here (profile resolution -- either LoadProfileLocal() above or
+    // InitializeProfileFromGPU() during Vulkan device setup -- is guaranteed complete by this
+    // point) rather than inside the frame loop below, since SetDebugTraceMode() is called there
+    // every frame and would otherwise stomp any live 'T'/'Y' key press right back to the tier
+    // default on the very next frame.
+    g_DebugState.traceMode = config::lumen::_HARDWARE_RAYTRACING ? 1u : 0u;
+#endif
+
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
 #ifndef NDEBUG
@@ -797,10 +975,16 @@ int main(int argc, char** argv) {
             float VERTEX_SPACING = config::VERTEX_SPACING;
             uint64_t VERTEX_BUFFER_BYTES = config::nanite::VERTEX_BUFFER_BYTES;
             uint64_t INDEX_BUFFER_BYTES = config::nanite::INDEX_BUFFER_BYTES;
-            uint32_t POOL_SIZE_MB = config::streaming::_POOL_SIZE_MB;
             float RENDER_SCALE = config::temporal::RENDER_SCALE;
             uint32_t PROBE_GRID_RESOLUTION = config::lumen::PROBE_GRID_RESOLUTION;
             uint32_t VSM_PHYSICAL_PAGE_CAPACITY = config::lumen::VSM_PHYSICAL_PAGE_CAPACITY;
+            // The "Hardware Ray Tracing" checkbox's own value only takes effect at the NEXT session
+            // start (see main()'s g_DebugState.traceMode seeding comment, right before the frame
+            // loop) -- 'T'/'Y' remain the live, no-reload way to change trace mode mid-session.
+            // NOTE: _TRANSLUCENCY_LIGHTING_VOLUME_DIM was dropped from this struct (2026-07-18 merge
+            // reconciliation) along with its EngineConfig.h declaration -- verified zero real
+            // consumers (see EngineConfig.h's own postprocess::_EFFECTS_QUALITY comment).
+            bool HARDWARE_RAYTRACING = config::lumen::_HARDWARE_RAYTRACING;
             std::string profileName = config::g_ActiveProfileName;
         };
         static StartupConfig startup;
@@ -810,10 +994,10 @@ int main(int argc, char** argv) {
                 config::VERTEX_SPACING,
                 config::nanite::VERTEX_BUFFER_BYTES,
                 config::nanite::INDEX_BUFFER_BYTES,
-                config::streaming::_POOL_SIZE_MB,
                 config::temporal::RENDER_SCALE,
                 config::lumen::PROBE_GRID_RESOLUTION,
                 config::lumen::VSM_PHYSICAL_PAGE_CAPACITY,
+                config::lumen::_HARDWARE_RAYTRACING,
                 config::g_ActiveProfileName
             };
             startupCaptured = true;
@@ -825,13 +1009,17 @@ int main(int argc, char** argv) {
         if (config::VERTEX_SPACING != startup.VERTEX_SPACING) { needsReload = true; reloadReason += "Vertex Spacing; "; }
         if (config::nanite::VERTEX_BUFFER_BYTES != startup.VERTEX_BUFFER_BYTES) { needsReload = true; reloadReason += "Vertex Buffer Size; "; }
         if (config::nanite::INDEX_BUFFER_BYTES != startup.INDEX_BUFFER_BYTES) { needsReload = true; reloadReason += "Index Buffer Size; "; }
-        if (config::streaming::_POOL_SIZE_MB != startup.POOL_SIZE_MB) { needsReload = true; reloadReason += "Streaming Pool Size; "; }
         if (config::temporal::RENDER_SCALE != startup.RENDER_SCALE) { needsReload = true; reloadReason += "Render Scale; "; }
         if (config::lumen::PROBE_GRID_RESOLUTION != startup.PROBE_GRID_RESOLUTION) { needsReload = true; reloadReason += "Probe Grid Resolution; "; }
         if (config::lumen::VSM_PHYSICAL_PAGE_CAPACITY != startup.VSM_PHYSICAL_PAGE_CAPACITY) { needsReload = true; reloadReason += "VSM Page Capacity; "; }
+        if (config::lumen::_HARDWARE_RAYTRACING != startup.HARDWARE_RAYTRACING) { needsReload = true; reloadReason += "Hardware Ray Tracing (takes effect next session -- 'T'/'Y' keys change it live without a restart); "; }
         if (config::g_ActiveProfileName != startup.profileName) { needsReload = true; reloadReason += "Profile Preset (changed to " + config::g_ActiveProfileName + "); "; }
 
         // UI Panel
+        // Starts collapsed on the very first launch (no prior imgui.ini entry) so this panel
+        // doesn't cover the top-left debug HUD/camera view by default -- ImGuiCond_FirstUseEver
+        // means any user who has since expanded/moved it keeps that state on later runs.
+        ImGui::SetNextWindowCollapsed(true, ImGuiCond_FirstUseEver);
         ImGui::Begin("Engine Configuration Panel");
         
         // Active Profile Selection
@@ -864,8 +1052,7 @@ int main(int argc, char** argv) {
                 ImGui::DragFloat("Floor Vertex Spacing", &config::FLOOR_VERTEX_SPACING, 0.05f, 0.1f, 10.0f);
                 ImGui::DragFloat("Software Raster Threshold", &config::nanite::SOFTWARE_RASTER_THRESHOLD_PIXELS, 0.1f, 0.0f, 64.0f);
                 ImGui::DragFloat("LOD Pixel Error Threshold", &config::nanite::LOD_PIXEL_ERROR_THRESHOLD, 0.05f, 0.01f, 10.0f);
-                ImGui::DragFloat("Max Pixels Per Edge", &config::nanite::_MAX_PIXELS_PER_EDGE, 0.05f, 0.1f, 10.0f);
-                
+
                 int64_t vBytes = config::nanite::VERTEX_BUFFER_BYTES;
                 int vMB = static_cast<int>(vBytes / (1024 * 1024));
                 if (ImGui::DragInt("Vertex Buffer (MB)", &vMB, 64, 128, 4096)) {
@@ -881,15 +1068,6 @@ int main(int argc, char** argv) {
                 ImGui::EndTabItem();
             }
 
-            // --- Tab Streaming ---
-            if (ImGui::BeginTabItem("Streaming")) {
-                int poolMB = static_cast<int>(config::streaming::_POOL_SIZE_MB);
-                if (ImGui::DragInt("Texture Pool Size (MB)", &poolMB, 128, 512, 32000)) {
-                    config::streaming::_POOL_SIZE_MB = static_cast<uint32_t>(poolMB);
-                }
-                ImGui::EndTabItem();
-            }
-
             // --- Tab Temporal ---
             if (ImGui::BeginTabItem("Temporal")) {
                 ImGui::DragFloat("Render Scale", &config::temporal::RENDER_SCALE, 0.01f, 0.25f, 2.00f);
@@ -901,19 +1079,6 @@ int main(int argc, char** argv) {
                     config::temporal::JITTER_FRAME_COUNT = static_cast<uint32_t>(jitterCount);
                 }
                 ImGui::Checkbox("Enabled By Default", &config::temporal::ENABLED_BY_DEFAULT);
-                int aaQual = static_cast<int>(config::temporal::_ANTI_ALIASING_QUALITY);
-                if (ImGui::DragInt("Anti-Aliasing Quality", &aaQual, 1, 1, 5)) {
-                    config::temporal::_ANTI_ALIASING_QUALITY = static_cast<uint32_t>(aaQual);
-                }
-                int aaMethod = static_cast<int>(config::temporal::_ANTI_ALIASING_METHOD);
-                if (ImGui::DragInt("Anti-Aliasing Method", &aaMethod, 1, 0, 5)) {
-                    config::temporal::_ANTI_ALIASING_METHOD = static_cast<uint32_t>(aaMethod);
-                }
-                ImGui::DragFloat("Screen Percentage", &config::temporal::_SCREEN_PERCENTAGE, 1.0f, 10.0f, 200.0f);
-                int upscaler = static_cast<int>(config::temporal::_TEMPORAL_AA_UPSCALER);
-                if (ImGui::DragInt("Temporal AA Upscaler", &upscaler, 1, 0, 5)) {
-                    config::temporal::_TEMPORAL_AA_UPSCALER = static_cast<uint32_t>(upscaler);
-                }
                 ImGui::EndTabItem();
             }
 
@@ -963,45 +1128,36 @@ int main(int argc, char** argv) {
                 if (ImGui::DragInt("VSM Page Capacity", &pageCap, 256, 256, 16384)) {
                     config::lumen::VSM_PHYSICAL_PAGE_CAPACITY = static_cast<uint32_t>(pageCap);
                 }
-                int giQual = static_cast<int>(config::lumen::_GI_QUALITY);
-                if (ImGui::DragInt("GI Quality", &giQual, 1, 1, 5)) {
-                    config::lumen::_GI_QUALITY = static_cast<uint32_t>(giQual);
-                }
                 ImGui::Checkbox("Hardware Ray Tracing", &config::lumen::_HARDWARE_RAYTRACING);
-                ImGui::Checkbox("Trace Mesh SDF", &config::lumen::_TRACE_MESH_SDF);
-                ImGui::Checkbox("Reflections Allow", &config::lumen::_REFLECTIONS_ALLOW);
-                ImGui::Checkbox("HWRT Nanite Mode", &config::lumen::_HARDWARE_RAYTRACING_NANITE_MODE);
                 ImGui::Checkbox("Megalights Enable", &config::lumen::_MEGALIGHTS_ENABLE);
                 ImGui::EndTabItem();
             }
 
-            // --- Tab Reflection ---
-            if (ImGui::BeginTabItem("Reflection")) {
-                int refQual = static_cast<int>(config::reflections::_QUALITY);
-                if (ImGui::DragInt("Reflection Quality", &refQual, 1, 1, 5)) {
-                    config::reflections::_QUALITY = static_cast<uint32_t>(refQual);
-                }
-                int refMethod = static_cast<int>(config::reflections::_METHOD);
-                if (ImGui::DragInt("Reflection Method", &refMethod, 1, 0, 5)) {
-                    config::reflections::_METHOD = static_cast<uint32_t>(refMethod);
-                }
-                ImGui::Checkbox("Screen Space Reflections", &config::reflections::_SCREEN_SPACE_REFLECTIONS);
+            // --- Tab MegaLights (UE5.8 rendering-parity gap G3: extended light-type roster) ---
+            // Debug-only, like this whole panel (#ifndef NDEBUG-gated). Tunes the live per-type
+            // enable/scale knobs (config::megalights::*) that renderer::MegaLightsPass::RecordShade
+            // threads into MegaLightsViewParamsUBO.typedLightControls every frame -- toggling a type
+            // off suppresses every spot/rect/photometric light of that kind on the opaque MegaLights
+            // path in real time, without regenerating or re-uploading the light SSBO.
+            if (ImGui::BeginTabItem("MegaLights")) {
+                ImGui::TextWrapped("Extended light types (spot / rect-area / photometric). Point lights are always on.");
+                ImGui::Separator();
+                ImGui::Checkbox("Spot Lights", &config::megalights::SPOT_LIGHTS_ENABLED);
+                ImGui::Checkbox("Rect (Area) Lights [LTC specular]", &config::megalights::RECT_LIGHTS_ENABLED);
+                ImGui::Checkbox("Photometric (IES-style) Lights", &config::megalights::PHOTOMETRIC_LIGHTS_ENABLED);
+                ImGui::DragFloat("Typed Light Intensity Scale", &config::megalights::TYPED_LIGHT_INTENSITY_SCALE, 0.02f, 0.0f, 8.0f);
+                ImGui::Separator();
+                ImGui::TextWrapped("RIS / spatial reuse (shared with point lights):");
+                ImGui::DragFloat("Spatial Bias Radius (world)", &config::megalights::SPATIAL_BIAS_RADIUS, 0.05f, 0.0f, 16.0f);
+                ImGui::DragFloat("Spatial Reuse Radius (px)", &config::megalights::SPATIAL_REUSE_RADIUS_PIXELS, 0.5f, 0.0f, 128.0f);
                 ImGui::EndTabItem();
             }
 
             // --- Tab Postprocess ---
             if (ImGui::BeginTabItem("Postprocess")) {
-                int ppQual = static_cast<int>(config::postprocess::_QUALITY);
-                if (ImGui::DragInt("Postprocess Quality", &ppQual, 1, 1, 5)) {
-                    config::postprocess::_QUALITY = static_cast<uint32_t>(ppQual);
-                }
                 int fxQual = static_cast<int>(config::postprocess::_EFFECTS_QUALITY);
                 if (ImGui::DragInt("Effects Quality", &fxQual, 1, 1, 5)) {
                     config::postprocess::_EFFECTS_QUALITY = static_cast<uint32_t>(fxQual);
-                }
-                int refrQual = static_cast<int>(config::postprocess::_REFRACTION_QUALITY);
-                if (ImGui::DragInt("Refraction Quality", &refrQual, 1, 1, 5)) {
-                    config::postprocess::_REFRACTION_QUALITY = static_cast<uint32_t>(refrQual);
                 }
                 ImGui::EndTabItem();
             }
@@ -1029,6 +1185,22 @@ int main(int argc, char** argv) {
                 // diffusion-radius tuning (the material's authored radius is multiplied by this).
                 ImGui::Checkbox("Subsurface Scattering", &g_DebugState.sssEnabled);
                 ImGui::SliderFloat("SSS Radius Scale", &g_DebugState.sssRadiusScale, 0.0f, 4.0f);
+                // UE5.8 rendering-parity gap G5: Substrate Glint/sparkle A/B toggle + density/intensity
+                // tuning (each multiplies the material's authored glintDensity/glintIntensity live --
+                // see the Metal-flake showcase material, slot 0, in renderer::GenerateShowcaseMaterialTable).
+                ImGui::Checkbox("Glint / Sparkle", &g_DebugState.glintEnabled);
+                ImGui::SliderFloat("Glint Density", &g_DebugState.glintDensityScale, 0.0f, 2.0f);
+                ImGui::SliderFloat("Glint Intensity", &g_DebugState.glintIntensityScale, 0.0f, 4.0f);
+                // UE5.8 rendering-parity gap G6: Substrate horizontal mixing -- live A/B blend-sharpness
+                // tuning of the rusting-metal showcase (Pyramid, slot 9, in renderer::
+                // GenerateShowcaseMaterialTable); higher = crisper rust-patch edges. The raw A/B mask
+                // itself is inspected via the SUBSTRATE MIXING view mode (keyboard 'N').
+                ImGui::SliderFloat("Mix Sharpness", &g_DebugState.mixSharpnessScale, 0.0f, 4.0f);
+                // UE5.8-parity gap G1 (Decal system): live bounds-overlay toggle + a count readout of
+                // the projected decals uploaded at Init (renderer::GenerateShowcaseDecals()).
+                ImGui::Separator();
+                ImGui::Checkbox("Show Decal Bounds", &g_DebugState.showDecalBounds);
+                ImGui::TextDisabled("Projected Decals: %u", clusterPipeline.GetDecalCount());
                 ImGui::EndTabItem();
             }
 
@@ -1066,18 +1238,27 @@ int main(int argc, char** argv) {
                 ImGui::EndTabItem();
             }
 
+            // --- Tab Path Tracer (UE5.8 rendering-parity gap G10b) -- DEBUG-only reference/ground-
+            // truth offline path tracer, to validate the real-time Lumen view against. The whole
+            // Engine Configuration Panel is already inside #ifndef NDEBUG, so this tab (and the
+            // config::debugview::PATH_TRACER_ENABLED toggle, itself #ifndef NDEBUG) never exists in
+            // a Release build. ---
+            if (ImGui::BeginTabItem("Path Tracer")) {
+                ImGui::Checkbox("Reference Path Tracer (bypass Lumen/MegaLights)", &config::debugview::PATH_TRACER_ENABLED);
+                ImGui::TextWrapped("Unbiased offline reference: full Substrate BSDF + NEE, multi-bounce, "
+                    "progressively accumulated while the camera is stationary (accumulation resets on "
+                    "camera movement). Ground-truth comparison against the real-time Lumen view.");
+                ImGui::Separator();
+                if (config::debugview::PATH_TRACER_ENABLED) {
+                    ImGui::Text("Accumulated samples: %u", clusterPipeline.GetPathTracerSampleCount());
+                } else {
+                    ImGui::TextDisabled("Enable to start accumulating a reference image.");
+                }
+                ImGui::EndTabItem();
+            }
+
             // --- Tab Volumetric ---
             if (ImGui::BeginTabItem("Volumetric")) {
-                int texQual = static_cast<int>(config::volumetrics::_TEXTURE_QUALITY);
-                if (ImGui::DragInt("Texture Quality", &texQual, 1, 1, 5)) {
-                    config::volumetrics::_TEXTURE_QUALITY = static_cast<uint32_t>(texQual);
-                }
-                int skyQual = static_cast<int>(config::volumetrics::_SKY_ATMOSPHERE_QUALITY);
-                if (ImGui::DragInt("Sky Atmosphere Quality", &skyQual, 1, 1, 5)) {
-                    config::volumetrics::_SKY_ATMOSPHERE_QUALITY = static_cast<uint32_t>(skyQual);
-                }
-                ImGui::Checkbox("Volumetric Fog", &config::volumetrics::_VOLUMETRIC_FOG_ENABLE);
-
                 // --- Local Fog Volumes (UE5.8 rendering-parity gap G8) -- localized box/sphere fog
                 // regions injected additively into the froxel grid (see config::localfog::VOLUMES
                 // and renderer::AtmosVolumetricFogPass). "Enable Local Fog Volumes" is a real runtime
@@ -1376,6 +1557,52 @@ int main(int argc, char** argv) {
                 ImGui::EndTabItem();
             }
 
+            // --- Tab Fur / Hair (UE5.8 rendering-parity gap G10a) -- GPU-instanced procedural fur
+            // strands grown off the skinned creature, shaded with the dedicated hair BSDF. ENABLED /
+            // occlusion / wireframe + appearance (width/curl/spec) take effect live; the strand-count
+            // /length/geometry knobs are consumed on Regenerate (a blocking device-idle re-bake). ---
+            if (ImGui::BeginTabItem("Fur / Hair")) {
+                ImGui::Checkbox("Enabled", &config::fur::ENABLED);
+                ImGui::Checkbox("Occlusion Cull (HZB)", &config::fur::OCCLUSION_CULL_ENABLED);
+                ImGui::Checkbox("Wireframe", &config::fur::WIREFRAME);
+
+                ImGui::Separator();
+                ImGui::TextUnformatted("Appearance (live)");
+                ImGui::SliderFloat("Strand Width (m)", &config::fur::WIDTH, 0.004f, 0.06f);
+                ImGui::SliderFloat("Curl / Droop", &config::fur::CURL_AMOUNT, 0.0f, 1.0f);
+                ImGui::SliderFloat("Specular Intensity", &config::fur::SPEC_INTENSITY, 0.0f, 2.0f);
+                ImGui::SliderFloat("TRT (2nd highlight)", &config::fur::TRT_INTENSITY, 0.0f, 2.0f);
+                ImGui::SliderFloat("Strand Length (m)", &config::fur::LENGTH, 0.02f, 0.5f);
+
+                ImGui::Separator();
+                ImGui::TextUnformatted("Strand parameters (applied on Regenerate)");
+                {
+                    int strands = static_cast<int>(config::fur::STRAND_COUNT);
+                    if (ImGui::SliderInt("Strand Count", &strands, 0,
+                            static_cast<int>(renderer::FurStrandPass::kMaxStrands))) {
+                        config::fur::STRAND_COUNT = static_cast<uint32_t>(strands < 0 ? 0 : strands);
+                    }
+                }
+                ImGui::SliderFloat("Length Jitter", &config::fur::LENGTH_JITTER, 0.0f, 1.0f);
+                ImGui::SliderFloat("Root Lift (m)", &config::fur::ROOT_LIFT, 0.0f, 0.05f);
+                {
+                    int seed = static_cast<int>(config::fur::SEED);
+                    if (ImGui::InputInt("Seed", &seed)) {
+                        config::fur::SEED = static_cast<uint32_t>(seed < 0 ? 0 : seed);
+                    }
+                }
+                if (ImGui::Button("Regenerate Strands")) {
+                    clusterPipeline.RegenerateFur();
+                }
+
+                ImGui::Separator();
+                ImGui::TextDisabled("Strands: %u / %u",
+                    clusterPipeline.GetFurStrand().GetStrandCount(),
+                    renderer::FurStrandPass::kMaxStrands);
+
+                ImGui::EndTabItem();
+            }
+
             // --- Tab Audio (Procedural 3D Audio Engine, src/audio/) ---------------------------
             // Debug-only per CLAUDE.md's build-separation rule: the sliders below edit the same
             // live config::audio::* globals audio::AudioEngine reads every Update() call in BOTH
@@ -1418,9 +1645,57 @@ int main(int argc, char** argv) {
 
             // --- Tab PCG Graph Editor -- Phase 7.1 (PCG editor-tooling roadmap) scaffold: proves
             // the vendored thedmd/imgui-node-editor library is wired end-to-end, nothing more.
-            // See renderer::debug::PcgGraphEditorPanel's own header comment for full context. ---
+            // See renderer::debug::PcgGraphEditorPanel's own header comment for full context.
+            // Phase 7.3 adds the "Node Data Inspector" side panel right below the canvas (same tab,
+            // not a disconnected one -- conceptually the two are the same tool): it shows live
+            // post-evaluation pin data for g_PcgInspectorDemoGraph, a small self-contained demo
+            // graph built at startup, entirely SEPARATE from the canvas above's own placeholder
+            // demo nodes (those are still wired to nothing, see PcgGraphEditorPanel's own comment).
+            // ---
             if (ImGui::BeginTabItem("PCG Graph Editor")) {
                 g_PcgGraphEditorPanel.Draw();
+
+                // Phase 7.2 (PCG editor-tooling roadmap): "PCG Point Cloud Debug Visualization" --
+                // draws renderer::ClusterRenderPipeline::RunPcgFullPipelineSmokeTest()'s own real
+                // sampler->filter point set as wireframe box gizmos in the live 3D scene (see
+                // renderer::debug::PcgPointCloudDebugView's own class comment). This tab only ever
+                // flips the config toggle + shows the live count -- the actual draw call is fully
+                // owned by ClusterRenderPipeline::RecordFrame, this UI never touches a raw
+                // pcg::PcgPoint itself.
+                ImGui::Separator();
+                ImGui::TextUnformatted("Point Cloud Debug Visualization (Phase 7.2)");
+                ImGui::Checkbox("Show Point Cloud Gizmos", &config::debugview::PCG_POINT_CLOUD_VIZ);
+                ImGui::TextDisabled("Points visualized: %u (from RunPcgFullPipelineSmokeTest's sampler->filter output)",
+                    clusterPipeline.GetDebugPcgPointCloudCount());
+
+                ImGui::Separator();
+                ImGui::TextWrapped(
+                    "Phase 7.3: Node Data Inspector -- shows live post-evaluation pin data for a small, "
+                    "SELF-CONTAINED demo graph built at startup (independent of the canvas above, which "
+                    "is still Phase 7.1's disconnected placeholder scaffold). Not yet wired to a real "
+                    "authored PCG Volume's graph -- that is a future Phase 6 integration point.");
+                if (ImGui::BeginChild("PcgNodeDataInspector_Child", ImVec2(0.0f, 320.0f), ImGuiChildFlags_Borders)) {
+                    g_PcgNodeDataInspector.Draw(g_PcgInspectorDemoGraph.graph, g_PcgInspectorDemoGraph.evalResult,
+                        &g_PcgInspectorDemoGraph.catalog);
+                }
+                ImGui::EndChild();
+
+                // Phase 7.4 (PCG editor-tooling roadmap, closes out Phase 7): "PCG Volume
+                // Inspector" -- browses PcgVolume actors discovered under world_data/actors/ (or,
+                // absent any today, 3 synthetic in-memory demo volumes -- see
+                // renderer::debug::PcgVolumeInspector's own header comment) and edits each one's
+                // seed/bounds/graph-asset-path IN MEMORY ONLY (no write-back in this phase).
+                ImGui::Separator();
+                ImGui::TextWrapped(
+                    "Phase 7.4: PCG Volume Inspector -- browse authored (or, absent any today, "
+                    "SYNTHETIC in-memory demo) PCG Volumes and edit each one's seed/bounds/graph "
+                    "asset path IN MEMORY. Write-back to disk is out of scope for this phase -- see "
+                    "PcgVolumeInspector.h's own header comment for the full scope rationale.");
+                if (ImGui::BeginChild("PcgVolumeInspector_Child", ImVec2(0.0f, 420.0f), ImGuiChildFlags_Borders)) {
+                    g_PcgVolumeInspector.Draw();
+                }
+                ImGui::EndChild();
+
                 ImGui::EndTabItem();
             }
 
@@ -1439,6 +1714,9 @@ int main(int argc, char** argv) {
         // g_StreamingDetailRadius/g_StreamingHlodRadius, plain floats read later this same frame by
         // the streaming tick below.
         if (streamingEnabled) {
+            // Same first-use-only default-collapse as the two panels below -- keeps this overlay
+            // from covering the HUD/camera view on a fresh imgui.ini.
+            ImGui::SetNextWindowCollapsed(true, ImGuiCond_FirstUseEver);
             ImGui::Begin("World Partition Streaming");
             ImGui::SliderFloat("Detail load radius", &g_StreamingDetailRadius, 5.0f, 150.0f);
             ImGui::SliderFloat("HLOD load radius", &g_StreamingHlodRadius, g_StreamingDetailRadius, 250.0f);
@@ -1457,6 +1735,9 @@ int main(int argc, char** argv) {
         // visible starting next frame -- a one-frame lag identical to the streaming panel's own
         // documented staleness above, not a correctness issue for an observability control).
         {
+            // Same first-use-only default-collapse as the Engine Configuration Panel above --
+            // keeps this diagnostic panel from covering the HUD/camera view on a fresh imgui.ini.
+            ImGui::SetNextWindowCollapsed(true, ImGuiCond_FirstUseEver);
             ImGui::Begin("LWC (Large World Coordinates)");
             maths::vec3 originOffset = lwcOrigin.GetCurrentOffset();
             world::CellCoord originCell = lwcOrigin.GetCurrentCell();
@@ -1694,6 +1975,15 @@ int main(int argc, char** argv) {
         clusterPipeline.SetDebugTAATSREnabled(g_DebugState.taatsrEnabled);
         clusterPipeline.SetDebugSSSEnabled(g_DebugState.sssEnabled);
         clusterPipeline.SetDebugSSSRadiusScale(g_DebugState.sssRadiusScale);
+        // UE5.8 rendering-parity gap G5 (Substrate Glint/sparkle): the checkbox zeroes the intensity
+        // scale (an A/B off), otherwise the two sliders scale the material-authored glint live.
+        clusterPipeline.SetDebugGlintDensityScale(g_DebugState.glintDensityScale);
+        clusterPipeline.SetDebugGlintIntensityScale(g_DebugState.glintEnabled ? g_DebugState.glintIntensityScale : 0.0f);
+        // UE5.8 rendering-parity gap G6 (Substrate horizontal mixing): live A/B blend-sharpness knob
+        // (multiplies every horizontally-mixed material's authored mixContrast; 1.0 = unchanged).
+        clusterPipeline.SetDebugMixMaskSharpnessScale(g_DebugState.mixSharpnessScale);
+        // UE5.8-parity gap G1 (Decal system): live decal bounds-overlay toggle (Debug-only).
+        clusterPipeline.SetDebugShowDecalBounds(g_DebugState.showDecalBounds);
         clusterPipeline.SetDebugEnhancedDisplacementEnabled(g_DebugState.enhancedDisplacementEnabled);
         clusterPipeline.SetDebugSplineDeformationEnabled(g_DebugState.splineDeformationEnabled);
         clusterPipeline.SetDebugAsyncComputeEnabled(g_DebugState.asyncComputeEnabled);
