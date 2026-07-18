@@ -290,6 +290,24 @@ public:
     // Init() has run BuildEntityData() -- main.cpp calls it exactly once, right after
     // VulkanContext::Init() returns.
     bool RunInstanceRegistrySmokeTest();
+
+    // Phase 9.2 (test-pipeline integration roadmap): captured outcome of the most recent
+    // RunInstanceRegistrySmokeTest() run. main.cpp calls that smoke test exactly once, right after
+    // Init() returns -- well before DebugTestPipeline::RunAll() ever executes (see main.cpp's own
+    // call ordering: the smoke test at line ~421, RunAll() only reachable at the --test-pipeline
+    // early-return much further down) -- so RunAll() has no way to observe its result except by
+    // querying this getter after the fact. `ran` stays false until the smoke test has actually run
+    // once; `details` mirrors real evidence from that run: the exact PASSED message (probe count,
+    // live entity count) on success, or a pointer to demo_log.txt's own more specific LOG_ERROR line
+    // on failure (matching this codebase's established AudioEngine-smoke-test convention in
+    // DebugTestPipeline.cpp -- granular per-check failure text already exists in the log, this
+    // struct does not duplicate it check-by-check).
+    struct InstanceRegistrySmokeTestResult {
+        bool ran = false;
+        bool passed = false;
+        std::string details;
+    };
+    const InstanceRegistrySmokeTestResult& GetInstanceRegistrySmokeTestResult() const { return m_InstanceRegistrySmokeTestResult; }
 #endif
 
 private:
@@ -595,6 +613,12 @@ private:
     // Debug-only headroom capacity above that count. Data()/TransformData() give the exact same
     // contiguous-array pointer semantics GetEntityData()/GetEntityTransformsCPU() always returned.
     core::InstanceRegistry<kInstanceRegistryCapacity> m_InstanceRegistry;
+
+#ifndef NDEBUG
+    // Backing storage for GetInstanceRegistrySmokeTestResult() above -- see that struct's own
+    // declaration-site comment. Zero-sized/never referenced in Release (whole member compiled out).
+    InstanceRegistrySmokeTestResult m_InstanceRegistrySmokeTestResult;
+#endif
 
     // Phase 5 (Streaming & Monde roadmap, Part 2, Gap 3) BUG FIX: per-SLOT (not per-unit as before
     // this fix), indexed by physical slot (StreamingUnitCoarseSlot(unit)/StreamingUnitFineSlot(unit)

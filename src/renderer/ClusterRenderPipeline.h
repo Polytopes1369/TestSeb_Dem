@@ -104,6 +104,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <string>
 #include <vector>
 #include <vulkan/vulkan.h>
 #include <vk_mem_alloc.h>
@@ -664,6 +665,30 @@ namespace renderer {
         // class' own header comment for why), so this smoke test is its only in-engine validation.
         bool RunPcgCellLoaderSmokeTest(const std::vector<PcgFullPipelineSmokeTestMeshDesc>& weightedMeshes,
             VkCommandPool commandPool, VkQueue queue);
+
+        // Phase 9.2 (test-pipeline integration roadmap): captured outcome of the most recent
+        // RunPcgInstanceDrawSmokeTest()/RunPcgFullPipelineSmokeTest()/RunPhase03DynamicLumenSmokeTest()/
+        // RunPcgCellLoaderSmokeTest() run. All four are called exactly once (main.cpp for the first,
+        // second, and fourth, right after this pipeline's own Init() returns; this class's own
+        // Init() itself for the third -- see RunPhase03DynamicLumenSmokeTest's own comment) well
+        // before DebugTestPipeline::RunAll() ever executes, so RunAll() has no way to observe their
+        // results except by querying these getters after the fact -- same "ran, failed generically
+        // until overwritten with real success details" convention as VulkanContext::
+        // GetInstanceRegistrySmokeTestResult() (see that struct's own comment for the full
+        // rationale, including why failure paths only get a generic demo_log.txt pointer rather than
+        // per-check instrumentation). RunPcgCellLoaderSmokeTest() (Phase 6.3, "Runtime Generator
+        // Hook") was not yet merged to main when this result-storage mechanism was first added --
+        // reconciled in here alongside the other three once Phase 6.3 landed, following the exact
+        // same pattern.
+        struct PcgSmokeTestResult {
+            bool ran = false;
+            bool passed = false;
+            std::string details;
+        };
+        const PcgSmokeTestResult& GetPcgInstanceDrawSmokeTestResult() const { return m_PcgInstanceDrawSmokeTestResult; }
+        const PcgSmokeTestResult& GetPcgFullPipelineSmokeTestResult() const { return m_PcgFullPipelineSmokeTestResult; }
+        const PcgSmokeTestResult& GetPhase03DynamicLumenSmokeTestResult() const { return m_Phase03DynamicLumenSmokeTestResult; }
+        const PcgSmokeTestResult& GetPcgCellLoaderSmokeTestResult() const { return m_PcgCellLoaderSmokeTestResult; }
 
         // PCG editor-tooling roadmap, Phase 7.2 ("PCG Point Cloud Debug Visualization"): last
         // point count RunPcgFullPipelineSmokeTest() uploaded into m_PcgPointCloudDebugView (its own
@@ -1281,6 +1306,15 @@ namespace renderer {
         // RecordFrame's [13c] forward block, right after m_ParticleSystem.RecordDraw, gated by
         // config::debugview::PCG_POINT_CLOUD_VIZ (the "PCG Graph Editor" tab's own checkbox).
         debug::PcgPointCloudDebugView m_PcgPointCloudDebugView;
+
+        // Backing storage for GetPcgInstanceDrawSmokeTestResult()/GetPcgFullPipelineSmokeTestResult()/
+        // GetPhase03DynamicLumenSmokeTestResult()/GetPcgCellLoaderSmokeTestResult() above -- see
+        // PcgSmokeTestResult's own declaration-site comment. Zero-sized/never referenced in Release
+        // (whole members compiled out).
+        PcgSmokeTestResult m_PcgInstanceDrawSmokeTestResult;
+        PcgSmokeTestResult m_PcgFullPipelineSmokeTestResult;
+        PcgSmokeTestResult m_Phase03DynamicLumenSmokeTestResult;
+        PcgSmokeTestResult m_PcgCellLoaderSmokeTestResult;
 #endif
     };
 
