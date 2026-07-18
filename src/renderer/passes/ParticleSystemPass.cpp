@@ -8,6 +8,8 @@
 #include "renderer/passes/AtmosClimatePass.h"
 #include "renderer/passes/ClusterResolvePass.h"
 #include "renderer/passes/GlobalSDFPass.h"
+#include "renderer/passes/VirtualShadowMapPass.h"
+#include "renderer/passes/WorldProbeGridPass.h"
 #include "renderer/vulkan/VulkanPipeline.h"
 #include "renderer/vulkan/VulkanUtils.h"
 
@@ -71,13 +73,28 @@ namespace renderer {
             float cameraRightX = 0.0f, cameraRightY = 0.0f, cameraRightZ = 0.0f, _pad1 = 0.0f;
             float cameraUpX = 0.0f, cameraUpY = 0.0f, cameraUpZ = 0.0f, _pad2 = 0.0f;
             float viewportWidth = 0.0f, viewportHeight = 0.0f, softFadeDistance = 0.0f, globalTime = 0.0f;
+            // Subtask 5.
+            float sunDirectionX = 0.0f, sunDirectionY = 0.0f, sunDirectionZ = 0.0f, sunIntensity = 0.0f;
+            float sunColorR = 0.0f, sunColorG = 0.0f, sunColorB = 0.0f, _pad3 = 0.0f;
+            float heatShimmerStrength = 0.0f, _pad4 = 0.0f, _pad5 = 0.0f, _pad6 = 0.0f;
         };
-        static_assert(sizeof(ParticleRenderParamsUBO) == 192, "ParticleRenderParamsUBO must match ParticleRender.vert/.frag's own UBO exactly (std140 layout)");
+        static_assert(sizeof(ParticleRenderParamsUBO) == 240, "ParticleRenderParamsUBO must match ParticleRender.vert/.frag's own UBO exactly (std140 layout)");
+
+        // Byte-for-byte mirror of world_probe_sampling.glsl's WorldProbeGridParamsUBO (std140) --
+        // identical to renderer::HeroTessellationPass's own copy (see that class' own comment).
+        struct WorldProbeGridParamsUBO {
+            float gridOriginX = 0.0f, gridOriginY = 0.0f, gridOriginZ = 0.0f;
+            float probeSpacing = 0.0f;
+            float gridResolution = 0.0f;
+            float _pad0 = 0.0f, _pad1 = 0.0f, _pad2 = 0.0f;
+        };
+        static_assert(sizeof(WorldProbeGridParamsUBO) == 32, "WorldProbeGridParamsUBO must match world_probe_sampling.glsl's own UBO exactly (std140 layout)");
 
     } // namespace
 
     bool ParticleSystemPass::Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
         const AtmosClimatePass& atmosClimate, const GlobalSDFPass& globalSDF, const ClusterResolvePass& resolvePass,
+        const VirtualShadowMapPass& vsm, const WorldProbeGridPass& worldProbes,
         VkFormat colorFormat, VkFormat depthFormat) {
         Shutdown();
 
@@ -409,10 +426,85 @@ namespace renderer {
             renderWrites[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_RenderSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &renderParamsInfo, nullptr };
             renderWrites[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_RenderSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &sceneDepthInfo, nullptr, nullptr };
             vkUpdateDescriptorSets(m_Device, 2, renderWrites, 0, nullptr);
+        }
 
-            VkDescriptorSetLayout renderPipelineSetLayouts[3] = { m_SetLayout, m_SortSetLayout, m_RenderSetLayout };
+        // =====================================================================================
+        // STEP 6b (Subtask 5) -- ParticleRender.frag's own set 3 ("lighting"): `vsm`'s 4 Virtual
+        // Shadow Map resources + `worldProbes`' grid + a one-time-uploaded WorldProbeGridParamsUBO
+        // -- see Init()'s own comment for the full rationale. Binding indices mirror
+        // ParticleRender.frag's own SHADOW_*/WORLD_PROBE_GRID_* macro definitions exactly (0-3 = VSM,
+        // 4-5 = World Probe Grid).
+        // =====================================================================================
+        {
+            m_WorldProbeGridParamsBuffer.Create(allocator, sizeof(WorldProbeGridParamsUBO),
+                VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
+            WorldProbeGridParamsUBO gridParams{};
+            gridParams.gridOriginX = worldProbes.GetGridOriginWorld().x;
+            gridParams.gridOriginY = worldProbes.GetGridOriginWorld().y;
+            gridParams.gridOriginZ = worldProbes.GetGridOriginWorld().z;
+            gridParams.probeSpacing = WorldProbeGridPass::kProbeSpacing;
+            gridParams.gridResolution = static_cast<float>(WorldProbeGridPass::kGridResolution);
+            VulkanUtils::ExecuteOneShotCommands(m_Device, commandPool, queue, [&](VkCommandBuffer cmd) {
+                vkCmdUpdateBuffer(cmd, m_WorldProbeGridParamsBuffer.Handle(), 0, sizeof(gridParams), &gridParams);
+                });
+
+            VkDescriptorSetLayoutBinding lightingBindings[6]{};
+            lightingBindings[0] = { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr };          // Shadow page table.
+            lightingBindings[1] = { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr };          // Shadow feedback.
+            lightingBindings[2] = { 2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr };  // Shadow physical atlas.
+            lightingBindings[3] = { 3, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr };         // Shadow sun clipmap levels.
+            lightingBindings[4] = { 4, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr }; // World Probe Grid.
+            lightingBindings[5] = { 5, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr };         // World Probe Grid params.
+
+            VkDescriptorSetLayoutCreateInfo lightingLayoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+            lightingLayoutInfo.bindingCount = 6;
+            lightingLayoutInfo.pBindings = lightingBindings;
+            VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &lightingLayoutInfo, nullptr, &m_LightingSetLayout));
+
+            VkDescriptorPoolSize lightingPoolSizes[3] = {
+                { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 },
+                { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2 },
+                { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2 }
+            };
+            VkDescriptorPoolCreateInfo lightingPoolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
+            lightingPoolInfo.maxSets = 1;
+            lightingPoolInfo.poolSizeCount = 3;
+            lightingPoolInfo.pPoolSizes = lightingPoolSizes;
+            VK_CHECK(vkCreateDescriptorPool(m_Device, &lightingPoolInfo, nullptr, &m_LightingDescriptorPool));
+
+            VkDescriptorSetAllocateInfo lightingSetAllocInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+            lightingSetAllocInfo.descriptorPool = m_LightingDescriptorPool;
+            lightingSetAllocInfo.descriptorSetCount = 1;
+            lightingSetAllocInfo.pSetLayouts = &m_LightingSetLayout;
+            VK_CHECK(vkAllocateDescriptorSets(m_Device, &lightingSetAllocInfo, &m_LightingSet));
+
+            VkDescriptorBufferInfo pageTableInfo{ vsm.GetPageTableBuffer(), 0, VK_WHOLE_SIZE };
+            VkDescriptorBufferInfo feedbackInfo{ vsm.GetFeedbackDeviceBuffer(), 0, VK_WHOLE_SIZE };
+            VkDescriptorImageInfo atlasInfo{ vsm.GetPhysicalAtlasSampler(), vsm.GetPhysicalAtlasView(), VK_IMAGE_LAYOUT_GENERAL };
+            VkDescriptorBufferInfo sunLevelsInfo{ vsm.GetSunLevelsBuffer(), 0, VK_WHOLE_SIZE };
+            VkDescriptorImageInfo worldProbeGridInfo{ worldProbes.GetGridSampler(), worldProbes.GetGridView(), VK_IMAGE_LAYOUT_GENERAL };
+            VkDescriptorBufferInfo worldProbeGridParamsInfo{ m_WorldProbeGridParamsBuffer.Handle(), 0, m_WorldProbeGridParamsBuffer.Size() };
+
+            VkWriteDescriptorSet lightingWrites[6]{};
+            lightingWrites[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_LightingSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &pageTableInfo, nullptr };
+            lightingWrites[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_LightingSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &feedbackInfo, nullptr };
+            lightingWrites[2] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_LightingSet, 2, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &atlasInfo, nullptr, nullptr };
+            lightingWrites[3] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_LightingSet, 3, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &sunLevelsInfo, nullptr };
+            lightingWrites[4] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_LightingSet, 4, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &worldProbeGridInfo, nullptr, nullptr };
+            lightingWrites[5] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_LightingSet, 5, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &worldProbeGridParamsInfo, nullptr };
+            vkUpdateDescriptorSets(m_Device, 6, lightingWrites, 0, nullptr);
+        }
+
+        // =====================================================================================
+        // STEP 6c (Subtask 4+5) -- ParticleRender.vert/.frag's own graphics pipeline: 4 sets
+        // (m_SetLayout/m_SortSetLayout/m_RenderSetLayout/m_LightingSetLayout) and 2 color
+        // attachments (particle color, alpha-blended; refraction offset, plain overwrite -- see
+        // this pass' own colorBlendAttachments comment below).
+        // =====================================================================================
+        {
+            VkDescriptorSetLayout renderPipelineSetLayouts[4] = { m_SetLayout, m_SortSetLayout, m_RenderSetLayout, m_LightingSetLayout };
             VkPipelineLayoutCreateInfo renderPipelineLayoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-            renderPipelineLayoutInfo.setLayoutCount = 3;
+            renderPipelineLayoutInfo.setLayoutCount = 4;
             renderPipelineLayoutInfo.pSetLayouts = renderPipelineSetLayouts;
             VK_CHECK(vkCreatePipelineLayout(m_Device, &renderPipelineLayoutInfo, nullptr, &m_RenderPipelineLayout));
 
@@ -460,18 +552,34 @@ namespace renderer {
             colorBlendAttachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
             colorBlendAttachment.alphaBlendOp = VK_BLEND_OP_ADD;
 
+            // Subtask 5: g_RefractionOffset (attachment 1) -- a plain overwrite (blendEnable=FALSE),
+            // same rationale as renderer::TransparentForwardPass's own identical second-attachment
+            // state: a distortion vector doesn't "compose" over a previous forward pass' contribution
+            // the way color does, and ParticleRender.frag's own main() always writes SOME value here
+            // (explicitly (0,0) when heatShimmerStrength == 0, see that shader's own comment), so a
+            // plain overwrite from whichever forward pass drew this pixel LAST is exactly correct.
+            VkPipelineColorBlendAttachmentState refractionBlendAttachment{};
+            refractionBlendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT;
+            refractionBlendAttachment.blendEnable = VK_FALSE;
+
+            VkPipelineColorBlendAttachmentState colorBlendAttachments[2] = { colorBlendAttachment, refractionBlendAttachment };
             VkPipelineColorBlendStateCreateInfo colorBlending{ VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
-            colorBlending.attachmentCount = 1;
-            colorBlending.pAttachments = &colorBlendAttachment;
+            colorBlending.attachmentCount = 2;
+            colorBlending.pAttachments = colorBlendAttachments;
 
             VkDynamicState dynamicStates[2] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
             VkPipelineDynamicStateCreateInfo dynamicState{ VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
             dynamicState.dynamicStateCount = 2;
             dynamicState.pDynamicStates = dynamicStates;
 
+            // Subtask 5: attachment 1 is renderer::TransparentForwardPass::kRefractionOffsetFormat
+            // (RG16F) -- must match exactly, since this pass writes into that SAME shared image (see
+            // RecordDraw's own comment), not a format renderer::TransparentForwardPass merely happens
+            // to also use.
+            VkFormat colorFormats[2] = { colorFormat, VK_FORMAT_R16G16_SFLOAT };
             VkPipelineRenderingCreateInfo pipelineRendering{ VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO };
-            pipelineRendering.colorAttachmentCount = 1;
-            pipelineRendering.pColorAttachmentFormats = &colorFormat;
+            pipelineRendering.colorAttachmentCount = 2;
+            pipelineRendering.pColorAttachmentFormats = colorFormats;
             pipelineRendering.depthAttachmentFormat = depthFormat;
 
             // Depth-tested (reversed-Z) but NOT written, same rationale as
@@ -628,9 +736,11 @@ namespace renderer {
     }
 
     void ParticleSystemPass::RecordDraw(VkCommandBuffer cmd, VkImage colorImage, VkImageView colorView, VkImageView depthView,
-        VkExtent2D renderExtent, const maths::mat4& viewProj, const maths::vec3& cameraPositionWorld,
+        VkImageView refractionOffsetView, VkExtent2D renderExtent,
+        const maths::mat4& viewProj, const maths::vec3& cameraPositionWorld,
         const maths::vec3& cameraRightWorld, const maths::vec3& cameraUpWorld,
-        float softFadeDistanceWorld, float globalTimeSeconds) {
+        const maths::vec3& sunDirectionWorld, const maths::vec3& sunColor, float sunIntensity,
+        float softFadeDistanceWorld, float heatShimmerStrength, float globalTimeSeconds) {
         ParticleRenderParamsUBO ubo{};
         ubo.viewProj = viewProj;
         ubo.invViewProj = viewProj.Inverse();
@@ -641,6 +751,10 @@ namespace renderer {
         ubo.viewportHeight = static_cast<float>(renderExtent.height);
         ubo.softFadeDistance = softFadeDistanceWorld;
         ubo.globalTime = globalTimeSeconds;
+        ubo.sunDirectionX = sunDirectionWorld.x; ubo.sunDirectionY = sunDirectionWorld.y; ubo.sunDirectionZ = sunDirectionWorld.z;
+        ubo.sunIntensity = sunIntensity;
+        ubo.sunColorR = sunColor.x; ubo.sunColorG = sunColor.y; ubo.sunColorB = sunColor.z;
+        ubo.heatShimmerStrength = heatShimmerStrength;
         vkCmdUpdateBuffer(cmd, m_RenderParamsBuffer.Handle(), 0, sizeof(ubo), &ubo);
 
         // Covers both this UBO update AND Subtask 3's own trailing barrier scope gap (RecordSort's
@@ -674,6 +788,21 @@ namespace renderer {
         colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD; // Preserve the already-composited scene underneath.
         colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
 
+        // Subtask 5: renderer::TransparentForwardPass's own shared heat-distortion image -- already
+        // VK_IMAGE_LAYOUT_GENERAL by this point in the frame (that pass' own RecordDraw leaves it
+        // there for renderer::PostProcessPass' later compute read, see ParticleRender.frag's own
+        // header comment) and dynamic rendering legally accepts GENERAL for any attachment use, so
+        // this pass binds it AT that layout directly -- no barrier/transition dance needed for this
+        // specific image, unlike `colorImage`/`depthView` above. loadOp=LOAD preserves whatever
+        // TransparentForwardPass/WaterForwardPass already wrote there this frame (see
+        // ParticleRender.frag's own "why write (0,0) explicitly" comment for the other half of this
+        // contract).
+        VkRenderingAttachmentInfo refractionAttachment{ VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
+        refractionAttachment.imageView = refractionOffsetView;
+        refractionAttachment.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        refractionAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+        refractionAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+
         // Same "already read-only by this point in the frame" assumption as
         // renderer::TransparentForwardPass::RecordDraw's own depth attachment -- see that method's
         // own comment. No transition/barrier needed: depthWriteEnable=FALSE means this pass never
@@ -684,18 +813,19 @@ namespace renderer {
         depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
         depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
 
+        VkRenderingAttachmentInfo colorAttachments[2] = { colorAttachment, refractionAttachment };
         VkRenderingInfo renderingInfo{ VK_STRUCTURE_TYPE_RENDERING_INFO };
         renderingInfo.renderArea = { { 0, 0 }, renderExtent };
         renderingInfo.layerCount = 1;
-        renderingInfo.colorAttachmentCount = 1;
-        renderingInfo.pColorAttachments = &colorAttachment;
+        renderingInfo.colorAttachmentCount = 2;
+        renderingInfo.pColorAttachments = colorAttachments;
         renderingInfo.pDepthAttachment = &depthAttachment;
 
         vkCmdBeginRendering(cmd, &renderingInfo);
 
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_RenderPipeline);
-        VkDescriptorSet renderSets[3] = { GetCurrentSet(), m_SortSet, m_RenderSet };
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_RenderPipelineLayout, 0, 3, renderSets, 0, nullptr);
+        VkDescriptorSet renderSets[4] = { GetCurrentSet(), m_SortSet, m_RenderSet, m_LightingSet };
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_RenderPipelineLayout, 0, 4, renderSets, 0, nullptr);
 
         VkViewport viewport{};
         viewport.width = static_cast<float>(renderExtent.width);
@@ -735,6 +865,9 @@ namespace renderer {
 
     void ParticleSystemPass::Shutdown() {
         if (m_Device != VK_NULL_HANDLE) {
+            if (m_LightingDescriptorPool != VK_NULL_HANDLE) vkDestroyDescriptorPool(m_Device, m_LightingDescriptorPool, nullptr);
+            if (m_LightingSetLayout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(m_Device, m_LightingSetLayout, nullptr);
+
             if (m_RenderPipeline != VK_NULL_HANDLE) vkDestroyPipeline(m_Device, m_RenderPipeline, nullptr);
             if (m_RenderPipelineLayout != VK_NULL_HANDLE) vkDestroyPipelineLayout(m_Device, m_RenderPipelineLayout, nullptr);
             if (m_RenderDescriptorPool != VK_NULL_HANDLE) vkDestroyDescriptorPool(m_Device, m_RenderDescriptorPool, nullptr);
@@ -766,6 +899,11 @@ namespace renderer {
         }
 
         m_RenderParamsBuffer.Destroy();
+        m_WorldProbeGridParamsBuffer.Destroy();
+
+        m_LightingDescriptorPool = VK_NULL_HANDLE;
+        m_LightingSetLayout = VK_NULL_HANDLE;
+        m_LightingSet = VK_NULL_HANDLE;
 
         m_RenderPipeline = VK_NULL_HANDLE;
         m_RenderPipelineLayout = VK_NULL_HANDLE;
