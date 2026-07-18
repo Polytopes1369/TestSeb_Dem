@@ -722,6 +722,14 @@ namespace renderer {
         // is exact over time regardless of framerate (e.g. 200/s at 300 fps spawns 0 or 1 particle
         // most frames, never silently rounding every fractional request down to 0).
         float m_ParticleSpawnAccumulator = 0.0f;
+        // Precipitation feature (rain/snow tied to the Atmos climate simulation) -- identical
+        // fractional-carry-over role as m_ParticleSpawnAccumulator above, just against
+        // config::atmos::PRECIPITATION_INTENSITY * PRECIPITATION_MAX_SPAWN_RATE_PER_SECOND instead
+        // of the embers emitter's own fixed SPAWN_RATE_PER_SECOND. Kept as a separate accumulator
+        // (not reusing m_ParticleSpawnAccumulator) since the two emitters' spawn rates are
+        // independent and this codebase's own m_ParticleSpawnAccumulator comment already establishes
+        // "one accumulator per independent spawn-rate source" as the pattern.
+        float m_PrecipSpawnAccumulator = 0.0f;
 
         // Lumen-style GI infrastructure -- unlike the debug-only stats/overlay block below, these
         // are real (if not yet light-transport-consuming) systems, not visualization tools, so
