@@ -38,6 +38,8 @@ namespace renderer {
     class AtmosClimatePass;
     class GlobalSDFPass;
     class ClusterResolvePass;
+    class VirtualShadowMapPass;
+    class WorldProbeGridPass;
 
     // Byte-for-byte mirror of ParticleCommon.glsl's `Particle` struct -- 64 bytes, std430 (vec3
     // members are 16-byte aligned in std430, so the trailing scalar after each vec3 packs into the
@@ -87,8 +89,18 @@ namespace renderer {
         // this pass draws onto the SAME color image and real depth-stencil attachment every other
         // forward pass (Hero/Water/TransparentForward) targets, not `resolvePass`'s own GBuffer
         // images (those are read-only inputs here, see GetOutputDepthView()'s own comment above).
+        // (Subtask 5) Also builds a THIRD render-pipeline set (set 3, "lighting"): `vsm`'s 4 Virtual
+        // Shadow Map resources (physical atlas + sampler, page table, feedback, sun clipmap levels --
+        // same 4-resource contract as renderer::TransparentForwardPass's own SetVirtualShadowMap, but
+        // taken directly as an Init() parameter here rather than a deferred setter, since
+        // ClusterRenderPipeline::Init() already has `vsm` fully ready by the time it reaches this
+        // call) and `worldProbes`' grid + a ONE-TIME-uploaded WorldProbeGridParamsUBO (mirrors
+        // TransparentForwardPass's own identical "static addressing" simplification -- the grid's
+        // toroidal recentering is not re-uploaded per frame here either, see that class' own Init()
+        // comment for why that limitation already exists elsewhere in this codebase).
         bool Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
             const AtmosClimatePass& atmosClimate, const GlobalSDFPass& globalSDF, const ClusterResolvePass& resolvePass,
+            const VirtualShadowMapPass& vsm, const WorldProbeGridPass& worldProbes,
             VkFormat colorFormat, VkFormat depthFormat);
 
         void Shutdown();
@@ -183,10 +195,23 @@ namespace renderer {
         // method's own comment) and after it (this call ends with vkCmdEndRendering and its own
         // color-attachment-to-whatever-the-caller-needs-next transition, same pattern as
         // TransparentForwardPass::RecordDraw's own trailing barrier).
+        // (Subtask 5) `sunDirectionWorld`/`sunColor`/`sunIntensity` feed the fragment shader's own
+        // shadowed-sun + indirect-diffuse combination (no BRDF/phase term -- a billboard has no real
+        // surface normal, see ParticleRender.frag's own header comment). `refractionOffsetView` is
+        // renderer::TransparentForwardPass::GetRefractionOffsetView() -- this pass becomes that
+        // image's first SECOND writer (bound with loadOp=LOAD at layout GENERAL the entire time, no
+        // extra barrier dance needed: it is already GENERAL by the time TransparentForwardPass's own
+        // RecordDraw finishes, see ParticleSystemPass.cpp's own comment, and dynamic rendering
+        // legally accepts GENERAL for any attachment use). `heatShimmerStrength` is a PER-DRAW-CALL
+        // toggle, not per-particle -- GpuParticle's already-merged 64-byte layout has no spare
+        // "isRefractive" flag, and a demoscene emitter is realistically one thermal "kind" or
+        // another (Subtask 6's ImGui panel will make this tunable per emitter).
         void RecordDraw(VkCommandBuffer cmd, VkImage colorImage, VkImageView colorView, VkImageView depthView,
-            VkExtent2D renderExtent, const maths::mat4& viewProj, const maths::vec3& cameraPositionWorld,
+            VkImageView refractionOffsetView, VkExtent2D renderExtent,
+            const maths::mat4& viewProj, const maths::vec3& cameraPositionWorld,
             const maths::vec3& cameraRightWorld, const maths::vec3& cameraUpWorld,
-            float softFadeDistanceWorld, float globalTimeSeconds);
+            const maths::vec3& sunDirectionWorld, const maths::vec3& sunColor, float sunIntensity,
+            float softFadeDistanceWorld, float heatShimmerStrength, float globalTimeSeconds);
 
     private:
         VkDevice m_Device = VK_NULL_HANDLE;
@@ -253,6 +278,15 @@ namespace renderer {
         VkDescriptorSet m_RenderSet = VK_NULL_HANDLE;
         VkPipelineLayout m_RenderPipelineLayout = VK_NULL_HANDLE;
         VkPipeline m_RenderPipeline = VK_NULL_HANDLE;
+
+        // Subtask 5 -- ParticleRender.frag's own set 3 ("lighting"): `vsm`'s 4 Virtual Shadow Map
+        // resources (borrowed, bound once, never re-written) + `worldProbes`' grid + a one-time-
+        // uploaded WorldProbeGridParamsUBO (see Init()'s own comment on why this is a static upload,
+        // not per-frame). Same one-time-bind convention as the Subtask 2 environment set.
+        GpuBuffer m_WorldProbeGridParamsBuffer; // WorldProbeGridParamsUBO, std140, GPU_ONLY, filled once at Init().
+        VkDescriptorSetLayout m_LightingSetLayout = VK_NULL_HANDLE;
+        VkDescriptorPool m_LightingDescriptorPool = VK_NULL_HANDLE;
+        VkDescriptorSet m_LightingSet = VK_NULL_HANDLE;
     };
 
 }
