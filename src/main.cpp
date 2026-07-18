@@ -42,6 +42,10 @@
 // authored (or synthetic-demo fallback) PCG Volumes and edits seed/bounds/graph-asset-path in
 // memory. See that header's own comment for the full scope rationale.
 #include "renderer/debug/PcgVolumeInspector.h"
+// Audio/Animation/World streaming debug visualization panels (Code Audit Phase 2, 2026-07-18).
+#include "audio/AudioDebugPanel.h"
+#include "animation/AnimationDebugPanel.h"
+#include "world/WorldPartitionDebugPanel.h"
 #endif
 
 // Unreal-editor style viewport navigation: hold the Right Mouse Button to enable FPS-style
@@ -1640,6 +1644,11 @@ int main(int argc, char** argv) {
                         audioEngine.GetPositionalSourceName(i), audioEngine.GetPositionalPan(i), audioEngine.GetPositionalDistanceGain(i));
                 }
 
+                // Audio Debug Panel (Code Audit Phase 2) -- organized real-time diagnostics
+                ImGui::Separator();
+                ImGui::TextUnformatted("Live Audio Diagnostics (Enhanced)");
+                audio::debug::AudioDebugPanel::RenderImGui(audioEngine);
+
                 ImGui::EndTabItem();
             }
 
@@ -1696,6 +1705,20 @@ int main(int argc, char** argv) {
                 }
                 ImGui::EndChild();
 
+                ImGui::EndTabItem();
+            }
+
+            // --- Animation Debug Panel (Code Audit Phase 2) ---
+            // Displays skeletal animator state: bone chain, undulation gait parameters, etc.
+            if (ImGui::BeginTabItem("Animation")) {
+                animation::debug::AnimationDebugPanel::RenderImGui(g_SkeletalAnimator);
+                ImGui::EndTabItem();
+            }
+
+            // --- World Partition Streaming Debug Panel (Code Audit Phase 2) ---
+            // Displays streaming manager state: tracked cells, in-flight loads, queue depth.
+            if (ImGui::BeginTabItem("Streaming")) {
+                world::debug::WorldPartitionDebugPanel::RenderImGui(g_StreamingManager);
                 ImGui::EndTabItem();
             }
 
