@@ -1,0 +1,11 @@
+# 1. Remplacez l'ancienne adresse (VulkanPC) par celle du nouveau dépôt
+git remote set-url origin https://github.com/Polytopes1369/TestSeb_Dem.git
+
+# 2. Ajoutez tous les fichiers et sous-dossiers actuels du dossier DemoScene_2026
+git add .
+
+# 3. Créez le commit avec vos fichiers actuels
+git commit -m "Mise à jour et transfert vers TestSeb_Dem"
+
+# 4. Envoie le tout sur le nouveau dépôt en écrasant l'historique distant si nécessaire
+git push -u origin main -f
