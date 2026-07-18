@@ -366,14 +366,28 @@ private:
     // translucent, emissive, MegaLights, Lumen GI), plus 2 static colored walls forming the Lumen
     // GI corner, the floor (a Phase 7b procedural terrain heightfield, not a flat plane), and a
     // Phase 7c water plane.
-    static constexpr uint32_t kEntityCount = 16;
+    // Procedural tree generator (renderer::ProceduralTreePass -- CLAUDE.md's "Arbres (generes par
+    // du code style speedtree)" requirement): kTreeVisualCount distinct trees, each baked as TWO
+    // entities (bark + leaves, see ProceduralTreePass.h's own class comment for why one entity
+    // can't hold both materials), inserted right after the 12 gallery primitives (indices
+    // [kTreeEntityIndexBase, kTreeEntityIndexBase + kTreeEntityCount)). The walls/floor/water block
+    // below is keyed off kEntityCount's OWN END (kEntityCount - 4/3/2/1), so growing kEntityCount
+    // to make room for the tree entities automatically shifts those to the new end without any
+    // other change -- exactly the same "keyed by absolute index, not distance from the start"
+    // mechanism GenerateShowcaseMaterialTable()/GridSlot() already rely on for the first 12.
+    static constexpr uint32_t kTreeVisualCount = 4;
+    static constexpr uint32_t kTreeEntityIndexBase = 12;
+    static constexpr uint32_t kTreeEntityCount = kTreeVisualCount * 2u; // bark + leaves per tree.
+
+    static constexpr uint32_t kEntityCount = 16 + kTreeEntityCount;
     // The 2 static walls that form the Lumen/GI showcase corner (see GenerateGeometry()'s wall
     // blocks and UpdateEntityRotations()'s fixed-rotation branch for them) -- generated right
     // before the floor. Deliberately offset from kEntityCount by 4/3 (not 3/2, as before Phase 7c)
-    // so adding the water plane as the new last entity does not shift these -- both must stay at
-    // their existing absolute indices (12/13), since GenerateShowcaseMaterialTable()'s own
-    // per-slot recipes and GridSlot()'s own zone layout are keyed by absolute index, not by
-    // "distance from the end".
+    // so adding the water plane as the new last entity does not shift these -- both stay at
+    // kEntityCount-4/kEntityCount-3 (12/13 before the tree entities above were inserted, now
+    // shifted to 20/21), since GenerateShowcaseMaterialTable()'s own per-slot recipes are keyed by
+    // an EXPLICIT materialID override at those two entity indices (see BuildEntityData()'s own
+    // kWallMaterialIDA/B constants), not by an implicit materialID==entityIndex assumption.
     static constexpr uint32_t kWallEntityIndexA = kEntityCount - 4;
     static constexpr uint32_t kWallEntityIndexB = kEntityCount - 3;
     // The floor (a Phase 7b terrain heightfield) is generated right before the water plane -- see

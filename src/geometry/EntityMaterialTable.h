@@ -11,6 +11,11 @@
 
 #include <cstdint>
 #include "geometry/ClusterFormat.h"
+// Reserved tree bark/foliage materialID constants only (kTreeBarkMaterialID/kTreeLeafMaterialID) --
+// a lightweight, dependency-free constants header, same "geometry may reference a plain renderer
+// data/constant header" precedent already established by ClusterDAG.h's own
+// #include "renderer/RenderTypes.h".
+#include "renderer/MaterialParameterTable.h"
 
 namespace geometry {
 
@@ -21,9 +26,30 @@ namespace geometry {
 
     // materialID -> {maxWPOAmplitude, maskTextureIndex}. Extend this switch as new procedurally-
     // generated material types (foliage, tree canopies, etc.) are added to the scene.
+    //
+    // renderer::ProceduralTreePass (real tree geometry, not just a foliage-look material) wires its
+    // wind sway through this SAME existing mechanism -- maxWPOAmplitude feeds
+    // src/shaders/include/wpo_deformation.glsl's ApplyWPODeformation, a per-cluster, height-scaled,
+    // phase-offset sine sway (see that file's own header comment). No real Atmos wind-VECTOR is
+    // plumbed into WPO anywhere in this codebase today (confirmed by grepping every
+    // SampleWindVelocity/wind-direction call site: all of them feed AtmosClouds/AtmosVolumetricFog/
+    // ParticleSimulation, never ClusterRaster.vert or this file) -- so this IS this project's
+    // documented time-based-sine placeholder (per the tree-generation task's own explicit fallback
+    // allowance), not a simplification introduced here. A future pass wiring a real wind vector into
+    // WPO would extend ApplyWPODeformation's signature, not this table.
     constexpr EntityMaterialProperties GetEntityMaterialProperties(uint32_t materialID) {
         switch (materialID) {
             case 1u: return EntityMaterialProperties{ 0.15f, 0u }; // Example foliage/tree material: sways, cutout mask slot 0.
+            // Tree bark/branches: solid cylinder geometry (no cutout mask), a small sway so the
+            // whole tree isn't perfectly rigid -- much less than the foliage's own sway below, since
+            // a real trunk/branch is far stiffer than a leaf cluster.
+            case renderer::kTreeBarkMaterialID: return EntityMaterialProperties{ 0.06f, kInvalidMaskTextureIndex };
+            // Tree foliage: the leaf cross-quad cards -- full opacity-cutout (mask slot 0, the same
+            // procedurally-generated blotchy leaf-cluster silhouette every other foliage-style
+            // material already reuses, see ProceduralMaskGenerate.comp's own header comment) plus
+            // the strongest sway in this table (a leaf cluster is the most wind-responsive part of a
+            // tree).
+            case renderer::kTreeLeafMaterialID: return EntityMaterialProperties{ 0.35f, 0u };
             default: return EntityMaterialProperties{ 0.0f, kInvalidMaskTextureIndex };
         }
     }

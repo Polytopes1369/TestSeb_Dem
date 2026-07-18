@@ -5,6 +5,7 @@
 #include "core/Logger.h"
 #include "renderer/MaterialParameterTable.h"
 #include "renderer/RenderTypes.h"
+#include "renderer/passes/ProceduralTreePass.h"
 #include "renderer/vulkan/RayTracingFunctions.h"
 #include "renderer/vulkan/VulkanUtils.h"
 #include "core/debug/ValidationMessageSink.h"
@@ -1580,6 +1581,16 @@ void VulkanContext::BuildEntityData() {
   // renderer::GenerateShowcaseMaterialTable's own comment for the full per-entity mapping.
   m_MaterialTable = renderer::GenerateShowcaseMaterialTable();
 
+  // Cornell-box wall colors (GenerateShowcaseMaterialTable()'s own hand-authored table.params[12]/
+  // [13] recipes) are hand-authored at these two FIXED materialID slots, independent of which
+  // entity index actually renders them -- before the procedural-tree entities below were inserted,
+  // kWallEntityIndexA/B happened to equal these same two numbers, so the pre-existing
+  // `entity.materialID = i` default silently did the right thing. That coincidence no longer holds
+  // once kTreeEntityCount pushes kWallEntityIndexA/B upward, so both are now named explicitly and
+  // assigned via the same override mechanism the hero/floor/water entities already use below.
+  constexpr uint32_t kWallMaterialIDA = 12u;
+  constexpr uint32_t kWallMaterialIDB = 13u;
+
   for (uint32_t i = 0; i < kEntityCount; ++i) {
     core::EntityID id = core::IDManager::GetNextID();
 
@@ -1592,16 +1603,21 @@ void VulkanContext::BuildEntityData() {
 
     // VSM advanced roadmap, Feature 2 (real static-vs-dynamic page invalidation): activates the
     // previously-dead IsDynamic bit on the 12 continuously-rotating showcase entities (indices
-    // [0, kWallEntityIndexA) == [0, 12) -- see UpdateEntityRotations(), which leaves exactly the
-    // last 4 showcase entities (the 2 Lumen-corner walls, the floor, the water plane --
-    // kWallEntityIndexA..kWaterEntityIndex) permanently static). Gives renderer::
-    // VirtualShadowMapPass's own per-page dynamic-content classification a real, meaningful flag
-    // to test instead of the dead default of always-0.
-    if (i < kWallEntityIndexA) {
+    // [0, kTreeEntityIndexBase) == [0, 12) -- see UpdateEntityRotations(), which leaves every
+    // entity from kTreeEntityIndexBase onward (the procedural trees, the 2 Lumen-corner walls, the
+    // floor, the water plane) permanently static. Gives renderer::VirtualShadowMapPass's own
+    // per-page dynamic-content classification a real, meaningful flag to test instead of the dead
+    // default of always-0.
+    if (i < kTreeEntityIndexBase) {
       core::SetFlag(entity.flags, core::EntityFlags::IsDynamic, true);
     }
 
-    bool isTransparent = m_MaterialTable.isTransparent[i];
+    // Only valid for i in [0, kTreeEntityIndexBase) -- the default `entity.materialID = i` above is
+    // only correct for the 12 showcase primitives (materialID == entity index BY DESIGN, see
+    // GenerateShowcaseMaterialTable()'s own zone-layout comment); every entity from
+    // kTreeEntityIndexBase onward gets its real materialID (and, from it, isTransparent) from an
+    // explicit override below instead.
+    bool isTransparent = (i < kTreeEntityIndexBase) ? m_MaterialTable.isTransparent[i] : false;
     // Phase 7a (UE5.8 parity roadmap, hero asset tessellation): the Icosphere (kHeroEntityIndex)
     // is the single tessellated/displaced hero asset, rendered ONLY by
     // renderer::HeroTessellationPass -- never by the opaque Nanite VisBuffer pipeline (no
@@ -1619,6 +1635,29 @@ void VulkanContext::BuildEntityData() {
       entity.materialID = renderer::kHeroMaterialID;
       isTransparent = true;
     }
+    // Procedural tree generator (renderer::ProceduralTreePass): each tree is baked as a bark
+    // entity followed immediately by its leaf entity (see VulkanContext.h's own kTreeEntityCount
+    // comment) -- even local offset = bark (opaque solid cylinder mesh), odd local offset = leaves
+    // (opaque base material too: the leaf cards use an opacity-CUTOUT mask, not alpha-blend
+    // transparency, see MaterialParameterTable.h's own kTreeLeafMaterialID comment for why
+    // isTransparent correctly stays false for it).
+    if (i >= kTreeEntityIndexBase && i < kTreeEntityIndexBase + kTreeEntityCount) {
+      uint32_t localIdx = i - kTreeEntityIndexBase;
+      bool isLeafPart = (localIdx % 2u) == 1u;
+      entity.materialID = isLeafPart ? renderer::kTreeLeafMaterialID : renderer::kTreeBarkMaterialID;
+      isTransparent = m_MaterialTable.isTransparent[entity.materialID];
+    }
+    // Lumen/GI showcase corner walls -- see kWallMaterialIDA/B's own comment above for why this
+    // explicit override is now required (materialID == entity index no longer coincidentally holds
+    // for these two once the procedural-tree entities shifted kWallEntityIndexA/B upward).
+    if (i == kWallEntityIndexA) {
+      entity.materialID = kWallMaterialIDA;
+      isTransparent = m_MaterialTable.isTransparent[entity.materialID];
+    }
+    if (i == kWallEntityIndexB) {
+      entity.materialID = kWallMaterialIDB;
+      isTransparent = m_MaterialTable.isTransparent[entity.materialID];
+    }
     // Phase 7b (UE5.8 parity roadmap, terrain heightfield): the floor entity is now a procedural
     // terrain heightfield (see GenerateGeometry()'s own terrain block), not a flat plane -- override
     // its materialID to the reserved renderer::kTerrainMaterialID slot so ClusterResolve.comp/
@@ -1628,6 +1667,7 @@ void VulkanContext::BuildEntityData() {
     // comment).
     if (i == kFloorEntityIndex) {
       entity.materialID = renderer::kTerrainMaterialID;
+      isTransparent = m_MaterialTable.isTransparent[entity.materialID];
     }
     // Phase 7c (UE5.8 parity roadmap, water/erosion): the water entity -- same exclusion mechanism
     // as the hero entity's own override above (forced IsTransparent so ClusterLODCompact.comp
@@ -2554,7 +2594,71 @@ void VulkanContext::GenerateGeometry() {
   }
 
   // -------------------------------------------------------------------------
-  // LUMEN/GI SHOWCASE CORNER (slots 12/13) — two static colored walls meeting at a right angle
+  // TREES (entities kTreeEntityIndexBase..kTreeEntityIndexBase+kTreeEntityCount-1) -- Procedural
+  // SpeedTree-style trees (renderer::ProceduralTreePass), fulfilling CLAUDE.md's "Arbres (generes
+  // par du code style speedtree)" requirement: kTreeVisualCount distinct trees, each two entities
+  // (bark + leaves -- see ProceduralTreePass.h's own class comment on why one entity can't hold
+  // both materials), placed in their own small clearing one zone-pitch step east of the 3x3
+  // showcase grid's own col=1 primitives (see GridSlot()'s own comment for that grid's layout) so
+  // they read as a distinct feature area, never overlapping any existing zone, while staying close
+  // enough to land inside the default camera framing. Each tree's bark+leaf pair is generated by
+  // its own scoped ProceduralTreePass instance (Init -> RecordGenerate -> Shutdown, all within this
+  // block) -- see that class's own header comment for why this is a bake-time-only pass, not a
+  // persistent per-frame one like renderer::GlobalSDFPass.
+  // -------------------------------------------------------------------------
+  {
+    renderer::ProceduralTreePass treePass;
+    treePass.Init(m_Device, m_CommandPool, m_GraphicsQueue, m_VertexBuffer, m_IndexBuffer);
+
+    constexpr float kTreeClearingX = 10.0f;  // One zone-pitch step past the gallery's own col=1 (x=4).
+    constexpr float kTreeRowSpacing = 4.0f;
+    // Matches the terrain/floor's own worldOffsetY (GenerateTerrain()'s -0.8f call-site argument
+    // below) -- trees are planted AT ground level, unlike the showcase primitives above (which
+    // deliberately float at the gallery's own y=0 "display stage" height, see GridSlot()'s header
+    // comment).
+    constexpr float kTreeGroundY = -0.8f;
+
+    LOG_INFO(std::format("[GenerateGeometry] Generating {} procedural trees (renderer::ProceduralTreePass)...",
+                          kTreeVisualCount));
+
+    for (uint32_t t = 0; t < kTreeVisualCount; ++t) {
+      uint32_t barkEntityIndex = kTreeEntityIndexBase + t * 2u;
+      uint32_t leafEntityIndex = barkEntityIndex + 1u;
+
+      renderer::ProceduralTreePass::TreeParams params{};
+      // Deterministic per-tree seed (see tree_lsystem.glsl's own "fully deterministic" comment --
+      // this demo must play back identically every run) -- an arbitrary odd multiplier spreads the
+      // low tree index `t` across the hash's full bit range rather than leaving 4 seeds that only
+      // differ in their low 2 bits.
+      params.seed = 0x5EED0000u + t * 0x1000193u;
+      params.depth = 4;
+      params.branchFactor = 3;
+      params.trunkHeight = 2.0f + 0.35f * float(t % 3u);
+      params.trunkRadius = 0.13f + 0.015f * float(t % 2u);
+      params.lengthTaper = 0.72f;
+      params.radiusTaper = 0.62f;
+      params.branchAngleRadians = 0.55f;
+      params.pitchDamping = 0.6f;
+      params.sides = 6;
+      params.leafSize = 0.22f;
+
+      params.barkMeshID = m_EntityData[barkEntityIndex].meshID;
+      params.barkMaterialID = static_cast<float>(m_EntityData[barkEntityIndex].materialID);
+      params.leafMeshID = m_EntityData[leafEntityIndex].meshID;
+      params.leafMaterialID = static_cast<float>(m_EntityData[leafEntityIndex].materialID);
+
+      params.worldOffsetX = kTreeClearingX;
+      params.worldOffsetY = kTreeGroundY;
+      params.worldOffsetZ = (float(t) - 0.5f * float(kTreeVisualCount - 1u)) * kTreeRowSpacing;
+
+      treePass.RecordGenerate(params, runningVertexOffset, runningIndexOffset);
+    }
+
+    treePass.Shutdown();
+  }
+
+  // -------------------------------------------------------------------------
+  // LUMEN/GI SHOWCASE CORNER (entities kWallEntityIndexA/B) — two static colored walls meeting at a right angle
   // around the ChamferBox (slot 11, zone (0,0)): a plain-colored diffuse corner is the clearest
   // possible demonstration of Lumen-style indirect color bounce (the neutral-gray ChamferBox
   // picks up the red/green tint purely from bounced light, with no material trickery of its own).
@@ -2576,7 +2680,7 @@ void VulkanContext::GenerateGeometry() {
     constexpr float kFloorTopY = -0.8f;   // Must match the floor's own worldOffsetY below.
     constexpr float kWallCenterY = kFloorTopY + kWallSpan * 0.5f; // Wall base sits exactly on the floor.
 
-    // WALL A (slot 12) — red, vertical plane fixed at X = -1.8, spanning Z in [-1.5, 1.5].
+    // WALL A (entity kWallEntityIndexA) — red, vertical plane fixed at X = -1.8, spanning Z in [-1.5, 1.5].
     // Baked flat then stood up about the X axis... no -- about the Z axis (see
     // UpdateEntityRotations(): RotateZ maps the baked local-X extent onto world Y, leaving X and Z
     // pinned), which is why the wall's OWN world-space X position comes from `slot.x` below.
@@ -2587,7 +2691,7 @@ void VulkanContext::GenerateGeometry() {
                     config::FLOOR_VERTEX_SPACING);
     }
 
-    // WALL B (slot 13) — green, vertical plane fixed at Z = -1.8, spanning X in [-1.5, 1.5].
+    // WALL B (entity kWallEntityIndexB) — green, vertical plane fixed at Z = -1.8, spanning X in [-1.5, 1.5].
     // Stood up about the X axis instead (RotateX maps the baked local-Z extent onto world Y,
     // leaving X and Z pinned) -- perpendicular to Wall A, closing the corner.
     {
@@ -2599,7 +2703,7 @@ void VulkanContext::GenerateGeometry() {
   }
 
   // -------------------------------------------------------------------------
-  // TERRAIN HEIGHTFIELD (slot 14) — Phase 7b (UE5.8 parity roadmap): 300m x 300m procedural
+  // TERRAIN HEIGHTFIELD (entity kFloorEntityIndex) — Phase 7b (UE5.8 parity roadmap): 300m x 300m procedural
   // terrain replacing what used to be a flat floor plane, at the same world footprint -- see
   // GenerateTerrain()'s own comment and terrain_noise.glsl's kTerrainAmplitude comment for why its
   // height variation stays small (this gallery floats every zone primitive at a fixed clearance
@@ -2628,7 +2732,7 @@ void VulkanContext::GenerateGeometry() {
   }
 
   // -------------------------------------------------------------------------
-  // WATER (slot 15) -- Phase 7c (UE5.8 parity roadmap, water/erosion): 16th entity, a flat plane
+  // WATER (entity kWaterEntityIndex) -- Phase 7c (UE5.8 parity roadmap, water/erosion): a flat plane
   // sized to the showcase zone-grid's own footprint (not the full 300x300 terrain -- the depth
   // test against the already-rasterized terrain naturally clips this flat quad to whatever low-
   // lying basin actually falls within it, so an oversized water plane would just waste fragment-
@@ -2801,10 +2905,11 @@ void VulkanContext::GenerateGeometry() {
         "Procedural geometry buffers overflowed -- see log for exact sizes.");
   }
 
-  LOG_INFO(std::format("[GenerateGeometry] All 12 primitives + 2 Lumen walls + floor generated: "
+  LOG_INFO(std::format("[GenerateGeometry] All 12 primitives + {} procedural trees + 2 Lumen walls "
+                       "+ floor + water generated: "
                        "totalVertexCount={} totalIndexCount={} "
                        "(buffers hold {} verts / {} indices max)",
-                       runningVertexOffset, runningIndexOffset,
+                       kTreeVisualCount, runningVertexOffset, runningIndexOffset,
                        m_VertexBufferBytes / sizeof(renderer::Vertex),
                        m_IndexBufferBytes / sizeof(uint32_t)));
 }
@@ -3027,6 +3132,21 @@ void VulkanContext::UpdateEntityRotations(float timeSeconds, const maths::vec3 &
       xform.rotation = maths::mat4{};
       xform.centerX = 0.0f;
       xform.centerY = kWaterLevel;
+      xform.centerZ = 0.0f;
+      xform._pad0 = 0.0f;
+    } else if (meshID >= kTreeEntityIndexBase && meshID < kTreeEntityIndexBase + kTreeEntityCount) {
+      // Procedural trees (renderer::ProceduralTreePass): static, no self-rotation (a real tree
+      // doesn't spin like the showcase primitives below) -- `center`'s exact value is mathematically
+      // irrelevant here: with rotation == identity, `center + rotation*(restPos - center)` reduces
+      // to exactly `restPos` regardless of center (the identical fact this function's own floor/
+      // wallA/wallB/water branches above already rely on), and geom_tree_bark.comp/
+      // geom_tree_leaves.comp already bake each tree's full world placement directly into restPos
+      // via their own worldOffsetX/Y/Z push-constant fields (see VulkanContext::GenerateGeometry()'s
+      // own TREES block) -- so this branch exists purely to keep GridSlot(meshID) (below, sized for
+      // only the original 12 gallery primitives) from ever being called with an out-of-range index.
+      xform.rotation = maths::mat4{};
+      xform.centerX = 0.0f;
+      xform.centerY = 0.0f;
       xform.centerZ = 0.0f;
       xform._pad0 = 0.0f;
     } else {
