@@ -218,9 +218,9 @@ void main() {
         p2Local = mix(p2Local, ApplySplineDeformation(p2Local, splineControlPoints), g_WPOGlobals.splineDeformationDebugMultiplier);
     }
 
-    p0 = xform.center + rotation * p0Local;
-    p1 = xform.center + rotation * p1Local;
-    p2 = xform.center + rotation * p2Local;
+    p0 = xform.translation + xform.center + rotation * p0Local;
+    p1 = xform.translation + xform.center + rotation * p1Local;
+    p2 = xform.translation + xform.center + rotation * p2Local;
 
     // Reapply the exact same WPO sway both rasterizers already applied -- see
     // ClusterResolve.comp's own comment for why this must happen before re-deriving barycentrics.

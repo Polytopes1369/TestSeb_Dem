@@ -8,7 +8,8 @@ namespace core {
         uint32_t materialID;
         uint32_t cellID;
         uint32_t flags; // Bit 0: CastShadows, Bit 1: IsInteractive, Bit 2: IsDynamic, Bit 3: UseCustomFog,
-                         // Bit 4: IsTransparent, Bit 5: HasEnhancedDisplacement, Bit 6: HasSplineDeformation
+                         // Bit 4: IsTransparent, Bit 5: HasEnhancedDisplacement, Bit 6: HasSplineDeformation,
+                         // Bit 7: StreamingInactive
     };
 
     enum EntityFlags : uint32_t {
@@ -27,7 +28,15 @@ namespace core {
         HasEnhancedDisplacement = 1 << 5,
         // Phase 1 (Nanite advanced): runtime Hermite-spline bend of this entity's rest-pose local
         // geometry, applied before the rigid per-entity rotation (include/spline_deformation.glsl).
-        HasSplineDeformation = 1 << 6
+        HasSplineDeformation = 1 << 6,
+        // Runtime World Partition streaming (renderer::VulkanContext::kStreamingSlotBase and
+        // world::WorldCellStreamingLoader): set on a streaming entity slot that is not currently
+        // claimed by any streamed-in cell. Gated at ClusterLODCompact.comp's own candidate-routing
+        // stage (same exclusion mechanism already used for IsTransparent) so an idle slot's
+        // (always geometrically valid, just parked) mesh never actually rasterizes. Always 0 for
+        // every non-streaming entity -- untouched by VulkanContext::BuildEntityData()'s original
+        // showcase-entity loop, so this bit changes nothing about their existing behavior.
+        StreamingInactive = 1 << 7
     };
 
     inline void SetFlag(uint32_t& flags, EntityFlags f, bool value) {
@@ -50,5 +59,8 @@ namespace core {
     struct EntityTransformCPU {
         maths::mat4 rotation;
         maths::vec3 center;
+        // Additional world-space offset on top of the rotate-about-center result -- see
+        // struct_custo.glsl's EntityTransform comment. Zero for every non-streaming entity.
+        maths::vec3 translation{};
     };
 }

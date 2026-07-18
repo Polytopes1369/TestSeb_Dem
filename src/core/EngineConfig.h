@@ -290,7 +290,40 @@ inline float SHARPEN_RADIUS_PIXELS = 1.0f;
 // Film Grain (animated, luminance-response-curved).
 inline float FILM_GRAIN_INTENSITY = 0.0f;
 inline float FILM_GRAIN_RESPONSE_MIDPOINT = 0.5f;
+
+// --- Real-time per-effect enable/disable toggles (ImGui "Post FX" tab, main.cpp) ---
+// Every effect below already has its own "strength" knob (an intensity/density/distance
+// parameter) whose zero value is mathematically equivalent to that effect being off -- see each
+// toggle's own call site in renderer::ClusterRenderPipeline::RecordFrame, which zeroes the
+// corresponding Settings field for one frame when its toggle is false rather than special-casing
+// every shader with a redundant enabled/disabled branch. Not wired into ApplyProfile() (these are
+// live debug/comparison switches, not a hardware-quality tier).
+inline bool BLOOM_ENABLED = true;
+inline bool CHROMATIC_ABERRATION_ENABLED = true;
+inline bool VIGNETTE_ENABLED = true;
+inline bool HEAT_DISTORTION_ENABLED = true;
+inline bool MOTION_BLUR_ENABLED = true;
+inline bool HEIGHT_FOG_ENABLED = true;
+inline bool GOD_RAYS_ENABLED = true;
+inline bool PANINI_ENABLED = true;
+inline bool SHARPEN_ENABLED = true;
+inline bool FILM_GRAIN_ENABLED = true;
+inline bool WHITE_BALANCE_ENABLED = true;
+inline bool COLOR_CORRECTION_ENABLED = true;
+inline bool DOF_ENABLED = true;
+inline bool AO_ENABLED = true;
+inline bool CONTACT_SHADOW_ENABLED = true;
+inline bool SSR_FALLBACK_ENABLED = true;
 } // namespace postprocess
+
+// Debug-only (ImGui "Buffer Viewer" tab, main.cpp) -- which intermediate GBuffer/GI buffer to
+// blit to the swapchain instead of the normal post-processed final image this frame. Index 0
+// ("Off") always means "show the real final composite" -- see
+// renderer::debug::DebugBufferViewPass and its call site in
+// renderer::ClusterRenderPipeline::RecordFrame for the actual list/ordering this indexes into.
+namespace debugview {
+inline int SELECTED_BUFFER_INDEX = 0;
+} // namespace debugview
 
 namespace volumetrics {
 inline uint32_t _TEXTURE_QUALITY = 4;
@@ -299,6 +332,25 @@ inline bool _VOLUMETRIC_FOG_ENABLE = true;
 inline uint32_t _VOLUMETRIC_FOG_GRID_PIXEL_SIZE = 4;
 inline float _VOLUMETRIC_CLOUD_VIEW_RAY_SAMPLE_COUNT_SCALE = 2.0f;
 } // namespace volumetrics
+
+// Atmos weather system (atmos_integration_plan.md, Subtask 1: Climatic State Manager & Wind
+// Simulation) -- live simulation knobs, not a quality-preset tier, so unlike volumetrics:: above
+// these are NOT mirrored into EngineConfig_{Low,Medium,High,Extrem}.h / Apply*Preset(): they are
+// runtime state a user tunes live via the Volumetric ImGui tab, the same way config::temporal::
+// BLEND_ALPHA or config::shadows' non-"_QUALITY" members already are.
+namespace atmos {
+inline float TEMPERATURE_CELSIUS = 22.0f;
+inline float RELATIVE_HUMIDITY = 0.55f; // Fraction [0,1], NOT percent -- see AtmosClimatePass::RecordUpdate's own Magnus-Tetens comment.
+inline float WIND_DIRECTION_DEGREES = 45.0f; // Compass bearing in the XZ plane, 0 = +Z (North), 90 = +X (East).
+inline float WIND_SPEED_MPS = 3.0f;
+inline float WIND_TURBULENCE_FREQUENCY = 0.15f;
+inline float WIND_TURBULENCE_OCTAVES = 3.0f;
+inline float WIND_TURBULENCE_SCALE = 1.0f;
+inline float WIND_TURBULENCE_ROUGHNESS = 0.5f;
+inline float CLOUD_DENSITY_TARGET = 0.5f; // [0,1] -- unconsumed until Subtask 4 (Volumetric Clouds).
+inline float FOG_DENSITY_TARGET = 0.1f; // [0,1] -- unconsumed until Subtask 3 (Froxel Volumetric Fog).
+inline float RAIN_STRENGTH = 0.0f; // [0,1] -- unconsumed until a future precipitation pass.
+} // namespace atmos
 
 // Active loaded state
 inline bool g_ProfileLoaded = false;

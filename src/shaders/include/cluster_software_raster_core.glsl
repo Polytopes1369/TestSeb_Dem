@@ -56,9 +56,9 @@ void RasterizeClusterTriangle(ClusterCullMetadata cluster, uint clusterSlotIndex
         p2Local = mix(p2Local, ApplySplineDeformation(p2Local, splineControlPoints), g_WPOGlobals.splineDeformationDebugMultiplier);
     }
 
-    p0World = xform.center + rotation * p0Local;
-    p1World = xform.center + rotation * p1Local;
-    p2World = xform.center + rotation * p2Local;
+    p0World = xform.translation + xform.center + rotation * p0Local;
+    p1World = xform.translation + xform.center + rotation * p1Local;
+    p2World = xform.translation + xform.center + rotation * p2Local;
 
 #if HAS_MASK_SUPPORT
     // Only decoded when this cluster is actually masked -- sparing the opaque case (impossible in

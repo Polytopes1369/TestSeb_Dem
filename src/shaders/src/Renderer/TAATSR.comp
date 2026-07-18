@@ -166,11 +166,25 @@ void main() {
         
         // Blend current frame and clamped history
         float alpha = ubo.jitterOffset == vec2(0.0) ? ubo.blendAlphaStatic : ubo.blendAlpha;
-        
-        // Adaptively reduce history contribution if the difference is very large
+
+        // Adaptively reduce history contribution if the difference is very large. Real
+        // disocclusion (camera/object motion revealing new geometry) is already fully handled
+        // above via the depth-reprojection hasHistory check, which bypasses this blend entirely --
+        // so this heuristic only needs to catch smaller residual artifacts (e.g. a specular
+        // highlight sliding across a surface), not act as a second disocclusion detector.
+        // Letting it saturate to alpha=1.0 (full history discard) is actively harmful for
+        // MegaLightsShade.comp's 1-sample-per-pixel-per-frame RIS estimator (see
+        // megalights_ris.glsl's SelectLightRIS comment: "no cross-pixel/cross-frame state --
+        // temporal/spatial reuse is explicitly Phase B"): that noise alone produces a large
+        // frame-to-frame colorDiff on any multi-light surface even with a fully static camera,
+        // which would otherwise zero out history every frame and pass the raw per-pixel noise
+        // straight through as visible flicker. Capping the boost below 1.0 guarantees this pass
+        // always retains some history weight, so that stochastic noise still gets time-averaged
+        // instead of being thrown away and reintroduced every frame.
+        const float kMaxAdaptiveAlpha = 0.5;
         float colorDiff = length(currentColorYCoCg - clampedHistoryYCoCg);
-        alpha = mix(alpha, 1.0, clamp(colorDiff * 2.0, 0.0, 1.0));
-        
+        alpha = mix(alpha, kMaxAdaptiveAlpha, clamp(colorDiff * 2.0, 0.0, 1.0));
+
         resolvedColorRGB = mix(clampedHistoryRGB, currentColorRGB, alpha);
     } else {
         // No history or reset triggered: output Catmull-Rom upscale directly

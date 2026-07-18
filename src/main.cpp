@@ -8,7 +8,12 @@
 #include "core/EntityData.h"
 #include "core/EngineConfig.h"
 #include "geometry/VirtualGeometryCacheTest.h"
+#include "world/StreamingManager.h"
+#include "world/CellManifest.h"
+#include "world/WorldCellStreamingLoader.h"
 #include <exception>
+#include <unordered_map>
+#include <vector>
 #include <format>
 #include <cstring>
 #include <thread>
@@ -34,6 +39,13 @@ struct CameraControlState {
     float moveSpeed = 5.0f; // meters/second, adjustable via mouse wheel while flying
 };
 static CameraControlState g_CameraControl;
+
+// Runtime World Partition streaming radii (world::StreamingSource) -- always-compiled runtime
+// state (streaming itself is a shipping feature, not a debug tool), only their ImGui sliders are
+// Debug-only per CLAUDE.md's build-separation rule. Tuned against BakeDemoWorld.cpp's own
+// kDemoWorldCellSize (20.0f) so a few cells fit within each radius at typical fly speed.
+static float g_StreamingDetailRadius = 30.0f;
+static float g_StreamingHlodRadius = 70.0f;
 
 // Mouse wheel while flying (RMB held) adjusts fly speed, matching UE5's own viewport scroll
 // behavior. GLFW only exposes wheel deltas via callback (no polling equivalent), so this is the
@@ -551,6 +563,43 @@ int main(int argc, char** argv) {
     }
 #endif
 
+    // --- Runtime World Partition streaming (world::StreamingManager, finalizing the previously
+    // offline-only OFPA/HLOD tooling -- see world/StreamingTypes.h and tools/WorldPartition/
+    // BakeDemoWorld.cpp for the full authoring -> runtime chain). world_data/cellmanifest.bin is
+    // produced by the offline WorldPartitionBakeTool (tools/WorldPartition/ never links into this
+    // executable, see that CMakeLists.txt section's own comment) -- if it is missing, streaming is
+    // gracefully disabled (the fixed showcase gallery still renders normally) rather than treated
+    // as a fatal error, unlike scene.cache above: streaming is additive, not load-bearing. ---
+    world::CellManifest cellManifest;
+    bool streamingEnabled = cellManifest.Load("world_data/cellmanifest.bin");
+    if (streamingEnabled) {
+        LOG_INFO(std::format("[Main] World Partition streaming ENABLED: {} authored cells (cellSize={:.1f}).",
+                              cellManifest.RecordCount(), cellManifest.CellSize()));
+    } else {
+        LOG_WARNING("[Main] world_data/cellmanifest.bin not found or unreadable -- World Partition "
+                    "streaming disabled. Run WorldPartitionBakeTool.exe once (see tools/WorldPartition/"
+                    "BakeDemoWorld.cpp) to author the demo world and enable it.");
+    }
+
+    world::WorldCellStreamingLoader worldCellLoader(cellManifest);
+    // Constructed unconditionally (cheap, inert if streamingEnabled is false -- UpdateStreamingSources/
+    // Update() are simply never called below) so its lifetime doesn't need its own conditional scope.
+    world::StreamingManager streamingManager(cellManifest.CellSize(), worldCellLoader,
+                                              clusterPipeline.GetLoadingManager(), /*maxConcurrentLoads=*/4);
+
+    // Bounded free-list over VulkanContext's kStreamingUnitCount physical GPU slots (see that
+    // class's own header comment on why the pool is small and fixed) -- maps a claimed cell to the
+    // unit currently rendering it. If more cells fall within g_StreamingHlodRadius simultaneously
+    // than there are free units, the newest ones are silently skipped (logged) until an older cell
+    // streams back out -- an explicit, accepted degradation of the bounded pool, not a crash.
+    std::unordered_map<world::CellCoord, uint32_t, world::CellCoordHash> cellToStreamingUnit;
+    std::vector<uint32_t> freeStreamingUnits;
+    for (uint32_t u = 0; u < vkContext.GetStreamingUnitCount(); ++u) freeStreamingUnits.push_back(u);
+
+    auto hashCellCoord = [](const world::CellCoord& c) -> uint32_t {
+        return static_cast<uint32_t>(c.x) * 73856093u ^ static_cast<uint32_t>(c.z) * 19349663u;
+    };
+
     // Instantiate the camera at the same vantage point the old auto-orbit used to start from
     // (distance 14, azimuth 0, elevation 28 around the origin). The feature-gallery base scene
     // (VulkanContext::GridSlot's 9 zones, kZonePitch = 4) keeps roughly the same ~7-unit max
@@ -813,6 +862,56 @@ int main(int argc, char** argv) {
                 ImGui::EndTabItem();
             }
 
+            // --- Tab Post FX (real-time per-effect enable/disable -- see config::postprocess's
+            // own *_ENABLED block comment for how each toggle actually takes effect) ---
+            if (ImGui::BeginTabItem("Post FX")) {
+                ImGui::Checkbox("Bloom", &config::postprocess::BLOOM_ENABLED);
+                ImGui::Checkbox("Chromatic Aberration", &config::postprocess::CHROMATIC_ABERRATION_ENABLED);
+                ImGui::Checkbox("Vignette", &config::postprocess::VIGNETTE_ENABLED);
+                ImGui::Checkbox("Heat Distortion", &config::postprocess::HEAT_DISTORTION_ENABLED);
+                ImGui::Checkbox("Motion Blur", &config::postprocess::MOTION_BLUR_ENABLED);
+                ImGui::Checkbox("Height Fog", &config::postprocess::HEIGHT_FOG_ENABLED);
+                ImGui::Checkbox("God Rays", &config::postprocess::GOD_RAYS_ENABLED);
+                ImGui::Checkbox("Panini Projection", &config::postprocess::PANINI_ENABLED);
+                ImGui::Checkbox("Sharpen", &config::postprocess::SHARPEN_ENABLED);
+                ImGui::Checkbox("Film Grain", &config::postprocess::FILM_GRAIN_ENABLED);
+                ImGui::Checkbox("White Balance", &config::postprocess::WHITE_BALANCE_ENABLED);
+                ImGui::Checkbox("Color Correction", &config::postprocess::COLOR_CORRECTION_ENABLED);
+                ImGui::Checkbox("Depth of Field", &config::postprocess::DOF_ENABLED);
+                ImGui::Checkbox("Ambient Occlusion (GTAO)", &config::postprocess::AO_ENABLED);
+                ImGui::Checkbox("Contact Shadows", &config::postprocess::CONTACT_SHADOW_ENABLED);
+                ImGui::Checkbox("SSR Fallback", &config::postprocess::SSR_FALLBACK_ENABLED);
+                ImGui::EndTabItem();
+            }
+
+            // --- Tab Buffer Viewer -- index order here MUST match
+            // renderer::ClusterRenderPipeline::RecordDebugBufferView's own switch statement
+            // exactly (see that function's own header comment, the single source of truth both
+            // sides are hand-kept in sync with -- there is no shared enum between the two
+            // translation units). ---
+            if (ImGui::BeginTabItem("Buffer Viewer")) {
+                static const char* kBufferNames[] = {
+                    "Off (Final Composite)",
+                    "Resolve: Direct Color (HDR)",
+                    "Resolve: World Normal",
+                    "Resolve: Depth",
+                    "Resolve: Albedo",
+                    "Resolve: Roughness/Metallic",
+                    "Reflection: Hit Mask",
+                    "Ambient Occlusion (GTAO)",
+                    "Bloom",
+                    "TAA/TSR Output",
+                    "Depth of Field Output",
+                    "Screen Trace GI",
+                    "Denoised GI (A-Trous)",
+                    "GI Composite",
+                    "Final Composite (Post-Process)",
+                };
+                ImGui::Combo("Buffer", &config::debugview::SELECTED_BUFFER_INDEX, kBufferNames, IM_ARRAYSIZE(kBufferNames));
+                ImGui::TextWrapped("Shows the selected buffer instead of the normal final image. Not tied to the Numpad debug-view-mode keys.");
+                ImGui::EndTabItem();
+            }
+
             // --- Tab Volumetric ---
             if (ImGui::BeginTabItem("Volumetric")) {
                 int texQual = static_cast<int>(config::volumetrics::_TEXTURE_QUALITY);
@@ -829,6 +928,28 @@ int main(int argc, char** argv) {
                     config::volumetrics::_VOLUMETRIC_FOG_GRID_PIXEL_SIZE = static_cast<uint32_t>(fogGrid);
                 }
                 ImGui::DragFloat("Cloud Ray Sample Scale", &config::volumetrics::_VOLUMETRIC_CLOUD_VIEW_RAY_SAMPLE_COUNT_SCALE, 0.05f, 0.1f, 10.0f);
+
+                // --- Atmos weather system, Subtask 1: Climatic State Manager & Wind Simulation ---
+                // (atmos_integration_plan.md, project root) -- live sliders over config::atmos::*,
+                // consumed every frame by renderer::AtmosClimatePass::RecordUpdate. Grouped in this
+                // same "Volumetric" tab rather than a new one, since config::volumetrics'
+                // sky/fog/cloud quality knobs above are this same weather system's other half.
+                ImGui::Separator();
+                ImGui::TextUnformatted("Atmos Climate");
+                ImGui::DragFloat("Temperature (C)", &config::atmos::TEMPERATURE_CELSIUS, 0.2f, -20.0f, 45.0f);
+                ImGui::SliderFloat("Relative Humidity", &config::atmos::RELATIVE_HUMIDITY, 0.01f, 1.0f);
+                ImGui::DragFloat("Wind Direction (deg)", &config::atmos::WIND_DIRECTION_DEGREES, 1.0f, 0.0f, 360.0f);
+                ImGui::DragFloat("Wind Speed (m/s)", &config::atmos::WIND_SPEED_MPS, 0.1f, 0.0f, 40.0f);
+                ImGui::DragFloat("Wind Turbulence Frequency", &config::atmos::WIND_TURBULENCE_FREQUENCY, 0.005f, 0.01f, 2.0f);
+                ImGui::DragFloat("Wind Turbulence Octaves", &config::atmos::WIND_TURBULENCE_OCTAVES, 0.05f, 1.0f, 6.0f);
+                ImGui::DragFloat("Wind Turbulence Scale", &config::atmos::WIND_TURBULENCE_SCALE, 0.05f, 0.0f, 10.0f);
+                ImGui::DragFloat("Wind Turbulence Roughness", &config::atmos::WIND_TURBULENCE_ROUGHNESS, 0.01f, 0.0f, 1.0f);
+                ImGui::DragFloat("Cloud Density Target", &config::atmos::CLOUD_DENSITY_TARGET, 0.01f, 0.0f, 1.0f);
+                ImGui::DragFloat("Fog Density Target", &config::atmos::FOG_DENSITY_TARGET, 0.01f, 0.0f, 1.0f);
+                ImGui::DragFloat("Rain Strength", &config::atmos::RAIN_STRENGTH, 0.01f, 0.0f, 1.0f);
+                ImGui::TextDisabled("Dew Point: %.2f C", clusterPipeline.GetAtmosClimate().GetLastDewPointCelsius());
+                ImGui::TextDisabled("LCL Height: %.1f m", clusterPipeline.GetAtmosClimate().GetLastLCLHeightMeters());
+
                 ImGui::EndTabItem();
             }
 
@@ -836,6 +957,27 @@ int main(int argc, char** argv) {
         }
 
         ImGui::End();
+
+        // World Partition streaming overlay: its own separate window, built here (within this
+        // frame's already-open ImGui::NewFrame()/Render() bracket, see the top of this loop) rather
+        // than after streamingManager.Update() runs below -- ImGui::Begin() after ImGui::Render()
+        // is invalid. Necessarily shows the PREVIOUS frame's tracked-cell/in-flight/pool numbers
+        // (this frame's own streamingManager.Update() hasn't run yet at this point in the loop) --
+        // a one-frame-stale debug readout, not a correctness issue for what is purely an
+        // observability overlay. The sliders themselves take effect immediately: they write into
+        // g_StreamingDetailRadius/g_StreamingHlodRadius, plain floats read later this same frame by
+        // the streaming tick below.
+        if (streamingEnabled) {
+            ImGui::Begin("World Partition Streaming");
+            ImGui::SliderFloat("Detail load radius", &g_StreamingDetailRadius, 5.0f, 150.0f);
+            ImGui::SliderFloat("HLOD load radius", &g_StreamingHlodRadius, g_StreamingDetailRadius, 250.0f);
+            ImGui::Text("Tracked cells: %zu", streamingManager.GetTrackedCellCount());
+            ImGui::Text("In-flight loads: %u", streamingManager.GetInFlightCount());
+            ImGui::Text("Pending queue: %zu", streamingManager.GetPendingQueueLength());
+            ImGui::Text("Streaming units free: %zu / %u", freeStreamingUnits.size(), vkContext.GetStreamingUnitCount());
+            ImGui::End();
+        }
+
         ImGui::Render();
 #endif
 
@@ -910,6 +1052,51 @@ int main(int argc, char** argv) {
         float aspect = static_cast<float>(vkContext.GetSwapchainExtent().width) /
             static_cast<float>(vkContext.GetSwapchainExtent().height);
         camera.Update(aspect);
+
+        // --- Runtime World Partition streaming tick: evaluate desired cell representations from
+        // the camera's current position, dispatch queued load/unload work onto the shared
+        // LoadingManager worker pool, then drain both its main-thread completions AND
+        // WorldCellStreamingLoader's own staged GPU-slot events -- see this block's construction
+        // site above for the full rationale. Placed after camera.Update() (this frame's position is
+        // final) and before RecordFrame() (no command buffer for this frame is being recorded yet),
+        // matching StreamingManager::Update()/PumpCompletions()'s own "main-thread-only, once per
+        // frame" contracts. ---
+        if (streamingEnabled) {
+            std::vector<world::StreamingSource> sources{
+                world::StreamingSource{ camera.GetPosition(), g_StreamingDetailRadius, g_StreamingHlodRadius, 0u }
+            };
+            streamingManager.UpdateStreamingSources(sources);
+            streamingManager.Update();
+            clusterPipeline.GetLoadingManager().PumpCompletions(8u);
+
+            for (const world::StreamingPlacementEvent& event : worldCellLoader.DrainEvents()) {
+                if (event.activate) {
+                    uint32_t unit;
+                    auto it = cellToStreamingUnit.find(event.coord);
+                    if (it != cellToStreamingUnit.end()) {
+                        unit = it->second;
+                    } else if (!freeStreamingUnits.empty()) {
+                        unit = freeStreamingUnits.back();
+                        freeStreamingUnits.pop_back();
+                        cellToStreamingUnit[event.coord] = unit;
+                    } else {
+                        LOG_WARNING(std::format(
+                            "[Streaming] Pool exhausted ({} units) -- cannot claim a slot for cell ({}, {}).",
+                            vkContext.GetStreamingUnitCount(), event.coord.x, event.coord.z));
+                        continue;
+                    }
+                    vkContext.SetStreamingUnitState(unit, true, event.useFineVariant,
+                                                     event.worldPosition, hashCellCoord(event.coord));
+                } else {
+                    auto it = cellToStreamingUnit.find(event.coord);
+                    if (it != cellToStreamingUnit.end()) {
+                        vkContext.SetStreamingUnitState(it->second, false, false, {}, 0u);
+                        freeStreamingUnits.push_back(it->second);
+                        cellToStreamingUnit.erase(it);
+                    }
+                }
+            }
+        }
 
 #ifndef NDEBUG
         camera.SetDebugViewMode(g_DebugState.viewMode);

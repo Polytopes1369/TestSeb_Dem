@@ -1,5 +1,8 @@
 #include "core/LoadingManager.h"
+#include "core/Logger.h"
 #include "core/ThreadingUtil.h"
+
+#include <format>
 
 namespace core {
 
@@ -10,6 +13,7 @@ namespace core {
         for (uint32_t i = 0; i < count; ++i) {
             m_WorkerThreads.emplace_back(&LoadingManager::WorkerThreadMain, this);
         }
+        LOG_INFO(std::format("[LoadingManager] Started {} worker thread(s).", count));
     }
 
     LoadingManager::~LoadingManager() {
@@ -94,6 +98,15 @@ namespace core {
     }
 
     void LoadingManager::Shutdown() {
+        // Guards against the log line firing twice: the destructor always calls Shutdown() as a
+        // safety net even when a caller already did so explicitly (see this function's own
+        // reset-to-sane-defaults comment below), and m_WorkerThreads is already empty on that
+        // second call.
+        if (!m_WorkerThreads.empty()) {
+            LOG_INFO(std::format("[LoadingManager] Shutting down {} worker thread(s), {} job(s) still in flight.",
+                m_WorkerThreads.size(), m_InFlight.load(std::memory_order_relaxed)));
+        }
+
         m_ShuttingDown.store(true, std::memory_order_release);
         m_QueueCV.notify_all();
         for (std::thread& worker : m_WorkerThreads) {

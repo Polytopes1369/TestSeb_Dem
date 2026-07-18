@@ -122,6 +122,7 @@
 #include "renderer/passes/ClusterSoftwareRasterPass.h"
 #include "renderer/passes/GeometryDecompressionPass.h"
 #include "renderer/streaming/GeometryStreamingCoordinator.h"
+#include "renderer/passes/AtmosClimatePass.h"
 #include "renderer/passes/GlobalSDFPass.h"
 #include "renderer/vulkan/GpuBuffer.h"
 #include "renderer/streaming/GpuGeometryPagePool.h"
@@ -152,6 +153,7 @@
 #include "renderer/passes/GICompositePass.h"
 #ifndef NDEBUG
 #include "renderer/debug/ClusterTriangleStatsPass.h"
+#include "renderer/debug/DebugBufferViewPass.h"
 #include "renderer/debug/DebugTextOverlay.h"
 #include "renderer/passes/SDFRayMarchPass.h"
 #endif
@@ -259,6 +261,13 @@ namespace renderer {
 
         void Shutdown();
 
+        // Exposes the pipeline-wide worker pool (see m_LoadingManager's own comment: owned here,
+        // not per-pass, specifically so future CPU-bound systems can share it) to runtime World
+        // Partition streaming (world::StreamingManager, io::AsyncDecompressingLoader) constructed
+        // in main.cpp -- previously only used internally by GlobalSDFPass::Init(). Must outlive
+        // anything handed this reference, exactly as m_LoadingManager's own comment already states.
+        core::LoadingManager& GetLoadingManager() { return m_LoadingManager; }
+
         // Phase 2 (Lumen advanced roadmap) fix: the frame is now recorded across 4 calls instead of
         // one RecordFrame() -- see this class' own header comment ("Per-frame GPU work") for the
         // full root-cause/redesign explanation and main.cpp for the exact submit sequence each call
@@ -330,6 +339,11 @@ namespace renderer {
         // this frame's real candidate count, which only ever exists on the GPU now that
         // m_LODSelection computes a dynamic per-frame cut (see ClusterLODSelectionPass).
         uint32_t GetClusterCount() const { return m_ClusterCount; }
+
+        // Exposes AtmosClimatePass's last computed Dew Point / LCL Height for main.cpp's Volumetric
+        // ImGui tab (atmos_integration_plan.md Subtask 1, objective #4) -- same "borrow a const ref"
+        // convention as e.g. GetTracedEntityInfos() elsewhere in this class.
+        const AtmosClimatePass& GetAtmosClimate() const { return m_AtmosClimate; }
 
 #ifndef NDEBUG
         // SWRT/HWRT back-end toggle shared by m_GIInject and m_WorldProbes' own trace pass (0 = SWRT
@@ -493,6 +507,13 @@ namespace renderer {
         // error path). Debug-only per CLAUDE.md's build-separation rule: this function's own file-
         // scope existence is guarded out of Release entirely, not merely skipped at runtime.
         void ValidateSplineBounds() const;
+
+        // Maps config::debugview::SELECTED_BUFFER_INDEX to one of this pipeline's own GBuffer/GI
+        // intermediate views (see the big index->buffer table in this method's own .cpp
+        // definition) and dispatches m_DebugBufferView with it -- backs the ImGui "Buffer Viewer"
+        // dropdown. Called at most once per frame, only when a buffer is actually selected (index
+        // != 0/"Off") -- see RecordFrame()'s own call site for exactly where.
+        void RecordDebugBufferView(VkCommandBuffer cmd);
 #endif
 
         VkDevice m_Device = VK_NULL_HANDLE;
@@ -704,6 +725,12 @@ namespace renderer {
         VirtualTextureVolumeBounds m_VTBounds;
         SurfaceCachePass m_SurfaceCache;
         GlobalSDFPass m_GlobalSDF;
+        // Atmos weather system, Subtask 1 (atmos_integration_plan.md): climate/wind state producer
+        // -- see AtmosClimatePass's own class comment. Declared here (not consumed by anything yet)
+        // so its RecordUpdate() call can run right at the top of RecordFrame()'s own [1z] GI-
+        // infrastructure block, ahead of every future consumer (Froxel Fog / Volumetric Clouds,
+        // Subtasks 3-4) that will eventually read its AtmosGlobalsUBO the same frame.
+        AtmosClimatePass m_AtmosClimate;
         // Sun direction is fixed by default; one point light is authored in Init() specifically to
         // exercise/verify Phase 3's point-light Virtual Shadow Maps (see Init()'s own comment) --
         // see renderer::LightingTypes.h's own comment for the full field-by-field default.
@@ -871,6 +898,11 @@ namespace renderer {
         // like m_TriangleStats/m_DebugOverlay above. Only recorded (and only ever blitted to the
         // swapchain in place of m_Resolve's output) when camera.debugViewMode == DEBUG_VIEW_LUMEN.
         SDFRayMarchPass m_SDFRayMarch;
+
+        // Backs the ImGui "Buffer Viewer" dropdown -- see debug::DebugBufferViewPass's own class
+        // comment. Only dispatched (and only ever blitted to the swapchain in place of
+        // m_PostProcess's output) when config::debugview::SELECTED_BUFFER_INDEX != 0.
+        debug::DebugBufferViewPass m_DebugBufferView;
 #endif
     };
 

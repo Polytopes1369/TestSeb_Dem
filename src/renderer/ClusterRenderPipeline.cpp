@@ -526,6 +526,16 @@ bool ClusterRenderPipeline::Init(
     return false;
   }
 
+  // Atmos weather system, Subtask 1: climate/wind state producer -- no dependency on any pass
+  // above/below (owns a single small UBO, no descriptor set -- see AtmosClimatePass.h's own class
+  // comment), so its Init() placement here is arbitrary; kept next to m_GlobalSDF since both are
+  // "self-contained globals producers" Init'd unconditionally in this same STEP 7 block.
+  if (!m_AtmosClimate.Init(createInfo.device, createInfo.allocator,
+                           createInfo.commandPool, createInfo.queue)) {
+    LOG_ERROR("[ClusterRenderPipeline] Failed to initialize AtmosClimatePass.");
+    return false;
+  }
+
   // Shared trace-scene descriptor sets (mesh SDF trace scene + Surface Cache sampling), built
   // once from m_GlobalSDF's per-entity SDF images and m_SurfaceCache's card table/atlases (both
   // already Init'd above) -- reused unmodified by m_SurfaceCacheRT/m_GIInject/m_WorldProbes.
@@ -733,6 +743,11 @@ bool ClusterRenderPipeline::Init(
   // One-time wiring (see SDFRayMarchPass::SetGlobalSDFViews's own comment): the 4 clipmap level
   // views never change again after GlobalSDFPass::Init().
   m_SDFRayMarch.SetGlobalSDFViews(m_GlobalSDF);
+
+  // Backs the ImGui "Buffer Viewer" dropdown -- see debug::DebugBufferViewPass's own class
+  // comment. Sized to m_DisplayExtent (it's blitted to the swapchain the same way
+  // m_PostProcess's own output is, not sized to any one candidate buffer's own resolution).
+  m_DebugBufferView.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue, m_DisplayExtent);
 #endif
 
 #ifndef NDEBUG
@@ -909,6 +924,7 @@ void ClusterRenderPipeline::Shutdown() {
   m_LastStatsSampleTime = 0.0f;
   m_LastStatsSampleBytes = 0;
   m_SDFRayMarch.Shutdown();
+  m_DebugBufferView.Shutdown();
 #endif
   m_MegaLights.Shutdown();
   m_ScreenSpaceEffects.Shutdown();
@@ -930,6 +946,7 @@ void ClusterRenderPipeline::Shutdown() {
   m_SurfaceCacheRT.Shutdown();
   m_TraceContext.Shutdown();
   m_GlobalSDF.Shutdown();
+  m_AtmosClimate.Shutdown();
   // Deliberately NOT calling m_LoadingManager.Shutdown() here: this Shutdown() method runs
   // defensively as the very first line of Init() too (see the top of this function), and
   // core::LoadingManager's worker threads are meant to live for this whole pipeline object's
@@ -981,6 +998,52 @@ void ClusterRenderPipeline::Shutdown() {
   m_RenderExtent = {0, 0};
   m_Device = VK_NULL_HANDLE;
 }
+
+#ifndef NDEBUG
+// Index->buffer table for the ImGui "Buffer Viewer" dropdown (config::debugview::
+// SELECTED_BUFFER_INDEX). main.cpp's own ImGui::Combo item array MUST list these same 15 entries
+// in this exact order -- there is no shared enum between the two translation units, just this
+// comment as the single source of truth both sides are hand-kept in sync with.
+//   0  = Off (normal final composite, this function is never called)
+//   1  = Resolve: Direct Color (HDR)
+//   2  = Resolve: World Normal
+//   3  = Resolve: Depth
+//   4  = Resolve: Albedo
+//   5  = Resolve: Roughness/Metallic
+//   6  = Reflection: Hit Mask
+//   7  = Ambient Occlusion (GTAO)
+//   8  = Bloom
+//   9  = TAA/TSR Output
+//   10 = Depth of Field Output
+//   11 = Screen Trace GI
+//   12 = Denoised GI (A-Trous)
+//   13 = GI Composite
+//   14 = Final Composite (Post-Process, pre-ImGui)
+void ClusterRenderPipeline::RecordDebugBufferView(VkCommandBuffer cmd) {
+    VkImageView sourceView = m_Resolve.GetOutputColorView();
+    debug::DebugBufferViewPass::VisualizationMode mode = debug::DebugBufferViewPass::VisualizationMode::kTonemap;
+
+    switch (config::debugview::SELECTED_BUFFER_INDEX) {
+        case 1: sourceView = m_Resolve.GetOutputColorView(); mode = debug::DebugBufferViewPass::VisualizationMode::kTonemap; break;
+        case 2: sourceView = m_Resolve.GetOutputNormalView(); mode = debug::DebugBufferViewPass::VisualizationMode::kOctNormal; break;
+        case 3: sourceView = m_Resolve.GetOutputDepthView(); mode = debug::DebugBufferViewPass::VisualizationMode::kGrayscale; break;
+        case 4: sourceView = m_Resolve.GetOutputAlbedoView(); mode = debug::DebugBufferViewPass::VisualizationMode::kPassthrough; break;
+        case 5: sourceView = m_Resolve.GetOutputRoughnessMetallicView(); mode = debug::DebugBufferViewPass::VisualizationMode::kGrayscale; break;
+        case 6: sourceView = m_Reflection.GetHitMaskView(); mode = debug::DebugBufferViewPass::VisualizationMode::kGrayscale; break;
+        case 7: sourceView = m_ScreenSpaceEffects.GetAOView(); mode = debug::DebugBufferViewPass::VisualizationMode::kGrayscale; break;
+        case 8: sourceView = m_Bloom.GetOutputView(); mode = debug::DebugBufferViewPass::VisualizationMode::kTonemap; break;
+        case 9: sourceView = m_TAATSR.GetOutputView(); mode = debug::DebugBufferViewPass::VisualizationMode::kTonemap; break;
+        case 10: sourceView = m_DepthOfField.GetOutputView(); mode = debug::DebugBufferViewPass::VisualizationMode::kTonemap; break;
+        case 11: sourceView = m_ScreenTrace.GetOutputView(); mode = debug::DebugBufferViewPass::VisualizationMode::kTonemap; break;
+        case 12: sourceView = m_Denoiser.GetOutputView(); mode = debug::DebugBufferViewPass::VisualizationMode::kTonemap; break;
+        case 13: sourceView = m_GIComposite.GetOutputView(); mode = debug::DebugBufferViewPass::VisualizationMode::kTonemap; break;
+        case 14: sourceView = m_PostProcess.GetOutputView(); mode = debug::DebugBufferViewPass::VisualizationMode::kPassthrough; break;
+        default: break; // Unknown index -- falls back to the Resolve color default set above.
+    }
+
+    m_DebugBufferView.RecordView(cmd, sourceView, mode);
+}
+#endif
 
 void ClusterRenderPipeline::BeginVisBufferRendering(
     VkCommandBuffer cmd, bool clearAttachments) const {
@@ -1201,6 +1264,14 @@ void ClusterRenderPipeline::RecordFrameEarly(VkCommandBuffer cmdEarly,
   m_FrameScratch.traceMode = traceMode;
   m_FrameScratch.useAsyncCompute = useAsyncCompute;
   m_FrameScratch.radiosityEnabled = radiosityEnabled;
+
+  // =========================================================================================
+  // [1y] Atmos weather system, Subtask 1: refresh AtmosGlobalsUBO (wind, Magnus-Tetens dew point /
+  // LCL height) from this frame's config::atmos::* knobs. No consumer yet (Phase 1 -- see
+  // AtmosClimatePass.h's own class comment); placed immediately before [1z] so a future Fog/Cloud
+  // consumer added inside that same block always sees an already-current buffer this frame.
+  // =========================================================================================
+  m_AtmosClimate.RecordUpdate(cmd, globalTimeSeconds);
 
   // =========================================================================================
   // [1z] Lumen-style GI infrastructure: Virtual Shadow Map page requests/renders (Phase 3) ->
@@ -1904,10 +1975,10 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
   {
     ScreenSpaceEffectsPass::Settings ssfxSettings{};
     ssfxSettings.aoRadiusWorld = config::postprocess::AO_RADIUS_WORLD;
-    ssfxSettings.aoIntensity = config::postprocess::AO_INTENSITY;
+    ssfxSettings.aoIntensity = config::postprocess::AO_ENABLED ? config::postprocess::AO_INTENSITY : 0.0f;
     ssfxSettings.aoPower = config::postprocess::AO_POWER;
     ssfxSettings.contactShadowLengthWorld = config::postprocess::CONTACT_SHADOW_LENGTH_WORLD;
-    ssfxSettings.contactShadowIntensity = config::postprocess::CONTACT_SHADOW_INTENSITY;
+    ssfxSettings.contactShadowIntensity = config::postprocess::CONTACT_SHADOW_ENABLED ? config::postprocess::CONTACT_SHADOW_INTENSITY : 0.0f;
     ssfxSettings.contactShadowThicknessWorld = config::postprocess::CONTACT_SHADOW_THICKNESS_WORLD;
     ssfxSettings.ssrFallbackMaxDistanceWorld = config::postprocess::SSR_FALLBACK_MAX_DISTANCE_WORLD;
     ssfxSettings.ssrFallbackThicknessWorld = config::postprocess::SSR_FALLBACK_THICKNESS_WORLD;
@@ -1988,7 +2059,7 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
       ScreenSpaceEffectsPass::Settings ssrFallbackSettings{};
       ssrFallbackSettings.ssrFallbackMaxDistanceWorld = config::postprocess::SSR_FALLBACK_MAX_DISTANCE_WORLD;
       ssrFallbackSettings.ssrFallbackThicknessWorld = config::postprocess::SSR_FALLBACK_THICKNESS_WORLD;
-      ssrFallbackSettings.ssrFallbackIntensity = config::postprocess::SSR_FALLBACK_INTENSITY;
+      ssrFallbackSettings.ssrFallbackIntensity = config::postprocess::SSR_FALLBACK_ENABLED ? config::postprocess::SSR_FALLBACK_INTENSITY : 0.0f;
       m_ScreenSpaceEffects.RecordSSRFallback(cmdLate, viewProj, cameraPositionWorld, ssrFallbackSettings);
     }
   }
@@ -2237,7 +2308,7 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
       DepthOfFieldPass::Settings dofSettings{};
       dofSettings.focalLengthMM = config::postprocess::DOF_FOCAL_LENGTH_MM;
       dofSettings.focusDistanceWorldUnits = config::postprocess::DOF_FOCUS_DISTANCE_WORLD_UNITS;
-      dofSettings.maxCoCRadiusPixels = config::postprocess::DOF_MAX_COC_RADIUS_PIXELS;
+      dofSettings.maxCoCRadiusPixels = config::postprocess::DOF_ENABLED ? config::postprocess::DOF_MAX_COC_RADIUS_PIXELS : 0.0f;
       m_DepthOfField.RecordGenerate(cmdLate, invViewProj, cameraPositionWorld, config::postprocess::EXPOSURE_APERTURE, dofSettings);
   }
 
@@ -2292,39 +2363,49 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
       ppSettings.exposureCompensationEV = config::postprocess::EXPOSURE_COMPENSATION_EV;
       ppSettings.adaptationSpeedUpEVPerSec = config::postprocess::EXPOSURE_ADAPTATION_SPEED_UP_EV_PER_SEC;
       ppSettings.adaptationSpeedDownEVPerSec = config::postprocess::EXPOSURE_ADAPTATION_SPEED_DOWN_EV_PER_SEC;
-      ppSettings.whiteBalanceTempKelvin = config::postprocess::WHITE_BALANCE_TEMP_KELVIN;
-      ppSettings.whiteBalanceTint = config::postprocess::WHITE_BALANCE_TINT;
-      ppSettings.liftR = config::postprocess::COLOR_LIFT_R; ppSettings.liftG = config::postprocess::COLOR_LIFT_G; ppSettings.liftB = config::postprocess::COLOR_LIFT_B;
-      ppSettings.gammaR = config::postprocess::COLOR_GAMMA_R; ppSettings.gammaG = config::postprocess::COLOR_GAMMA_G; ppSettings.gammaB = config::postprocess::COLOR_GAMMA_B;
-      ppSettings.gainR = config::postprocess::COLOR_GAIN_R; ppSettings.gainG = config::postprocess::COLOR_GAIN_G; ppSettings.gainB = config::postprocess::COLOR_GAIN_B;
-      ppSettings.saturation = config::postprocess::COLOR_SATURATION;
-      ppSettings.contrast = config::postprocess::COLOR_CONTRAST;
+      // Real-time "Post FX" toggles (ImGui, main.cpp): every effect below already has its own
+      // zero-is-off strength knob (see config::postprocess's own comment on its *_ENABLED block)
+      // -- White Balance/Color Correction are the two exceptions with no natural zero, so they
+      // fall back to their own documented neutral/identity values instead.
+      ppSettings.whiteBalanceTempKelvin = config::postprocess::WHITE_BALANCE_ENABLED ? config::postprocess::WHITE_BALANCE_TEMP_KELVIN : 6500.0f;
+      ppSettings.whiteBalanceTint = config::postprocess::WHITE_BALANCE_ENABLED ? config::postprocess::WHITE_BALANCE_TINT : 0.0f;
+      ppSettings.liftR = config::postprocess::COLOR_CORRECTION_ENABLED ? config::postprocess::COLOR_LIFT_R : 0.0f;
+      ppSettings.liftG = config::postprocess::COLOR_CORRECTION_ENABLED ? config::postprocess::COLOR_LIFT_G : 0.0f;
+      ppSettings.liftB = config::postprocess::COLOR_CORRECTION_ENABLED ? config::postprocess::COLOR_LIFT_B : 0.0f;
+      ppSettings.gammaR = config::postprocess::COLOR_CORRECTION_ENABLED ? config::postprocess::COLOR_GAMMA_R : 1.0f;
+      ppSettings.gammaG = config::postprocess::COLOR_CORRECTION_ENABLED ? config::postprocess::COLOR_GAMMA_G : 1.0f;
+      ppSettings.gammaB = config::postprocess::COLOR_CORRECTION_ENABLED ? config::postprocess::COLOR_GAMMA_B : 1.0f;
+      ppSettings.gainR = config::postprocess::COLOR_CORRECTION_ENABLED ? config::postprocess::COLOR_GAIN_R : 1.0f;
+      ppSettings.gainG = config::postprocess::COLOR_CORRECTION_ENABLED ? config::postprocess::COLOR_GAIN_G : 1.0f;
+      ppSettings.gainB = config::postprocess::COLOR_CORRECTION_ENABLED ? config::postprocess::COLOR_GAIN_B : 1.0f;
+      ppSettings.saturation = config::postprocess::COLOR_CORRECTION_ENABLED ? config::postprocess::COLOR_SATURATION : 1.0f;
+      ppSettings.contrast = config::postprocess::COLOR_CORRECTION_ENABLED ? config::postprocess::COLOR_CONTRAST : 1.0f;
       ppSettings.displayGamma = config::postprocess::DISPLAY_GAMMA;
-      ppSettings.bloomIntensity = config::postprocess::BLOOM_INTENSITY;
-      ppSettings.chromaticAberrationIntensity = config::postprocess::CHROMATIC_ABERRATION_INTENSITY;
-      ppSettings.vignetteIntensity = config::postprocess::VIGNETTE_INTENSITY;
+      ppSettings.bloomIntensity = config::postprocess::BLOOM_ENABLED ? config::postprocess::BLOOM_INTENSITY : 0.0f;
+      ppSettings.chromaticAberrationIntensity = config::postprocess::CHROMATIC_ABERRATION_ENABLED ? config::postprocess::CHROMATIC_ABERRATION_INTENSITY : 0.0f;
+      ppSettings.vignetteIntensity = config::postprocess::VIGNETTE_ENABLED ? config::postprocess::VIGNETTE_INTENSITY : 0.0f;
       ppSettings.vignetteSmoothness = config::postprocess::VIGNETTE_SMOOTHNESS;
       ppSettings.vignetteColorBleed = config::postprocess::VIGNETTE_COLOR_BLEED;
-      ppSettings.heatDistortionIntensity = config::postprocess::HEAT_DISTORTION_INTENSITY;
-      ppSettings.motionBlurIntensity = config::postprocess::MOTION_BLUR_INTENSITY;
+      ppSettings.heatDistortionIntensity = config::postprocess::HEAT_DISTORTION_ENABLED ? config::postprocess::HEAT_DISTORTION_INTENSITY : 0.0f;
+      ppSettings.motionBlurIntensity = config::postprocess::MOTION_BLUR_ENABLED ? config::postprocess::MOTION_BLUR_INTENSITY : 0.0f;
       ppSettings.motionBlurMaxVelocityUV = config::postprocess::MOTION_BLUR_MAX_VELOCITY_UV;
       ppSettings.fogColorR = config::postprocess::FOG_COLOR_R;
       ppSettings.fogColorG = config::postprocess::FOG_COLOR_G;
       ppSettings.fogColorB = config::postprocess::FOG_COLOR_B;
-      ppSettings.fogDensity = config::postprocess::FOG_DENSITY;
+      ppSettings.fogDensity = config::postprocess::HEIGHT_FOG_ENABLED ? config::postprocess::FOG_DENSITY : 0.0f;
       ppSettings.fogHeightFalloff = config::postprocess::FOG_HEIGHT_FALLOFF;
       ppSettings.fogHeightOffset = config::postprocess::FOG_HEIGHT_OFFSET;
       ppSettings.fogStartDistance = config::postprocess::FOG_START_DISTANCE;
       ppSettings.fogMaxOpacity = config::postprocess::FOG_MAX_OPACITY;
-      ppSettings.godRaysIntensity = config::postprocess::GOD_RAYS_INTENSITY;
+      ppSettings.godRaysIntensity = config::postprocess::GOD_RAYS_ENABLED ? config::postprocess::GOD_RAYS_INTENSITY : 0.0f;
       ppSettings.godRaysDecay = config::postprocess::GOD_RAYS_DECAY;
       ppSettings.godRaysDensity = config::postprocess::GOD_RAYS_DENSITY;
       ppSettings.godRaysWeight = config::postprocess::GOD_RAYS_WEIGHT;
-      ppSettings.paniniD = config::postprocess::PANINI_D;
+      ppSettings.paniniD = config::postprocess::PANINI_ENABLED ? config::postprocess::PANINI_D : 0.0f;
       ppSettings.paniniS = config::postprocess::PANINI_S;
-      ppSettings.sharpenIntensity = config::postprocess::SHARPEN_INTENSITY;
+      ppSettings.sharpenIntensity = config::postprocess::SHARPEN_ENABLED ? config::postprocess::SHARPEN_INTENSITY : 0.0f;
       ppSettings.sharpenRadiusPixels = config::postprocess::SHARPEN_RADIUS_PIXELS;
-      ppSettings.filmGrainIntensity = config::postprocess::FILM_GRAIN_INTENSITY;
+      ppSettings.filmGrainIntensity = config::postprocess::FILM_GRAIN_ENABLED ? config::postprocess::FILM_GRAIN_INTENSITY : 0.0f;
       ppSettings.filmGrainResponseMidpoint = config::postprocess::FILM_GRAIN_RESPONSE_MIDPOINT;
 
       // Same prevViewProj-or-current-frame-fallback expression [13d]'s own TAA pass already
@@ -2337,6 +2418,14 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
   }
 
 #ifndef NDEBUG
+  // ImGui "Buffer Viewer" dropdown: dispatched ONCE here (not inline in either blitSourceImage
+  // selection block below, both of which only SELECT among already-produced images -- this is the
+  // one exception that actually produces new GPU work this frame) so it's recorded before both the
+  // HUD-targeting selection and the final blit's own selection reference its output image.
+  if (config::debugview::SELECTED_BUFFER_INDEX != 0) {
+    RecordDebugBufferView(cmd);
+  }
+
   // =========================================================================================
   // [13b] Debug-only stat overlay (whole block compiled out in Release). Timing contract: read
   // back the PREVIOUS frame's triangle-count result first (safe because main.cpp's frame fence
@@ -2401,6 +2490,12 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
             blitSourceImage = m_Resolve.GetOutputColorImage();
         }
     }
+    // ImGui "Buffer Viewer" dropdown -- takes priority over the Numpad debug-view-mode
+    // substitutions above (an orthogonal selection mechanism; the actual dispatch already
+    // happened just above this whole [13b] block, see that call site's own comment).
+    if (config::debugview::SELECTED_BUFFER_INDEX != 0) {
+        blitSourceImage = m_DebugBufferView.GetOutputImage();
+    }
 #endif
 
     VkImage overlayTargetImage = blitSourceImage;
@@ -2424,6 +2519,12 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
     else if (blitSourceImage == m_SDFRayMarch.GetOutputImage()) {
         overlayTargetView = m_SDFRayMarch.GetOutputView();
         overlayExtent = m_RenderExtent;
+    }
+    else if (blitSourceImage == m_DebugBufferView.GetOutputImage()) {
+        // Also RGBA8_UNORM (DebugBufferViewPass::kOutputFormat), matching the default above --
+        // only the view/extent need overriding.
+        overlayTargetView = m_DebugBufferView.GetOutputView();
+        overlayExtent = m_DisplayExtent;
     }
 #endif
     else if (blitSourceImage == m_GIComposite.GetOutputImage()) {
@@ -2480,12 +2581,22 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
           blitSourceImage = m_Resolve.GetOutputColorImage();
       }
   }
+  // ImGui "Buffer Viewer" dropdown -- same override as the HUD-targeting selection above (the
+  // dispatch itself already happened earlier at [13a.5], see that call site's own comment).
+  if (config::debugview::SELECTED_BUFFER_INDEX != 0) {
+      blitSourceImage = m_DebugBufferView.GetOutputImage();
+  }
 #endif
 
   VkExtent2D blitSrcExtent = m_RenderExtent;
   if (blitSourceImage == m_PostProcess.GetOutputImage()) {
       blitSrcExtent = m_DisplayExtent;
   }
+#ifndef NDEBUG
+  else if (blitSourceImage == m_DebugBufferView.GetOutputImage()) {
+      blitSrcExtent = m_DisplayExtent;
+  }
+#endif
 
   {
     VkMemoryBarrier2 resolveToBlitBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};

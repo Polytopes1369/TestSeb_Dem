@@ -39,7 +39,7 @@ layout(location = 1) out vec3 outWorldNormal;
 void main() {
     EntityTransform xform = entityTransforms[pc.entityID];
     mat3 rotation = mat3(xform.rotation);
-    vec3 worldPos = xform.center + rotation * (inPosition - xform.center);
+    vec3 worldPos = xform.translation + xform.center + rotation * (inPosition - xform.center);
     outWorldPos = worldPos;
     outWorldNormal = rotation * inNormal;
     gl_Position = pc.viewProj * vec4(worldPos, 1.0);
