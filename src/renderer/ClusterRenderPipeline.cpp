@@ -881,6 +881,17 @@ bool ClusterRenderPipeline::Init(
     return false;
   }
 
+  // UE5.8-parity gap G1 (Decal system): deferred projected-decal compositing over m_Resolve's own
+  // GBuffer (albedo/normal/roughness-metallic) + direct color images. The fixed showcase decal set is
+  // authored here via renderer::GenerateShowcaseDecals() -- this IS where decals are added to the
+  // scene (mirroring how renderer::GenerateShowcaseMaterialTable authors the per-entity materials) --
+  // and uploaded once into this pass (instance SSBO + CPU-built decal BVH). All views borrowed; the
+  // pass owns none of them (see DecalProjectionPass's own class comment).
+  m_Decals.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
+      createInfo.renderExtent, m_Resolve.GetOutputDepthView(), m_Resolve.GetOutputNormalView(),
+      m_Resolve.GetOutputAlbedoView(), m_Resolve.GetOutputRoughnessMetallicView(),
+      m_Resolve.GetOutputColorView(), GenerateShowcaseDecals());
+
   // Hair/Fur shading model (UE5.8 rendering-parity gap G10a) -- GPU-instanced procedural fur strands
   // grown off the skinned creature's surface. Same dependency set as m_VegetationScatter (VSM +
   // World Probes for forward lighting, m_HZB for the per-strand occlusion cull), plus the skinned-
@@ -1334,6 +1345,7 @@ void ClusterRenderPipeline::Shutdown() {
   m_Reflection.Shutdown();
   m_ScreenTrace.Shutdown();
   m_GIComposite.Shutdown();
+  m_Decals.Shutdown();
   m_SubsurfaceScattering.Shutdown();
   m_Denoiser.Shutdown();
   // Phase PP1/PP2 (post-process stack roadmap): reverse Init() order (m_TAATSR -> m_Bloom ->
@@ -2560,24 +2572,31 @@ void ClusterRenderPipeline::RecordFrameMid(VkCommandBuffer cmdMid, VkCommandBuff
 #ifndef NDEBUG
   if (cameraCopy.debugViewMode == DEBUG_VIEW_NORMAL) {
     m_ShadingBin.RecordClassifyAndSort(cmdMid, m_RenderExtent);
-    // Glint / sparkle (UE5.8 rendering-parity gap G5): Debug-only tuning multipliers (see the
-    // SetDebugGlint* setters) -- 1.0 in Release, so the material's authored sparkle renders unchanged.
+    // Glint / sparkle (UE5.8 rendering-parity gap G5) + Substrate horizontal mixing (gap G6):
+    // Debug-only tuning multipliers (see the SetDebugGlint*/SetDebugMixMaskSharpnessScale setters)
+    // -- 1.0 in Release, so the material's authored sparkle/mix-sharpness renders unchanged. Wave 2
+    // (UE5.8 caustics/light-function parity): m_FrameScratch.globalTimeSeconds is a real feature
+    // input, not a Debug-only toggle, so it is threaded on both this path and the Release #else path
+    // below unconditionally.
     m_Resolve.RecordResolveBinned(cmdMid, viewProj, m_SceneLights.sun, cameraPositionWorld, surfaceWetness, snowCoverage,
-        m_DebugGlintDensityScale, m_DebugGlintIntensityScale, m_DebugMixMaskSharpnessScale, m_ShadingBin);
+        m_DebugGlintDensityScale, m_DebugGlintIntensityScale, m_DebugMixMaskSharpnessScale, m_FrameScratch.globalTimeSeconds, m_ShadingBin);
   } else {
     maths::mat4 prevViewProjForResolve = m_HasPrevViewProj ? m_PrevViewProj : viewProj;
     m_Resolve.RecordResolve(cmdMid, viewProj, prevViewProjForResolve, m_SceneLights.sun, cameraPositionWorld, surfaceWetness, snowCoverage,
-        m_DebugGlintDensityScale, m_DebugGlintIntensityScale, m_DebugMixMaskSharpnessScale, cameraCopy.debugViewMode);
+        m_DebugGlintDensityScale, m_DebugGlintIntensityScale, m_DebugMixMaskSharpnessScale, m_FrameScratch.globalTimeSeconds, cameraCopy.debugViewMode);
   }
 #else
   m_ShadingBin.RecordClassifyAndSort(cmdMid, m_RenderExtent);
-  // Glint / sparkle (UE5.8 rendering-parity gap G5): the m_DebugGlint* tuning members are Debug-only
-  // (#ifndef NDEBUG, see ClusterRenderPipeline.h), so Release passes literal 1.0/1.0 -- the material's
-  // authored glintDensity/glintIntensity renders unmodified (same Debug-only-scale/Release-literal-1.0
-  // pattern the SSS radius scale uses, see this file's own m_DebugSSSRadiusScale usage). No debug
-  // symbols/strings survive into the Release binary, per CLAUDE.md's build-separation rule.
+  // Glint / sparkle (UE5.8 rendering-parity gap G5) + Substrate horizontal mixing (gap G6): the
+  // m_DebugGlint*/m_DebugMixMaskSharpnessScale tuning members are Debug-only (#ifndef NDEBUG, see
+  // ClusterRenderPipeline.h), so Release passes literal 1.0/1.0/1.0 -- the material's authored
+  // glintDensity/glintIntensity/mixContrast renders unmodified (same Debug-only-scale/
+  // Release-literal-1.0 pattern the SSS radius scale uses, see this file's own m_DebugSSSRadiusScale
+  // usage). No debug symbols/strings survive into the Release binary, per CLAUDE.md's
+  // build-separation rule. m_FrameScratch.globalTimeSeconds (Wave 2) is threaded unconditionally --
+  // see the Debug branch's own comment for why it is not part of that Debug-only trio.
   m_Resolve.RecordResolveBinned(cmdMid, viewProj, m_SceneLights.sun, cameraPositionWorld, surfaceWetness, snowCoverage,
-      1.0f, 1.0f, 1.0f, m_ShadingBin);
+      1.0f, 1.0f, 1.0f, m_FrameScratch.globalTimeSeconds, m_ShadingBin);
 #endif
 }
 
@@ -2623,6 +2642,22 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
         VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
         VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR);
   }
+
+  // =========================================================================================
+  // [12decal] UE5.8-parity gap G1 (Decal system): project the fully-procedural decals onto the
+  // freshly resolved opaque GBuffer + direct color, BEFORE any deferred lighting pass below consumes
+  // them -- exactly a UE deferred decal's "written into the GBuffer before it is consumed by lighting"
+  // placement (see DecalProjectionPass's own class comment). Recorded as the first real GPU work of
+  // this command buffer (after the async-compute ACQUIRE above, which only touches the Surface Cache
+  // atlas/TLAS, not the GBuffer/color images this reads-and-writes). Everything below ([12a] GTAO/
+  // Contact Shadows, [12b] Screen Trace, [12b2] Reflections, [12b3] MegaLights, [12e] GI Composite)
+  // therefore operates on the decaled GBuffer; the pass's own trailing barrier makes that visible.
+  // =========================================================================================
+  m_Decals.RecordDecals(cmdLate, invViewProj, cameraPositionWorld, globalTimeSeconds
+#ifndef NDEBUG
+      , m_DebugShowDecalBounds
+#endif
+  );
 
   // =========================================================================================
   // [12a] Phase PP4 (post-process stack roadmap): GTAO + Screen-Space Contact Shadows.

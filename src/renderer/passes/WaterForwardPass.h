@@ -40,6 +40,7 @@
 #include "renderer/vulkan/GpuBuffer.h"
 #include "renderer/vulkan/RenderPass.h"
 #include "renderer/MaterialParameterTable.h" // MaterialParameters
+#include "renderer/WaterEffectsParams.h" // Wave 2: FoamParams
 #include "renderer/passes/SurfaceCachePass.h" // EntityDrawRange
 
 namespace renderer {
@@ -117,7 +118,14 @@ namespace renderer {
         // never changes at runtime.
         GpuBuffer m_MaterialParamsBuffer;
 
-        VkDescriptorSetLayout m_SetLayout = VK_NULL_HANDLE; // set 0: this pass' own 7 bindings.
+        // Binding 7 (Wave 2, UE5.8 water/foam parity) -- wave-breaking foam parameters (see
+        // include/foam_generation.glsl's own FoamUBO comment). Written once at Init() time with a
+        // fixed, hand-tuned recipe (same "authored once, never changes at runtime" convention as
+        // m_MaterialParamsBuffer above -- no per-material foam authoring exists yet, see this
+        // pass' own Init()'s comment).
+        GpuBuffer m_FoamParamsBuffer;
+
+        VkDescriptorSetLayout m_SetLayout = VK_NULL_HANDLE; // set 0: this pass' own 8 bindings.
         VkDescriptorPool m_DescriptorPool = VK_NULL_HANDLE;
         VkDescriptorSet m_Set = VK_NULL_HANDLE;
 

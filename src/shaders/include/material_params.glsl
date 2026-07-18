@@ -48,10 +48,11 @@ struct SubstrateSlab {
 };
 
 // GLSL-side, std430-compatible mirror of renderer::MaterialParameters
-// (src/renderer/MaterialParameterTable.h) -- 320 bytes: three SubstrateSlab blocks (base + the
-// horizontal-mix partner `mixB` + optional vertical-layer `top`) plus two trailing 16-byte blocks,
-// matching Substrate's own two composition operators -- the C++ mirror's own static_assert verifies
-// the match field-for-field. Populated once at renderer::ClusterResolvePass::Init() from
+// (src/renderer/MaterialParameterTable.h) -- 336 bytes: three SubstrateSlab blocks (base + the
+// horizontal-mix partner `mixB` + optional vertical-layer `top`) plus three trailing 16-byte blocks
+// (opacity/reflection controls, horizontal-mix controls, Wave 2 iridescence), matching Substrate's
+// own two composition operators plus the iridescence layer -- the C++ mirror's own static_assert
+// verifies the match field-for-field. Populated once at renderer::ClusterResolvePass::Init() from
 // renderer::GenerateShowcaseMaterialTable() (a fully deterministic, hand-authored table -- no
 // on-disk .cache section: materialID is per-entity, not per-triangle, so this table is small and
 // fully built once at startup). Consumed by ClusterResolve.comp/ClusterResolveBinned.comp/
@@ -97,6 +98,13 @@ struct MaterialParams {
     float mixScale;
     float mixContrast;
     float mixBias;
+    // Wave 2 (UE5.8 Substrate iridescence layer) -- see renderer::MaterialParameters::
+    // iridescenceAmount/iridescenceThickness's own comment (MaterialParameterTable.h). Consumed by
+    // substrate_bsdf.glsl's EvaluateSubstrateMaterial via include/iridescence_bsdf.glsl.
+    float iridescenceAmount;
+    float iridescenceThickness;
+    float _padIridescence0;
+    float _padIridescence1;
 };
 
 // Phase 7b (UE5.8 parity roadmap, terrain heightfield): mirror of renderer::kTerrainMaterialID

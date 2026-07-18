@@ -153,8 +153,18 @@ namespace renderer {
         float mixScale = 1.0f;
         float mixContrast = 1.0f;
         float mixBias = 0.5f;
+        // Wave 2 (UE5.8 Substrate iridescence layer): thin-film interference "shimmer" -- see
+        // renderer::IridescenceMaterialParams' own comment (MaterialParameterTable.h intentionally
+        // keeps these as two flat scalars here rather than embedding that struct directly, matching
+        // every other field in this table). 0.0 = off (default, zero extra cost -- see
+        // substrate_bsdf.glsl's EvaluateIridescence early-exit). iridescenceThickness in [0,1] maps
+        // to a [10,500]nm film thickness (see EvaluateIridescence's own comment).
+        float iridescenceAmount = 0.0f;
+        float iridescenceThickness = 0.5f;
+        float _padIridescence0 = 0.0f;
+        float _padIridescence1 = 0.0f;
     };
-    static_assert(sizeof(MaterialParameters) == 320,
+    static_assert(sizeof(MaterialParameters) == 336,
         "MaterialParameters must match MaterialParams in material_params.glsl exactly (std430 layout)");
 
     // Bounds both this CPU-side array and the matching GPU SSBO (ClusterResolvePass allocates
@@ -318,9 +328,16 @@ namespace renderer {
 
         // Transparent/glass (Sphere, slot 4): clear pale-blue, near-zero roughness, low alpha,
         // traced front-layer reflections on (see MaterialParameters::hasReflections's own comment).
+        // Wave 2: also this scene's iridescence showcase -- a thin-film soap-bubble/oil-film shimmer
+        // on top of the glass look (see MaterialParameters::iridescenceAmount's own comment); a
+        // moderate 0.4 amount keeps the underlying glass color legible rather than fully overwritten
+        // by the rainbow tint, ~185nm film thickness (thin end of the mapped range -- reads as a
+        // tighter, more colorful interference pattern than a thicker film would).
         table.params[4].base = MakeBaseSlab(maths::vec3(0.75f, 0.85f, 0.95f), 0.03f, maths::vec3(0.0f, 0.0f, 0.0f), 0.0f);
         table.params[4].alpha = 0.12f;
         table.params[4].hasReflections = 1.0f;
+        table.params[4].iridescenceAmount = 0.4f;
+        table.params[4].iridescenceThickness = 0.35f;
 
         // Translucent (Torus, slot 5): soft frosted violet, mid alpha, no reflections (no clear
         // image to reflect through a frosted surface). Phase PP3 (post-process stack roadmap): also

@@ -170,10 +170,15 @@ namespace renderer {
         // substrate_bsdf.glsl's EvaluateSubstrateMixMask. Defaults to 1.0 (authored value unchanged);
         // Release passes 1.0 (no toggle exists there), driven in Debug by the Post FX "Mix Sharpness"
         // slider (renderer::ClusterRenderPipeline's own SetDebugMixMaskSharpnessScale setter).
+        // `globalTimeSeconds` (Wave 2, UE5.8 caustics/light-function parity): real elapsed time,
+        // threaded into ResolveViewParamsUBO.timeSeconds and consumed by ComputeUnderwaterCaustics's
+        // scroll animation (procedural_light_modulation.glsl) -- EvaluateSunLightFunction does not
+        // need it. Defaults to 0.0 (a static but still-correct caustics pattern) so every pre-Wave-2
+        // caller compiles unchanged.
         void RecordResolve(VkCommandBuffer cmd, const maths::mat4& viewProj, const maths::mat4& prevViewProj,
             const DirectionalLight& sun, const maths::vec3& cameraPositionWorld, float surfaceWetness, float snowCoverage,
             float glintDensityScale = 1.0f, float glintIntensityScale = 1.0f, float mixMaskSharpnessScale = 1.0f,
-            uint32_t debugViewMode = 0);
+            float globalTimeSeconds = 0.0f, uint32_t debugViewMode = 0);
 
         // --- Phase 1b: binned resolve path (renderer::ClusterShadingBinPass) ---
         // Second-phase init, called once after BOTH Init() above AND `shadingBinPass.Init()` have
@@ -211,7 +216,8 @@ namespace renderer {
         // non-defaulted trailing reference) follows them, so both callers pass them explicitly.
         void RecordResolveBinned(VkCommandBuffer cmd, const maths::mat4& viewProj,
             const DirectionalLight& sun, const maths::vec3& cameraPositionWorld, float surfaceWetness, float snowCoverage,
-            float glintDensityScale, float glintIntensityScale, float mixMaskSharpnessScale, const ClusterShadingBinPass& shadingBinPass);
+            float glintDensityScale, float glintIntensityScale, float mixMaskSharpnessScale,
+            float globalTimeSeconds, const ClusterShadingBinPass& shadingBinPass);
 
         // Binds Phase 3's renderer::VirtualShadowMapPass resources (physical page atlas + sampler,
         // page table, feedback buffer, sun clipmap levels UBO) into BOTH this pass's descriptor

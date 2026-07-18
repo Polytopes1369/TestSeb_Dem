@@ -32,6 +32,11 @@ namespace renderer {
         // std140 padding (still needed to round vec2 up to a 16-byte boundary) -- Atmos weather
         // system's surface response extension repurposes them as real data (surfaceWetness/
         // snowCoverage, see ClusterResolve.comp's own field comment) instead of growing the UBO.
+        // Wave 2 (UE5.8 caustics/light-function parity): timeSeconds joins the 16-byte block G6's
+        // mixMaskSharpnessScale opens below (2 of its 4 floats now real data, 2 remain dead padding)
+        // rather than growing the UBO with a further block -- feeds the procedural (texture-free)
+        // underwater caustics term and the sun's light-function modulation, both in ClusterResolve.
+        // comp/ClusterResolveBinned.comp.
         struct ResolveViewParams {
             maths::mat4 viewProj;
             maths::mat4 prevViewProj;
@@ -64,12 +69,13 @@ namespace renderer {
             // Substrate horizontal mixing (UE5.8 rendering-parity gap G6): Debug-only per-material
             // blend-sharpness tuning multiplier. The FIRST field to actually GROW this UBO past its
             // previously-fully-packed 192 bytes -- glintIntensityScale above already consumed the last
-            // dead pad float, so this opens a fresh std140 16-byte block (a lone trailing float rounds
-            // the whole struct up to the next 16-byte boundary), hence the three explicit pad floats
-            // to keep this C++ mirror byte-exact with the GLSL UBO. 1.0 in Release, driven by the Post
-            // FX ImGui "Mix Sharpness" slider in Debug. See ClusterResolve.comp's own field comment.
+            // dead pad float, so this opens a fresh std140 16-byte block. 1.0 in Release, driven by the
+            // Post FX ImGui "Mix Sharpness" slider in Debug. See ClusterResolve.comp's own field comment.
             float mixMaskSharpnessScale = 1.0f;
-            float _padMix0 = 0.0f;
+            // Wave 2 (UE5.8 caustics/light-function parity): real elapsed time, joining this same
+            // freshly-opened block (see this struct's own top comment) -- see ClusterResolve.comp's
+            // own timeSeconds field comment.
+            float timeSeconds = 0.0f;
             float _padMix1 = 0.0f;
             float _padMix2 = 0.0f;
         };
@@ -524,7 +530,8 @@ namespace renderer {
 
     void ClusterResolvePass::RecordResolve(VkCommandBuffer cmd, const maths::mat4& viewProj, const maths::mat4& prevViewProj,
         const DirectionalLight& sun, const maths::vec3& cameraPositionWorld, float surfaceWetness, float snowCoverage,
-        float glintDensityScale, float glintIntensityScale, float mixMaskSharpnessScale, uint32_t debugViewMode) {
+        float glintDensityScale, float glintIntensityScale, float mixMaskSharpnessScale,
+        float globalTimeSeconds, uint32_t debugViewMode) {
         ResolveViewParams viewParams{};
         viewParams.viewProj = viewProj;
         viewParams.prevViewProj = prevViewProj;
@@ -549,6 +556,7 @@ namespace renderer {
         viewParams.cameraPositionWorldX = cameraPositionWorld.x;
         viewParams.cameraPositionWorldY = cameraPositionWorld.y;
         viewParams.cameraPositionWorldZ = cameraPositionWorld.z;
+        viewParams.timeSeconds = globalTimeSeconds;
         vkCmdUpdateBuffer(cmd, m_ViewParamsBuffer.Handle(), 0, sizeof(ResolveViewParams), &viewParams);
 
         VulkanUtils::RecordMemoryBarrier(cmd,
@@ -720,7 +728,8 @@ namespace renderer {
 
     void ClusterResolvePass::RecordResolveBinned(VkCommandBuffer cmd, const maths::mat4& viewProj,
         const DirectionalLight& sun, const maths::vec3& cameraPositionWorld, float surfaceWetness, float snowCoverage,
-        float glintDensityScale, float glintIntensityScale, float mixMaskSharpnessScale, const ClusterShadingBinPass& shadingBinPass) {
+        float glintDensityScale, float glintIntensityScale, float mixMaskSharpnessScale,
+        float globalTimeSeconds, const ClusterShadingBinPass& shadingBinPass) {
         // prevViewProj is never read by ClusterResolveBinned.comp (this path never serves
         // DEBUG_VIEW_MOTION_VECTORS) -- `viewProj` itself is reused as a harmless placeholder value
         // rather than introducing a separate identity-matrix concept for an otherwise-dead field.
@@ -749,6 +758,7 @@ namespace renderer {
         viewParams.cameraPositionWorldX = cameraPositionWorld.x;
         viewParams.cameraPositionWorldY = cameraPositionWorld.y;
         viewParams.cameraPositionWorldZ = cameraPositionWorld.z;
+        viewParams.timeSeconds = globalTimeSeconds;
         vkCmdUpdateBuffer(cmd, m_ViewParamsBuffer.Handle(), 0, sizeof(ResolveViewParams), &viewParams);
 
         VulkanUtils::RecordMemoryBarrier(cmd,
