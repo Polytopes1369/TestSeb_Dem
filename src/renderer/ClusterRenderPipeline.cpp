@@ -2440,11 +2440,11 @@ void ClusterRenderPipeline::RecordFrameMid(VkCommandBuffer cmdMid, VkCommandBuff
     // Glint / sparkle (UE5.8 rendering-parity gap G5): Debug-only tuning multipliers (see the
     // SetDebugGlint* setters) -- 1.0 in Release, so the material's authored sparkle renders unchanged.
     m_Resolve.RecordResolveBinned(cmdMid, viewProj, m_SceneLights.sun, cameraPositionWorld, surfaceWetness, snowCoverage,
-        m_DebugGlintDensityScale, m_DebugGlintIntensityScale, m_ShadingBin);
+        m_DebugGlintDensityScale, m_DebugGlintIntensityScale, m_DebugMixMaskSharpnessScale, m_ShadingBin);
   } else {
     maths::mat4 prevViewProjForResolve = m_HasPrevViewProj ? m_PrevViewProj : viewProj;
     m_Resolve.RecordResolve(cmdMid, viewProj, prevViewProjForResolve, m_SceneLights.sun, cameraPositionWorld, surfaceWetness, snowCoverage,
-        m_DebugGlintDensityScale, m_DebugGlintIntensityScale, cameraCopy.debugViewMode);
+        m_DebugGlintDensityScale, m_DebugGlintIntensityScale, m_DebugMixMaskSharpnessScale, cameraCopy.debugViewMode);
   }
 #else
   m_ShadingBin.RecordClassifyAndSort(cmdMid, m_RenderExtent);
@@ -2454,7 +2454,7 @@ void ClusterRenderPipeline::RecordFrameMid(VkCommandBuffer cmdMid, VkCommandBuff
   // pattern the SSS radius scale uses, see this file's own m_DebugSSSRadiusScale usage). No debug
   // symbols/strings survive into the Release binary, per CLAUDE.md's build-separation rule.
   m_Resolve.RecordResolveBinned(cmdMid, viewProj, m_SceneLights.sun, cameraPositionWorld, surfaceWetness, snowCoverage,
-      1.0f, 1.0f, m_ShadingBin);
+      1.0f, 1.0f, 1.0f, m_ShadingBin);
 #endif
 }
 
