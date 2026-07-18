@@ -8,12 +8,34 @@
 // point lights per pixel via RIS-weighted streaming reservoir sampling (megalights_ris.glsl's
 // SelectLightRIS, M=16 cheap weight evaluations), then traces EXACTLY ONE ray-traced shadow-
 // visibility query against the winner -- the entire point of RIS: O(1) expensive rays per pixel
-// regardless of how many lights exist. Writes RAW, unfiltered radiance (this phase has no temporal/
-// spatial reservoir reuse yet -- that is Phase B) into its own dedicated image; renderer::
-// MegaLightsPass denoises it with its own owned renderer::ATrousDenoisePass instance before
-// compositing (MegaLightsComposite.comp) -- see that class' own header comment for why a dedicated
-// instance is needed here rather than inheriting renderer::ClusterRenderPipeline's own [12d]
-// instance (which denoises Screen Trace GI specifically, not this pass' output).
+// regardless of how many lights exist. renderer::MegaLightsPass denoises the raw radiance this
+// shader writes with its own owned renderer::ATrousDenoisePass instance before compositing
+// (MegaLightsComposite.comp) -- see that class' own header comment for why a dedicated instance is
+// needed here rather than inheriting renderer::ClusterRenderPipeline's own [12d] instance (which
+// denoises Screen Trace GI specifically, not this pass' output).
+//
+// --- Phase 4 of the "Nanite advanced" roadmap (light BVH for RIS spatial bias, temporal ReSTIR
+// with per-frame revalidated visibility -- see the approved plan) ---
+// Feature 1: SelectLightRIS's candidate draw is now BIASED toward lights near this pixel's own
+// shading point via GatherSpatialLightCandidates' (megalights_bvh.glsl) traversal of geometry::
+// LightBVH -- NOT an O(N)-avoidance optimization (RIS was already O(1)/pixel), only a change of
+// WHICH candidates the existing fixed-size draw pulls from. See megalights_bvh.glsl's own header
+// comment for the full derivation.
+//
+// Feature 2: temporal ReSTIR is folded directly into THIS shader (no new pass/dispatch, unlike
+// ReflectionTemporal.comp) -- reservoir combination only ever reads THIS invocation's own fresh
+// single-frame RIS result plus the PREVIOUS frame's distinct ping-ponged history buffer, never a
+// neighboring invocation's in-flight write, so there is no intra-dispatch read/write race to avoid
+// by splitting into a second pass (unlike ReflectionTemporal.comp's own 3x3 spatial neighborhood
+// read, which genuinely does need to avoid racing a neighboring workgroup's write -- see that
+// file's own header comment). This frame's BVH-biased RIS winner is combined with the reprojected
+// history reservoir via a standard Bitterli et al. streaming-RIS reservoir combine
+// (CombineTemporalReservoir below), each candidate's streaming weight re-evaluated at THIS frame's
+// worldPos/normal (never the stored/stale one). The mandatory shadow-visibility ray below is still
+// traced EXACTLY ONCE per pixel per frame -- only its TARGET changes, from the raw single-frame RIS
+// winner to the temporally-combined reservoir's current winner, which is the concrete mechanism
+// satisfying "never trust stale reprojected visibility": every frame re-traces toward whatever
+// light the combined reservoir holds right now, never reusing a prior frame's occlusion result.
 
 #include "include/math_utils.glsl"
 #include "include/octahedral.glsl"
@@ -43,8 +65,22 @@ layout(set = 0, binding = 5) uniform accelerationStructureEXT g_TLAS;
 
 layout(std140, set = 0, binding = 7) uniform MegaLightsViewParamsUBO {
     mat4 invViewProj;
+    // Feature 2 (Phase 4, temporal ReSTIR): the PREVIOUS frame's own combined view-projection
+    // matrix -- reprojects this frame's worldPos back into the previous frame's screen space to
+    // fetch its reservoir history slot. Identity on the very first frame ever recorded (see
+    // renderer::MegaLightsPass::RecordShade's own comment) -- always safe even then, since every
+    // reservoir slot starts (and any never-written pixel stays) sentinel-filled, see
+    // MegaLightReservoir's own comment below.
+    mat4 prevViewProj;
     vec2 viewportSize;
-    vec2 _pad0;
+    // Feature 1 (Phase 4, light BVH spatial bias): config::megalights::SPATIAL_BIAS_RADIUS,
+    // live-tunable (not a shader constant) since it needs visual tuning. <= 0.0 disables the
+    // spatial bias entirely for this frame (GatherSpatialLightCandidates is skipped outright, see
+    // main() below) -- the same safety valve renderer::MegaLightsPass::Init uses for the
+    // defensive/never-expected-in-practice empty-BVH case (see that class' own m_LightBVHNodesBuffer
+    // comment).
+    float spatialBiasRadius;
+    float _pad0;
     // Substrate integration: the view direction EvaluateSubstrateMaterial's specular/Fresnel terms
     // need -- this shader had no view-dependent term at all before (see ClusterResolve.comp's own
     // ResolveViewParamsUBO.cameraPositionWorld comment for the identical addition pattern there).
@@ -62,6 +98,43 @@ layout(r16ui, set = 0, binding = 8) uniform readonly uimage2D g_GBufferMaterialI
 layout(std430, set = 0, binding = 9) readonly buffer MaterialParamsSSBO {
     MaterialParams params[];
 } g_MaterialParams;
+
+// Feature 1 (Phase 4): geometry::LightBVH traversal -- see megalights_bvh.glsl's own header
+// comment. Bindings 10/11 mirror SDFRayMarch.comp's own 2-buffer BVH split (nodes SSBO, leaf-index
+// SSBO).
+#define MEGALIGHTS_BVH_SET 0
+#define MEGALIGHTS_BVH_NODES_BINDING 10
+#define MEGALIGHTS_BVH_INDICES_BINDING 11
+#include "include/megalights_bvh.glsl"
+
+// Feature 2 (Phase 4): byte-for-byte mirror of renderer::MegaLightReservoir (MegaLightsPass.cpp) --
+// 48 bytes, std430: every vec3 immediately followed by the scalar filling its base-alignment gap
+// (matches MegaLight's own convention, see megalights_types.glsl), padded to a 16-byte multiple by
+// _pad0/_pad1/_pad2 at the end. `lightIndex == 0xFFFFFFFFu` is the reserved invalid/no-sample
+// sentinel -- the exact bit pattern renderer::MegaLightsPass::Init's own vkCmdFillBuffer(...,
+// 0xFFFFFFFFu) zero-fills every reservoir slot with (see that call site's own comment); the other
+// fields (worldPos/normal/M/W) are consequently NaN-valued garbage under that same fill pattern in
+// a freshly-cleared slot, so every read site below checks lightIndex FIRST and short-circuits
+// (GLSL guarantees left-to-right && / || short-circuit evaluation) before ever touching them.
+struct MegaLightReservoir {
+    vec3 worldPos;
+    float M;
+    vec3 normal;
+    float W;
+    uint lightIndex;
+    float _pad0, _pad1, _pad2;
+};
+
+// Binding 12: THIS frame's write target (whichever physical buffer renderer::MegaLightsPass just
+// flipped m_CurrentReservoirSlotIndex to -- see that member's own comment). Binding 13: the
+// PREVIOUS frame's reservoir, read-only -- mirrors renderer::ReflectionPass's own "two full
+// descriptor-set variants, current/history swapped per variant" ping-pong convention exactly.
+layout(std430, set = 0, binding = 12) buffer MegaLightReservoirCurrentBuffer {
+    MegaLightReservoir currentReservoirs[];
+};
+layout(std430, set = 0, binding = 13) readonly buffer MegaLightReservoirHistoryBuffer {
+    MegaLightReservoir historyReservoirs[];
+};
 
 layout(push_constant) uniform MegaLightsPushConstants {
     uint frameIndex;
@@ -81,6 +154,70 @@ bool TraceShadowRay(vec3 origin, vec3 dir, float tMax) {
     return rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT;
 }
 
+// Feature 2 (Phase 4): standard Bitterli et al. streaming-RIS reservoir combine. Combines
+// `newValid`/`newLightIndex`/`newW` (this frame's BVH-biased SelectLightRIS winner -- M is always
+// exactly kMegaLightsCandidateCount, the fixed number of RIS candidates that single-frame draw
+// already resampled from; `newW` is SelectLightRIS's own outInvPdf, which -- see that function's
+// own comment -- is algebraically identical to a reservoir's unbiased contribution weight W =
+// wsum / (M * targetPdf(y)), so Phase A's existing RIS output plugs directly into this combine with
+// no extra bookkeeping) with `historyValid`/`historyLightIndex`/`historyM`/`historyW` (the
+// reprojected, disocclusion-tested previous-frame reservoir). Each candidate's streaming weight is
+// computed from MegaLightTargetWeight (megalights_ris.glsl) RE-EVALUATED at THIS frame's
+// worldPos/normal -- never the stored/stale target weight, so a moving light or a reprojected
+// surface point never silently keeps using an outdated importance estimate. `historyM` is clamped
+// to kMegaLightsTemporalHistoryMaxM (standard ReSTIR-style temporal age-clamp) before being used as
+// its streaming weight multiplier, bounding how much a single long-lived stale reservoir can
+// dominate a freshly-relit surface. `rand0`/`rand1` are two independent low-discrepancy draws
+// (Halton23) -- one consumed per candidate stream step, matching SelectLightRIS's own
+// per-frame-offset indexing convention so successive frames decorrelate rather than alias.
+const float kMegaLightsTemporalHistoryMaxM = 20.0 * float(kMegaLightsCandidateCount);
+
+void CombineTemporalReservoir(
+    bool newValid, uint newLightIndex, float newW,
+    bool historyValid, uint historyLightIndex, float historyM, float historyW,
+    vec3 worldPos, vec3 normal, float rand0, float rand1,
+    out uint outLightIndex, out float outM, out float outW) {
+
+    outLightIndex = 0xFFFFFFFFu;
+    float wsum = 0.0;
+    float M = 0.0;
+
+    if (newValid) {
+        float targetNew = MegaLightTargetWeight(g_Lights.lights[newLightIndex], worldPos, normal);
+        float weightNew = targetNew * newW * float(kMegaLightsCandidateCount);
+        wsum += weightNew;
+        if (weightNew > 0.0 && rand0 < weightNew / wsum) {
+            outLightIndex = newLightIndex;
+        }
+        M += float(kMegaLightsCandidateCount);
+    }
+
+    if (historyValid) {
+        float clampedHistoryM = min(historyM, kMegaLightsTemporalHistoryMaxM);
+        float targetHist = MegaLightTargetWeight(g_Lights.lights[historyLightIndex], worldPos, normal);
+        float weightHist = targetHist * historyW * clampedHistoryM;
+        wsum += weightHist;
+        if (weightHist > 0.0 && rand1 < weightHist / wsum) {
+            outLightIndex = historyLightIndex;
+        }
+        M += clampedHistoryM;
+    }
+
+    float finalTargetPdf = (outLightIndex != 0xFFFFFFFFu)
+        ? MegaLightTargetWeight(g_Lights.lights[outLightIndex], worldPos, normal)
+        : 0.0;
+    outM = M;
+    outW = (finalTargetPdf > 0.0 && M > 0.0) ? (wsum / (M * finalTargetPdf)) : 0.0;
+}
+
+// Feature 2 (Phase 4): world-space distance + normal cosine disocclusion test -- reuses
+// ReflectionTemporal.comp's own two-term disocclusion test PATTERN (NOT its exponential
+// radiance-blend math, which does not apply here: a reservoir is a discrete sample, not a
+// blendable radiance value). Same ~14m-scene-scale thresholds as that shader's own
+// kDisocclusionDistanceThreshold/kDisocclusionCosThreshold.
+const float kMegaLightsDisocclusionDistanceThreshold = 0.5;
+const float kMegaLightsDisocclusionCosThreshold = 0.5; // ~60 degrees.
+
 void main() {
     ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
     ivec2 viewportSize = ivec2(g_ViewParams.viewportSize);
@@ -88,10 +225,25 @@ void main() {
         return;
     }
 
+    uint pixelIndex = uint(pixel.y) * uint(viewportSize.x) + uint(pixel.x);
+
     float depth = imageLoad(g_GBufferDepth, pixel).r;
     if (depth <= 0.0) {
         // Background pixel (matches ClusterResolve.comp's own reversed-Z "depth == 0.0" sentinel).
         imageStore(g_ShadeRadiance, pixel, vec4(0.0));
+        // Feature 2: no valid shading point this frame at all -- write an explicit invalid sentinel
+        // reservoir so a pixel that later becomes foreground (e.g. the camera pans) never
+        // reprojects a stale reservoir left over from this slot's own last foreground frame (two
+        // ping-pong swaps ago). NOT reading/preserving whatever was there before -- every frame
+        // fully revalidates, matching this whole feature's "never trust stale state" design.
+        MegaLightReservoir invalidReservoir;
+        invalidReservoir.worldPos = vec3(0.0);
+        invalidReservoir.M = 0.0;
+        invalidReservoir.normal = vec3(0.0);
+        invalidReservoir.W = 0.0;
+        invalidReservoir.lightIndex = 0xFFFFFFFFu;
+        invalidReservoir._pad0 = 0.0; invalidReservoir._pad1 = 0.0; invalidReservoir._pad2 = 0.0;
+        currentReservoirs[pixelIndex] = invalidReservoir;
         return;
     }
 
@@ -100,16 +252,79 @@ void main() {
     vec4 worldPos4 = g_ViewParams.invViewProj * vec4(ndcXY, depth, 1.0);
     vec3 worldPos = worldPos4.xyz / worldPos4.w;
 
-    uint pixelSeed = uint(pixel.y) * uint(viewportSize.x) + uint(pixel.x);
-    uint selectedIndex;
-    float invPdf;
-    bool valid = SelectLightRIS(worldPos, normal, pixelSeed, pc.frameIndex, selectedIndex, invPdf);
-    if (!valid) {
+    uint pixelSeed = pixelIndex;
+
+    // --- Feature 1: gather a BVH-biased spatial candidate pool, then draw this frame's RIS winner
+    // from it (falls back to the full population automatically when the pool is empty -- see
+    // SelectLightRIS's own comment). Skipped entirely when spatialBiasRadius <= 0 (the defensive
+    // empty-BVH safety valve -- see g_ViewParams' own comment). ---
+    uint spatialPool[kMegaLightsSpatialPoolCapacity];
+    uint spatialPoolCount = 0u;
+    if (g_ViewParams.spatialBiasRadius > 0.0) {
+        GatherSpatialLightCandidates(worldPos, g_ViewParams.spatialBiasRadius, spatialPool, spatialPoolCount);
+    }
+
+    uint newLightIndex;
+    float newInvPdf;
+    bool newValid = SelectLightRIS(worldPos, normal, pixelSeed, pc.frameIndex, spatialPool, spatialPoolCount, newLightIndex, newInvPdf);
+
+    // --- Feature 2: reproject this pixel's own worldPos through the PREVIOUS frame's
+    // view-projection matrix, nearest-neighbor-fetch (never bilinear -- reservoirs are discrete
+    // samples, not filterable values) the history reservoir at the reprojected INTEGER pixel, and
+    // disocclusion-test it before trusting it. ---
+    bool historyValid = false;
+    uint historyLightIndex = 0xFFFFFFFFu;
+    float historyM = 0.0;
+    float historyW = 0.0;
+
+    vec4 prevClip = g_ViewParams.prevViewProj * vec4(worldPos, 1.0);
+    if (prevClip.w > 1.0e-4) {
+        vec2 prevUV = (prevClip.xy / prevClip.w) * 0.5 + 0.5;
+        if (all(greaterThanEqual(prevUV, vec2(0.0))) && all(lessThanEqual(prevUV, vec2(1.0)))) {
+            ivec2 prevPixel = clamp(ivec2(prevUV * vec2(viewportSize)), ivec2(0), viewportSize - ivec2(1));
+            uint prevIndex = uint(prevPixel.y) * uint(viewportSize.x) + uint(prevPixel.x);
+            MegaLightReservoir raw = historyReservoirs[prevIndex];
+
+            bool disoccluded = raw.lightIndex == 0xFFFFFFFFu
+                || distance(raw.worldPos, worldPos) > kMegaLightsDisocclusionDistanceThreshold
+                || dot(raw.normal, normal) < kMegaLightsDisocclusionCosThreshold;
+
+            if (!disoccluded) {
+                historyValid = true;
+                historyLightIndex = raw.lightIndex;
+                historyM = raw.M;
+                historyW = raw.W;
+            }
+        }
+    }
+
+    // --- Feature 2: Bitterli-style streaming-RIS temporal combine. ---
+    vec2 combineRand = Halton23(pixelSeed * 2u + pc.frameIndex * 15485863u);
+    uint combinedLightIndex;
+    float combinedM;
+    float combinedW;
+    CombineTemporalReservoir(
+        newValid, newLightIndex, newInvPdf,
+        historyValid, historyLightIndex, historyM, historyW,
+        worldPos, normal, combineRand.x, combineRand.y,
+        combinedLightIndex, combinedM, combinedW);
+
+    // Write the combined reservoir back into the CURRENT slot -- becomes next frame's history.
+    MegaLightReservoir outReservoir;
+    outReservoir.worldPos = worldPos;
+    outReservoir.M = combinedM;
+    outReservoir.normal = normal;
+    outReservoir.W = combinedW;
+    outReservoir.lightIndex = combinedLightIndex;
+    outReservoir._pad0 = 0.0; outReservoir._pad1 = 0.0; outReservoir._pad2 = 0.0;
+    currentReservoirs[pixelIndex] = outReservoir;
+
+    if (combinedLightIndex == 0xFFFFFFFFu) {
         imageStore(g_ShadeRadiance, pixel, vec4(0.0));
         return;
     }
 
-    MegaLight light = g_Lights.lights[selectedIndex];
+    MegaLight light = g_Lights.lights[combinedLightIndex];
     vec3 toLight = light.position - worldPos;
     float dist = length(toLight);
     vec3 lightDir = toLight / max(dist, 1.0e-4);
@@ -117,6 +332,9 @@ void main() {
 
     // A grazing/back-facing candidate needs no shadow ray -- it already contributes zero.
     vec3 biasedOrigin = worldPos + normal * 1.0e-2;
+    // Mandatory per-frame visibility revalidation (Feature 2): traces toward the TEMPORALLY-
+    // COMBINED reservoir's current winner -- exactly one ray per pixel per frame, same ray-budget
+    // invariant Phase A already established (see this file's own header comment).
     bool occluded = (NdotL > 0.0) ? TraceShadowRay(biasedOrigin, lightDir, max(dist - 2.0e-2, 1.0e-3)) : true;
     float visibility = occluded ? 0.0 : 1.0;
 
@@ -136,16 +354,18 @@ void main() {
     uint materialSlot = min(imageLoad(g_GBufferMaterialID, pixel).r, MATERIAL_TABLE_SIZE - 1u);
     MaterialParams mat = g_MaterialParams.params[materialSlot];
 
-    // Full shading contribution of the selected light, times the RIS unbiased-estimator factor --
-    // see megalights_ris.glsl's own SelectLightRIS comment for the derivation. EvaluateSubstrateMaterial
-    // already applies its own NdotL internally per BSDF lobe -- no separate NdotL multiply here (that
-    // would double-count it; NdotL above is still used for the shadow-ray early-out check).
-    // light.intensity is real luminous intensity in CANDELA (renderer::MegaLight's own comment,
-    // 2026-07-17 recalibration) -- `intensity / distSq` is the standard inverse-square illuminance-
-    // at-a-point formula; EvaluateSubstrateMaterial's own contract ("caller multiplies by the
-    // light's real color/intensity", its diffuse lobe already bakes in the /PI Lambertian
-    // normalization) means no extra factor is needed here.
-    vec3 radiance = EvaluateSubstrateMaterial(mat, normal, viewDir, lightDir) * light.color * light.intensity / distSq * window * visibility * invPdf;
+    // Full shading contribution of the combined reservoir's winning light, times its unbiased
+    // contribution weight `combinedW` -- see CombineTemporalReservoir's own comment for the
+    // derivation (replaces Phase A's single-frame `invPdf` factor now that the light being shaded
+    // is the TEMPORALLY-COMBINED winner, not necessarily this frame's own raw RIS draw).
+    // EvaluateSubstrateMaterial already applies its own NdotL internally per BSDF lobe -- no
+    // separate NdotL multiply here (that would double-count it; NdotL above is still used for the
+    // shadow-ray early-out check). light.intensity is real luminous intensity in CANDELA
+    // (renderer::MegaLight's own comment, 2026-07-17 recalibration) -- `intensity / distSq` is the
+    // standard inverse-square illuminance-at-a-point formula; EvaluateSubstrateMaterial's own
+    // contract ("caller multiplies by the light's real color/intensity", its diffuse lobe already
+    // bakes in the /PI Lambertian normalization) means no extra factor is needed here.
+    vec3 radiance = EvaluateSubstrateMaterial(mat, normal, viewDir, lightDir) * light.color * light.intensity / distSq * window * visibility * combinedW;
     // No saturate(): g_ShadeRadiance is now linear HDR (rgba16f) -- clamping here would defeat the
     // whole point of widening the format, re-introducing the hard-clip renderer::PostProcessPass exists
     // to replace with a soft display-referred curve.

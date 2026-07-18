@@ -56,15 +56,32 @@ float MegaLightTargetWeight(MegaLight light, vec3 worldPos, vec3 normal) {
 }
 
 // Streaming weighted reservoir (textbook WRS/Chao's algorithm, single reservoir, no cross-pixel/
-// cross-frame state -- temporal/spatial reuse is explicitly Phase B) over kMegaLightsCandidateCount
-// candidates, indexed via a per-pixel/per-frame-offset Halton23 sequence (math_utils.glsl) rather
-// than a naive hash-modulo, to avoid visible index-selection banding. Returns false if every
-// candidate's weight was zero (e.g. no light in range) -- `outLightIndex`/`outInvPdf` are only valid
-// when this returns true. `outInvPdf` is the RIS unbiased estimator's (totalWeight / M) /
-// targetWeight(selected) factor: multiplying the FULL shading contribution (not just the target
-// proxy) of the selected light by this factor gives an unbiased estimate of the true multi-light sum
-// -- see MegaLightsShade.comp's own call site for the exact final formula.
-bool SelectLightRIS(vec3 worldPos, vec3 normal, uint pixelSeed, uint frameIndex, out uint outLightIndex, out float outInvPdf) {
+// cross-frame state -- temporal reuse across FRAMES is Feature 2 of Phase 4, layered on top of this
+// function's own single-frame result by MegaLightsShade.comp's own CombineTemporalReservoir, not
+// inside this function) over kMegaLightsCandidateCount candidates, indexed via a per-pixel/
+// per-frame-offset Halton23 sequence (math_utils.glsl) rather than a naive hash-modulo, to avoid
+// visible index-selection banding.
+//
+// Feature 1 of Phase 4 (light BVH for RIS spatial bias): `pool`/`poolCount` are
+// megalights_bvh.glsl's GatherSpatialLightCandidates own output -- when poolCount > 0, each
+// candidate index is drawn from THAT pool (biasing every one of the M draws toward lights actually
+// near `worldPos`) instead of uniformly across the full g_Lights population; when poolCount == 0
+// (an isolated accent-zone pixel with no light within the BVH's query radius, or a caller that
+// never populated a pool at all), this falls back to the ORIGINAL full-population draw -- no
+// regression for that case. Only the candidate index SOURCE changes; the streaming-reservoir/
+// weighting math below is completely untouched from Phase A.
+//
+// Returns false if every candidate's weight was zero (e.g. no light in range) --
+// `outLightIndex`/`outInvPdf` are only valid when this returns true. `outInvPdf` is the RIS
+// unbiased estimator's (totalWeight / M) / targetWeight(selected) factor: multiplying the FULL
+// shading contribution (not just the target proxy) of the selected light by this factor gives an
+// unbiased estimate of the true multi-light sum -- see MegaLightsShade.comp's own call site for the
+// exact final formula. This same (totalWeight / M) / targetWeight(selected) factor is also exactly
+// the standard ReSTIR reservoir's own unbiased contribution weight W = wsum / (M * targetPdf(y)) --
+// see CombineTemporalReservoir's own comment for why this lets Phase A's existing RIS output be fed
+// directly into Feature 2's temporal combine with no extra bookkeeping.
+bool SelectLightRIS(vec3 worldPos, vec3 normal, uint pixelSeed, uint frameIndex,
+    uint pool[kMegaLightsSpatialPoolCapacity], uint poolCount, out uint outLightIndex, out float outInvPdf) {
     if (g_Lights.lightCount == 0u) {
         outLightIndex = 0u;
         outInvPdf = 0.0;
@@ -78,7 +95,12 @@ bool SelectLightRIS(vec3 worldPos, vec3 normal, uint pixelSeed, uint frameIndex,
     uint baseIndex = pixelSeed * kMegaLightsCandidateCount + frameIndex * 9781u;
     for (uint i = 0u; i < kMegaLightsCandidateCount; ++i) {
         vec2 h = Halton23(baseIndex + i);
-        uint candidateIndex = min(uint(h.x * float(g_Lights.lightCount)), g_Lights.lightCount - 1u);
+        uint candidateIndex;
+        if (poolCount > 0u) {
+            candidateIndex = pool[min(uint(h.x * float(poolCount)), poolCount - 1u)];
+        } else {
+            candidateIndex = min(uint(h.x * float(g_Lights.lightCount)), g_Lights.lightCount - 1u);
+        }
         MegaLight candidate = g_Lights.lights[candidateIndex];
 
         float w = MegaLightTargetWeight(candidate, worldPos, normal);

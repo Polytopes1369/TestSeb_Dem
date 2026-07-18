@@ -2154,6 +2154,14 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
   // `megaLightsEnabled` (debug-only toggle, main.cpp's 'X' key) gates the call entirely, same
   // Release-always-on convention as `reflectionsEnabled` above (a real live consumer from frame
   // one).
+  //
+  // Phase 4 of the "Nanite advanced" roadmap (light BVH for RIS spatial bias, temporal ReSTIR with
+  // per-frame revalidated visibility): RecordShade now also takes `prevViewProjForMegaLights` --
+  // its own reservoir reprojection needs the previous frame's combined view-projection matrix, same
+  // `m_HasPrevViewProj` frame-0-safety ternary already used for [12b2]'s own
+  // prevViewProjForReflection above (identity matrix on the very first frame ever recorded; see
+  // MegaLightsPass::RecordShade's own header comment for why an identity matrix is always safe here
+  // even then, thanks to the reservoir's own sentinel-fill invalid-history guard).
   // =========================================================================================
   {
 #ifndef NDEBUG
@@ -2162,7 +2170,8 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
     bool megaLightsEnabled = true;
 #endif
     if (megaLightsEnabled) {
-      m_MegaLights.RecordShade(cmdLate, viewProj, cameraPositionWorld, m_FrameIndex);
+      maths::mat4 prevViewProjForMegaLights = m_HasPrevViewProj ? m_PrevViewProj : maths::mat4{};
+      m_MegaLights.RecordShade(cmdLate, viewProj, prevViewProjForMegaLights, cameraPositionWorld, m_FrameIndex);
     }
   }
 
