@@ -372,6 +372,20 @@ inline float WIND_TURBULENCE_ROUGHNESS = 0.5f;
 inline float CLOUD_DENSITY_TARGET = 0.5f; // [0,1] -- unconsumed until Subtask 4 (Volumetric Clouds).
 inline float FOG_DENSITY_TARGET = 0.1f; // [0,1] -- unconsumed until Subtask 3 (Froxel Volumetric Fog).
 inline float RAIN_STRENGTH = 0.0f; // [0,1] -- unconsumed until a future precipitation pass.
+
+// --- Dynamic Weather Simulation (post-Subtask-1 addition, see AtmosClimatePass.h's own class
+// comment) -- when DYNAMIC_WEATHER_ENABLED, TEMPERATURE_CELSIUS/RELATIVE_HUMIDITY/WIND_SPEED_MPS/
+// CLOUD_DENSITY_TARGET/FOG_DENSITY_TARGET/RAIN_STRENGTH above are REINTERPRETED as baseline
+// "centers" the autonomous simulation drifts around, rather than literal per-frame state; the
+// fields below are the simulation's own parameters (front cadence, smoothing, season length/
+// amplitude), all still live ImGui sliders (main.cpp's Volumetric tab). ---
+inline bool DYNAMIC_WEATHER_ENABLED = true; // Master toggle: ON = autonomous drift, OFF = original static-read path (manual sliders take full, literal effect).
+inline float WEATHER_FRONT_TAU_SECONDS = 45.0f; // Exponential-approach smoothing time constant for weather-front drift (current += (target-current)*(1-exp(-dt/tau))) -- tens of seconds, so fronts are gradual, not per-frame twitchy.
+inline float WEATHER_FRONT_FREQUENCY = 0.015f; // How fast the clear/overcast/stormy blend weights drift, in noise-cycles per simulated second -- low-frequency by design (see AtmosClimatePass.cpp's own AtmosFbm1D), never an obviously-looping sine.
+inline float YEAR_LENGTH_SECONDS = 180.0f; // Simulated seconds per full seasonal cycle (winter->summer->winter) -- default 3 minutes so a demo session can actually observe a season change; a periodic function IS correct here (unlike weather fronts).
+inline float SEASONAL_TEMPERATURE_AMPLITUDE_CELSIUS = 12.0f; // Peak-to-baseline swing the seasonal cycle adds/subtracts from TEMPERATURE_CELSIUS (summer = +amplitude, winter = -amplitude).
+inline float SEASONAL_PRECIP_AMPLITUDE = 0.35f; // Peak-to-baseline swing the seasonal cycle adds/subtracts from RAIN_STRENGTH's target (winter = wetter, summer = drier).
+inline float SEASONAL_SUN_ELEVATION_AMPLITUDE_DEGREES = 15.0f; // Peak seasonal sweep applied to the scene's fixed base sun elevation angle (see ClusterRenderPipeline::Init()'s own sun-direction comment) -- a modest elevation-only sweep, no azimuth/axial-tilt astronomy.
 } // namespace atmos
 
 // GPU particle system (particle_system_integration_plan.md, Subtask 6: Final Integration) -- live

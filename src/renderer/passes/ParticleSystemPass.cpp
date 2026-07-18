@@ -81,7 +81,7 @@ namespace renderer {
         static_assert(sizeof(ParticleRenderParamsUBO) == 240, "ParticleRenderParamsUBO must match ParticleRender.vert/.frag's own UBO exactly (std140 layout)");
 
         // Byte-for-byte mirror of world_probe_sampling.glsl's WorldProbeGridParamsUBO (std140) --
-        // identical to renderer::HeroTessellationPass's own copy (see that class' own comment).
+        // identical to renderer::TessellationPass's own copy (see that class' own comment).
         struct WorldProbeGridParamsUBO {
             float gridOriginX = 0.0f, gridOriginY = 0.0f, gridOriginZ = 0.0f;
             float probeSpacing = 0.0f;

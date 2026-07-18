@@ -6,7 +6,7 @@
 // flat fallback baseColor; this include overrides it per-pixel using the already-interpolated
 // worldPos/normal available at ClusterResolve.comp/ClusterResolveBinned.comp's material-evaluation
 // step -- no new binding, no new MaterialParameters field (kept as dedicated GLSL constants, same
-// "private constant, single-entity scope" convention HeroTessellationPass established for
+// "private constant, single-entity scope" convention TessellationPass established for
 // displacementScale in Phase 7a).
 #include "terrain_noise.glsl"
 #include "water_params.glsl" // Phase 7c: kWaterLevel, for the beach band below.

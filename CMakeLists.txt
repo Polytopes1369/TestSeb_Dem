@@ -377,9 +377,11 @@ if(Vulkan_GLSLC_EXECUTABLE)
         # MegaLightsShade.comp -- Phase A of the MegaLights native-port roadmap's own inline-HWRT
         # shadow-visibility ray, see that shader's own TraceShadowRay comment; TransparentForward.frag
         # -- the same Phase A follow-up's inlined shadow-ray shading for the translucent/glass path,
-        # see that shader's own TraceShadowRay comment; HeroTessellation.frag -- Phase 7a's own copy
-        # of the same inlined MegaLights shadow-ray + optional reflection trace, see that shader's
-        # own TraceShadowRay/TraceHWRT comments; WaterForward.frag -- Phase 7c's own copy of the
+        # see that shader's own TraceShadowRay comment; Tessellation.frag -- the generalized
+        # multi-entity tessellation pass' own copy of the same inlined MegaLights shadow-ray +
+        # optional reflection trace (formerly HeroTessellation.frag, single-entity only -- see
+        # renderer::TessellationPass's own class comment), see that shader's own TraceShadowRay/
+        # TraceHWRT comments; WaterForward.frag -- Phase 7c's own copy of the
         # same inlined optional reflection trace, see that shader's own TraceHWRT comment).
         # Every other shader stage keeps glslc's default target-env/target-spv untouched.
         get_filename_component(SHADER_EXT ${SHADER_SRC} EXT)
@@ -388,7 +390,7 @@ if(Vulkan_GLSLC_EXECUTABLE)
                 OR SHADER_NAME STREQUAL "SurfaceCacheGIInject.comp" OR SHADER_NAME STREQUAL "ScreenProbeTrace.comp"
                 OR SHADER_NAME STREQUAL "WorldProbeInject.comp" OR SHADER_NAME STREQUAL "ReflectionTrace.comp"
                 OR SHADER_NAME STREQUAL "MegaLightsShade.comp" OR SHADER_NAME STREQUAL "TransparentForward.frag"
-                OR SHADER_NAME STREQUAL "HeroTessellation.frag" OR SHADER_NAME STREQUAL "WaterForward.frag")
+                OR SHADER_NAME STREQUAL "Tessellation.frag" OR SHADER_NAME STREQUAL "WaterForward.frag")
             set(GLSLC_EXTRA_FLAGS --target-env=vulkan1.3 --target-spv=spv1.4)
         endif()
 
