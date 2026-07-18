@@ -55,6 +55,11 @@
 
 #include "include/ParticleCommon.glsl"
 #include "include/AtmosNoiseCommon.glsl"
+// Niagara-parity roadmap, subtask B2 (Ribbon/Trail render mode) -- set 2 here (after this shader's
+// own set 0 particle-state / set 1 environment sets), see ParticleRibbonCommon.glsl's own header
+// comment for the full set-index rationale (ParticleRibbonRender.vert binds the SAME 2 buffers at a
+// DIFFERENT set index, 4, within its own unrelated pipeline layout).
+#include "include/ParticleRibbonCommon.glsl"
 
 layout(local_size_x = 64) in;
 
@@ -282,6 +287,16 @@ void SpawnParticle(uint slotIndex, uint spawnRequestIndex, uint emitterIndex) {
     // one-frame-safe default, not the value that actually reaches the render pass.
     p.baseSize = size;
     particles[slotIndex] = p;
+
+    // Niagara-parity roadmap, subtask B2 (Ribbon/Trail render mode): reset this slot's own ring
+    // buffer regardless of THIS emitter's current renderMode (cheap -- 2 small writes -- and avoids
+    // a reused slot's ribbon ever momentarily showing a stale trail connecting back to whichever
+    // PREVIOUS particle used to occupy it, including across a live ImGui renderMode switch). Seeding
+    // ring slot 0 with the spawn position (rather than leaving count at 0) means a particle's ribbon
+    // has continuity from its own spawn point starting the very first frame it is alive, instead of
+    // needing a few frames to accumulate before any segment is drawable.
+    ribbonSampleCount[slotIndex] = 1u;
+    ribbonHistory[slotIndex * kRibbonHistorySamples] = vec4(position, 0.0);
 }
 
 // Precipitation feature -- spawns one rain or snow particle inside a horizontal box "shell" centered
@@ -342,6 +357,14 @@ void SpawnPrecipitationParticle(uint slotIndex, uint spawnRequestIndex) {
     // Explicit default, not read GPU memory, same convention as p.emitterIndex above.
     p.baseSize = 0.0;
     particles[slotIndex] = p;
+
+    // Niagara-parity roadmap, subtask B2: same reset as SpawnParticle's own -- precipitation
+    // particles never render as ribbons themselves (see ParticleRender.vert's own gating comment),
+    // but this slot's ring buffer must still be reset here in case a LATER ember spawn reuses this
+    // exact slot while its own emitter is in Ribbon mode (see SpawnParticle's own comment for the
+    // full "reused slot must never inherit stale ring contents" rationale).
+    ribbonSampleCount[slotIndex] = 1u;
+    ribbonHistory[slotIndex * kRibbonHistorySamples] = vec4(spawnPos, 0.0);
 }
 
 void UpdateParticle(uint slotIndex) {
@@ -460,6 +483,20 @@ void UpdateParticle(uint slotIndex) {
         float age = clamp((p.maxLife - (p.life - pc.dt)) / max(p.maxLife, 1.0e-5), 0.0, 1.0);
         p.color = SampleColorCurve(e, age);
         p.size = vec2(p.baseSize, p.baseSize) * SampleSizeCurve(e, age);
+
+        // --- Niagara-parity roadmap, subtask B2 (Ribbon/Trail render mode) ---
+        // Pushes THIS frame's resolved position into this particle's own ring buffer -- gated on
+        // renderMode == 2 (not unconditional) so the extra SSBO write only happens for particles
+        // whose emitter actually needs a trail; a non-ribbon emitter's particles simply keep
+        // whatever was written once at spawn (see SpawnParticle's own comment) and never grow past
+        // that single sample. Uses `e.renderMode` (already fetched above for the curve sampling just
+        // above) rather than re-reading EmitterParams a second time.
+        if (e.renderMode == 2u) {
+            uint pushIndex = ribbonSampleCount[slotIndex];
+            uint ringSlot = pushIndex % kRibbonHistorySamples;
+            ribbonHistory[slotIndex * kRibbonHistorySamples + ringSlot] = vec4(newPosition, 0.0);
+            ribbonSampleCount[slotIndex] = pushIndex + 1u;
+        }
     }
     p.position = newPosition;
 

@@ -401,6 +401,68 @@ namespace renderer {
         m_CurrentIndex = 0;
 
         // =====================================================================================
+        // STEP 3b (B2 -- Niagara-parity roadmap, Ribbon/Trail render mode) -- the per-particle-SLOT
+        // position-history ring buffers (see this class' own m_RibbonHistoryBuffer/
+        // m_RibbonSampleCountBuffer declaration comments and ParticleRibbonCommon.glsl's own header
+        // comment for the full contract) plus their OWN dedicated descriptor set, built HERE (before
+        // STEP 4 below) specifically because ParticleSimulation.comp's own pipeline layout (built in
+        // STEP 4) needs to bind this set as its 3rd set alongside the existing particle-state/
+        // environment sets -- ParticleSimulation.comp is the only WRITER of these buffers
+        // (ParticleRibbonRender.vert, built much later in this method, is the only reader).
+        // =====================================================================================
+        {
+            constexpr VkDeviceSize kRibbonHistoryBytes = static_cast<VkDeviceSize>(kMaxParticles) * kRibbonHistorySamples * sizeof(float) * 4; // vec4 per sample.
+            constexpr VkDeviceSize kRibbonSampleCountBytes = static_cast<VkDeviceSize>(kMaxParticles) * sizeof(uint32_t);
+            m_RibbonHistoryBuffer.Create(allocator, kRibbonHistoryBytes,
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
+            m_RibbonSampleCountBuffer.Create(allocator, kRibbonSampleCountBytes,
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
+
+            // Zero both buffers at Init() -- not strictly required for correctness (every particle
+            // slot this pass ever DRAWS has necessarily already gone through SpawnParticle/
+            // SpawnPrecipitationParticle at least once, both of which unconditionally reset their own
+            // slot's ribbonSampleCount/ribbonHistory[0] before that slot ever becomes visible via the
+            // alive/sorted-pairs lists -- see SpawnParticle's own comment), but matches this
+            // codebase's own established "always explicitly seed a GPU_ONLY buffer's starting
+            // content, don't rely solely on a data-flow invariant" convention (e.g. CounterBuffer/
+            // PerEmitterAliveCountBuffer are both explicitly zeroed too).
+            VulkanUtils::ExecuteOneShotCommands(m_Device, commandPool, queue, [&](VkCommandBuffer cmd) {
+                vkCmdFillBuffer(cmd, m_RibbonHistoryBuffer.Handle(), 0, VK_WHOLE_SIZE, 0u);
+                vkCmdFillBuffer(cmd, m_RibbonSampleCountBuffer.Handle(), 0, VK_WHOLE_SIZE, 0u);
+                });
+
+            // COMPUTE (ParticleSimulation.comp writes) | VERTEX (ParticleRibbonRender.vert reads) --
+            // same dual-stage convention as m_SortSetLayout's own binding 0.
+            VkDescriptorSetLayoutBinding ribbonBindings[2]{};
+            ribbonBindings[0] = { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_VERTEX_BIT, nullptr };
+            ribbonBindings[1] = { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_VERTEX_BIT, nullptr };
+            VkDescriptorSetLayoutCreateInfo ribbonLayoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+            ribbonLayoutInfo.bindingCount = 2;
+            ribbonLayoutInfo.pBindings = ribbonBindings;
+            VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &ribbonLayoutInfo, nullptr, &m_RibbonSetLayout));
+
+            VkDescriptorPoolSize ribbonPoolSize{ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 };
+            VkDescriptorPoolCreateInfo ribbonPoolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
+            ribbonPoolInfo.maxSets = 1;
+            ribbonPoolInfo.poolSizeCount = 1;
+            ribbonPoolInfo.pPoolSizes = &ribbonPoolSize;
+            VK_CHECK(vkCreateDescriptorPool(m_Device, &ribbonPoolInfo, nullptr, &m_RibbonDescriptorPool));
+
+            VkDescriptorSetAllocateInfo ribbonSetAllocInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+            ribbonSetAllocInfo.descriptorPool = m_RibbonDescriptorPool;
+            ribbonSetAllocInfo.descriptorSetCount = 1;
+            ribbonSetAllocInfo.pSetLayouts = &m_RibbonSetLayout;
+            VK_CHECK(vkAllocateDescriptorSets(m_Device, &ribbonSetAllocInfo, &m_RibbonSet));
+
+            VkDescriptorBufferInfo ribbonHistoryInfo{ m_RibbonHistoryBuffer.Handle(), 0, m_RibbonHistoryBuffer.Size() };
+            VkDescriptorBufferInfo ribbonSampleCountInfo{ m_RibbonSampleCountBuffer.Handle(), 0, m_RibbonSampleCountBuffer.Size() };
+            VkWriteDescriptorSet ribbonWrites[2]{};
+            ribbonWrites[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_RibbonSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &ribbonHistoryInfo, nullptr };
+            ribbonWrites[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_RibbonSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &ribbonSampleCountInfo, nullptr };
+            vkUpdateDescriptorSets(m_Device, 2, ribbonWrites, 0, nullptr);
+        }
+
+        // =====================================================================================
         // STEP 4 (Subtask 2) -- ParticleSimulation.comp's environment set (set 1): AtmosGlobalsUBO
         // (wind, borrowed unmodified from `atmosClimate`) + the 4 Global SDF clipmap levels
         // (collision, borrowed unmodified from `globalSDF`, sampled with this pass' own dedicated
@@ -467,10 +529,15 @@ namespace renderer {
             envWrites[2] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_EnvironmentSet, 2, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &precipParamsInfo, nullptr };
             vkUpdateDescriptorSets(m_Device, 3, envWrites, 0, nullptr);
 
-            VkDescriptorSetLayout simSetLayouts[2] = { m_SetLayout, m_EnvironmentSetLayout };
+            // B2 (Ribbon/Trail render mode): set 2 is the ribbon position-history set built in STEP
+            // 3b above -- ParticleSimulation.comp's own #include "include/ParticleRibbonCommon.glsl"
+            // declares it at set = 2 by that file's own default (see that file's header comment for
+            // why the set index is #define-configurable and differs from ParticleRibbonRender.vert's
+            // own set = 4).
+            VkDescriptorSetLayout simSetLayouts[3] = { m_SetLayout, m_EnvironmentSetLayout, m_RibbonSetLayout };
             VkPushConstantRange pushRange{ VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(ParticleSimulationPC) };
             VkPipelineLayoutCreateInfo simPipelineLayoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-            simPipelineLayoutInfo.setLayoutCount = 2;
+            simPipelineLayoutInfo.setLayoutCount = 3;
             simPipelineLayoutInfo.pSetLayouts = simSetLayouts;
             simPipelineLayoutInfo.pushConstantRangeCount = 1;
             simPipelineLayoutInfo.pPushConstantRanges = &pushRange;
@@ -1125,6 +1192,120 @@ namespace renderer {
             vkDestroyShaderModule(m_Device, meshFragModule, nullptr);
         }
 
+        // =====================================================================================
+        // STEP 8 (B2 -- Niagara-parity roadmap, Ribbon/Trail render mode) -- the ribbon-strip
+        // graphics pipeline. Reuses the billboard pipeline's own 4 sets (particle state / sort /
+        // render-params / lighting) PLUS a 5th, new set (m_RibbonSetLayout, STEP 3b above) for the
+        // per-particle position history -- unlike m_MeshPipeline, this needs its OWN pipeline layout
+        // (m_RenderPipelineLayout only has 4 sets) since it needs one more set than the billboard/
+        // mesh pipelines do.
+        // =====================================================================================
+        {
+            constexpr uint32_t kRibbonSegmentCount = kRibbonHistorySamples - 1u; // 5 segments from 6 samples.
+            constexpr uint32_t kRibbonVertexCount = kRibbonSegmentCount * 6u;     // 6 vertices (2 triangles) per segment, no bound vertex buffer -- see ParticleRibbonRender.vert's own header comment.
+
+            m_RibbonIndirectDrawBuffer.Create(allocator, sizeof(VkDrawIndirectCommand),
+                VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
+            VkDrawIndirectCommand ribbonIndirectInitial{ kRibbonVertexCount, 0u, 0u, 0u };
+            VulkanUtils::ExecuteOneShotCommands(m_Device, commandPool, queue, [&](VkCommandBuffer cmd) {
+                vkCmdUpdateBuffer(cmd, m_RibbonIndirectDrawBuffer.Handle(), 0, sizeof(ribbonIndirectInitial), &ribbonIndirectInitial);
+                });
+
+            VkDescriptorSetLayout ribbonPipelineSetLayouts[5] = { m_SetLayout, m_SortSetLayout, m_RenderSetLayout, m_LightingSetLayout, m_RibbonSetLayout };
+            VkPipelineLayoutCreateInfo ribbonPipelineLayoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+            ribbonPipelineLayoutInfo.setLayoutCount = 5;
+            ribbonPipelineLayoutInfo.pSetLayouts = ribbonPipelineSetLayouts;
+            VK_CHECK(vkCreatePipelineLayout(m_Device, &ribbonPipelineLayoutInfo, nullptr, &m_RibbonRenderPipelineLayout));
+
+            VkShaderModule ribbonVertModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/ParticleRibbonRender.vert.spv");
+            VkShaderModule ribbonFragModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/ParticleRibbonRender.frag.spv");
+            VkPipelineShaderStageCreateInfo ribbonStages[2]{};
+            ribbonStages[0] = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_VERTEX_BIT, ribbonVertModule, "main", nullptr };
+            ribbonStages[1] = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT, ribbonFragModule, "main", nullptr };
+
+            // No bound vertex buffer -- ParticleRibbonRender.vert generates every corner from
+            // gl_VertexIndex, exactly like the billboard pipeline.
+            VkPipelineVertexInputStateCreateInfo ribbonVertexInputInfo{ VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
+
+            VkPipelineInputAssemblyStateCreateInfo ribbonInputAssembly{ VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
+            ribbonInputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+            ribbonInputAssembly.primitiveRestartEnable = VK_FALSE;
+
+            VkPipelineViewportStateCreateInfo ribbonViewportState{ VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
+            ribbonViewportState.viewportCount = 1;
+            ribbonViewportState.scissorCount = 1;
+
+            // No culling -- same rationale as the billboard pipeline's own identical choice: a
+            // screen-facing ribbon strip's winding is not a meaningful "front/back" the way a real
+            // solid mesh's is (ParticleMeshRender's own pipeline, by contrast, DOES cull).
+            VkPipelineRasterizationStateCreateInfo ribbonRasterizer{ VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
+            ribbonRasterizer.polygonMode = VK_POLYGON_MODE_FILL;
+            ribbonRasterizer.lineWidth = 1.0f;
+            ribbonRasterizer.cullMode = VK_CULL_MODE_NONE;
+            ribbonRasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+
+            VkPipelineMultisampleStateCreateInfo ribbonMultisampling{ VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
+            ribbonMultisampling.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+            // Standard "over" alpha blend, identical to the billboard pipeline's own -- a ribbon
+            // strip is translucent and back-to-front sorted exactly like a billboard sprite.
+            VkPipelineColorBlendAttachmentState ribbonColorBlendAttachment{};
+            ribbonColorBlendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+            ribbonColorBlendAttachment.blendEnable = VK_TRUE;
+            ribbonColorBlendAttachment.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+            ribbonColorBlendAttachment.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+            ribbonColorBlendAttachment.colorBlendOp = VK_BLEND_OP_ADD;
+            ribbonColorBlendAttachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+            ribbonColorBlendAttachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+            ribbonColorBlendAttachment.alphaBlendOp = VK_BLEND_OP_ADD;
+            VkPipelineColorBlendAttachmentState ribbonRefractionBlendAttachment{};
+            ribbonRefractionBlendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT;
+            ribbonRefractionBlendAttachment.blendEnable = VK_FALSE;
+            VkPipelineColorBlendAttachmentState ribbonColorBlendAttachments[2] = { ribbonColorBlendAttachment, ribbonRefractionBlendAttachment };
+            VkPipelineColorBlendStateCreateInfo ribbonColorBlending{ VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
+            ribbonColorBlending.attachmentCount = 2;
+            ribbonColorBlending.pAttachments = ribbonColorBlendAttachments;
+
+            VkDynamicState ribbonDynamicStates[2] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+            VkPipelineDynamicStateCreateInfo ribbonDynamicState{ VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
+            ribbonDynamicState.dynamicStateCount = 2;
+            ribbonDynamicState.pDynamicStates = ribbonDynamicStates;
+
+            VkFormat ribbonColorFormats[2] = { colorFormat, VK_FORMAT_R16G16_SFLOAT };
+            VkPipelineRenderingCreateInfo ribbonPipelineRendering{ VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO };
+            ribbonPipelineRendering.colorAttachmentCount = 2;
+            ribbonPipelineRendering.pColorAttachmentFormats = ribbonColorFormats;
+            ribbonPipelineRendering.depthAttachmentFormat = depthFormat;
+
+            // Depth-tested but NOT written -- identical constraint/rationale to both the billboard
+            // and mesh pipelines above (this whole rendering scope's depth attachment is bound
+            // read-only, see RecordDraw's own depthAttachment declaration).
+            VkPipelineDepthStencilStateCreateInfo ribbonDepthStencil{ VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
+            ribbonDepthStencil.depthTestEnable = VK_TRUE;
+            ribbonDepthStencil.depthWriteEnable = VK_FALSE;
+            ribbonDepthStencil.depthCompareOp = VK_COMPARE_OP_GREATER;
+            ribbonDepthStencil.depthBoundsTestEnable = VK_FALSE;
+            ribbonDepthStencil.stencilTestEnable = VK_FALSE;
+
+            VkGraphicsPipelineCreateInfo ribbonPipelineInfo{ VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
+            ribbonPipelineInfo.pNext = &ribbonPipelineRendering;
+            ribbonPipelineInfo.stageCount = 2;
+            ribbonPipelineInfo.pStages = ribbonStages;
+            ribbonPipelineInfo.pVertexInputState = &ribbonVertexInputInfo;
+            ribbonPipelineInfo.pInputAssemblyState = &ribbonInputAssembly;
+            ribbonPipelineInfo.pViewportState = &ribbonViewportState;
+            ribbonPipelineInfo.pRasterizationState = &ribbonRasterizer;
+            ribbonPipelineInfo.pMultisampleState = &ribbonMultisampling;
+            ribbonPipelineInfo.pColorBlendState = &ribbonColorBlending;
+            ribbonPipelineInfo.pDepthStencilState = &ribbonDepthStencil;
+            ribbonPipelineInfo.pDynamicState = &ribbonDynamicState;
+            ribbonPipelineInfo.layout = m_RibbonRenderPipelineLayout;
+            VK_CHECK(vkCreateGraphicsPipelines(m_Device, VK_NULL_HANDLE, 1, &ribbonPipelineInfo, nullptr, &m_RibbonPipeline));
+
+            vkDestroyShaderModule(m_Device, ribbonVertModule, nullptr);
+            vkDestroyShaderModule(m_Device, ribbonFragModule, nullptr);
+        }
+
         LOG_INFO(std::format("[ParticleSystemPass] Initialized: {} max particles, {} KB particle buffer x2, simulation + sort + render pipelines ready.",
             kMaxParticles, static_cast<uint32_t>(kParticleBufferBytes / 1024)));
         return true;
@@ -1192,9 +1373,15 @@ namespace renderer {
             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
             VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_UNIFORM_READ_BIT);
 
-        VkDescriptorSet sets[2] = { GetCurrentSet(), m_EnvironmentSet };
+        // B2 (Ribbon/Trail render mode): m_RibbonSet is this pipeline's 3rd set (see STEP 3b/STEP 4's
+        // own comments in Init()) -- UpdateParticle()'s own ribbon-history push (ParticleSimulation.
+        // comp) and both spawn functions' own ring-buffer reset need it bound every dispatch, not
+        // just when some emitter happens to currently be in Ribbon mode (SpawnParticle/
+        // SpawnPrecipitationParticle always reset their own slot's ring buffer regardless of render
+        // mode, see either function's own comment).
+        VkDescriptorSet sets[3] = { GetCurrentSet(), m_EnvironmentSet, m_RibbonSet };
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_SimPipeline);
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_SimPipelineLayout, 0, 2, sets, 0, nullptr);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_SimPipelineLayout, 0, 3, sets, 0, nullptr);
 
         ParticleSimulationPC pc{};
         pc.dt = dt;
@@ -1428,6 +1615,13 @@ namespace renderer {
         vkCmdCopyBuffer(cmd, m_CounterBuffer.Handle(), m_MeshIndirectDrawBuffer[kMeshArchetypeBox].Handle(), 1, &meshAliveCountCopy);
         vkCmdCopyBuffer(cmd, m_CounterBuffer.Handle(), m_MeshIndirectDrawBuffer[kMeshArchetypeIcosphere].Handle(), 1, &meshAliveCountCopy);
 
+        // B2 (Ribbon/Trail render mode): same refresh, same reasoning, for m_RibbonIndirectDrawBuffer
+        // -- a VkDrawIndirectCommand (non-indexed, see that buffer's own declaration comment), whose
+        // instanceCount field is ALSO at byte offset 4, same as VkDrawIndirectCommand's own layout
+        // (vertexCount, instanceCount, firstVertex, firstInstance).
+        VkBufferCopy ribbonAliveCountCopy{ 4, 4, sizeof(uint32_t) };
+        vkCmdCopyBuffer(cmd, m_CounterBuffer.Handle(), m_RibbonIndirectDrawBuffer.Handle(), 1, &ribbonAliveCountCopy);
+
         // Covers both this UBO update AND Subtask 3's own trailing barrier scope gap (RecordSort's
         // own trailing barrier only makes the sorted-pair/indirect-draw data visible to
         // COMPUTE_SHADER, not to this draw's VERTEX_SHADER/DRAW_INDIRECT reads -- see RecordSort's
@@ -1548,6 +1742,20 @@ namespace renderer {
         vkCmdPushConstants(cmd, m_RenderPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(meshPcIcosphere), &meshPcIcosphere);
         vkCmdDrawIndexedIndirect(cmd, m_MeshIndirectDrawBuffer[kMeshArchetypeIcosphere].Handle(), 0, 1, sizeof(VkDrawIndexedIndirectCommand));
 
+        // =====================================================================================
+        // B2 (Ribbon/Trail render mode) -- one instanced draw, same "issue unconditionally,
+        // per-instance gating in the vertex shader" contract as the mesh draws above (see
+        // ParticleRibbonRender.vert's own comment). Its own 5th set (m_RibbonSet, the position
+        // history) is bound in ADDITION to the same 4 sets already bound for the billboard/mesh
+        // draws above -- m_RibbonRenderPipelineLayout is a DIFFERENT VkPipelineLayout object than
+        // m_RenderPipelineLayout (5 sets vs 4), so all 5 must be rebound here even though the first
+        // 4 are the exact same descriptor sets already bound moments ago.
+        // =====================================================================================
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_RibbonPipeline);
+        VkDescriptorSet ribbonSets[5] = { GetCurrentSet(), m_SortSet, m_RenderSet, m_LightingSet, m_RibbonSet };
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_RibbonRenderPipelineLayout, 0, 5, ribbonSets, 0, nullptr);
+        vkCmdDrawIndirect(cmd, m_RibbonIndirectDrawBuffer.Handle(), 0, 1, sizeof(VkDrawIndirectCommand));
+
         vkCmdEndRendering(cmd);
 
         VkImageMemoryBarrier2 toGeneral{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
@@ -1569,6 +1777,16 @@ namespace renderer {
 
     void ParticleSystemPass::Shutdown() {
         if (m_Device != VK_NULL_HANDLE) {
+            // B2 (Ribbon/Trail render mode): m_RibbonPipeline uses its OWN pipeline layout
+            // (m_RibbonRenderPipelineLayout, unlike m_MeshPipeline's reuse of m_RenderPipelineLayout)
+            // -- both destroyed here, before every other set/pool this method tears down further
+            // below (order does not strictly matter per the Vulkan spec, see m_MeshPipeline's own
+            // Shutdown()-ordering comment, only tidy).
+            if (m_RibbonPipeline != VK_NULL_HANDLE) vkDestroyPipeline(m_Device, m_RibbonPipeline, nullptr);
+            if (m_RibbonRenderPipelineLayout != VK_NULL_HANDLE) vkDestroyPipelineLayout(m_Device, m_RibbonRenderPipelineLayout, nullptr);
+            if (m_RibbonDescriptorPool != VK_NULL_HANDLE) vkDestroyDescriptorPool(m_Device, m_RibbonDescriptorPool, nullptr);
+            if (m_RibbonSetLayout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(m_Device, m_RibbonSetLayout, nullptr);
+
             if (m_LightingDescriptorPool != VK_NULL_HANDLE) vkDestroyDescriptorPool(m_Device, m_LightingDescriptorPool, nullptr);
             if (m_LightingSetLayout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(m_Device, m_LightingSetLayout, nullptr);
 
@@ -1626,6 +1844,16 @@ namespace renderer {
         m_MeshIndirectDrawBuffer[0].Destroy();
         m_MeshIndirectDrawBuffer[1].Destroy();
         m_MeshPipeline = VK_NULL_HANDLE;
+
+        // B2 (Ribbon/Trail render mode).
+        m_RibbonHistoryBuffer.Destroy();
+        m_RibbonSampleCountBuffer.Destroy();
+        m_RibbonIndirectDrawBuffer.Destroy();
+        m_RibbonDescriptorPool = VK_NULL_HANDLE;
+        m_RibbonSetLayout = VK_NULL_HANDLE;
+        m_RibbonSet = VK_NULL_HANDLE;
+        m_RibbonRenderPipelineLayout = VK_NULL_HANDLE;
+        m_RibbonPipeline = VK_NULL_HANDLE;
 
         m_LightingDescriptorPool = VK_NULL_HANDLE;
         m_LightingSetLayout = VK_NULL_HANDLE;
