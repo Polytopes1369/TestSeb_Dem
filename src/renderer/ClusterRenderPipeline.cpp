@@ -770,7 +770,7 @@ bool ClusterRenderPipeline::Init(
   // real depth-stencil buffer every other forward pass targets. RecordSimulate/RecordSort/
   // RecordDraw are all implemented but NOT yet called from RecordFrame (Subtask 6 wires that up),
   // so this Init() has no RecordFrame ordering consequence yet.
-  if (!m_ParticleSystem.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
+  if (!m_ParticleSystem.Init(createInfo.physicalDevice, createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
                              m_AtmosClimate, m_GlobalSDF, m_Resolve, m_VirtualShadowMap, m_WorldProbes,
                              GICompositePass::kOutputFormat, createInfo.depthFormat)) {
     LOG_ERROR("[ClusterRenderPipeline] Failed to initialize ParticleSystemPass.");
