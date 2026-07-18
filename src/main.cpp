@@ -1175,8 +1175,22 @@ int main(int argc, char** argv) {
                         ImGui::Checkbox("Active", &cfg.active);
                         ImGui::DragFloat("Spawn Rate (particles/s)", &cfg.spawnRate, 5.0f, 0.0f, 5000.0f);
                         ImGui::DragFloat3("Position", &cfg.positionX, 0.05f);
-                        ImGui::Combo("Spawn Shape", reinterpret_cast<int*>(&cfg.spawnShape), "Cone Burst\0Sphere Volume\0\0");
+                        ImGui::Combo("Spawn Shape", reinterpret_cast<int*>(&cfg.spawnShape), "Cone Burst\0Sphere Volume\0Mesh Surface\0\0");
                         ImGui::DragFloat("Shape Param (sphere radius)", &cfg.shapeParam0, 0.02f, 0.0f, 20.0f);
+                        // Subtask C3 (spawn-on-mesh-surface): only consulted when Spawn Shape above is
+                        // "Mesh Surface" -- matches ClusterCullMetadata::entityID / geometry::
+                        // ClusterIndexEntry::entityID (the showcase scene's own entity indices, see
+                        // VulkanContext::BuildEntityData()'s call sites for which meshID each showcase
+                        // zone uses). An entity with no currently-resident clusters (streamed out, or an
+                        // out-of-range ID) simply falls back to a small sphere spawn around this
+                        // emitter's own Position above -- see ParticleSimulation.comp's own
+                        // SpawnParticleCore comment.
+                        if (cfg.spawnShape == 2u) {
+                            int targetEntityId = static_cast<int>(cfg.spawnTargetEntityId);
+                            if (ImGui::DragInt("Target Entity ID (mesh surface)", &targetEntityId, 1.0f, 0, 63)) {
+                                cfg.spawnTargetEntityId = static_cast<uint32_t>(std::max(0, targetEntityId));
+                            }
+                        }
                         ImGui::ColorEdit4("Base Color", &cfg.colorR);
                         ImGui::DragFloatRange2("Size Range", &cfg.sizeMin, &cfg.sizeMax, 0.005f, 0.001f, 5.0f);
                         ImGui::DragFloatRange2("Lifetime Range (s)", &cfg.lifetimeMin, &cfg.lifetimeMax, 0.05f, 0.1f, 30.0f);
@@ -1187,6 +1201,11 @@ int main(int argc, char** argv) {
                         ImGui::SliderFloat("Bounce Elasticity", &cfg.bounceElasticity, 0.0f, 1.0f);
                         ImGui::SliderFloat("Friction", &cfg.friction, 0.0f, 1.0f);
                         ImGui::DragFloat("Wind Drag", &cfg.dragCoefficient, 0.02f, 0.0f, 5.0f);
+                        // Subtask C2 (screen-space depth-buffer collision) -- a fallback/supplement to
+                        // the Global SDF collision above, for camera-relative dynamic geometry the SDF
+                        // clipmap has not (re)captured yet. See config::particles::EmitterConfig::
+                        // depthCollisionEnabled's own declaration comment.
+                        ImGui::Checkbox("Depth-Buffer Collision (fallback)", &cfg.depthCollisionEnabled);
 
                         // Module stack roadmap (subtask A3): two independently-toggleable force
                         // modules layered on top of the fixed physics knobs above -- a small,
@@ -1229,6 +1248,31 @@ int main(int argc, char** argv) {
                             ImGui::PopID();
                         }
                         ImGui::PopID();
+
+                        // Subtask C4 (Niagara-parity roadmap: sub-emitters / event-driven spawn
+                        // chains) -- this emitter triggers spawning INTO a different emitter slot's
+                        // own style when one of its own particles dies or first hits Global SDF
+                        // geometry. See config::particles::EmitterConfig's own trailing fields'
+                        // declaration comment and ParticleSimulation.comp's own TriggerSubEmitter
+                        // comment for the full one-level-deep-capped contract -- a sub-emitter-spawned
+                        // particle can never itself trigger a further chain, regardless of what the
+                        // target slot's own fields below say.
+                        ImGui::Separator();
+                        ImGui::TextUnformatted("Sub-Emitters (subtask C4)");
+                        ImGui::Checkbox("Enable Sub-Emitter", &cfg.subEmitterEnabled);
+                        {
+                            int targetSlot = static_cast<int>(cfg.subEmitterTargetSlot);
+                            if (ImGui::Combo("Target Emitter Slot", &targetSlot, kEmitterNames, static_cast<int>(renderer::ParticleSystemPass::kMaxEmitters))) {
+                                cfg.subEmitterTargetSlot = static_cast<uint32_t>(targetSlot);
+                            }
+                        }
+                        ImGui::Combo("Trigger Condition", reinterpret_cast<int*>(&cfg.subEmitterTriggerMode), "On Death\0On Collision\0\0");
+                        {
+                            int spawnCount = static_cast<int>(cfg.subEmitterSpawnCount);
+                            if (ImGui::DragInt("Spawn Count Per Trigger", &spawnCount, 0.2f, 0, 32)) {
+                                cfg.subEmitterSpawnCount = static_cast<uint32_t>(std::max(0, spawnCount));
+                            }
+                        }
 
                         // Multi-emitter roadmap (subtask A1) validation/debug instrumentation: proves
                         // this emitter is independently alive/producing particles, not just that the

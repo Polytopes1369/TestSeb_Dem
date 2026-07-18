@@ -79,7 +79,26 @@ namespace renderer {
         // comment) and never reach the curve-evaluation code path at all (see UpdateParticle's own
         // comment on why that branch is ember-only).
         float baseSize = 0.0f;
-        float _pad1 = 0.0f, _pad2 = 0.0f;
+        // Subtask C4 (Niagara-parity roadmap: sub-emitters / event-driven spawn chains) -- repurposes
+        // what were `_pad1`/`_pad2` (this struct's total size does not change, same "reuse a trailing
+        // pad slot" convention as baseSize's own declaration comment above). Both are set exactly once
+        // at spawn (ParticleSimulation.comp's SpawnParticleCore) and read/latched every
+        // UpdateParticle() call thereafter -- never touched by the render pass or any CPU code.
+        //
+        // subEmitterChildFlag: 0.0 for every normally-spawned particle; forced to 1.0 for a particle
+        // that was itself created BY a sub-emitter trigger (TriggerSubEmitter). This is the ENTIRE
+        // mechanism that caps sub-emitter chains at exactly one level deep -- UpdateParticle only ever
+        // calls TriggerSubEmitter for a particle whose OWN subEmitterChildFlag is still 0.0, so a child
+        // particle can never itself spawn a third generation, regardless of what its own (inherited)
+        // emitter slot's EmitterParams::subEmitterEnabled says. See TriggerSubEmitter's own header
+        // comment (ParticleSimulation.comp) for the full safety argument.
+        float subEmitterChildFlag = 0.0f;
+        // subEmitterCollisionFired: 0.0 until this particle's first Global SDF collision contact (for
+        // an emitter with subEmitterTriggerMode == 1, on-collision) fires its one allowed trigger, then
+        // latched to 1.0 for the rest of this particle's life -- without this latch, a particle resting/
+        // repeatedly bouncing against geometry would re-fire (and flood the dead-list) every single
+        // frame it stays in contact, instead of exactly once per particle lifetime.
+        float subEmitterCollisionFired = 0.0f;
     };
     static_assert(sizeof(GpuParticle) == 80, "GpuParticle must match ParticleCommon.glsl's Particle struct exactly (std430 layout)");
 
@@ -177,8 +196,40 @@ namespace renderer {
                 { 1.0f, 1.0f, 1.0f, 1.0f }, { 1.0f, 1.0f, 1.0f, 1.0f }
             };
             float sizeCurve[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+
+            // Subtask C2 (Niagara-parity roadmap: screen-space depth-buffer collision) -- see
+            // ParticleSimulation.comp's own ResolveDepthBufferCollision comment for the full contract:
+            // when nonzero, this emitter's ember particles ALSO resolve a bounce/absorb response
+            // against the opaque scene's reconstructed depth-buffer surface, as a fallback/supplement
+            // to the Global SDF collision above (useful for camera-relative dynamic geometry the SDF
+            // clipmap has not (re)captured yet).
+            uint32_t depthCollisionEnabled = 0;
+            // Subtask C3 (spawn-on-mesh-surface): which entity's clusters spawnShape == 2 samples
+            // triangles from -- matches ClusterCullMetadata::entityID / geometry::ClusterIndexEntry::
+            // entityID exactly (the same index renderer::ClusterHardwareRasterPass's own vertex shader
+            // uses to look up EntityDataBuffer/EntityTransformBuffer, see ParticleSimulation.comp's own
+            // SpawnParticleCore comment for the full sampling contract). Unused by any other
+            // spawnShape.
+            uint32_t spawnTargetEntityId = 0;
+
+            // Subtask C4 (Niagara-parity roadmap: sub-emitters / event-driven spawn chains) -- lets an
+            // emitter trigger spawning INTO a different emitter slot when one of its own particles dies
+            // or on its first Global SDF collision contact (e.g. an ember that, on death, spawns a
+            // small burst of dust in EMITTERS[1]'s style at the death location). See ParticleSimulation.
+            // comp's own TriggerSubEmitter comment for the full GPU-side mechanism (a fully in-shader,
+            // same-dispatch immediate re-spawn -- chosen over a CPU-readback queue specifically to
+            // preserve exact per-event world position, see that function's own comment) and Particle::
+            // subEmitterChildFlag's own declaration comment (this file, above) for why chains are
+            // provably capped at exactly one level deep.
+            uint32_t subEmitterEnabled = 0;
+            uint32_t subEmitterTargetSlot = 0; // Which EmitterParamsBuffer slot the spawned particles are styled/tagged as (bounds-checked via emitters.length() in-shader, not this field itself).
+            uint32_t subEmitterTriggerMode = 0; // 0 = on this particle's own death, 1 = on its first Global SDF collision contact.
+            uint32_t subEmitterSpawnCount = 0; // Particles spawned per trigger EVENT (not per frame) -- also hard-capped in-shader (see TriggerSubEmitter's own comment) independent of however large this is configured.
+            // Closes out this block's trailing 16-byte slot -- same "always end a subtask's growth on
+            // a clean std430 boundary" convention as every earlier block in this struct.
+            uint32_t _padC4a = 0, _padC4b = 0;
         };
-        static_assert(sizeof(EmitterParams) == 192, "EmitterParams must match ParticleCommon.glsl's EmitterParams struct exactly (std430 layout)");
+        static_assert(sizeof(EmitterParams) == 224, "EmitterParams must match ParticleCommon.glsl's EmitterParams struct exactly (std430 layout)");
 
         // Maximum simultaneous emitter slots (multi-emitter roadmap, subtask A1) -- small and fixed
         // (unlike kMaxParticles, no sort/perf pressure motivates a larger number yet; a future
@@ -290,11 +341,31 @@ namespace renderer {
         // convention. Taken unconditionally (not `#ifndef NDEBUG`-guarded itself) so this method's
         // signature does not need to differ between Debug/Release builds -- in Release it is simply
         // an unused parameter, costing nothing (no code is generated to read it).
+        // (Subtask C2) Also binds a NEW environment-set (set 1) resource: `resolvePass`'s SAME
+        // sampled GBuffer depth copy the render pipeline's own set 2 already samples for soft-particle
+        // fade (GetOutputDepthView()), bound here a SECOND time with its own dedicated sampler/binding
+        // so ParticleSimulation.comp (a COMPUTE shader, which never binds set 2) can ALSO reconstruct
+        // the opaque scene's world position under a particle for the new screen-space depth-buffer
+        // collision mode -- see EmitterParams::depthCollisionEnabled and ParticleSimulation.comp's own
+        // ResolveDepthBufferCollision comment for the full contract.
+        // (Subtask C3, spawn-on-mesh-surface) Also binds 4 MORE environment-set resources, all
+        // borrowed unmodified (never re-written by this pass): `clusterMetadataBuffer` (renderer::
+        // ClusterOcclusionCullingPass::GetClusterMetadataBuffer()) and `compressedPhysicalPoolBuffer`
+        // (renderer::GpuGeometryPagePool::GetPhysicalPoolBuffer()) -- the EXACT SAME two buffers
+        // renderer::ClusterHardwareRasterPass's own ClusterRaster.vert already reads triangle geometry
+        // from (see cluster_vertex_decode.glsl's own DecodeClusterPosition) -- plus `entityTransformBuffer`/
+        // `entityDataBuffer` (the same two buffers ClusterRaster.vert also binds, needed to transform a
+        // sampled rest-pose triangle point into world space). Reusing these SAME 4 buffers (rather than
+        // building a second, bespoke mesh format) is what lets spawnShape == 2 sample real triangle
+        // surfaces of ANY already-streamed entity -- see ParticleSimulation.comp's own SpawnParticleCore
+        // comment for the full random-triangle-then-barycentric sampling algorithm.
         bool Init(VkPhysicalDevice physicalDevice, VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
             const AtmosClimatePass& atmosClimate, const GlobalSDFPass& globalSDF, const ClusterResolvePass& resolvePass,
             const VirtualShadowMapPass& vsm, const WorldProbeGridPass& worldProbes,
             const MegaLightsPass& megaLights, const SurfaceCacheRayTracingPass& rtPass,
             const AtmosVolumetricFogPass& volumetricFog,
+            VkBuffer clusterMetadataBuffer, VkBuffer compressedPhysicalPoolBuffer,
+            VkBuffer entityTransformBuffer, VkBuffer entityDataBuffer,
             VkFormat colorFormat, VkFormat depthFormat);
 
         void Shutdown();
@@ -425,7 +496,17 @@ namespace renderer {
         // `spawnCounts` mechanism above, not a separate dispatch -- it is authored with a low-gravity,
         // high-drag "Sphere volume drift" recipe (spawnShape == 1, same shape kind as the "Ambient
         // Dust" emitter) positioned at the falls' own base, so it needs no shader-side special case.
+        //
+        // Subtask C2 (screen-space depth-buffer collision): `viewProj`/`invViewProj` are this frame's
+        // SAME combined camera matrices renderer::ClusterRenderPipeline already computed for every
+        // other pass this frame (its own `viewProj`/`invViewProj` locals) -- uploaded here into this
+        // pass' own ParticleDepthCollisionUBO (environment set, binding 3) so ParticleSimulation.comp
+        // can project a particle's world position forward to screen space, sample `resolvePass`'s
+        // depth copy (bound at Init()), and reconstruct the scene surface position back out of it,
+        // exactly like ParticleRender.frag's own soft-particle fade does -- see that shader's own
+        // header comment and ResolveDepthBufferCollision's own comment for the shared math.
         void RecordSimulate(VkCommandBuffer cmd, const GlobalSDFPass& globalSDF, float dt, float time,
+            const maths::mat4& viewProj, const maths::mat4& invViewProj, VkExtent2D renderExtent,
             const EmitterParams emitters[kMaxEmitters], const uint32_t spawnCounts[kMaxEmitters],
             const float precipCenterWorld[3], uint32_t precipSpawnCount, uint32_t precipKind,
             float precipSpawnRadiusMeters, float precipSpawnHeightAboveCenterMeters,
@@ -605,6 +686,16 @@ namespace renderer {
         // -- see that method's own comment. 48 bytes, GPU_ONLY, same vkCmdUpdateBuffer-then-barrier
         // idiom as AtmosClimatePass::RecordUpdate's own AtmosGlobalsUBO upload.
         GpuBuffer m_PrecipitationParamsBuffer;
+
+        // Subtask C2 (screen-space depth-buffer collision) -- environment set binding 3
+        // (ParticleDepthCollisionUBO: viewProj/invViewProj/viewportSize) and binding 4 (`resolvePass`'s
+        // sampled GBuffer depth copy, bound a SECOND time here with this pass' OWN dedicated sampler --
+        // see Init()'s own comment for why a compute-stage binding needs this separate from the render
+        // pipeline's own set 2 sampler, m_SceneDepthSampler below). The UBO is re-uploaded every
+        // RecordSimulate() call (the camera moves every frame), same vkCmdUpdateBuffer-then-barrier
+        // idiom as m_PrecipitationParamsBuffer just above.
+        GpuBuffer m_DepthCollisionParamsBuffer;
+        VkSampler m_ComputeSceneDepthSampler = VK_NULL_HANDLE; // Nearest -- same rationale as m_SceneDepthSampler's own declaration comment.
 
         VkPipelineLayout m_SimPipelineLayout = VK_NULL_HANDLE;
         VkPipeline m_SimPipeline = VK_NULL_HANDLE;

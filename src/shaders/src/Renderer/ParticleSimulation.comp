@@ -56,6 +56,19 @@
 #include "include/ParticleCommon.glsl"
 #include "include/AtmosNoiseCommon.glsl"
 
+// Subtask C3 (spawn-on-mesh-surface): reuses the SAME cluster metadata/compressed-geometry-pool/
+// entity-transform/entity-data buffers renderer::ClusterHardwareRasterPass's own ClusterRaster.vert
+// already reads triangle geometry from, rather than building a second mesh format -- see
+// SpawnParticleCore's own comment for the full sampling algorithm. cluster_vertex_decode.glsl's
+// DecodeClusterPosition() decodes a vertex position directly from the COMPRESSED pool with no
+// dependency on any separately-decompressed buffer (see that header's own comment), which is exactly
+// why this compute shader can do this with no new decompression pass of its own.
+#include "include/cluster_culling_common.glsl"
+#include "include/struct_custo.glsl"
+#define COMPRESSED_POOL_SET 1
+#define COMPRESSED_POOL_BINDING 6
+#include "include/cluster_vertex_decode.glsl"
+
 layout(local_size_x = 64) in;
 
 // std140 mirror of AtmosClimatePass.cpp's AtmosGlobalsUBO -- see AtmosNoiseCommon.glsl's own header
@@ -91,6 +104,77 @@ layout(std140, set = 1, binding = 2) uniform PrecipitationParamsUBO {
     float spawnHeightAboveCenter; float spawnBandThickness; float floorBelowCenter; float rainFallSpeed; // Spawn band sits at spawnCenter.y + spawnHeightAboveCenter, +/- spawnBandThickness/2; floorBelowCenter is how far below spawnCenter.y a precip particle is force-recycled.
     float snowFallSpeed; float snowWobbleStrength; float _pad0; float _pad1;
 } g_Precip;
+
+// Subtask C2 (screen-space depth-buffer collision) -- this frame's camera matrices, mirroring
+// renderer::ParticleSystemPass.cpp's own (anonymous-namespace) ParticleDepthCollisionUBO byte-for-
+// byte. `viewportWidth`/`viewportHeight` feed the depth-gradient normal estimate below (texel size).
+layout(std140, set = 1, binding = 3) uniform ParticleDepthCollisionUBO {
+    mat4 viewProj;
+    mat4 invViewProj;
+    float viewportWidth;
+    float viewportHeight;
+} g_DepthCollision;
+
+// Subtask C5 (Niagara-parity roadmap: GPU Data Interfaces) -- a small, fixed-size array of generically-
+// bound 2D textures ("data interface slots") any particle-shader feature can sample from BY INDEX,
+// instead of every new feature inventing its own bespoke named binding the way wind/SDF/VSM/world-
+// probes/depth all did before this. Deliberately NOT a full Niagara-style typed/named plugin registry
+// (out of scope for this project -- see EmitterParams' own header comment on why a full visual-
+// scripting module graph is likewise out of scope) -- just a fixed array of combined-image-samplers,
+// each slot bound once at Init() time by whichever CALLER wants to publish a texture through this
+// interface. Subtask C2's own screen-space depth-buffer collision is the first (and today, only) real
+// consumer, retrofitted onto slot 0 (see ResolveDepthBufferCollision's own call site below) in place
+// of what was originally a bespoke `g_SceneDepthCompute` binding -- proving this abstraction is not
+// just theoretical, an actual existing feature runs through it. Every element must hold a valid
+// descriptor regardless of whether anything indexes it (this engine does not enable
+// VkPhysicalDeviceVulkan12Features::descriptorBindingPartiallyBound -- same constraint/convention
+// already established by e.g. VirtualTextureManager's own K_MAX_VT_PHYSICAL_POOLS handling), so unused
+// slots 1-3 are bound to the SAME scene-depth view/sampler as slot 0 at Init() time -- harmless, since
+// nothing indexes them today.
+#define PARTICLE_DATA_INTERFACE_SLOT_COUNT 4
+layout(set = 1, binding = 4) uniform sampler2D g_DataInterfaceTextures[PARTICLE_DATA_INTERFACE_SLOT_COUNT];
+
+// Generic single-channel (red component) read from data-interface `slot` at normalized `uv` -- exactly
+// what a particle-shader feature needing "one arbitrary external scalar field, by index" should call
+// instead of declaring its own named sampler2D binding. Out-of-range `slot` returns 0.0 rather than an
+// out-of-bounds array access. `slot` is always a compile-time-constant literal at every call site in
+// this file today (a plain dynamically-uniform index), so no GL_EXT_nonuniform_qualifier annotation is
+// required -- core GLSL 4.60 already permits dynamically-uniform sampler-array indexing.
+float SampleDataInterfaceFloat(uint slot, vec2 uv) {
+    if (slot >= uint(PARTICLE_DATA_INTERFACE_SLOT_COUNT)) {
+        return 0.0;
+    }
+    return texture(g_DataInterfaceTextures[slot], uv).r;
+}
+
+// Same as above, but reads xyz instead of just red -- e.g. a future data interface publishing a
+// world-space vector field (a flow map, a second wind layer, etc.) instead of a single scalar. Unused
+// by any consumer today (C2's depth read only ever needs the single red channel) -- included as part
+// of this SAME minimal interface rather than added later as a second bespoke accessor, since a vec3
+// read is exactly as generic a primitive as the float one above and costs nothing unused.
+vec3 SampleDataInterfaceVec3(uint slot, vec2 uv) {
+    if (slot >= uint(PARTICLE_DATA_INTERFACE_SLOT_COUNT)) {
+        return vec3(0.0);
+    }
+    return texture(g_DataInterfaceTextures[slot], uv).rgb;
+}
+
+// Subtask C3 (spawn-on-mesh-surface) -- the SAME 3 metadata/entity buffers ClusterRaster.vert reads
+// (binding 6, the compressed geometry pool itself, is declared by cluster_vertex_decode.glsl's own
+// COMPRESSED_POOL_SET/BINDING macros above). Anonymous block instance names (no `g_` prefix on
+// entityTransforms/entityData) deliberately match ClusterRaster.vert's own exact declaration style,
+// since these are literally the same buffers.
+layout(std430, set = 1, binding = 5) readonly buffer ClusterCullMetadataSSBO {
+    ClusterCullMetadata clusters[];
+} g_Clusters;
+
+layout(std430, set = 1, binding = 7) readonly buffer EntityTransformBuffer {
+    EntityTransform entityTransforms[];
+};
+
+layout(std430, set = 1, binding = 8) readonly buffer EntityDataBuffer {
+    EntityData entityData[];
+};
 
 layout(push_constant) uniform ParticleSimulationPC {
     float dt;
@@ -196,6 +280,98 @@ vec3 SampleCurlTurbulence(vec3 worldPos, float time, float scale) {
     return AtmosFractalCurlNoise3D(scrolledPos, 1.0, 3.0, 0.5);
 }
 
+// Subtask C2 (Niagara-parity roadmap: screen-space depth-buffer collision) -- a secondary collision
+// mode alongside the existing Global SDF one (SampleGlobalSDF above), gated per-emitter by
+// EmitterParams.depthCollisionEnabled. Reconstructs the opaque scene's world position under `pos`'s
+// current screen-space location from `resolvePass`'s sampled GBuffer depth copy, exactly the same
+// inverse-view-projection approach ParticleRender.frag's own soft-particle fade already uses (see
+// that shader's own header comment) -- just run in reverse here: that fragment shader starts from a
+// screen pixel and reconstructs the WORLD position under it; this function starts from a WORLD
+// position (the particle) and projects FORWARD to find which screen pixel/depth-sample to compare
+// against, then reconstructs the scene surface position from that same sample the same way.
+//
+// This is a fallback/supplement to the Global SDF collision above, not a replacement: SampleGlobalSDF
+// returns a large "no data" sentinel (1.0e4) for any world position outside every clipmap level's
+// currently-streamed window (see that function's own comment), silently skipping the SDF branch with
+// no collision response at all in that case -- exactly the situation this mode is meant to catch
+// (camera-relative dynamic geometry the SDF clipmap has not (re)captured yet, e.g. a just-streamed
+// cell). Returns false (leaving `pos`/`vel` untouched) whenever there is nothing meaningful to test
+// against (behind the camera, off-screen, sky, or not yet penetrating), so calling this unconditionally
+// right after the SDF branch (regardless of whether the SDF branch itself already resolved a bounce
+// this frame) is always safe -- see UpdateParticle's own call site comment.
+bool ResolveDepthBufferCollision(inout vec3 pos, inout vec3 vel, float bounceElasticity, float friction) {
+    vec4 clip = g_DepthCollision.viewProj * vec4(pos, 1.0);
+    if (clip.w <= 1.0e-4) {
+        return false; // Behind (or exactly at) the camera -- no meaningful projection.
+    }
+    vec3 ndc = clip.xyz / clip.w;
+    if (abs(ndc.x) > 1.0 || abs(ndc.y) > 1.0) {
+        return false; // Off-screen -- the depth buffer simply has no data for this particle's own position.
+    }
+
+    vec2 screenUV = ndc.xy * 0.5 + 0.5;
+    // Subtask C5: reads through the generic Data Interface accessor (slot 0 == the scene depth copy,
+    // see this file's own PARTICLE_DATA_INTERFACE_SLOT_COUNT comment) instead of a bespoke sampler --
+    // functionally identical to the direct texture() read this replaced, just routed through the
+    // shared abstraction.
+    float sceneNdcDepth = SampleDataInterfaceFloat(0u, screenUV);
+    // Reversed-Z (near = 1.0, far = 0.0): sceneNdcDepth <= 0.0 means sky/no-geometry-hit at this pixel
+    // (renderer::ClusterResolvePass's own g_OutputDepth clear-to-0 convention, see ParticleRender.
+    // frag's own identical check) -- nothing to collide against. Otherwise the particle has only just
+    // penetrated the opaque surface once its OWN ndc.z drops BELOW the scene's (reversed-Z: smaller z
+    // is farther from the camera), the reversed-Z analogue of a standard "particle_z > scene_z means
+    // occluded" depth test.
+    if (sceneNdcDepth <= 0.0 || ndc.z >= sceneNdcDepth) {
+        return false;
+    }
+
+    vec4 sceneClip = vec4(ndc.xy, sceneNdcDepth, 1.0);
+    vec4 sceneWorld4 = g_DepthCollision.invViewProj * sceneClip;
+    vec3 sceneWorldPos = sceneWorld4.xyz / sceneWorld4.w;
+
+    // Approximate the local surface normal from the screen-space depth gradient (forward differences,
+    // one texel step in each screen axis) rather than a true geometric normal -- this compute stage has
+    // no separate normal GBuffer bound (renderer::ClusterResolvePass's own normal image is a different
+    // binding entirely, not wired here), and a depth-gradient normal is the standard cheap
+    // approximation for screen-space collision response. A neighbor sample landing on the sky (0.0)
+    // would poison the gradient with a huge false discontinuity -- fall back to re-using the center
+    // depth for that one axis instead (a locally flat approximation is far closer to correct than a
+    // fake cliff-edge at every silhouette).
+    vec2 texel = 1.0 / max(vec2(g_DepthCollision.viewportWidth, g_DepthCollision.viewportHeight), vec2(1.0));
+    float depthDX = SampleDataInterfaceFloat(0u, screenUV + vec2(texel.x, 0.0));
+    float depthDY = SampleDataInterfaceFloat(0u, screenUV + vec2(0.0, texel.y));
+    if (depthDX <= 0.0) depthDX = sceneNdcDepth;
+    if (depthDY <= 0.0) depthDY = sceneNdcDepth;
+
+    vec4 worldDX4 = g_DepthCollision.invViewProj * vec4(ndc.xy + vec2(2.0 * texel.x, 0.0), depthDX, 1.0);
+    vec4 worldDY4 = g_DepthCollision.invViewProj * vec4(ndc.xy + vec2(0.0, 2.0 * texel.y), depthDY, 1.0);
+    vec3 worldPosDX = worldDX4.xyz / worldDX4.w;
+    vec3 worldPosDY = worldDY4.xyz / worldDY4.w;
+
+    vec3 n = cross(worldPosDX - sceneWorldPos, worldPosDY - sceneWorldPos);
+    float nLen = length(n);
+    n = nLen > 1.0e-8 ? (n / nLen) : vec3(0.0, 1.0, 0.0);
+    // Force the normal to oppose the incoming velocity -- the forward-difference cross product's sign
+    // depends on screen-space winding, not the true outward surface direction, so this is the only
+    // reliable way to guarantee reflect() below bounces the particle AWAY from the surface rather than
+    // deeper into it.
+    if (dot(n, vel) > 0.0) {
+        n = -n;
+    }
+
+    // No true signed-distance field is available here (only a single depth sample per pixel, not a
+    // volumetric field like Global SDF), so the particle is pushed back out to the reconstructed
+    // surface point plus a small fixed skin thickness instead of an exact penetration-depth offset.
+    const float kPushOutEpsilon = 0.02;
+    pos = sceneWorldPos + n * kPushOutEpsilon;
+
+    vec3 reflected = reflect(vel, n);
+    float normalSpeed = dot(reflected, n);
+    vec3 tangentVelocity = reflected - n * normalSpeed;
+    vel = n * normalSpeed * bounceElasticity + tangentVelocity * friction;
+    return true;
+}
+
 // Subtask A4 (color-over-life / size-over-life curves): shared bracketing-key math for both
 // SampleColorCurve and SampleSizeCurve below -- 4 fixed keyframes evenly spaced across [0,1] (age
 // 0.0/0.33/0.67/1.0) means exactly 3 equal intervals, so `age * 3` directly gives a continuous
@@ -233,17 +409,139 @@ float SampleSizeCurve(EmitterParams e, float age) {
     return mix(e.sizeCurve[key0], e.sizeCurve[key0 + 1], frac);
 }
 
-void SpawnParticle(uint slotIndex, uint spawnRequestIndex, uint emitterIndex) {
-    uint seed = HashUint(pc.randomSeedBase ^ (slotIndex * 2654435761u) ^ (spawnRequestIndex * 40503u) ^ (emitterIndex * 2246822519u));
+// Subtask C3 (spawn-on-mesh-surface): uniformly-random point on the surface of `e.spawnTargetEntityId`'s
+// mesh, in WORLD space. Two-stage rejection sample, chosen as the SIMPLEST correct approach that reuses
+// existing buffers rather than building a second mesh format (per this subtask's own design brief):
+//   1. Pick a uniformly-random cluster SLOT (out of every cluster currently resident for ANY entity),
+//      retrying up to kMaxClusterPickAttempts times until one happens to belong to the target entity.
+//      This project's cluster metadata has no per-entity index (clusters for different entities are
+//      interleaved in upload order, see renderer::ClusterOcclusionCullingPass), so building one just for
+//      this feature would itself be "a second mesh format" -- a bounded-retry rejection sample is the
+//      pragmatic, minimal alternative the task's own design brief calls for. Degrades gracefully (falls
+//      through to the caller's own fallback) if the target entity is never found within the attempt
+//      budget (e.g. a very small entity lost among thousands of clusters, or an invalid ID).
+//   2. Within that cluster, pick a uniformly-random LOCAL triangle (indices decoded straight out of the
+//      SAME compressed pool the position/UV decode already reads, see CLUSTER_INDICES_BASE_BYTES's own
+//      comment in cluster_vertex_decode.glsl -- 1 byte per local vertex index, no separate decompressed
+//      index buffer needed) and a uniformly-random barycentric point on it (Osada et al.'s sqrt(r1)
+//      folding avoids the well-known corner-clustering bias of a naive (r1, r2) linear pair).
+// Returns false (leaving `outPosition` untouched) when no cluster of the target entity was found.
+bool SampleEntityMeshSurface(uint targetEntityId, inout uint seed, out vec3 outPosition) {
+    const uint kMaxClusterPickAttempts = 32u;
+    uint clusterCount = uint(g_Clusters.clusters.length());
+    if (clusterCount == 0u) {
+        return false;
+    }
+
+    bool found = false;
+    ClusterCullMetadata targetCluster;
+    for (uint attempt = 0u; attempt < kMaxClusterPickAttempts && !found; ++attempt) {
+        // Folds `attempt` into the hash directly (rather than drawing from NextRandomFloat) so this
+        // rejection loop advances independently of the rest of this particle's own spawn RNG sequence.
+        uint candidate = HashUint(seed ^ (attempt * 2654435761u) ^ 0x9E3779B9u) % clusterCount;
+        ClusterCullMetadata c = g_Clusters.clusters[candidate];
+        if (c.entityID == targetEntityId) {
+            targetCluster = c;
+            found = true;
+        }
+    }
+    if (!found || targetCluster.indexCount < 3u) {
+        return false;
+    }
+
+    uint triangleCount = targetCluster.indexCount / 3u;
+    uint triIndex = min(uint(NextRandomFloat(seed) * float(triangleCount)), triangleCount - 1u);
+    uint physicalPageIndex = targetCluster.vertexOffset / CLUSTER_MAX_VERTICES;
+    uint pageByteBase = physicalPageIndex * CLUSTER_PAGE_SIZE_BYTES;
+
+    uint i0 = ClusterLoadByte(pageByteBase + CLUSTER_INDICES_BASE_BYTES + triIndex * 3u + 0u);
+    uint i1 = ClusterLoadByte(pageByteBase + CLUSTER_INDICES_BASE_BYTES + triIndex * 3u + 1u);
+    uint i2 = ClusterLoadByte(pageByteBase + CLUSTER_INDICES_BASE_BYTES + triIndex * 3u + 2u);
+    vec3 v0 = DecodeClusterPosition(pageByteBase, i0, targetCluster.boundsMin, targetCluster.boundsMax);
+    vec3 v1 = DecodeClusterPosition(pageByteBase, i1, targetCluster.boundsMin, targetCluster.boundsMax);
+    vec3 v2 = DecodeClusterPosition(pageByteBase, i2, targetCluster.boundsMin, targetCluster.boundsMax);
+
+    float r1 = NextRandomFloat(seed);
+    float r2 = NextRandomFloat(seed);
+    float sqrtR1 = sqrt(r1);
+    float bary0 = 1.0 - sqrtR1;
+    float bary1 = sqrtR1 * (1.0 - r2);
+    float bary2 = sqrtR1 * r2;
+    vec3 restPos = v0 * bary0 + v1 * bary1 + v2 * bary2;
+
+    // Transform from the cluster's own rest-pose space into world space -- the SAME composition
+    // ClusterRaster.vert applies (rotate-about-center, then translate; see struct_custo.glsl's own
+    // EntityTransform comment). Barycentric interpolation commutes with this affine transform, so
+    // blending the 3 rest-pose vertices FIRST and transforming once is equivalent to (and cheaper than)
+    // transforming each vertex individually.
+    EntityData ed = entityData[targetCluster.entityID];
+    EntityTransform xform = entityTransforms[ed.meshID];
+    vec3 localPos = restPos - xform.center;
+    outPosition = xform.translation + xform.center + mat3(xform.rotation) * localPos;
+    return true;
+}
+
+// Pops one index off the tail of the dead-list, atomically -- shared by every spawn path in this file
+// (mode == 1 embers, mode == 2 precipitation, AND subtask C4's own in-line TriggerSubEmitter below)
+// since the free-list itself is not per-kind/per-caller (see ParticleCommon.glsl's own DeadListBuffer
+// comment: it is a single shared pool, exactly the "share the pool, back off gracefully under
+// pressure" contract every spawn path in this file already relies on -- an over-subscribed request
+// simply stops finding free slots here and gives up on the remainder). Calling this from WITHIN
+// mode == 0's UpdateParticle (TriggerSubEmitter's own case) is exactly as safe as calling it from a
+// dedicated mode == 1/2 spawn dispatch: every caller only ever performs atomic increments/decrements
+// on the shared counter plus an index-protected array read, so two threads (regardless of which mode
+// dispatched them) can never claim the same slot index. Returns false (and leaves deadCount untouched
+// -- see the underflow-undo below) when the pool is fully alive.
+bool TryPopDeadListSlot(out uint slotIndex) {
+    // atomicAdd(deadCount, -1) returns the PRE-decrement value, so the slot this thread claims is at
+    // deadIndices[oldValue - 1]. uint wraps on underflow, so oldValue == 0 (nothing left to pop) is
+    // diagnosed via the explicit guard below rather than trusting an unsigned-wraparound comparison.
+    uint oldDeadCount = atomicAdd(deadCount, -1u);
+    if (oldDeadCount == 0u) {
+        // No dead slots left -- undo the decrement (it wrapped to UINT_MAX) and give up; the caller's
+        // spawnQueue was simply optimistic this frame (kMaxParticles is already fully alive).
+        atomicAdd(deadCount, 1u);
+        return false;
+    }
+    slotIndex = deadIndices[oldDeadCount - 1u];
+    return true;
+}
+
+// `centerPosition` is the spawn-volume center for shapes 0/1 (the emitter's own live position for a
+// normal spawn, mode == 1; a DEATH/COLLISION location for a subtask C4 sub-emitter trigger instead,
+// see TriggerSubEmitter's own comment) -- ignored by shape 2 (mesh surface), which always samples
+// `emitters[emitterIndex]`'s OWN spawnTargetEntityId regardless of who is spawning into this slot.
+// `isSubEmitterChild` is subtask C4's one-level-deep recursion cap -- see Particle::subEmitterChildFlag's
+// own declaration comment (ParticleSystemPass.h) for the full safety argument.
+void SpawnParticleCore(uint slotIndex, uint seed, uint emitterIndex, vec3 centerPosition, bool isSubEmitterChild) {
     EmitterParams e = emitters[emitterIndex];
 
     vec3 position;
     vec3 velocity;
-    if (e.spawnShape == 1u) {
+    if (e.spawnShape == 2u) {
+        // Subtask C3: spawn distributed across an existing entity's mesh surface instead of a simple
+        // volume/cone -- see SampleEntityMeshSurface's own comment for the full algorithm. Falls back
+        // to a small sphere-volume spawn around the emitter's own configured position (NOT
+        // `centerPosition` -- a mesh-surface spawn has no meaningful notion of a sub-emitter override
+        // location) if the target entity's clusters could not be found within the attempt budget.
+        vec3 meshPos;
+        if (SampleEntityMeshSurface(e.spawnTargetEntityId, seed, meshPos)) {
+            position = meshPos;
+        } else {
+            position = e.position + RandomInUnitSphere(seed) * max(e.shapeParam0, 0.1);
+        }
+        // Gentle upward drift -- reads as spores/pollen/embers lifting off a mesh surface, matching
+        // this project's own established "no bespoke velocity per new shape" minimalism (every other
+        // module -- curl-noise, attractor -- is still free to layer on top in UpdateParticle).
+        velocity = vec3(
+            (NextRandomFloat(seed) * 2.0 - 1.0) * 0.1,
+            0.05 + NextRandomFloat(seed) * 0.15,
+            (NextRandomFloat(seed) * 2.0 - 1.0) * 0.1);
+    } else if (e.spawnShape == 1u) {
         // Sphere volume drift (subtask A1's "Ambient Dust" default): spawn anywhere inside a sphere
-        // of radius shapeParam0 around the emitter position, gentle mostly-vertical drift instead of
+        // of radius shapeParam0 around the spawn-volume center, gentle mostly-vertical drift instead of
         // a launched burst.
-        position = e.position + RandomInUnitSphere(seed) * e.shapeParam0;
+        position = centerPosition + RandomInUnitSphere(seed) * e.shapeParam0;
         velocity = vec3(
             (NextRandomFloat(seed) * 2.0 - 1.0) * 0.15,
             NextRandomFloat(seed) * 0.3,
@@ -256,7 +554,7 @@ void SpawnParticle(uint slotIndex, uint spawnRequestIndex, uint emitterIndex) {
             NextRandomFloat(seed) * 0.5 + 0.5,
             NextRandomFloat(seed) * 2.0 - 1.0));
         float speed = 1.0 + NextRandomFloat(seed) * 2.0;
-        position = e.position + (vec3(NextRandomFloat(seed), NextRandomFloat(seed), NextRandomFloat(seed)) - 0.5) * 0.1;
+        position = centerPosition + (vec3(NextRandomFloat(seed), NextRandomFloat(seed), NextRandomFloat(seed)) - 0.5) * 0.1;
         velocity = jitterDir * speed;
     }
     float life = mix(e.lifetimeMin, e.lifetimeMax, NextRandomFloat(seed));
@@ -281,7 +579,76 @@ void SpawnParticle(uint slotIndex, uint spawnRequestIndex, uint emitterIndex) {
     // comment) immediately re-evaluates both from the curves at age ~= 0, so this is purely a sane
     // one-frame-safe default, not the value that actually reaches the render pass.
     p.baseSize = size;
+    // Subtask C4: see Particle::subEmitterChildFlag's own declaration comment (ParticleSystemPass.h)
+    // for the full one-level-deep recursion-cap argument this single assignment is responsible for.
+    p.subEmitterChildFlag = isSubEmitterChild ? 1.0 : 0.0;
+    p.subEmitterCollisionFired = 0.0;
     particles[slotIndex] = p;
+}
+
+void SpawnParticle(uint slotIndex, uint spawnRequestIndex, uint emitterIndex) {
+    uint seed = HashUint(pc.randomSeedBase ^ (slotIndex * 2654435761u) ^ (spawnRequestIndex * 40503u) ^ (emitterIndex * 2246822519u));
+    SpawnParticleCore(slotIndex, seed, emitterIndex, emitters[emitterIndex].position, false);
+}
+
+// Subtask C4 (Niagara-parity roadmap: sub-emitters / event-driven spawn chains) -- called from inside
+// UpdateParticle (one thread per particle) at exactly two possible moments: the frame a particle's own
+// life crosses to <= 0 (subEmitterTriggerMode == 0, "on death"), or the frame it first contacts Global
+// SDF geometry (subEmitterTriggerMode == 1, "on collision", latched via Particle::
+// subEmitterCollisionFired so it can only ever fire once per particle lifetime -- see that field's own
+// declaration comment). Both call sites already guard `p.subEmitterChildFlag == 0.0` before calling
+// this at all, so `seed`/`atPosition` here always belong to an ELIGIBLE (non-child) particle.
+//
+// --- Why an immediate, same-dispatch, in-shader re-spawn (rather than a CPU-readback queue) ---
+// The plan doc explicitly allows either mechanism. A CPU-readback queue (GPU writes "please spawn N at
+// P for slot K" requests into a small buffer, ClusterRenderPipeline reads them back NEXT frame and
+// folds them into that frame's ordinary spawnCounts) was considered, but it has a real fidelity cost:
+// the ordinary per-emitter spawn path always jitters new particles around EmitterParams.position, not
+// an arbitrary caller-supplied point -- so a CPU-readback round trip would spawn dust somewhere near
+// EMITTERS[targetSlot]'s own configured position, NOT at the actual death/collision location the
+// feature description calls for ("...spawns a small burst of dust... AT THE DEATH LOCATION"). Directly
+// popping the dead-list and initializing new particles HERE, inside this same mode == 0 dispatch,
+// costs zero extra latency and preserves exact per-event position fidelity instead.
+//
+// --- Why this is safe within a single dispatch (no barrier between "spawn" and "this frame's update") ---
+// mode == 0 covers every slot with ONE thread each, and TryPopDeadListSlot's atomics guarantee no two
+// threads (regardless of call site) ever claim the same slot index -- see that function's own comment.
+// The only subtlety: a child particle spawned HERE, into some OTHER slot X, might be processed by slot
+// X's own UpdateParticle thread either before or after this write completes (workgroup dispatch order
+// is not sequential) -- if slot X's own thread already read `particles[X]` as dead (life <= 0) BEFORE
+// this write lands, that thread simply returns early and does nothing further; it does NOT re-read
+// afterward (a one-shot invocation), so the freshly-spawned child is invisible to THIS frame's
+// alive-list rebuild. It is NOT lost, however: next frame's mode == 0 dispatch iterates every slot
+// unconditionally and will find life > 0 there, correctly rebuilding it into the alive list and
+// resuming its normal countdown -- the only consequence of this race is the new particle rendering one
+// frame later than it was created, imperceptible for a demoscene dust-puff/spark-burst effect, and
+// nothing here can double-free a slot, corrupt the dead-list, or leak an index.
+//
+// --- Why chains are capped at exactly one level deep ---
+// Every particle spawned by this function has its OWN subEmitterChildFlag forced to 1.0 (see
+// SpawnParticleCore's own call site below) regardless of subEmitterTargetSlot's configured
+// EmitterParams -- so even if a user configures EMITTERS[targetSlot] to ALSO have subEmitterEnabled
+// set (pointing at a third slot), UpdateParticle's own two call sites below never invoke this function
+// for a particle whose subEmitterChildFlag is already 1.0, so a third generation can never spawn. This
+// is enforced structurally (a per-particle flag propagated at spawn time), not by convention alone.
+void TriggerSubEmitter(EmitterParams e, vec3 atPosition, uint baseSeedSalt) {
+    uint targetSlot = e.subEmitterTargetSlot;
+    if (e.subEmitterEnabled == 0u || e.subEmitterSpawnCount == 0u || targetSlot >= uint(emitters.length())) {
+        return;
+    }
+    // Defensive hard cap independent of however large subEmitterSpawnCount is configured -- bounds the
+    // worst-case dead-list drain from a single trigger EVENT to a small, fixed number regardless of
+    // user (ImGui) misconfiguration, on top of (not instead of) the one-level-deep structural cap above.
+    const uint kMaxSubEmitterSpawnPerTrigger = 32u;
+    uint spawnN = min(e.subEmitterSpawnCount, kMaxSubEmitterSpawnPerTrigger);
+    for (uint i = 0u; i < spawnN; ++i) {
+        uint slotIndex;
+        if (!TryPopDeadListSlot(slotIndex)) {
+            break; // Dead-list exhausted this frame -- back off gracefully, same convention as every other spawn path in this file.
+        }
+        uint seed = HashUint(baseSeedSalt ^ (slotIndex * 2654435761u) ^ (i * 40503u) ^ 0x2545F491u);
+        SpawnParticleCore(slotIndex, seed, targetSlot, atPosition, /*isSubEmitterChild=*/true);
+    }
 }
 
 // Precipitation feature -- spawns one rain or snow particle inside a horizontal box "shell" centered
@@ -354,6 +721,11 @@ void UpdateParticle(uint slotIndex) {
 
     vec3 wind = SampleWindVelocity(p.position, pc.time, g_AtmosGlobals.windDirection, g_AtmosGlobals.windSpeed, g_AtmosGlobals.windTurbulenceParams);
     vec3 newPosition;
+    // Subtask C4: hoisted out of the ember branch below (which used to declare this locally) so the
+    // shared on-death trigger check further down can also read it -- left unassigned (never read) on
+    // the precipitation path, matching that path's own existing "precipitation never touches
+    // EmitterParams" convention (see the ember branch's own comment on `e` below).
+    EmitterParams e;
 
     if (isPrecipitation) {
         // --- Precipitation fall: relax toward a fixed terminal fall speed instead of accelerating
@@ -396,7 +768,7 @@ void UpdateParticle(uint slotIndex) {
         // the top of UpdateParticle) since precipitation particles never touch EmitterParams at all
         // -- their own kind-branch above uses PrecipitationParamsUBO instead, and their spawn path
         // sets emitterIndex to an unused default (see SpawnPrecipitationParticle's own comment).
-        EmitterParams e = emitters[p.emitterIndex];
+        e = emitters[p.emitterIndex];
         p.velocity.y += e.gravityY * pc.dt;
         p.velocity += (wind - p.velocity) * clamp(e.dragCoefficient * pc.dt, 0.0, 1.0);
 
@@ -444,6 +816,31 @@ void UpdateParticle(uint slotIndex) {
             float normalSpeed = dot(reflected, n);
             vec3 tangentVelocity = reflected - n * normalSpeed;
             p.velocity = n * normalSpeed * e.bounceElasticity + tangentVelocity * e.friction;
+
+            // --- Subtask C4: on-collision sub-emitter trigger ---
+            // Fires at most once per particle lifetime (the subEmitterCollisionFired latch below),
+            // right at this particle's FIRST Global SDF contact -- see TriggerSubEmitter's own header
+            // comment for the full mechanism and one-level-deep recursion-cap argument.
+            // p.subEmitterChildFlag == 0.0 excludes a particle that is ITSELF a sub-emitter spawn.
+            if (e.subEmitterEnabled != 0u && e.subEmitterTriggerMode == 1u &&
+                p.subEmitterChildFlag == 0.0 && p.subEmitterCollisionFired == 0.0) {
+                TriggerSubEmitter(e, newPosition, pc.randomSeedBase ^ (slotIndex * 3571643827u));
+                p.subEmitterCollisionFired = 1.0;
+            }
+        }
+
+        // --- Subtask C2: screen-space depth-buffer collision (secondary/fallback mode) ---
+        // Runs unconditionally after the Global SDF branch above (not nested inside its `dist < 0.0`
+        // block) -- see ResolveDepthBufferCollision's own header comment for why this is always safe:
+        // it is a no-op whenever the particle isn't actually penetrating the reconstructed depth-buffer
+        // surface, which is already true immediately after the SDF branch just pushed it back out.
+        if (e.depthCollisionEnabled != 0u) {
+            vec3 depthPos = newPosition;
+            vec3 depthVel = p.velocity;
+            if (ResolveDepthBufferCollision(depthPos, depthVel, e.bounceElasticity, e.friction)) {
+                newPosition = depthPos;
+                p.velocity = depthVel;
+            }
         }
 
         // --- Subtask A4: color-over-life / size-over-life curves ---
@@ -469,6 +866,17 @@ void UpdateParticle(uint slotIndex) {
     if (p.life <= 0.0) {
         uint deadSlot = atomicAdd(deadCount, 1u);
         deadIndices[deadSlot] = slotIndex;
+
+        // --- Subtask C4: on-death sub-emitter trigger ---
+        // Fires exactly once, the frame this particle's own life crosses to <= 0 (natural expiry OR an
+        // SDF-absorb kill for a kind that has one -- embers never force-absorb, so this is always
+        // natural expiry for kKindEmber) -- never re-checked again since the slot is now dead. Excluded
+        // for precipitation (isPrecipitation) since only ember particles have a meaningful `e` fetched
+        // above, and excluded for a particle that is itself a sub-emitter spawn (subEmitterChildFlag),
+        // same one-level-deep cap as the on-collision trigger above.
+        if (!isPrecipitation && e.subEmitterEnabled != 0u && e.subEmitterTriggerMode == 0u && p.subEmitterChildFlag == 0.0) {
+            TriggerSubEmitter(e, p.position, pc.randomSeedBase ^ (slotIndex * 668265263u));
+        }
     } else {
         uint aliveSlot = atomicAdd(aliveCount, 1u);
         aliveIndices[aliveSlot] = slotIndex;
@@ -480,28 +888,6 @@ void UpdateParticle(uint slotIndex) {
         atomicAdd(perEmitterAliveCount[p.emitterIndex], 1u);
 #endif
     }
-}
-
-// Pops one index off the tail of the dead-list, atomically -- shared by both spawn modes (mode == 1
-// embers, mode == 2 precipitation) since the free-list itself is not per-kind (see ParticleCommon.
-// glsl's own DeadListBuffer comment: it is a single shared pool, exactly the "precipitation shares
-// the pool with any other emitter, backs off gracefully under pressure" contract the integration plan
-// asks for -- an over-subscribed spawnQueue simply stops finding free slots here and gives up on the
-// remaining requests, same as this codebase's own pre-existing embers path already did). Returns
-// false (and leaves deadCount untouched -- see the underflow-undo below) when the pool is fully alive.
-bool TryPopDeadListSlot(out uint slotIndex) {
-    // atomicAdd(deadCount, -1) returns the PRE-decrement value, so the slot this thread claims is at
-    // deadIndices[oldValue - 1]. uint wraps on underflow, so oldValue == 0 (nothing left to pop) is
-    // diagnosed via the explicit guard below rather than trusting an unsigned-wraparound comparison.
-    uint oldDeadCount = atomicAdd(deadCount, -1u);
-    if (oldDeadCount == 0u) {
-        // No dead slots left -- undo the decrement (it wrapped to UINT_MAX) and give up; the caller's
-        // spawnQueue was simply optimistic this frame (kMaxParticles is already fully alive).
-        atomicAdd(deadCount, 1u);
-        return false;
-    }
-    slotIndex = deadIndices[oldDeadCount - 1u];
-    return true;
 }
 
 void main() {

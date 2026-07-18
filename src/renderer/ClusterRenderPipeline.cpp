@@ -784,9 +784,17 @@ bool ClusterRenderPipeline::Init(
   // D4's reserved particle-derived light tail), m_SurfaceCacheRT (D1's shared g_TLAS for MegaLights'
   // own shadow-visibility ray), and m_AtmosFog (D5's integrated froxel grid) -- all three already
   // Init'd above (m_SurfaceCacheRT at STEP 7's own earlier call, m_MegaLights/m_AtmosFog just above).
+  // Subtask C3 (spawn-on-mesh-surface): also borrows the SAME cluster metadata / compressed geometry
+  // pool / entity transform / entity data buffers m_HardwareRaster.Init()/m_Resolve.Init() already
+  // received above (m_OcclusionCulling and m_PagePool are both already Init'd well before this
+  // point) -- see ParticleSystemPass::Init's own header comment for why reusing these 4 buffers,
+  // rather than a second mesh format, is what lets EmitterParams::spawnTargetEntityId sample real
+  // triangle surfaces.
   if (!m_ParticleSystem.Init(createInfo.physicalDevice, createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
                              m_AtmosClimate, m_GlobalSDF, m_Resolve, m_VirtualShadowMap, m_WorldProbes,
                              m_MegaLights, m_SurfaceCacheRT, m_AtmosFog,
+                             m_OcclusionCulling.GetClusterMetadataBuffer(), m_PagePool.GetPhysicalPoolBuffer(),
+                             createInfo.entityTransformBuffer, createInfo.entityDataBuffer,
                              GICompositePass::kOutputFormat, createInfo.depthFormat)) {
     LOG_ERROR("[ClusterRenderPipeline] Failed to initialize ParticleSystemPass.");
     return false;
@@ -1719,6 +1727,18 @@ void ClusterRenderPipeline::RecordFrameEarly(VkCommandBuffer cmdEarly,
             gpu.sizeCurve[key] = cfg.sizeCurve[key];
         }
 
+        // Subtask C2 (screen-space depth-buffer collision): same "copy the live ImGui-edited config
+        // value into this frame's GPU struct" pattern as every other field above.
+        gpu.depthCollisionEnabled = cfg.depthCollisionEnabled ? 1u : 0u;
+        // Subtask C3 (spawn-on-mesh-surface): only meaningful when spawnShape == 2, copied
+        // unconditionally like every other field regardless (harmless when unused).
+        gpu.spawnTargetEntityId = cfg.spawnTargetEntityId;
+        // Subtask C4 (sub-emitters): same "copy the live ImGui-edited config value" pattern.
+        gpu.subEmitterEnabled = cfg.subEmitterEnabled ? 1u : 0u;
+        gpu.subEmitterTargetSlot = cfg.subEmitterTargetSlot;
+        gpu.subEmitterTriggerMode = cfg.subEmitterTriggerMode;
+        gpu.subEmitterSpawnCount = cfg.subEmitterSpawnCount;
+
         if (cfg.active) {
           m_ParticleSpawnAccumulator[i] += cfg.spawnRate * particleDeltaTimeSeconds;
         }
@@ -1753,7 +1773,13 @@ void ClusterRenderPipeline::RecordFrameEarly(VkCommandBuffer cmdEarly,
       // (see that array's own comment) -- it rides the SAME per-emitter particleEmitters/
       // particleSpawnCounts arrays built by the loop above, needing no separate accumulator, position,
       // or RecordSimulate parameter of its own.
+      // Subtask C2 (screen-space depth-buffer collision): `viewProj`/`invViewProj` are the SAME
+      // combined camera matrices this frame's resolve/rasterization passes already computed above
+      // (see this function's own earlier "Every stage of this frame consumes the SAME combined
+      // matrix" comment) -- reused here unmodified so ParticleSimulation.comp's forward screen-space
+      // projection matches exactly what produced m_Resolve's own depth copy this frame.
       m_ParticleSystem.RecordSimulate(cmdEarly, m_GlobalSDF, particleDeltaTimeSeconds, globalTimeSeconds,
+          viewProj, invViewProj, m_RenderExtent,
           particleEmitters, particleSpawnCounts,
           precipCenterWorld, precipSpawnCount, precipKind,
           config::atmos::PRECIPITATION_SPAWN_RADIUS_METERS, config::atmos::PRECIPITATION_SPAWN_HEIGHT_ABOVE_CAMERA_METERS,
