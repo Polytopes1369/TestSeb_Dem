@@ -131,6 +131,7 @@
 #include "renderer/streaming/GpuGeometryPagePool.h"
 #include "renderer/passes/HeroTessellationPass.h"
 #include "renderer/passes/WaterForwardPass.h"
+#include "renderer/passes/ParticleSystemPass.h"
 #include "renderer/passes/HZBPass.h"
 #include "renderer/LightingTypes.h"
 #include "renderer/passes/ProceduralMaskGenerator.h"
@@ -692,6 +693,17 @@ namespace renderer {
         // invisible to that refraction (and anything drawn before it that skipped this ordering
         // would show through unrealistically, since water is meant to be the top-most surface).
         WaterForwardPass m_WaterForward;
+
+        // GPU-driven particle system (Niagara-style), Subtask 1 of particle_system_integration_plan.md
+        // (project root) -- currently just the buffer/descriptor-set skeleton (see
+        // renderer::ParticleSystemPass's own class comment); no RecordSimulate/RecordSort/RecordDraw
+        // exist yet (Subtasks 2-4), so this is Init'd/Shutdown'd here but not yet called from
+        // RecordFrame. Declared after m_WaterForward (not interleaved with the GI infrastructure
+        // below) since the eventual render call belongs among the other forward-rendered passes --
+        // see the plan doc's own "after opaque Nanite + m_TransparentForward, before post-process"
+        // ordering requirement, which Subtask 6 will wire up once RecordDraw exists. Always
+        // initialized (not Debug-only), same build-separation rule as m_TransparentForward above.
+        ParticleSystemPass m_ParticleSystem;
 
         // Lumen-style GI infrastructure -- unlike the debug-only stats/overlay block below, these
         // are real (if not yet light-transport-consuming) systems, not visualization tools, so

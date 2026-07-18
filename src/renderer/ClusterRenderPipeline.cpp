@@ -735,6 +735,15 @@ bool ClusterRenderPipeline::Init(
     }
   }
 
+  // GPU particle system, Subtask 1 (particle_system_integration_plan.md): buffer/descriptor-set
+  // skeleton only -- see renderer::ParticleSystemPass's own class comment. No render/simulate call
+  // exists yet (Subtasks 2-4 add those), so this Init() is standalone, not order-dependent on
+  // anything above/below it.
+  if (!m_ParticleSystem.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue)) {
+    LOG_ERROR("[ClusterRenderPipeline] Failed to initialize ParticleSystemPass.");
+    return false;
+  }
+
   // Screen Trace GI -- linear screen-space depth raymarching falling back to the World Probe grid.
   m_ScreenTrace.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
                      createInfo.renderExtent, m_Resolve.GetOutputDepthView(), m_Resolve.GetOutputNormalView(),
@@ -1033,6 +1042,7 @@ void ClusterRenderPipeline::Shutdown() {
 
   m_HeroTessellation.Shutdown();
   m_WaterForward.Shutdown();
+  m_ParticleSystem.Shutdown();
   m_TransparentForward.Shutdown();
   m_ShadingBin.Shutdown();
   m_Resolve.Shutdown();
