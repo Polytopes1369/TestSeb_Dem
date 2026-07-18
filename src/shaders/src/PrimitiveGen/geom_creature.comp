@@ -1,0 +1,230 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+
+// Skeletal-animation feature: procedurally generates the BIND-POSE (rest-pose, undeformed) mesh
+// for the engine's one skinned entity -- a segmented "worm/snake" creature, a straight single-chain
+// spine of `boneCount` joints (see animation::SkeletalAnimator, src/animation/SkeletalAnimator.h),
+// each ringed by a tapered cross-section, capped by a pole vertex at each end. Follows the exact
+// convention every other geom_*.comp primitive already establishes (CPU-orchestrated compute
+// dispatch producing vertex/index buffers that feed into geometry::ClusterDAG's cluster-building,
+// see VulkanContext::GenerateCreature()) -- the one genuinely new piece is the SECOND SSBO write
+// below (VertexSkinBuffer, binding 5), authoring each vertex's linear-blend-skinning bone
+// indices/weights alongside its normal Vertex write, at the exact same vertexOffset+vIdx slot.
+//
+// --- Bind pose MUST match animation::SkeletalAnimator's own analytic bind pose bit-for-bit ---
+// This shader places bone i's ring at local-space X = i * segmentLength (Y=Z=0 at ring center) --
+// see animation::SkeletalAnimator::BindPoseBoneLocalPosition()'s own identical formula. Both
+// `boneCount` and `segmentLength` arrive as Params UBO fields set directly from
+// animation::SkeletalAnimator::kBoneCount/kSegmentLength (VulkanContext::GenerateCreature()), so
+// the two can never independently drift out of sync.
+//
+// --- Mesh resolution: rings != bones (this is what makes 2-bone blending real) ---
+// If a ring existed ONLY at each bone's exact position, every vertex would bind 100% to exactly
+// one bone (correct at that single point, but produces a visible hard crease at each joint once
+// bones rotate, since the geometry between two such rings would stay rigidly bound to only one
+// bone or the other). `ringsPerSegment` (>1) inserts extra rings BETWEEN consecutive bones, each
+// genuinely blending between its two adjacent bones by the parametric fraction along that segment
+// -- standard linear-blend-skinning weight authoring, and the concrete mechanism behind this
+// task's "a vertex near a joint blends between the two adjacent bones by distance/parametric-t
+// along the limb" requirement.
+//
+// --- Topology ---
+// totalRings = (boneCount-1)*ringsPerSegment + 1 rings, each `sidesPerRing` vertices around a
+// tapered circular cross-section (RadiusProfile below), plus one pole vertex at each end (tail =
+// before ring 0, head = past the last ring) for a closed, cap-free-look-free mesh. Body quads
+// (2 triangles each) connect consecutive rings; two triangle fans close the tail/head ends.
+
+#include "include/struct_custo.glsl"
+#include "include/math_utils.glsl"
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) writeonly buffer VertexBuffer { Vertex vertices[]; };
+layout(std430, binding = 1) writeonly buffer IndexBuffer  { uint indices[]; };
+
+layout(std140, binding = 2) uniform Params
+{
+    uint  boneCount;       // animation::SkeletalAnimator::kBoneCount, passed through verbatim.
+    uint  sidesPerRing;    // Radial resolution of the cross-section (>= 3).
+    uint  ringsPerSegment; // Rings generated PER inter-bone segment (>= 1; see header comment).
+    float segmentLength;   // animation::SkeletalAnimator::kSegmentLength, passed through verbatim.
+    float radiusMin;       // Cross-section radius at the tail/head tips.
+    float radiusMax;       // Cross-section radius at the body's widest point (mid-spine).
+    uint  meshID;
+    float materialID;
+    uint  vertexOffset;
+    uint  indexOffset;
+    float worldOffsetX;
+    float worldOffsetY;
+    float worldOffsetZ;
+};
+
+// Skeletal-animation feature: per-vertex bone-skinning influence, written alongside the Vertex
+// SSBO above at the SAME vertexOffset+vIdx slot -- byte-for-byte mirror of
+// geometry::ClusterVertexSkin (ClusterFormat.h: 4x uint8 boneIndices + 4x uint8 boneWeights,
+// tightly packed, no padding). GLSL has no native uint8 storage type without an extra device
+// extension this engine doesn't otherwise enable, so each 4-byte group is packed by hand into one
+// uint (byte k occupies bits [8k, 8k+8)) -- exactly matching this buffer's C++ reader
+// (geometry::VirtualGeometryCacheTest.cpp's ReadbackFullGeometry, a raw memcpy) on this engine's
+// little-endian x86-64 target, where a uint's low byte is also its first byte in memory.
+struct VertexSkin {
+    uint boneIndicesPacked;
+    uint boneWeightsPacked;
+};
+layout(std430, binding = 5) writeonly buffer VertexSkinBuffer { VertexSkin skins[]; };
+
+uint PackBytes4(uint b0, uint b1, uint b2, uint b3) {
+    return (b0 & 0xFFu) | ((b1 & 0xFFu) << 8u) | ((b2 & 0xFFu) << 16u) | ((b3 & 0xFFu) << 24u);
+}
+
+// Radius profile along the spine (t01 in [0,1], 0 = tail, 1 = head): tapers to radiusMin at both
+// ends, bulging up toward radiusMax mid-body. Mirrored BY HAND in
+// animation::SkeletalAnimator::ValidateSkeletalBounds() (documented there) since a GLSL function
+// cannot be shared with that C++ validation code -- keep the two in sync if this formula changes.
+float RadiusProfile(float t01) {
+    float shapeEnvelope = sin(t01 * PI);
+    return mix(radiusMin, radiusMax, pow(max(shapeEnvelope, 0.0), 0.6));
+}
+
+void main()
+{
+    if (boneCount < 2u || sidesPerRing < 3u || ringsPerSegment < 1u || radiusMax <= radiusMin)
+    {
+        return;
+    }
+
+    uint totalRings = (boneCount - 1u) * ringsPerSegment + 1u;
+    uint ringVertexCount = totalRings * sidesPerRing;
+    uint tailPoleIdx = ringVertexCount;
+    uint headPoleIdx = ringVertexCount + 1u;
+    uint totalVerts = ringVertexCount + 2u;
+
+    uint id = gl_GlobalInvocationID.x;
+
+    // --- Vertex generation ---
+    if (id < totalVerts)
+    {
+        Vertex v;
+        v.meshID = meshID;
+        v.materialID = materialID;
+
+        VertexSkin skin;
+        skin.boneIndicesPacked = 0u;
+        skin.boneWeightsPacked = 0u;
+
+        if (id < ringVertexCount)
+        {
+            uint ring = id / sidesPerRing;
+            uint col  = id % sidesPerRing;
+
+            float t01 = float(ring) / float(totalRings - 1u);
+            float globalT = t01 * float(boneCount - 1u); // Continuous bone-index parameter, [0, boneCount-1].
+
+            uint boneLow = min(uint(floor(globalT)), boneCount - 2u);
+            uint boneHigh = boneLow + 1u;
+            float blend = clamp(globalT - float(boneLow), 0.0, 1.0);
+
+            float radius = RadiusProfile(t01);
+            float ang = (float(col) / float(sidesPerRing)) * TAU;
+
+            // Bind-pose local position: spine along local +X (matches
+            // animation::SkeletalAnimator::BindPoseBoneLocalPosition() exactly), cross-section
+            // circle in the YZ plane.
+            v.position = vec3(globalT * segmentLength, cos(ang) * radius, sin(ang) * radius);
+            // Radial-only normal (ignores the small slope the tapering radius profile introduces)
+            // -- the same established simplification geom_capsule.comp's own cylindrical body ring
+            // already uses; only affects shading, not silhouette or skinning.
+            v.normal = vec3(0.0, cos(ang), sin(ang));
+            v.uv = vec2(t01, float(col) / float(sidesPerRing));
+
+            // Linear-blend-skinning weight authoring: blends between the two adjacent bones by the
+            // parametric fraction along this segment -- standard LBS weight authoring. w0+w1 sums
+            // to EXACTLY 255 by construction (w1 derived as the remainder, not independently
+            // rounded), so the GPU-decoded weights (skeletal_animation.glsl) always sum to exactly
+            // 1.0 for every ring vertex. Slots 2/3 stay zero (unused): a single spine chain never
+            // needs more than 2 simultaneous bone influences.
+            uint w0 = uint(round((1.0 - blend) * 255.0));
+            uint w1 = 255u - w0;
+            skin.boneIndicesPacked = PackBytes4(boneLow, boneHigh, 0u, 0u);
+            skin.boneWeightsPacked = PackBytes4(w0, w1, 0u, 0u);
+        }
+        else if (id == tailPoleIdx)
+        {
+            v.position = vec3(-radiusMin, 0.0, 0.0);
+            v.normal = vec3(-1.0, 0.0, 0.0);
+            v.uv = vec2(0.0, 0.0);
+            // Fully bound to bone 0 (root/tail bone) -- this pole sits at the chain's own tip.
+            skin.boneIndicesPacked = PackBytes4(0u, 0u, 0u, 0u);
+            skin.boneWeightsPacked = PackBytes4(255u, 0u, 0u, 0u);
+        }
+        else // headPoleIdx
+        {
+            v.position = vec3(float(boneCount - 1u) * segmentLength + radiusMin, 0.0, 0.0);
+            v.normal = vec3(1.0, 0.0, 0.0);
+            v.uv = vec2(1.0, 0.0);
+            // Fully bound to the last bone (the head bone).
+            skin.boneIndicesPacked = PackBytes4(boneCount - 1u, 0u, 0u, 0u);
+            skin.boneWeightsPacked = PackBytes4(255u, 0u, 0u, 0u);
+        }
+
+        v.uv2 = v.uv;
+        v.position += vec3(worldOffsetX, worldOffsetY, worldOffsetZ);
+        vertices[vertexOffset + id] = v;
+        skins[vertexOffset + id] = skin;
+    }
+
+    // --- Index generation ---
+    // Body quads: (totalRings-1) segments * sidesPerRing columns, 2 triangles (6 indices) each.
+    // Winding mirrors geom_capsule.comp's own cylindrical body ring exactly (b0,t0,t1 / b0,t1,b1,
+    // relabeled ring/col here) -- a proven-correct pattern for this "swept ring perpendicular to a
+    // long axis" mesh shape, just swept along local +X here instead of +Y.
+    uint bodyQuadCount = (totalRings - 1u) * sidesPerRing;
+    if (id < bodyQuadCount)
+    {
+        uint ring = id / sidesPerRing;
+        uint col  = id % sidesPerRing;
+        uint colNext = (col + 1u) % sidesPerRing;
+
+        uint r0  = ring * sidesPerRing + col;
+        uint r0n = (ring + 1u) * sidesPerRing + col;
+        uint r1n = (ring + 1u) * sidesPerRing + colNext;
+        uint r1  = ring * sidesPerRing + colNext;
+
+        uint tIdx = indexOffset + id * 6u;
+        indices[tIdx + 0u] = vertexOffset + r0;
+        indices[tIdx + 1u] = vertexOffset + r0n;
+        indices[tIdx + 2u] = vertexOffset + r1n;
+        indices[tIdx + 3u] = vertexOffset + r0;
+        indices[tIdx + 4u] = vertexOffset + r1n;
+        indices[tIdx + 5u] = vertexOffset + r1;
+    }
+
+    // Tail cap fan: sidesPerRing triangles, ring 0 -> tailPoleIdx. Winding mirrors
+    // geom_capsule.comp's own BOTTOM hemisphere pole-ring triangle (pole, thisCol, nextCol) -- the
+    // tail pole plays the same "outward-facing cap at the START of the parametric range" role.
+    if (id < sidesPerRing)
+    {
+        uint col = id;
+        uint colNext = (col + 1u) % sidesPerRing;
+        uint tIdx = indexOffset + bodyQuadCount * 6u + id * 3u;
+        indices[tIdx + 0u] = vertexOffset + tailPoleIdx;
+        indices[tIdx + 1u] = vertexOffset + col;
+        indices[tIdx + 2u] = vertexOffset + colNext;
+    }
+
+    // Head cap fan: sidesPerRing triangles, last ring -> headPoleIdx. Winding mirrors
+    // geom_capsule.comp's own TOP hemisphere pole-ring triangle (thisCol, pole, nextCol) --
+    // deliberately the OPPOSITE order from the tail cap above, since the head pole plays the
+    // "outward-facing cap at the END of the parametric range" role (same asymmetry reason
+    // geom_capsule.comp's own top/bottom hemisphere pole triangles differ).
+    if (id < sidesPerRing)
+    {
+        uint col = id;
+        uint colNext = (col + 1u) % sidesPerRing;
+        uint lastRingBase = (totalRings - 1u) * sidesPerRing;
+        uint tIdx = indexOffset + bodyQuadCount * 6u + sidesPerRing * 3u + id * 3u;
+        indices[tIdx + 0u] = vertexOffset + lastRingBase + col;
+        indices[tIdx + 1u] = vertexOffset + headPoleIdx;
+        indices[tIdx + 2u] = vertexOffset + lastRingBase + colNext;
+    }
+}

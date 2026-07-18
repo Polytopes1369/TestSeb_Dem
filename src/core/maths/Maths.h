@@ -308,6 +308,69 @@ namespace maths {
             return { axis.x * s, axis.y * s, axis.z * s, std::cos(angleRadians * 0.5f) };
         }
 
+        // Skeletal-animation feature: Hamilton product (this * other), the standard "apply `other`'s
+        // rotation first, then this one's" composition -- used by animation::SkeletalAnimator to
+        // compose a bone's authored bind-pose local rotation with its procedurally-animated delta
+        // rotation (e.g. a walk-cycle's per-joint swing angle) into one net local rotation, exactly
+        // the same left-to-right composition order mat4::operator* already uses for this codebase's
+        // rigid transforms.
+        constexpr quat operator*(const quat& o) const {
+            return quat{
+                w * o.x + x * o.w + y * o.z - z * o.y,
+                w * o.y - x * o.z + y * o.w + z * o.x,
+                w * o.z + x * o.y - y * o.x + z * o.w,
+                w * o.w - x * o.x - y * o.y - z * o.z
+            };
+        }
+
+        constexpr float LengthSquared() const { return x * x + y * y + z * z + w * w; }
+
+        // Re-normalizes to unit length -- guards against floating-point drift accumulating across
+        // many per-frame quat*quat compositions (animation::SkeletalAnimator recomposes every
+        // bone's local rotation from scratch each frame rather than incrementally, so drift is
+        // actually minimal in practice, but this is cheap insurance matching vec3::Normalize's own
+        // "return the zero-length input unchanged rather than dividing by zero" defensive contract).
+        quat Normalize() const {
+            float lenSq = LengthSquared();
+            if (lenSq <= 0.0f) {
+                return quat{};
+            }
+            float invLen = 1.0f / std::sqrt(lenSq);
+            return quat{ x * invLen, y * invLen, z * invLen, w * invLen };
+        }
+
+        // Converts to an equivalent pure-rotation mat4, column-major (matches mat4's own m[16]
+        // convention: m[row + col*4]) -- standard quaternion-to-matrix derivation. Assumes `this`
+        // is already unit-length (every caller in this codebase normalizes before converting, since
+        // an un-normalized quaternion would additionally bake in a non-uniform scale here).
+        mat4 ToMat4() const {
+            mat4 result;
+            float xx = x * x, yy = y * y, zz = z * z;
+            float xy = x * y, xz = x * z, yz = y * z;
+            float wx = w * x, wy = w * y, wz = w * z;
+
+            result.m[0] = 1.0f - 2.0f * (yy + zz);
+            result.m[1] = 2.0f * (xy + wz);
+            result.m[2] = 2.0f * (xz - wy);
+            result.m[3] = 0.0f;
+
+            result.m[4] = 2.0f * (xy - wz);
+            result.m[5] = 1.0f - 2.0f * (xx + zz);
+            result.m[6] = 2.0f * (yz + wx);
+            result.m[7] = 0.0f;
+
+            result.m[8] = 2.0f * (xz + wy);
+            result.m[9] = 2.0f * (yz - wx);
+            result.m[10] = 1.0f - 2.0f * (xx + yy);
+            result.m[11] = 0.0f;
+
+            result.m[12] = 0.0f;
+            result.m[13] = 0.0f;
+            result.m[14] = 0.0f;
+            result.m[15] = 1.0f;
+            return result;
+        }
+
         // PCG data model (Phase 1, PCG roadmap): rotates `v` by this quaternion using the standard
         // "v + 2*w*(qv x v) + 2*(qv x (qv x v))" identity (qv = this quaternion's vector part) --
         // needed by PcgVolumeData::ContainsWorldPoint (OBB world-to-local test) and by future PCG

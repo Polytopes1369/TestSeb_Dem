@@ -70,7 +70,11 @@ namespace geometry {
     // -----------------------------------------------------------------------------------------
     struct CacheFileHeader {
         static constexpr uint32_t kMagic = 0x4F45474Cu;   // "LGEO" little-endian ("Local GEOmetry cache")
-        static constexpr uint32_t kVersion = 7u;           // Bumped: DAGNodeEntry now supports up to
+        static constexpr uint32_t kVersion = 8u;           // Bumped: ClusterData now carries a trailing
+                                                            // ClusterVertexSkin[kMaxClusterVertices] block
+                                                            // (skeletal-animation feature) -- see that
+                                                            // struct's own comment. Version 7 bumped for:
+                                                            // DAGNodeEntry now supports up to
                                                             // kMaxGroupOutputClusters (2) parents and
                                                             // up to 4 children per cluster (Nanite-style
                                                             // ~4-cluster groups, see ClusterDAG.h's
@@ -270,15 +274,38 @@ namespace geometry {
     };
     static_assert(sizeof(ClusterVertexUV) == 4, "ClusterVertexUV must be 4 bytes");
 
+    // Skeletal-animation feature: per-vertex linear-blend-skinning influence, up to 4 bones. Only
+    // ever populated (non-zero) for a cluster belonging to a core::EntityFlags::IsSkeletallyAnimated
+    // entity (currently just the procedural creature, VulkanContext::kCreatureEntityIndex) -- every
+    // other entity's clusters carry this block zero-initialized (ClusterData{} default-constructs to
+    // all zeros, see EncodeClusterData in VirtualGeometryCacheTest.cpp) and it is simply never
+    // decoded/consumed for them (gated by ENTITY_FLAG_IS_SKELETALLY_ANIMATED at every raster/resolve
+    // call site -- see skeletal_animation.glsl). boneWeights are unsigned-normalized bytes (0 =
+    // 0.0, 255 = 1.0), authored to sum to 255 across the up-to-4 active slots for a given vertex
+    // (geom_creature.comp); an unused slot has both boneIndices[k] == 0 and boneWeights[k] == 0,
+    // contributing nothing since 0 weight means the corresponding boneMatrices[0] sample is scaled
+    // to zero regardless of which bone index happens to occupy that unused slot.
+    struct ClusterVertexSkin {
+        uint8_t boneIndices[4];
+        uint8_t boneWeights[4];
+    };
+    static_assert(sizeof(ClusterVertexSkin) == 8, "ClusterVertexSkin must be 8 bytes");
+
     struct ClusterData {
         ClusterVertexPosition positions[kMaxClusterVertices];
         ClusterVertexNormal normals[kMaxClusterVertices];
         ClusterVertexUV uvs[kMaxClusterVertices];
+        // Skeletal-animation feature (see ClusterVertexSkin's own comment above): appended AFTER
+        // the original 3 attribute blocks and BEFORE the local triangle-list indices, in the
+        // ~2880 bytes of headroom this format's fixed kPageSizeBytes (4096) page already left
+        // unused (original ClusterData was only 1216 of those 4096 bytes) -- adds 512 bytes
+        // (64 vertices * 8 bytes) without needing to grow kPageSizeBytes itself.
+        ClusterVertexSkin skin[kMaxClusterVertices];
         // Local (cluster-relative) triangle-list indices, in [0, kMaxClusterVertices), indexing
         // into the arrays above.
         uint8_t indices[kMaxClusterIndices];
     };
-    static_assert(sizeof(ClusterData) == 1216, "ClusterData size drifted from the expected 1216 bytes");
+    static_assert(sizeof(ClusterData) == 1728, "ClusterData size drifted from the expected 1728 bytes");
     static_assert(kPageSizeBytes >= sizeof(ClusterData),
         "ClusterData must fit within one page so a cluster's geometry block can be a single page");
 

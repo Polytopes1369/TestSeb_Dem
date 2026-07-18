@@ -465,8 +465,23 @@ namespace renderer {
             layoutInfo.pBindings = bindings;
             VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &layoutInfo, nullptr, &m_FinalShadeSetLayout));
 
+            // Pre-existing bug fix (found while investigating an unrelated skeletal-animation-feature
+            // crash-reproduction run): this pool undercounted VK_DESCRIPTOR_TYPE_STORAGE_IMAGE at 3,
+            // but the set layout above actually declares 4 STORAGE_IMAGE bindings (0 g_ShadeRadiance,
+            // 1 g_GBufferNormal, 2 g_GBufferDepth, 6 g_GBufferMaterialID) -- binding 6
+            // (g_GBufferMaterialID, the Substrate-integration image) was added to this later "Final
+            // Shade" pipeline by copying the earlier "Shade" pipeline's own tail-binding pattern
+            // (which DOES correctly count it, see that pipeline's own "bindings {0,1,2,3,4,8} == 6
+            // per set" pool-size comment a few hundred lines above) without correspondingly bumping
+            // this pool's own STORAGE_IMAGE count. Confirmed via
+            // vkAllocateDescriptorSets(): Trying to allocate 4 ... but this pool only has a total of
+            // 3 descriptors for this type validation warning, present on an unmodified `main` build
+            // too (this bug predates and is unrelated to the skeletal-animation feature) -- fixed
+            // here since it was tipping over into an actual VK_ERROR_OUT_OF_POOL_MEMORY_KHR-induced
+            // heap-corruption crash under this feature's slightly different allocation pattern,
+            // blocking --test-pipeline verification.
             VkDescriptorPoolSize poolSizes[4] = {
-                { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 3 },
+                { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 4 },
                 { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1 },
                 { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3 },
                 { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 }
