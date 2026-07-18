@@ -374,6 +374,24 @@ inline float FOG_DENSITY_TARGET = 0.1f; // [0,1] -- unconsumed until Subtask 3 (
 inline float RAIN_STRENGTH = 0.0f; // [0,1] -- unconsumed until a future precipitation pass.
 } // namespace atmos
 
+// GPU particle system (particle_system_integration_plan.md, Subtask 6: Final Integration) -- live
+// emitter/simulation knobs, same "runtime state, not a quality-preset tier" convention as
+// config::atmos:: above (not mirrored into EngineConfig_{Low,Medium,High,Extrem}.h), tuned live via
+// main.cpp's own Particles ImGui tab.
+namespace particles {
+inline float SPAWN_RATE_PER_SECOND = 200.0f; // New particles/second the emitter requests -- renderer::ClusterRenderPipeline accumulates the fractional remainder across frames (see its own m_ParticleSpawnAccumulator comment) so this is exact over time even at a variable framerate.
+inline float EMITTER_POSITION_X = 0.0f;
+inline float EMITTER_POSITION_Y = 3.0f;
+inline float EMITTER_POSITION_Z = 0.0f;
+inline float GRAVITY = -9.8f; // World-space Y acceleration, m/s^2 -- see ParticleSimulation.comp's own gravityY push-constant field.
+inline float BOUNCE_ELASTICITY = 0.4f; // [0,1] -- fraction of normal-relative speed kept after a Global SDF collision.
+inline float FRICTION = 0.85f; // [0,1] -- fraction of tangential-relative speed kept after a Global SDF collision.
+inline float DRAG_COEFFICIENT = 0.5f; // How strongly velocity relaxes toward the local Atmos wind vector each second.
+inline float SOFT_FADE_DISTANCE = 0.5f; // World units -- see ParticleRender.frag's own softFade comment.
+inline bool HEAT_SHIMMER_ENABLED = false;
+inline float HEAT_SHIMMER_STRENGTH = 0.02f; // Only applied when HEAT_SHIMMER_ENABLED is true -- see ParticleSystemPass::RecordDraw's own comment on why this is a per-draw-call, not per-particle, toggle.
+} // namespace particles
+
 // Active loaded state
 inline bool g_ProfileLoaded = false;
 inline std::string g_ActiveProfileName = "High"; // Default to High properties
