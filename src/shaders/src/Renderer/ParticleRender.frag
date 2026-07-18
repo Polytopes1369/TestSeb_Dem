@@ -321,7 +321,10 @@ void main() {
             float windowSq = 1.0 - nd2 * nd2;
             float window = clamp(windowSq * windowSq, 0.0, 1.0);
 
-            lighting += light.color * (light.intensity / distSq) * window * visibility * invPdf;
+            // G3: per-type angular window (1 for a POINT light, incl. every particle-derived ember,
+            // so pre-G3 behavior is unchanged); a rect is point-approximated here (no LTC on this
+            // billboard-lighting path), same documented scope as the other inline forward consumers.
+            lighting += light.color * (light.intensity / distSq) * window * MegaLightAngularShaping(light, megaLightDir) * visibility * invPdf;
         }
     }
 

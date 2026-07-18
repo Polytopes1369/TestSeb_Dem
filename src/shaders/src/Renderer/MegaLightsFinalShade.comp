@@ -25,6 +25,10 @@
 #include "include/octahedral.glsl"
 #include "include/material_params.glsl"
 #include "include/substrate_bsdf.glsl"
+// G3: LTC analytic rect-light specular (see ltc_area_light.glsl's own header comment). Included after
+// substrate_bsdf.glsl so its F_Schlick/ggx_brdf dependency is already satisfied by an earlier include
+// guard, this codebase's standard include-ordering convention.
+#include "include/ltc_area_light.glsl"
 
 layout(local_size_x = 8, local_size_y = 8) in;
 
@@ -56,6 +60,13 @@ layout(std140, set = 0, binding = 5) uniform MegaLightsViewParamsUBO {
     float spatialReuseRadiusPixels;
     vec3 cameraPositionWorld;
     float _pad2;
+    // G3 (Debug-tunable, always present in the layout): x/y/z enable spot/rect/photometric light
+    // TYPES (0 = suppressed, 1 = on -- gated live from config::megalights::*_LIGHTS_ENABLED, all 1 in
+    // Release), w is a global intensity multiplier for the new (non-point) types
+    // (config::megalights::TYPED_LIGHT_INTENSITY_SCALE). Only this Stage-3 shader reads them; Stage 1/
+    // Stage 2 declare the field solely so all three UBO mirrors stay byte-identical, same convention
+    // as prevViewProj/spatialReuseRadiusPixels being declared-but-unused across stages.
+    vec4 typedLightControls;
 } g_ViewParams;
 
 // Substrate integration: identical to MegaLightsShade.comp's own pre-split bindings 8/9 -- see that
@@ -124,46 +135,98 @@ void main() {
     vec3 worldPos = worldPos4.xyz / worldPos4.w;
 
     MegaLight light = g_Lights.lights[reservoir.lightIndex];
-    vec3 toLight = light.position - worldPos;
-    float dist = length(toLight);
-    vec3 lightDir = toLight / max(dist, 1.0e-4);
-    float NdotL = saturate(dot(normal, lightDir));
-
-    // A grazing/back-facing candidate needs no shadow ray -- it already contributes zero.
-    vec3 biasedOrigin = worldPos + normal * 1.0e-2;
-    // Mandatory per-frame visibility revalidation: traces toward the SPATIALLY-RESAMPLED
-    // reservoir's current winner -- exactly one ray per pixel per frame, same ray-budget invariant
-    // Phase A originally established (see this file's own header comment). Never reuses a prior
-    // frame's (or a neighbor's) occlusion result -- every frame/every pixel independently
-    // revalidates visibility toward whatever light it ends up with right now.
-    bool occluded = (NdotL > 0.0) ? TraceShadowRay(biasedOrigin, lightDir, max(dist - 2.0e-2, 1.0e-3)) : true;
-    float visibility = occluded ? 0.0 : 1.0;
-
-    float distSq = max(dist * dist, 1.0e-4);
-    float normalizedDist = saturate(dist / max(light.radius, 1.0e-4));
-    float nd2 = normalizedDist * normalizedDist;
-    float windowSq = 1.0 - nd2 * nd2;
-    float window = saturate(windowSq * windowSq);
-
-    // Substrate integration: real per-pixel Slab BSDF response (diffuse + anisotropic specular +
-    // second lobe/Haze + fuzz, vertically layered with the Top slab if any) -- see
-    // MegaLightsShade.comp's own pre-split comment for the full derivation (unchanged here, only
-    // relocated).
     vec3 viewDir = normalize(g_ViewParams.cameraPositionWorld - worldPos);
     uint materialSlot = min(imageLoad(g_GBufferMaterialID, pixel).r, MATERIAL_TABLE_SIZE - 1u);
     MaterialParams mat = g_MaterialParams.params[materialSlot];
+    vec3 biasedOrigin = worldPos + normal * 1.0e-2;
 
-    // Full shading contribution of the spatially-resampled reservoir's winning light, times its
-    // unbiased contribution weight `reservoir.W` -- see MegaLightsSpatialReuse.comp's own combine
-    // loop for the derivation (replaces the pre-split single-frame `combinedW` now that the light
-    // being shaded is the SPATIALLY-COMBINED winner). EvaluateSubstrateMaterial already applies its
-    // own NdotL internally per BSDF lobe -- no separate NdotL multiply here (NdotL above is still
-    // used only for the shadow-ray early-out check). light.intensity is real luminous intensity in
-    // CANDELA (renderer::MegaLight's own comment) -- intensity/distSq is the standard inverse-square
-    // illuminance-at-a-point formula; EvaluateSubstrateMaterial's own contract ("caller multiplies by
-    // the light's real color/intensity", diffuse lobe already bakes in the /PI Lambertian
-    // normalization) means no extra factor is needed here.
-    vec3 radiance = EvaluateSubstrateMaterial(mat, normal, viewDir, lightDir) * light.color * light.intensity / distSq * window * visibility * reservoir.W;
+    // G3 Debug enable/scale controls (see g_ViewParams.typedLightControls comment). A suppressed
+    // TYPE contributes exactly nothing (its whole radiance is multiplied by 0); a POINT light is
+    // never affected. typeScale globally rescales the new (non-point) types' intensity.
+    float typeEnable = 1.0;
+    float typeScale = 1.0;
+    if (light.lightType == MEGALIGHT_TYPE_SPOT)             { typeEnable = g_ViewParams.typedLightControls.x; typeScale = g_ViewParams.typedLightControls.w; }
+    else if (light.lightType == MEGALIGHT_TYPE_RECT)        { typeEnable = g_ViewParams.typedLightControls.y; typeScale = g_ViewParams.typedLightControls.w; }
+    else if (light.lightType == MEGALIGHT_TYPE_PHOTOMETRIC) { typeEnable = g_ViewParams.typedLightControls.z; typeScale = g_ViewParams.typedLightControls.w; }
+
+    vec3 radiance = vec3(0.0);
+
+    if (light.lightType == MEGALIGHT_TYPE_RECT) {
+        // --- Area (rect) light: LTC analytic specular + stochastic point-on-rect diffuse (G3) ---
+        // A point-sample specular estimator cannot integrate an area emitter's glossy response (see
+        // ltc_area_light.glsl's header) -- so the specular term is the analytic whole-rect LTC
+        // evaluation, while the diffuse/shadowed term stochastically samples ONE point on the rect
+        // (consistent with this codebase's RIS/ReSTIR point-sampling framework) and traces the one
+        // mandatory shadow-visibility ray toward THAT point. The sample offset is a stable per-pixel
+        // hash (this stage carries no frameIndex push-constant, by design -- see this file's own
+        // header/the pass' RecordShade "no push constants" comment); a fixed per-pixel sample is
+        // deterministic (no temporal flicker) and its residual single-sample bias is cleaned by the
+        // pass' own A-Trous denoiser downstream, matching how every other MegaLights term relies on it.
+        vec3 n = normalize(light.direction);
+        vec3 u = normalize(light.tangentU);
+        vec3 vAxis = cross(n, u);
+        vec2 rnd = Hash2(vec2(pixel) + vec2(float(reservoir.lightIndex) * 0.618, 1.377));
+        vec2 uv = rnd * 2.0 - 1.0; // uniform over [-1,1]^2 of the rect.
+        vec3 samplePoint = light.position + u * (light.rectHalfExtentX * uv.x) + vAxis * (light.rectHalfExtentY * uv.y);
+
+        vec3 toSample = samplePoint - worldPos;
+        float distS = length(toSample);
+        vec3 dirS = toSample / max(distS, 1.0e-4);
+
+        // One-sided emission: a surface behind the emitter (relative to its +normal face) receives
+        // nothing unless the rect is two-sided. `-dirS` is the light->surface direction.
+        float facing = MegaLightRectTwoSided(light) ? 1.0 : ((dot(n, -dirS) > 0.0) ? 1.0 : 0.0);
+
+        float NdotL = saturate(dot(normal, dirS));
+        bool occluded = (NdotL > 0.0 && facing > 0.0) ? TraceShadowRay(biasedOrigin, dirS, max(distS - 2.0e-2, 1.0e-3)) : true;
+        float visibility = occluded ? 0.0 : 1.0;
+
+        float distSq = max(distS * distS, 1.0e-4);
+        float normalizedDist = saturate(distS / max(light.radius, 1.0e-4));
+        float nd2 = normalizedDist * normalizedDist;
+        float windowSq = 1.0 - nd2 * nd2;
+        float window = saturate(windowSq * windowSq);
+
+        // Diffuse: stochastic point-sampled Lambertian (EvaluateSlabDiffuse already bakes in NdotL and
+        // the /PI normalization) with standard inverse-square falloff, shadowed by the sample's ray.
+        vec3 diffuse = EvaluateSlabDiffuse(mat.base, normal, dirS) / distSq;
+        // Specular: analytic LTC over the whole rect (noise-free), reusing the shading point's own
+        // Substrate base F0/roughness. Shadowed by the same single sample's visibility (a cheap,
+        // documented shared-visibility approximation -- a fully unshadowed analytic term would light
+        // through occluders).
+        vec3 spec = EvaluateRectLTCSpecular(light, normal, viewDir, worldPos, mat.base.f0, mat.base.roughness);
+
+        radiance = (diffuse + spec) * light.color * light.intensity * window * visibility * facing * reservoir.W * typeEnable * typeScale;
+    } else {
+        // --- Point / spot / photometric: shared inverse-square + per-type angular shaping (G3) ---
+        vec3 toLight = light.position - worldPos;
+        float dist = length(toLight);
+        vec3 lightDir = toLight / max(dist, 1.0e-4);
+        float NdotL = saturate(dot(normal, lightDir));
+
+        // Per-type angular window (1 for POINT, the cone smoothstep for SPOT, the analytic IES
+        // profile for PHOTOMETRIC) -- shared with the RIS proxy so selection and shading agree.
+        float angular = MegaLightAngularShaping(light, lightDir);
+
+        // Mandatory per-frame visibility revalidation toward the winner -- exactly one ray per pixel
+        // per frame (see this file's own header comment). A grazing/back-facing/out-of-cone candidate
+        // needs no ray (it already contributes zero).
+        bool occluded = (NdotL > 0.0 && angular > 0.0) ? TraceShadowRay(biasedOrigin, lightDir, max(dist - 2.0e-2, 1.0e-3)) : true;
+        float visibility = occluded ? 0.0 : 1.0;
+
+        float distSq = max(dist * dist, 1.0e-4);
+        float normalizedDist = saturate(dist / max(light.radius, 1.0e-4));
+        float nd2 = normalizedDist * normalizedDist;
+        float windowSq = 1.0 - nd2 * nd2;
+        float window = saturate(windowSq * windowSq);
+
+        // Substrate integration: full per-pixel Slab BSDF response -- see MegaLightsShade.comp's own
+        // pre-split comment (unchanged, only the new `angular`/`typeEnable`/`typeScale` factors added,
+        // all 1 for a POINT light so its result is bit-identical to the pre-G3 path).
+        radiance = EvaluateSubstrateMaterial(mat, normal, viewDir, lightDir)
+            * light.color * light.intensity / distSq * window * angular * visibility * reservoir.W * typeEnable * typeScale;
+    }
+
     // No saturate(): g_ShadeRadiance is linear HDR (rgba16f) -- clamping here would defeat the whole
     // point of widening the format, re-introducing the hard-clip renderer::PostProcessPass exists to
     // replace with a soft display-referred curve.

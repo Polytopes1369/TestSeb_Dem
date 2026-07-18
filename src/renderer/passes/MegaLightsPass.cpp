@@ -37,8 +37,13 @@ namespace renderer {
             // Substrate integration: see MegaLightsShade.comp's own MegaLightsViewParamsUBO.
             // cameraPositionWorld comment.
             float cameraPositionWorldX = 0.0f, cameraPositionWorldY = 0.0f, cameraPositionWorldZ = 0.0f, _pad2 = 0.0f;
+            // G3: vec4 typedLightControls (grew the UBO from 160 to 176 bytes) -- (enableSpot,
+            // enableRect, enablePhotometric, typedIntensityScale), fed live from config::megalights::
+            // *_LIGHTS_ENABLED / TYPED_LIGHT_INTENSITY_SCALE. Only MegaLightsFinalShade.comp reads
+            // them; Stage 1/Stage 2 declare-but-ignore, same convention as the fields above.
+            float enableSpot = 1.0f, enableRect = 1.0f, enablePhotometric = 1.0f, typedIntensityScale = 1.0f;
         };
-        static_assert(sizeof(MegaLightsViewParamsUBO) == 160,
+        static_assert(sizeof(MegaLightsViewParamsUBO) == 176,
             "MegaLightsViewParamsUBO must match MegaLightsShade.comp's own UBO exactly (std140 layout)");
 
         // Phase 4, Feature 2: byte-for-byte std430 mirror of MegaLightReservoir in
@@ -691,6 +696,13 @@ namespace renderer {
         ubo.cameraPositionWorldX = cameraPositionWorld.x;
         ubo.cameraPositionWorldY = cameraPositionWorld.y;
         ubo.cameraPositionWorldZ = cameraPositionWorld.z;
+        // G3: Debug-tunable per-type enable/scale (all effectively 1 in Release, since the config
+        // globals default to enabled/1.0 and only the Debug ImGui panel ever mutates them) -- see
+        // MegaLightsFinalShade.comp's own g_ViewParams.typedLightControls comment.
+        ubo.enableSpot = config::megalights::SPOT_LIGHTS_ENABLED ? 1.0f : 0.0f;
+        ubo.enableRect = config::megalights::RECT_LIGHTS_ENABLED ? 1.0f : 0.0f;
+        ubo.enablePhotometric = config::megalights::PHOTOMETRIC_LIGHTS_ENABLED ? 1.0f : 0.0f;
+        ubo.typedIntensityScale = config::megalights::TYPED_LIGHT_INTENSITY_SCALE;
         vkCmdUpdateBuffer(cmd, m_ViewParamsBuffer.Handle(), 0, sizeof(ubo), &ubo);
 
         VulkanUtils::RecordMemoryBarrier(cmd,
