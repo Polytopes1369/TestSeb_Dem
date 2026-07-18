@@ -144,9 +144,16 @@ namespace renderer {
         // this frame. `cameraPositionWorld` (Substrate integration): feeds EvaluateSubstrateMaterial's
         // specular/Fresnel view-direction term -- the pre-Substrate shader had no view-dependent term
         // at all, so this is new; same value renderer::ClusterRenderPipeline already threads into
-        // ReflectionPass/TransparentForwardPass's own view-params UBOs.
+        // ReflectionPass/TransparentForwardPass's own view-params UBOs. `surfaceWetness`/
+        // `snowCoverage` (Atmos weather system, surface response extension): renderer::
+        // AtmosClimatePass::GetSurfaceWetness()/GetSnowCoverage() -- [0,1] scalars integrated once
+        // per frame from the live climate state, threaded straight into ResolveViewParamsUBO's own
+        // (previously dead-padding) fields and consumed by substrate_bsdf.glsl's
+        // ApplySurfaceWeather -- see that function's own comment for the exact wet/snow BSDF
+        // modulation.
         void RecordResolve(VkCommandBuffer cmd, const maths::mat4& viewProj, const maths::mat4& prevViewProj,
-            const DirectionalLight& sun, const maths::vec3& cameraPositionWorld, uint32_t debugViewMode = 0);
+            const DirectionalLight& sun, const maths::vec3& cameraPositionWorld, float surfaceWetness, float snowCoverage,
+            uint32_t debugViewMode = 0);
 
         // --- Phase 1b: binned resolve path (renderer::ClusterShadingBinPass) ---
         // Second-phase init, called once after BOTH Init() above AND `shadingBinPass.Init()` have
@@ -173,10 +180,13 @@ namespace renderer {
         // the exact per-frame ordering (this path replaces RecordResolve() entirely whenever
         // `camera.debugViewMode == 0`; Release always takes this path, see that field's own
         // Debug-only gating in core/Camera.h). Ends with the identical trailing barrier
-        // RecordResolve() itself ends with. `sun`/`cameraPositionWorld` -- see RecordResolve()'s own
-        // comment.
+        // RecordResolve() itself ends with. `sun`/`cameraPositionWorld`/`surfaceWetness`/
+        // `snowCoverage` -- see RecordResolve()'s own comment (this Release-live path needs the
+        // exact same weather modulation the Debug-only full-screen path gets, since this feature
+        // must work correctly in Release, not just under a debug view mode).
         void RecordResolveBinned(VkCommandBuffer cmd, const maths::mat4& viewProj,
-            const DirectionalLight& sun, const maths::vec3& cameraPositionWorld, const ClusterShadingBinPass& shadingBinPass);
+            const DirectionalLight& sun, const maths::vec3& cameraPositionWorld, float surfaceWetness, float snowCoverage,
+            const ClusterShadingBinPass& shadingBinPass);
 
         // Binds Phase 3's renderer::VirtualShadowMapPass resources (physical page atlas + sampler,
         // page table, feedback buffer, sun clipmap levels UBO) into BOTH this pass's descriptor

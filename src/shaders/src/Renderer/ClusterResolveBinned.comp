@@ -108,8 +108,12 @@ layout(std140, set = 0, binding = 6) uniform ResolveViewParamsUBO {
     mat4 viewProj;
     mat4 prevViewProj;
     vec2 viewportSize;
-    float _pad0;
-    float _pad1;
+    // Atmos weather system, surface response extension -- see ClusterResolve.comp's own identical
+    // ResolveViewParamsUBO.surfaceWetness/snowCoverage field comment (this binned/Release path
+    // shares the exact same UBO layout/contents, uploaded by the same ClusterResolvePass::
+    // RecordResolveBinned that fills ClusterResolve.comp's copy).
+    float surfaceWetness;
+    float snowCoverage;
     // Phase 3: sun direction -- see ClusterResolve.comp's own identical field comment.
     vec3 sunDirection;
     float _pad2;
@@ -325,6 +329,10 @@ void main() {
     vec2 vtUV = (worldPos.xz - g_VTVolume.worldMinXZ) / (g_VTVolume.worldMaxXZ - g_VTVolume.worldMinXZ);
     vec3 vtAlbedo = SampleVirtualTextureLOD(0u, vtUV, vtLod, g_VTVolume.virtualTextureSize, g_VTVolume.tileSize, g_VTVolume.borderSize).rgb;
     mat.base.diffuseAlbedo *= vtAlbedo;
+
+    // Atmos weather system, surface response extension -- see ClusterResolve.comp's own identical
+    // comment (applied before the BSDF evaluation so direct/ambient/GBuffer outputs all agree).
+    mat = ApplySurfaceWeather(mat, normal, g_ViewParams.surfaceWetness, g_ViewParams.snowCoverage);
 
     // Substrate: full Slab BSDF response to the sun's direction, shadowed by sunVisibility -- see
     // ClusterResolve.comp's own identical Step 3 comment for the full rationale, including the

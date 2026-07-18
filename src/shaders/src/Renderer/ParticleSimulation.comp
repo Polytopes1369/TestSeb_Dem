@@ -68,6 +68,13 @@ layout(std140, set = 1, binding = 0) uniform AtmosGlobalsUBO {
 // reason (linear filtering would blend across the wrap seam).
 layout(set = 1, binding = 1) uniform sampler3D uGlobalClipmaps[4];
 
+// Multi-emitter roadmap (subtask A1): emitterPosition/bounceElasticity/friction/dragCoefficient/
+// gravityY were removed from this push-constant block -- every one of those is now a per-emitter
+// value read straight out of EmitterParamsBuffer (ParticleCommon.glsl), indexed by `emitterIndex`
+// below during spawn, or by the particle's own stored `emitterIndex` field during update. Reconciled
+// with the precipitation feature's own PrecipitationParamsUBO below -- the two features never read
+// each other's per-emitter/per-kind data.
+//
 // Precipitation feature's own environment-set binding (set 1, binding 2 -- alongside AtmosGlobalsUBO/
 // clipmaps above, same "borrowed, bound once" environment set). std140 mirror of renderer::
 // ParticleSystemPass.cpp's own (anonymous-namespace) PrecipitationParamsUBO. Unlike AtmosGlobalsUBO
@@ -84,22 +91,17 @@ layout(std140, set = 1, binding = 2) uniform PrecipitationParamsUBO {
 layout(push_constant) uniform ParticleSimulationPC {
     float dt;
     float time;
-    float emitterPosition[3];
-    float bounceElasticity;   // [0,1]: fraction of the pre-collision normal-relative speed kept after a bounce.
-    float friction;           // [0,1]: fraction of the pre-collision tangential-relative speed kept after a bounce.
-    float dragCoefficient;    // [0,1] per second-ish: how strongly velocity relaxes toward the local wind vector.
-    float gravityY;           // World-space gravitational acceleration (negative = downward), m/s^2.
     float levelVoxelSize[4];
     int levelCenterVoxel[12]; // 4 levels * (x,y,z), flattened -- mirrors SDFRayMarchPC's own layout.
     int clipmapResolution;
     uint spawnCount;
     uint randomSeedBase;      // Per-call PRNG salt (e.g. frame index) so repeated spawns don't reuse the same jitter sequence.
+    uint emitterIndex;        // Which EmitterParamsBuffer slot to spawn for -- only meaningful when mode == 1.
     int mode;                 // 0 = update existing particles, 1 = spawn embers, 2 = spawn precipitation.
     uint precipSpawnCount;    // mode == 2 only -- how many precipitation particles to spawn this dispatch.
     uint precipKind;          // mode == 2 only -- kParticleKindRain or kParticleKindSnow (CPU-resolved from Atmos temperature).
 } pc;
 
-vec3 GetEmitterPosition() { return vec3(pc.emitterPosition[0], pc.emitterPosition[1], pc.emitterPosition[2]); }
 vec3 GetLevelCenterVoxel(int level) {
     return vec3(pc.levelCenterVoxel[level * 3 + 0], pc.levelCenterVoxel[level * 3 + 1], pc.levelCenterVoxel[level * 3 + 2]);
 }
@@ -157,27 +159,58 @@ float NextRandomFloat(inout uint seed) {
     return float(seed) / 4294967296.0;
 }
 
-void SpawnParticle(uint slotIndex, uint spawnRequestIndex) {
-    uint seed = HashUint(pc.randomSeedBase ^ (slotIndex * 2654435761u) ^ (spawnRequestIndex * 40503u));
+// Uniform-random point strictly inside a unit sphere -- cube-reject sampling (cheap, no trig),
+// used by the Sphere spawn shape below. 3 PRNG draws typical (a rejected sample redraws all 3).
+vec3 RandomInUnitSphere(inout uint seed) {
+    vec3 v;
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        v = vec3(NextRandomFloat(seed), NextRandomFloat(seed), NextRandomFloat(seed)) * 2.0 - 1.0;
+        if (dot(v, v) <= 1.0) {
+            return v;
+        }
+    }
+    return v; // Vanishingly unlikely (8 rejections in a row, ~1.5% volume ratio) -- fall through with whatever v currently holds rather than looping unbounded in a shader.
+}
 
-    // Small conical launch jitter around a mostly-upward initial velocity -- a generic "embers/
-    // sparks" default; Subtask 6's ImGui emitter panel is where this becomes user-tunable.
-    vec3 jitterDir = normalize(vec3(
-        NextRandomFloat(seed) * 2.0 - 1.0,
-        NextRandomFloat(seed) * 0.5 + 0.5,
-        NextRandomFloat(seed) * 2.0 - 1.0));
-    float speed = 1.0 + NextRandomFloat(seed) * 2.0;
-    float life = 2.0 + NextRandomFloat(seed) * 2.0;
+void SpawnParticle(uint slotIndex, uint spawnRequestIndex, uint emitterIndex) {
+    uint seed = HashUint(pc.randomSeedBase ^ (slotIndex * 2654435761u) ^ (spawnRequestIndex * 40503u) ^ (emitterIndex * 2246822519u));
+    EmitterParams e = emitters[emitterIndex];
+
+    vec3 position;
+    vec3 velocity;
+    if (e.spawnShape == 1u) {
+        // Sphere volume drift (subtask A1's "Ambient Dust" default): spawn anywhere inside a sphere
+        // of radius shapeParam0 around the emitter position, gentle mostly-vertical drift instead of
+        // a launched burst.
+        position = e.position + RandomInUnitSphere(seed) * e.shapeParam0;
+        velocity = vec3(
+            (NextRandomFloat(seed) * 2.0 - 1.0) * 0.15,
+            NextRandomFloat(seed) * 0.3,
+            (NextRandomFloat(seed) * 2.0 - 1.0) * 0.15);
+    } else {
+        // Cone burst (legacy "embers/sparks" default, spawnShape == 0): small conical launch jitter
+        // around a mostly-upward initial velocity.
+        vec3 jitterDir = normalize(vec3(
+            NextRandomFloat(seed) * 2.0 - 1.0,
+            NextRandomFloat(seed) * 0.5 + 0.5,
+            NextRandomFloat(seed) * 2.0 - 1.0));
+        float speed = 1.0 + NextRandomFloat(seed) * 2.0;
+        position = e.position + (vec3(NextRandomFloat(seed), NextRandomFloat(seed), NextRandomFloat(seed)) - 0.5) * 0.1;
+        velocity = jitterDir * speed;
+    }
+    float life = mix(e.lifetimeMin, e.lifetimeMax, NextRandomFloat(seed));
+    float size = mix(e.sizeMin, e.sizeMax, NextRandomFloat(seed));
 
     Particle p;
-    p.position = GetEmitterPosition() + (vec3(NextRandomFloat(seed), NextRandomFloat(seed), NextRandomFloat(seed)) - 0.5) * 0.1;
+    p.position = position;
     p.life = life;
-    p.velocity = jitterDir * speed;
+    p.velocity = velocity;
     p.maxLife = life;
-    p.color = vec4(1.0, 0.7, 0.3, 1.0);
-    p.size = vec2(0.1, 0.1);
+    p.color = e.color;
+    p.size = vec2(size, size);
     p.rotation = NextRandomFloat(seed) * 6.28318530718;
     p.randomSeed = PackParticleSeed(kParticleKindEmber, seed);
+    p.emitterIndex = emitterIndex;
     particles[slotIndex] = p;
 }
 
@@ -232,6 +265,7 @@ void SpawnPrecipitationParticle(uint slotIndex, uint spawnRequestIndex) {
     p.size = size;
     p.rotation = 0.0; // Unused for rain/snow -- ParticleRender.vert derives the streak/flake orientation from velocity/kind instead, see that shader's own comment.
     p.randomSeed = PackParticleSeed(pc.precipKind, seed);
+    p.emitterIndex = 0; // Unused by precipitation (see UpdateParticle's own comment) -- explicit default, not read GPU memory.
     particles[slotIndex] = p;
 }
 
@@ -240,7 +274,6 @@ void UpdateParticle(uint slotIndex) {
     if (p.life <= 0.0) {
         return; // Already dead (and already resting in the dead-list from a previous frame, or never spawned) -- nothing to do.
     }
-
     uint kind = UnpackParticleKind(p.randomSeed);
     bool isPrecipitation = (kind == kParticleKindRain || kind == kParticleKindSnow);
 
@@ -280,9 +313,17 @@ void UpdateParticle(uint slotIndex) {
             p.life = 0.0;
         }
     } else {
-        // --- Gravity + wind + drag (unchanged embers path) ---
-        p.velocity.y += pc.gravityY * pc.dt;
-        p.velocity += (wind - p.velocity) * clamp(pc.dragCoefficient * pc.dt, 0.0, 1.0);
+        // --- Gravity + wind + drag ---
+        // Multi-emitter roadmap (subtask A1): physics constants come from THIS particle's own
+        // emitter slot, not a single global -- so two emitters can have wildly different gravity/
+        // bounce/friction/drag simultaneously, and live-editing one emitter's ImGui sliders never
+        // affects another emitter's already-flying particles. Fetched here (not unconditionally at
+        // the top of UpdateParticle) since precipitation particles never touch EmitterParams at all
+        // -- their own kind-branch above uses PrecipitationParamsUBO instead, and their spawn path
+        // sets emitterIndex to an unused default (see SpawnPrecipitationParticle's own comment).
+        EmitterParams e = emitters[p.emitterIndex];
+        p.velocity.y += e.gravityY * pc.dt;
+        p.velocity += (wind - p.velocity) * clamp(e.dragCoefficient * pc.dt, 0.0, 1.0);
         newPosition = p.position + p.velocity * pc.dt;
 
         // --- Global SDF collision (central-difference normal, reflect() split into elastic-normal /
@@ -304,7 +345,7 @@ void UpdateParticle(uint slotIndex) {
             vec3 reflected = reflect(p.velocity, n);
             float normalSpeed = dot(reflected, n);
             vec3 tangentVelocity = reflected - n * normalSpeed;
-            p.velocity = n * normalSpeed * pc.bounceElasticity + tangentVelocity * pc.friction;
+            p.velocity = n * normalSpeed * e.bounceElasticity + tangentVelocity * e.friction;
         }
     }
     p.position = newPosition;
@@ -318,6 +359,13 @@ void UpdateParticle(uint slotIndex) {
     } else {
         uint aliveSlot = atomicAdd(aliveCount, 1u);
         aliveIndices[aliveSlot] = slotIndex;
+#ifdef _DEBUG
+        // Debug/test instrumentation only (multi-emitter roadmap, subtask A1's own validation step) --
+        // see PerEmitterAliveCountBuffer's own declaration comment in ParticleCommon.glsl. Compiled
+        // out of the Release SPIR-V entirely (glslc only defines _DEBUG for the Debug shader build,
+        // see CMakeLists.txt's own GLSLC_DEBUG_DEFINE), so this atomic costs nothing in Release.
+        atomicAdd(perEmitterAliveCount[p.emitterIndex], 1u);
+#endif
     }
 }
 
@@ -352,7 +400,7 @@ void main() {
         }
         uint slotIndex;
         if (TryPopDeadListSlot(slotIndex)) {
-            SpawnParticle(slotIndex, index);
+            SpawnParticle(slotIndex, index, pc.emitterIndex);
         }
     } else if (pc.mode == 2) {
         if (index >= pc.precipSpawnCount) {

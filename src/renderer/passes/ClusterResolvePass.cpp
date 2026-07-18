@@ -17,7 +17,7 @@ namespace renderer {
 
         // Byte-for-byte mirror of ResolveViewParamsUBO in ClusterResolve.comp/ClusterResolveBinned
         // .comp (std140): mat4 (64 bytes) + mat4 (64 bytes, prevViewProj -- DEBUG_VIEW_MOTION_VECTORS'
-        // own reprojection) + vec2 (8 bytes) + 2 pad floats rounding up to a 16-byte boundary (144
+        // own reprojection) + vec2 (8 bytes) + 2 floats rounding up to a 16-byte boundary (144
         // bytes) + vec3 sunDirection (Phase 3 -- points FROM the light TOWARD the scene, same
         // convention as renderer::DirectionalLight, needed so this shader's direct-lighting term
         // uses the SAME sun direction the shadow was rendered from) + 1 pad float rounding back up
@@ -25,14 +25,17 @@ namespace renderer {
         // renderer::DirectionalLight's own comment -- physically-based recalibration, 2026-07-17)
         // rounding up to 176 bytes + vec3 cameraPositionWorld (Substrate integration:
         // EvaluateSubstrateMaterial's view-direction term) + 1 pad float rounding up to 192 bytes
-        // total.
+        // total. The 2 floats immediately after viewportWidth/viewportHeight were originally dead
+        // std140 padding (still needed to round vec2 up to a 16-byte boundary) -- Atmos weather
+        // system's surface response extension repurposes them as real data (surfaceWetness/
+        // snowCoverage, see ClusterResolve.comp's own field comment) instead of growing the UBO.
         struct ResolveViewParams {
             maths::mat4 viewProj;
             maths::mat4 prevViewProj;
             float viewportWidth = 0.0f;
             float viewportHeight = 0.0f;
-            float _pad0 = 0.0f;
-            float _pad1 = 0.0f;
+            float surfaceWetness = 0.0f;
+            float snowCoverage = 0.0f;
             float sunDirectionX = 0.0f;
             float sunDirectionY = 0.0f;
             float sunDirectionZ = 0.0f;
@@ -488,12 +491,15 @@ namespace renderer {
     }
 
     void ClusterResolvePass::RecordResolve(VkCommandBuffer cmd, const maths::mat4& viewProj, const maths::mat4& prevViewProj,
-        const DirectionalLight& sun, const maths::vec3& cameraPositionWorld, uint32_t debugViewMode) {
+        const DirectionalLight& sun, const maths::vec3& cameraPositionWorld, float surfaceWetness, float snowCoverage,
+        uint32_t debugViewMode) {
         ResolveViewParams viewParams{};
         viewParams.viewProj = viewProj;
         viewParams.prevViewProj = prevViewProj;
         viewParams.viewportWidth = static_cast<float>(m_RenderExtent.width);
         viewParams.viewportHeight = static_cast<float>(m_RenderExtent.height);
+        viewParams.surfaceWetness = surfaceWetness;
+        viewParams.snowCoverage = snowCoverage;
         viewParams.sunDirectionX = sun.direction.x;
         viewParams.sunDirectionY = sun.direction.y;
         viewParams.sunDirectionZ = sun.direction.z;
@@ -669,7 +675,8 @@ namespace renderer {
     }
 
     void ClusterResolvePass::RecordResolveBinned(VkCommandBuffer cmd, const maths::mat4& viewProj,
-        const DirectionalLight& sun, const maths::vec3& cameraPositionWorld, const ClusterShadingBinPass& shadingBinPass) {
+        const DirectionalLight& sun, const maths::vec3& cameraPositionWorld, float surfaceWetness, float snowCoverage,
+        const ClusterShadingBinPass& shadingBinPass) {
         // prevViewProj is never read by ClusterResolveBinned.comp (this path never serves
         // DEBUG_VIEW_MOTION_VECTORS) -- `viewProj` itself is reused as a harmless placeholder value
         // rather than introducing a separate identity-matrix concept for an otherwise-dead field.
@@ -678,6 +685,8 @@ namespace renderer {
         viewParams.prevViewProj = viewProj;
         viewParams.viewportWidth = static_cast<float>(m_RenderExtent.width);
         viewParams.viewportHeight = static_cast<float>(m_RenderExtent.height);
+        viewParams.surfaceWetness = surfaceWetness;
+        viewParams.snowCoverage = snowCoverage;
         viewParams.sunDirectionX = sun.direction.x;
         viewParams.sunDirectionY = sun.direction.y;
         viewParams.sunDirectionZ = sun.direction.z;

@@ -12,11 +12,13 @@
 // and binds it unmodified for every stage's pipeline, so hardcoding the 4 bindings here is correct
 // and avoids the indirection those other shaders need.
 
-// Mirrors renderer::GpuParticle (src/renderer/passes/ParticleSystemPass.h) byte-for-byte -- 64
+// Mirrors renderer::GpuParticle (src/renderer/passes/ParticleSystemPass.h) byte-for-byte -- 80
 // bytes, std430. vec3 members are 16-byte aligned in std430, so the trailing scalar after each vec3
 // packs into the same 16-byte slot with no manual padding required (position+life,
-// velocity+maxLife); color is a plain vec4 (16 bytes); size+rotation+randomSeed closes the last
-// 16-byte slot exactly (8 + 4 + 4).
+// velocity+maxLife); color is a plain vec4 (16 bytes); size+rotation+randomSeed closes that slot
+// exactly (8 + 4 + 4); emitterIndex (multi-emitter roadmap, subtask A1) closes a final dedicated
+// 16-byte slot with 3 reserved pad floats for future per-particle authoring data (e.g. a future
+// color/size-over-life curve's sample parameter).
 struct Particle {
     vec3 position;
     float life;        // Seconds remaining before this particle dies (Subtask 2 counts this down and recycles the slot into DeadListBuffer at <= 0).
@@ -28,13 +30,41 @@ struct Particle {
     uint randomSeed;     // Per-particle PRNG state, re-seeded at spawn (Subtask 2). Precipitation
                           // feature: the TOP 2 BITS (bits 30-31, see PackParticleKind/UnpackParticleKind
                           // below) are stolen to tag which emitter "kind" spawned this particle --
-                          // GpuParticle's 64-byte layout is already fully packed (no spare field), and
                           // randomSeed is otherwise dead after spawn (SpawnParticle re-seeds it once, no
                           // other consumer -- CPU or GPU -- ever reads it as a raw PRNG value again), so
-                          // this is the only place a per-particle tag can live without breaking the
-                          // struct's byte-for-byte contract. The remaining 30 bits keep plenty of
+                          // this is where the tag lives even though the multi-emitter roadmap (subtask
+                          // A1, below) later added spare pad floats to this struct for other reasons --
+                          // moving the tag would mean touching every already-tested precipitation
+                          // call site for zero functional benefit. The remaining 30 bits keep plenty of
                           // entropy for UpdateParticle's own per-particle wobble phase (Subtask
                           // precipitation, snow horizontal drift).
+    // Multi-emitter roadmap (subtask A1): which EmitterParamsBuffer slot spawned this particle -- only
+    // meaningful for kKindEmber particles (see below); precipitation's own physics (mode == 2 spawn,
+    // the kind-branch in UpdateParticle) never reads this field, it uses randomSeed's packed kind tag
+    // and the separate PrecipitationParamsUBO instead.
+    uint emitterIndex;
+    float _pad0, _pad1, _pad2;
+};
+
+// Per-emitter, live-tunable spawn/physics parameters -- one instance per active emitter slot (see
+// renderer::ParticleSystemPass::kMaxEmitters), re-uploaded in full every RecordSimulate() call since
+// every field is directly editable via main.cpp's Particles ImGui tab
+// (config::particles::EMITTERS[]). Mirrors renderer::ParticleSystemPass::EmitterParams byte-for-byte
+// -- 80 bytes, std430, same "flat floats, vec3 packs with trailing scalar" layout as Particle above.
+// Only consumed for kKindEmber particles -- precipitation (rain/snow) has its own dedicated
+// PrecipitationParamsUBO (this file's own binding declarations further down) instead.
+struct EmitterParams {
+    vec3 position;
+    float shapeParam0;      // Spawn-shape parameter: Sphere (spawnShape==1) = radius in world units; Cone (spawnShape==0) = unused.
+    vec4 color;             // Base spawn color (Subtask A4 will add color-over-life curves on top of this).
+    float sizeMin, sizeMax;
+    float lifetimeMin, lifetimeMax;
+    float gravityY;          // World-space Y acceleration, m/s^2 (replaces the old single global config::particles::GRAVITY).
+    float bounceElasticity;  // [0,1] -- fraction of normal-relative speed kept after a Global SDF collision.
+    float friction;          // [0,1] -- fraction of tangential-relative speed kept after a Global SDF collision.
+    float dragCoefficient;   // How strongly velocity relaxes toward the local Atmos wind vector each second.
+    uint spawnShape;         // 0 = Cone burst (legacy "embers" launch direction/jitter), 1 = Sphere volume drift spawn.
+    float _pad0, _pad1, _pad2;
 };
 
 // Particle "kind" tag, packed into Particle.randomSeed's top 2 bits (see that field's own comment).
@@ -99,6 +129,31 @@ layout(std430, set = 0, binding = 3) buffer CounterBuffer {
     uint aliveCount;
     uint spawnQueue;
     uint _pad0;
+};
+
+// Fixed-size array of kMaxEmitters EmitterParams (renderer::ParticleSystemPass::kMaxEmitters),
+// read-only from every particle shader's point of view -- the CPU side (RecordSimulate) is the only
+// writer, via a full vkCmdUpdateBuffer every call (see that method's own comment). Subtask A1
+// (multi-emitter roadmap): SpawnParticle indexes this by the emitter it is spawning for;
+// UpdateParticle indexes this by the particle's OWN stored Particle.emitterIndex so each particle's
+// physics response (gravity/bounce/friction/drag) stays correct for its emitter even if that
+// emitter's live ImGui values change mid-flight.
+layout(std430, set = 0, binding = 4) readonly buffer EmitterParamsBuffer {
+    EmitterParams emitters[];
+};
+
+// Debug/test instrumentation only (multi-emitter roadmap, subtask A1's own validation step): one
+// alive-particle counter per emitter slot, reset to 0 every RecordSimulate() call (vkCmdFillBuffer)
+// and incremented by UpdateParticle() ONLY in Debug builds (see that function's own `#ifdef _DEBUG`
+// guard) -- per CLAUDE.md's build-separation rule, no atomic-increment instruction is ever emitted
+// into the Release SPIR-V, so this buffer's contents are simply never written to in Release (its
+// allocation is the only thing that survives unconditionally, same harmless-always-present
+// convention as CounterBuffer's own unused `spawnQueue`/`_pad0` fields above). Read back by
+// renderer::ParticleSystemPass's own Debug-only GetLastPerEmitterAliveCountApprox(), surfaced in
+// main.cpp's Particles ImGui tab so a developer can visually confirm each emitter is independently
+// alive/producing particles.
+layout(std430, set = 0, binding = 5) buffer PerEmitterAliveCountBuffer {
+    uint perEmitterAliveCount[];
 };
 
 #endif

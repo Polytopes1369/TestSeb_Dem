@@ -102,6 +102,8 @@ namespace renderer {
         m_GlobalsBuffer.Destroy();
         m_LastDewPointCelsius = 0.0f;
         m_LastLCLHeightMeters = 0.0f;
+        m_SurfaceWetness = 0.0f;
+        m_SnowCoverage = 0.0f;
         m_Allocator = VK_NULL_HANDLE;
         m_Device = VK_NULL_HANDLE;
 
@@ -291,6 +293,57 @@ namespace renderer {
 
         m_LastDewPointCelsius = dewPoint;
         m_LastLCLHeightMeters = lclHeight;
+
+        // --- Surface weather response (wetness / snow coverage) -- see AtmosClimatePass.h's own
+        // GetSurfaceWetness()/GetSnowCoverage() comment for the consumer side. This is the first real
+        // consumer of config::atmos::RAIN_STRENGTH (previously "unconsumed until a future
+        // precipitation pass" -- see that knob's own EngineConfig.h comment); a parallel
+        // precipitation-particle workstream reads the SAME knob for its own emission rate, so both
+        // systems react to one shared "how hard is it raining" scalar instead of drifting out of
+        // sync with two independently-authored values. No dedicated PRECIPITATION_INTENSITY knob
+        // existed at the time this was written, so RAIN_STRENGTH doubles as that signal here. ---
+        //
+        // Reuses this function's own `dt` (declared near the top, guarded the same [0, 0.25]s way
+        // against alt-tab/breakpoint stalls, sourced from m_HasLastFrameTime/m_LastFrameTimeSeconds --
+        // see that member's own comment) instead of a second, separately-tracked delta: both the
+        // Dynamic Weather Simulation above and this surface-response accumulator need exactly the
+        // same "elapsed time since last RecordUpdate() call" quantity, so one shared computation is
+        // correct and avoids two independent frame-time trackers silently drifting apart.
+
+        // Wetness target: driven mostly by active rain (effectiveRainStrength -- the Dynamic Weather
+        // Simulation's smoothed/seasonally-offset precipitation value when enabled, or the raw
+        // config::atmos::RAIN_STRENGTH slider otherwise, see its own declaration above), with ambient
+        // dew/fog wetting contributing a smaller amount once humidity climbs above 60% (a
+        // demoscene-scale global approximation -- real dew/fog wetting is a slow condensation
+        // process, not proportional to RH alone, but this is a believable stand-in with zero extra
+        // simulation state).
+        const float humidityWetting = std::clamp((relativeHumidity - 0.6f) / 0.4f, 0.0f, 1.0f) * 0.5f;
+        const float targetWetness = std::clamp(effectiveRainStrength + humidityWetting, 0.0f, 1.0f);
+        // Asymmetric time constants: a surface wets almost immediately once rain starts hitting it,
+        // but evaporates/dries much more slowly once the rain stops -- matching the real-world
+        // absorb-fast/evaporate-slow asymmetry, and giving a visibly gradual (not instant-snap)
+        // transition either direction, per this feature's own "multi-second time constant" requirement.
+        const float wetnessTau = (targetWetness > m_SurfaceWetness) ? 2.5f : 20.0f;
+        m_SurfaceWetness += (targetWetness - m_SurfaceWetness) * (1.0f - std::exp(-dt / wetnessTau));
+        m_SurfaceWetness = std::clamp(m_SurfaceWetness, 0.0f, 1.0f);
+
+        // Snow target: needs BOTH cold (temperature at/below freezing, with a smooth -5C..+2C band
+        // rather than a hard 0C cutoff -- real snow lingers a little above freezing and melts fully a
+        // few degrees above it) AND active precipitation (rain-or-snow intensity, same
+        // effectiveRainStrength signal as wetness above, plus a smaller high-humidity contribution
+        // for "it's cold and hazy" rime/frost accumulation).
+        const float coldT = std::clamp((temperature - 2.0f) / (-5.0f - 2.0f), 0.0f, 1.0f);
+        const float coldFactor = coldT * coldT * (3.0f - 2.0f * coldT); // smoothstep(2C, -5C, temperature)
+        const float humiditySnowPrecip = std::clamp((relativeHumidity - 0.8f) / 0.2f, 0.0f, 1.0f);
+        const float precipFactor = std::clamp(effectiveRainStrength + humiditySnowPrecip, 0.0f, 1.0f);
+        const float targetSnow = coldFactor * precipFactor;
+        // Snow builds up slowly (accumulation over many seconds of continuous cold precipitation) but
+        // melts noticeably faster once it warms up (targetSnow's own coldFactor already drives the
+        // target toward 0 -- this shorter melt tau just makes the visual transition read as "melting
+        // away" rather than "very slowly fading", matching how real snow cover actually behaves).
+        const float snowTau = (targetSnow > m_SnowCoverage) ? 30.0f : 8.0f;
+        m_SnowCoverage += (targetSnow - m_SnowCoverage) * (1.0f - std::exp(-dt / snowTau));
+        m_SnowCoverage = std::clamp(m_SnowCoverage, 0.0f, 1.0f);
 
         // --- Wind vector (compass bearing in the XZ plane -- see config::atmos::WIND_DIRECTION_DEGREES's own comment) ---
         // Wind DIRECTION is left manual-only (not simulated) -- only the front simulation's own

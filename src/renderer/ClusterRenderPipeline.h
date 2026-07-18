@@ -718,17 +718,19 @@ namespace renderer {
         // comment) but using the identical clamp-against-stalls formula.
         float m_LastParticleFrameTimeSeconds = 0.0f;
         bool m_HasLastParticleFrameTime = false;
-        // Fractional spawn-count carry-over across frames, so config::particles::SPAWN_RATE_PER_SECOND
-        // is exact over time regardless of framerate (e.g. 200/s at 300 fps spawns 0 or 1 particle
-        // most frames, never silently rounding every fractional request down to 0).
-        float m_ParticleSpawnAccumulator = 0.0f;
+        // Multi-emitter roadmap (subtask A1): one fractional spawn-count carry-over per emitter slot
+        // (was a single float pre-A1) so each emitter's own config::particles::EMITTERS[i].spawnRate
+        // stays exact over time regardless of framerate, independently of every other emitter (e.g.
+        // one emitter at 200/s and another at 40/s each round correctly on their own schedule, never
+        // silently rounding a fractional request down to 0).
+        float m_ParticleSpawnAccumulator[ParticleSystemPass::kMaxEmitters] = {};
         // Precipitation feature (rain/snow tied to the Atmos climate simulation) -- identical
         // fractional-carry-over role as m_ParticleSpawnAccumulator above, just against
         // config::atmos::PRECIPITATION_INTENSITY * PRECIPITATION_MAX_SPAWN_RATE_PER_SECOND instead
-        // of the embers emitter's own fixed SPAWN_RATE_PER_SECOND. Kept as a separate accumulator
-        // (not reusing m_ParticleSpawnAccumulator) since the two emitters' spawn rates are
-        // independent and this codebase's own m_ParticleSpawnAccumulator comment already establishes
-        // "one accumulator per independent spawn-rate source" as the pattern.
+        // of any embers emitter's own fixed spawnRate. Kept as a separate accumulator (not folded
+        // into the m_ParticleSpawnAccumulator array above) since precipitation is not one of the
+        // config::particles::EMITTERS[] slots -- it has its own dedicated camera-relative spawn-shell
+        // and kind-resolution logic (see RecordSimulate's own precip* parameters).
         float m_PrecipSpawnAccumulator = 0.0f;
 
         // Lumen-style GI infrastructure -- unlike the debug-only stats/overlay block below, these
