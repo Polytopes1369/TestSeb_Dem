@@ -34,6 +34,22 @@
 #include "pcg/PcgSelfPruningFilter.h"
 #include "pcg/PcgVolumeSampler.h"
 
+// PCG roadmap Phase 6.3 ("Runtime Generator Hook"): RunPcgCellLoaderSmokeTest() below builds a real,
+// on-disk PcgGraph asset + PcgVolume .actor file and drives world::PcgCellLoader (the new
+// world::IWorldCellLoader implementation) directly, simulating exactly what world::StreamingManager
+// would trigger from a worker thread -- see that method's own header comment
+// (renderer/ClusterRenderPipeline.h) for exactly what it checks. world::PcgCellLoader.h and
+// WorldPartition/PcgVolumeActor.h are BOTH whole-file Debug-only (see their own header comments for
+// why -- the tools/WorldPartition/ Release-link boundary) so including them here unconditionally is
+// harmless (an empty header in Release) and matches this file's own established convention (see the
+// comment on pcg/PcgInstanceSpawnManager.h just above).
+#include "pcg/PcgGraph.h"
+#include "pcg/PcgNodePlugin.h"
+#include "pcg/PcgPointData.h"
+#include "world/PcgCellLoader.h"
+#include "WorldPartition/PcgVolumeActor.h"
+#include "WorldPartition/Uuid.h"
+
 namespace renderer {
 
     namespace {
@@ -4046,6 +4062,256 @@ bool ClusterRenderPipeline::RunPcgFullPipelineSmokeTest(
       "spawner->glue->render PCG pipeline verified end-to-end.",
       sampledPoints.size(), filteredPoints.size(), spawnRequests.size(), acquiredSlots.size(),
       candidateCount, gpuDrawCount, kTestWidth, kTestHeight));
+  return true;
+}
+
+namespace {
+
+    // PCG roadmap Phase 6.3 ("Runtime Generator Hook"): synthetic source node registered once
+    // (namespace-scope self-registration -- see pcg::PCG_REGISTER_NODE_TYPE's own header comment,
+    // PcgNodePlugin.h) purely for RunPcgCellLoaderSmokeTest() below, standing in for a real Phase 2
+    // sampler (none of which are yet wired into the graph-node registry -- see
+    // pcg::PcgCellGenerator.h's own top-of-file comment, point 2). Places a deterministic countX x
+    // countZ grid of points on the Y=0 plane, starting at (originX, 0, originZ) with `spacing`
+    // between consecutive samples -- an exact copy of tests/PcgCellGeneratorTests.cpp's own
+    // "pcg.test.cellgen_grid_points" node (same file-scope self-registration idiom, different
+    // translation unit), deliberately given a DISTINCT "pcg.smoketest." type-id prefix since
+    // PCG_REGISTER_NODE_TYPE's registry is process-global across every linked translation unit (see
+    // that macro's own comment) -- a colliding typeId between this Debug-only smoke test and that
+    // standalone CTest executable would never actually collide at RUNTIME (they never link into the
+    // same binary), but a distinct prefix keeps that invariant obviously true by construction rather
+    // than by accident.
+    PCG_REGISTER_NODE_TYPE("pcg.smoketest.cellloader_grid_points", "CellLoader Smoke Test Grid Points",
+        .Output("Points", pcg::PcgPinDataType::Points),
+        [](const pcg::PcgNodePinDataMap& inputs, const pcg::PcgAttributeSet& params) -> pcg::PcgNodeExecuteResult {
+            (void)inputs; // This node type declares no input pins.
+            const int32_t countX = params.GetOr<int32_t>("countX", 1);
+            const int32_t countZ = params.GetOr<int32_t>("countZ", 1);
+            const float spacing = params.GetOr<float>("spacing", 1.0f);
+            const float originX = params.GetOr<float>("originX", 0.0f);
+            const float originZ = params.GetOr<float>("originZ", 0.0f);
+
+            std::vector<pcg::PcgPoint> points;
+            points.reserve(static_cast<size_t>(std::max(countX, 0)) * static_cast<size_t>(std::max(countZ, 0)));
+            uint32_t index = 0;
+            for (int32_t iz = 0; iz < countZ; ++iz) {
+                for (int32_t ix = 0; ix < countX; ++ix) {
+                    pcg::PcgPoint point;
+                    point.position.x = originX + static_cast<float>(ix) * spacing;
+                    point.position.y = 0.0f;
+                    point.position.z = originZ + static_cast<float>(iz) * spacing;
+                    point.seed = index++;
+                    points.push_back(point);
+                }
+            }
+
+            pcg::PcgNodePinDataMap outputs;
+            outputs.emplace("Points", std::move(points));
+            return pcg::PcgNodeExecuteResult::Ok(std::move(outputs));
+        });
+
+} // namespace
+
+bool ClusterRenderPipeline::RunPcgCellLoaderSmokeTest(
+    const std::vector<PcgFullPipelineSmokeTestMeshDesc>& weightedMeshes, VkCommandPool commandPool, VkQueue queue) {
+  LOG_INFO("[ClusterRenderPipeline] Running PCG Phase 6.3 (Runtime Generator Hook) cell-loader smoke test...");
+
+  if (weightedMeshes.empty()) {
+    LOG_ERROR("[ClusterRenderPipeline] PCG cell-loader smoke test FAILED: no weighted meshes supplied.");
+    return false;
+  }
+
+  // =========================================================================================
+  // STEP 1 -- author a real, on-disk scratch scenario: a PcgGraph JSON asset (grid-points source
+  // above -> the REAL registered "pcg.spawner.weighted_mesh" node, the real expected authoring
+  // pattern -- see pcg::PcgCellGenerator.h's own top-of-file comment) and a PcgVolume .actor file
+  // referencing it, sized/positioned to overlap EXACTLY cell (0,0) at a fixed test cellSize. Mirrors
+  // tests/PcgCellGeneratorTests.cpp's own BuildSpawnerGraph/WriteGraphAssetToDisk pattern.
+  // =========================================================================================
+  const std::filesystem::path scratchDir = std::filesystem::temp_directory_path() / "PcgCellLoaderSmokeTest";
+  const std::filesystem::path actorsDir = scratchDir / "actors";
+  std::error_code dirEc;
+  // Start from a clean slate every run -- a stale volume left over from a previous crashed run must
+  // never silently double the expected instance count below.
+  std::filesystem::remove_all(actorsDir, dirEc);
+  std::filesystem::create_directories(actorsDir, dirEc);
+
+  constexpr float kTestCellSize = 20.0f;
+  constexpr int32_t kGridCountX = 3;
+  constexpr int32_t kGridCountZ = 3; // 3x3 = 9 points, all inside cell (0,0)'s own [0,20)x[0,20) footprint (origin (2,2), spacing 3 -> max coordinate 8 < 20).
+
+  pcg::PcgNodeTypeRegistry registryUnused;
+  pcg::PcgNodeTypeCatalog catalog;
+  pcg::PopulateNativeNodeTypePlugins(registryUnused, catalog);
+
+  pcg::PcgGraph graph;
+  std::string catalogError;
+  pcg::PcgAttributeSet gridParams;
+  gridParams.Set("countX", kGridCountX);
+  gridParams.Set("countZ", kGridCountZ);
+  gridParams.Set("spacing", 3.0f);
+  gridParams.Set("originX", 2.0f);
+  gridParams.Set("originZ", 2.0f);
+  const uint32_t sourceNode = pcg::AddNodeFromCatalog(graph, catalog, "pcg.smoketest.cellloader_grid_points", gridParams, "GridPoints", &catalogError);
+  if (sourceNode == pcg::PcgNode::kInvalidId) {
+    LOG_ERROR(std::format("[ClusterRenderPipeline] PCG cell-loader smoke test FAILED: could not add the synthetic grid-points node ({}).", catalogError));
+    return false;
+  }
+
+  pcg::PcgAttributeSet spawnerParams;
+  std::vector<pcg::PcgMeshSpawnEntry> palette;
+  for (const PcgFullPipelineSmokeTestMeshDesc& mesh : weightedMeshes) {
+    palette.push_back(pcg::PcgMeshSpawnEntry{ mesh.meshID, mesh.materialID, mesh.weight });
+  }
+  pcg::EncodeWeightedMeshList(spawnerParams, palette);
+  spawnerParams.Set(pcg::kSpawnerDensityThresholdParamKey, 0.0f);
+  spawnerParams.Set(pcg::kSpawnerSeedParamKey, 8080);
+
+  const uint32_t spawnerNode = pcg::AddNodeFromCatalog(graph, catalog, "pcg.spawner.weighted_mesh", spawnerParams, "Spawner", &catalogError);
+  if (spawnerNode == pcg::PcgNode::kInvalidId) {
+    LOG_ERROR(std::format("[ClusterRenderPipeline] PCG cell-loader smoke test FAILED: could not add the weighted_mesh spawner node ({}).", catalogError));
+    return false;
+  }
+
+  std::string linkError;
+  if (graph.AddLink(sourceNode, "Points", spawnerNode, "Points", &linkError) != pcg::PcgGraph::AddLinkStatus::Ok) {
+    LOG_ERROR(std::format("[ClusterRenderPipeline] PCG cell-loader smoke test FAILED: GridPoints -> Spawner link failed ({}).", linkError));
+    return false;
+  }
+
+  const std::filesystem::path graphAssetPath = scratchDir / "CellLoaderSmokeTest.pcggraph.json";
+  {
+    std::ofstream graphOut(graphAssetPath, std::ios::binary | std::ios::trunc);
+    if (!graphOut.is_open()) {
+      LOG_ERROR("[ClusterRenderPipeline] PCG cell-loader smoke test FAILED: could not open the scratch graph asset file for writing.");
+      return false;
+    }
+    graphOut << graph.SerializeToJson();
+  }
+
+  worldpartition::PcgVolumeDesc volumeDesc;
+  // [1, 19) on both X/Z -- strictly INSIDE cell (0,0)'s own [0,20) footprint, never touching a cell
+  // boundary. worldpartition::ComputeOverlappingCells uses floor(worldPos / cellSize) on BOTH
+  // boundsMin and boundsMax (inclusive on the resulting cell range) -- an exact [0, kTestCellSize]
+  // bounds would land boundsMax precisely on cell (1,1)'s own floor() threshold (floor(20/20) == 1),
+  // overlapping 4 cells instead of the single cell this test needs (caught by this test's own
+  // GetIndexedCellCount() == 1 check the first time this smoke test ran -- see this codebase's own
+  // "Clean merge != correct merge" precedent for why an off-by-one boundary case like this is worth
+  // spelling out explicitly rather than trusting an eyeballed range).
+  volumeDesc.bounds.boundsMin = { 1.0f, 0.0f, 1.0f };
+  volumeDesc.bounds.boundsMax = { 19.0f, 5.0f, 19.0f };
+  volumeDesc.graphAssetPath = graphAssetPath.string();
+  volumeDesc.seed = 999u;
+
+  // "PCG63SMOK" folded into 64 bits -- deterministic, matching this codebase's own "a demoscene demo
+  // is a fixed procedural performance" convention (see e.g. BakeDemoWorld.cpp's own header comment).
+  worldpartition::UuidGenerator uuidGen(0x5043473633534D4BULL);
+  const worldpartition::Uuid volumeUuid = uuidGen.Generate();
+  const worldpartition::ActorRecord volumeRecord = worldpartition::BuildPcgVolumeActorRecord(volumeUuid, volumeDesc);
+  const std::filesystem::path volumeActorPath = worldpartition::MakeActorFilePath(actorsDir, volumeUuid);
+  if (!worldpartition::WriteActorFile(volumeActorPath, volumeRecord)) {
+    LOG_ERROR("[ClusterRenderPipeline] PCG cell-loader smoke test FAILED: could not write the scratch PcgVolume actor file.");
+    return false;
+  }
+
+  // =========================================================================================
+  // STEP 2 -- throwaway PcgInstanceDrawPass/PcgInstanceSpawnManager pair (identical setup
+  // convention to RunPcgFullPipelineSmokeTest's own STEP 4 above), sized exactly to the grid's own
+  // known point count.
+  // =========================================================================================
+  const uint32_t expectedInstanceCount = static_cast<uint32_t>(kGridCountX * kGridCountZ);
+  PcgInstanceDrawPass pcgPass;
+  maths::vec3 sunDir = (m_BaseSunDirection.Length() > 0.0f) ? m_BaseSunDirection.Normalize() : maths::vec3(0.3f, 0.8f, 0.4f).Normalize();
+  pcgPass.Init(m_Device, m_Allocator, commandPool, queue,
+      m_PagePool.GetPhysicalPoolBuffer(), GenerateShowcaseMaterialTable(),
+      sunDir, maths::vec3(1.0f, 0.96f, 0.9f), 3.0f, maths::vec3(0.12f, 0.12f, 0.14f),
+      VK_FORMAT_R16G16B16A16_SFLOAT, VK_FORMAT_D32_SFLOAT,
+      expectedInstanceCount, 8192u);
+  pcg::PcgInstanceSpawnManager spawnManager(pcgPass);
+
+  // =========================================================================================
+  // STEP 3 -- the actual Phase 6.3 subject under test: world::PcgCellLoader, constructed exactly
+  // the way a future live caller would (scan-at-construction, then IWorldCellLoader calls simulate
+  // whatever world::StreamingManager would have triggered).
+  // =========================================================================================
+  world::PcgCellLoader cellLoader(actorsDir, kTestCellSize, spawnManager);
+
+  if (cellLoader.GetVolumeCount() != 1) {
+    LOG_ERROR(std::format("[ClusterRenderPipeline] PCG cell-loader smoke test FAILED: expected 1 indexed PCG Volume, found {}.", cellLoader.GetVolumeCount()));
+    pcgPass.Shutdown();
+    return false;
+  }
+  if (cellLoader.GetIndexedCellCount() != 1) {
+    LOG_ERROR(std::format("[ClusterRenderPipeline] PCG cell-loader smoke test FAILED: expected the volume to overlap exactly 1 cell, index has {}.", cellLoader.GetIndexedCellCount()));
+    pcgPass.Shutdown();
+    return false;
+  }
+
+  // --- Simulates exactly what world::StreamingManager would trigger from a core::LoadingManager
+  // worker thread when cell (0,0) enters a StreamingSource's detailLoadRadius -- called directly
+  // here (synchronously, on this thread) since this test's whole point is validating
+  // world::PcgCellLoader's own logic, not re-proving core::LoadingManager's own worker-pool dispatch
+  // (already covered elsewhere, and IWorldCellLoader's own threading contract makes a synchronous
+  // direct call from any one thread just as valid as a worker-pool-dispatched one). ---
+  cellLoader.LoadCellFullDetail(world::CellCoord{ 0, 0 });
+  cellLoader.Pump(); // Main-thread pump step -- drives the real SpawnInstances() call.
+
+  const uint32_t liveAfterLoad = pcgPass.GetLiveInstanceCount();
+  if (liveAfterLoad != expectedInstanceCount) {
+    LOG_ERROR(std::format(
+        "[ClusterRenderPipeline] PCG cell-loader smoke test FAILED: expected {} live instance(s) after "
+        "LoadCellFullDetail+Pump, got {}.", expectedInstanceCount, liveAfterLoad));
+    pcgPass.Shutdown();
+    return false;
+  }
+  if (cellLoader.GetLoadedCellCount() != 1) {
+    LOG_ERROR(std::format("[ClusterRenderPipeline] PCG cell-loader smoke test FAILED: expected 1 tracked loaded cell, got {}.", cellLoader.GetLoadedCellCount()));
+    pcgPass.Shutdown();
+    return false;
+  }
+
+  // --- LoadCellHlod is a documented no-op for this phase (see world::PcgCellLoader::LoadCellHlod's
+  // own header comment) -- calling it for a DIFFERENT cell must not change the live instance count
+  // at all, proving the "no fake HLOD behavior" scope decision actually holds at runtime. ---
+  cellLoader.LoadCellHlod(world::CellCoord{ 5, 5 });
+  cellLoader.Pump();
+  const uint32_t liveAfterHlod = pcgPass.GetLiveInstanceCount();
+  if (liveAfterHlod != expectedInstanceCount) {
+    LOG_ERROR(std::format(
+        "[ClusterRenderPipeline] PCG cell-loader smoke test FAILED: LoadCellHlod unexpectedly changed the "
+        "live instance count (expected to stay at {}, got {}) -- it is documented to be a no-op for this phase.",
+        expectedInstanceCount, liveAfterHlod));
+    pcgPass.Shutdown();
+    return false;
+  }
+
+  // --- Unload the real cell -- Pump() must despawn every instance that cell's own generation
+  // acquired. ---
+  cellLoader.UnloadCell(world::CellCoord{ 0, 0 });
+  cellLoader.Pump();
+  const uint32_t liveAfterUnload = pcgPass.GetLiveInstanceCount();
+  const size_t loadedCellsAfterUnload = cellLoader.GetLoadedCellCount();
+  pcgPass.Shutdown();
+
+  if (liveAfterUnload != 0) {
+    LOG_ERROR(std::format(
+        "[ClusterRenderPipeline] PCG cell-loader smoke test FAILED: expected 0 live instances after "
+        "UnloadCell+Pump, got {}.", liveAfterUnload));
+    return false;
+  }
+  if (loadedCellsAfterUnload != 0) {
+    LOG_ERROR(std::format("[ClusterRenderPipeline] PCG cell-loader smoke test FAILED: expected 0 tracked loaded cells after unload, got {}.", loadedCellsAfterUnload));
+    return false;
+  }
+
+  LOG_INFO(std::format(
+      "[ClusterRenderPipeline] PCG cell-loader smoke test PASSED: 1 volume indexed into 1 cell, "
+      "LoadCellFullDetail+Pump acquired {} real instance(s) (matching the grid's own deterministic "
+      "point count), LoadCellHlod verified as a documented no-op, UnloadCell+Pump despawned every "
+      "acquired instance back to 0. world::IWorldCellLoader -> pcg::GeneratePcgContentForCell -> "
+      "world::PcgCellLoader::Pump -> pcg::PcgInstanceSpawnManager -> renderer::PcgInstanceDrawPass "
+      "verified end-to-end.",
+      expectedInstanceCount));
   return true;
 }
 #endif

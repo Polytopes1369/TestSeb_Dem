@@ -722,6 +722,32 @@ int main(int argc, char** argv) {
             LOG_ERROR("[Main] PCG full-pipeline smoke test FAILED -- see log above for the specific check.");
         }
     }
+
+    // PCG roadmap Phase 6.3 ("Runtime Generator Hook", world::PcgCellLoader): proves the LIVE
+    // streaming-triggered generation path -- world::IWorldCellLoader::LoadCellFullDetail()/
+    // UnloadCell() -> pcg::GeneratePcgContentForCell() -> world::PcgCellLoader::Pump() ->
+    // pcg::PcgInstanceSpawnManager -- actually runs end-to-end, simulating exactly what
+    // world::StreamingManager would trigger from a worker thread. See
+    // ClusterRenderPipeline::RunPcgCellLoaderSmokeTest's own comment for exactly what it checks at
+    // each stage. Reuses the SAME 3 already-resident World Partition streaming archetype meshes as
+    // both smoke tests above (this class has no VulkanContext dependency of its own, same reason as
+    // PcgFullPipelineSmokeTestMeshDesc's own comment). Not fatal on failure (logged only), matching
+    // every other smoke test's own convention.
+    {
+        std::vector<renderer::ClusterRenderPipeline::PcgFullPipelineSmokeTestMeshDesc> pcgCellLoaderMeshes;
+        static constexpr uint32_t kCellLoaderUnits[3] = { 0u, 1u, 2u }; // Rock, Bush, Tree (same units as above).
+        for (uint32_t i = 0; i < 3u; ++i) {
+            VulkanContext::StreamingArchetypeMeshInfo meshInfo = vkContext.GetStreamingArchetypeFineMeshInfo(kCellLoaderUnits[i]);
+            renderer::ClusterRenderPipeline::PcgFullPipelineSmokeTestMeshDesc desc{};
+            desc.meshID = meshInfo.meshID;
+            desc.materialID = meshInfo.materialID;
+            desc.weight = 1.0f;
+            pcgCellLoaderMeshes.push_back(desc);
+        }
+        if (!clusterPipeline.RunPcgCellLoaderSmokeTest(pcgCellLoaderMeshes, vkContext.GetCommandPool(), vkContext.GetGraphicsQueue())) {
+            LOG_ERROR("[Main] PCG cell-loader smoke test FAILED -- see log above for the specific check.");
+        }
+    }
 #endif
 
     // Frame-pacing fence, created signaled so the first frame's wait passes immediately. Replaces
