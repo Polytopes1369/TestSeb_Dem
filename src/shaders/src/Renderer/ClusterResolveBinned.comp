@@ -132,6 +132,12 @@ layout(std140, set = 0, binding = 6) uniform ResolveViewParamsUBO {
     // Glint / sparkle (UE5.8 rendering-parity gap G5) Debug-only intensity tuning multiplier -- see
     // ClusterResolve.comp's own identical glintIntensityScale field comment.
     float glintIntensityScale;
+    // Substrate horizontal mixing (UE5.8 rendering-parity gap G6) Debug-only blend-sharpness tuning
+    // multiplier -- see ClusterResolve.comp's own identical mixMaskSharpnessScale field comment (this
+    // binned/Release path shares the exact same UBO layout/contents; in Release it is a hardcoded
+    // 1.0, so a horizontally-mixed material blends at its authored mixContrast here just as it does
+    // in the Debug path). The first field to grow this UBO past 192 bytes -> a fresh 16-byte block.
+    float mixMaskSharpnessScale;
 } g_ViewParams;
 
 // binding 7 == g_MaskTextures[], declared by mask_sampling.glsl.
@@ -339,6 +345,17 @@ void main() {
     if (pc.binIndex == MATERIAL_ID_TERRAIN) {
         mat.base.diffuseAlbedo = ComputeTerrainAlbedo(worldPos, normal, mat.base.diffuseAlbedo);
     }
+    // Substrate horizontal material mixing (UE5.8 rendering-parity gap G6): resolve base (A) + mixB
+    // (B) into one effective base by the per-pixel world-space procedural mask, right after the
+    // material lookup -- see ClusterResolve.comp's own identical call-site comment for the full
+    // rationale (every downstream term then shades the correctly-blended surface). This is the
+    // Release-live (binned) path, so it MUST run here too, not only in the Debug full-screen path.
+    // Zero cost when this dispatch's bin material doesn't mix (mixAmount == 0, uniform across the
+    // whole dispatch since every thread shares pc.binIndex's material -> no warp divergence). The
+    // raw-mask out param is unused here (only ClusterResolve.comp's DEBUG_VIEW_SUBSTRATE_MIXING
+    // needs it -- Debug views never take this binned path, see this shader's own header comment).
+    float mixMaskUnused = 0.0;
+    mat = ApplySubstrateHorizontalMix(mat, worldPos, g_ViewParams.mixMaskSharpnessScale, mixMaskUnused);
 
     // Step 4: Runtime Virtual Texture detail multiply -- see ClusterResolve.comp's own identical
     // comment for the full rationale (safe no-op multiply until real tile content exists).

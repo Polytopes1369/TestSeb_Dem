@@ -91,14 +91,28 @@ namespace renderer {
         "SubstrateSlab must match the SubstrateSlab struct in material_params.glsl exactly (std430 layout)");
 
     // GLSL-friendly, std430-compatible mirror of MaterialParams in
-    // src/shaders/include/material_params.glsl -- two SubstrateSlab blocks (base + optional top)
-    // plus a trailing 16-byte block, matching Substrate's own "vertical layering" model: a material
-    // is either a single Slab (topWeight == 0.0, the exact behavior every material had before this
-    // struct existed) or a Base slab with a Top slab (Coat/Fuzz-emphasis/SSS-emphasis) layered over
-    // it, composited by substrate_bsdf.glsl's EvaluateSubstrateMaterial (see that function's own
-    // comment for the vertical-layer energy-conservation formula).
+    // src/shaders/include/material_params.glsl -- three SubstrateSlab blocks (base + the
+    // horizontal-mix partner `mixB` + optional vertical-layer `top`) plus two trailing 16-byte
+    // blocks, matching Substrate's own TWO composition operators: a material is a single Slab
+    // (topWeight == 0.0 AND mixAmount == 0.0, the exact behavior every material had before this
+    // struct existed), OR a Base slab with a Top slab (Coat/Fuzz/SSS-emphasis) layered over it
+    // VERTICALLY (composited by substrate_bsdf.glsl's EvaluateSubstrateMaterial), OR a Base slab
+    // (A) spatially blended with a `mixB` slab (B) HORIZONTALLY by a per-pixel procedural mask
+    // (composited by substrate_bsdf.glsl's ApplySubstrateHorizontalMix -- UE5.8 rendering-parity
+    // gap G6), OR any combination (the horizontal mix resolves to one effective base first, then
+    // the vertical coat layers over that result).
     struct MaterialParameters {
         SubstrateSlab base;
+        // Horizontal mixing (UE5.8 rendering-parity gap G6): the "B side" Slab that `base` (the "A
+        // side") is spatially blended with across the SAME surface by a per-pixel procedural mask
+        // -- rust patches over bare metal, moss over rock, dirt over paint, etc. DISTINCT from
+        // `top` below: `top` is a coat stacked VERTICALLY over the base (Substrate's layering
+        // operator, a Fresnel-weighted coat-over-base energy split), whereas `mixB` sits
+        // side-by-side with `base` and one wins per pixel by the mask weight (Substrate's mixing
+        // operator, a parameter-space lerp of the two Slabs). Never evaluated at all unless
+        // `mixAmount` (below) > 0.0 -- exactly the pre-G6 single-base behavior at identical cost.
+        // See substrate_bsdf.glsl's ApplySubstrateHorizontalMix / EvaluateSubstrateMixMask.
+        SubstrateSlab mixB;
         SubstrateSlab top;
         // Substrate's vertical-layer Coverage/weight, [0, 1]. 0.0 (default) = fast path, `top` is
         // never evaluated -- identical cost and result to a single flat Slab material.
@@ -125,8 +139,22 @@ namespace renderer {
         // matching real UE5.8 rather than paying the trace cost for every alpha-blended surface.
         // 0.0 = off (default, matches every other category incl. "Translucent" below), 1.0 = on.
         float hasReflections = 0.0f;
+        // Horizontal mixing (UE5.8 rendering-parity gap G6) control block -- these four floats drive
+        // substrate_bsdf.glsl's world-space procedural blend mask (see EvaluateSubstrateMixMask).
+        // mixAmount [0,1]: master coverage AND enable flag in one -- 0.0 (default) disables the
+        // whole operator at zero cost (mixB never touched), exactly like topWeight above and
+        // SubstrateSlab::glintIntensity's own "0.0 == off" convention. mixScale: world-space noise
+        // frequency (cycles per world unit) of the blend mask -- higher = smaller/more-numerous
+        // patches. mixContrast: transition sharpness -- higher = crisper A/B boundary (distinct
+        // patches), lower = a soft gradient (a flat 0 would degenerate to a hard 50% seam, so the
+        // shader floors it). mixBias [0,1]: mask threshold -- shifts how much of the surface reads
+        // as B (the mixB slab) vs A (the base slab). Defaults leave the operator off.
+        float mixAmount = 0.0f;
+        float mixScale = 1.0f;
+        float mixContrast = 1.0f;
+        float mixBias = 0.5f;
     };
-    static_assert(sizeof(MaterialParameters) == 208,
+    static_assert(sizeof(MaterialParameters) == 320,
         "MaterialParameters must match MaterialParams in material_params.glsl exactly (std430 layout)");
 
     // Bounds both this CPU-side array and the matching GPU SSBO (ClusterResolvePass allocates
@@ -316,8 +344,27 @@ namespace renderer {
         // own colors read clearly rather than mixing with a tinted base.
         table.params[8].base = MakeBaseSlab(maths::vec3(0.7f, 0.7f, 0.7f), 0.6f, maths::vec3(0.0f, 0.0f, 0.0f), 0.0f);
 
-        // Dielectric B (Pyramid, slot 9): matte deep green, fully opaque non-metal.
-        table.params[9].base = MakeBaseSlab(maths::vec3(0.15f, 0.55f, 0.25f), 0.75f, maths::vec3(0.0f, 0.0f, 0.0f), 0.0f);
+        // Horizontal material mixing (Pyramid, slot 9): UE5.8 rendering-parity gap G6 showcase --
+        // rusting metal. Repurposes what was the "Dielectric B" slot (the scene still demonstrates
+        // plain dielectrics via slot 3 "Dielectric A", the two Cornell walls, the terrain and the
+        // floor). The base "A" Slab is clean steel (fully metallic, low roughness, neutral gray F0,
+        // zero diffuseAlbedo -- a metal's color lives in F0, see MakeBaseSlab); the mixB "B" Slab is
+        // oxidized rust (dielectric, high roughness, warm orange-brown diffuseAlbedo, flat 0.04 F0).
+        // A world-space procedural mask (substrate_bsdf.glsl's EvaluateSubstrateMixMask, driven by
+        // the four mix* controls below) blends the two per-pixel, so the pyramid shows rust patches
+        // spreading across bare steel: every physically meaningful Slab parameter (albedo, roughness,
+        // F0, effectively metallic->dielectric) transitions TOGETHER across each patch boundary --
+        // the whole point of parameter-space horizontal mixing, versus a naive average or a hard
+        // seam. The pyramid's large flat faces read the patchy blend clearly. mixContrast/mixScale/
+        // mixBias tuned for several distinct-but-soft-edged rust patches over roughly half the
+        // surface; mixAmount 1.0 = full effect. This is the only slot with mixAmount > 0.0 -- every
+        // other material keeps the zero-cost single-base fast path (see MaterialParameters::mixAmount).
+        table.params[9].base = MakeBaseSlab(maths::vec3(0.55f, 0.57f, 0.60f), 0.28f, maths::vec3(0.0f, 0.0f, 0.0f), 1.0f);
+        table.params[9].mixB = MakeBaseSlab(maths::vec3(0.42f, 0.20f, 0.09f), 0.90f, maths::vec3(0.0f, 0.0f, 0.0f), 0.0f);
+        table.params[9].mixAmount = 1.0f;
+        table.params[9].mixScale = 2.2f;
+        table.params[9].mixContrast = 4.0f;
+        table.params[9].mixBias = 0.5f;
 
         // Screen-space Subsurface Scattering showcase (TorusKnot, slot 10) -- UE5.8 rendering-parity
         // gap G4, "Subsurface Profile" shading model. Repurposes what was the "Nanite B neutral"

@@ -22,7 +22,13 @@ enum DebugViewMode : uint32_t {
   // Substrate integration: color-codes each pixel's Top slab (vertical layering) -- grey = no top
   // slab (topWeight == 0), blue-tinted = Clear Coat, orange-tinted = Fuzz/Cloth, brightness scaled
   // by topWeight (coverage) -- see ClusterResolve.comp's own viewMode==16 branch.
-  DEBUG_VIEW_SUBSTRATE_SLABS = 16
+  DEBUG_VIEW_SUBSTRATE_SLABS = 16,
+  // Substrate horizontal mixing (UE5.8 rendering-parity gap G6): visualizes the raw per-pixel A/B
+  // mix mask -- blue = pure base "A" slab, red = pure mixB "B" slab, the gradient between showing
+  // the spatially-varying blend (proves it is a non-uniform procedural blend, not a flat average or
+  // a hard seam). Non-mixing materials (mixAmount == 0) read solid blue. See ClusterResolve.comp's
+  // own viewMode==17 branch.
+  DEBUG_VIEW_SUBSTRATE_MIXING = 17
 };
 #endif
 
