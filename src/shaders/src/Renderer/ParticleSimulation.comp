@@ -115,14 +115,49 @@ layout(std140, set = 1, binding = 3) uniform ParticleDepthCollisionUBO {
     float viewportHeight;
 } g_DepthCollision;
 
-// Subtask C2: `resolvePass`'s SAME sampled GBuffer depth copy ParticleRender.frag's own soft-particle
-// fade already samples (renderer::ClusterResolvePass::GetOutputDepthView(), R32_SFLOAT, raw NDC z,
-// reversed-Z: near = 1.0, far = 0.0, cleared to 0.0 for sky/no-geometry) -- bound a SECOND time here,
-// with this pass' own dedicated compute-stage sampler (renderer::ParticleSystemPass::Init's own
-// m_ComputeSceneDepthSampler), since a COMPUTE shader cannot share the fragment-stage-only binding
-// ParticleRender.frag uses (a different descriptor set entirely -- see that shader's own header
-// comment for why a depth ATTACHMENT needs a separate sampled copy in the first place).
-layout(set = 1, binding = 4) uniform sampler2D g_SceneDepthCompute;
+// Subtask C5 (Niagara-parity roadmap: GPU Data Interfaces) -- a small, fixed-size array of generically-
+// bound 2D textures ("data interface slots") any particle-shader feature can sample from BY INDEX,
+// instead of every new feature inventing its own bespoke named binding the way wind/SDF/VSM/world-
+// probes/depth all did before this. Deliberately NOT a full Niagara-style typed/named plugin registry
+// (out of scope for this project -- see EmitterParams' own header comment on why a full visual-
+// scripting module graph is likewise out of scope) -- just a fixed array of combined-image-samplers,
+// each slot bound once at Init() time by whichever CALLER wants to publish a texture through this
+// interface. Subtask C2's own screen-space depth-buffer collision is the first (and today, only) real
+// consumer, retrofitted onto slot 0 (see ResolveDepthBufferCollision's own call site below) in place
+// of what was originally a bespoke `g_SceneDepthCompute` binding -- proving this abstraction is not
+// just theoretical, an actual existing feature runs through it. Every element must hold a valid
+// descriptor regardless of whether anything indexes it (this engine does not enable
+// VkPhysicalDeviceVulkan12Features::descriptorBindingPartiallyBound -- same constraint/convention
+// already established by e.g. VirtualTextureManager's own K_MAX_VT_PHYSICAL_POOLS handling), so unused
+// slots 1-3 are bound to the SAME scene-depth view/sampler as slot 0 at Init() time -- harmless, since
+// nothing indexes them today.
+#define PARTICLE_DATA_INTERFACE_SLOT_COUNT 4
+layout(set = 1, binding = 4) uniform sampler2D g_DataInterfaceTextures[PARTICLE_DATA_INTERFACE_SLOT_COUNT];
+
+// Generic single-channel (red component) read from data-interface `slot` at normalized `uv` -- exactly
+// what a particle-shader feature needing "one arbitrary external scalar field, by index" should call
+// instead of declaring its own named sampler2D binding. Out-of-range `slot` returns 0.0 rather than an
+// out-of-bounds array access. `slot` is always a compile-time-constant literal at every call site in
+// this file today (a plain dynamically-uniform index), so no GL_EXT_nonuniform_qualifier annotation is
+// required -- core GLSL 4.60 already permits dynamically-uniform sampler-array indexing.
+float SampleDataInterfaceFloat(uint slot, vec2 uv) {
+    if (slot >= uint(PARTICLE_DATA_INTERFACE_SLOT_COUNT)) {
+        return 0.0;
+    }
+    return texture(g_DataInterfaceTextures[slot], uv).r;
+}
+
+// Same as above, but reads xyz instead of just red -- e.g. a future data interface publishing a
+// world-space vector field (a flow map, a second wind layer, etc.) instead of a single scalar. Unused
+// by any consumer today (C2's depth read only ever needs the single red channel) -- included as part
+// of this SAME minimal interface rather than added later as a second bespoke accessor, since a vec3
+// read is exactly as generic a primitive as the float one above and costs nothing unused.
+vec3 SampleDataInterfaceVec3(uint slot, vec2 uv) {
+    if (slot >= uint(PARTICLE_DATA_INTERFACE_SLOT_COUNT)) {
+        return vec3(0.0);
+    }
+    return texture(g_DataInterfaceTextures[slot], uv).rgb;
+}
 
 // Subtask C3 (spawn-on-mesh-surface) -- the SAME 3 metadata/entity buffers ClusterRaster.vert reads
 // (binding 6, the compressed geometry pool itself, is declared by cluster_vertex_decode.glsl's own
@@ -275,7 +310,11 @@ bool ResolveDepthBufferCollision(inout vec3 pos, inout vec3 vel, float bounceEla
     }
 
     vec2 screenUV = ndc.xy * 0.5 + 0.5;
-    float sceneNdcDepth = texture(g_SceneDepthCompute, screenUV).r;
+    // Subtask C5: reads through the generic Data Interface accessor (slot 0 == the scene depth copy,
+    // see this file's own PARTICLE_DATA_INTERFACE_SLOT_COUNT comment) instead of a bespoke sampler --
+    // functionally identical to the direct texture() read this replaced, just routed through the
+    // shared abstraction.
+    float sceneNdcDepth = SampleDataInterfaceFloat(0u, screenUV);
     // Reversed-Z (near = 1.0, far = 0.0): sceneNdcDepth <= 0.0 means sky/no-geometry-hit at this pixel
     // (renderer::ClusterResolvePass's own g_OutputDepth clear-to-0 convention, see ParticleRender.
     // frag's own identical check) -- nothing to collide against. Otherwise the particle has only just
@@ -299,8 +338,8 @@ bool ResolveDepthBufferCollision(inout vec3 pos, inout vec3 vel, float bounceEla
     // depth for that one axis instead (a locally flat approximation is far closer to correct than a
     // fake cliff-edge at every silhouette).
     vec2 texel = 1.0 / max(vec2(g_DepthCollision.viewportWidth, g_DepthCollision.viewportHeight), vec2(1.0));
-    float depthDX = texture(g_SceneDepthCompute, screenUV + vec2(texel.x, 0.0)).r;
-    float depthDY = texture(g_SceneDepthCompute, screenUV + vec2(0.0, texel.y)).r;
+    float depthDX = SampleDataInterfaceFloat(0u, screenUV + vec2(texel.x, 0.0));
+    float depthDY = SampleDataInterfaceFloat(0u, screenUV + vec2(0.0, texel.y));
     if (depthDX <= 0.0) depthDX = sceneNdcDepth;
     if (depthDY <= 0.0) depthDY = sceneNdcDepth;
 

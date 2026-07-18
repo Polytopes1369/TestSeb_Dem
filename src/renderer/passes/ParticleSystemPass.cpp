@@ -17,6 +17,11 @@ namespace renderer {
 
     namespace {
 
+        // Subtask C5 (GPU Data Interfaces): must match ParticleSimulation.comp's own
+        // PARTICLE_DATA_INTERFACE_SLOT_COUNT exactly -- see that shader's own header comment for the
+        // full "generic external-texture-by-index" contract this constant sizes.
+        constexpr uint32_t kParticleDataInterfaceSlotCount = 4;
+
         // Matches VkDrawIndirectCommand's own field order/size exactly (16 bytes) -- used only to
         // build the one-time initial content this class uploads into m_IndirectDrawBuffer; the real
         // struct is used directly everywhere else (vkCmdDrawIndirect, Subtask 4).
@@ -390,7 +395,12 @@ namespace renderer {
             envBindings[1] = { 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, GlobalSDFPass::kLevelCount, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
             envBindings[2] = { 2, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
             envBindings[3] = { 3, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
-            envBindings[4] = { 4, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+            // Subtask C5 (GPU Data Interfaces): binding 4 is a FIXED-SIZE ARRAY of generically-bound
+            // textures (kParticleDataInterfaceSlotCount, matching ParticleSimulation.comp's own
+            // PARTICLE_DATA_INTERFACE_SLOT_COUNT exactly) rather than one dedicated sampler -- subtask
+            // C2's screen-space depth-buffer collision is retrofitted onto slot 0 below (see this
+            // class' own header comment on that retrofit).
+            envBindings[4] = { 4, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kParticleDataInterfaceSlotCount, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
             envBindings[5] = { 5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // ClusterCullMetadataSSBO.
             envBindings[6] = { 6, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // CompressedClusterPoolSSBO.
             envBindings[7] = { 7, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // EntityTransformBuffer.
@@ -403,7 +413,7 @@ namespace renderer {
 
             VkDescriptorPoolSize envPoolSizes[3] = {
                 { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 3 }, // AtmosGlobalsUBO (binding 0) + PrecipitationParamsUBO (binding 2) + ParticleDepthCollisionUBO (binding 3).
-                { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, GlobalSDFPass::kLevelCount + 1 }, // Clipmaps (binding 1) + scene depth copy (binding 4).
+                { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, GlobalSDFPass::kLevelCount + kParticleDataInterfaceSlotCount }, // Clipmaps (binding 1) + Data Interface slots (binding 4).
                 { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4 } // Cluster metadata + compressed pool + entity transform + entity data (bindings 5-8).
             };
             VkDescriptorPoolCreateInfo envPoolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
@@ -425,7 +435,17 @@ namespace renderer {
             }
             VkDescriptorBufferInfo precipParamsInfo{ m_PrecipitationParamsBuffer.Handle(), 0, m_PrecipitationParamsBuffer.Size() };
             VkDescriptorBufferInfo depthCollisionParamsInfo{ m_DepthCollisionParamsBuffer.Handle(), 0, m_DepthCollisionParamsBuffer.Size() };
-            VkDescriptorImageInfo computeSceneDepthInfo{ m_ComputeSceneDepthSampler, resolvePass.GetOutputDepthView(), VK_IMAGE_LAYOUT_GENERAL };
+            // Subtask C5 (GPU Data Interfaces): slot 0 is the ONLY real consumer today (subtask C2's
+            // depth-buffer collision, retrofitted from what was originally a single dedicated binding --
+            // see this class' own header comment). Slots 1-3 are unused by every shader today, but this
+            // engine does not enable descriptorBindingPartiallyBound, so every array element must still
+            // hold a VALID descriptor -- bound to the exact same scene-depth view/sampler as slot 0,
+            // same harmless-placeholder convention already established by e.g. SetVirtualTexture's own
+            // K_MAX_VT_PHYSICAL_POOLS handling.
+            VkDescriptorImageInfo dataInterfaceInfos[kParticleDataInterfaceSlotCount]{};
+            for (uint32_t slot = 0; slot < kParticleDataInterfaceSlotCount; ++slot) {
+                dataInterfaceInfos[slot] = { m_ComputeSceneDepthSampler, resolvePass.GetOutputDepthView(), VK_IMAGE_LAYOUT_GENERAL };
+            }
             VkDescriptorBufferInfo clusterMetadataInfo{ clusterMetadataBuffer, 0, VK_WHOLE_SIZE };
             VkDescriptorBufferInfo compressedPoolInfo{ compressedPhysicalPoolBuffer, 0, VK_WHOLE_SIZE };
             VkDescriptorBufferInfo entityTransformInfo{ entityTransformBuffer, 0, VK_WHOLE_SIZE };
@@ -436,7 +456,7 @@ namespace renderer {
             envWrites[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_EnvironmentSet, 1, 0, GlobalSDFPass::kLevelCount, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, clipmapInfos, nullptr, nullptr };
             envWrites[2] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_EnvironmentSet, 2, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &precipParamsInfo, nullptr };
             envWrites[3] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_EnvironmentSet, 3, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &depthCollisionParamsInfo, nullptr };
-            envWrites[4] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_EnvironmentSet, 4, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &computeSceneDepthInfo, nullptr, nullptr };
+            envWrites[4] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_EnvironmentSet, 4, 0, kParticleDataInterfaceSlotCount, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, dataInterfaceInfos, nullptr, nullptr };
             envWrites[5] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_EnvironmentSet, 5, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &clusterMetadataInfo, nullptr };
             envWrites[6] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_EnvironmentSet, 6, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &compressedPoolInfo, nullptr };
             envWrites[7] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_EnvironmentSet, 7, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &entityTransformInfo, nullptr };
