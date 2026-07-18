@@ -99,6 +99,13 @@ namespace renderer {
         // never recreated after GlobalSDFPass::Init(), so this binding never needs to be refreshed.
         void SetGlobalSDFViews(const GlobalSDFPass& globalSDF);
 
+        // Atmos weather system, Subtask 2 (atmos_integration_plan.md): binds renderer::AtmosSkyPass's
+        // Sky-View LUT view/sampler into this pass's own descriptor set (set 1, binding 2) -- same
+        // "deferred, called once after the producer pass' own Init()" convention as
+        // SetGlobalSDFViews() above, since renderer::AtmosSkyPass is Init'd independently. Must be
+        // called exactly once before the first RecordRayMarch() call.
+        void SetAtmosSkyView(VkImageView skyViewLUTView, VkSampler skyViewLUTSampler);
+
         // Ray marches one full frame into the output image: `cameraPosition`/`cameraForward`/
         // `cameraUp` describe the camera (same convention as renderer::SurfaceCachePass::
         // UpdateVisibility: cameraUp need not be re-orthonormalized, only non-parallel to
@@ -114,9 +121,12 @@ namespace renderer {
         // variant, skipping the fine per-entity BVH refinement tier entirely) makes this pass's
         // output visually distinct between the two debug views that both blit-swap to it -- see
         // renderer::ClusterRenderPipeline::RecordFrame's own [14] blit-source-swap comment.
+        // `sunDirectionWorld` (Atmos weather system, Subtask 2): threaded into the Sky-View LUT's
+        // sun-relative azimuth mapping on a miss -- see SDFRayMarch.comp's own GetSunDirection().
         void RecordRayMarch(VkCommandBuffer cmd, const GlobalSDFPass& globalSDF,
             const maths::vec3& cameraPosition, const maths::vec3& cameraForward, const maths::vec3& cameraUp,
-            float fovYRadians, float aspectRatio, float nearZ, float farZ, bool coarseOnly);
+            float fovYRadians, float aspectRatio, float nearZ, float farZ, bool coarseOnly,
+            const maths::vec3& sunDirectionWorld);
 
         uint32_t GetOutputWidth() const { return m_OutputWidth; }
         uint32_t GetOutputHeight() const { return m_OutputHeight; }

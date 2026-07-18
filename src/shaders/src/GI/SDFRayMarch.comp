@@ -30,6 +30,7 @@
 // snapped center) matters, to decide whether a world position is even validly covered right now.
 
 #include "include/procedural_material.glsl"
+#include "include/atmos_sky_lut_mapping.glsl"
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
@@ -63,6 +64,11 @@ layout(set = 0, binding = 3) uniform sampler3D uEntitySDFs[128];
 // Must match renderer::GlobalSDFPass::kLevelCount exactly.
 layout(set = 1, binding = 0) uniform sampler3D uGlobalClipmaps[4];
 layout(rgba8, set = 1, binding = 1) uniform writeonly image2D uOutput;
+// Atmos weather system, Subtask 2 (atmos_integration_plan.md): renderer::AtmosSkyPass's Sky-View
+// LUT, bound with THIS pass's own linear-filter sampler -- replaces the flat vertical-gradient sky
+// miss below with the same physically based sky every other consumer (PostProcessComposite.comp)
+// samples. See atmos_sky_lut_mapping.glsl's own header comment for the UV<->direction mapping.
+layout(set = 1, binding = 2) uniform sampler2D uSkyViewLUT;
 
 layout(push_constant) uniform SDFRayMarchPC {
     float cameraPosition[3];
@@ -79,7 +85,11 @@ layout(push_constant) uniform SDFRayMarchPC {
     int rootNodeIndex;        // -1 if the scene has zero entities (BVH is empty).
     int entitySamplerCount;   // How many of uEntitySDFs' 128 slots are real entities (rest are the far-value placeholder).
     int coarseOnly;           // 0 = normal two-tier march (DEBUG_VIEW_LUMEN); 1 = coarse-clipmap-only (DEBUG_VIEW_GLOBAL_SDF), skips Stage 2+3 entirely.
+    float sunDirection[3];    // Points FROM the light TOWARD the scene (renderer::ClusterResolvePass's own convention).
+    float _pad0;
 } pc;
+
+vec3 GetSunDirection() { return vec3(pc.sunDirection[0], pc.sunDirection[1], pc.sunDirection[2]); }
 
 vec3 GetCameraPosition() { return vec3(pc.cameraPosition[0], pc.cameraPosition[1], pc.cameraPosition[2]); }
 vec3 GetCameraForward()  { return vec3(pc.cameraForward[0], pc.cameraForward[1], pc.cameraForward[2]); }
@@ -351,11 +361,18 @@ void main() {
         float ndotl = max(dot(normal, lightDir), 0.0);
         color = baseColor * (0.2 + 0.8 * ndotl);
     } else {
-        // Sky miss: a simple vertical gradient, matching this codebase's "genuinely complete if
-        // intentionally simple" procedural-fallback convention (see SurfaceCacheCapture.frag's own
-        // comment) rather than a flat undefined color.
-        float skyT = clamp(rayDir.y * 0.5 + 0.5, 0.0, 1.0);
-        color = mix(vec3(0.05, 0.07, 0.12), vec3(0.5, 0.65, 0.9), skyT);
+        // Sky miss: sample renderer::AtmosSkyPass's physically based Sky-View LUT instead of the
+        // flat vertical gradient this used to be -- see this file's own binding comment. This debug
+        // output is a plain rgba8 UNORM image with no real exposure/tonemap pipeline of its own
+        // (unlike PostProcessComposite.comp's actual HDR chain), so a fixed debug-exposure constant
+        // (kDebugSkyExposure, roughly matched to this engine's real lux-scaled sun illuminance --
+        // see AtmosSkyLUTs.comp's own sunIlluminance push constant) brings the LUT's raw radiance
+        // into a displayable range before a Reinhard rolloff (x / (x+1)) handles the sun-adjacent
+        // highlights without hard clipping.
+        const float kDebugSkyExposure = 1.0 / 200.0;
+        vec2 skyUV = SkyViewLUTUVFromDirection(rayDir, GetSunDirection());
+        vec3 skyRadiance = texture(uSkyViewLUT, skyUV).rgb * kDebugSkyExposure;
+        color = skyRadiance / (skyRadiance + vec3(1.0));
     }
 
     imageStore(uOutput, pixel, vec4(color, 1.0));

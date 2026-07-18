@@ -40,6 +40,7 @@
 #include "include/color_grading.glsl"
 #include "include/aces_tonemap.glsl"
 #include "include/math_utils.glsl"
+#include "include/atmos_sky_lut_mapping.glsl"
 
 layout(local_size_x = 8, local_size_y = 8) in;
 
@@ -134,11 +135,17 @@ layout(std140, set = 0, binding = 3) uniform PostProcessParamsUBO {
 
     uint frameIndex;
     float _padPP5a, _padPP5b, _padPP5c;
+
+    // Atmos weather system, Subtask 2: current sun direction (points FROM the light TOWARD the
+    // scene), fed to SkyViewLUTUVFromDirection() on a scene miss below.
+    vec3 sunDirWorld;
+    float _padSky;
 } g_Params;
 
 layout(set = 0, binding = 4) uniform sampler2D g_Bloom;
 layout(set = 0, binding = 5) uniform sampler2D g_Depth;             // renderer::ClusterResolvePass depth, render-res, bilinear-upsampled.
 layout(set = 0, binding = 6) uniform sampler2D g_RefractionOffset;  // renderer::TransparentForwardPass's own second attachment, render-res, bilinear-upsampled.
+layout(set = 0, binding = 7) uniform sampler2D g_SkyViewLUT;        // renderer::AtmosSkyPass's own Sky-View LUT (Atmos Subtask 2).
 
 // Radial per-channel UV offset -- red sampled slightly closer to center, blue slightly further out
 // (the classic lateral chromatic aberration look), scaled by distance-from-center squared so the
@@ -396,6 +403,22 @@ void main() {
         color += SampleWithChromaticAberration(tapUV, g_Params.chromaticAberrationIntensity);
     }
     color /= float(kMotionBlurTaps);
+
+    // --- Atmos weather system, Subtask 2: replace the (currently black -- renderer::
+    // ClusterResolveBinned.comp never writes a pixel with no covering cluster at all, see that
+    // shader's own comment) scene-miss background with renderer::AtmosSkyPass's physically based
+    // Sky-View LUT. Stays in the same linear HDR units as the rest of `color` (real lux-scaled
+    // radiance, see AtmosSkyLUTs.comp's own sunIlluminance push constant), so it is subject to the
+    // SAME exposure/tonemap/color-grading chain below as any other scene radiance -- exactly how a
+    // real camera would expose the sky, not a separately-tuned flat background color. ---
+    if (!hitScene) {
+        vec4 farClip = vec4(distortedUV * 2.0 - 1.0, 1.0, 1.0);
+        vec4 farWorld4 = g_Params.invViewProj * farClip;
+        vec3 farWorld = farWorld4.xyz / farWorld4.w;
+        vec3 rayDir = normalize(farWorld - g_Params.cameraPositionWorld);
+        vec2 skyUV = SkyViewLUTUVFromDirection(rayDir, g_Params.sunDirWorld);
+        color = SanitizeHDR(texture(g_SkyViewLUT, skyUV).rgb);
+    }
 
     // --- Physical Camera / Auto Exposure: UE's own Iso100 photometric conversion, MaxLuminance =
     // 1.2 * 2^EV100, applied scene color scale = 1 / MaxLuminance.

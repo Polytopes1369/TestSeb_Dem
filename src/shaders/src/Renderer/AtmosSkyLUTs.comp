@@ -1,0 +1,350 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+
+// Atmos weather system, Subtask 2 (atmos_integration_plan.md): Physically Based Sky (Sebastien
+// Hillaire, "A Scalable and Production Ready Sky and Atmosphere Rendering Technique", 2020).
+// Three entry points in one file, selected by `pc.mode` (same "single shader, mode branches in
+// main()" convention GlobalSDFComposite.comp already establishes in this codebase):
+//
+//   mode == 0 (Transmittance LUT, 256x64): for each (height, view-zenith-angle) texel, raymarches
+//     straight out to the atmosphere's top boundary (or the ground, whichever the ray hits first)
+//     accumulating Rayleigh + Mie + ozone optical depth -> stores exp(-opticalDepth) (per-channel,
+//     since Rayleigh/ozone are chromatic). Pure medium property -- independent of the sun.
+//   mode == 1 (Multi-Scattering LUT, 32x32): for each (sun-zenith-cosine, height) texel, samples
+//     kMultiScatterDirectionCount directions on the sphere, raymarches each accumulating single-
+//     scattered radiance (attenuated by the just-written Transmittance LUT, sampled back rather than
+//     re-raymarched -- Hillaire's own "reuse the cheaper LUT" trick) and each step's own scattering
+//     albedo, then applies the closed-form infinite-bounce geometric series (psi_ms = L2/(1-f_ms))
+//     to estimate an ISOTROPIC multi-scatter contribution -- see ComputeMultiScatteringLUT()'s own
+//     comment for the exact derivation.
+//   mode == 2 (Sky-View LUT, 200x200): for each texel, maps to a world-space ray direction via
+//     atmos_sky_lut_mapping.glsl's SkyViewLUTDirectionFromUV() (using THIS frame's real sun
+//     direction, baked directly into the raymarch rather than kept as a LUT axis -- see that
+//     include's own header comment), raymarches from a fixed camera height accumulating single
+//     scattering (Rayleigh + Mie phase functions) modulated by sun transmittance (Transmittance LUT)
+//     and camera-to-sample transmittance, PLUS the isotropic multi-scatter contribution (Multi-
+//     Scattering LUT), with an Earth-shadow test (a sample point in the planet's own umbra
+//     contributes no direct light). Regenerated every frame (the sun moves); Transmittance/Multi-
+//     Scattering only need regenerating when the sun's zenith angle actually changes -- see
+//     AtmosSkyPass::RecordUpdate's own comment for that cache-invalidation policy.
+
+#include "include/atmos_sky_lut_mapping.glsl"
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0, rgba16f) uniform writeonly image2D g_TransmittanceStorage;
+layout(set = 0, binding = 1) uniform sampler2D g_TransmittanceSampler;
+layout(set = 0, binding = 2, rgba16f) uniform writeonly image2D g_MultiScatteringStorage;
+layout(set = 0, binding = 3) uniform sampler2D g_MultiScatteringSampler;
+layout(set = 0, binding = 4, rgba16f) uniform writeonly image2D g_SkyViewStorage;
+
+layout(push_constant) uniform AtmosSkyLUTsPC {
+    int mode;              // 0 = Transmittance, 1 = Multi-Scattering, 2 = Sky-View.
+    int outputWidth;
+    int outputHeight;
+    float sunDirX, sunDirY, sunDirZ; // Points FROM the light TOWARD the scene (renderer::ClusterResolvePass's own convention).
+    float sunIlluminance;   // Sun disk illuminance scale (lux-ish, matches this engine's own real-photometric recalibration).
+} pc;
+
+// --- Physical constants (Bruneton/Hillaire reference values, Earth-like atmosphere, all in km) ---
+const float kGroundRadiusKm = 6360.0;
+const float kAtmosphereTopRadiusKm = 6460.0;
+const float kAtmosphereThicknessKm = kAtmosphereTopRadiusKm - kGroundRadiusKm;
+
+const vec3 kRayleighScatterCoeff = vec3(5.802e-3, 13.558e-3, 33.1e-3); // per km
+const float kRayleighScaleHeightKm = 8.0;
+
+const float kMieScatterCoeff = 3.996e-3; // per km, achromatic
+const float kMieAbsorptionCoeff = 4.40e-3; // per km
+const float kMieExtinctionCoeff = kMieScatterCoeff + kMieAbsorptionCoeff;
+const float kMieScaleHeightKm = 1.2;
+const float kMiePhaseG = 0.8;
+
+// Ozone: triangular absorption layer centered at 25km altitude, 30km total width, chromatic
+// (responsible for the sky's deep blue -- ozone absorbs almost no blue, moderately absorbs red/green).
+const vec3 kOzoneAbsorptionCoeff = vec3(0.650e-3, 1.881e-3, 0.085e-3); // per km
+const float kOzoneLayerCenterKm = 25.0;
+const float kOzoneLayerHalfWidthKm = 15.0;
+
+// Fixed camera altitude above the ground sphere used for Sky-View LUT generation -- the LUT's own
+// two axes (azimuth-relative-to-sun, elevation) already fully describe "what does the sky look like
+// from here", so a 3rd (camera height) axis is not worth the extra LUT dimension for this demo's
+// scope (a ground-level/near-ground vantage, matching a walking-height camera). Real world-space
+// camera Y is NOT used here -- seeUnrealistically large per-scene-unit heights would put the demo's
+// small-scale geometry off the literal Earth-radius scale this raymarch operates on; only the SKY
+// LOOK depends on this constant, not the demo scene's own rendering.
+const float kCameraHeightAboveGroundKm = 0.5;
+
+const int kTransmittanceSteps = 40;
+const int kMultiScatterSteps = 20;
+const int kMultiScatterDirectionCount = 32;
+const int kSkyViewSteps = 32;
+
+// --- Shared physics ---
+
+float RayleighPhase(float cosTheta) {
+    return (3.0 / (16.0 * ATMOS_PI)) * (1.0 + cosTheta * cosTheta);
+}
+
+// Henyey-Greenstein Mie phase function.
+float MiePhase(float cosTheta, float g) {
+    float g2 = g * g;
+    float denom = 4.0 * ATMOS_PI * pow(max(1.0 + g2 - 2.0 * g * cosTheta, 1.0e-6), 1.5);
+    return (1.0 - g2) / denom;
+}
+
+// Ray/sphere intersection, sphere centered at the planet's own origin. Returns false (no valid
+// forward intersection) when the ray points entirely away from the sphere. `t0` may be negative
+// (origin already inside the sphere) -- callers use max(t0, 0.0) themselves.
+bool RaySphereIntersect(vec3 ro, vec3 rd, float radius, out float t0, out float t1) {
+    float b = dot(ro, rd);
+    float c = dot(ro, ro) - radius * radius;
+    float discriminant = b * b - c;
+    if (discriminant < 0.0) {
+        t0 = t1 = -1.0;
+        return false;
+    }
+    float sq = sqrt(discriminant);
+    t0 = -b - sq;
+    t1 = -b + sq;
+    return t1 >= 0.0;
+}
+
+// Rayleigh/Mie/ozone number densities at `heightKm` above the ground sphere (NOT distance from
+// planet center -- callers pass length(pos) - kGroundRadiusKm).
+vec3 GetDensities(float heightKm) {
+    float rayleigh = exp(-max(heightKm, 0.0) / kRayleighScaleHeightKm);
+    float mie = exp(-max(heightKm, 0.0) / kMieScaleHeightKm);
+    float ozone = max(0.0, 1.0 - abs(heightKm - kOzoneLayerCenterKm) / kOzoneLayerHalfWidthKm);
+    return vec3(rayleigh, mie, ozone);
+}
+
+vec3 GetExtinction(float heightKm) {
+    vec3 d = GetDensities(heightKm);
+    return d.x * kRayleighScatterCoeff + d.y * kMieExtinctionCoeff + d.z * kOzoneAbsorptionCoeff;
+}
+
+// How far along `rd` from `ro` (both in the planet-centered frame) this ray travels before either
+// leaving the atmosphere's top boundary or hitting the ground -- whichever comes first. `hitGround`
+// tells the caller whether to treat the far end as an opaque surface (no more sky beyond it).
+float AtmosphereMarchDistance(vec3 ro, vec3 rd, out bool hitGround) {
+    float tGround0, tGround1;
+    bool hasGround = RaySphereIntersect(ro, rd, kGroundRadiusKm, tGround0, tGround1);
+    float tTop0, tTop1;
+    RaySphereIntersect(ro, rd, kAtmosphereTopRadiusKm, tTop0, tTop1);
+    float tTop = max(tTop1, 0.0);
+
+    if (hasGround && tGround0 > 0.0) {
+        hitGround = true;
+        return tGround0;
+    }
+    hitGround = false;
+    return tTop;
+}
+
+// --- mode 0: Transmittance LUT -------------------------------------------------------------------
+
+void ComputeTransmittanceLUT(ivec2 pixel) {
+    vec2 uv = (vec2(pixel) + 0.5) / vec2(pc.outputWidth, pc.outputHeight);
+
+    float heightKm = uv.y * kAtmosphereThicknessKm;
+    float cosTheta = clamp(uv.x * 2.0 - 1.0, -1.0, 1.0);
+    float sinTheta = sqrt(max(1.0 - cosTheta * cosTheta, 0.0));
+
+    vec3 ro = vec3(0.0, kGroundRadiusKm + heightKm, 0.0);
+    vec3 rd = normalize(vec3(sinTheta, cosTheta, 0.0));
+
+    bool hitGround;
+    float marchDistance = AtmosphereMarchDistance(ro, rd, hitGround);
+
+    vec3 opticalDepth = vec3(0.0);
+    float stepSize = marchDistance / float(kTransmittanceSteps);
+    for (int i = 0; i < kTransmittanceSteps; ++i) {
+        float t = (float(i) + 0.5) * stepSize; // Midpoint rule.
+        vec3 samplePos = ro + rd * t;
+        float sampleHeight = length(samplePos) - kGroundRadiusKm;
+        opticalDepth += GetExtinction(sampleHeight) * stepSize;
+    }
+
+    vec3 transmittance = exp(-opticalDepth);
+    imageStore(g_TransmittanceStorage, pixel, vec4(transmittance, 1.0));
+}
+
+// --- mode 1: Multi-Scattering LUT -----------------------------------------------------------------
+
+// Fibonacci sphere: kMultiScatterDirectionCount roughly-uniformly distributed unit directions,
+// deterministic (no RNG state needed) and cheap -- standard technique for a fixed, small direction
+// sample set (see e.g. renderer::WorldProbeGridPass's own probe-direction sampling for the same
+// pattern applied elsewhere in this codebase).
+vec3 FibonacciSphereDirection(int i, int n) {
+    float goldenAngle = ATMOS_PI * (3.0 - sqrt(5.0));
+    float y = 1.0 - (2.0 * float(i) + 1.0) / float(n);
+    float radius = sqrt(max(1.0 - y * y, 0.0));
+    float theta = goldenAngle * float(i);
+    return vec3(cos(theta) * radius, y, sin(theta) * radius);
+}
+
+void ComputeMultiScatteringLUT(ivec2 pixel) {
+    vec2 uv = (vec2(pixel) + 0.5) / vec2(pc.outputWidth, pc.outputHeight);
+
+    float cosSunZenith = clamp(uv.x * 2.0 - 1.0, -1.0, 1.0);
+    float heightKm = uv.y * kAtmosphereThicknessKm;
+
+    vec3 ro = vec3(0.0, kGroundRadiusKm + heightKm, 0.0);
+    // Local frame: sun lies in the XY plane at this texel's cosSunZenith -- consistent with
+    // ComputeSkyViewLUT()'s own sun-relative sampling of this same LUT (both only ever read it via
+    // (cosSunZenith, height), never via a stored direction, so the in-plane choice here is arbitrary
+    // but must stay self-consistent, which it trivially is within this one file).
+    float sinSunZenith = sqrt(max(1.0 - cosSunZenith * cosSunZenith, 0.0));
+    vec3 sunDir = vec3(sinSunZenith, cosSunZenith, 0.0);
+
+    vec3 totalSecondOrderScatter = vec3(0.0);
+    vec3 totalScatterFraction = vec3(0.0);
+
+    for (int dirIndex = 0; dirIndex < kMultiScatterDirectionCount; ++dirIndex) {
+        vec3 rd = FibonacciSphereDirection(dirIndex, kMultiScatterDirectionCount);
+
+        bool hitGround;
+        float marchDistance = AtmosphereMarchDistance(ro, rd, hitGround);
+        float stepSize = marchDistance / float(kMultiScatterSteps);
+
+        vec3 throughput = vec3(1.0); // Accumulated camera-to-sample transmittance.
+        vec3 scatterSum = vec3(0.0);
+        vec3 fractionSum = vec3(0.0);
+
+        for (int i = 0; i < kMultiScatterSteps; ++i) {
+            float t = (float(i) + 0.5) * stepSize;
+            vec3 samplePos = ro + rd * t;
+            float sampleHeight = length(samplePos) - kGroundRadiusKm;
+            vec3 densities = GetDensities(sampleHeight);
+            vec3 extinction = GetExtinction(sampleHeight);
+            vec3 scatterCoeff = densities.x * kRayleighScatterCoeff + densities.y * vec3(kMieScatterCoeff);
+
+            vec3 stepTransmittance = exp(-extinction * stepSize);
+
+            // Sun visibility at this sample: ground-shadow test + Transmittance LUT lookup (reused,
+            // not re-raymarched -- see this file's own header comment).
+            float sunT0, sunT1;
+            bool sunBlocked = RaySphereIntersect(samplePos, sunDir, kGroundRadiusKm, sunT0, sunT1) && sunT0 > 0.0;
+            vec3 sunTransmittance = vec3(0.0);
+            if (!sunBlocked) {
+                float sampleCosSunZenith = clamp(dot(normalize(samplePos), sunDir), -1.0, 1.0);
+                vec2 transUV = vec2(sampleCosSunZenith * 0.5 + 0.5, clamp(sampleHeight / kAtmosphereThicknessKm, 0.0, 1.0));
+                sunTransmittance = texture(g_TransmittanceSampler, transUV).rgb;
+            }
+
+            // Isotropic single-scatter estimate at this sample (phase = 1/(4*pi), the standard
+            // multi-scatter-LUT simplification -- see this file's own header comment).
+            vec3 inscatter = scatterCoeff * (1.0 / (4.0 * ATMOS_PI)) * sunTransmittance * pc.sunIlluminance;
+            scatterSum += throughput * inscatter * stepSize;
+            // Average single-scattering albedo along the path -- feeds the geometric-series closed
+            // form below (Hillaire's own f_ms term).
+            fractionSum += throughput * scatterCoeff * stepSize;
+
+            throughput *= stepTransmittance;
+        }
+
+        totalSecondOrderScatter += scatterSum;
+        totalScatterFraction += fractionSum;
+    }
+
+    totalSecondOrderScatter /= float(kMultiScatterDirectionCount);
+    totalScatterFraction /= float(kMultiScatterDirectionCount);
+
+    // Closed-form infinite-bounce geometric series (Hillaire 2020, section 5.1): each further
+    // scattering order multiplies by the same average single-scatter albedo `f_ms`, so the infinite
+    // sum telescopes to L2 / (1 - f_ms). Clamped away from 1 to avoid the (physically impossible for
+    // a real, absorbing atmosphere) divide-by-zero blowup a slightly-too-optimistic direction sample
+    // set could otherwise produce.
+    vec3 fMs = clamp(totalScatterFraction, vec3(0.0), vec3(0.99));
+    vec3 multiScatter = totalSecondOrderScatter / (vec3(1.0) - fMs);
+
+    imageStore(g_MultiScatteringStorage, pixel, vec4(multiScatter, 1.0));
+}
+
+// --- mode 2: Sky-View LUT ---------------------------------------------------------------------
+
+void ComputeSkyViewLUT(ivec2 pixel) {
+    vec2 uv = (vec2(pixel) + 0.5) / vec2(pc.outputWidth, pc.outputHeight);
+
+    vec3 sunDirToScene = normalize(vec3(pc.sunDirX, pc.sunDirY, pc.sunDirZ));
+    vec3 rd = SkyViewLUTDirectionFromUV(uv, sunDirToScene);
+    vec3 sunDir = -sunDirToScene; // Direction FROM the scene TOWARD the sun (raymarch needs this).
+
+    vec3 ro = vec3(0.0, kGroundRadiusKm + kCameraHeightAboveGroundKm, 0.0);
+
+    bool hitGround;
+    float marchDistance = AtmosphereMarchDistance(ro, rd, hitGround);
+    float stepSize = marchDistance / float(kSkyViewSteps);
+
+    float cosViewSun = dot(rd, sunDir);
+    float rayleighPhaseValue = RayleighPhase(cosViewSun);
+    float miePhaseValue = MiePhase(cosViewSun, kMiePhaseG);
+
+    vec3 throughput = vec3(1.0); // Camera-to-sample transmittance, accumulated along the march.
+    vec3 radiance = vec3(0.0);
+
+    for (int i = 0; i < kSkyViewSteps; ++i) {
+        float t = (float(i) + 0.5) * stepSize;
+        vec3 samplePos = ro + rd * t;
+        float sampleHeight = length(samplePos) - kGroundRadiusKm;
+        vec3 densities = GetDensities(sampleHeight);
+        vec3 extinction = GetExtinction(sampleHeight);
+        vec3 rayleighScatter = densities.x * kRayleighScatterCoeff;
+        float mieScatter = densities.y * kMieScatterCoeff;
+
+        vec3 stepTransmittance = exp(-extinction * stepSize);
+
+        float sunT0, sunT1;
+        bool sunBlocked = RaySphereIntersect(samplePos, sunDir, kGroundRadiusKm, sunT0, sunT1) && sunT0 > 0.0;
+        vec3 sunTransmittance = vec3(0.0);
+        vec3 multiScatterContribution = vec3(0.0);
+        {
+            float sampleCosSunZenith = clamp(dot(normalize(samplePos), sunDir), -1.0, 1.0);
+            vec2 msUV = vec2(sampleCosSunZenith * 0.5 + 0.5, clamp(sampleHeight / kAtmosphereThicknessKm, 0.0, 1.0));
+            multiScatterContribution = texture(g_MultiScatteringSampler, msUV).rgb;
+
+            if (!sunBlocked) {
+                vec2 transUV = vec2(sampleCosSunZenith * 0.5 + 0.5, clamp(sampleHeight / kAtmosphereThicknessKm, 0.0, 1.0));
+                sunTransmittance = texture(g_TransmittanceSampler, transUV).rgb;
+            }
+        }
+
+        // Single scattering (direct sun, phase-weighted) + isotropic multi-scattering (already
+        // integrated over all directions by ComputeMultiScatteringLUT -- no phase weighting needed,
+        // matches Hillaire's own convention of treating multi-scatter as directionally uniform).
+        vec3 singleScatter = (rayleighScatter * rayleighPhaseValue + vec3(mieScatter * miePhaseValue)) * sunTransmittance;
+        vec3 multiScatter = (rayleighScatter + vec3(mieScatter)) * multiScatterContribution;
+
+        radiance += throughput * (singleScatter + multiScatter) * pc.sunIlluminance * stepSize;
+        throughput *= stepTransmittance;
+    }
+
+    // Ground hit: blend in a flat, dim albedo-like ground tint attenuated by whatever throughput
+    // survived the march, so a near-horizon ray that grazes the planet doesn't show a hard black
+    // disc -- a deliberately simple stand-in (this pass has no real terrain albedo to sample; actual
+    // terrain visibility/shading for camera rays that hit THIS demo's own geometry is handled
+    // entirely by the normal Nanite/Lumen pipeline upstream of this LUT, which only ever gets
+    // sampled on a scene-geometry MISS -- see PostProcessComposite.comp's own consumer comment).
+    if (hitGround) {
+        vec3 groundTint = vec3(0.05, 0.045, 0.04);
+        radiance += throughput * groundTint * pc.sunIlluminance * 0.001;
+    }
+
+    imageStore(g_SkyViewStorage, pixel, vec4(radiance, 1.0));
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (pixel.x >= pc.outputWidth || pixel.y >= pc.outputHeight) {
+        return;
+    }
+
+    if (pc.mode == 0) {
+        ComputeTransmittanceLUT(pixel);
+    } else if (pc.mode == 1) {
+        ComputeMultiScatteringLUT(pixel);
+    } else {
+        ComputeSkyViewLUT(pixel);
+    }
+}

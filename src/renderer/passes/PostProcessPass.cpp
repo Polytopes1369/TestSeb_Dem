@@ -31,7 +31,7 @@ namespace renderer {
 
     void PostProcessPass::Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
         VkExtent2D displayExtent, VkImageView hdrColorView, VkImageView bloomView,
-        VkImageView depthView, VkImageView refractionOffsetView) {
+        VkImageView depthView, VkImageView refractionOffsetView, VkImageView skyViewLUTView) {
         Shutdown();
         m_Device = device;
         m_Allocator = allocator;
@@ -132,8 +132,9 @@ namespace renderer {
         // (HistogramSSBO + ExposureStateSSBO), Composite set uses 1 (ExposureStateSSBO read-only).
         std::array<VkDescriptorPoolSize, 4> poolSizes{ {
             // Histogram HDR input + Composite HDR input + Composite g_Bloom (PP2) + Composite
-            // g_Depth + Composite g_RefractionOffset (both PP3).
-            { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 5 },
+            // g_Depth + Composite g_RefractionOffset (both PP3) + Composite g_SkyViewLUT (Atmos
+            // Subtask 2).
+            { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 6 },
             { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1 },          // Composite output.
             { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4 },
             { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 },         // Composite params.
@@ -207,7 +208,7 @@ namespace renderer {
 
         // --- Stage 3: PostProcessComposite.comp ---
         {
-            std::array<VkDescriptorSetLayoutBinding, 7> bindings{ {
+            std::array<VkDescriptorSetLayoutBinding, 8> bindings{ {
                 { 0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // g_HDRColor
                 { 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },          // g_Output
                 { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },         // ExposureStateSSBO
@@ -215,6 +216,7 @@ namespace renderer {
                 { 4, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // g_Bloom (Phase PP2)
                 { 5, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // g_Depth (Phase PP3)
                 { 6, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // g_RefractionOffset (Phase PP3)
+                { 7, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // g_SkyViewLUT (Atmos Subtask 2)
             } };
             VkDescriptorSetLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
             layoutInfo.bindingCount = static_cast<uint32_t>(bindings.size());
@@ -247,9 +249,11 @@ namespace renderer {
         {
             VkDescriptorImageInfo depthInfo{ m_LinearSampler, depthView, VK_IMAGE_LAYOUT_GENERAL };
             VkDescriptorImageInfo refractionInfo{ m_LinearSampler, refractionOffsetView, VK_IMAGE_LAYOUT_GENERAL };
-            std::array<VkWriteDescriptorSet, 2> writes{ {
+            VkDescriptorImageInfo skyViewInfo{ m_LinearSampler, skyViewLUTView, VK_IMAGE_LAYOUT_GENERAL };
+            std::array<VkWriteDescriptorSet, 3> writes{ {
                 { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_CompositeSet, 5, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &depthInfo, nullptr, nullptr },
                 { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_CompositeSet, 6, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &refractionInfo, nullptr, nullptr },
+                { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_CompositeSet, 7, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &skyViewInfo, nullptr, nullptr },
             } };
             vkUpdateDescriptorSets(m_Device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
         }
@@ -395,6 +399,13 @@ namespace renderer {
         params.godRaysDecay = settings.godRaysDecay;
         params.godRaysDensity = settings.godRaysDensity;
         params.godRaysWeight = settings.godRaysWeight;
+
+        // Atmos weather system, Subtask 2: raw sun direction (unlike sunScreenU/V above, NOT
+        // projected -- PostProcessComposite.comp's own SkyViewLUTUVFromDirection() needs the real
+        // 3D direction to reproduce AtmosSkyLUTs.comp's own sun-relative azimuth mapping).
+        params.sunDirWorldX = sunDirection.x;
+        params.sunDirWorldY = sunDirection.y;
+        params.sunDirWorldZ = sunDirection.z;
 
         // Phase PP5: Panini Projection -- half-FOV tangents drive the tangent-space UV remap (see
         // PostProcessComposite.comp's own ApplyPaniniProjection comment). Matches maths::mat4::

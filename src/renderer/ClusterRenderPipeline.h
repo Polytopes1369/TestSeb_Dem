@@ -79,6 +79,7 @@
 #include "renderer/passes/GeometryDecompressionPass.h"
 #include "renderer/streaming/GeometryStreamingCoordinator.h"
 #include "renderer/passes/AtmosClimatePass.h"
+#include "renderer/passes/AtmosSkyPass.h"
 #include "renderer/passes/GlobalSDFPass.h"
 #include "renderer/vulkan/GpuBuffer.h"
 #include "renderer/streaming/GpuGeometryPagePool.h"
@@ -504,6 +505,11 @@ namespace renderer {
         // infrastructure block, ahead of every future consumer (Froxel Fog / Volumetric Clouds,
         // Subtasks 3-4) that will eventually read its AtmosGlobalsUBO the same frame.
         AtmosClimatePass m_AtmosClimate;
+        // Atmos weather system, Subtask 2: Physically Based Sky (Hillaire LUTs) -- see AtmosSkyPass's
+        // own class comment. RecordUpdate() runs right after m_AtmosClimate's own, before anything
+        // that samples GetSkyViewLUTView() this same frame (m_PostProcess, and Debug-only
+        // m_SDFRayMarch).
+        AtmosSkyPass m_AtmosSky;
         // Sun direction is fixed by default; one point light is authored in Init() specifically to
         // exercise/verify Phase 3's point-light Virtual Shadow Maps (see Init()'s own comment) --
         // see renderer::LightingTypes.h's own comment for the full field-by-field default.
