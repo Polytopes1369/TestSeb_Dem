@@ -468,11 +468,27 @@ bool ClusterRenderPipeline::Init(
   // (RGBA8_UNORM, matching ClusterResolvePass::kOutputAlbedoFormat's own choice of format for the
   // exact same "simplest, most broadly supported color-attachment-and-storage-capable format"
   // reason) -- see renderer::VirtualTextureConfig's own struct defaults for the virtual space/tile/
-  // border/physical-capacity sizing this demo uses unmodified. Always Init()'d and always wired into
-  // m_Resolve's descriptor sets below regardless of config::lumen::BUILD_VIRTUAL_TEXTURES (that flag
-  // only gates the expensive per-frame disk-streaming work, see VirtualTextureStreamingCoordinator::
-  // RecordBeginFrame's own comment) -- exactly like m_VirtualShadowMap's own unconditional Init()
-  // above, gated the same way by config::lumen::BUILD_SHADOWS instead.
+  // border/physical-capacity sizing this demo uses unmodified. m_VTManager.Init() below (and the
+  // m_Resolve descriptor wiring further down) run UNCONDITIONALLY regardless of
+  // config::lumen::BUILD_VIRTUAL_TEXTURES -- NOT an oversight: ClusterResolvePass's set-0 layout is
+  // fixed at ITS OWN Init() time with bindings 21-24 (g_PageTable/g_PhysicalPools[]/g_VTFeedback/
+  // VirtualTextureVolumeUBO) always present and statically referenced by ClusterResolve.comp /
+  // ClusterResolveBinned.comp, and this engine does not enable
+  // VkPhysicalDeviceVulkan12Features::descriptorBindingPartiallyBound (see
+  // ClusterResolvePass::SetVirtualTexture's own comment) -- so every one of those bindings MUST hold
+  // a valid descriptor before the first RecordResolve()/RecordResolveBinned() call, and both of those
+  // run every frame unconditionally too (not gated by this flag either). Skipping m_VTManager's own
+  // Init() when the flag is off would leave those bindings unwritten -- a validation error (and
+  // undefined behavior on drivers that don't catch it) on the very first frame. Only m_VTRenderPass
+  // further below (the on-demand PAGE RENDERING half -- see its own class comment) is actually gated:
+  // SetVirtualTexture()'s signature (below) never takes a VirtualTextureRenderPass reference, so its
+  // Init() is not part of this mandatory descriptor contract, and (today) it is also never driven by
+  // any real per-frame caller even when the flag is on (RequestPage() has zero production call sites
+  // -- see m_VTBounds' own comment below) -- so gating it is free, both in the "feature off" case and,
+  // right now, in the "feature on" case too. Matches m_VirtualShadowMap's own unconditional Init()
+  // above under config::lumen::BUILD_SHADOWS for the identical descriptor-validity reason (see
+  // VirtualShadowMapPass's own class comment) -- only the gated HALF differs (there, per-frame
+  // capture work; here, m_VTRenderPass's Init()) because the two systems' consumers differ.
   VirtualTextureConfig vtConfig{};
   std::vector<VkFormat> vtPoolFormats{ VK_FORMAT_R8G8B8A8_UNORM };
   if (!m_VTManager.Init(createInfo.physicalDevice, createInfo.device, createInfo.allocator,
@@ -484,11 +500,20 @@ bool ClusterRenderPipeline::Init(
   // Default volume bounds (see VirtualTextureVolumeBounds' own struct defaults, [-8,8]^2 XZ / [-4,4]
   // Y) already cover this demo's scene bounding sphere (~6.4m radius, see VirtualShadowMapPass's own
   // scene-bounds read) with generous margin -- kept as-is rather than re-deriving from the geometry
-  // cache file's own bounds.
+  // cache file's own bounds. Computed unconditionally: m_Resolve.SetVirtualTexture() further below
+  // reads it regardless of config::lumen::BUILD_VIRTUAL_TEXTURES (see this scope's opening comment).
   m_VTBounds = VirtualTextureVolumeBounds{};
-  if (!m_VTRenderPass.Init(createInfo.device, &m_VTManager, m_VTBounds)) {
-    LOG_ERROR("[ClusterRenderPipeline] Failed to initialize VirtualTextureRenderPass.");
-    return false;
+  // config::lumen::BUILD_VIRTUAL_TEXTURES gate: see this scope's opening comment for why ONLY
+  // m_VTRenderPass's Init() (not m_VTManager's/m_VTStreaming's, both above/below) can safely skip
+  // its setup when the feature is off. VirtualTextureRenderPass::Init() itself is pure CPU work (one
+  // view-projection matrix, no Vulkan resources -- see that method's own body), so today this mainly
+  // documents intent/saves a log line; it still future-proofs this call site against that class
+  // growing real GPU setup later without anyone having to remember to gate it retroactively.
+  if (config::lumen::BUILD_VIRTUAL_TEXTURES) {
+    if (!m_VTRenderPass.Init(createInfo.device, &m_VTManager, m_VTBounds)) {
+      LOG_ERROR("[ClusterRenderPipeline] Failed to initialize VirtualTextureRenderPass.");
+      return false;
+    }
   }
 
   // Streams previously-baked tiles back from disk (.vtcache, sibling to the geometry .cache file at
@@ -497,7 +522,8 @@ bool ClusterRenderPipeline::Init(
   // on a from-scratch run -- this demo has no offline VT bake step wired up yet, matching this
   // phase's own scope: the streaming PLUMBING is real and complete, the content SOURCE is future
   // work, exactly like VirtualTextureRenderPass itself is not yet driven by any real page-visibility
-  // system either).
+  // system either). Init()'d unconditionally, same descriptor-validity reason as m_VTManager above --
+  // GetFeedbackDeviceBuffer() below feeds binding 23, which SetVirtualTexture() must always populate.
   std::filesystem::path vtCacheFilePath = createInfo.cacheFilePath;
   vtCacheFilePath.replace_extension(".vtcache");
   if (!m_VTStreaming.Init(createInfo.device, createInfo.allocator, createInfo.commandPool,
