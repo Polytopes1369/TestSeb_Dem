@@ -92,6 +92,25 @@ layout(std140, set = 1, binding = 2) uniform PrecipitationParamsUBO {
     float snowFallSpeed; float snowWobbleStrength; float _pad0; float _pad1;
 } g_Precip;
 
+// Subtask C2 (screen-space depth-buffer collision) -- this frame's camera matrices, mirroring
+// renderer::ParticleSystemPass.cpp's own (anonymous-namespace) ParticleDepthCollisionUBO byte-for-
+// byte. `viewportWidth`/`viewportHeight` feed the depth-gradient normal estimate below (texel size).
+layout(std140, set = 1, binding = 3) uniform ParticleDepthCollisionUBO {
+    mat4 viewProj;
+    mat4 invViewProj;
+    float viewportWidth;
+    float viewportHeight;
+} g_DepthCollision;
+
+// Subtask C2: `resolvePass`'s SAME sampled GBuffer depth copy ParticleRender.frag's own soft-particle
+// fade already samples (renderer::ClusterResolvePass::GetOutputDepthView(), R32_SFLOAT, raw NDC z,
+// reversed-Z: near = 1.0, far = 0.0, cleared to 0.0 for sky/no-geometry) -- bound a SECOND time here,
+// with this pass' own dedicated compute-stage sampler (renderer::ParticleSystemPass::Init's own
+// m_ComputeSceneDepthSampler), since a COMPUTE shader cannot share the fragment-stage-only binding
+// ParticleRender.frag uses (a different descriptor set entirely -- see that shader's own header
+// comment for why a depth ATTACHMENT needs a separate sampled copy in the first place).
+layout(set = 1, binding = 4) uniform sampler2D g_SceneDepthCompute;
+
 layout(push_constant) uniform ParticleSimulationPC {
     float dt;
     float time;
@@ -194,6 +213,94 @@ vec3 RandomInUnitSphere(inout uint seed) {
 vec3 SampleCurlTurbulence(vec3 worldPos, float time, float scale) {
     vec3 scrolledPos = worldPos * scale + vec3(time * 0.15, -time * 0.1, time * 0.05);
     return AtmosFractalCurlNoise3D(scrolledPos, 1.0, 3.0, 0.5);
+}
+
+// Subtask C2 (Niagara-parity roadmap: screen-space depth-buffer collision) -- a secondary collision
+// mode alongside the existing Global SDF one (SampleGlobalSDF above), gated per-emitter by
+// EmitterParams.depthCollisionEnabled. Reconstructs the opaque scene's world position under `pos`'s
+// current screen-space location from `resolvePass`'s sampled GBuffer depth copy, exactly the same
+// inverse-view-projection approach ParticleRender.frag's own soft-particle fade already uses (see
+// that shader's own header comment) -- just run in reverse here: that fragment shader starts from a
+// screen pixel and reconstructs the WORLD position under it; this function starts from a WORLD
+// position (the particle) and projects FORWARD to find which screen pixel/depth-sample to compare
+// against, then reconstructs the scene surface position from that same sample the same way.
+//
+// This is a fallback/supplement to the Global SDF collision above, not a replacement: SampleGlobalSDF
+// returns a large "no data" sentinel (1.0e4) for any world position outside every clipmap level's
+// currently-streamed window (see that function's own comment), silently skipping the SDF branch with
+// no collision response at all in that case -- exactly the situation this mode is meant to catch
+// (camera-relative dynamic geometry the SDF clipmap has not (re)captured yet, e.g. a just-streamed
+// cell). Returns false (leaving `pos`/`vel` untouched) whenever there is nothing meaningful to test
+// against (behind the camera, off-screen, sky, or not yet penetrating), so calling this unconditionally
+// right after the SDF branch (regardless of whether the SDF branch itself already resolved a bounce
+// this frame) is always safe -- see UpdateParticle's own call site comment.
+bool ResolveDepthBufferCollision(inout vec3 pos, inout vec3 vel, float bounceElasticity, float friction) {
+    vec4 clip = g_DepthCollision.viewProj * vec4(pos, 1.0);
+    if (clip.w <= 1.0e-4) {
+        return false; // Behind (or exactly at) the camera -- no meaningful projection.
+    }
+    vec3 ndc = clip.xyz / clip.w;
+    if (abs(ndc.x) > 1.0 || abs(ndc.y) > 1.0) {
+        return false; // Off-screen -- the depth buffer simply has no data for this particle's own position.
+    }
+
+    vec2 screenUV = ndc.xy * 0.5 + 0.5;
+    float sceneNdcDepth = texture(g_SceneDepthCompute, screenUV).r;
+    // Reversed-Z (near = 1.0, far = 0.0): sceneNdcDepth <= 0.0 means sky/no-geometry-hit at this pixel
+    // (renderer::ClusterResolvePass's own g_OutputDepth clear-to-0 convention, see ParticleRender.
+    // frag's own identical check) -- nothing to collide against. Otherwise the particle has only just
+    // penetrated the opaque surface once its OWN ndc.z drops BELOW the scene's (reversed-Z: smaller z
+    // is farther from the camera), the reversed-Z analogue of a standard "particle_z > scene_z means
+    // occluded" depth test.
+    if (sceneNdcDepth <= 0.0 || ndc.z >= sceneNdcDepth) {
+        return false;
+    }
+
+    vec4 sceneClip = vec4(ndc.xy, sceneNdcDepth, 1.0);
+    vec4 sceneWorld4 = g_DepthCollision.invViewProj * sceneClip;
+    vec3 sceneWorldPos = sceneWorld4.xyz / sceneWorld4.w;
+
+    // Approximate the local surface normal from the screen-space depth gradient (forward differences,
+    // one texel step in each screen axis) rather than a true geometric normal -- this compute stage has
+    // no separate normal GBuffer bound (renderer::ClusterResolvePass's own normal image is a different
+    // binding entirely, not wired here), and a depth-gradient normal is the standard cheap
+    // approximation for screen-space collision response. A neighbor sample landing on the sky (0.0)
+    // would poison the gradient with a huge false discontinuity -- fall back to re-using the center
+    // depth for that one axis instead (a locally flat approximation is far closer to correct than a
+    // fake cliff-edge at every silhouette).
+    vec2 texel = 1.0 / max(vec2(g_DepthCollision.viewportWidth, g_DepthCollision.viewportHeight), vec2(1.0));
+    float depthDX = texture(g_SceneDepthCompute, screenUV + vec2(texel.x, 0.0)).r;
+    float depthDY = texture(g_SceneDepthCompute, screenUV + vec2(0.0, texel.y)).r;
+    if (depthDX <= 0.0) depthDX = sceneNdcDepth;
+    if (depthDY <= 0.0) depthDY = sceneNdcDepth;
+
+    vec4 worldDX4 = g_DepthCollision.invViewProj * vec4(ndc.xy + vec2(2.0 * texel.x, 0.0), depthDX, 1.0);
+    vec4 worldDY4 = g_DepthCollision.invViewProj * vec4(ndc.xy + vec2(0.0, 2.0 * texel.y), depthDY, 1.0);
+    vec3 worldPosDX = worldDX4.xyz / worldDX4.w;
+    vec3 worldPosDY = worldDY4.xyz / worldDY4.w;
+
+    vec3 n = cross(worldPosDX - sceneWorldPos, worldPosDY - sceneWorldPos);
+    float nLen = length(n);
+    n = nLen > 1.0e-8 ? (n / nLen) : vec3(0.0, 1.0, 0.0);
+    // Force the normal to oppose the incoming velocity -- the forward-difference cross product's sign
+    // depends on screen-space winding, not the true outward surface direction, so this is the only
+    // reliable way to guarantee reflect() below bounces the particle AWAY from the surface rather than
+    // deeper into it.
+    if (dot(n, vel) > 0.0) {
+        n = -n;
+    }
+
+    // No true signed-distance field is available here (only a single depth sample per pixel, not a
+    // volumetric field like Global SDF), so the particle is pushed back out to the reconstructed
+    // surface point plus a small fixed skin thickness instead of an exact penetration-depth offset.
+    const float kPushOutEpsilon = 0.02;
+    pos = sceneWorldPos + n * kPushOutEpsilon;
+
+    vec3 reflected = reflect(vel, n);
+    float normalSpeed = dot(reflected, n);
+    vec3 tangentVelocity = reflected - n * normalSpeed;
+    vel = n * normalSpeed * bounceElasticity + tangentVelocity * friction;
+    return true;
 }
 
 // Subtask A4 (color-over-life / size-over-life curves): shared bracketing-key math for both
@@ -444,6 +551,20 @@ void UpdateParticle(uint slotIndex) {
             float normalSpeed = dot(reflected, n);
             vec3 tangentVelocity = reflected - n * normalSpeed;
             p.velocity = n * normalSpeed * e.bounceElasticity + tangentVelocity * e.friction;
+        }
+
+        // --- Subtask C2: screen-space depth-buffer collision (secondary/fallback mode) ---
+        // Runs unconditionally after the Global SDF branch above (not nested inside its `dist < 0.0`
+        // block) -- see ResolveDepthBufferCollision's own header comment for why this is always safe:
+        // it is a no-op whenever the particle isn't actually penetrating the reconstructed depth-buffer
+        // surface, which is already true immediately after the SDF branch just pushed it back out.
+        if (e.depthCollisionEnabled != 0u) {
+            vec3 depthPos = newPosition;
+            vec3 depthVel = p.velocity;
+            if (ResolveDepthBufferCollision(depthPos, depthVel, e.bounceElasticity, e.friction)) {
+                newPosition = depthPos;
+                p.velocity = depthVel;
+            }
         }
 
         // --- Subtask A4: color-over-life / size-over-life curves ---

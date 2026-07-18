@@ -1523,6 +1523,10 @@ void ClusterRenderPipeline::RecordFrameEarly(VkCommandBuffer cmdEarly,
             gpu.sizeCurve[key] = cfg.sizeCurve[key];
         }
 
+        // Subtask C2 (screen-space depth-buffer collision): same "copy the live ImGui-edited config
+        // value into this frame's GPU struct" pattern as every other field above.
+        gpu.depthCollisionEnabled = cfg.depthCollisionEnabled ? 1u : 0u;
+
         if (cfg.active) {
           m_ParticleSpawnAccumulator[i] += cfg.spawnRate * particleDeltaTimeSeconds;
         }
@@ -1557,7 +1561,13 @@ void ClusterRenderPipeline::RecordFrameEarly(VkCommandBuffer cmdEarly,
       // (see that array's own comment) -- it rides the SAME per-emitter particleEmitters/
       // particleSpawnCounts arrays built by the loop above, needing no separate accumulator, position,
       // or RecordSimulate parameter of its own.
+      // Subtask C2 (screen-space depth-buffer collision): `viewProj`/`invViewProj` are the SAME
+      // combined camera matrices this frame's resolve/rasterization passes already computed above
+      // (see this function's own earlier "Every stage of this frame consumes the SAME combined
+      // matrix" comment) -- reused here unmodified so ParticleSimulation.comp's forward screen-space
+      // projection matches exactly what produced m_Resolve's own depth copy this frame.
       m_ParticleSystem.RecordSimulate(cmdEarly, m_GlobalSDF, particleDeltaTimeSeconds, globalTimeSeconds,
+          viewProj, invViewProj, m_RenderExtent,
           particleEmitters, particleSpawnCounts,
           precipCenterWorld, precipSpawnCount, precipKind,
           config::atmos::PRECIPITATION_SPAWN_RADIUS_METERS, config::atmos::PRECIPITATION_SPAWN_HEIGHT_ABOVE_CAMERA_METERS,

@@ -546,6 +546,14 @@ struct EmitterConfig {
         { 1.0f, 1.0f, 1.0f, 1.0f }, { 1.0f, 1.0f, 1.0f, 1.0f }
     };
     float sizeCurve[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+
+    // Subtask C2 (Niagara-parity roadmap: screen-space depth-buffer collision) -- deliberately added
+    // at the END of this struct (same convention module-stack roadmap subtask A3's own trailing
+    // fields already established, see that comment above) so every existing positional
+    // EmitterConfig{...} aggregate initializer below keeps relying on this new field's own default
+    // member initializer rather than needing to be rewritten. See renderer::ParticleSystemPass::
+    // EmitterParams::depthCollisionEnabled's own declaration comment for the full contract.
+    bool depthCollisionEnabled = false;
 };
 
 // Slot 0 preserves the ORIGINAL single-emitter defaults exactly (same position/spawn rate/physics

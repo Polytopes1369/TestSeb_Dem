@@ -110,6 +110,15 @@ struct EmitterParams {
     // vec4 multiple.
     vec4 colorCurve[4];
     float sizeCurve[4];
+
+    // Subtask C2 (Niagara-parity roadmap: screen-space depth-buffer collision) -- mirrors renderer::
+    // ParticleSystemPass::EmitterParams::depthCollisionEnabled (src/renderer/passes/
+    // ParticleSystemPass.h) byte-for-byte, see that field's own declaration comment for the full
+    // contract and ParticleSimulation.comp's own ResolveDepthBufferCollision for the consuming logic.
+    // `_padC2b`/`_padC2c` reserve the rest of this 16-byte slot for subtasks C3/C4, landing in the
+    // same contiguous block immediately after this one.
+    uint depthCollisionEnabled;
+    float _padC2a, _padC2b, _padC2c;
 };
 
 // Particle "kind" tag, packed into Particle.randomSeed's top 2 bits (see that field's own comment).

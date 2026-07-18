@@ -66,6 +66,18 @@ namespace renderer {
         };
         static_assert(sizeof(PrecipitationParamsUBO) == 48, "PrecipitationParamsUBO must match ParticleSimulation.comp's own UBO exactly (std140 layout)");
 
+        // Subtask C2 (screen-space depth-buffer collision) -- std140 mirror of ParticleSimulation.
+        // comp's own ParticleDepthCollisionUBO (environment set, binding 3). A UBO rather than more
+        // push-constant fields for the same reason as PrecipitationParamsUBO above: two mat4s alone
+        // (128 bytes) would blow straight through ParticleSimulationPC's own <=128-byte budget.
+        // Re-uploaded every RecordSimulate() call (the camera moves every frame).
+        struct ParticleDepthCollisionUBO {
+            maths::mat4 viewProj{};
+            maths::mat4 invViewProj{};
+            float viewportWidth = 0.0f, viewportHeight = 0.0f, _pad0 = 0.0f, _pad1 = 0.0f;
+        };
+        static_assert(sizeof(ParticleDepthCollisionUBO) == 144, "ParticleDepthCollisionUBO must match ParticleSimulation.comp's own UBO exactly (std140 layout)");
+
         // Byte-for-byte mirror of ParticleSort.comp's own SortedPair struct -- 8 bytes, std430
         // (two 4-byte scalars, no padding needed).
         struct SortedPair {
@@ -346,19 +358,43 @@ namespace renderer {
             m_PrecipitationParamsBuffer.Create(allocator, sizeof(PrecipitationParamsUBO),
                 VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
 
-            VkDescriptorSetLayoutBinding envBindings[3]{};
+            // Subtask C2 (screen-space depth-buffer collision): this pass' own ParticleDepthCollisionUBO
+            // (binding 3, re-uploaded every RecordSimulate() call -- see that struct's own declaration
+            // comment) and a SECOND binding of `resolvePass`'s sampled GBuffer depth copy (binding 4,
+            // bound once here, never re-written) via a dedicated compute-stage sampler -- see
+            // m_ComputeSceneDepthSampler's own declaration comment for why this is a separate VkSampler
+            // object from the render pipeline's own m_SceneDepthSampler (STEP 6 below), even though both
+            // use identical NEAREST/CLAMP settings against the exact same underlying image view.
+            m_DepthCollisionParamsBuffer.Create(allocator, sizeof(ParticleDepthCollisionUBO),
+                VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
+
+            VkSamplerCreateInfo computeDepthSamplerInfo{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
+            computeDepthSamplerInfo.magFilter = VK_FILTER_NEAREST;
+            computeDepthSamplerInfo.minFilter = VK_FILTER_NEAREST;
+            computeDepthSamplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+            computeDepthSamplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+            computeDepthSamplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+            computeDepthSamplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+            computeDepthSamplerInfo.minLod = 0.0f;
+            computeDepthSamplerInfo.maxLod = 0.0f;
+            computeDepthSamplerInfo.unnormalizedCoordinates = VK_FALSE;
+            VK_CHECK(vkCreateSampler(m_Device, &computeDepthSamplerInfo, nullptr, &m_ComputeSceneDepthSampler));
+
+            VkDescriptorSetLayoutBinding envBindings[5]{};
             envBindings[0] = { 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
             envBindings[1] = { 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, GlobalSDFPass::kLevelCount, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
             envBindings[2] = { 2, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+            envBindings[3] = { 3, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+            envBindings[4] = { 4, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
 
             VkDescriptorSetLayoutCreateInfo envLayoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-            envLayoutInfo.bindingCount = 3;
+            envLayoutInfo.bindingCount = 5;
             envLayoutInfo.pBindings = envBindings;
             VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &envLayoutInfo, nullptr, &m_EnvironmentSetLayout));
 
             VkDescriptorPoolSize envPoolSizes[2] = {
-                { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2 }, // AtmosGlobalsUBO (binding 0) + PrecipitationParamsUBO (binding 2).
-                { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, GlobalSDFPass::kLevelCount }
+                { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 3 }, // AtmosGlobalsUBO (binding 0) + PrecipitationParamsUBO (binding 2) + ParticleDepthCollisionUBO (binding 3).
+                { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, GlobalSDFPass::kLevelCount + 1 } // Clipmaps (binding 1) + scene depth copy (binding 4).
             };
             VkDescriptorPoolCreateInfo envPoolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
             envPoolInfo.maxSets = 1;
@@ -378,12 +414,16 @@ namespace renderer {
                 clipmapInfos[level] = { m_ClipmapSampler, globalSDF.GetClipmapView(level), VK_IMAGE_LAYOUT_GENERAL };
             }
             VkDescriptorBufferInfo precipParamsInfo{ m_PrecipitationParamsBuffer.Handle(), 0, m_PrecipitationParamsBuffer.Size() };
+            VkDescriptorBufferInfo depthCollisionParamsInfo{ m_DepthCollisionParamsBuffer.Handle(), 0, m_DepthCollisionParamsBuffer.Size() };
+            VkDescriptorImageInfo computeSceneDepthInfo{ m_ComputeSceneDepthSampler, resolvePass.GetOutputDepthView(), VK_IMAGE_LAYOUT_GENERAL };
 
-            VkWriteDescriptorSet envWrites[3]{};
+            VkWriteDescriptorSet envWrites[5]{};
             envWrites[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_EnvironmentSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &atmosGlobalsInfo, nullptr };
             envWrites[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_EnvironmentSet, 1, 0, GlobalSDFPass::kLevelCount, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, clipmapInfos, nullptr, nullptr };
             envWrites[2] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_EnvironmentSet, 2, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &precipParamsInfo, nullptr };
-            vkUpdateDescriptorSets(m_Device, 3, envWrites, 0, nullptr);
+            envWrites[3] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_EnvironmentSet, 3, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &depthCollisionParamsInfo, nullptr };
+            envWrites[4] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_EnvironmentSet, 4, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &computeSceneDepthInfo, nullptr, nullptr };
+            vkUpdateDescriptorSets(m_Device, 5, envWrites, 0, nullptr);
 
             VkDescriptorSetLayout simSetLayouts[2] = { m_SetLayout, m_EnvironmentSetLayout };
             VkPushConstantRange pushRange{ VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(ParticleSimulationPC) };
@@ -715,6 +755,7 @@ namespace renderer {
     }
 
     void ParticleSystemPass::RecordSimulate(VkCommandBuffer cmd, const GlobalSDFPass& globalSDF, float dt, float time,
+        const maths::mat4& viewProj, const maths::mat4& invViewProj, VkExtent2D renderExtent,
         const EmitterParams emitters[kMaxEmitters], const uint32_t spawnCounts[kMaxEmitters],
         const float precipCenterWorld[3], uint32_t precipSpawnCount, uint32_t precipKind,
         float precipSpawnRadiusMeters, float precipSpawnHeightAboveCenterMeters,
@@ -771,6 +812,16 @@ namespace renderer {
         precipUbo.snowFallSpeed = precipSnowFallSpeedMps;
         precipUbo.snowWobbleStrength = precipSnowWobbleStrength;
         vkCmdUpdateBuffer(cmd, m_PrecipitationParamsBuffer.Handle(), 0, sizeof(precipUbo), &precipUbo);
+
+        // Subtask C2 (screen-space depth-buffer collision): this frame's camera matrices, re-uploaded
+        // every call (the camera moves every frame) -- see ParticleDepthCollisionUBO's own declaration
+        // comment for why this needs its own UBO rather than more push-constant fields.
+        ParticleDepthCollisionUBO depthCollisionUbo{};
+        depthCollisionUbo.viewProj = viewProj;
+        depthCollisionUbo.invViewProj = invViewProj;
+        depthCollisionUbo.viewportWidth = static_cast<float>(renderExtent.width);
+        depthCollisionUbo.viewportHeight = static_cast<float>(renderExtent.height);
+        vkCmdUpdateBuffer(cmd, m_DepthCollisionParamsBuffer.Handle(), 0, sizeof(depthCollisionUbo), &depthCollisionUbo);
 
         VulkanUtils::RecordMemoryBarrier(cmd, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
@@ -1127,6 +1178,7 @@ namespace renderer {
             if (m_EnvironmentDescriptorPool != VK_NULL_HANDLE) vkDestroyDescriptorPool(m_Device, m_EnvironmentDescriptorPool, nullptr);
             if (m_EnvironmentSetLayout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(m_Device, m_EnvironmentSetLayout, nullptr);
             if (m_ClipmapSampler != VK_NULL_HANDLE) vkDestroySampler(m_Device, m_ClipmapSampler, nullptr);
+            if (m_ComputeSceneDepthSampler != VK_NULL_HANDLE) vkDestroySampler(m_Device, m_ComputeSceneDepthSampler, nullptr);
 
             if (m_DescriptorPool != VK_NULL_HANDLE) vkDestroyDescriptorPool(m_Device, m_DescriptorPool, nullptr);
             if (m_SetLayout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(m_Device, m_SetLayout, nullptr);
@@ -1151,6 +1203,7 @@ namespace renderer {
         }
 
         m_PrecipitationParamsBuffer.Destroy();
+        m_DepthCollisionParamsBuffer.Destroy();
         m_RenderParamsBuffer.Destroy();
         m_WorldProbeGridParamsBuffer.Destroy();
 
@@ -1177,6 +1230,7 @@ namespace renderer {
         m_EnvironmentSetLayout = VK_NULL_HANDLE;
         m_EnvironmentSet = VK_NULL_HANDLE;
         m_ClipmapSampler = VK_NULL_HANDLE;
+        m_ComputeSceneDepthSampler = VK_NULL_HANDLE;
 
         m_DescriptorPool = VK_NULL_HANDLE;
         m_SetLayout = VK_NULL_HANDLE;

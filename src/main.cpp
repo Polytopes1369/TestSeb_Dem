@@ -1132,6 +1132,11 @@ int main(int argc, char** argv) {
                         ImGui::SliderFloat("Bounce Elasticity", &cfg.bounceElasticity, 0.0f, 1.0f);
                         ImGui::SliderFloat("Friction", &cfg.friction, 0.0f, 1.0f);
                         ImGui::DragFloat("Wind Drag", &cfg.dragCoefficient, 0.02f, 0.0f, 5.0f);
+                        // Subtask C2 (screen-space depth-buffer collision) -- a fallback/supplement to
+                        // the Global SDF collision above, for camera-relative dynamic geometry the SDF
+                        // clipmap has not (re)captured yet. See config::particles::EmitterConfig::
+                        // depthCollisionEnabled's own declaration comment.
+                        ImGui::Checkbox("Depth-Buffer Collision (fallback)", &cfg.depthCollisionEnabled);
 
                         // Module stack roadmap (subtask A3): two independently-toggleable force
                         // modules layered on top of the fixed physics knobs above -- a small,

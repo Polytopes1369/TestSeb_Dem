@@ -173,8 +173,21 @@ namespace renderer {
                 { 1.0f, 1.0f, 1.0f, 1.0f }, { 1.0f, 1.0f, 1.0f, 1.0f }
             };
             float sizeCurve[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+
+            // Subtask C2 (Niagara-parity roadmap: screen-space depth-buffer collision) -- see
+            // ParticleSimulation.comp's own ResolveDepthBufferCollision comment for the full contract:
+            // when nonzero, this emitter's ember particles ALSO resolve a bounce/absorb response
+            // against the opaque scene's reconstructed depth-buffer surface, as a fallback/supplement
+            // to the Global SDF collision above (useful for camera-relative dynamic geometry the SDF
+            // clipmap has not (re)captured yet). `_padC2b`/`_padC2c` reserve the rest of this 16-byte
+            // slot for subtasks C3/C4 (Niagara-parity roadmap), which land immediately after this one
+            // in the SAME contiguous block -- matches this struct's own established per-subtask growth
+            // convention of always closing out a clean 16-byte slot (see e.g. the module-stack
+            // roadmap's own curl-noise/attractor blocks above).
+            uint32_t depthCollisionEnabled = 0;
+            float _padC2a = 0.0f, _padC2b = 0.0f, _padC2c = 0.0f;
         };
-        static_assert(sizeof(EmitterParams) == 192, "EmitterParams must match ParticleCommon.glsl's EmitterParams struct exactly (std430 layout)");
+        static_assert(sizeof(EmitterParams) == 208, "EmitterParams must match ParticleCommon.glsl's EmitterParams struct exactly (std430 layout)");
 
         // Maximum simultaneous emitter slots (multi-emitter roadmap, subtask A1) -- small and fixed
         // (unlike kMaxParticles, no sort/perf pressure motivates a larger number yet; a future
@@ -252,6 +265,13 @@ namespace renderer {
         // TransparentForwardPass's own identical "static addressing" simplification -- the grid's
         // toroidal recentering is not re-uploaded per frame here either, see that class' own Init()
         // comment for why that limitation already exists elsewhere in this codebase).
+        // (Subtask C2) Also binds a NEW environment-set (set 1) resource: `resolvePass`'s SAME
+        // sampled GBuffer depth copy the render pipeline's own set 2 already samples for soft-particle
+        // fade (GetOutputDepthView()), bound here a SECOND time with its own dedicated sampler/binding
+        // so ParticleSimulation.comp (a COMPUTE shader, which never binds set 2) can ALSO reconstruct
+        // the opaque scene's world position under a particle for the new screen-space depth-buffer
+        // collision mode -- see EmitterParams::depthCollisionEnabled and ParticleSimulation.comp's own
+        // ResolveDepthBufferCollision comment for the full contract.
         bool Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
             const AtmosClimatePass& atmosClimate, const GlobalSDFPass& globalSDF, const ClusterResolvePass& resolvePass,
             const VirtualShadowMapPass& vsm, const WorldProbeGridPass& worldProbes,
@@ -357,7 +377,17 @@ namespace renderer {
         // `spawnCounts` mechanism above, not a separate dispatch -- it is authored with a low-gravity,
         // high-drag "Sphere volume drift" recipe (spawnShape == 1, same shape kind as the "Ambient
         // Dust" emitter) positioned at the falls' own base, so it needs no shader-side special case.
+        //
+        // Subtask C2 (screen-space depth-buffer collision): `viewProj`/`invViewProj` are this frame's
+        // SAME combined camera matrices renderer::ClusterRenderPipeline already computed for every
+        // other pass this frame (its own `viewProj`/`invViewProj` locals) -- uploaded here into this
+        // pass' own ParticleDepthCollisionUBO (environment set, binding 3) so ParticleSimulation.comp
+        // can project a particle's world position forward to screen space, sample `resolvePass`'s
+        // depth copy (bound at Init()), and reconstruct the scene surface position back out of it,
+        // exactly like ParticleRender.frag's own soft-particle fade does -- see that shader's own
+        // header comment and ResolveDepthBufferCollision's own comment for the shared math.
         void RecordSimulate(VkCommandBuffer cmd, const GlobalSDFPass& globalSDF, float dt, float time,
+            const maths::mat4& viewProj, const maths::mat4& invViewProj, VkExtent2D renderExtent,
             const EmitterParams emitters[kMaxEmitters], const uint32_t spawnCounts[kMaxEmitters],
             const float precipCenterWorld[3], uint32_t precipSpawnCount, uint32_t precipKind,
             float precipSpawnRadiusMeters, float precipSpawnHeightAboveCenterMeters,
@@ -494,6 +524,16 @@ namespace renderer {
         // -- see that method's own comment. 48 bytes, GPU_ONLY, same vkCmdUpdateBuffer-then-barrier
         // idiom as AtmosClimatePass::RecordUpdate's own AtmosGlobalsUBO upload.
         GpuBuffer m_PrecipitationParamsBuffer;
+
+        // Subtask C2 (screen-space depth-buffer collision) -- environment set binding 3
+        // (ParticleDepthCollisionUBO: viewProj/invViewProj/viewportSize) and binding 4 (`resolvePass`'s
+        // sampled GBuffer depth copy, bound a SECOND time here with this pass' OWN dedicated sampler --
+        // see Init()'s own comment for why a compute-stage binding needs this separate from the render
+        // pipeline's own set 2 sampler, m_SceneDepthSampler below). The UBO is re-uploaded every
+        // RecordSimulate() call (the camera moves every frame), same vkCmdUpdateBuffer-then-barrier
+        // idiom as m_PrecipitationParamsBuffer just above.
+        GpuBuffer m_DepthCollisionParamsBuffer;
+        VkSampler m_ComputeSceneDepthSampler = VK_NULL_HANDLE; // Nearest -- same rationale as m_SceneDepthSampler's own declaration comment.
 
         VkPipelineLayout m_SimPipelineLayout = VK_NULL_HANDLE;
         VkPipeline m_SimPipeline = VK_NULL_HANDLE;
