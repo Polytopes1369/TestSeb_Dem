@@ -114,7 +114,7 @@ namespace renderer {
 
     } // namespace
 
-    bool ParticleSystemPass::Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
+    bool ParticleSystemPass::Init(VkPhysicalDevice physicalDevice, VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
         const AtmosClimatePass& atmosClimate, const GlobalSDFPass& globalSDF, const ClusterResolvePass& resolvePass,
         const VirtualShadowMapPass& vsm, const WorldProbeGridPass& worldProbes,
         VkFormat colorFormat, VkFormat depthFormat) {
@@ -709,6 +709,54 @@ namespace renderer {
             vkDestroyShaderModule(m_Device, fragModule, nullptr);
         }
 
+        // =====================================================================================
+        // STEP 7 (subtask E2) -- GPU timestamp query profiling, Debug-only: a single 6-query
+        // VK_QUERY_TYPE_TIMESTAMP pool bracketing RecordSimulate()/RecordSort()/RecordDraw()'s own
+        // GPU work every frame (see m_TimestampQueryPool's own declaration comment for the exact
+        // index layout). `physicalDevice` is queried here ONLY for VkPhysicalDeviceLimits::
+        // timestampComputeAndGraphics/timestampPeriod -- this pass' own graphics queue is used for
+        // BOTH the compute dispatches (RecordSimulate/RecordSort, on cmdEarly) and the graphics draw
+        // (RecordDraw, on cmdLate), so timestampComputeAndGraphics is the exact guarantee needed
+        // ("timestamps work on every queue family that advertises GRAPHICS_BIT or COMPUTE_BIT"), no
+        // separate per-queue-family timestampValidBits query is required on top of it. Gracefully
+        // degrades (m_TimestampQueriesSupported = false, every GetLastXxxMs() accessor returns
+        // 0.0f) on the rare GPU/driver that reports this as VK_FALSE, instead of ever hitting a
+        // validation error from writing/copying a timestamp query on an unsupported queue.
+        // =====================================================================================
+#ifndef NDEBUG
+        {
+            VkPhysicalDeviceProperties deviceProperties{};
+            vkGetPhysicalDeviceProperties(physicalDevice, &deviceProperties);
+            m_TimestampQueriesSupported = (deviceProperties.limits.timestampComputeAndGraphics == VK_TRUE)
+                && (deviceProperties.limits.timestampPeriod > 0.0f);
+            m_TimestampPeriodNs = deviceProperties.limits.timestampPeriod;
+
+            if (m_TimestampQueriesSupported) {
+                VkQueryPoolCreateInfo queryPoolInfo{ VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO };
+                queryPoolInfo.queryType = VK_QUERY_TYPE_TIMESTAMP;
+                queryPoolInfo.queryCount = kTimestampQueryCount;
+                VK_CHECK(vkCreateQueryPool(m_Device, &queryPoolInfo, nullptr, &m_TimestampQueryPool));
+
+                // Every query must be reset at least once before its first use (Vulkan spec
+                // requirement, VUID-vkCmdWriteTimestamp2-query-04903 and friends) -- done once here,
+                // via a one-shot command buffer, so RecordSimulate()'s own per-frame copy-out (which
+                // runs BEFORE this pass' very first real timestamp write, on frame 0) reads a
+                // well-defined "reset, unavailable" state rather than driver-uninitialized memory.
+                VulkanUtils::ExecuteOneShotCommands(m_Device, commandPool, queue, [&](VkCommandBuffer cmd) {
+                    vkCmdResetQueryPool(cmd, m_TimestampQueryPool, 0, kTimestampQueryCount);
+                    });
+
+                m_TimestampReadbackBuffer.Create(allocator, static_cast<VkDeviceSize>(kTimestampQueryCount) * sizeof(uint64_t),
+                    VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_CPU_TO_GPU, /*mapped=*/true);
+                // Zero-initialize the readback buffer so GetLastXxxMs() reports a clean 0.0f (via
+                // the "end <= start" guard in those accessors) instead of whatever garbage memory
+                // the fresh allocation happened to contain, before the first real frame's copy-out
+                // ever runs.
+                std::memset(m_TimestampReadbackBuffer.MappedData(), 0, static_cast<size_t>(m_TimestampReadbackBuffer.Size()));
+            }
+        }
+#endif
+
         LOG_INFO(std::format("[ParticleSystemPass] Initialized: {} max particles, {} KB particle buffer x2, simulation + sort + render pipelines ready.",
             kMaxParticles, static_cast<uint32_t>(kParticleBufferBytes / 1024)));
         return true;
@@ -720,6 +768,38 @@ namespace renderer {
         float precipSpawnRadiusMeters, float precipSpawnHeightAboveCenterMeters,
         float precipSpawnBandThicknessMeters, float precipFloorBelowCenterMeters,
         float precipRainFallSpeedMps, float precipSnowFallSpeedMps, float precipSnowWobbleStrength) {
+#ifndef NDEBUG
+        // Subtask E2 (GPU timestamp query profiling): this frame's FIRST touch of
+        // m_TimestampQueryPool -- runs once per frame, right here at the very top of RecordSimulate
+        // (the first of the 3 particle-system methods called each frame, always on cmdEarly -- see
+        // renderer::ClusterRenderPipeline::RecordFrame's own call-site comment). Sequence, in order:
+        //   1. Copy OUT last frame's 6 raw tick values (still sitting in the query pool from
+        //      whichever frame last wrote them) into the mapped readback buffer. Provably safe
+        //      without VK_QUERY_RESULT_WAIT_BIT: main.cpp's single frameFence is waited on (top of
+        //      its render loop) before THIS frame's command buffers are even reset/re-recorded, so
+        //      by the time this vkCmdCopyQueryPoolResults call is even being RECORDED, the GPU work
+        //      that wrote every one of these 6 queries last frame (across both cmdEarly and cmdLate,
+        //      same queue, same fence) has already fully retired -- there is no "query not yet
+        //      available" race to handle, unlike a copy issued mid-frame against still-in-flight
+        //      work.
+        //   2. Reset all 6 queries in one call -- satisfies Vulkan's "must reset before reuse" rule
+        //      for every slot THIS frame will write, including the 2 (DrawStart/DrawEnd) that
+        //      RecordDraw() -- called later this same frame, on the separate cmdLate command buffer
+        //      -- will write; safe because cmdEarly is always submitted before cmdLate on the same
+        //      queue every frame (same-queue submission order guarantee, see
+        //      VulkanContext::GetCommandBufferEarly()'s own class comment).
+        //   3. Write SimStart (query 0) -- the actual start of this method's own GPU work below.
+        // Skipped entirely (net no-op) if this GPU/driver doesn't support timestamp queries on this
+        // pass' own combined graphics+compute queue -- see Init()'s own comment.
+        if (m_TimestampQueriesSupported) {
+            vkCmdCopyQueryPoolResults(cmd, m_TimestampQueryPool, 0, kTimestampQueryCount,
+                m_TimestampReadbackBuffer.Handle(), 0, sizeof(uint64_t),
+                VK_QUERY_RESULT_64_BIT);
+            vkCmdResetQueryPool(cmd, m_TimestampQueryPool, 0, kTimestampQueryCount);
+            vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_TimestampQueryPool, 0);
+        }
+#endif
+
         // Multi-emitter roadmap (subtask A1): this frame's (possibly ImGui-edited) per-emitter
         // parameters, uploaded wholesale -- every field is live-tunable, so a full re-upload every
         // call is simplest and cheap (kMaxEmitters * 112 bytes == 448 bytes today -- grew from 80
@@ -861,9 +941,29 @@ namespace renderer {
         // will need its own additional barrier at that time.
         VulkanUtils::RecordMemoryBarrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+
+#ifndef NDEBUG
+        // Subtask E2: SimEnd (query 1) -- BOTTOM_OF_PIPE marks the end of every command recorded
+        // above in this same call, the standard coarse-grained "time this batch of GPU work" idiom
+        // (TOP_OF_PIPE start / BOTTOM_OF_PIPE end) used throughout this codebase's new profiling
+        // instrumentation -- see GetLastSimMs()'s own comment for how this pairs with query 0.
+        if (m_TimestampQueriesSupported) {
+            vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, m_TimestampQueryPool, 1);
+        }
+#endif
     }
 
     void ParticleSystemPass::RecordSort(VkCommandBuffer cmd, const float cameraPositionWorld[3], const float cameraForwardWorld[3]) {
+#ifndef NDEBUG
+        // Subtask E2: SortStart (query 2) -- see RecordSimulate()'s own comment for the full
+        // per-frame reset sequence this pairs with (already performed by RecordSimulate(), called
+        // immediately before this method every frame -- see renderer::ClusterRenderPipeline's own
+        // call-site comment).
+        if (m_TimestampQueriesSupported) {
+            vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_TimestampQueryPool, 2);
+        }
+#endif
+
         VkDescriptorSet sets[2] = { GetCurrentSet(), m_SortSet };
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_SortPipeline);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_SortPipelineLayout, 0, 2, sets, 0, nullptr);
@@ -959,6 +1059,14 @@ namespace renderer {
         VulkanUtils::RecordMemoryBarrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT,
             VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT,
             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+
+#ifndef NDEBUG
+        // Subtask E2: SortEnd (query 3) -- see RecordSimulate()'s SimEnd comment for the shared
+        // TOP_OF_PIPE-start/BOTTOM_OF_PIPE-end convention.
+        if (m_TimestampQueriesSupported) {
+            vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, m_TimestampQueryPool, 3);
+        }
+#endif
     }
 
 #ifndef NDEBUG
@@ -976,6 +1084,49 @@ namespace renderer {
         const uint32_t* counts = static_cast<const uint32_t*>(m_PerEmitterAliveCountReadbackBuffer.MappedData());
         return counts[emitterIndex];
     }
+
+    namespace {
+        // Subtask E2 shared helper: converts a {startTicks, endTicks} pair from
+        // m_TimestampReadbackBuffer into milliseconds, given this device's own timestampPeriod
+        // (nanoseconds/tick). Defensively returns 0.0f (rather than a nonsensical negative or huge
+        // value) if endTicks <= startTicks -- this happens legitimately once, on the very first
+        // frame after Init() (both queries still hold their Init()-time zero-fill, see Init()'s own
+        // comment on why the readback buffer is memset to 0 up front), and would otherwise happen on
+        // any GPU timer wraparound (36-bit minimum guaranteed valid bits per the Vulkan spec --
+        // exceedingly unlikely within one session's uptime, but a free, correct guard regardless).
+        float ComputeTimestampDeltaMs(uint64_t startTicks, uint64_t endTicks, float timestampPeriodNs) {
+            if (endTicks <= startTicks) {
+                return 0.0f;
+            }
+            double deltaTicks = static_cast<double>(endTicks - startTicks);
+            double deltaNs = deltaTicks * static_cast<double>(timestampPeriodNs);
+            return static_cast<float>(deltaNs / 1'000'000.0);
+        }
+    }
+
+    float ParticleSystemPass::GetLastSimMs() const {
+        if (!m_TimestampQueriesSupported || m_TimestampReadbackBuffer.MappedData() == nullptr) {
+            return 0.0f;
+        }
+        const uint64_t* ticks = static_cast<const uint64_t*>(m_TimestampReadbackBuffer.MappedData());
+        return ComputeTimestampDeltaMs(ticks[0], ticks[1], m_TimestampPeriodNs);
+    }
+
+    float ParticleSystemPass::GetLastSortMs() const {
+        if (!m_TimestampQueriesSupported || m_TimestampReadbackBuffer.MappedData() == nullptr) {
+            return 0.0f;
+        }
+        const uint64_t* ticks = static_cast<const uint64_t*>(m_TimestampReadbackBuffer.MappedData());
+        return ComputeTimestampDeltaMs(ticks[2], ticks[3], m_TimestampPeriodNs);
+    }
+
+    float ParticleSystemPass::GetLastDrawMs() const {
+        if (!m_TimestampQueriesSupported || m_TimestampReadbackBuffer.MappedData() == nullptr) {
+            return 0.0f;
+        }
+        const uint64_t* ticks = static_cast<const uint64_t*>(m_TimestampReadbackBuffer.MappedData());
+        return ComputeTimestampDeltaMs(ticks[4], ticks[5], m_TimestampPeriodNs);
+    }
 #endif
 
     void ParticleSystemPass::RecordDraw(VkCommandBuffer cmd, VkImage colorImage, VkImageView colorView, VkImageView depthView,
@@ -984,6 +1135,18 @@ namespace renderer {
         const maths::vec3& cameraRightWorld, const maths::vec3& cameraUpWorld,
         const maths::vec3& sunDirectionWorld, const maths::vec3& sunColor, float sunIntensity,
         float softFadeDistanceWorld, float heatShimmerStrength, float globalTimeSeconds) {
+#ifndef NDEBUG
+        // Subtask E2: DrawStart (query 4) -- this runs on cmdLate, a DIFFERENT primary command
+        // buffer than RecordSimulate()/RecordSort()'s own cmdEarly (see
+        // renderer::ClusterRenderPipeline's own call-site comment) -- safe to write here with no
+        // additional reset because RecordSimulate()'s own per-frame reset (see that method's own
+        // comment) already reset query 4 earlier this same frame, on the same queue, before cmdLate
+        // is ever submitted.
+        if (m_TimestampQueriesSupported) {
+            vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_TimestampQueryPool, 4);
+        }
+#endif
+
         ParticleRenderParamsUBO ubo{};
         ubo.viewProj = viewProj;
         ubo.invViewProj = viewProj.Inverse();
@@ -1104,6 +1267,16 @@ namespace renderer {
         toGeneralDependency.imageMemoryBarrierCount = 1;
         toGeneralDependency.pImageMemoryBarriers = &toGeneral;
         vkCmdPipelineBarrier2(cmd, &toGeneralDependency);
+
+#ifndef NDEBUG
+        // Subtask E2: DrawEnd (query 5) -- BOTTOM_OF_PIPE, same convention as SimEnd/SortEnd. This
+        // is the LAST of the 6 queries written each frame -- next frame's RecordSimulate() call is
+        // guaranteed (by main.cpp's own frameFence wait, see that method's own comment) to only
+        // copy this value out once it has fully retired.
+        if (m_TimestampQueriesSupported) {
+            vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, m_TimestampQueryPool, 5);
+        }
+#endif
     }
 
     void ParticleSystemPass::Shutdown() {
@@ -1136,6 +1309,16 @@ namespace renderer {
         m_SortDispatchArgsBuffer.Destroy();
 #ifndef NDEBUG
         m_AliveCountReadbackBuffer.Destroy();
+        // Subtask E2: query pool has no VMA-backed allocation (it's a plain VkQueryPool, not a
+        // GpuBuffer/image) -- destroyed directly via vkDestroyQueryPool, guarded by m_Device the
+        // same way every other raw Vulkan handle in this method's own top block already is.
+        if (m_Device != VK_NULL_HANDLE && m_TimestampQueryPool != VK_NULL_HANDLE) {
+            vkDestroyQueryPool(m_Device, m_TimestampQueryPool, nullptr);
+        }
+        m_TimestampQueryPool = VK_NULL_HANDLE;
+        m_TimestampQueriesSupported = false;
+        m_TimestampPeriodNs = 1.0f;
+        m_TimestampReadbackBuffer.Destroy();
 #endif
         m_IndirectDrawBuffer.Destroy();
         m_EmitterParamsBuffer.Destroy();

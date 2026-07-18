@@ -1032,6 +1032,12 @@ int main(int argc, char** argv) {
                     "Denoised GI (A-Trous)",
                     "GI Composite",
                     "Final Composite (Post-Process)",
+                    // Subtask E3 (Debug Buffer Viewer extension): one pixel per particle SLOT (a
+                    // 256x256 grid, renderer::ParticleSystemPass::kMaxParticles exactly) -- dead
+                    // slots render as a faint gray, alive slots are color-coded by which emitter
+                    // spawned them and brightness-faded by remaining life. See
+                    // renderer::debug::ParticleDebugViewPass's own class comment.
+                    "Particles: Alive/Emitter Heatmap",
                 };
                 ImGui::Combo("Buffer", &config::debugview::SELECTED_BUFFER_INDEX, kBufferNames, IM_ARRAYSIZE(kBufferNames));
                 ImGui::TextWrapped("Shows the selected buffer instead of the normal final image. Not tied to the Numpad debug-view-mode keys.");
@@ -1241,6 +1247,20 @@ int main(int argc, char** argv) {
 
                 ImGui::Separator();
                 ImGui::TextDisabled("Alive: %u / %u", clusterPipeline.GetParticleSystem().GetLastAliveCountApprox(), renderer::ParticleSystemPass::kMaxParticles);
+
+                // Subtask E2 (GPU timestamp query profiling): per-pass GPU time for last frame's
+                // RecordSimulate()/RecordSort()/RecordDraw() calls -- exactly one frame stale (see
+                // renderer::ParticleSystemPass::GetLastSimMs()'s own comment for why this is
+                // deterministic, not racy, unlike the alive-count readback above). Reads as 0.00 ms
+                // across the board on a GPU/driver that doesn't support timestamp queries on this
+                // pass' own combined graphics+compute queue (see ParticleSystemPass::Init()'s own
+                // comment) -- not distinguished from "genuinely instant" in this readout, since a
+                // real 0.00 ms pass and an unsupported query both mean "nothing meaningful to show
+                // here" from a developer's point of view.
+                ImGui::TextDisabled("GPU: Sim %.2f ms / Sort %.2f ms / Draw %.2f ms",
+                    clusterPipeline.GetParticleSystem().GetLastSimMs(),
+                    clusterPipeline.GetParticleSystem().GetLastSortMs(),
+                    clusterPipeline.GetParticleSystem().GetLastDrawMs());
 
                 ImGui::EndTabItem();
             }

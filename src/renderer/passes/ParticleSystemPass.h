@@ -252,7 +252,17 @@ namespace renderer {
         // TransparentForwardPass's own identical "static addressing" simplification -- the grid's
         // toroidal recentering is not re-uploaded per frame here either, see that class' own Init()
         // comment for why that limitation already exists elsewhere in this codebase).
-        bool Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
+        // `physicalDevice` (new parameter, subtask E2 -- GPU timestamp query profiling): needed only
+        // to query VkPhysicalDeviceLimits::timestampPeriod/timestampComputeAndGraphics for this
+        // pass' own Debug-only VkQueryPool -- see m_TimestampQueryPool's own declaration comment.
+        // Matches renderer::SurfaceCacheRayTracingPass::Init's own "physicalDevice first" parameter
+        // convention (that pass queries VkPhysicalDeviceRayTracingPipelinePropertiesKHR for the same
+        // reason: a property only obtainable from the physical device handle, not VkDevice). Taken
+        // unconditionally (not `#ifndef NDEBUG`-guarded itself) so this method's signature does not
+        // need to differ between Debug/Release builds -- in Release it is simply an unused
+        // parameter, costing nothing (no code is generated to read it, see Init()'s own .cpp
+        // definition).
+        bool Init(VkPhysicalDevice physicalDevice, VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
             const AtmosClimatePass& atmosClimate, const GlobalSDFPass& globalSDF, const ClusterResolvePass& resolvePass,
             const VirtualShadowMapPass& vsm, const WorldProbeGridPass& worldProbes,
             VkFormat colorFormat, VkFormat depthFormat);
@@ -290,6 +300,34 @@ namespace renderer {
         // independently spawning/alive, not just that the aggregate total is nonzero. `emitterIndex`
         // must be < kMaxEmitters.
         uint32_t GetLastPerEmitterAliveCountApprox(uint32_t emitterIndex) const;
+
+        // Subtask E2 (GPU timestamp query profiling): milliseconds spent in the most recently
+        // COMPLETED frame's RecordSimulate()/RecordSort()/RecordDraw() GPU work, respectively --
+        // exactly ONE frame stale, deterministically (not "1-2 frames" like GetLastAliveCountApprox()
+        // above): RecordSimulate()'s own copy-out-then-reset sequence (see that method's own .cpp
+        // comment) only ever reads query results that main.cpp's single per-frame frameFence wait
+        // (top of its render loop, before this frame's command buffers are even re-recorded) has
+        // already guaranteed are fully retired on the GPU -- so, unlike the alive-count readback,
+        // there is no race between "GPU still writing this frame" and "CPU already reading" to
+        // reason about; the value is simply always exactly last frame's real timing, never mid-
+        // flight garbage. Returns 0.0f if this GPU/driver combination does not support timestamp
+        // queries on this pass' own combined graphics+compute queue (see Init()'s own comment on
+        // VkPhysicalDeviceLimits::timestampComputeAndGraphics) or before the first frame has
+        // completed a full cycle.
+        float GetLastSimMs() const;
+        float GetLastSortMs() const;
+        float GetLastDrawMs() const;
+
+        // Subtask E3 (Debug Buffer Viewer extension): the CURRENTLY active raw particle-state
+        // buffer handle/size (GetCurrentSet()'s own physical binding 0, see that accessor's own
+        // comment) -- exposed specifically for renderer::debug::ParticleDebugViewPass's own
+        // read-only compute bake (an alive-list occupancy heatmap + per-emitter color overlay for
+        // the ImGui "Buffer Viewer" dropdown), which needs the raw VkBuffer handle directly rather
+        // than going through GetSetLayout()'s full descriptor-set contract like every real particle
+        // shader does. Never used by Release code -- guarded `#ifndef NDEBUG` like every other
+        // Debug-only accessor on this class.
+        VkBuffer GetParticleBufferHandleForDebugView() const { return m_ParticleBuffer[m_CurrentIndex].Handle(); }
+        VkDeviceSize GetParticleBufferSizeForDebugView() const { return m_ParticleBuffer[m_CurrentIndex].Size(); }
 #endif
 
         // Dispatches ParticleSimulation.comp in up to three passes against GetCurrentSet() (see that
@@ -523,6 +561,43 @@ namespace renderer {
         // persistently mapped -- RecordSort() vkCmdCopyBuffer's CounterBuffer.aliveCount into this
         // every call, no fence-wait (deliberately stale-tolerant, observability only).
         GpuBuffer m_AliveCountReadbackBuffer;
+
+        // Subtask E2 (GPU timestamp query profiling), Debug-only: 6 timestamp queries bracketing
+        // RecordSimulate()/RecordSort()/RecordDraw()'s own GPU work every frame -- indices
+        // {0=SimStart, 1=SimEnd, 2=SortStart, 3=SortEnd, 4=DrawStart, 5=DrawEnd}. Written across TWO
+        // different primary command buffers within the same frame (RecordSimulate/RecordSort on
+        // renderer::ClusterRenderPipeline's own "cmdEarly", RecordDraw on its "cmdLate") -- safe
+        // because both share the same graphics queue and are submitted in that same relative order
+        // every frame (see VulkanContext::GetCommandBufferEarly()'s own class comment on why
+        // same-queue submission order alone already makes cmdEarly's work visible to cmdLate), and
+        // RecordSimulate()'s own copy-out-then-reset sequence resets ALL 6 queries (including the
+        // 2 cmdLate will write later this same frame) before ANY of the 6 is written this frame --
+        // satisfying Vulkan's "a query must be reset before each reuse" requirement for every slot,
+        // every frame, with a single vkCmdResetQueryPool call. See RecordSimulate()'s own comment
+        // for the exact copy-out/reset ordering and why it is provably race-free (no
+        // VK_QUERY_RESULT_WAIT_BIT / blocking vkGetQueryPoolResults needed).
+        VkQueryPool m_TimestampQueryPool = VK_NULL_HANDLE;
+        static constexpr uint32_t kTimestampQueryCount = 6;
+        // False if this physical device does not report VkPhysicalDeviceLimits::
+        // timestampComputeAndGraphics == VK_TRUE (i.e. timestamp queries are not guaranteed to work
+        // on a queue family that does both compute and graphics, exactly what this pass' own
+        // graphics queue is used for -- see Init()'s own comment) -- every timestamp-related call
+        // becomes a no-op and the 3 GetLastXxxMs() accessors all return 0.0f when this is false, so
+        // this Debug-only feature degrades gracefully instead of hitting validation errors on an
+        // unusual GPU/driver.
+        bool m_TimestampQueriesSupported = false;
+        // VkPhysicalDeviceLimits::timestampPeriod (nanoseconds per timestamp tick) -- queried once
+        // at Init() time (see that method's own comment) and cached here since it never changes for
+        // a given physical device; every GetLastXxxMs() accessor multiplies a raw tick delta by this
+        // value (then / 1e6 for nanoseconds -> milliseconds) to report real wall-clock time
+        // regardless of which GPU vendor's own tick granularity happens to be running this session.
+        float m_TimestampPeriodNs = 1.0f;
+        // kTimestampQueryCount * sizeof(uint64_t) bytes, CPU_TO_GPU, persistently mapped --
+        // RecordSimulate()'s own vkCmdCopyQueryPoolResults copies the raw tick values here every
+        // frame (see this pass' own class-level RecordSimulate() comment), read directly via
+        // MappedData() by the 3 GetLastXxxMs() accessors with no fence-wait, same convention as
+        // m_AliveCountReadbackBuffer above.
+        GpuBuffer m_TimestampReadbackBuffer;
 #endif
 
         // Subtask 4 -- ParticleRender.vert/.frag's own set 2 (ParticleRenderParamsUBO + the sampled

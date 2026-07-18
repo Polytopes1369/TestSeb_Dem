@@ -780,7 +780,7 @@ bool ClusterRenderPipeline::Init(
   // real depth-stencil buffer every other forward pass targets. RecordSimulate/RecordSort/
   // RecordDraw are all implemented but NOT yet called from RecordFrame (Subtask 6 wires that up),
   // so this Init() has no RecordFrame ordering consequence yet.
-  if (!m_ParticleSystem.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
+  if (!m_ParticleSystem.Init(createInfo.physicalDevice, createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
                              m_AtmosClimate, m_GlobalSDF, m_Resolve, m_VirtualShadowMap, m_WorldProbes,
                              GICompositePass::kOutputFormat, createInfo.depthFormat)) {
     LOG_ERROR("[ClusterRenderPipeline] Failed to initialize ParticleSystemPass.");
@@ -870,6 +870,11 @@ bool ClusterRenderPipeline::Init(
   // comment. Sized to m_DisplayExtent (it's blitted to the swapchain the same way
   // m_PostProcess's own output is, not sized to any one candidate buffer's own resolution).
   m_DebugBufferView.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue, m_DisplayExtent);
+
+  // Subtask E3 (Debug Buffer Viewer extension): backs Buffer Viewer index 15 -- see
+  // debug::ParticleDebugViewPass's own class comment. Sized to its own fixed 256x256 grid, not
+  // m_DisplayExtent (one pixel per particle slot, not per screen pixel).
+  m_ParticleDebugView.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue);
 #endif
 
 #ifndef NDEBUG
@@ -1175,6 +1180,7 @@ void ClusterRenderPipeline::Shutdown() {
   m_LastStatsSampleBytes = 0;
   m_SDFRayMarch.Shutdown();
   m_DebugBufferView.Shutdown();
+  m_ParticleDebugView.Shutdown();
 #endif
   m_AtmosClouds.Shutdown();
   m_AtmosFog.Shutdown();
@@ -1270,7 +1276,7 @@ void ClusterRenderPipeline::RegenerateVegetationScatter() {
 
 #ifndef NDEBUG
 // Index->buffer table for the ImGui "Buffer Viewer" dropdown (config::debugview::
-// SELECTED_BUFFER_INDEX). main.cpp's own ImGui::Combo item array MUST list these same 15 entries
+// SELECTED_BUFFER_INDEX). main.cpp's own ImGui::Combo item array MUST list these same 16 entries
 // in this exact order -- there is no shared enum between the two translation units, just this
 // comment as the single source of truth both sides are hand-kept in sync with.
 //   0  = Off (normal final composite, this function is never called)
@@ -1288,6 +1294,9 @@ void ClusterRenderPipeline::RegenerateVegetationScatter() {
 //   12 = Denoised GI (A-Trous)
 //   13 = GI Composite
 //   14 = Final Composite (Post-Process, pre-ImGui)
+//   15 = Particles: Alive/Emitter Heatmap (subtask E3 -- see debug::ParticleDebugViewPass's own
+//        class comment; unlike every other entry above, this one BAKES its own source image first
+//        via RecordBake(), since its data lives in a raw SSBO, not a pre-existing image view)
 void ClusterRenderPipeline::RecordDebugBufferView(VkCommandBuffer cmd) {
     VkImageView sourceView = m_Resolve.GetOutputColorView();
     debug::DebugBufferViewPass::VisualizationMode mode = debug::DebugBufferViewPass::VisualizationMode::kTonemap;
@@ -1307,6 +1316,22 @@ void ClusterRenderPipeline::RecordDebugBufferView(VkCommandBuffer cmd) {
         case 12: sourceView = m_Denoiser.GetOutputView(); mode = debug::DebugBufferViewPass::VisualizationMode::kTonemap; break;
         case 13: sourceView = m_GIComposite.GetOutputView(); mode = debug::DebugBufferViewPass::VisualizationMode::kTonemap; break;
         case 14: sourceView = m_PostProcess.GetOutputView(); mode = debug::DebugBufferViewPass::VisualizationMode::kPassthrough; break;
+        case 15: {
+            // Subtask E3: bake this frame's raw particle-state SSBO into an rgba8 image first (this
+            // entry's data has no pre-existing image view, unlike every case above) -- safe to read
+            // GetParticleBufferHandleForDebugView() here with no extra barrier of our own: this
+            // call runs from RecordFrame's own [13a] step on cmdLate, AFTER m_ParticleSystem's own
+            // RecordSimulate() (cmdEarly, earlier this same frame) already installed a trailing
+            // COMPUTE_SHADER-write -> COMPUTE_SHADER-read/write barrier whose scope -- per this
+            // codebase's own established "a Vulkan memory dependency covers every subsequent
+            // command in the buffer, not just the immediately-following one" convention (see
+            // ParticleSystemPass::RecordSort's own comment) -- already extends to this later read.
+            m_ParticleDebugView.RecordBake(cmd, m_ParticleSystem.GetParticleBufferHandleForDebugView(),
+                m_ParticleSystem.GetParticleBufferSizeForDebugView(), ParticleSystemPass::kMaxEmitters);
+            sourceView = m_ParticleDebugView.GetOutputView();
+            mode = debug::DebugBufferViewPass::VisualizationMode::kPassthrough;
+            break;
+        }
         default: break; // Unknown index -- falls back to the Resolve color default set above.
     }
 

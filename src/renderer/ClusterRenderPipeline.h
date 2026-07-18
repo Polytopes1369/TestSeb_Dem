@@ -161,6 +161,7 @@
 #include "renderer/debug/ClusterTriangleStatsPass.h"
 #include "renderer/debug/DebugBufferViewPass.h"
 #include "renderer/debug/DebugTextOverlay.h"
+#include "renderer/debug/ParticleDebugViewPass.h"
 #include "renderer/passes/SDFRayMarchPass.h"
 // Phase 0.2 (UE5.8-parity PCG roadmap, "PCG Instance Draw Path"): only ever instantiated (as a
 // local variable) inside RunPcgInstanceDrawSmokeTest() below -- see that method's own comment.
@@ -1069,6 +1070,12 @@ namespace renderer {
         // code; empty (and zero-cost) in Release.
         std::vector<geometry::ClusterIndexEntry> m_DebugIndexEntriesCopy;
         std::vector<geometry::DAGNodeEntry> m_DebugDagEntriesCopy;
+
+        // Subtask E3 (Debug Buffer Viewer extension): backs Buffer Viewer index 15 (see
+        // debug::ParticleDebugViewPass's own class comment) -- only baked (RecordDebugBufferView's
+        // own case 15) when that specific index is selected, same "additive, only-when-selected"
+        // convention as m_DebugBufferView itself.
+        debug::ParticleDebugViewPass m_ParticleDebugView;
 #endif
     };
 
