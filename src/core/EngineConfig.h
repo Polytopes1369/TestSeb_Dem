@@ -73,14 +73,6 @@ inline float _TSR_HISTORY_SCREEN_PERCENTAGE = 100.0f;
 inline uint32_t _TSR_VELOCITY_HEADING_CONVECTIVE = 1;
 } // namespace temporal
 
-namespace shadows {
-inline uint32_t _QUALITY = 4;
-inline bool _VIRTUAL_ENABLE = true;
-inline uint32_t _MAX_RESOLUTION = 4096;
-inline uint32_t _CSM_MAX_CASCADES = 6;
-inline float _DISTANCE_SCALE = 1.50f;
-} // namespace shadows
-
 namespace lumen {
 inline uint32_t CARDS_PER_FRAME_BUDGET = 16u;
 inline uint32_t EVICTION_FRAME_DELAY = 600u;
@@ -462,7 +454,7 @@ inline LocalFogVolumeConfig VOLUMES[kMaxLocalFogVolumes] = {
 // Simulation) -- live simulation knobs, not a quality-preset tier, so unlike volumetrics:: above
 // these are NOT mirrored into EngineConfig_{Low,Medium,High,Extrem}.h / Apply*Preset(): they are
 // runtime state a user tunes live via the Volumetric ImGui tab, the same way config::temporal::
-// BLEND_ALPHA or config::shadows' non-"_QUALITY" members already are.
+// BLEND_ALPHA already is.
 namespace atmos {
 inline float TEMPERATURE_CELSIUS = 22.0f;
 inline float RELATIVE_HUMIDITY = 0.55f; // Fraction [0,1], NOT percent -- see AtmosClimatePass::RecordUpdate's own Magnus-Tetens comment.
@@ -787,11 +779,6 @@ inline void ApplyProfile(std::string_view profileName) {
         config_extrem::temporal::TSR_HISTORY_SCREEN_PERCENTAGE;
     temporal::_TSR_VELOCITY_HEADING_CONVECTIVE =
         config_extrem::temporal::TSR_VELOCITY_HEADING_CONVECTIVE;
-    shadows::_QUALITY = config_extrem::shadows::QUALITY;
-    shadows::_VIRTUAL_ENABLE = config_extrem::shadows::VIRTUAL_ENABLE;
-    shadows::_MAX_RESOLUTION = config_extrem::shadows::MAX_RESOLUTION;
-    shadows::_CSM_MAX_CASCADES = config_extrem::shadows::CSM_MAX_CASCADES;
-    shadows::_DISTANCE_SCALE = config_extrem::shadows::DISTANCE_SCALE;
     lumen::CARDS_PER_FRAME_BUDGET =
         config_extrem::lumen::CARDS_PER_FRAME_BUDGET;
     lumen::EVICTION_FRAME_DELAY = config_extrem::lumen::EVICTION_FRAME_DELAY;
@@ -878,11 +865,6 @@ inline void ApplyProfile(std::string_view profileName) {
         config_high::temporal::TSR_HISTORY_SCREEN_PERCENTAGE;
     temporal::_TSR_VELOCITY_HEADING_CONVECTIVE =
         config_high::temporal::TSR_VELOCITY_HEADING_CONVECTIVE;
-    shadows::_QUALITY = config_high::shadows::QUALITY;
-    shadows::_VIRTUAL_ENABLE = config_high::shadows::VIRTUAL_ENABLE;
-    shadows::_MAX_RESOLUTION = config_high::shadows::MAX_RESOLUTION;
-    shadows::_CSM_MAX_CASCADES = config_high::shadows::CSM_MAX_CASCADES;
-    shadows::_DISTANCE_SCALE = config_high::shadows::DISTANCE_SCALE;
     lumen::CARDS_PER_FRAME_BUDGET = config_high::lumen::CARDS_PER_FRAME_BUDGET;
     lumen::EVICTION_FRAME_DELAY = config_high::lumen::EVICTION_FRAME_DELAY;
     lumen::PROBE_GRID_RESOLUTION = config_high::lumen::PROBE_GRID_RESOLUTION;
@@ -965,11 +947,6 @@ inline void ApplyProfile(std::string_view profileName) {
         config_medium::temporal::TSR_HISTORY_SCREEN_PERCENTAGE;
     temporal::_TSR_VELOCITY_HEADING_CONVECTIVE =
         config_medium::temporal::TSR_VELOCITY_HEADING_CONVECTIVE;
-    shadows::_QUALITY = config_medium::shadows::QUALITY;
-    shadows::_VIRTUAL_ENABLE = config_medium::shadows::VIRTUAL_ENABLE;
-    shadows::_MAX_RESOLUTION = config_medium::shadows::MAX_RESOLUTION;
-    shadows::_CSM_MAX_CASCADES = config_medium::shadows::CSM_MAX_CASCADES;
-    shadows::_DISTANCE_SCALE = config_medium::shadows::DISTANCE_SCALE;
     lumen::CARDS_PER_FRAME_BUDGET =
         config_medium::lumen::CARDS_PER_FRAME_BUDGET;
     lumen::EVICTION_FRAME_DELAY = config_medium::lumen::EVICTION_FRAME_DELAY;
@@ -1056,11 +1033,6 @@ inline void ApplyProfile(std::string_view profileName) {
         config_low::temporal::TSR_HISTORY_SCREEN_PERCENTAGE;
     temporal::_TSR_VELOCITY_HEADING_CONVECTIVE =
         config_low::temporal::TSR_VELOCITY_HEADING_CONVECTIVE;
-    shadows::_QUALITY = config_low::shadows::QUALITY;
-    shadows::_VIRTUAL_ENABLE = config_low::shadows::VIRTUAL_ENABLE;
-    shadows::_MAX_RESOLUTION = config_low::shadows::MAX_RESOLUTION;
-    shadows::_CSM_MAX_CASCADES = config_low::shadows::CSM_MAX_CASCADES;
-    shadows::_DISTANCE_SCALE = config_low::shadows::DISTANCE_SCALE;
     lumen::CARDS_PER_FRAME_BUDGET = config_low::lumen::CARDS_PER_FRAME_BUDGET;
     lumen::EVICTION_FRAME_DELAY = config_low::lumen::EVICTION_FRAME_DELAY;
     lumen::PROBE_GRID_RESOLUTION = config_low::lumen::PROBE_GRID_RESOLUTION;

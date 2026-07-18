@@ -56,17 +56,6 @@ constexpr float TSR_HISTORY_SCREEN_PERCENTAGE = 100.0f;
 constexpr uint32_t TSR_VELOCITY_HEADING_CONVECTIVE = 1;
 } // namespace temporal
 
-namespace shadows {
-// UE 5.8 Shadows settings (Virtual Shadow Maps enabled on High profile)
-// sg.ShadowQuality=2 (High)
-constexpr uint32_t QUALITY = 2;
-// r.Shadow.Virtual.Enable=1 (Highly optimized shadow performance on RTX 4060)
-constexpr bool VIRTUAL_ENABLE = true;
-constexpr uint32_t MAX_RESOLUTION = 2048;
-constexpr uint32_t CSM_MAX_CASCADES = 4;
-constexpr float DISTANCE_SCALE = 1.00f;
-} // namespace shadows
-
 namespace lumen {
 constexpr uint32_t CARDS_PER_FRAME_BUDGET = 12u;
 constexpr uint32_t EVICTION_FRAME_DELAY = 450u;

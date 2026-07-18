@@ -754,7 +754,6 @@ int main(int argc, char** argv) {
             uint64_t INDEX_BUFFER_BYTES = config::nanite::INDEX_BUFFER_BYTES;
             uint32_t POOL_SIZE_MB = config::streaming::_POOL_SIZE_MB;
             float RENDER_SCALE = config::temporal::RENDER_SCALE;
-            uint32_t SHADOW_MAX_RESOLUTION = config::shadows::_MAX_RESOLUTION;
             uint32_t PROBE_GRID_RESOLUTION = config::lumen::PROBE_GRID_RESOLUTION;
             uint32_t VSM_PHYSICAL_PAGE_CAPACITY = config::lumen::VSM_PHYSICAL_PAGE_CAPACITY;
             uint32_t TRANSLUCENCY_LIGHTING_VOLUME_DIM = config::postprocess::_TRANSLUCENCY_LIGHTING_VOLUME_DIM;
@@ -770,7 +769,6 @@ int main(int argc, char** argv) {
                 config::nanite::INDEX_BUFFER_BYTES,
                 config::streaming::_POOL_SIZE_MB,
                 config::temporal::RENDER_SCALE,
-                config::shadows::_MAX_RESOLUTION,
                 config::lumen::PROBE_GRID_RESOLUTION,
                 config::lumen::VSM_PHYSICAL_PAGE_CAPACITY,
                 config::postprocess::_TRANSLUCENCY_LIGHTING_VOLUME_DIM,
@@ -788,7 +786,6 @@ int main(int argc, char** argv) {
         if (config::nanite::INDEX_BUFFER_BYTES != startup.INDEX_BUFFER_BYTES) { needsReload = true; reloadReason += "Index Buffer Size; "; }
         if (config::streaming::_POOL_SIZE_MB != startup.POOL_SIZE_MB) { needsReload = true; reloadReason += "Streaming Pool Size; "; }
         if (config::temporal::RENDER_SCALE != startup.RENDER_SCALE) { needsReload = true; reloadReason += "Render Scale; "; }
-        if (config::shadows::_MAX_RESOLUTION != startup.SHADOW_MAX_RESOLUTION) { needsReload = true; reloadReason += "VSM Max Resolution; "; }
         if (config::lumen::PROBE_GRID_RESOLUTION != startup.PROBE_GRID_RESOLUTION) { needsReload = true; reloadReason += "Probe Grid Resolution; "; }
         if (config::lumen::VSM_PHYSICAL_PAGE_CAPACITY != startup.VSM_PHYSICAL_PAGE_CAPACITY) { needsReload = true; reloadReason += "VSM Page Capacity; "; }
         if (config::postprocess::_TRANSLUCENCY_LIGHTING_VOLUME_DIM != startup.TRANSLUCENCY_LIGHTING_VOLUME_DIM) { needsReload = true; reloadReason += "Translucency Volume Dim; "; }
@@ -878,25 +875,6 @@ int main(int argc, char** argv) {
                 if (ImGui::DragInt("Temporal AA Upscaler", &upscaler, 1, 0, 5)) {
                     config::temporal::_TEMPORAL_AA_UPSCALER = static_cast<uint32_t>(upscaler);
                 }
-                ImGui::EndTabItem();
-            }
-
-            // --- Tab Shadow ---
-            if (ImGui::BeginTabItem("Shadow")) {
-                int shadQual = static_cast<int>(config::shadows::_QUALITY);
-                if (ImGui::DragInt("Shadow Quality", &shadQual, 1, 1, 5)) {
-                    config::shadows::_QUALITY = static_cast<uint32_t>(shadQual);
-                }
-                ImGui::Checkbox("Virtual Shadow Maps", &config::shadows::_VIRTUAL_ENABLE);
-                int maxRes = static_cast<int>(config::shadows::_MAX_RESOLUTION);
-                if (ImGui::DragInt("VSM Max Resolution", &maxRes, 512, 512, 16384)) {
-                    config::shadows::_MAX_RESOLUTION = static_cast<uint32_t>(maxRes);
-                }
-                int cascades = static_cast<int>(config::shadows::_CSM_MAX_CASCADES);
-                if (ImGui::DragInt("CSM Max Cascades", &cascades, 1, 1, 8)) {
-                    config::shadows::_CSM_MAX_CASCADES = static_cast<uint32_t>(cascades);
-                }
-                ImGui::DragFloat("CSM Distance Scale", &config::shadows::_DISTANCE_SCALE, 0.05f, 0.1f, 10.0f);
                 ImGui::EndTabItem();
             }
 

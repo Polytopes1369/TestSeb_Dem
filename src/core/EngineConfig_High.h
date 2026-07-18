@@ -56,16 +56,6 @@ constexpr float TSR_HISTORY_SCREEN_PERCENTAGE = 100.0f;
 constexpr uint32_t TSR_VELOCITY_HEADING_CONVECTIVE = 1;
 } // namespace temporal
 
-namespace shadows {
-// UE 5.8 Shadows settings (Epic Virtual Shadow Maps)
-// sg.ShadowQuality=3 (Epic)
-constexpr uint32_t QUALITY = 3;
-constexpr bool VIRTUAL_ENABLE = true;
-constexpr uint32_t MAX_RESOLUTION = 4096;
-constexpr uint32_t CSM_MAX_CASCADES = 4;
-constexpr float DISTANCE_SCALE = 1.20f;
-} // namespace shadows
-
 namespace lumen {
 constexpr uint32_t CARDS_PER_FRAME_BUDGET = 16u;
 constexpr uint32_t EVICTION_FRAME_DELAY = 600u;
