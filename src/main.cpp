@@ -805,6 +805,10 @@ int main(int argc, char** argv) {
         if (config::g_ActiveProfileName != startup.profileName) { needsReload = true; reloadReason += "Profile Preset (changed to " + config::g_ActiveProfileName + "); "; }
 
         // UI Panel
+        // Starts collapsed on the very first launch (no prior imgui.ini entry) so this panel
+        // doesn't cover the top-left debug HUD/camera view by default -- ImGuiCond_FirstUseEver
+        // means any user who has since expanded/moved it keeps that state on later runs.
+        ImGui::SetNextWindowCollapsed(true, ImGuiCond_FirstUseEver);
         ImGui::Begin("Engine Configuration Panel");
         
         // Active Profile Selection
@@ -1447,6 +1451,9 @@ int main(int argc, char** argv) {
         // g_StreamingDetailRadius/g_StreamingHlodRadius, plain floats read later this same frame by
         // the streaming tick below.
         if (streamingEnabled) {
+            // Same first-use-only default-collapse as the two panels below -- keeps this overlay
+            // from covering the HUD/camera view on a fresh imgui.ini.
+            ImGui::SetNextWindowCollapsed(true, ImGuiCond_FirstUseEver);
             ImGui::Begin("World Partition Streaming");
             ImGui::SliderFloat("Detail load radius", &g_StreamingDetailRadius, 5.0f, 150.0f);
             ImGui::SliderFloat("HLOD load radius", &g_StreamingHlodRadius, g_StreamingDetailRadius, 250.0f);
@@ -1465,6 +1472,9 @@ int main(int argc, char** argv) {
         // visible starting next frame -- a one-frame lag identical to the streaming panel's own
         // documented staleness above, not a correctness issue for an observability control).
         {
+            // Same first-use-only default-collapse as the Engine Configuration Panel above --
+            // keeps this diagnostic panel from covering the HUD/camera view on a fresh imgui.ini.
+            ImGui::SetNextWindowCollapsed(true, ImGuiCond_FirstUseEver);
             ImGui::Begin("LWC (Large World Coordinates)");
             maths::vec3 originOffset = lwcOrigin.GetCurrentOffset();
             world::CellCoord originCell = lwcOrigin.GetCurrentCell();
