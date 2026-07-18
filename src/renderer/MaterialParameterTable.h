@@ -178,6 +178,11 @@ namespace renderer {
     inline constexpr uint32_t kTreeBarkMaterialID = 22u;
     inline constexpr uint32_t kTreeLeafMaterialID = 23u;
 
+    // Skeletal-animation feature: the procedural skinned creature's material. Reserved one past
+    // kTreeLeafMaterialID, same "never collides with a real entity's showcase material" convention
+    // -- assigned explicitly to exactly one entity (VulkanContext::kCreatureEntityIndex).
+    inline constexpr uint32_t kCreatureMaterialID = 24u;
+
     // One generated table: the PBR parameters themselves, plus a parallel convenience flag so
     // callers (VulkanContext::BuildEntityData, deciding each entity's core::EntityFlags::
     // IsTransparent bit) don't need to re-derive "alpha < 1.0" themselves.
@@ -403,6 +408,17 @@ namespace renderer {
         // on the opaque VisBuffer path rather than being routed to a forward blend pass.
         table.params[kTreeLeafMaterialID].base =
             MakeBaseSlab(maths::vec3(0.16f, 0.42f, 0.12f), 0.75f, maths::vec3(0.0f, 0.0f, 0.0f), 0.0f);
+
+        // Skeletal-animation feature: creature -- a mottled olive-brown "chitin/hide" look (moderate
+        // roughness, a faint dielectric sheen so its segmented body reads distinctly from the matte
+        // terrain/foliage around it), fully opaque, non-metal. kCreatureMaterialID likewise sits past
+        // every hand-authored slot above, untouched by the isTransparent loop.
+        table.params[kCreatureMaterialID].base =
+            MakeBaseSlab(maths::vec3(0.22f, 0.24f, 0.10f), 0.55f, maths::vec3(0.0f, 0.0f, 0.0f), 0.0f);
+        table.params[kCreatureMaterialID].hasReflections = 1.0f;
+        table.params[kCreatureMaterialID].topWeight = 0.20f;
+        table.params[kCreatureMaterialID].top.roughness = 0.30f;
+        table.params[kCreatureMaterialID].top.f0 = maths::vec3(0.03f, 0.03f, 0.03f);
 
         return table;
     }

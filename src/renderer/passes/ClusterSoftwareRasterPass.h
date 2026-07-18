@@ -79,10 +79,14 @@ namespace renderer {
         // comment) -- bound read-only at the first free slot past each set's existing bindings:
         // binding 9 for the masked raster set (ClusterSoftwareRaster.comp), binding 8 for the
         // opaque raster set (ClusterSoftwareRasterOpaque.comp).
+        // `boneMatricesBuffer` (skeletal-animation feature) is animation::SkeletalAnimator::
+        // GetBoneMatricesBuffer() -- bound read-only at the next free slot past
+        // splineControlPointsBuffer in each set: binding 10 (masked), binding 9 (opaque).
         void Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue, VkExtent2D renderExtent,
             VkBuffer clusterMetadataBuffer, VkBuffer compressedPhysicalPoolBuffer, VkBuffer softwareClusterListBuffer,
             VkBuffer softwareClusterListOpaqueBuffer, VkBuffer wpoGlobalsBuffer, const std::vector<VkDescriptorImageInfo>& maskImageInfos,
-            VkBuffer entityTransformBuffer, VkBuffer entityDataBuffer, VkBuffer splineControlPointsBuffer);
+            VkBuffer entityTransformBuffer, VkBuffer entityDataBuffer, VkBuffer splineControlPointsBuffer,
+            VkBuffer boneMatricesBuffer);
 
         void Shutdown();
 

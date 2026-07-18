@@ -443,7 +443,9 @@ namespace geometry {
         uint32_t targetMeshID,
         const std::vector<renderer::Vertex>& allVertices,
         const std::vector<uint32_t>& allIndices,
-        uint32_t maskTextureIndex) {
+        uint32_t maskTextureIndex,
+        const std::vector<ClusterVertexSkin>* allVertexSkins,
+        bool forceSingleLevelDAG) {
 
         LOG_INFO(std::format("[ClusterDAG] Building DAG for mesh ID {} (mask texture index: {})...", targetMeshID, maskTextureIndex));
         ClusterDAG dag;
@@ -464,9 +466,22 @@ namespace geometry {
             node.isMasked = cluster.isMasked;
             node.mesh.positions.reserve(cluster.globalVertexIndices.size());
             node.mesh.uvs.reserve(cluster.globalVertexIndices.size());
+            // Skeletal-animation feature: only populated when the caller supplied a skin array
+            // (see this function's own header comment) -- every other entity leaves
+            // node.mesh.boneIndices/boneWeights empty, exactly as SimplifiableMesh's own comment
+            // documents.
+            if (allVertexSkins != nullptr) {
+                node.mesh.boneIndices.reserve(cluster.globalVertexIndices.size());
+                node.mesh.boneWeights.reserve(cluster.globalVertexIndices.size());
+            }
             for (uint32_t g : cluster.globalVertexIndices) {
                 node.mesh.positions.push_back(allVertices[g].position);
                 node.mesh.uvs.push_back(allVertices[g].uv);
+                if (allVertexSkins != nullptr) {
+                    const ClusterVertexSkin& skin = (*allVertexSkins)[g];
+                    node.mesh.boneIndices.push_back({ skin.boneIndices[0], skin.boneIndices[1], skin.boneIndices[2], skin.boneIndices[3] });
+                    node.mesh.boneWeights.push_back({ skin.boneWeights[0], skin.boneWeights[1], skin.boneWeights[2], skin.boneWeights[3] });
+                }
             }
             node.mesh.locked.assign(cluster.globalVertexIndices.size(), false);
             node.mesh.triangles.assign(cluster.localTriangleIndices.begin(), cluster.localTriangleIndices.end());
@@ -474,6 +489,27 @@ namespace geometry {
 
             dag.nodes.push_back(std::move(node));
             currentLevel.push_back(static_cast<uint32_t>(dag.nodes.size() - 1));
+        }
+
+        if (forceSingleLevelDAG) {
+            // Skeletal-animation feature: skip grouping/simplification entirely -- see this
+            // function's own header comment for why bone influence data cannot survive QEM/merge.
+            // Every level-0 leaf becomes its own root, exactly like the pre-existing
+            // "leafClusters.size() == 1" case already produces naturally via the while loop below
+            // simply never executing.
+            dag.rootIndices = currentLevel;
+
+            std::vector<std::string> validationErrors;
+            bool isValid = ValidateClusterDAG(dag, validationErrors);
+            if (isValid) {
+                LOG_INFO(std::format("[ClusterDAG] DAG generation complete (forceSingleLevelDAG). Total nodes: {}, Root count: {}. Validation: PASSED.", dag.nodes.size(), dag.rootIndices.size()));
+            } else {
+                LOG_ERROR(std::format("[ClusterDAG] DAG validation FAILED with {} errors!", validationErrors.size()));
+                for (const auto& err : validationErrors) {
+                    LOG_ERROR(std::format("[ClusterDAG]   Validation Error: {}", err));
+                }
+            }
+            return dag;
         }
 
         uint32_t level = 1;

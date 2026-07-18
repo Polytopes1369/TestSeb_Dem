@@ -19,6 +19,8 @@ const uint ENTITY_FLAG_IS_TRANSPARENT = 1u << 4; // 0x10 -- see core::EntityFlag
 const uint ENTITY_FLAG_HAS_ENHANCED_DISPLACEMENT = 1u << 5; // 0x20 -- see core::EntityFlags::HasEnhancedDisplacement.
 const uint ENTITY_FLAG_HAS_SPLINE_DEFORMATION    = 1u << 6; // 0x40 -- see core::EntityFlags::HasSplineDeformation.
 const uint ENTITY_FLAG_STREAMING_INACTIVE        = 1u << 7; // 0x80 -- see core::EntityFlags::StreamingInactive.
+const uint ENTITY_FLAG_IS_TESSELLATED            = 1u << 8; // 0x100 -- see core::EntityFlags::IsTessellated.
+const uint ENTITY_FLAG_IS_SKELETALLY_ANIMATED    = 1u << 9; // 0x200 -- see core::EntityFlags::IsSkeletallyAnimated.
 
 // Helper to test flags easily in GLSL
 bool GetFlag(uint flags, uint f) {

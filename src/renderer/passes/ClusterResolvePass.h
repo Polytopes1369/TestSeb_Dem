@@ -118,13 +118,19 @@ namespace renderer {
         // re-derive the same spline-bent triangle both rasterizers already drew (Phase 1, Nanite
         // advanced). Retained (like entityDataBuffer) so InitBinnedResolve() below needs no
         // duplicate parameter for it.
+        // `boneMatricesBuffer` (skeletal-animation feature) is animation::SkeletalAnimator::
+        // GetBoneMatricesBuffer() -- bound read-only at binding 29 (the first free slot past this
+        // shader's full 0-28 range, including the Atmos weather Sky-View LUT/Cloud Shadow Map
+        // bindings 27/28) so ClusterResolve.comp/ClusterResolveBinned.comp can re-derive the same
+        // skinned triangle both rasterizers already drew. Same "retained, no duplicate parameter"
+        // convention as splineControlPointsBuffer above.
         void Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue, VkExtent2D renderExtent,
             VkBuffer clusterMetadataBuffer, VkBuffer compressedPhysicalPoolBuffer,
             VkImageView hwClusterIDView, VkImageView hwTriangleIDView, VkImageView hwDepthView,
             VkImageView swVisBufferAtomicView, const std::vector<VkDescriptorImageInfo>& maskImageInfos,
             VkBuffer wpoGlobalsBuffer, VkBuffer entityTransformBuffer, VkBuffer entityDataBuffer,
             const std::array<MaterialParameters, kMaxMaterials>& materialTable,
-            VkBuffer splineControlPointsBuffer);
+            VkBuffer splineControlPointsBuffer, VkBuffer boneMatricesBuffer);
 
         void Shutdown();
 
@@ -300,6 +306,7 @@ namespace renderer {
         VkBuffer m_EntityTransformBuffer = VK_NULL_HANDLE; // Borrowed, same handle Init() received.
         VkBuffer m_EntityDataBuffer = VK_NULL_HANDLE;      // Borrowed, same handle Init() received.
         VkBuffer m_SplineControlPointsBuffer = VK_NULL_HANDLE; // Borrowed, same handle Init() received (Phase 1, Nanite advanced).
+        VkBuffer m_BoneMatricesBuffer = VK_NULL_HANDLE;    // Borrowed, same handle Init() received (skeletal-animation feature).
         std::vector<VkDescriptorImageInfo> m_MaskImageInfos; // Copy of Init()'s own `maskImageInfos` parameter.
 
         VkDescriptorSetLayout m_ResolveBinnedSetLayout = VK_NULL_HANDLE;

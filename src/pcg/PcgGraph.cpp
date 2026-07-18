@@ -114,12 +114,13 @@ namespace pcg {
 
         struct PinTypeNameEntry { PcgPinDataType type; const char* name; };
         constexpr PinTypeNameEntry kPinTypeNames[] = {
-            { PcgPinDataType::Points,       "Points" },
-            { PcgPinDataType::AttributeSet, "AttributeSet" },
-            { PcgPinDataType::Surface,      "Surface" },
-            { PcgPinDataType::Volume,       "Volume" },
-            { PcgPinDataType::Landscape,    "Landscape" },
-            { PcgPinDataType::Spline,       "Spline" },
+            { PcgPinDataType::Points,        "Points" },
+            { PcgPinDataType::AttributeSet,  "AttributeSet" },
+            { PcgPinDataType::Surface,       "Surface" },
+            { PcgPinDataType::Volume,        "Volume" },
+            { PcgPinDataType::Landscape,     "Landscape" },
+            { PcgPinDataType::Spline,        "Spline" },
+            { PcgPinDataType::SpawnRequests, "SpawnRequests" }, // Phase 4.1 additive extension.
         };
 
         // --- AttributeValue <-> json --------------------------------------------------------------
@@ -297,6 +298,7 @@ namespace pcg {
         case 4: return PcgPinDataType::Volume;
         case 5: return PcgPinDataType::Landscape;
         case 6: return PcgPinDataType::Spline;
+        case 7: return PcgPinDataType::SpawnRequests; // Phase 4.1 additive extension.
         default:
             assert(false && "PinDataTypeOfValue: called on an empty (monostate) PcgPinData");
             return PcgPinDataType::Points;

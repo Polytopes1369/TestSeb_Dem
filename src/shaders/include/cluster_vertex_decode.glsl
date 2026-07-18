@@ -20,23 +20,30 @@
 #define CLUSTER_PAGE_SIZE_BYTES 4096u
 
 // Byte layout of geometry::ClusterData, in field declaration order (positions, then normals,
-// then UVs, then the local triangle-list indices):
-//   ClusterVertexPosition positions[64]; //  6 bytes/vertex -> 384 bytes, offset   0
-//   ClusterVertexNormal   normals[64];   //  3 bytes/vertex -> 192 bytes, offset 384
-//   ClusterVertexUV       uvs[64];       //  4 bytes/vertex -> 256 bytes, offset 576
-//   uint8_t               indices[384];  //  1 byte/index   -> 384 bytes, offset 832
+// then UVs, then skeletal-animation skin data, then the local triangle-list indices):
+//   ClusterVertexPosition positions[64]; //  6 bytes/vertex -> 384 bytes, offset    0
+//   ClusterVertexNormal   normals[64];   //  3 bytes/vertex -> 192 bytes, offset  384
+//   ClusterVertexUV       uvs[64];       //  4 bytes/vertex -> 256 bytes, offset  576
+//   ClusterVertexSkin     skin[64];      //  8 bytes/vertex -> 512 bytes, offset  832
+//   uint8_t               indices[384];  //  1 byte/index   -> 384 bytes, offset 1344
 // Matches geometry::kMaxClusterTriangles / kMaxClusterIndices (ClusterFormat.h). Decoded by
 // DecompressClusterIndices.comp (see renderer::GeometryDecompressionPass), the sibling of this
-// header's vertex-attribute decode functions -- unlike positions/normals/UVs, local indices
+// header's vertex-attribute decode functions -- unlike positions/normals/UVs/skin, local indices
 // cannot be decoded on the fly in a vertex shader (hardware indexed rendering fetches them
 // through a fixed-function stage that runs before any shader), so they must be expanded ahead of
 // time into a real GPU-native index buffer instead.
 #define CLUSTER_POSITION_BLOCK_BYTES (CLUSTER_MAX_VERTICES * 6u)
 #define CLUSTER_NORMAL_BLOCK_BYTES   (CLUSTER_MAX_VERTICES * 3u)
+#define CLUSTER_UV_BLOCK_BYTES       (CLUSTER_MAX_VERTICES * 4u)
+#define CLUSTER_SKIN_BLOCK_BYTES     (CLUSTER_MAX_VERTICES * 8u)
 #define CLUSTER_POSITION_BASE_BYTES  0u
 #define CLUSTER_NORMAL_BASE_BYTES    (CLUSTER_POSITION_BASE_BYTES + CLUSTER_POSITION_BLOCK_BYTES)
 #define CLUSTER_UV_BASE_BYTES        (CLUSTER_NORMAL_BASE_BYTES + CLUSTER_NORMAL_BLOCK_BYTES)
-#define CLUSTER_INDICES_BASE_BYTES (CLUSTER_UV_BASE_BYTES + CLUSTER_MAX_VERTICES * 4u)
+// Skeletal-animation feature: appended AFTER uvs, BEFORE indices -- see geometry::ClusterData's
+// own comment in ClusterFormat.h for why this ordering/placement was chosen (uses the page's
+// existing headroom rather than growing kPageSizeBytes).
+#define CLUSTER_SKIN_BASE_BYTES      (CLUSTER_UV_BASE_BYTES + CLUSTER_UV_BLOCK_BYTES)
+#define CLUSTER_INDICES_BASE_BYTES   (CLUSTER_SKIN_BASE_BYTES + CLUSTER_SKIN_BLOCK_BYTES)
 
 layout(std430, set = COMPRESSED_POOL_SET, binding = COMPRESSED_POOL_BINDING) readonly buffer CompressedClusterPoolSSBO {
     uint words[];
@@ -101,6 +108,29 @@ vec3 DecodeClusterNormal(uint pageByteBase, uint vertexIndex) {
         n.y = (1.0 - abs(oldX)) * ((n.y >= 0.0) ? 1.0 : -1.0);
     }
     return normalize(n);
+}
+
+// Skeletal-animation feature: geometry::ClusterVertexSkin, bit-for-bit -- 4 bone indices + 4
+// unsigned-normalized bone weights (0..255 -> 0.0..1.0), per vertex. Only ever meaningful for a
+// cluster belonging to a core::EntityFlags::IsSkeletallyAnimated entity; every other cluster's
+// skin block is zero-initialized (see ClusterFormat.h's own ClusterVertexSkin comment), which
+// decodes as boneIndices == uvec4(0) and boneWeights == vec4(0.0) -- a harmless all-zero-weight
+// result that ApplySkeletalSkinning (skeletal_animation.glsl) never actually gets called with,
+// since every call site gates on that same entity flag first.
+void DecodeClusterSkin(uint pageByteBase, uint vertexIndex, out uvec4 boneIndices, out vec4 boneWeights) {
+    uint byteOffset = pageByteBase + CLUSTER_SKIN_BASE_BYTES + vertexIndex * 8u;
+    boneIndices = uvec4(
+        ClusterLoadByte(byteOffset + 0u),
+        ClusterLoadByte(byteOffset + 1u),
+        ClusterLoadByte(byteOffset + 2u),
+        ClusterLoadByte(byteOffset + 3u)
+    );
+    boneWeights = vec4(
+        float(ClusterLoadByte(byteOffset + 4u)),
+        float(ClusterLoadByte(byteOffset + 5u)),
+        float(ClusterLoadByte(byteOffset + 6u)),
+        float(ClusterLoadByte(byteOffset + 7u))
+    ) / 255.0;
 }
 
 #endif // CLUSTER_VERTEX_DECODE_GLSL
