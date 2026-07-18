@@ -610,17 +610,48 @@ int main(int argc, char** argv) {
     // SurfaceCachePass::Init() to prune translucent-material cards at load time.
     pipelineInfo.entityDataCPU = vkContext.GetEntityData();
 
-    // Init is wrapped so an uncaught std::runtime_error (GpuBuffer allocation failure, missing
-    // SPIR-V file, ...) surfaces as a logged message instead of a silent std::terminate -- the
-    // console/log otherwise shows nothing at all for an exception escaping main.
+    // ClusterRenderPipeline::Init() sequentially creates ~40 render passes' worth of GPU buffers/
+    // images/pipelines (many involving first-time driver-side SPIR-V pipeline compilation -- there
+    // is no persisted VkPipelineCache anywhere in this codebase, so this cost is paid fresh on
+    // EVERY launch, not just a cold scene.cache) plus several one-shot staged uploads, all on
+    // whichever thread calls it. It has no GLFW dependency of its own (every handle it touches --
+    // device/allocator/queue/commandPool/images -- was already created by VulkanContext::Init()
+    // above) and, like geometry::RunVirtualGeometryCacheTest() before it, is a single self-contained
+    // call that returns a bool. Calling it directly here -- right after the cache-build wait, which
+    // already had this exact problem -- would again stop glfwPollEvents() from running for the
+    // whole 20-30+ second duration, so Win32 ghosts the window as "Not Responding" a second time.
+    // Same worker-thread + polling-pump pattern as the cache-build wait above, reused verbatim
+    // (including the try/catch, since GpuBuffer allocation failures/missing SPIR-V files can still
+    // throw std::runtime_error here).
     renderer::ClusterRenderPipeline clusterPipeline;
+    std::atomic<bool> pipelineInitDone{ false };
     bool pipelineInitOk = false;
-    try {
-        pipelineInitOk = clusterPipeline.Init(pipelineInfo);
+    std::thread pipelineInitThread([&]() {
+        try {
+            pipelineInitOk = clusterPipeline.Init(pipelineInfo);
+        }
+        catch (const std::exception& e) {
+            LOG_CRITICAL(std::format("[Main] ClusterRenderPipeline::Init threw: {}", e.what()));
+            pipelineInitOk = false;
+        }
+        // Release-store: publishes pipelineInitOk to the polling loop's acquire-load below before
+        // that loop can stop and join this thread.
+        pipelineInitDone.store(true, std::memory_order_release);
+    });
+
+    static const char* kPipelineInitSpinnerFrames[] = { "|", "/", "-", "\\" };
+    uint32_t pipelineInitSpinnerIndex = 0;
+    while (!pipelineInitDone.load(std::memory_order_acquire)) {
+        glfwPollEvents();
+        std::string waitTitle = std::string("Vulkan 1.3 Bindless Demoscene - Initializing render pipeline ")
+            + kPipelineInitSpinnerFrames[pipelineInitSpinnerIndex] + " (please wait)";
+        glfwSetWindowTitle(window, waitTitle.c_str());
+        pipelineInitSpinnerIndex = (pipelineInitSpinnerIndex + 1) % 4;
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
-    catch (const std::exception& e) {
-        LOG_CRITICAL(std::format("[Main] ClusterRenderPipeline::Init threw: {}", e.what()));
-    }
+    pipelineInitThread.join();
+    glfwSetWindowTitle(window, "Vulkan 1.3 Bindless Demoscene");
+
     if (!pipelineInitOk) {
         LOG_CRITICAL("[Main] ClusterRenderPipeline initialization FAILED.");
         clusterPipeline.Shutdown();
