@@ -31,6 +31,11 @@
 //      world_data/cellmanifest.bin is missing (fresh checkout that never ran
 //      WorldPartitionBakeTool.exe) -- matches this codebase's "streaming is additive, not
 //      load-bearing" convention.
+//  12. Procedural 3D Audio Engine (src/audio/AudioEngine.cpp) smoke test: confirms Init() succeeds
+//      (real XAudio2 device/mastering/source voices) and a real sequence of Update() calls with a
+//      moving camera neither crashes nor leaves the engine uninitialized, then Shutdown() tears
+//      down cleanly. Does NOT (cannot, headless) verify audio is actually audible/correctly
+//      panned -- see this feature's own delivery notes for how that was verified instead.
 #ifndef NDEBUG
 
 #include "core/debug/DebugTestPipeline.h"
@@ -42,6 +47,7 @@
 #include "core/Camera.h"
 #include "core/EngineConfig.h"
 #include "core/Logger.h"
+#include "audio/AudioEngine.h"
 #include "imgui.h"
 #include "backends/imgui_impl_glfw.h"
 #include "backends/imgui_impl_vulkan.h"
@@ -646,6 +652,69 @@ namespace debugpipeline {
                                  "Delta: {}.", coarseTotal, fineTotal,
                                  static_cast<int64_t>(fineTotal) - static_cast<int64_t>(coarseTotal)),
                     shot
+                };
+            });
+
+        // === 12. Procedural 3D Audio Engine smoke test (src/audio/) ============================
+        // This codebase has no prior audio code to test against, so this is deliberately narrow:
+        // confirms AudioEngine::Init() succeeds (real XAudio2 device + mastering voice + 3
+        // positional source voices + 1 generative music bed voice all created) and a real sequence
+        // of Update() calls -- with a MOVING camera, so PositionalSource's pan/distance-attenuation
+        // math and every voice's streaming ring-buffer refill path are genuinely exercised across
+        // several distinct camera poses, not just called once from a fixed position -- neither
+        // crashes nor leaves the engine uninitialized, then that Shutdown() tears down cleanly.
+        // Uses its OWN local AudioEngine instance (not main()'s), so this test is fully self-
+        // contained and never interferes with (or depends on) the interactive loop's own instance.
+        // This does NOT (and cannot, from an automated headless pipeline with no audio-capture
+        // tooling) verify audio is actually AUDIBLE or that 3D panning sounds correct -- see this
+        // feature's own delivery notes for how that was verified instead (code-level review of the
+        // XAudio2 API contract against the real SDK header, plus a real ~49-second interactive run
+        // with continuous per-frame Update() calls and zero XAudio2 errors/warnings logged).
+        runTest("Procedural 3D Audio Engine (Init + Streaming Update)", "src/audio/AudioEngine.cpp",
+            [&]() -> TestOutcome {
+                audio::AudioEngine testAudioEngine;
+                bool initOk = testAudioEngine.Init();
+                if (!initOk) {
+                    return TestOutcome{
+                        TestStatus::Fail, 0,
+                        "audio::AudioEngine::Init() returns true (XAudio2 device + mastering voice + "
+                        "3 positional source voices + 1 generative music bed voice all created).",
+                        "Init() returned false -- see demo_log.txt for the specific XAudio2/COM HRESULT "
+                        "that failed (e.g. no audio device present on this machine/CI runner).",
+                        "A false return is treated as non-fatal in main.cpp (the demo simply runs "
+                        "silent), but is still reported as a FAIL here so a genuine regression doesn't "
+                        "go unnoticed."
+                    };
+                }
+
+                constexpr uint32_t kUpdateCount = 30;
+                for (uint32_t i = 0; i < kUpdateCount; ++i) {
+                    azimuth += 0.05f;
+                    camera.CameraOrbit({ 0.0f, 0.0f, 0.0f }, 14.0f, azimuth, 28.0f);
+                    float aspect = static_cast<float>(vkContext.GetSwapchainExtent().width) /
+                                   static_cast<float>(vkContext.GetSwapchainExtent().height);
+                    camera.Update(aspect);
+                    testAudioEngine.Update(1.0f / 60.0f, camera.GetFrameInfo(aspect));
+                }
+
+                bool stillInitialized = testAudioEngine.IsInitialized();
+                uint32_t noteCount = testAudioEngine.GetGenerativeActiveNoteCount();
+                testAudioEngine.Shutdown();
+                bool cleanlyShutdown = !testAudioEngine.IsInitialized();
+
+                bool pass = initOk && stillInitialized && cleanlyShutdown;
+                return TestOutcome{
+                    pass ? TestStatus::Pass : TestStatus::Fail, 0,
+                    std::format("Init() succeeds, stays initialized across {} real Update() calls with "
+                                 "a moving camera (streaming ring-buffer refills + 3D pan/attenuation "
+                                 "recomputed every call), and Shutdown() cleanly tears down "
+                                 "(IsInitialized() false afterward).", kUpdateCount),
+                    std::format("Init()={}, IsInitialized() after {} updates={}, active generative pad "
+                                 "notes at end={}, IsInitialized() after Shutdown()={}.",
+                                 initOk, kUpdateCount, stillInitialized, noteCount, !cleanlyShutdown),
+                    "Confirms real-time streaming synthesis code paths execute without crashing across "
+                    "many frames/camera positions; does not (cannot, headless) verify audible "
+                    "correctness -- see this test's own header comment."
                 };
             });
 

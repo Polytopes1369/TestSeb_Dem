@@ -12,6 +12,7 @@
 #include "world/CellManifest.h"
 #include "world/WorldCellStreamingLoader.h"
 #include "world/LwcOrigin.h"
+#include "audio/AudioEngine.h"
 #include <exception>
 #include <optional>
 #include <unordered_map>
@@ -673,6 +674,24 @@ int main(int argc, char** argv) {
     // showcase gallery still fills the rest of the frame.
     Camera camera({ 12.3613f, 6.5726f, 0.0f }, { 0.0f, 4.0f, 0.0f });
 
+    // Procedural 3D Audio Engine (src/audio/ -- closes the "moteur de son 3D + style FL studio"
+    // gap in this project's own CLAUDE.md design brief): owned directly here, following the same
+    // "plain local variable, Init() once before the loop, Update() once per frame inside it"
+    // pattern `camera`/`lwcOrigin` above and below already establish for per-frame CPU-side state
+    // that isn't itself a Vulkan resource. A real, always-on feature (per CLAUDE.md's build-
+    // separation rule) -- constructed and updated identically in Debug and Release, unlike
+    // g_DebugState above. Deliberately instantiated AFTER the #ifndef NDEBUG --test-pipeline
+    // early-return above (never reached at all during an automated --test-pipeline run, which has
+    // no need to spin up real XAudio2 hardware) but unconditionally in the normal interactive path.
+    // Init() failure (e.g. no audio device present) is logged and non-fatal -- see AudioEngine::
+    // Init()'s own comment: the demo simply runs silent, matching this codebase's own convention
+    // for additive-not-load-bearing subsystems (e.g. World Partition streaming's missing-manifest
+    // fallback just below).
+    audio::AudioEngine audioEngine;
+    if (!audioEngine.Init()) {
+        LOG_WARNING("[Main] AudioEngine::Init failed -- continuing without audio.");
+    }
+
     // Phase 5 (Streaming & Monde roadmap, Part 1): the single LWC origin-tracking instance driving
     // every render-boundary rebase this frame (Camera::UpdateRebased/GetRebasedPosition for the
     // camera, VulkanContext::UpdateEntityRotations's originOffset parameter for every entity) --
@@ -1196,6 +1215,46 @@ int main(int argc, char** argv) {
                 ImGui::EndTabItem();
             }
 
+            // --- Tab Audio (Procedural 3D Audio Engine, src/audio/) ---------------------------
+            // Debug-only per CLAUDE.md's build-separation rule: the sliders below edit the same
+            // live config::audio::* globals audio::AudioEngine reads every Update() call in BOTH
+            // Debug and Release (the engine itself is not gated, only this diagnostic panel is).
+            if (ImGui::BeginTabItem("Audio")) {
+                if (!audioEngine.IsInitialized()) {
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.3f, 0.3f, 1.0f));
+                    ImGui::TextWrapped("AudioEngine failed to initialize (no audio device / XAudio2 unavailable) -- running silent. See demo_log.txt.");
+                    ImGui::PopStyleColor();
+                }
+
+                ImGui::SliderFloat("Master Volume", &config::audio::MASTER_VOLUME, 0.0f, 1.0f);
+
+                ImGui::Separator();
+                ImGui::TextUnformatted("Generative Music (procedural pentatonic-scale ambient pad sequencer)");
+                ImGui::Checkbox("Enabled", &config::audio::GENERATIVE_MUSIC_ENABLED);
+                ImGui::SliderFloat("Volume##Generative", &config::audio::GENERATIVE_MUSIC_VOLUME, 0.0f, 1.0f);
+                ImGui::DragFloat("Tempo (BPM)", &config::audio::GENERATIVE_TEMPO_BPM, 0.5f, 20.0f, 200.0f);
+                ImGui::SliderFloat("Note Density", &config::audio::GENERATIVE_NOTE_DENSITY, 0.0f, 1.0f);
+                ImGui::TextDisabled("Active pad notes: %u / %u", audioEngine.GetGenerativeActiveNoteCount(), audio::GenerativeComposer::kMaxPolyphony);
+                ImGui::TextDisabled("Sequencer: bar chord %u/4, step %u/16", audioEngine.GetGenerativeChordIndex() + 1u, audioEngine.GetGenerativeStepIndex() + 1u);
+
+                ImGui::Separator();
+                ImGui::TextUnformatted("Positional Environmental Sources (3D distance attenuation + stereo pan)");
+                ImGui::Checkbox("Enabled##Positional", &config::audio::POSITIONAL_AUDIO_ENABLED);
+                ImGui::SliderFloat("Embers Volume", &config::audio::EMBERS_VOLUME, 0.0f, 1.0f);
+                ImGui::SliderFloat("Waterfall Volume", &config::audio::WATERFALL_VOLUME, 0.0f, 1.0f);
+                ImGui::SliderFloat("Wind Volume", &config::audio::WIND_VOLUME, 0.0f, 1.0f);
+                ImGui::DragFloat("Attenuation Reference Distance (m)", &config::audio::ATTENUATION_REFERENCE_DISTANCE_METERS, 0.1f, 0.1f, 50.0f);
+                ImGui::DragFloat("Attenuation Rolloff", &config::audio::ATTENUATION_ROLLOFF, 0.05f, 0.0f, 10.0f);
+                ImGui::DragFloat("Attenuation Max Distance (m)", &config::audio::ATTENUATION_MAX_DISTANCE_METERS, 1.0f, 1.0f, 500.0f);
+
+                for (uint32_t i = 0; i < audio::AudioEngine::kPositionalSourceCountDebug; ++i) {
+                    ImGui::TextDisabled("%s: pan %.2f, distance gain %.2f",
+                        audioEngine.GetPositionalSourceName(i), audioEngine.GetPositionalPan(i), audioEngine.GetPositionalDistanceGain(i));
+                }
+
+                ImGui::EndTabItem();
+            }
+
             // --- Tab PCG Graph Editor -- Phase 7.1 (PCG editor-tooling roadmap) scaffold: proves
             // the vendored thedmd/imgui-node-editor library is wired end-to-end, nothing more.
             // See renderer::debug::PcgGraphEditorPanel's own header comment for full context. ---
@@ -1378,6 +1437,26 @@ int main(int argc, char** argv) {
         // UpdateRebased's own comment. camera.GetPosition() (true absolute) stays untouched for
         // the streaming-source distance math further below.
         camera.UpdateRebased(aspect, lwcOrigin.GetCurrentOffset());
+
+        // Procedural 3D Audio Engine: fed once per frame with the current camera + this frame's
+        // own dt, entirely decoupled from the Vulkan command-buffer recording that starts further
+        // below (XAudio2 mixes on its own internal thread -- this call only tops up each voice's
+        // streaming ring buffer and updates 3D pan/attenuation, never blocks on audio hardware, see
+        // AudioEngine::Update's own comment). Uses the TRUE absolute camera position/forward (NOT
+        // the LWC-rebased one camera.UpdateRebased() just built the render path's view matrix from
+        // above) -- this demo's world extent is small enough that positional audio never needs
+        // large-world-coordinate rebasing, so camera.GetFrameInfo() is deliberately used here
+        // as-is rather than threading lwcOrigin's offset through a second, audio-only rebase.
+        // Placed after the fly-camera movement block (this frame's camera position is final) and
+        // after camera.UpdateRebased() only because `aspect` is computed alongside it just above --
+        // GetFrameInfo()'s own aspectRatio/fovYRadians/near/far fields are unused by AudioEngine.
+        {
+            static double lastAudioTime = glfwGetTime();
+            double now = glfwGetTime();
+            float audioDt = static_cast<float>(now - lastAudioTime);
+            lastAudioTime = now;
+            audioEngine.Update(audioDt, camera.GetFrameInfo(aspect));
+        }
 
         // --- Runtime World Partition streaming tick: evaluate desired cell representations from
         // the camera's current position, dispatch queued load/unload work onto the shared
@@ -1739,6 +1818,10 @@ int main(int argc, char** argv) {
     }
 
     LOG_INFO("Shutting down engine...");
+
+    // No Vulkan dependency (XAudio2 mixes independently on its own thread) -- safe to shut down
+    // before the GPU drain below. Idempotent/safe even if Init() failed above.
+    audioEngine.Shutdown();
 
     // Drain the GPU before destroying anything the last in-flight frame may still be using --
     // the per-frame loop deliberately never device-idles, so this is the one place that does.
