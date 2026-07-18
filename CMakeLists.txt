@@ -551,7 +551,10 @@ if(Vulkan_GLSLC_EXECUTABLE)
         # mandatory shadow-ray trace that used to live in MegaLightsShade.comp before the spatial-
         # reuse split moved it out, see that file's own TraceShadowRay comment; the new Stage 2 in
         # between, MegaLightsSpatialReuse.comp, does NOT need this -- it only reads/combines
-        # reservoir SSBOs, no ray query of its own).
+        # reservoir SSBOs, no ray query of its own; ParticleRender.frag -- Niagara-parity
+        # render-integration roadmap, D1 (MegaLights sampling for particles): the same inlined
+        # MegaLights shadow-visibility-ray shading TransparentForward.frag/Tessellation.frag already
+        # carry their own copy of, see that shader's own TraceShadowRay comment).
         # Every other shader stage keeps glslc's default target-env/target-spv untouched.
         get_filename_component(SHADER_EXT ${SHADER_SRC} EXT)
         set(GLSLC_EXTRA_FLAGS "")
@@ -560,7 +563,7 @@ if(Vulkan_GLSLC_EXECUTABLE)
                 OR SHADER_NAME STREQUAL "WorldProbeInject.comp" OR SHADER_NAME STREQUAL "ReflectionTrace.comp"
                 OR SHADER_NAME STREQUAL "MegaLightsShade.comp" OR SHADER_NAME STREQUAL "TransparentForward.frag"
                 OR SHADER_NAME STREQUAL "Tessellation.frag" OR SHADER_NAME STREQUAL "WaterForward.frag"
-                OR SHADER_NAME STREQUAL "MegaLightsFinalShade.comp")
+                OR SHADER_NAME STREQUAL "MegaLightsFinalShade.comp" OR SHADER_NAME STREQUAL "ParticleRender.frag")
             set(GLSLC_EXTRA_FLAGS --target-env=vulkan1.3 --target-spv=spv1.4)
         endif()
 

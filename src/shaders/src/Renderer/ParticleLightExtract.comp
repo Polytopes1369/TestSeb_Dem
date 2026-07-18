@@ -1,0 +1,80 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+
+// Niagara-parity render-integration roadmap, D4 (particles as light emitters): reads set 0
+// (renderer::ParticleSystemPass's own particle-state descriptor set, unchanged -- ParticleBuffer/
+// AliveListBuffer/CounterBuffer) and writes exactly kMaxParticleDerivedLights (MegaLightsTypes.h --
+// mirrored below as a plain literal, this codebase's own established convention for a GLSL file
+// that cannot #include a C++ header, see e.g. mesh_sdf_trace.glsl's own kMaxTracedEntities comment)
+// MegaLight-formatted entries into renderer::MegaLightsPass's own light SSBO, at the fixed byte
+// offset GetParticleLightsBufferOffset() reserves for exactly this purpose (see that function's own
+// comment and renderer::ParticleSystemPass::RecordExtractLights' own header comment for the full
+// mechanism/placement-in-frame rationale).
+//
+// One workgroup, kMaxParticleDerivedLights threads, one thread per reserved light slot -- thread `i`
+// reads the ALIVE list's `i`-th entry (NOT the sorted list: this sample needs no back-to-front
+// order, only a bounded, consistent set of currently-alive particles, so it stays independent of
+// ParticleSort.comp's own timing/scope, see this pass' own RecordExtractLights comment). A slot
+// with no corresponding alive particle (i >= aliveCount), or whose particle is not a kKindEmber
+// (rain/snow never count as "emissive" for this feature), gets an INERT MegaLight (zero radius,
+// zero intensity) -- MegaLightTargetWeight (megalights_ris.glsl) provably scores an inert light's
+// weight as exactly 0 regardless of the shading point/normal it is queried against (radius == 0
+// forces its smooth windowed falloff to saturate at 0 for any distance > ~0), so writing one every
+// frame is always safe, never a stale/leftover bright light from a since-recycled particle.
+
+#include "include/ParticleCommon.glsl"
+#include "include/megalights_types.glsl"
+
+layout(local_size_x = 16, local_size_y = 1, local_size_z = 1) in;
+
+// Must match renderer::kMaxParticleDerivedLights (MegaLightsTypes.h) exactly, and this shader's own
+// local_size_x above (a single (1,1,1) workgroup dispatch covers every slot in one pass).
+const uint kMaxParticleDerivedLights = 16u;
+
+// renderer::MegaLightsPass's own light SSBO, bound at a nonzero VkDescriptorBufferInfo.offset
+// (GetParticleLightsBufferOffset()) so this declaration sees a plain, zero-indexed
+// MegaLight[kMaxParticleDerivedLights] array -- no header/static-population size needs to leak into
+// this shader at all. writeonly: this shader never needs to read back what a previous frame wrote.
+layout(std430, set = 1, binding = 0) writeonly buffer ParticleDerivedLightsBuffer {
+    MegaLight g_ParticleLights[];
+};
+
+// A billboard ember's "light source" radius/intensity is derived from its own rendered footprint
+// and albedo -- there is no separately-authored "light strength" field on GpuParticle (the plan
+// doc's own scope-down: piggy-backing on the particle's EXISTING visual size/color, rather than
+// growing the already-byte-exact Particle/EmitterParams structs the roadmap's own top-level
+// instructions explicitly say not to touch, keeps this additive and zero-risk to the two other
+// parallel workstreams extending those same structs concurrently).
+const float kEmberLightRadiusScale = 6.0;   // World-radius-of-influence per world-unit of the particle's own billboard size.
+const float kEmberLightIntensityScale = 600.0; // Candela per unit of the particle's own peak color channel (matches MegaLight's real-candela convention, MegaLightsTypes.h).
+
+void main() {
+    uint slot = gl_GlobalInvocationID.x;
+    if (slot >= kMaxParticleDerivedLights) {
+        return;
+    }
+
+    MegaLight outLight;
+    outLight.position = vec3(0.0);
+    outLight.radius = 0.0;
+    outLight.color = vec3(0.0);
+    outLight.intensity = 0.0;
+
+    if (slot < aliveCount) {
+        uint particleIndex = aliveIndices[slot];
+        Particle p = particles[particleIndex];
+        uint kind = UnpackParticleKind(p.randomSeed);
+
+        if (kind == kParticleKindEmber && p.life > 0.0) {
+            float brightness = max(p.color.r, max(p.color.g, p.color.b));
+            if (brightness > 0.0) {
+                outLight.position = p.position;
+                outLight.radius = max(p.size.x, p.size.y) * kEmberLightRadiusScale;
+                outLight.color = p.color.rgb;
+                outLight.intensity = brightness * kEmberLightIntensityScale;
+            }
+        }
+    }
+
+    g_ParticleLights[slot] = outLight;
+}

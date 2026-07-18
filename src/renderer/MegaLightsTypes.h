@@ -19,6 +19,22 @@ namespace renderer {
     // runtime, no shader-side format change is needed.
     constexpr uint32_t kMaxMegaLights = 256u;
 
+    // Niagara-parity render-integration roadmap, D4 (particles as light emitters): a small, FIXED
+    // number of extra light SLOTS reserved at the tail of MegaLightsPass' own light SSBO -- see
+    // MegaLightsPass::GetParticleLightsBufferOffset()'s own comment. Deliberately NOT folded into
+    // kMaxMegaLights itself (which stays the STATIC procedural population's own exact size,
+    // GenerateProceduralLights() below is completely unaware this capacity even exists) -- these
+    // slots are instead re-written every frame by renderer::ParticleSystemPass::RecordExtractLights
+    // from a bounded sample of currently-alive emissive particles, giving nearby OPAQUE geometry
+    // (lit via MegaLightsPass' existing RIS + shadow-visibility-ray pipeline, completely unmodified
+    // otherwise) a real, GPU-driven way to be lit by bright particles (e.g. embers) without any
+    // CPU readback and without touching the static population's own generation/BVH-build code path
+    // beyond appending this many placeholder (always-candidate, zero-weight-until-written) leaf
+    // entries once at Init() time -- see MegaLightsPass.cpp's own STEP 1/1.5 comment for the full
+    // derivation of why a placeholder-AABB approach is required for the BVH-biased opaque shading
+    // path specifically, not just the SSBO content itself.
+    constexpr uint32_t kMaxParticleDerivedLights = 16u;
+
     // GLSL-friendly, std430-compatible mirror of MegaLight in
     // src/shaders/include/megalights_types.glsl -- 32 bytes, two {vec3, float} blocks, same
     // field-ordering convention as renderer::MaterialParameters (every vec3 immediately followed by

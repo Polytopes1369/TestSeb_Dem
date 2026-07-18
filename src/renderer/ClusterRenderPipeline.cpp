@@ -780,8 +780,21 @@ bool ClusterRenderPipeline::Init(
   // real depth-stencil buffer every other forward pass targets. RecordSimulate/RecordSort/
   // RecordDraw are all implemented but NOT yet called from RecordFrame (Subtask 6 wires that up),
   // so this Init() has no RecordFrame ordering consequence yet.
-  if (!m_ParticleSystem.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
+  // Niagara-parity render-integration roadmap: also borrows m_MegaLights (D1 RIS point-light SSBO +
+  // D4's reserved particle-derived light tail), m_SurfaceCacheRT (D1's shared g_TLAS for MegaLights'
+  // own shadow-visibility ray), and m_AtmosFog (D5's integrated froxel grid) -- all three already
+  // Init'd above (m_SurfaceCacheRT at STEP 7's own earlier call, m_MegaLights/m_AtmosFog just above).
+  // Subtask C3 (spawn-on-mesh-surface): also borrows the SAME cluster metadata / compressed geometry
+  // pool / entity transform / entity data buffers m_HardwareRaster.Init()/m_Resolve.Init() already
+  // received above (m_OcclusionCulling and m_PagePool are both already Init'd well before this
+  // point) -- see ParticleSystemPass::Init's own header comment for why reusing these 4 buffers,
+  // rather than a second mesh format, is what lets EmitterParams::spawnTargetEntityId sample real
+  // triangle surfaces.
+  if (!m_ParticleSystem.Init(createInfo.physicalDevice, createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
                              m_AtmosClimate, m_GlobalSDF, m_Resolve, m_VirtualShadowMap, m_WorldProbes,
+                             m_MegaLights, m_SurfaceCacheRT, m_AtmosFog,
+                             m_OcclusionCulling.GetClusterMetadataBuffer(), m_PagePool.GetPhysicalPoolBuffer(),
+                             createInfo.entityTransformBuffer, createInfo.entityDataBuffer,
                              GICompositePass::kOutputFormat, createInfo.depthFormat)) {
     LOG_ERROR("[ClusterRenderPipeline] Failed to initialize ParticleSystemPass.");
     return false;
@@ -870,6 +883,11 @@ bool ClusterRenderPipeline::Init(
   // comment. Sized to m_DisplayExtent (it's blitted to the swapchain the same way
   // m_PostProcess's own output is, not sized to any one candidate buffer's own resolution).
   m_DebugBufferView.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue, m_DisplayExtent);
+
+  // Subtask E3 (Debug Buffer Viewer extension): backs Buffer Viewer index 15 -- see
+  // debug::ParticleDebugViewPass's own class comment. Sized to its own fixed 256x256 grid, not
+  // m_DisplayExtent (one pixel per particle slot, not per screen pixel).
+  m_ParticleDebugView.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue);
 #endif
 
 #ifndef NDEBUG
@@ -1175,6 +1193,7 @@ void ClusterRenderPipeline::Shutdown() {
   m_LastStatsSampleBytes = 0;
   m_SDFRayMarch.Shutdown();
   m_DebugBufferView.Shutdown();
+  m_ParticleDebugView.Shutdown();
 #endif
   m_AtmosClouds.Shutdown();
   m_AtmosFog.Shutdown();
@@ -1270,7 +1289,7 @@ void ClusterRenderPipeline::RegenerateVegetationScatter() {
 
 #ifndef NDEBUG
 // Index->buffer table for the ImGui "Buffer Viewer" dropdown (config::debugview::
-// SELECTED_BUFFER_INDEX). main.cpp's own ImGui::Combo item array MUST list these same 15 entries
+// SELECTED_BUFFER_INDEX). main.cpp's own ImGui::Combo item array MUST list these same 16 entries
 // in this exact order -- there is no shared enum between the two translation units, just this
 // comment as the single source of truth both sides are hand-kept in sync with.
 //   0  = Off (normal final composite, this function is never called)
@@ -1288,6 +1307,9 @@ void ClusterRenderPipeline::RegenerateVegetationScatter() {
 //   12 = Denoised GI (A-Trous)
 //   13 = GI Composite
 //   14 = Final Composite (Post-Process, pre-ImGui)
+//   15 = Particles: Alive/Emitter Heatmap (subtask E3 -- see debug::ParticleDebugViewPass's own
+//        class comment; unlike every other entry above, this one BAKES its own source image first
+//        via RecordBake(), since its data lives in a raw SSBO, not a pre-existing image view)
 void ClusterRenderPipeline::RecordDebugBufferView(VkCommandBuffer cmd) {
     VkImageView sourceView = m_Resolve.GetOutputColorView();
     debug::DebugBufferViewPass::VisualizationMode mode = debug::DebugBufferViewPass::VisualizationMode::kTonemap;
@@ -1307,6 +1329,22 @@ void ClusterRenderPipeline::RecordDebugBufferView(VkCommandBuffer cmd) {
         case 12: sourceView = m_Denoiser.GetOutputView(); mode = debug::DebugBufferViewPass::VisualizationMode::kTonemap; break;
         case 13: sourceView = m_GIComposite.GetOutputView(); mode = debug::DebugBufferViewPass::VisualizationMode::kTonemap; break;
         case 14: sourceView = m_PostProcess.GetOutputView(); mode = debug::DebugBufferViewPass::VisualizationMode::kPassthrough; break;
+        case 15: {
+            // Subtask E3: bake this frame's raw particle-state SSBO into an rgba8 image first (this
+            // entry's data has no pre-existing image view, unlike every case above) -- safe to read
+            // GetParticleBufferHandleForDebugView() here with no extra barrier of our own: this
+            // call runs from RecordFrame's own [13a] step on cmdLate, AFTER m_ParticleSystem's own
+            // RecordSimulate() (cmdEarly, earlier this same frame) already installed a trailing
+            // COMPUTE_SHADER-write -> COMPUTE_SHADER-read/write barrier whose scope -- per this
+            // codebase's own established "a Vulkan memory dependency covers every subsequent
+            // command in the buffer, not just the immediately-following one" convention (see
+            // ParticleSystemPass::RecordSort's own comment) -- already extends to this later read.
+            m_ParticleDebugView.RecordBake(cmd, m_ParticleSystem.GetParticleBufferHandleForDebugView(),
+                m_ParticleSystem.GetParticleBufferSizeForDebugView(), ParticleSystemPass::kMaxEmitters);
+            sourceView = m_ParticleDebugView.GetOutputView();
+            mode = debug::DebugBufferViewPass::VisualizationMode::kPassthrough;
+            break;
+        }
         default: break; // Unknown index -- falls back to the Resolve color default set above.
     }
 
@@ -1689,6 +1727,26 @@ void ClusterRenderPipeline::RecordFrameEarly(VkCommandBuffer cmdEarly,
             gpu.sizeCurve[key] = cfg.sizeCurve[key];
         }
 
+        // Subtask C2 (screen-space depth-buffer collision): same "copy the live ImGui-edited config
+        // value into this frame's GPU struct" pattern as every other field above.
+        gpu.depthCollisionEnabled = cfg.depthCollisionEnabled ? 1u : 0u;
+        // Subtask C3 (spawn-on-mesh-surface): only meaningful when spawnShape == 2, copied
+        // unconditionally like every other field regardless (harmless when unused).
+        gpu.spawnTargetEntityId = cfg.spawnTargetEntityId;
+        // Subtask C4 (sub-emitters): same "copy the live ImGui-edited config value" pattern.
+        gpu.subEmitterEnabled = cfg.subEmitterEnabled ? 1u : 0u;
+        gpu.subEmitterTargetSlot = cfg.subEmitterTargetSlot;
+        gpu.subEmitterTriggerMode = cfg.subEmitterTriggerMode;
+        gpu.subEmitterSpawnCount = cfg.subEmitterSpawnCount;
+
+        // Niagara-parity roadmap (bundled B1/B2/B3 render-mode workstream) -- same "copy the live
+        // ImGui-edited config value into this frame's GPU struct" pattern as every field above.
+        gpu.renderMode = cfg.renderMode;
+        gpu.meshArchetype = cfg.meshArchetype;
+        gpu.ribbonWidth = cfg.ribbonWidth;
+        gpu.spriteOrientationMode = cfg.spriteOrientationMode;
+        gpu.subVariationStrength = cfg.subVariationStrength;
+
         if (cfg.active) {
           m_ParticleSpawnAccumulator[i] += cfg.spawnRate * particleDeltaTimeSeconds;
         }
@@ -1723,7 +1781,13 @@ void ClusterRenderPipeline::RecordFrameEarly(VkCommandBuffer cmdEarly,
       // (see that array's own comment) -- it rides the SAME per-emitter particleEmitters/
       // particleSpawnCounts arrays built by the loop above, needing no separate accumulator, position,
       // or RecordSimulate parameter of its own.
+      // Subtask C2 (screen-space depth-buffer collision): `viewProj`/`invViewProj` are the SAME
+      // combined camera matrices this frame's resolve/rasterization passes already computed above
+      // (see this function's own earlier "Every stage of this frame consumes the SAME combined
+      // matrix" comment) -- reused here unmodified so ParticleSimulation.comp's forward screen-space
+      // projection matches exactly what produced m_Resolve's own depth copy this frame.
       m_ParticleSystem.RecordSimulate(cmdEarly, m_GlobalSDF, particleDeltaTimeSeconds, globalTimeSeconds,
+          viewProj, invViewProj, m_RenderExtent,
           particleEmitters, particleSpawnCounts,
           precipCenterWorld, precipSpawnCount, precipKind,
           config::atmos::PRECIPITATION_SPAWN_RADIUS_METERS, config::atmos::PRECIPITATION_SPAWN_HEIGHT_ABOVE_CAMERA_METERS,
@@ -1734,6 +1798,15 @@ void ClusterRenderPipeline::RecordFrameEarly(VkCommandBuffer cmdEarly,
       float particleCameraPosition[3] = { cameraFrameInfo.position.x, cameraFrameInfo.position.y, cameraFrameInfo.position.z };
       float particleCameraForward[3] = { cameraFrameInfo.forward.x, cameraFrameInfo.forward.y, cameraFrameInfo.forward.z };
       m_ParticleSystem.RecordSort(cmdEarly, particleCameraPosition, particleCameraForward);
+
+      // Niagara-parity render-integration roadmap, D4 (particles as light emitters): samples this
+      // frame's freshly-rebuilt alive list into m_MegaLights' own reserved particle-derived light
+      // tail -- see ParticleSystemPass::RecordExtractLights' own comment for why this only needs to
+      // run after RecordSimulate (not specifically after RecordSort) and why it is placed here
+      // anyway (one obvious call-site location, same command buffer). m_MegaLights.RecordShade
+      // (RecordFrameLate, later this same frame) reads the result via same-queue submission
+      // ordering -- see that method's own comment.
+      m_ParticleSystem.RecordExtractLights(cmdEarly);
     }
 
     // 4. Secondary-bounce injection into m_SurfaceCache's own radiance atlas + the TLAS refit that
@@ -2701,9 +2774,17 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
     // before post-process" top layer. Draws onto the SAME transparentTargetImage/View + real depth
     // buffer every forward pass above targets, and into m_TransparentForward's own shared
     // heat-distortion image (see ParticleSystemPass::RecordDraw's own comment on why that's safe
-    // with no extra barrier). cameraRight/cameraUp are not tracked anywhere in CameraFrameInfo (see
-    // that struct's own field list) -- derived here via the same forward-cross-worldUp formula
-    // renderer::AtmosVolumetricFogPass::RecordUpdate/SDFRayMarchPass::RecordRayMarch already use.
+    // with no extra barrier). cameraRight/cameraUp/cameraForward are not tracked anywhere in
+    // CameraFrameInfo (see that struct's own field list) -- right/up are derived here via the same
+    // forward-cross-worldUp formula renderer::AtmosVolumetricFogPass::RecordUpdate/
+    // SDFRayMarchPass::RecordRayMarch already use; forward (D5) is simply cameraFrameInfo.forward
+    // itself, already tracked.
+    //
+    // Niagara-parity render-integration roadmap: `m_SceneLights` (D3 point lights) and
+    // `m_WorldProbes.GetGridOriginWorld()` (D6 fix -- this frame's CURRENT toroidal-recenter origin,
+    // not a stale Init()-time snapshot) and `m_FrameIndex` (D1 MegaLights RIS decorrelation) are all
+    // already tracked/available at this call site, same values every other consumer below/above
+    // already reads.
     {
       const maths::vec3 worldUpHint{0.0f, 1.0f, 0.0f};
       const maths::vec3 particleCameraRight = cameraFrameInfo.forward.Cross(worldUpHint).Normalize();
@@ -2711,9 +2792,10 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
       float particleHeatShimmerStrength = config::particles::HEAT_SHIMMER_ENABLED ? config::particles::HEAT_SHIMMER_STRENGTH : 0.0f;
       m_ParticleSystem.RecordDraw(cmdLate, transparentTargetImage, transparentTargetView, m_DepthImageView,
           m_TransparentForward.GetRefractionOffsetView(), m_RenderExtent,
-          viewProj, cameraFrameInfo.position, particleCameraRight, particleCameraUp,
+          viewProj, cameraFrameInfo.position, particleCameraRight, particleCameraUp, cameraFrameInfo.forward,
           m_SceneLights.sun.direction, m_SceneLights.sun.color, m_SceneLights.sun.intensity,
-          config::particles::SOFT_FADE_DISTANCE, particleHeatShimmerStrength, globalTimeSeconds);
+          m_SceneLights, m_WorldProbes.GetGridOriginWorld(),
+          config::particles::SOFT_FADE_DISTANCE, particleHeatShimmerStrength, globalTimeSeconds, m_FrameIndex);
     }
   }
 

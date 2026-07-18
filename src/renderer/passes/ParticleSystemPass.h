@@ -31,6 +31,7 @@
 #include <vk_mem_alloc.h>
 
 #include "core/maths/Maths.h"
+#include "renderer/LightingTypes.h" // SceneLights -- Niagara-parity render-integration roadmap, D3 (point-light VSM shadows).
 #include "renderer/vulkan/GpuBuffer.h"
 
 namespace renderer {
@@ -40,6 +41,9 @@ namespace renderer {
     class ClusterResolvePass;
     class VirtualShadowMapPass;
     class WorldProbeGridPass;
+    class MegaLightsPass;               // Niagara-parity render-integration roadmap, D1/D4.
+    class SurfaceCacheRayTracingPass;    // D1 (shared g_TLAS for MegaLights' shadow-visibility ray).
+    class AtmosVolumetricFogPass;        // D5 (froxel fog tint/modulation).
 
     // Byte-for-byte mirror of ParticleCommon.glsl's `Particle` struct -- 80 bytes, std430 (vec3
     // members are 16-byte aligned in std430, so the trailing scalar after each vec3 packs into the
@@ -75,7 +79,26 @@ namespace renderer {
         // comment) and never reach the curve-evaluation code path at all (see UpdateParticle's own
         // comment on why that branch is ember-only).
         float baseSize = 0.0f;
-        float _pad1 = 0.0f, _pad2 = 0.0f;
+        // Subtask C4 (Niagara-parity roadmap: sub-emitters / event-driven spawn chains) -- repurposes
+        // what were `_pad1`/`_pad2` (this struct's total size does not change, same "reuse a trailing
+        // pad slot" convention as baseSize's own declaration comment above). Both are set exactly once
+        // at spawn (ParticleSimulation.comp's SpawnParticleCore) and read/latched every
+        // UpdateParticle() call thereafter -- never touched by the render pass or any CPU code.
+        //
+        // subEmitterChildFlag: 0.0 for every normally-spawned particle; forced to 1.0 for a particle
+        // that was itself created BY a sub-emitter trigger (TriggerSubEmitter). This is the ENTIRE
+        // mechanism that caps sub-emitter chains at exactly one level deep -- UpdateParticle only ever
+        // calls TriggerSubEmitter for a particle whose OWN subEmitterChildFlag is still 0.0, so a child
+        // particle can never itself spawn a third generation, regardless of what its own (inherited)
+        // emitter slot's EmitterParams::subEmitterEnabled says. See TriggerSubEmitter's own header
+        // comment (ParticleSimulation.comp) for the full safety argument.
+        float subEmitterChildFlag = 0.0f;
+        // subEmitterCollisionFired: 0.0 until this particle's first Global SDF collision contact (for
+        // an emitter with subEmitterTriggerMode == 1, on-collision) fires its one allowed trigger, then
+        // latched to 1.0 for the rest of this particle's life -- without this latch, a particle resting/
+        // repeatedly bouncing against geometry would re-fire (and flood the dead-list) every single
+        // frame it stays in contact, instead of exactly once per particle lifetime.
+        float subEmitterCollisionFired = 0.0f;
     };
     static_assert(sizeof(GpuParticle) == 80, "GpuParticle must match ParticleCommon.glsl's Particle struct exactly (std430 layout)");
 
@@ -173,8 +196,79 @@ namespace renderer {
                 { 1.0f, 1.0f, 1.0f, 1.0f }, { 1.0f, 1.0f, 1.0f, 1.0f }
             };
             float sizeCurve[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+
+            // Subtask C2 (Niagara-parity roadmap: screen-space depth-buffer collision) -- see
+            // ParticleSimulation.comp's own ResolveDepthBufferCollision comment for the full contract:
+            // when nonzero, this emitter's ember particles ALSO resolve a bounce/absorb response
+            // against the opaque scene's reconstructed depth-buffer surface, as a fallback/supplement
+            // to the Global SDF collision above (useful for camera-relative dynamic geometry the SDF
+            // clipmap has not (re)captured yet).
+            uint32_t depthCollisionEnabled = 0;
+            // Subtask C3 (spawn-on-mesh-surface): which entity's clusters spawnShape == 2 samples
+            // triangles from -- matches ClusterCullMetadata::entityID / geometry::ClusterIndexEntry::
+            // entityID exactly (the same index renderer::ClusterHardwareRasterPass's own vertex shader
+            // uses to look up EntityDataBuffer/EntityTransformBuffer, see ParticleSimulation.comp's own
+            // SpawnParticleCore comment for the full sampling contract). Unused by any other
+            // spawnShape.
+            uint32_t spawnTargetEntityId = 0;
+
+            // Subtask C4 (Niagara-parity roadmap: sub-emitters / event-driven spawn chains) -- lets an
+            // emitter trigger spawning INTO a different emitter slot when one of its own particles dies
+            // or on its first Global SDF collision contact (e.g. an ember that, on death, spawns a
+            // small burst of dust in EMITTERS[1]'s style at the death location). See ParticleSimulation.
+            // comp's own TriggerSubEmitter comment for the full GPU-side mechanism (a fully in-shader,
+            // same-dispatch immediate re-spawn -- chosen over a CPU-readback queue specifically to
+            // preserve exact per-event world position, see that function's own comment) and Particle::
+            // subEmitterChildFlag's own declaration comment (this file, above) for why chains are
+            // provably capped at exactly one level deep.
+            uint32_t subEmitterEnabled = 0;
+            uint32_t subEmitterTargetSlot = 0; // Which EmitterParamsBuffer slot the spawned particles are styled/tagged as (bounds-checked via emitters.length() in-shader, not this field itself).
+            uint32_t subEmitterTriggerMode = 0; // 0 = on this particle's own death, 1 = on its first Global SDF collision contact.
+            uint32_t subEmitterSpawnCount = 0; // Particles spawned per trigger EVENT (not per frame) -- also hard-capped in-shader (see TriggerSubEmitter's own comment) independent of however large this is configured.
+            // Closes out this block's trailing 16-byte slot -- same "always end a subtask's growth on
+            // a clean std430 boundary" convention as every earlier block in this struct.
+            uint32_t _padC4a = 0, _padC4b = 0;
+
+            // Niagara-parity roadmap (bundled B1 "Mesh Particle" + B2 "Ribbon/Trail" + B3 "sprite
+            // orientation/sub-variation" workstream): ONE render-mode enum shared by all three
+            // subtasks -- they are bundled into a single workstream specifically because they all
+            // extend this same "how does this emitter render" decision, and a shared enum avoids 3
+            // separate, potentially-conflicting notions of "render mode" (see kRenderModeBillboard/
+            // kRenderModeMeshParticle/kRenderModeRibbon below).
+            //
+            // renderMode == 0 (Billboard) is the default for every field here BELOW this comment,
+            // so an emitter that never touches any of these new fields (every emitter that existed
+            // before this roadmap step) renders EXACTLY as before -- ParticleRender.vert/.frag's own
+            // gating checks (see those files' own comments) only special-case a particle when its
+            // own emitter's renderMode is explicitly non-zero.
+            uint32_t renderMode = 0;            // 0 = Billboard (default), 1 = Mesh Particle (B1), 2 = Ribbon/Trail (B2). Only meaningful for kKindEmber particles -- precipitation (rain/snow) has no EmitterParams slot of its own (see Particle::emitterIndex's own comment) and always renders as its original billboard streak/flake regardless of this field.
+            uint32_t meshArchetype = 0;          // Render mode 1 (Mesh Particle) only -- which of the two procedural meshes ParticleSystemPass generates once at Init() to instance: 0 = box, 1 = icosphere (see ParticleMeshRender.vert's own comment and this class' own kMeshArchetypeBox/kMeshArchetypeIcosphere).
+            float ribbonWidth = 0.05f;           // Render mode 2 (Ribbon/Trail) only -- half-width, world units, of the trail's cross-section quad-strip (see ParticleRibbonRender.vert's own comment).
+            uint32_t spriteOrientationMode = 0;  // Render mode 0 (Billboard) only -- 0 = camera-facing (Subtask 4's original, unchanged default), 1 = velocity-aligned (B3, see ParticleRender.vert's own comment).
+            float subVariationStrength = 0.0f;   // Render mode 0 (Billboard) only -- [0,1], B3's procedural per-particle analytic-shape perturbation strength; 0.0 (default) renders pixel-identical to the pre-B3 plain soft circle/streak (see ParticleRender.frag's own comment).
+            float _pad2 = 0.0f, _pad3 = 0.0f, _pad4 = 0.0f; // Closes this struct's final 16-byte std430 slot.
         };
-        static_assert(sizeof(EmitterParams) == 192, "EmitterParams must match ParticleCommon.glsl's EmitterParams struct exactly (std430 layout)");
+        static_assert(sizeof(EmitterParams) == 256, "EmitterParams must match ParticleCommon.glsl's EmitterParams struct exactly (std430 layout)");
+
+        // Niagara-parity roadmap: EmitterParams::renderMode values -- see that field's own
+        // declaration comment for the full contract.
+        static constexpr uint32_t kRenderModeBillboard = 0;
+        static constexpr uint32_t kRenderModeMeshParticle = 1;
+        static constexpr uint32_t kRenderModeRibbon = 2;
+
+        // B1 (Mesh Particle): EmitterParams::meshArchetype values -- both meshes are generated once
+        // at Init() into one small shared vertex/index buffer (see this class' own Init() comment on
+        // why this is plain hardware instancing, not the virtualized Nanite-like cluster/DAG pipeline
+        // every OTHER procedurally-generated mesh in this codebase eventually streams through).
+        static constexpr uint32_t kMeshArchetypeBox = 0;
+        static constexpr uint32_t kMeshArchetypeIcosphere = 1;
+
+        // B2 (Ribbon/Trail): how many past world-space positions each particle SLOT keeps in its own
+        // per-slot ring buffer (renderer::ParticleSystemPass's own m_RibbonHistoryBuffer) -- within
+        // the 4-8 sample budget this roadmap step's own task description asks for. Must match
+        // ParticleRibbonCommon.glsl's own kRibbonHistorySamples exactly (that file is the shader-side
+        // mirror this constant sizes the backing buffer for).
+        static constexpr uint32_t kRibbonHistorySamples = 6;
 
         // Maximum simultaneous emitter slots (multi-emitter roadmap, subtask A1) -- small and fixed
         // (unlike kMaxParticles, no sort/perf pressure motivates a larger number yet; a future
@@ -248,13 +342,69 @@ namespace renderer {
         // same 4-resource contract as renderer::TransparentForwardPass's own SetVirtualShadowMap, but
         // taken directly as an Init() parameter here rather than a deferred setter, since
         // ClusterRenderPipeline::Init() already has `vsm` fully ready by the time it reaches this
-        // call) and `worldProbes`' grid + a ONE-TIME-uploaded WorldProbeGridParamsUBO (mirrors
-        // TransparentForwardPass's own identical "static addressing" simplification -- the grid's
-        // toroidal recentering is not re-uploaded per frame here either, see that class' own Init()
-        // comment for why that limitation already exists elsewhere in this codebase).
-        bool Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
+        // call) and `worldProbes`' grid + a WorldProbeGridParamsUBO.
+        //
+        // D6 fix (Niagara-parity render-integration roadmap): the grid's toroidal recenter origin is
+        // now re-uploaded EVERY RecordDraw() call (see that method's own comment) instead of once
+        // here at Init() -- `worldProbes` is still taken here (unchanged contract) since its grid
+        // VIEW/SAMPLER never change, only the live origin threaded through RecordDraw does.
+        //
+        // D1 (MegaLights sampling for particles): set 3 additionally borrows `megaLights`' own light
+        // SSBO (stochastic RIS point-light draw, same MEGALIGHTS_LIGHTS_SET contract
+        // TransparentForward.frag's own inline MegaLights shading already establishes) and
+        // `rtPass`'s TLAS (the one shadow-visibility ray MegaLightsShade.comp's own algorithm also
+        // traces) -- `megaLights`/`rtPass` must already be Init'd, same borrowed/bound-once
+        // convention as `vsm`/`worldProbes` above.
+        //
+        // D3 (point-light VSM shadows): set 3 additionally borrows `vsm`'s own ShadowPointFacesUBO
+        // (shadow_point_sampling.glsl's contract) -- no extra Init() parameter needed, `vsm` already
+        // exposes it via GetPointFacesBuffer().
+        //
+        // D5 (volumetric fog interaction): set 3 additionally borrows `volumetricFog`'s integrated
+        // froxel grid (GetIntegratedFogView()/GetFogSampler()) to tint/modulate a particle's own lit
+        // color by the fog it is embedded in, mirroring PostProcessComposite.comp's own
+        // ApplyVolumetricFog reader-side contract (atmos_volumetric_fog_mapping.glsl).
+        //
+        // D4 (particles as light emitters): also builds a SEPARATE, additive compute pipeline (set 0
+        // reused unmodified, plus a new tiny set 1) that writes a bounded sample of currently-alive
+        // emissive particles directly into `megaLights`' own reserved "particle-derived" tail slots
+        // (see MegaLightsPass::GetParticleLightsBufferOffset()'s own comment) every
+        // RecordExtractLights() call -- see that method's own comment for the full mechanism and why
+        // it is scoped this way rather than a fuller (and materially riskier) redesign of MegaLights'
+        // own light-population lifecycle.
+        //
+        // `physicalDevice` (subtask E2 -- GPU timestamp query profiling): needed only to query
+        // VkPhysicalDeviceLimits::timestampPeriod/timestampComputeAndGraphics for this pass' own
+        // Debug-only VkQueryPool -- see m_TimestampQueryPool's own declaration comment. Matches
+        // renderer::SurfaceCacheRayTracingPass::Init's own "physicalDevice first" parameter
+        // convention. Taken unconditionally (not `#ifndef NDEBUG`-guarded itself) so this method's
+        // signature does not need to differ between Debug/Release builds -- in Release it is simply
+        // an unused parameter, costing nothing (no code is generated to read it).
+        // (Subtask C2) Also binds a NEW environment-set (set 1) resource: `resolvePass`'s SAME
+        // sampled GBuffer depth copy the render pipeline's own set 2 already samples for soft-particle
+        // fade (GetOutputDepthView()), bound here a SECOND time with its own dedicated sampler/binding
+        // so ParticleSimulation.comp (a COMPUTE shader, which never binds set 2) can ALSO reconstruct
+        // the opaque scene's world position under a particle for the new screen-space depth-buffer
+        // collision mode -- see EmitterParams::depthCollisionEnabled and ParticleSimulation.comp's own
+        // ResolveDepthBufferCollision comment for the full contract.
+        // (Subtask C3, spawn-on-mesh-surface) Also binds 4 MORE environment-set resources, all
+        // borrowed unmodified (never re-written by this pass): `clusterMetadataBuffer` (renderer::
+        // ClusterOcclusionCullingPass::GetClusterMetadataBuffer()) and `compressedPhysicalPoolBuffer`
+        // (renderer::GpuGeometryPagePool::GetPhysicalPoolBuffer()) -- the EXACT SAME two buffers
+        // renderer::ClusterHardwareRasterPass's own ClusterRaster.vert already reads triangle geometry
+        // from (see cluster_vertex_decode.glsl's own DecodeClusterPosition) -- plus `entityTransformBuffer`/
+        // `entityDataBuffer` (the same two buffers ClusterRaster.vert also binds, needed to transform a
+        // sampled rest-pose triangle point into world space). Reusing these SAME 4 buffers (rather than
+        // building a second, bespoke mesh format) is what lets spawnShape == 2 sample real triangle
+        // surfaces of ANY already-streamed entity -- see ParticleSimulation.comp's own SpawnParticleCore
+        // comment for the full random-triangle-then-barycentric sampling algorithm.
+        bool Init(VkPhysicalDevice physicalDevice, VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
             const AtmosClimatePass& atmosClimate, const GlobalSDFPass& globalSDF, const ClusterResolvePass& resolvePass,
             const VirtualShadowMapPass& vsm, const WorldProbeGridPass& worldProbes,
+            const MegaLightsPass& megaLights, const SurfaceCacheRayTracingPass& rtPass,
+            const AtmosVolumetricFogPass& volumetricFog,
+            VkBuffer clusterMetadataBuffer, VkBuffer compressedPhysicalPoolBuffer,
+            VkBuffer entityTransformBuffer, VkBuffer entityDataBuffer,
             VkFormat colorFormat, VkFormat depthFormat);
 
         void Shutdown();
@@ -290,6 +440,34 @@ namespace renderer {
         // independently spawning/alive, not just that the aggregate total is nonzero. `emitterIndex`
         // must be < kMaxEmitters.
         uint32_t GetLastPerEmitterAliveCountApprox(uint32_t emitterIndex) const;
+
+        // Subtask E2 (GPU timestamp query profiling): milliseconds spent in the most recently
+        // COMPLETED frame's RecordSimulate()/RecordSort()/RecordDraw() GPU work, respectively --
+        // exactly ONE frame stale, deterministically (not "1-2 frames" like GetLastAliveCountApprox()
+        // above): RecordSimulate()'s own copy-out-then-reset sequence (see that method's own .cpp
+        // comment) only ever reads query results that main.cpp's single per-frame frameFence wait
+        // (top of its render loop, before this frame's command buffers are even re-recorded) has
+        // already guaranteed are fully retired on the GPU -- so, unlike the alive-count readback,
+        // there is no race between "GPU still writing this frame" and "CPU already reading" to
+        // reason about; the value is simply always exactly last frame's real timing, never mid-
+        // flight garbage. Returns 0.0f if this GPU/driver combination does not support timestamp
+        // queries on this pass' own combined graphics+compute queue (see Init()'s own comment on
+        // VkPhysicalDeviceLimits::timestampComputeAndGraphics) or before the first frame has
+        // completed a full cycle.
+        float GetLastSimMs() const;
+        float GetLastSortMs() const;
+        float GetLastDrawMs() const;
+
+        // Subtask E3 (Debug Buffer Viewer extension): the CURRENTLY active raw particle-state
+        // buffer handle/size (GetCurrentSet()'s own physical binding 0, see that accessor's own
+        // comment) -- exposed specifically for renderer::debug::ParticleDebugViewPass's own
+        // read-only compute bake (an alive-list occupancy heatmap + per-emitter color overlay for
+        // the ImGui "Buffer Viewer" dropdown), which needs the raw VkBuffer handle directly rather
+        // than going through GetSetLayout()'s full descriptor-set contract like every real particle
+        // shader does. Never used by Release code -- guarded `#ifndef NDEBUG` like every other
+        // Debug-only accessor on this class.
+        VkBuffer GetParticleBufferHandleForDebugView() const { return m_ParticleBuffer[m_CurrentIndex].Handle(); }
+        VkDeviceSize GetParticleBufferSizeForDebugView() const { return m_ParticleBuffer[m_CurrentIndex].Size(); }
 #endif
 
         // Dispatches ParticleSimulation.comp in up to three passes against GetCurrentSet() (see that
@@ -357,7 +535,17 @@ namespace renderer {
         // `spawnCounts` mechanism above, not a separate dispatch -- it is authored with a low-gravity,
         // high-drag "Sphere volume drift" recipe (spawnShape == 1, same shape kind as the "Ambient
         // Dust" emitter) positioned at the falls' own base, so it needs no shader-side special case.
+        //
+        // Subtask C2 (screen-space depth-buffer collision): `viewProj`/`invViewProj` are this frame's
+        // SAME combined camera matrices renderer::ClusterRenderPipeline already computed for every
+        // other pass this frame (its own `viewProj`/`invViewProj` locals) -- uploaded here into this
+        // pass' own ParticleDepthCollisionUBO (environment set, binding 3) so ParticleSimulation.comp
+        // can project a particle's world position forward to screen space, sample `resolvePass`'s
+        // depth copy (bound at Init()), and reconstruct the scene surface position back out of it,
+        // exactly like ParticleRender.frag's own soft-particle fade does -- see that shader's own
+        // header comment and ResolveDepthBufferCollision's own comment for the shared math.
         void RecordSimulate(VkCommandBuffer cmd, const GlobalSDFPass& globalSDF, float dt, float time,
+            const maths::mat4& viewProj, const maths::mat4& invViewProj, VkExtent2D renderExtent,
             const EmitterParams emitters[kMaxEmitters], const uint32_t spawnCounts[kMaxEmitters],
             const float precipCenterWorld[3], uint32_t precipSpawnCount, uint32_t precipKind,
             float precipSpawnRadiusMeters, float precipSpawnHeightAboveCenterMeters,
@@ -389,6 +577,30 @@ namespace renderer {
         // consumers -- a render-stage consumer, Subtask 4, will need its own additional barrier,
         // including one for INDIRECT_COMMAND_READ on the indirect-draw buffer specifically).
         void RecordSort(VkCommandBuffer cmd, const float cameraPositionWorld[3], const float cameraForwardWorld[3]);
+
+        // D4 (Niagara-parity render-integration roadmap, particles as light emitters): dispatches
+        // ParticleLightExtract.comp -- a single (1,1,1) workgroup, kMaxParticleDerivedLights
+        // (MegaLightsTypes.h) threads, one per reserved MegaLights "particle-derived" light slot.
+        // Thread `i` inspects GetCurrentSet()'s ALIVE list entry `i` (NOT the sorted list -- this
+        // does not need back-to-front order, only a bounded, consistent sample of currently-alive
+        // particles, so it stays decoupled from RecordSort()'s own timing/scope): if that slot holds
+        // a live kKindEmber particle, writes a real {position, radius, color, intensity} MegaLight
+        // entry (derived from the particle's own size/color) directly into the reserved tail slot;
+        // otherwise writes an inert (zero-radius, zero-intensity) one, which
+        // MegaLightTargetWeight (megalights_ris.glsl) provably scores as exactly zero weight
+        // regardless of position -- see this method's own .cpp comment for the full write-target/
+        // BVH-placeholder derivation. Must be called AFTER RecordSimulate() (needs this frame's
+        // alive list) -- RecordSort() is not a dependency, but this codebase's own RecordFrame calls
+        // it right after RecordSort() anyway for a single obvious call-site location. Writes directly
+        // into MegaLightsPass' own m_LightBuffer at a fixed byte offset (bound once at Init(), see
+        // this class' own Init() comment) -- no MegaLightsPass parameter needed here. Caller owns
+        // the barrier before (alive-list state visible to COMPUTE_SHADER, RecordSimulate()'s own
+        // trailing barrier already covers this) and after (this call's own trailing barrier only
+        // covers a future COMPUTE_SHADER reader on the SAME queue -- MegaLightsPass::RecordShade
+        // reads the result from a LATER command-buffer submission on the same graphics queue, which
+        // this codebase already relies on same-queue submission ordering to make visible, see
+        // ClusterRenderPipeline.h's own "same-queue submission order (not a semaphore)" precedent).
+        void RecordExtractLights(VkCommandBuffer cmd);
 
         // Draws every alive particle (see ParticleRender.vert's own header comment) via
         // vkCmdDrawIndirect against `colorView`/`depthView` -- the SAME forward-pass color/depth
@@ -422,12 +634,31 @@ namespace renderer {
         // toggle, not per-particle -- GpuParticle's already-merged 64-byte layout has no spare
         // "isRefractive" flag, and a demoscene emitter is realistically one thermal "kind" or
         // another (Subtask 6's ImGui panel will make this tunable per emitter).
+        //
+        // Niagara-parity render-integration roadmap (D1/D3/D5/D6), new parameters:
+        //   `cameraForwardWorld` (D5) -- feeds the froxel volumetric-fog view-space-depth
+        //     reconstruction (atmos_volumetric_fog_mapping.glsl's ViewZToFroxelW), same "camera
+        //     right/up already tracked, forward is not, so it is derived once at the call site and
+        //     passed down" convention this method's own cameraRight/cameraUp already establish.
+        //   `sceneLights` (D3) -- the SAME renderer::SceneLights aggregate
+        //     renderer::VirtualShadowMapPass::RecordBeginFrame/TransparentForwardPass::RecordDraw
+        //     already receive every frame; only its `pointLights`/`pointLightCount` fields are read
+        //     here (re-uploaded into this pass' own small ParticlePointLightsUBO every call, since
+        //     unlike the VSM resources themselves, the light POSITIONS/colors are ordinary per-frame
+        //     CPU data, not a borrowed GPU handle).
+        //   `worldProbeGridOrigin` (D6 fix) -- `renderer::WorldProbeGridPass::GetGridOriginWorld()`'s
+        //     CURRENT value, re-uploaded into m_WorldProbeGridParamsBuffer every call instead of the
+        //     stale one-time Init()-time value (see this class' own Init() comment on D6).
+        //   `frameIndex` (D1) -- decorrelates MegaLights' own RIS candidate draw across frames,
+        //     exactly like MegaLightsShade.comp/TransparentForward.frag's own `frameIndex` push
+        //     constant already does.
         void RecordDraw(VkCommandBuffer cmd, VkImage colorImage, VkImageView colorView, VkImageView depthView,
             VkImageView refractionOffsetView, VkExtent2D renderExtent,
             const maths::mat4& viewProj, const maths::vec3& cameraPositionWorld,
-            const maths::vec3& cameraRightWorld, const maths::vec3& cameraUpWorld,
+            const maths::vec3& cameraRightWorld, const maths::vec3& cameraUpWorld, const maths::vec3& cameraForwardWorld,
             const maths::vec3& sunDirectionWorld, const maths::vec3& sunColor, float sunIntensity,
-            float softFadeDistanceWorld, float heatShimmerStrength, float globalTimeSeconds);
+            const SceneLights& sceneLights, const maths::vec3& worldProbeGridOrigin,
+            float softFadeDistanceWorld, float heatShimmerStrength, float globalTimeSeconds, uint32_t frameIndex);
 
     private:
         VkDevice m_Device = VK_NULL_HANDLE;
@@ -495,6 +726,16 @@ namespace renderer {
         // idiom as AtmosClimatePass::RecordUpdate's own AtmosGlobalsUBO upload.
         GpuBuffer m_PrecipitationParamsBuffer;
 
+        // Subtask C2 (screen-space depth-buffer collision) -- environment set binding 3
+        // (ParticleDepthCollisionUBO: viewProj/invViewProj/viewportSize) and binding 4 (`resolvePass`'s
+        // sampled GBuffer depth copy, bound a SECOND time here with this pass' OWN dedicated sampler --
+        // see Init()'s own comment for why a compute-stage binding needs this separate from the render
+        // pipeline's own set 2 sampler, m_SceneDepthSampler below). The UBO is re-uploaded every
+        // RecordSimulate() call (the camera moves every frame), same vkCmdUpdateBuffer-then-barrier
+        // idiom as m_PrecipitationParamsBuffer just above.
+        GpuBuffer m_DepthCollisionParamsBuffer;
+        VkSampler m_ComputeSceneDepthSampler = VK_NULL_HANDLE; // Nearest -- same rationale as m_SceneDepthSampler's own declaration comment.
+
         VkPipelineLayout m_SimPipelineLayout = VK_NULL_HANDLE;
         VkPipeline m_SimPipeline = VK_NULL_HANDLE;
 
@@ -523,6 +764,43 @@ namespace renderer {
         // persistently mapped -- RecordSort() vkCmdCopyBuffer's CounterBuffer.aliveCount into this
         // every call, no fence-wait (deliberately stale-tolerant, observability only).
         GpuBuffer m_AliveCountReadbackBuffer;
+
+        // Subtask E2 (GPU timestamp query profiling), Debug-only: 6 timestamp queries bracketing
+        // RecordSimulate()/RecordSort()/RecordDraw()'s own GPU work every frame -- indices
+        // {0=SimStart, 1=SimEnd, 2=SortStart, 3=SortEnd, 4=DrawStart, 5=DrawEnd}. Written across TWO
+        // different primary command buffers within the same frame (RecordSimulate/RecordSort on
+        // renderer::ClusterRenderPipeline's own "cmdEarly", RecordDraw on its "cmdLate") -- safe
+        // because both share the same graphics queue and are submitted in that same relative order
+        // every frame (see VulkanContext::GetCommandBufferEarly()'s own class comment on why
+        // same-queue submission order alone already makes cmdEarly's work visible to cmdLate), and
+        // RecordSimulate()'s own copy-out-then-reset sequence resets ALL 6 queries (including the
+        // 2 cmdLate will write later this same frame) before ANY of the 6 is written this frame --
+        // satisfying Vulkan's "a query must be reset before each reuse" requirement for every slot,
+        // every frame, with a single vkCmdResetQueryPool call. See RecordSimulate()'s own comment
+        // for the exact copy-out/reset ordering and why it is provably race-free (no
+        // VK_QUERY_RESULT_WAIT_BIT / blocking vkGetQueryPoolResults needed).
+        VkQueryPool m_TimestampQueryPool = VK_NULL_HANDLE;
+        static constexpr uint32_t kTimestampQueryCount = 6;
+        // False if this physical device does not report VkPhysicalDeviceLimits::
+        // timestampComputeAndGraphics == VK_TRUE (i.e. timestamp queries are not guaranteed to work
+        // on a queue family that does both compute and graphics, exactly what this pass' own
+        // graphics queue is used for -- see Init()'s own comment) -- every timestamp-related call
+        // becomes a no-op and the 3 GetLastXxxMs() accessors all return 0.0f when this is false, so
+        // this Debug-only feature degrades gracefully instead of hitting validation errors on an
+        // unusual GPU/driver.
+        bool m_TimestampQueriesSupported = false;
+        // VkPhysicalDeviceLimits::timestampPeriod (nanoseconds per timestamp tick) -- queried once
+        // at Init() time (see that method's own comment) and cached here since it never changes for
+        // a given physical device; every GetLastXxxMs() accessor multiplies a raw tick delta by this
+        // value (then / 1e6 for nanoseconds -> milliseconds) to report real wall-clock time
+        // regardless of which GPU vendor's own tick granularity happens to be running this session.
+        float m_TimestampPeriodNs = 1.0f;
+        // kTimestampQueryCount * sizeof(uint64_t) bytes, CPU_TO_GPU, persistently mapped --
+        // RecordSimulate()'s own vkCmdCopyQueryPoolResults copies the raw tick values here every
+        // frame (see this pass' own class-level RecordSimulate() comment), read directly via
+        // MappedData() by the 3 GetLastXxxMs() accessors with no fence-wait, same convention as
+        // m_AliveCountReadbackBuffer above.
+        GpuBuffer m_TimestampReadbackBuffer;
 #endif
 
         // Subtask 4 -- ParticleRender.vert/.frag's own set 2 (ParticleRenderParamsUBO + the sampled
@@ -539,13 +817,92 @@ namespace renderer {
         VkPipeline m_RenderPipeline = VK_NULL_HANDLE;
 
         // Subtask 5 -- ParticleRender.frag's own set 3 ("lighting"): `vsm`'s 4 Virtual Shadow Map
-        // resources (borrowed, bound once, never re-written) + `worldProbes`' grid + a one-time-
-        // uploaded WorldProbeGridParamsUBO (see Init()'s own comment on why this is a static upload,
-        // not per-frame). Same one-time-bind convention as the Subtask 2 environment set.
-        GpuBuffer m_WorldProbeGridParamsBuffer; // WorldProbeGridParamsUBO, std140, GPU_ONLY, filled once at Init().
+        // resources (borrowed, bound once, never re-written) + `worldProbes`' grid + a
+        // WorldProbeGridParamsUBO (D6 fix: re-uploaded every RecordDraw() call now, see that
+        // method's own comment -- no longer a one-time Init()-time upload).
+        //
+        // Niagara-parity render-integration roadmap extensions to this SAME set (D1/D3/D5, bindings
+        // 6-10 -- see Init()'s own comment for the full rationale of each):
+        //   6: MegaLightsSSBO (borrowed, `megaLights`'s own light buffer).
+        //   7: g_TLAS (borrowed, `rtPass`'s TLAS -- MegaLights' own shadow-visibility ray).
+        //   8: ShadowPointFacesUBO (borrowed, `vsm`'s own point-light VSM view-proj matrices).
+        //   9: ParticlePointLightsUBO (owned, re-uploaded every RecordDraw() call from `sceneLights`).
+        //   10: g_VolumetricFog (borrowed, `volumetricFog`'s integrated froxel grid).
+        GpuBuffer m_WorldProbeGridParamsBuffer; // WorldProbeGridParamsUBO, std140, GPU_ONLY, re-uploaded every RecordDraw() call (D6).
+        // D3: up to kMaxPointLights (LightingTypes.h) {position, color, intensity, radius} entries,
+        // re-uploaded every RecordDraw() call from `sceneLights.pointLights` -- ordinary per-frame
+        // CPU light data, unlike the borrowed GPU-owned resources this set otherwise only binds once.
+        GpuBuffer m_ParticlePointLightsBuffer;
         VkDescriptorSetLayout m_LightingSetLayout = VK_NULL_HANDLE;
         VkDescriptorPool m_LightingDescriptorPool = VK_NULL_HANDLE;
         VkDescriptorSet m_LightingSet = VK_NULL_HANDLE;
+
+        // D4 (particles as light emitters): a SEPARATE, additive compute pipeline -- set 0 reused
+        // unmodified from Subtask 1 (reads ParticleBuffer/AliveListBuffer/CounterBuffer to sample
+        // currently-alive particles), plus this NEW tiny set 1 (a single STORAGE_BUFFER binding: the
+        // borrowed MegaLightsPass buffer, bound with a nonzero VkDescriptorBufferInfo.offset landing
+        // exactly on its reserved "particle-derived" tail region -- see RecordExtractLights()'s own
+        // .cpp comment for why this needs no new getter/setter round-trip through MegaLightsPass
+        // beyond the offset/capacity accessors it already exposes for this exact purpose).
+        VkDescriptorSetLayout m_LightExtractSetLayout = VK_NULL_HANDLE;
+        VkDescriptorPool m_LightExtractDescriptorPool = VK_NULL_HANDLE;
+        VkDescriptorSet m_LightExtractSet = VK_NULL_HANDLE;
+        VkPipelineLayout m_LightExtractPipelineLayout = VK_NULL_HANDLE;
+        VkPipeline m_LightExtractPipeline = VK_NULL_HANDLE;
+
+        // ===================================================================================
+        // B1 (Mesh Particle render mode) -- a small, fixed, shared vertex/index buffer holding BOTH
+        // procedural mesh archetypes (box + icosphere), generated ONCE at Init() by reusing
+        // geom_box.comp/geom_icosphere.comp (the SAME GPU generation shaders the main cluster
+        // pipeline builds its procedural entity meshes from -- see Init()'s own comment for why this
+        // is deliberately NOT plumbed through GpuGeometryPagePool/ClusterDAG). Never written again
+        // after Init() -- neither archetype is parametrized at runtime, EmitterParams::meshArchetype
+        // only SELECTS between the two fixed sub-ranges below via vkCmdDrawIndexedIndirect's own
+        // firstIndex/vertexOffset fields.
+        // ===================================================================================
+        GpuBuffer m_MeshVertexBuffer; // struct_custo.glsl's Vertex (48 bytes), STORAGE (generation write) + VERTEX (render read).
+        GpuBuffer m_MeshIndexBuffer;  // uint32 indices, STORAGE (generation write) + INDEX (render read).
+        // One VkDrawIndexedIndirectCommand per archetype (index 0 = box, 1 = icosphere, matching
+        // kMeshArchetypeBox/kMeshArchetypeIcosphere) -- indexCount/firstIndex/vertexOffset are fixed
+        // at Init() (each archetype's own known sub-range), instanceCount is refreshed every
+        // RecordDraw() call from CounterBuffer.aliveCount (mirrors m_IndirectDrawBuffer's own
+        // instanceCount-copy idiom, done in RecordDraw() rather than RecordSort() specifically so
+        // this feature never has to touch RecordSort()/ParticleSort.comp at all).
+        GpuBuffer m_MeshIndirectDrawBuffer[2];
+        // Reuses m_RenderPipelineLayout (sets 0/1/2/3 = particle/sort/renderParams/lighting -- see
+        // that layout's own comment) unmodified except for one new small push-constant range this
+        // pipeline's own vertex shader uses to know which archetype (box/icosphere) THIS draw call
+        // represents (ParticleRender.vert/.frag, the billboard pipeline sharing the same layout,
+        // simply never declares/reads that range -- legal, see Init()'s own STEP 6c comment).
+        VkPipeline m_MeshPipeline = VK_NULL_HANDLE;
+
+        // ===================================================================================
+        // B2 (Ribbon/Trail render mode) -- per-particle-SLOT position-history ring buffers, a
+        // dedicated descriptor set (set 4 for both the simulation compute pipeline and the ribbon
+        // render pipeline -- see ParticleRibbonCommon.glsl's own header comment for why this is a
+        // SEPARATE set rather than 2 more bindings appended to m_SetLayout) written every
+        // UpdateParticle() call (ParticleSimulation.comp) and read by ParticleRibbonRender.vert to
+        // build each particle's own trailing quad-strip.
+        // ===================================================================================
+        GpuBuffer m_RibbonHistoryBuffer;      // kMaxParticles * kRibbonHistorySamples vec4 positions, GPU_ONLY.
+        GpuBuffer m_RibbonSampleCountBuffer;  // kMaxParticles uint32 "total pushes so far" counters, GPU_ONLY.
+        VkDescriptorSetLayout m_RibbonSetLayout = VK_NULL_HANDLE;
+        VkDescriptorPool m_RibbonDescriptorPool = VK_NULL_HANDLE;
+        VkDescriptorSet m_RibbonSet = VK_NULL_HANDLE;
+        // VkDrawIndirectCommand (non-indexed, procedurally generated via gl_VertexIndex exactly like
+        // the billboard pipeline -- see ParticleRibbonRender.vert's own comment): vertexCount fixed
+        // at Init() (6 vertices/segment * (kRibbonHistorySamples - 1) segments), instanceCount
+        // refreshed every RecordDraw() call from CounterBuffer.aliveCount, same "refresh in
+        // RecordDraw(), never touch RecordSort()" convention as m_MeshIndirectDrawBuffer above.
+        GpuBuffer m_RibbonIndirectDrawBuffer;
+        // A dedicated pipeline layout (unlike m_MeshPipeline's reuse of m_RenderPipelineLayout
+        // above): ribbon rendering needs a 5th descriptor set (m_RibbonSetLayout, the position
+        // history above) on top of the SAME 4 sets the billboard AND mesh pipelines already bind
+        // (particle/sort/renderParams/lighting) -- ribbons are alpha-blended and back-to-front
+        // sorted exactly like billboards (both read SortedPairsBuffer via set 1), unlike a real
+        // opaque 3D mesh instance where draw order does not affect correctness.
+        VkPipelineLayout m_RibbonRenderPipelineLayout = VK_NULL_HANDLE;
+        VkPipeline m_RibbonPipeline = VK_NULL_HANDLE;
     };
 
 }

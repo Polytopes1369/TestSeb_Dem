@@ -55,14 +55,19 @@ struct Particle {
     // SpawnPrecipitationParticle comment in ParticleSimulation.comp) and never reach the curve-
     // evaluation code path at all (see UpdateParticle's own comment on why that branch is ember-only).
     float baseSize;
-    float _pad1, _pad2;
+    // Subtask C4 (Niagara-parity roadmap: sub-emitters / event-driven spawn chains) -- mirrors
+    // renderer::GpuParticle::subEmitterChildFlag/subEmitterCollisionFired (src/renderer/passes/
+    // ParticleSystemPass.h) byte-for-byte, repurposing what were `_pad1`/`_pad2` -- see those fields'
+    // own declaration comment for the full contract (one-level-deep sub-emitter recursion cap /
+    // once-per-lifetime collision-trigger latch).
+    float subEmitterChildFlag, subEmitterCollisionFired;
 };
 
 // Per-emitter, live-tunable spawn/physics parameters -- one instance per active emitter slot (see
 // renderer::ParticleSystemPass::kMaxEmitters), re-uploaded in full every RecordSimulate() call since
 // every field is directly editable via main.cpp's Particles ImGui tab
 // (config::particles::EMITTERS[]). Mirrors renderer::ParticleSystemPass::EmitterParams byte-for-byte
-// -- 192 bytes, std430, same "flat floats, vec3 packs with trailing scalar" layout as Particle above.
+// -- 256 bytes, std430, same "flat floats, vec3 packs with trailing scalar" layout as Particle above.
 // Only consumed for kKindEmber particles -- precipitation (rain/snow) has its own dedicated
 // PrecipitationParamsUBO (this file's own binding declarations further down) instead.
 //
@@ -110,6 +115,40 @@ struct EmitterParams {
     // vec4 multiple.
     vec4 colorCurve[4];
     float sizeCurve[4];
+
+    // Subtask C2 (Niagara-parity roadmap: screen-space depth-buffer collision) -- mirrors renderer::
+    // ParticleSystemPass::EmitterParams::depthCollisionEnabled (src/renderer/passes/
+    // ParticleSystemPass.h) byte-for-byte, see that field's own declaration comment for the full
+    // contract and ParticleSimulation.comp's own ResolveDepthBufferCollision for the consuming logic.
+    uint depthCollisionEnabled;
+    // Subtask C3 (spawn-on-mesh-surface): mirrors renderer::ParticleSystemPass::EmitterParams::
+    // spawnTargetEntityId byte-for-byte -- see that field's own declaration comment.
+    uint spawnTargetEntityId;
+
+    // Subtask C4 (Niagara-parity roadmap: sub-emitters / event-driven spawn chains) -- mirrors
+    // renderer::ParticleSystemPass::EmitterParams' own trailing block byte-for-byte, see that
+    // struct's own declaration comment for the full contract.
+    uint subEmitterEnabled;
+    uint subEmitterTargetSlot;
+    uint subEmitterTriggerMode;
+    uint subEmitterSpawnCount;
+    uint _padC4a, _padC4b;
+
+    // Niagara-parity roadmap (bundled B1 "Mesh Particle" + B2 "Ribbon/Trail" + B3 "sprite
+    // orientation/sub-variation" workstream): ONE render-mode enum shared by all three subtasks --
+    // mirrors renderer::ParticleSystemPass::EmitterParams::renderMode/meshArchetype/ribbonWidth/
+    // spriteOrientationMode/subVariationStrength (src/renderer/passes/ParticleSystemPass.h)
+    // byte-for-byte -- see that field's own declaration comment for the full contract. Appended at
+    // the very END of this struct for the same "minimize textual overlap with other parallel
+    // workstreams" reason as that file's own comment. renderMode == 0 (Billboard) is the default for
+    // every field below, so an emitter that never touches any of these fields renders EXACTLY as it
+    // did before this roadmap step -- see ParticleRender.vert/.frag's own gating-check comments.
+    uint renderMode;            // 0 = Billboard (default), 1 = Mesh Particle (B1), 2 = Ribbon/Trail (B2). Only meaningful for kKindEmber particles.
+    uint meshArchetype;         // Render mode 1 only -- 0 = box, 1 = icosphere (see ParticleMeshRender.vert's own comment).
+    float ribbonWidth;          // Render mode 2 only -- half-width, world units, of the trail's cross-section quad-strip.
+    uint spriteOrientationMode; // Render mode 0 only -- 0 = camera-facing (original default), 1 = velocity-aligned (B3).
+    float subVariationStrength; // Render mode 0 only -- [0,1], B3's procedural per-particle shape perturbation strength (0.0 = pixel-identical to pre-B3).
+    float _pad2, _pad3, _pad4;
 };
 
 // Particle "kind" tag, packed into Particle.randomSeed's top 2 bits (see that field's own comment).
