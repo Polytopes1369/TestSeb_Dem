@@ -1,0 +1,532 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+
+// Particle system Subtask 2 (particle_system_integration_plan.md, project root): the GPU-driven
+// spawn + physics-update kernel every RecordSimulate() call dispatches twice (see
+// renderer::ParticleSystemPass::RecordSimulate's own comment for the exact two-dispatch contract) --
+// which half runs is selected by pc.mode, this codebase's established "one shader, multiple modes
+// via a push-constant int + branch in main()" convention (see e.g. GlobalSDFComposite.comp).
+//
+// --- mode == 1: Spawn ---
+// One thread per REQUESTED new particle (dispatched over ceil(spawnCount / 64) workgroups, NOT over
+// kMaxParticles -- gl_GlobalInvocationID.x >= pc.spawnCount threads exit immediately). Each valid
+// thread atomically pops exactly one index off the tail of the dead-list (ParticleCommon.glsl's
+// DeadListBuffer, mirroring renderer::ParticleSystemPass::RecordSimulate's own "pop from the tail"
+// comment) and fully (re)initializes that particle slot: position/velocity jittered around the
+// caller-supplied emitter position, life = maxLife, a freshly re-seeded PRNG state. Deliberately does
+// NOT touch AliveListBuffer/CounterBuffer.aliveCount -- see mode == 0 below for why that would
+// double-count.
+//
+// --- mode == 0: Update ---
+// One thread per PARTICLE SLOT (dispatched over ceil(kMaxParticles / 64) workgroups) -- covers every
+// pre-existing alive particle AND every particle mode == 1/2 just spawned this same RecordSimulate()
+// call, uniformly, since both look identical here (a slot with life > 0). A dead slot (life <= 0)
+// costs one branch and returns. A live slot's physics branches on its own stored kind (see
+// ParticleCommon.glsl's UnpackParticleKind): kKindEmber integrates gravity + wind + drag, then (module
+// stack roadmap, subtask A3) additively layers its own emitter's curl-noise turbulence and/or radial
+// attractor/repulsor force -- EACH independently toggleable per emitter and a no-op branch when
+// disabled (see EmitterParams' own curlNoiseEnabled/attractorEnabled fields and UpdateParticle's own
+// call site) -- before resolving Global SDF collisions with a bounce (elastic-normal/
+// frictional-tangential split), exactly as before this feature existed; kKindRain/kKindSnow (this
+// file's own precipitation feature, see mode
+// == 2 below) instead relax velocity toward a fixed downward fall speed (blended with the local wind
+// for horizontal drift, plus a sine-noise wobble for snow) and are simply ABSORBED (life forced to 0,
+// no bounce) on any Global SDF collision or once they sink below g_Precip.floorBelowCenter under the
+// current camera-relative spawn shell -- see UpdateParticle's own comment for why precipitation
+// deliberately skips the bounce path entirely. Either way, the particle then either returns its index
+// to the dead-list (life just expired) or appends it to AliveListBuffer (still alive). This is the
+// ONLY place either list is written from an existing particle, which is exactly why
+// renderer::ParticleSystemPass::RecordSimulate resets aliveCount to 0 immediately before mode == 1's
+// dispatch: this mode == 0 pass rebuilds the alive-list from scratch every call, so a particle spawned
+// this frame is counted exactly once (here), not twice (once by mode == 1/2, once by mode == 0).
+//
+// --- mode == 2: Spawn precipitation (rain/snow) ---
+// Same "one thread per requested new particle, pop one dead-list slot" contract as mode == 1, but
+// spawns into a camera-relative horizontal spawn-shell (a box centered on g_Precip.spawnCenter's XZ,
+// see SpawnPrecipitationParticle) instead of jittering around a fixed emitter position -- this is
+// what keeps precipitation "always falling somewhere visible" as the camera moves, per this feature's
+// own integration-plan requirement, rather than a single fixed-position emitter. `pc.precipKind`
+// (kParticleKindRain or kParticleKindSnow, resolved CPU-side from the current Atmos temperature
+// every RecordSimulate() call -- see renderer::ParticleSystemPass::RecordSimulate's own comment)
+// selects which kind every particle spawned by THIS dispatch is tagged with; a particle already in
+// flight keeps whatever kind it was originally spawned with even if the CPU-resolved kind changes
+// next frame (e.g. temperature crossing the snow threshold mid-fall) -- UpdateParticle reads the
+// PARTICLE's own stored kind, not this frame's pc.precipKind, for exactly this reason.
+
+#include "include/ParticleCommon.glsl"
+#include "include/AtmosNoiseCommon.glsl"
+
+layout(local_size_x = 64) in;
+
+// std140 mirror of AtmosClimatePass.cpp's AtmosGlobalsUBO -- see AtmosNoiseCommon.glsl's own header
+// comment for the authoritative field-by-field layout this must match.
+layout(std140, set = 1, binding = 0) uniform AtmosGlobalsUBO {
+    vec3 windDirection; float windSpeed;
+    float temperature, humidity, dewPoint, condensationLCL;
+    float cloudDensityTarget, fogDensityTarget, rainStrength, time;
+    vec4 windTurbulenceParams;
+} g_AtmosGlobals;
+
+// Must match renderer::GlobalSDFPass::kLevelCount exactly -- same toroidal clipmap array
+// SDFRayMarch.comp's own uGlobalClipmaps binds, sampled with the same NEAREST filter for the same
+// reason (linear filtering would blend across the wrap seam).
+layout(set = 1, binding = 1) uniform sampler3D uGlobalClipmaps[4];
+
+// Multi-emitter roadmap (subtask A1): emitterPosition/bounceElasticity/friction/dragCoefficient/
+// gravityY were removed from this push-constant block -- every one of those is now a per-emitter
+// value read straight out of EmitterParamsBuffer (ParticleCommon.glsl), indexed by `emitterIndex`
+// below during spawn, or by the particle's own stored `emitterIndex` field during update. Reconciled
+// with the precipitation feature's own PrecipitationParamsUBO below -- the two features never read
+// each other's per-emitter/per-kind data.
+//
+// Precipitation feature's own environment-set binding (set 1, binding 2 -- alongside AtmosGlobalsUBO/
+// clipmaps above, same "borrowed, bound once" environment set). std140 mirror of renderer::
+// ParticleSystemPass.cpp's own (anonymous-namespace) PrecipitationParamsUBO. Unlike AtmosGlobalsUBO
+// (owned/updated by AtmosClimatePass) this buffer is owned and updated every RecordSimulate() call by
+// ParticleSystemPass ITSELF (see that method's own comment) -- kept out of the push-constant block
+// specifically to stay well under the Vulkan-guaranteed minimum 128-byte push-constant budget this
+// codebase's ParticleSimulationPC below is already close to.
+layout(std140, set = 1, binding = 2) uniform PrecipitationParamsUBO {
+    vec3 spawnCenter; float spawnRadius;                 // World-space XZ center (this frame's camera position) + half-extent of the horizontal spawn box, meters.
+    float spawnHeightAboveCenter; float spawnBandThickness; float floorBelowCenter; float rainFallSpeed; // Spawn band sits at spawnCenter.y + spawnHeightAboveCenter, +/- spawnBandThickness/2; floorBelowCenter is how far below spawnCenter.y a precip particle is force-recycled.
+    float snowFallSpeed; float snowWobbleStrength; float _pad0; float _pad1;
+} g_Precip;
+
+layout(push_constant) uniform ParticleSimulationPC {
+    float dt;
+    float time;
+    float levelVoxelSize[4];
+    int levelCenterVoxel[12]; // 4 levels * (x,y,z), flattened -- mirrors SDFRayMarchPC's own layout.
+    int clipmapResolution;
+    uint spawnCount;
+    uint randomSeedBase;      // Per-call PRNG salt (e.g. frame index) so repeated spawns don't reuse the same jitter sequence.
+    uint emitterIndex;        // Which EmitterParamsBuffer slot to spawn for -- only meaningful when mode == 1. The rivers/waterfalls feature's waterfall mist is EMITTERS[3], spawned through this same path.
+    int mode;                 // 0 = update existing particles, 1 = spawn embers for this emitterIndex, 2 = spawn precipitation.
+    uint precipSpawnCount;    // mode == 2 only -- how many precipitation particles to spawn this dispatch.
+    uint precipKind;          // mode == 2 only -- kParticleKindRain or kParticleKindSnow (CPU-resolved from Atmos temperature).
+} pc;
+
+vec3 GetLevelCenterVoxel(int level) {
+    return vec3(pc.levelCenterVoxel[level * 3 + 0], pc.levelCenterVoxel[level * 3 + 1], pc.levelCenterVoxel[level * 3 + 2]);
+}
+
+// Which (if any) clipmap level currently covers world position `p` -- mirrors SDFRayMarch.comp's own
+// SelectLevel exactly (see that shader's header comment for the fixed-lattice rationale).
+int SelectGlobalSDFLevel(vec3 p) {
+    for (int level = 0; level < 4; ++level) {
+        float halfExtent = float(pc.clipmapResolution) * 0.5 * pc.levelVoxelSize[level];
+        vec3 center = GetLevelCenterVoxel(level) * pc.levelVoxelSize[level];
+        vec3 d = abs(p - center);
+        if (d.x < halfExtent && d.y < halfExtent && d.z < halfExtent) {
+            return level;
+        }
+    }
+    return -1;
+}
+
+// World-unit signed distance at `p` from `level`'s clipmap -- mirrors SDFRayMarch.comp's own
+// SampleClipmap exactly.
+float SampleClipmapLevel(int level, vec3 p) {
+    float voxelSize = pc.levelVoxelSize[level];
+    ivec3 worldVoxel = ivec3(floor(p / voxelSize));
+    int res = pc.clipmapResolution;
+    ivec3 wrapped = ((worldVoxel % res) + res) % res;
+    vec3 uvw = (vec3(wrapped) + 0.5) / float(res);
+    return texture(uGlobalClipmaps[level], uvw).r;
+}
+
+// Global SDF signed distance at world position `p`, or a large positive "no data" sentinel if `p`
+// falls outside every clipmap level's currently-streamed window -- treated by the collision step
+// below as "definitely not colliding," matching renderer::GlobalSDFPass::kFarValue's own "far"
+// convention for an as-yet-uncomposited texel.
+float SampleGlobalSDF(vec3 p) {
+    int level = SelectGlobalSDFLevel(p);
+    if (level < 0) {
+        return 1.0e4;
+    }
+    return SampleClipmapLevel(level, p);
+}
+
+// Cheap integer hash (Wang-style, same "no texture lookups" procedural-noise discipline as
+// AtmosNoiseCommon.glsl's own AtmosHash33) -- decorrelates one uint seed into another.
+uint HashUint(uint x) {
+    x ^= x >> 16u; x *= 0x7feb352du;
+    x ^= x >> 15u; x *= 0x846ca68bu;
+    x ^= x >> 16u;
+    return x;
+}
+
+// Advances `seed` in place and returns a uniform float in [0, 1) -- the standard "seed doubles as
+// PRNG state" idiom, matching this file's own per-particle randomSeed field's purpose.
+float NextRandomFloat(inout uint seed) {
+    seed = HashUint(seed);
+    return float(seed) / 4294967296.0;
+}
+
+// Uniform-random point strictly inside a unit sphere -- cube-reject sampling (cheap, no trig),
+// used by the Sphere spawn shape below. 3 PRNG draws typical (a rejected sample redraws all 3).
+vec3 RandomInUnitSphere(inout uint seed) {
+    vec3 v;
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        v = vec3(NextRandomFloat(seed), NextRandomFloat(seed), NextRandomFloat(seed)) * 2.0 - 1.0;
+        if (dot(v, v) <= 1.0) {
+            return v;
+        }
+    }
+    return v; // Vanishingly unlikely (8 rejections in a row, ~1.5% volume ratio) -- fall through with whatever v currently holds rather than looping unbounded in a shader.
+}
+
+// Rivers/waterfalls feature: the waterfall mist/foam emitter (config::particles::EMITTERS[3], see
+// that array's own comment) rides this SAME per-emitter path as any other emitter, authored with
+// spawnShape == 1 (Sphere volume drift) below for a soft, near-weightless billow rather than a
+// bespoke recipe -- no special-casing needed here.
+
+// Module stack roadmap (subtask A3): curl-noise turbulence module's own force sample -- reuses
+// AtmosNoiseCommon.glsl's existing AtmosFractalCurlNoise3D (the same divergence-free noise helper
+// Atmos wind turbulence already uses, see that file's own header comment) rather than introducing a
+// second noise implementation, keeping this module consistent with the established
+// procedural-noise style. `scale` (per-emitter, EmitterParams.curlNoiseScale) is a frequency
+// multiplier on world position; the domain is additionally scrolled slowly along a fixed diagonal by
+// `time` so the field visibly evolves rather than looking frozen in world space for a particle that
+// lingers in one place (e.g. this file's own Sphere volume drift spawn shape) -- independent of
+// wind's own scroll direction/speed, since this module is explicitly NOT tied to wind, only layered
+// additively on top of it (see UpdateParticle's own call site).
+vec3 SampleCurlTurbulence(vec3 worldPos, float time, float scale) {
+    vec3 scrolledPos = worldPos * scale + vec3(time * 0.15, -time * 0.1, time * 0.05);
+    return AtmosFractalCurlNoise3D(scrolledPos, 1.0, 3.0, 0.5);
+}
+
+// Subtask A4 (color-over-life / size-over-life curves): shared bracketing-key math for both
+// SampleColorCurve and SampleSizeCurve below -- 4 fixed keyframes evenly spaced across [0,1] (age
+// 0.0/0.33/0.67/1.0) means exactly 3 equal intervals, so `age * 3` directly gives a continuous
+// "which interval, and how far across it" value with no division needed. Returns the lower key index
+// (already clamped so key+1 never overruns the last index, 3) and the fractional position within that
+// interval via `outFrac`. Deliberately NOT a texture-based gradient LUT -- this project has zero
+// on-disk texture assets by design (see e.g. ParticleRender.frag's own header comment) -- and
+// deliberately a fixed small key count rather than a runtime-sized array, keeping EmitterParams'
+// own byte layout static and std430-mirror-able, matching this codebase's own "fixed small array, not
+// a runtime-length buffer" convention already established by e.g. ParticleSimulationPC's own
+// levelVoxelSize[4]/levelCenterVoxel[12].
+int CurveBracketKey(float age, out float outFrac) {
+    const float kIntervalCount = 3.0; // 4 keys -> 3 intervals, each covering 1/3 of [0,1].
+    float t = clamp(age, 0.0, 1.0) * kIntervalCount;
+    int key0 = clamp(int(floor(t)), 0, 2);
+    outFrac = clamp(t - float(key0), 0.0, 1.0);
+    return key0;
+}
+
+// Samples EmitterParams.colorCurve[4] at the given normalized age via linear interpolation between
+// the two bracketing keys -- see EmitterParams::colorCurve's own declaration comment (ParticleCommon.
+// glsl) for why this is DIRECT/authoritative output, not a multiplier on `e.color`.
+vec4 SampleColorCurve(EmitterParams e, float age) {
+    float frac;
+    int key0 = CurveBracketKey(age, frac);
+    return mix(e.colorCurve[key0], e.colorCurve[key0 + 1], frac);
+}
+
+// Same bracketing-key interpolation as SampleColorCurve above, over EmitterParams.sizeCurve[4]
+// instead -- see that field's own declaration comment for why this result is a MULTIPLIER applied on
+// top of the particle's own spawn-time base size, not an absolute size.
+float SampleSizeCurve(EmitterParams e, float age) {
+    float frac;
+    int key0 = CurveBracketKey(age, frac);
+    return mix(e.sizeCurve[key0], e.sizeCurve[key0 + 1], frac);
+}
+
+void SpawnParticle(uint slotIndex, uint spawnRequestIndex, uint emitterIndex) {
+    uint seed = HashUint(pc.randomSeedBase ^ (slotIndex * 2654435761u) ^ (spawnRequestIndex * 40503u) ^ (emitterIndex * 2246822519u));
+    EmitterParams e = emitters[emitterIndex];
+
+    vec3 position;
+    vec3 velocity;
+    if (e.spawnShape == 1u) {
+        // Sphere volume drift (subtask A1's "Ambient Dust" default): spawn anywhere inside a sphere
+        // of radius shapeParam0 around the emitter position, gentle mostly-vertical drift instead of
+        // a launched burst.
+        position = e.position + RandomInUnitSphere(seed) * e.shapeParam0;
+        velocity = vec3(
+            (NextRandomFloat(seed) * 2.0 - 1.0) * 0.15,
+            NextRandomFloat(seed) * 0.3,
+            (NextRandomFloat(seed) * 2.0 - 1.0) * 0.15);
+    } else {
+        // Cone burst (legacy "embers/sparks" default, spawnShape == 0): small conical launch jitter
+        // around a mostly-upward initial velocity.
+        vec3 jitterDir = normalize(vec3(
+            NextRandomFloat(seed) * 2.0 - 1.0,
+            NextRandomFloat(seed) * 0.5 + 0.5,
+            NextRandomFloat(seed) * 2.0 - 1.0));
+        float speed = 1.0 + NextRandomFloat(seed) * 2.0;
+        position = e.position + (vec3(NextRandomFloat(seed), NextRandomFloat(seed), NextRandomFloat(seed)) - 0.5) * 0.1;
+        velocity = jitterDir * speed;
+    }
+    float life = mix(e.lifetimeMin, e.lifetimeMax, NextRandomFloat(seed));
+    float size = mix(e.sizeMin, e.sizeMax, NextRandomFloat(seed));
+
+    Particle p;
+    p.position = position;
+    p.life = life;
+    p.velocity = velocity;
+    p.maxLife = life;
+    p.color = e.color;
+    p.size = vec2(size, size);
+    p.rotation = NextRandomFloat(seed) * 6.28318530718;
+    p.randomSeed = PackParticleSeed(kParticleKindEmber, seed);
+    p.emitterIndex = emitterIndex;
+    // Subtask A4: preserve this particle's own randomized base size -- see Particle::baseSize's own
+    // declaration comment (ParticleCommon.glsl) for why UpdateParticle needs this stored separately
+    // from `size` above rather than re-deriving it from sizeMin/sizeMax (which only bound the RANGE,
+    // not which value THIS particle actually drew). `p.color`/`p.size` above are still set to their
+    // old plain spawn values regardless -- this same RecordSimulate() call's mode == 0 Update dispatch
+    // (which covers every particle spawned by mode == 1 THIS call too, see this file's own header
+    // comment) immediately re-evaluates both from the curves at age ~= 0, so this is purely a sane
+    // one-frame-safe default, not the value that actually reaches the render pass.
+    p.baseSize = size;
+    particles[slotIndex] = p;
+}
+
+// Precipitation feature -- spawns one rain or snow particle inside a horizontal box "shell" centered
+// on this frame's camera position (g_Precip.spawnCenter.xz), at a height band above it -- see this
+// file's own header comment (mode == 2) and PrecipitationParamsUBO's own field comments for the
+// exact geometry. Mirrors SpawnParticle's own "pop a dead-list slot, jitter, initialize" structure,
+// just with a different spawn volume and per-kind initial velocity/appearance instead of the generic
+// embers jitter cone.
+void SpawnPrecipitationParticle(uint slotIndex, uint spawnRequestIndex) {
+    uint seed = HashUint(pc.randomSeedBase ^ (slotIndex * 2246822519u) ^ (spawnRequestIndex * 3266489917u));
+
+    // Uniform position inside the horizontal box: independent X/Z offsets in [-spawnRadius,
+    // spawnRadius], and a Y offset within the spawn band's thickness -- a "shell" with real volume,
+    // not a flat single-height plane, so particles do not all pop into existence in visible lockstep.
+    float offsetX = (NextRandomFloat(seed) * 2.0 - 1.0) * g_Precip.spawnRadius;
+    float offsetZ = (NextRandomFloat(seed) * 2.0 - 1.0) * g_Precip.spawnRadius;
+    float offsetY = (NextRandomFloat(seed) - 0.5) * g_Precip.spawnBandThickness;
+    vec3 spawnPos = vec3(
+        g_Precip.spawnCenter.x + offsetX,
+        g_Precip.spawnCenter.y + g_Precip.spawnHeightAboveCenter + offsetY,
+        g_Precip.spawnCenter.z + offsetZ);
+
+    bool isSnow = (pc.precipKind == kParticleKindSnow);
+
+    // Initial velocity: mostly straight down at the kind's own terminal fall speed (UpdateParticle's
+    // own drag-toward-target integration keeps it there every subsequent frame -- see that function's
+    // own comment) with a small random jitter so a fresh spawn does not look perfectly uniform.
+    float fallSpeed = isSnow ? g_Precip.snowFallSpeed : g_Precip.rainFallSpeed;
+    float speedJitter = 1.0 + (NextRandomFloat(seed) - 0.5) * 0.2;
+    vec3 initialVelocity = vec3(
+        (NextRandomFloat(seed) * 2.0 - 1.0) * (isSnow ? 0.3 : 0.05),
+        -fallSpeed * speedJitter,
+        (NextRandomFloat(seed) * 2.0 - 1.0) * (isSnow ? 0.3 : 0.05));
+
+    // Generous lifetime -- the real recycle mechanism is UpdateParticle's own floor-height/SDF-contact
+    // despawn (see that function's own comment), this is only a hard backstop so a particle that
+    // somehow never finds a floor (e.g. spawned over an uncovered Global SDF region with the camera
+    // then flying away) does not accumulate forever.
+    float life = isSnow ? (14.0 + NextRandomFloat(seed) * 6.0) : (4.0 + NextRandomFloat(seed) * 2.0);
+
+    vec4 color = isSnow ? vec4(0.95, 0.97, 1.0, 0.85) : vec4(0.65, 0.75, 0.85, 0.35);
+    vec2 size = isSnow ? vec2(0.06 + NextRandomFloat(seed) * 0.05, 0.06 + NextRandomFloat(seed) * 0.05)
+                        : vec2(0.015, 0.5 + NextRandomFloat(seed) * 0.25); // Rain: thin width, long streak (see ParticleRender.vert's own kind-conditional billboard-axis comment).
+
+    Particle p;
+    p.position = spawnPos;
+    p.life = life;
+    p.velocity = initialVelocity;
+    p.maxLife = life;
+    p.color = color;
+    p.size = size;
+    p.rotation = 0.0; // Unused for rain/snow -- ParticleRender.vert derives the streak/flake orientation from velocity/kind instead, see that shader's own comment.
+    p.randomSeed = PackParticleSeed(pc.precipKind, seed);
+    p.emitterIndex = 0; // Unused by precipitation (see UpdateParticle's own comment) -- explicit default, not read GPU memory.
+    // Subtask A4: unused by precipitation -- rain/snow sizes are asymmetric width/length (`size`
+    // above), which a single symmetric baseSize float could not represent anyway, and UpdateParticle's
+    // curve-evaluation code path never runs for precipitation kinds (see that function's own comment).
+    // Explicit default, not read GPU memory, same convention as p.emitterIndex above.
+    p.baseSize = 0.0;
+    particles[slotIndex] = p;
+}
+
+void UpdateParticle(uint slotIndex) {
+    Particle p = particles[slotIndex];
+    if (p.life <= 0.0) {
+        return; // Already dead (and already resting in the dead-list from a previous frame, or never spawned) -- nothing to do.
+    }
+    uint kind = UnpackParticleKind(p.randomSeed);
+    bool isPrecipitation = (kind == kParticleKindRain || kind == kParticleKindSnow);
+
+    vec3 wind = SampleWindVelocity(p.position, pc.time, g_AtmosGlobals.windDirection, g_AtmosGlobals.windSpeed, g_AtmosGlobals.windTurbulenceParams);
+    vec3 newPosition;
+
+    if (isPrecipitation) {
+        // --- Precipitation fall: relax toward a fixed terminal fall speed instead of accelerating
+        // under gravity indefinitely (real raindrops/snowflakes reach terminal velocity almost
+        // immediately, not gradually over many seconds like a solid ember) -- blended with the local
+        // Atmos wind for horizontal drift, matching how wind already pushes embers around. Snow adds
+        // a per-particle sine-noise wobble on top (phase/frequency derived from the particle's own
+        // stored raw seed, so every flake drifts slightly differently, not in lockstep). ---
+        vec3 targetVelocity = vec3(wind.x, -(kind == kParticleKindSnow ? g_Precip.snowFallSpeed : g_Precip.rainFallSpeed), wind.z);
+        if (kind == kParticleKindSnow) {
+            uint rawSeed = UnpackParticleRawSeed(p.randomSeed);
+            float phase = float(rawSeed & 0xFFFFu) * 9.587e-5; // ~[0, 2*pi) from the low 16 bits.
+            float freqScale = 0.5 + float((rawSeed >> 16u) & 0xFFu) * (0.5 / 255.0); // [0.5, 1.0) Hz-ish variety from the next 8 bits.
+            vec2 wobble = vec2(sin(pc.time * freqScale + phase), cos(pc.time * freqScale * 0.7 + phase * 1.3));
+            targetVelocity.x += wobble.x * g_Precip.snowWobbleStrength;
+            targetVelocity.z += wobble.y * g_Precip.snowWobbleStrength;
+        }
+        // Converge quickly (within a fraction of a second) rather than using the embers' own slower
+        // pc.dragCoefficient relaxation -- a raindrop/snowflake is already at effectively-terminal
+        // velocity the instant it spawns, it does not spend seconds gradually catching up to the wind.
+        p.velocity += (targetVelocity - p.velocity) * clamp(4.0 * pc.dt, 0.0, 1.0);
+        newPosition = p.position + p.velocity * pc.dt;
+
+        // --- Absorbed on contact: any Global SDF penetration or sinking below the camera-relative
+        // recycle floor kills the particle outright (no bounce) -- rain/snow is meant to visually
+        // disappear into the ground/geometry it lands on, not ricochet off it like an ember spark.
+        // The floor-height check is the primary despawn path in practice (the spawn shell always
+        // follows the camera, see SpawnPrecipitationParticle's own comment, so most precipitation
+        // never crosses into Global-SDF-covered geometry at all); the SDF check additionally handles
+        // particles that DO fall onto/through streamed geometry before reaching the floor. ---
+        if (SampleGlobalSDF(newPosition) < 0.0 || newPosition.y < (g_Precip.spawnCenter.y - g_Precip.floorBelowCenter)) {
+            p.life = 0.0;
+        }
+    } else {
+        // --- Gravity + wind + drag ---
+        // Multi-emitter roadmap (subtask A1): physics constants come from THIS particle's own
+        // emitter slot, not a single global -- so two emitters can have wildly different gravity/
+        // bounce/friction/drag simultaneously, and live-editing one emitter's ImGui sliders never
+        // affects another emitter's already-flying particles. Fetched here (not unconditionally at
+        // the top of UpdateParticle) since precipitation particles never touch EmitterParams at all
+        // -- their own kind-branch above uses PrecipitationParamsUBO instead, and their spawn path
+        // sets emitterIndex to an unused default (see SpawnPrecipitationParticle's own comment).
+        EmitterParams e = emitters[p.emitterIndex];
+        p.velocity.y += e.gravityY * pc.dt;
+        p.velocity += (wind - p.velocity) * clamp(e.dragCoefficient * pc.dt, 0.0, 1.0);
+
+        // --- Module stack roadmap (subtask A3): curl-noise turbulence force ---
+        // Additive, independent of the base wind above (a per-emitter tunable layered ON TOP of it,
+        // not a replacement) -- gated by its own enable flag so a disabled module costs exactly one
+        // branch beyond this point (no noise evaluation at all when off).
+        if (e.curlNoiseEnabled != 0u) {
+            p.velocity += SampleCurlTurbulence(p.position, pc.time, e.curlNoiseScale) * e.curlNoiseStrength * pc.dt;
+        }
+
+        // --- Module stack roadmap (subtask A3): radial attractor/repulsor force ---
+        // Additive force toward (positive strength) or away from (negative strength) a point that is
+        // an offset from this emitter's own live position -- smoothstep falloff to zero at
+        // attractorRadius avoids both a harsh cutoff and an inverse-square singularity as a particle
+        // approaches the point itself. Gated the same way as the turbulence module above.
+        if (e.attractorEnabled != 0u) {
+            vec3 toAttractor = (e.position + e.attractorOffset) - p.position;
+            float distToAttractor = length(toAttractor);
+            if (distToAttractor > 1.0e-4) {
+                float falloff = 1.0 - smoothstep(0.0, e.attractorRadius, distToAttractor);
+                p.velocity += (toAttractor / distToAttractor) * e.attractorStrength * falloff * pc.dt;
+            }
+        }
+
+        newPosition = p.position + p.velocity * pc.dt;
+
+        // --- Global SDF collision (central-difference normal, reflect() split into elastic-normal /
+        // frictional-tangential components -- see this file's own header comment) ---
+        float dist = SampleGlobalSDF(newPosition);
+        if (dist < 0.0) {
+            const float kNormalEpsilon = 0.05; // World units -- small relative to a typical clipmap voxel (kBaseVoxelSize = 0.5).
+            vec3 n = vec3(
+                SampleGlobalSDF(newPosition + vec3(kNormalEpsilon, 0.0, 0.0)) - SampleGlobalSDF(newPosition - vec3(kNormalEpsilon, 0.0, 0.0)),
+                SampleGlobalSDF(newPosition + vec3(0.0, kNormalEpsilon, 0.0)) - SampleGlobalSDF(newPosition - vec3(0.0, kNormalEpsilon, 0.0)),
+                SampleGlobalSDF(newPosition + vec3(0.0, 0.0, kNormalEpsilon)) - SampleGlobalSDF(newPosition - vec3(0.0, 0.0, kNormalEpsilon)));
+            float nLen = length(n);
+            n = nLen > 1.0e-8 ? n / nLen : vec3(0.0, 1.0, 0.0);
+
+            // Push the particle back out to the surface (dist is negative -- the penetration depth --
+            // so subtracting n * dist moves it along +n by exactly that depth).
+            newPosition -= n * dist;
+
+            vec3 reflected = reflect(p.velocity, n);
+            float normalSpeed = dot(reflected, n);
+            vec3 tangentVelocity = reflected - n * normalSpeed;
+            p.velocity = n * normalSpeed * e.bounceElasticity + tangentVelocity * e.friction;
+        }
+
+        // --- Subtask A4: color-over-life / size-over-life curves ---
+        // Evaluated every frame (not just once at spawn, see SpawnParticle's own comment) from this
+        // particle's own normalized age, so an ember visibly fades/recolors/shrinks over its lifetime
+        // instead of holding one fixed appearance until it disappears. `age` uses `p.life - pc.dt`
+        // (this frame's remaining life BEFORE the shared decrement a few lines below runs) so the
+        // curve reflects THIS frame's end-of-step age without needing to hoist that decrement or
+        // re-fetch `e` after this if/else block. Gated to this ember branch only -- precipitation
+        // (rain/snow) has its own fixed per-kind appearance set once at spawn
+        // (SpawnPrecipitationParticle) and is deliberately excluded: its own size is an asymmetric
+        // width/length streak (see that function's own comment), which a single baseSize float could
+        // not represent, and it has no EmitterParams of its own to curve against in the first place.
+        float age = clamp((p.maxLife - (p.life - pc.dt)) / max(p.maxLife, 1.0e-5), 0.0, 1.0);
+        p.color = SampleColorCurve(e, age);
+        p.size = vec2(p.baseSize, p.baseSize) * SampleSizeCurve(e, age);
+    }
+    p.position = newPosition;
+
+    p.life -= pc.dt;
+    particles[slotIndex] = p;
+
+    if (p.life <= 0.0) {
+        uint deadSlot = atomicAdd(deadCount, 1u);
+        deadIndices[deadSlot] = slotIndex;
+    } else {
+        uint aliveSlot = atomicAdd(aliveCount, 1u);
+        aliveIndices[aliveSlot] = slotIndex;
+#ifdef _DEBUG
+        // Debug/test instrumentation only (multi-emitter roadmap, subtask A1's own validation step) --
+        // see PerEmitterAliveCountBuffer's own declaration comment in ParticleCommon.glsl. Compiled
+        // out of the Release SPIR-V entirely (glslc only defines _DEBUG for the Debug shader build,
+        // see CMakeLists.txt's own GLSLC_DEBUG_DEFINE), so this atomic costs nothing in Release.
+        atomicAdd(perEmitterAliveCount[p.emitterIndex], 1u);
+#endif
+    }
+}
+
+// Pops one index off the tail of the dead-list, atomically -- shared by both spawn modes (mode == 1
+// embers, mode == 2 precipitation) since the free-list itself is not per-kind (see ParticleCommon.
+// glsl's own DeadListBuffer comment: it is a single shared pool, exactly the "precipitation shares
+// the pool with any other emitter, backs off gracefully under pressure" contract the integration plan
+// asks for -- an over-subscribed spawnQueue simply stops finding free slots here and gives up on the
+// remaining requests, same as this codebase's own pre-existing embers path already did). Returns
+// false (and leaves deadCount untouched -- see the underflow-undo below) when the pool is fully alive.
+bool TryPopDeadListSlot(out uint slotIndex) {
+    // atomicAdd(deadCount, -1) returns the PRE-decrement value, so the slot this thread claims is at
+    // deadIndices[oldValue - 1]. uint wraps on underflow, so oldValue == 0 (nothing left to pop) is
+    // diagnosed via the explicit guard below rather than trusting an unsigned-wraparound comparison.
+    uint oldDeadCount = atomicAdd(deadCount, -1u);
+    if (oldDeadCount == 0u) {
+        // No dead slots left -- undo the decrement (it wrapped to UINT_MAX) and give up; the caller's
+        // spawnQueue was simply optimistic this frame (kMaxParticles is already fully alive).
+        atomicAdd(deadCount, 1u);
+        return false;
+    }
+    slotIndex = deadIndices[oldDeadCount - 1u];
+    return true;
+}
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+
+    if (pc.mode == 1) {
+        if (index >= pc.spawnCount) {
+            return;
+        }
+        uint slotIndex;
+        if (TryPopDeadListSlot(slotIndex)) {
+            SpawnParticle(slotIndex, index, pc.emitterIndex);
+        }
+    } else if (pc.mode == 2) {
+        if (index >= pc.precipSpawnCount) {
+            return;
+        }
+        uint slotIndex;
+        if (TryPopDeadListSlot(slotIndex)) {
+            SpawnPrecipitationParticle(slotIndex, index);
+        }
+    } else {
+        if (index >= particles.length()) {
+            return;
+        }
+        UpdateParticle(index);
+    }
+}

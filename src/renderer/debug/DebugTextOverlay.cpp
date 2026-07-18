@@ -263,7 +263,8 @@ namespace renderer::debug {
 
     void DebugTextOverlay::BuildFrameText(float gpuMemUsedMB, uint32_t pendingPageLoads, float bytesPerSecond,
         uint32_t hwTriangleCount, uint32_t swTriangleCount, float fps, float viewportWidthPixels, float viewportHeightPixels,
-        bool radiosityEnabled, bool ssrtEnabled, uint32_t traceMode, bool worldProbesEnabled) {
+        bool radiosityEnabled, bool ssrtEnabled, uint32_t traceMode, bool worldProbesEnabled,
+        uint32_t aliveParticleCount, uint32_t maxParticleCount) {
         m_PendingGlyphs.clear();
 
         constexpr float kMarginX = 8.0f;
@@ -285,6 +286,7 @@ namespace renderer::debug {
         // that fact stays visible instead of implying parity with the other three.
         AppendLine(std::format("WORLDPROBES={} (not yet sampled)", worldProbesEnabled ? "ON" : "OFF"),
             kMarginX, y); y += kLineHeight;
+        AppendLine(std::format("GPU PARTICLES: {}/{}", aliveParticleCount, maxParticleCount), kMarginX, y); y += kLineHeight;
 
         // Bottom-left profile name overlay (e.g. low, medium, high)
         std::string profileLower = "";

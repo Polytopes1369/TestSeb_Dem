@@ -1,0 +1,130 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+
+#include "include/struct_custo.glsl"
+#include "include/math_utils.glsl"
+#include "include/tree_lsystem.glsl"
+
+// Procedurally generates a whole tree's trunk+branch skeleton as a chain of tapered cylinder
+// segments, one per L-system node (see tree_lsystem.glsl's own header comment for the full
+// deterministic recursive-branching model). One invocation per output VERTEX (matching this
+// codebase's other geom_*.comp generators' convention, e.g. geom_tube.comp), plus a second,
+// disjoint id-range reused by the SAME invocations to also emit that segment's side-quad indices
+// -- identical dual-purpose-invocation idiom to geom_tube.comp's own outer/inner-wall + index
+// generation.
+//
+// Each node contributes one tapered cylinder ring pair (bottom ring at that node's start radius,
+// top ring at its end radius) -- (sides+1)*2 vertices (a duplicate seam column per ring, so UV.x
+// wraps 0..1 cleanly, same convention as every other radially-symmetric primitive in this
+// codebase) and sides*2 triangles (sides*6 indices). Deliberately NOT capped at either end: the
+// trunk's bottom ring sits at/below the terrain's own ground level (invisible from above), and
+// every child node's bottom ring coincides exactly with its parent's top ring position (no visible
+// gap despite the two rings being separate, unwelded vertices -- the same simplification this
+// engine's own autosmooth pass documents as acceptable for adjoining primitive pieces).
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) writeonly buffer VertexBuffer { Vertex vertices[]; };
+layout(std430, binding = 1) writeonly buffer IndexBuffer  { uint indices[]; };
+
+layout(push_constant) uniform TreeBarkParams
+{
+    uint  seed;
+    uint  depth;
+    uint  branchFactor;
+    float trunkHeight;
+    float trunkRadius;
+    float lengthTaper;
+    float radiusTaper;
+    float branchAngle;
+    float pitchDamping;
+    uint  sides;
+    uint  nodeCount;
+    uint  meshID;
+    float materialID;
+    uint  vertexOffset;
+    uint  indexOffset;
+    float worldOffsetX;
+    float worldOffsetY;
+    float worldOffsetZ;
+};
+
+void main()
+{
+    // Strict validation: reject degenerate parameters outright rather than silently producing a
+    // broken/zero-sized mesh (this project's "Zero approximation" rule).
+    if (trunkHeight <= 0.0 || trunkRadius <= 0.0 || sides < 3u || nodeCount == 0u ||
+        branchFactor < 2u || depth == 0u || lengthTaper <= 0.0 || lengthTaper >= 1.0 ||
+        radiusTaper <= 0.0 || radiusTaper >= 1.0)
+    {
+        return;
+    }
+
+    uint id = gl_GlobalInvocationID.x;
+
+    uint sideColumns = sides + 1u;
+    uint vertsPerNode = sideColumns * 2u;
+    uint totalVerts = nodeCount * vertsPerNode;
+
+    if (id < totalVerts)
+    {
+        uint nodeID = id / vertsPerNode;
+        uint local = id % vertsPerNode;
+        uint ring = local / sideColumns;      // 0 = bottom (start), 1 = top (end).
+        uint col = local % sideColumns;
+
+        TreeNodeState node = DecodeTreeNode(nodeID, seed, depth, branchFactor,
+            trunkHeight, trunkRadius, lengthTaper, radiusTaper, branchAngle, pitchDamping);
+
+        vec3 segDir = node.endPos - node.startPos;
+        float segLen = length(segDir);
+        vec3 dir = (segLen > EPSILON) ? (segDir / segLen) : vec3(0.0, 1.0, 0.0);
+
+        // Build a stable perpendicular basis around `dir` -- the standard "arbitrary reference
+        // axis, cross twice" trick for orienting a ring around an axis that is not itself fixed
+        // (every node's direction differs, unlike a primitive like geom_tube.comp whose axis is
+        // always world Y).
+        vec3 arbitrary = (abs(dir.y) < 0.99) ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+        vec3 right = normalize(cross(arbitrary, dir));
+        vec3 fwd = normalize(cross(dir, right));
+
+        float t = float(col == sides ? 0u : col) / float(sides);
+        float ang = t * TAU;
+        vec3 radial = cos(ang) * right + sin(ang) * fwd;
+
+        vec3 center = (ring == 0u) ? node.startPos : node.endPos;
+        float radius = (ring == 0u) ? node.radiusStart : node.radiusEnd;
+
+        Vertex v;
+        v.position = center + radial * radius;
+        v.normal = radial; // Already unit-length (right/fwd orthonormal, cos^2+sin^2 == 1).
+        v.uv = vec2(float(col) / float(sides), float(ring) + float(node.level));
+        v.uv2 = v.uv;
+        v.meshID = meshID;
+        v.materialID = materialID;
+
+        v.position += vec3(worldOffsetX, worldOffsetY, worldOffsetZ);
+        vertices[vertexOffset + id] = v;
+    }
+
+    uint totalQuads = nodeCount * sides;
+    if (id < totalQuads)
+    {
+        uint nodeID = id / sides;
+        uint col = id % sides;
+        uint base = nodeID * vertsPerNode;
+
+        uint b0 = base + col;
+        uint b1 = base + col + 1u;
+        uint t0 = base + sideColumns + col;
+        uint t1 = base + sideColumns + col + 1u;
+
+        uint tIdx = indexOffset + id * 6u;
+        indices[tIdx + 0u] = vertexOffset + b0;
+        indices[tIdx + 1u] = vertexOffset + t0;
+        indices[tIdx + 2u] = vertexOffset + t1;
+        indices[tIdx + 3u] = vertexOffset + b0;
+        indices[tIdx + 4u] = vertexOffset + t1;
+        indices[tIdx + 5u] = vertexOffset + b1;
+    }
+}

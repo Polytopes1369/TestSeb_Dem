@@ -1,0 +1,151 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+
+// Vegetation scatter (UE5.8 rendering-parity gap G2), scatter-point generator. Runs ONCE at
+// renderer::VegetationScatterPass::Init (and again on a Debug regenerate) -- NOT per frame -- to
+// populate the GPU-resident per-instance buffer. Samples the SAME analytic terrain heightfield the
+// terrain entity itself is built from (terrain_noise.glsl's SampleTerrainHeight) plus the SAME
+// height/slope biome bands the terrain shader paints (terrain_shading.glsl), so scatter density
+// correlates with what the ground already looks like: dense grass/shrubs on the flat grass band,
+// rocks on steep slopes/cliffs and the beach transition, nothing underwater or on snow.
+//
+// Placement is a jittered grid (a cheap Poisson-disc-ish scheme, per the G2 brief's "don't
+// over-engineer"): one candidate per cell, its position hash-jittered inside the cell (breaks the
+// grid look), and a hashed probability roll -- weighted by the local band -- decides whether the
+// cell actually spawns an instance and which archetype. At most one instance per cell keeps natural
+// spacing (~cellSize) with no explicit neighbor search.
+
+#include "include/terrain_shading.glsl"     // pulls terrain_noise.glsl (SampleTerrainHeight, kTerrainAmplitude), water_params.glsl (kWaterLevel); provides kTerrainBaseWorldY, kBeachBandWidth
+#include "include/VegetationCommon.glsl"
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(std430, set = 0, binding = 0) writeonly buffer InstanceBuffer {
+    VegetationInstance instances[];
+};
+layout(std430, set = 0, binding = 1) buffer CounterBuffer {
+    uint instanceCount;
+};
+
+layout(push_constant) uniform GenParams {
+    float originX, originZ;   // World-space min corner (XZ) of the square scatter region.
+    float cellSize;           // World-unit size of one candidate cell.
+    uint  gridDim;            // Cells per side (total candidates = gridDim * gridDim).
+    float grassDensity;       // [0,1] placement weight scales.
+    float bushDensity;
+    float rockDensity;
+    uint  maxInstances;       // Hard cap = InstanceBuffer capacity.
+    uint  seed;               // Global determinism seed.
+    float _pad0, _pad1;
+} pc;
+
+// World-space heightfield slope: 1 = flat (+Y normal), 0 = vertical. Analytic central difference,
+// same epsilon-tangent construction geom_terrain.comp uses for the baked terrain's own normals, so
+// the slope this reads matches the terrain surface the instances sit on.
+float TerrainSlopeY(vec2 xz, float eps) {
+    float hL = SampleTerrainHeight(vec2(xz.x - eps, xz.y));
+    float hR = SampleTerrainHeight(vec2(xz.x + eps, xz.y));
+    float hD = SampleTerrainHeight(vec2(xz.x, xz.y - eps));
+    float hU = SampleTerrainHeight(vec2(xz.x, xz.y + eps));
+    vec3 tangentX = vec3(2.0 * eps, hR - hL, 0.0);
+    vec3 tangentZ = vec3(0.0, hU - hD, 2.0 * eps);
+    return clamp(normalize(cross(tangentZ, tangentX)).y, 0.0, 1.0);
+}
+
+void main() {
+    uint cx = gl_GlobalInvocationID.x;
+    uint cz = gl_GlobalInvocationID.y;
+    if (cx >= pc.gridDim || cz >= pc.gridDim) {
+        return;
+    }
+
+    // Deterministic per-cell hash chain.
+    uint cellHash = VegHashCombine(pc.seed, VegHashCombine(cx, cz * 0x9e37u));
+
+    // Jittered position inside the cell (breaks the uniform-grid look).
+    float jx = VegHashToUnitFloat(VegHashU(cellHash));
+    float jz = VegHashToUnitFloat(VegHashU(cellHash ^ 0xa5a5u));
+    float worldX = pc.originX + (float(cx) + jx) * pc.cellSize;
+    float worldZ = pc.originZ + (float(cz) + jz) * pc.cellSize;
+    vec2 xz = vec2(worldX, worldZ);
+
+    // Sample the terrain exactly where the instance will stand.
+    float localHeight = SampleTerrainHeight(xz);
+    float worldY = localHeight + kTerrainBaseWorldY;
+    float slopeFactor = TerrainSlopeY(xz, pc.cellSize * 0.25);
+
+    // Reject underwater outright (no submerged grass/rocks in this demo).
+    if (worldY < kWaterLevel + 0.02) {
+        return;
+    }
+
+    // Biome band factors -- identical thresholds to terrain_shading.glsl's ComputeTerrainAlbedo so
+    // the scatter tracks the painted ground.
+    float heightFactor = clamp((worldY - kTerrainBaseWorldY + kTerrainAmplitude) / (2.0 * kTerrainAmplitude), 0.0, 1.0);
+    float rockBlend  = 1.0 - smoothstep(0.55, 0.82, slopeFactor);
+    float beachFactor = (1.0 - smoothstep(0.0, kBeachBandWidth, worldY - kWaterLevel)) * smoothstep(0.3, 0.6, slopeFactor);
+    float snowBlend  = smoothstep(0.62, 0.85, heightFactor) * smoothstep(0.45, 0.75, slopeFactor);
+
+    // No scatter on snowfields.
+    if (snowBlend > 0.5) {
+        return;
+    }
+
+    // "Grassiness": flat, not rocky, not snowy, not the sand shoreline.
+    float grassiness = slopeFactor * (1.0 - rockBlend) * (1.0 - snowBlend) * (1.0 - beachFactor);
+    float rockiness  = max(rockBlend, beachFactor); // Rocks on cliffs AND along the beach transition.
+
+    float wGrass = grassiness * pc.grassDensity;
+    float wBush  = grassiness * pc.bushDensity;
+    float wRock  = rockiness  * pc.rockDensity;
+    float total  = wGrass + wBush + wRock;
+    if (total <= 1.0e-4) {
+        return;
+    }
+
+    // Probability roll: does this cell place anything at all?
+    float placeRoll = VegHashToUnitFloat(VegHashU(cellHash ^ 0x1357u));
+    if (placeRoll > clamp(total, 0.0, 1.0)) {
+        return;
+    }
+
+    // Pick an archetype proportional to its weight.
+    float pickRoll = VegHashToUnitFloat(VegHashU(cellHash ^ 0x2468u)) * total;
+    uint archetype;
+    if (pickRoll < wGrass) {
+        archetype = kVegArchetypeGrass;
+    } else if (pickRoll < wGrass + wBush) {
+        archetype = kVegArchetypeBush;
+    } else {
+        archetype = kVegArchetypeRock;
+    }
+
+    // Per-instance transform variation.
+    uint sh = VegHashU(cellHash ^ 0x0f0f0f0fu);
+    float scaleRoll = VegHashToUnitFloat(sh);
+    float yaw = VegHashToUnitFloat(VegHashU(sh)) * 6.2831853;
+    float scale;
+    if (archetype == kVegArchetypeGrass) {
+        scale = 0.6 + scaleRoll * 0.7;   // [0.6, 1.3]
+    } else if (archetype == kVegArchetypeBush) {
+        scale = 0.7 + scaleRoll * 0.8;   // [0.7, 1.5]
+    } else {
+        scale = 0.5 + scaleRoll * 1.1;   // [0.5, 1.6]
+    }
+
+    // Claim a slot; silently drop the instance if the buffer is full (graceful cap, same "back off
+    // under pressure" convention the particle free-list uses).
+    uint slot = atomicAdd(instanceCount, 1u);
+    if (slot >= pc.maxInstances) {
+        return;
+    }
+
+    VegetationInstance inst;
+    inst.position = vec3(worldX, worldY, worldZ);
+    inst.scale = scale;
+    inst.yaw = yaw;
+    inst.archetype = archetype;
+    inst.tintSeed = VegHashU(cellHash ^ 0xdeadbeefu);
+    inst._pad0 = 0.0;
+    instances[slot] = inst;
+}

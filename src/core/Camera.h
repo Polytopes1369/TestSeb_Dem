@@ -57,6 +57,30 @@ public:
 
   void Update(float aspectRatio);
 
+  // Phase 5 (Streaming & Monde roadmap, Part 1): LWC camera-relative rendering. Identical to
+  // Update() except the view matrix is built from `m_Position - originOffset` (the current LWC
+  // origin cell's world-space center, see world::LwcOrigin) instead of the true absolute
+  // m_Position -- every later system this frame that reads back the camera's world position
+  // (renderer::ClusterRenderPipeline::m_FrameScratch, populated once by RecordFrameEarly) must see
+  // this SAME rebased value, matching the entity side's own rebase (VulkanContext::
+  // UpdateEntityRotations's originOffset parameter) so both halves of every worldPos - viewProj
+  // multiplication a shader ever performs stay in the same small-magnitude reference frame. Kept
+  // as a second, additive entry point rather than folding `originOffset` into Update() itself so
+  // Camera stays origin-agnostic and reusable as-is by callers that have no LwcOrigin at all (e.g.
+  // DebugTestPipeline.cpp's own separate camera instance, which never calls this overload and so
+  // keeps working exactly as before -- effectively an implicit zero offset).
+  void UpdateRebased(float aspectRatio, const maths::vec3& originOffset);
+
+  // Companion to UpdateRebased() -- the position that call's view matrix was actually built from
+  // (m_Position - originOffset), for callers that need the same rebased eye point CPU-side (e.g.
+  // main.cpp's RecordFrameEarly call site, for CameraPushConstants/CameraFrameInfo::position).
+  // SetPosition()/GetPosition() themselves stay untouched (true absolute position, still needed for
+  // streaming distance math against world::StreamingManager and any UI that reports world
+  // coordinates) -- this is a derived read, never a stored one.
+  maths::vec3 GetRebasedPosition(const maths::vec3& originOffset) const {
+    return m_Position - originOffset;
+  }
+
   void CameraPan(maths::vec3 start, maths::vec3 end, float t);
   void CameraZoom(float fovChangeDegrees);
   void CameraOrbit(maths::vec3 center, float distance, float azimuthDegrees,

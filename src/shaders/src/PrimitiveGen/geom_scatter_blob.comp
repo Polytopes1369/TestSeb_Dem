@@ -1,0 +1,111 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+
+// Vegetation scatter (UE5.8 rendering-parity gap G2), blob archetype generator -- bakes ONE
+// noise-perturbed low-poly rounded shape once at renderer::VegetationScatterPass::Init into the
+// pass' own dedicated vertex/index buffers (see geom_scatter_grass.comp's header for why this stays
+// out of the shared Nanite geometry SSBO). A single shader source drives BOTH the "bush" and "rock"
+// archetypes, differentiated purely by the push-constant tuning (a bush = rounder, lower noise, sits
+// on its base; a rock = more angular, higher noise, flatter bottom) -- no separate module needed,
+// same "one source, per-instance params" economy this project already favors.
+//
+// Topology: a UV sphere (rings x sectors), each vertex pushed in/out radially by a small fbm of
+// displacement_noise.glsl's ValueNoise3D (the exact hash-mixer every other procedural surface in
+// this renderer uses), giving an irregular boulder/bush silhouette with zero texture data. One
+// invocation per vertex (same per-vertex threading as geom_terrain.comp / geom_sphere.comp).
+
+#include "include/struct_custo.glsl"
+#include "include/math_utils.glsl"          // PI
+#include "include/displacement_noise.glsl"  // ValueNoise3D
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(std430, binding = 0) writeonly buffer VertexBuffer { Vertex vertices[]; };
+layout(std430, binding = 1) writeonly buffer IndexBuffer  { uint indices[]; };
+
+layout(push_constant) uniform Params {
+    float radius;
+    float noiseAmplitude;   // Fractional radial displacement (0.15 = +/-15% lumpiness).
+    float noiseFrequency;   // Angular noise frequency (higher = more, smaller lumps).
+    uint  rings;            // Latitude subdivisions.
+    uint  sectors;          // Longitude subdivisions.
+    uint  seed;             // Decorrelates this archetype's noise domain from every other.
+    uint  meshID;
+    float materialID;
+    uint  vertexOffset;
+    uint  indexOffset;
+    float flattenBottom;    // [0,1): squash of the lower hemisphere so the shape sits flat on the ground.
+} pc;
+
+// 2-octave fbm of ValueNoise3D over the unit direction, remapped to [-1, 1].
+float BlobFbm(vec3 dir) {
+    vec3 p = dir * pc.noiseFrequency + vec3(float(pc.seed) * 0.618);
+    float sum = 0.0;
+    float amp = 0.5;
+    float freq = 1.0;
+    float maxAmp = 0.0;
+    for (int o = 0; o < 2; ++o) {
+        sum += (ValueNoise3D(p * freq) * 2.0 - 1.0) * amp;
+        maxAmp += amp;
+        amp *= 0.5;
+        freq *= 2.13;
+    }
+    return sum / maxAmp;
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x; // latitude index [0, rings]
+    uint j = gl_GlobalInvocationID.y; // longitude index [0, sectors]
+    if (i > pc.rings || j > pc.sectors) {
+        return;
+    }
+
+    float theta = float(i) / float(pc.rings) * PI;        // polar, 0 = top (+Y)
+    float phi   = float(j) / float(pc.sectors) * 2.0 * PI; // azimuth
+
+    vec3 dir = vec3(sin(theta) * cos(phi), cos(theta), sin(theta) * sin(phi));
+
+    // Radial noise displacement -- clamped so the surface can never invert through the center.
+    float disp = 1.0 + clamp(BlobFbm(dir) * pc.noiseAmplitude, -0.6, 0.9);
+    vec3 pos = dir * (pc.radius * disp);
+
+    // Flatten the lower hemisphere and lift so the shape rests on the local ground plane (y = 0),
+    // ready to be placed on the terrain by the instance transform.
+    if (pos.y < 0.0) {
+        pos.y *= (1.0 - pc.flattenBottom);
+    }
+    float lift = pc.radius * (1.0 - pc.flattenBottom * 0.5);
+    pos.y += lift;
+
+    // Radial direction is an adequate shading normal for this low-frequency, soft-lit decorative
+    // blob (the fragment shader uses VSM sun + World Probe indirect diffuse, not a sharp specular
+    // lobe) -- an exact displaced normal would cost finite differences for no visible gain here.
+    vec3 nrm = normalize(dir + vec3(0.0, 0.15, 0.0)); // slight upward bias for a grounded look
+
+    uint stride = pc.sectors + 1u;
+    uint vIdx = pc.vertexOffset + i * stride + j;
+    Vertex v;
+    v.position = pos;
+    v.normal = nrm;
+    v.uv = vec2(float(j) / float(pc.sectors), float(i) / float(pc.rings));
+    v.uv2 = v.uv;
+    v.meshID = pc.meshID;
+    v.materialID = pc.materialID;
+    vertices[vIdx] = v;
+
+    // Emit the two triangles of the quad whose lower-left corner is this vertex.
+    if (i < pc.rings && j < pc.sectors) {
+        uint a = pc.vertexOffset + i * stride + j;
+        uint b = pc.vertexOffset + (i + 1u) * stride + j;
+        uint c = pc.vertexOffset + (i + 1u) * stride + (j + 1u);
+        uint d = pc.vertexOffset + i * stride + (j + 1u);
+
+        uint t = pc.indexOffset + (i * pc.sectors + j) * 6u;
+        indices[t + 0u] = a;
+        indices[t + 1u] = b;
+        indices[t + 2u] = c;
+        indices[t + 3u] = a;
+        indices[t + 4u] = c;
+        indices[t + 5u] = d;
+    }
+}

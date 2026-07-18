@@ -9,6 +9,7 @@
 #include <vulkan/vulkan.h>
 #include <vk_mem_alloc.h>
 #include "core/EngineConfig.h"
+#include "core/maths/Maths.h"
 
 namespace renderer {
 
@@ -39,14 +40,22 @@ namespace renderer {
 
         void Shutdown();
 
+        // Atmos weather system, Subtask 5: binds renderer::AtmosSkyPass's Sky-View LUT into set 0's
+        // binding 9 -- must be called exactly once after both Init() and AtmosSkyPass's own Init(),
+        // before the first RecordInject() call, same deferred-binding convention as e.g.
+        // renderer::ClusterResolvePass::SetVirtualShadowMap.
+        void SetAtmosSkyView(VkImageView skyViewLUTView, VkSampler skyViewLUTSampler);
+
         // Dispatches up to kCardsPerFrameBudget cards' worth of GI injection, advancing the
         // internal round-robin cursor exactly like SurfaceCachePass::RecordCapture. `traceMode`
         // selects SurfaceCacheGIInject.comp's trace back-end uniformly for this call: 0 = SWRT
-        // (mesh_sdf_trace.glsl), 1 = HWRT (inline rayQueryEXT against the shared TLAS). Caller
-        // owns every synchronization barrier before (source atlases + TLAS visible) and after
-        // (radiance atlas writes visible to the next consumer) this call.
+        // (mesh_sdf_trace.glsl), 1 = HWRT (inline rayQueryEXT against the shared TLAS).
+        // `sunDirectionWorld` (Atmos Subtask 5): fed to a hemisphere-ray miss's own Sky-View LUT
+        // sample, points FROM the light TOWARD the scene. Caller owns every synchronization barrier
+        // before (source atlases + TLAS visible) and after (radiance atlas writes visible to the
+        // next consumer) this call.
         void RecordInject(VkCommandBuffer cmd, const SurfaceCacheTraceContext& traceContext,
-            const SurfaceCachePass& surfaceCache, uint32_t traceMode);
+            const SurfaceCachePass& surfaceCache, uint32_t traceMode, const maths::vec3& sunDirectionWorld);
 
     private:
         VkDevice m_Device = VK_NULL_HANDLE;

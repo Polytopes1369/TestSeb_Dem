@@ -18,7 +18,14 @@ namespace debugpipeline {
     enum class TestStatus {
         Pass,
         Warn,
-        Fail
+        Fail,
+        // Phase 5 (Streaming & Monde roadmap, Part 2, Gap 3): a test whose PRECONDITION could not be
+        // met in this environment (e.g. world_data/cellmanifest.bin missing on a fresh checkout that
+        // never ran WorldPartitionBakeTool.exe) -- never counted as a FAIL (see FailCount()'s own
+        // exclusion), matching this codebase's established "streaming is additive, not load-bearing"
+        // degradation convention (world::CellManifest::Load()'s own header comment) rather than
+        // treating an absent optional asset as a hard test failure.
+        Skip
     };
 
     struct FeatureTestResult {

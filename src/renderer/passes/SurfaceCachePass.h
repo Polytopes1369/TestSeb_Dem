@@ -205,6 +205,11 @@ namespace renderer {
         // per frame, via VirtualShadowMapPass::RecordBeginFrame()).
         void SetVirtualShadowMap(const VirtualShadowMapPass& vsm);
 
+        // Atmos weather system, Subtask 5: binds renderer::AtmosCloudsPass's Cloud Shadow Map into
+        // the lighting set's binding 8 -- must be called exactly once after both Init() and
+        // AtmosCloudsPass's own Init(), before the first RecordCapture() call.
+        void SetAtmosCloudShadow(VkImageView cloudShadowView, VkSampler cloudShadowSampler);
+
         // Writes `lights` into the persistently-mapped lighting UBO (set 0, binding 0) that every
         // SurfaceCacheCapture.frag invocation reads. Call once per frame before RecordCapture() --
         // a plain memcpy into host-visible/coherent memory, no descriptor-set update needed (only

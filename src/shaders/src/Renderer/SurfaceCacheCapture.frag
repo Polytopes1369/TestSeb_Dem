@@ -57,6 +57,11 @@
 #include "include/shadow_atlas_sampling.glsl"
 #include "include/shadow_sun_sampling.glsl"
 #include "include/shadow_point_sampling.glsl"
+#include "include/atmos_clouds_density.glsl"
+
+// Atmos weather system, Subtask 5: renderer::AtmosCloudsPass's Cloud Shadow Map -- see
+// ComputeDirectLighting's own comment for how this modulates the sun term.
+layout(set = 0, binding = 8) uniform sampler2D g_CloudShadowMap;
 
 struct PointLightGPU {
     vec4 positionAndRadius; // xyz = world position, w = radius (attenuation reaches ~0 here).
@@ -118,6 +123,10 @@ vec3 ComputeDirectLighting(vec3 worldPos, vec3 n) {
     float sunNdotL = max(dot(n, sunDir), 0.0);
     if (sunNdotL > 0.0) {
         float visibility = SampleSunShadowVSM(worldPos);
+        // Atmos weather system, Subtask 5: cloud shadow modulation, same convention as
+        // ClusterResolveBinned.comp's own identical sun-term multiply -- makes the Surface Cache's
+        // own indirect bounce (fed by this capture) dim correctly under a passing cloud shadow.
+        visibility *= texture(g_CloudShadowMap, AtmosCloudShadowUVFromWorldXZ(worldPos.xz)).r;
         lighting += uLighting.sunColor.rgb * uLighting.sunDirectionAndIntensity.w * sunNdotL * visibility;
     }
 

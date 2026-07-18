@@ -1,0 +1,152 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+
+// Particle system Subtask 3 (particle_system_integration_plan.md, project root): sorts the current
+// frame's alive particles back-to-front (farthest from the camera first) so Subtask 4's billboard
+// render pass can alpha-blend them correctly ("over" compositing requires painting far-to-near).
+// One shader, two modes via push-constant `mode` (this codebase's established convention, e.g.
+// GlobalSDFComposite.comp / ParticleSimulation.comp) -- see
+// renderer::ParticleSystemPass::RecordSort's own comment for the full per-call dispatch sequence.
+//
+// --- mode == 0: InitKeys ---
+// One thread per SORT SLOT (dispatched over kMaxParticles threads -- see this shader's own "why
+// kMaxParticles slots, not aliveCount" note below). Slot i < aliveCount reads
+// ParticleCommon.glsl's AliveListBuffer[i] to find which particle occupies that slot, computes its
+// camera-forward-projected depth key (dot(position - cameraPos, cameraForward) -- larger means
+// farther away), and writes {particleIndex, key} into SortedPairsBuffer[i]. Slot i >= aliveCount
+// (i.e. every currently-dead/unused sort slot) instead gets a sentinel key of -FLT_MAX, so it sorts
+// to the very end of a DESCENDING sort (see mode == 1 below) -- past every real particle, regardless
+// of how many are alive this frame.
+//
+// --- mode == 1: CompareExchange ---
+// One bitonic-sort compare-exchange STEP of the classic iterative network (Batcher's algorithm,
+// stage size `pc.stageSize` == k, pass size `pc.passSize` == j in the textbook k/j notation) over
+// the FULL kMaxParticles-length SortedPairsBuffer -- NOT just the alive prefix, since bitonic sort
+// requires a power-of-two element count and kMaxParticles already is one, while aliveCount changes
+// every frame and is not. This is why mode == 0 pads every unused slot with a sentinel: the full
+// buffer is unconditionally sortable, and after every (k, j) pair has run once, SortedPairsBuffer
+// [0..aliveCount) holds exactly the alive particles, in back-to-front order, ready for Subtask 4's
+// vertex shader to index via gl_InstanceIndex. The comparison operators below are the MIRROR of the
+// textbook ascending-bitonic-sort network (`<` where the reference uses `>` and vice versa)
+// specifically to produce a DESCENDING result (farthest key first) instead of the network's natural
+// ascending order.
+//
+// Subtask A2 (particle sort & budget scaling roadmap): renderer::ParticleSystemPass::RecordSort still
+// issues the SAME fixed loop of CompareExchange dispatches (unchanged stage/pass structure, unchanged
+// per-step barrier), but each one is now a vkCmdDispatchIndirect reading SortDispatchArgsBuffer below
+// instead of a fixed-size vkCmdDispatch -- see that buffer's own comment for the full mechanism and
+// why shrinking ONLY this mode's workgroup count (never mode == 0's) is provably safe.
+//
+// --- mode == 2: Compute Dispatch Args ---
+// A single-thread pre-pass (gl_GlobalInvocationID.x != 0 threads return immediately) that rounds
+// THIS frame's real aliveCount up to the next power of two and writes the resulting 256-wide
+// workgroup count into SortDispatchArgsBuffer -- see that buffer's own declaration comment.
+
+#include "include/ParticleCommon.glsl"
+
+layout(local_size_x = 256) in;
+
+struct SortedPair {
+    uint index; // Slot index into ParticleBuffer -- 0xFFFFFFFF for a sentinel (unused) slot.
+    float key;  // Camera-forward-projected depth -- larger is farther from the camera.
+};
+
+layout(std430, set = 1, binding = 0) buffer SortedPairsBuffer {
+    SortedPair sortedPairs[];
+};
+
+// Subtask A2 (particle sort & budget scaling roadmap): a VkDispatchIndirectCommand-compatible
+// (uint32 x/y/z, 12 bytes) buffer this shader's own mode == 2 branch fills every RecordSort() call --
+// read directly by renderer::ParticleSystemPass::RecordSort's own vkCmdDispatchIndirect calls for
+// every mode == 1 CompareExchange dispatch (NOT for mode == 0 InitKeys, which stays a fixed,
+// full-kMaxParticles-width direct dispatch -- see that method's own comment).
+//
+// Why shrinking ONLY the CompareExchange dispatches' workgroup count is safe, with NO other change
+// (no bound-check rewrite, no stage/pass loop truncation) needed: InitKeys (mode == 0) above still
+// unconditionally fills the ENTIRE [aliveCount, kMaxParticles) tail with the IDENTICAL sentinel key
+// every single frame, regardless of how small groupCountX below is. `groupCountX` here is computed
+// from `paddedAliveCount = next_pow2(aliveCount) >= aliveCount`, so for ANY CompareExchange thread
+// this buffer causes to be skipped (global index >= paddedAliveCount, hence also >= aliveCount), its
+// partner index (always > its own index, by this shader's own "lower-indexed thread acts" convention
+// below) is ALSO >= paddedAliveCount >= aliveCount -- i.e. skipping it only ever discards a
+// sentinel-vs-sentinel compare-exchange, which is PROVABLY a no-op (identical keys never swap)
+// regardless of stageSize/passSize. No real particle's compare-exchange is ever skipped, and no
+// stale/uninitialized data is ever read, because InitKeys' own full-width fill above is untouched.
+layout(std430, set = 1, binding = 1) buffer SortDispatchArgsBuffer {
+    uint groupCountX;
+    uint groupCountY;
+    uint groupCountZ;
+};
+
+layout(push_constant) uniform ParticleSortPC {
+    float cameraPosition[3];
+    float cameraForward[3];
+    uint stageSize; // k -- only meaningful in mode == 1.
+    uint passSize;  // j -- only meaningful in mode == 1.
+    int mode;       // 0 = InitKeys, 1 = CompareExchange, 2 = Compute Dispatch Args (Subtask A2).
+} pc;
+
+vec3 GetCameraPosition() { return vec3(pc.cameraPosition[0], pc.cameraPosition[1], pc.cameraPosition[2]); }
+vec3 GetCameraForward()  { return vec3(pc.cameraForward[0], pc.cameraForward[1], pc.cameraForward[2]); }
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+
+    if (pc.mode == 0) {
+        if (i >= sortedPairs.length()) {
+            return;
+        }
+        if (i < aliveCount) {
+            uint particleIndex = aliveIndices[i];
+            vec3 toParticle = particles[particleIndex].position - GetCameraPosition();
+            float key = dot(toParticle, GetCameraForward());
+            sortedPairs[i] = SortedPair(particleIndex, key);
+        } else {
+            sortedPairs[i] = SortedPair(0xFFFFFFFFu, -3.402823466e38);
+        }
+        return;
+    }
+
+    if (pc.mode == 2) {
+        // Compute Dispatch Args -- see SortDispatchArgsBuffer's own declaration comment above.
+        // Single-thread: every other invocation in this dispatch's one workgroup returns immediately
+        // to avoid a write race on groupCountX/Y/Z below.
+        if (i != 0u) {
+            return;
+        }
+        uint capacity = uint(sortedPairs.length()); // kMaxParticles -- the sort buffer's fixed allocated length.
+        uint clampedAlive = min(max(aliveCount, 1u), capacity);
+        // Smallest power of two >= clampedAlive -- a plain doubling loop (at most 17 iterations for a
+        // 65536-capacity buffer): this pre-pass is a single thread running once per RecordSort() call,
+        // so clarity/obvious-correctness matters far more here than shaving a handful of ALU ops.
+        uint padded = 1u;
+        while (padded < clampedAlive) {
+            padded <<= 1u;
+        }
+        groupCountX = (padded + 255u) / 256u;
+        groupCountY = 1u;
+        groupCountZ = 1u;
+        return;
+    }
+
+    // mode == 1: one compare-exchange step. Each pair {i, partner} is processed exactly once, by
+    // whichever of the two has the lower index (the higher-indexed thread just returns) -- the
+    // standard way to avoid two threads racing to swap the same pair from both sides.
+    uint partner = i ^ pc.passSize;
+    if (partner <= i || partner >= sortedPairs.length()) {
+        return;
+    }
+
+    SortedPair a = sortedPairs[i];
+    SortedPair b = sortedPairs[partner];
+
+    // Mirrored ascending-network comparisons (see this shader's own header comment) -- produces a
+    // DESCENDING overall result once every (stageSize, passSize) pair has run.
+    bool inAscendingBlock = (i & pc.stageSize) == 0u;
+    bool shouldSwap = inAscendingBlock ? (a.key < b.key) : (a.key > b.key);
+
+    if (shouldSwap) {
+        sortedPairs[i] = b;
+        sortedPairs[partner] = a;
+    }
+}

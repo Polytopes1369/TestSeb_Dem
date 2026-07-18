@@ -7,9 +7,20 @@
 #include "core/EngineConfig.h" // config::VERTEX_SPACING default arg for GeneratePlane()
 #include "core/EntityData.h"
 #include "core/IDManager.h"
+#include "core/InstanceRegistry.h"
 #include "renderer/MaterialParameterTable.h"
+// Phase 5 (Streaming & Monde roadmap, Part 2, Gap 3): world::CellManifest/world::CellCoord --
+// VulkanContext::GenerateGeometry() reads the same offline-baked world_data/cellmanifest.bin
+// main.cpp's own world::CellManifest instance loads, to bake each authored cell's real HLOD proxy
+// into a dedicated streaming unit at startup (see kStreamingUnitCount's own comment). Both headers
+// are Vulkan-free and have zero dependency back onto renderer::, so this is a one-directional,
+// acyclic addition.
+#include "world/CellManifest.h"
 #include <array>
+#include <cassert>
+#include <optional>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 #include <string>
 
@@ -147,7 +158,21 @@ public:
     // Recomputes every entity's self-rotation (tumbling on all 3 axes) from elapsed scene
     // time and re-uploads the whole EntityTransform array to the GPU. Must be called once per
     // frame, before recording the draw, so the vertex shader picks up this frame's rotation.
-    void UpdateEntityRotations(float timeSeconds);
+    //
+    // Phase 5 (Streaming & Monde roadmap, Part 1): `originOffset` is the current LWC origin cell's
+    // world-space center (world::LwcOrigin::GetCurrentOffset(), computed by main.cpp earlier this
+    // same frame, after the fly-camera movement block so this call sees this frame's fresh origin,
+    // never a stale one -- see main.cpp's own per-frame ordering comment). Subtracted from every
+    // entity's `translation` channel ONLY, not `center` -- see this method's .cpp definition for the
+    // exact worked-out reason `center` must stay untouched (it is also the rotation pivot inside
+    // struct_custo.glsl's `rotation*(restPos-center)` term, baked against the immutable, always-
+    // absolute GPU vertex buffer; rebasing it there would introduce a spurious rotation*offset error
+    // term on every rotating entity, growing with the offset's own magnitude -- exactly the kind of
+    // "close enough" approximation CLAUDE.md's zero-approximation rule forbids). `translation` is
+    // already the pure world-space-additive-after-rotation channel struct_custo.glsl's own
+    // composition comment documents, so subtracting there alone rebases the FINAL composed world
+    // position by exactly `-originOffset`, correct regardless of any entity's current rotation.
+    void UpdateEntityRotations(float timeSeconds, const maths::vec3& originOffset);
 
     // --- Accessors exposing the raw GPU handles needed by geometry::RunVirtualGeometryCacheTest
     // to read back the live procedural Vertex/Index SSBOs for the virtual geometry cache test.
@@ -157,7 +182,7 @@ public:
     VkCommandPool GetCommandPool() const { return m_CommandPool; }
     VkBuffer GetVertexBuffer() const { return m_VertexBuffer; }
     VkBuffer GetIndexBuffer() const { return m_IndexBuffer; }
-    const core::EntityData* GetEntityData() const { return m_EntityData.data(); }
+    const core::EntityData* GetEntityData() const { return m_InstanceRegistry.Data(); }
     // Returns the TOTAL entity count including the streaming pool (kTotalEntityCount), not just
     // the fixed showcase gallery -- every existing "iterate every entity" consumer (GlobalSDFPass's
     // per-entity SDF bake, EntityBVH, TLAS build, shadow maps) picks up the streaming slots
@@ -172,7 +197,7 @@ public:
     // a GPU buffer handle to bind) -- currently only SurfaceCacheRayTracingPass's per-frame TLAS
     // refit and GlobalSDFPass's object-space compositing (see core::EntityTransformCPU's own
     // comment for why this lives in EntityData.h, not here).
-    const core::EntityTransformCPU* GetEntityTransformsCPU() const { return m_EntityTransformsCPU.data(); }
+    const core::EntityTransformCPU* GetEntityTransformsCPU() const { return m_InstanceRegistry.TransformData(); }
     VkBuffer GetEntityBuffer() const { return m_EntityBuffer; }
     const renderer::MaterialTable& GetMaterialTable() const { return m_MaterialTable; }
 
@@ -188,6 +213,56 @@ public:
     // command buffer recording begins (see main.cpp's own call site, right after
     // StreamingManager::Update() and before ClusterRenderPipeline::RecordFrame()).
     void SetStreamingUnitState(uint32_t unit, bool active, bool useFineVariant, const maths::vec3& worldPos, uint32_t cellID);
+
+    // Phase 5 (Streaming & Monde roadmap, Part 2, Gap 3): returns the streaming unit
+    // GenerateGeometry() dedicated to `coord` at startup (real, baked HLOD proxy + fine archetype
+    // mesh -- see that function's own streaming-pool bake-in block), or std::nullopt if this cell
+    // has no dedicated unit (world_data/cellmanifest.bin was missing/unreadable at startup, this
+    // cell is unauthored, or the manifest's authored-cell count exceeded kStreamingUnitCount's fixed
+    // capacity). Callers (main.cpp's own streaming-activation loop) must fall back to the shared
+    // free-list pool over the remaining spare units in that case -- see
+    // GetDedicatedStreamingUnitCount()'s own comment for the exact fallback contract.
+    std::optional<uint32_t> GetDedicatedStreamingUnitForCell(const world::CellCoord& coord) const;
+
+    // Number of units GenerateGeometry() dedicated to a real authored cell at startup -- ALWAYS the
+    // contiguous range [0, GetDedicatedStreamingUnitCount()) (unit index == that cell's index in
+    // world::CellManifest::GetOrderedCells(), see that function's own bake-in loop), so a caller
+    // building its own free-list over the REMAINING spare units (main.cpp's own
+    // freeStreamingUnits) can simply start iterating at this value instead of at 0. Returns 0 if
+    // world_data/cellmanifest.bin was missing/unreadable at startup (every unit then falls back to
+    // the pre-Phase-5 shared 4-archetype rotation, exactly as before this feature).
+    uint32_t GetDedicatedStreamingUnitCount() const { return static_cast<uint32_t>(m_CellToStreamingUnit.size()); }
+
+    // Phase 0.2 (UE5.8-parity PCG roadmap, "PCG Instance Draw Path"): the real, already-baked
+    // meshID/materialID of streaming unit `unit`'s FINE (full-detail) archetype variant -- lets a
+    // caller (main.cpp's PcgInstanceDrawPass smoke test) point new PCG draw instances at already-
+    // resident geometry without needing this class's own private streaming-slot layout constants
+    // (StreamingUnitFineSlot/kStreamingSlotBase, both private -- see this class' own header comment
+    // on why every existing "iterate every entity" consumer instead goes through GetEntityData()/
+    // GetEntityCount()). `unit` must be < GetStreamingUnitCount(). Valid any time after Init() has
+    // run BuildEntityData() -- every streaming unit's fine-variant EntityData is authored there
+    // unconditionally, regardless of whether any world cell has actually claimed the unit yet (see
+    // SetStreamingUnitState()'s own comment: an idle unit still carries a real, valid meshID, only
+    // core::EntityFlags::StreamingInactive hides it from being drawn by the normal per-frame cut).
+    struct StreamingArchetypeMeshInfo { uint32_t meshID = 0; uint32_t materialID = 0; };
+    StreamingArchetypeMeshInfo GetStreamingArchetypeFineMeshInfo(uint32_t unit) const {
+        assert(unit < kStreamingUnitCount);
+        uint32_t fineIdx = StreamingUnitFineSlot(unit);
+        return { m_InstanceRegistry[fineIdx].meshID, m_InstanceRegistry[fineIdx].materialID };
+    }
+
+#ifndef NDEBUG
+    // Phase 0.1 (UE5.8-parity PCG roadmap, "Dynamic Instance Registry"): CPU-only startup smoke test
+    // proving core::InstanceRegistry::AcquireSlot()/ReleaseSlot() free-list bookkeeping is correct
+    // and cannot corrupt any of the kTotalEntityCount already-live entities BuildEntityData()
+    // acquired at Init() time. Whole declaration + definition compiled out in Release (matching this
+    // class's existing m_DebugMessenger/m_EnableValidationLayers convention below) -- see the .cpp
+    // definition for exactly what it checks. Returns false (after LOG_ERROR-ing the specific failing
+    // check) on the first failing check, true if every check passes. Safe to call any time after
+    // Init() has run BuildEntityData() -- main.cpp calls it exactly once, right after
+    // VulkanContext::Init() returns.
+    bool RunInstanceRegistrySmokeTest();
+#endif
 
 private:
     VkInstance m_Instance = VK_NULL_HANDLE;
@@ -296,6 +371,9 @@ private:
     // Params UBO / DispatchGeometryCompute path as every other non-box primitive above (in fact
     // byte-identical to PlaneParams, see GenerateTerrain()'s own comment).
     VkPipeline m_TerrainPipeline = VK_NULL_HANDLE;
+    // Rivers/waterfalls feature: geom_river.comp -- same shared Params UBO / DispatchGeometryCompute
+    // path, own RiverParams struct (see GenerateRiver()'s own comment).
+    VkPipeline m_RiverPipeline = VK_NULL_HANDLE;
 
     // The box is generated via 6 dispatches (one per cube face) of the same geom_box.comp
     // module, each specialized with a different VkSpecializationInfo (axis mapping / winding)
@@ -324,14 +402,28 @@ private:
     // translucent, emissive, MegaLights, Lumen GI), plus 2 static colored walls forming the Lumen
     // GI corner, the floor (a Phase 7b procedural terrain heightfield, not a flat plane), and a
     // Phase 7c water plane.
-    static constexpr uint32_t kEntityCount = 16;
+    // Procedural tree generator (renderer::ProceduralTreePass -- CLAUDE.md's "Arbres (generes par
+    // du code style speedtree)" requirement): kTreeVisualCount distinct trees, each baked as TWO
+    // entities (bark + leaves, see ProceduralTreePass.h's own class comment for why one entity
+    // can't hold both materials), inserted right after the 12 gallery primitives (indices
+    // [kTreeEntityIndexBase, kTreeEntityIndexBase + kTreeEntityCount)). The walls/floor/water block
+    // below is keyed off kEntityCount's OWN END (kEntityCount - 4/3/2/1), so growing kEntityCount
+    // to make room for the tree entities automatically shifts those to the new end without any
+    // other change -- exactly the same "keyed by absolute index, not distance from the start"
+    // mechanism GenerateShowcaseMaterialTable()/GridSlot() already rely on for the first 12.
+    static constexpr uint32_t kTreeVisualCount = 4;
+    static constexpr uint32_t kTreeEntityIndexBase = 12;
+    static constexpr uint32_t kTreeEntityCount = kTreeVisualCount * 2u; // bark + leaves per tree.
+
+    static constexpr uint32_t kEntityCount = 16 + kTreeEntityCount;
     // The 2 static walls that form the Lumen/GI showcase corner (see GenerateGeometry()'s wall
     // blocks and UpdateEntityRotations()'s fixed-rotation branch for them) -- generated right
     // before the floor. Deliberately offset from kEntityCount by 4/3 (not 3/2, as before Phase 7c)
-    // so adding the water plane as the new last entity does not shift these -- both must stay at
-    // their existing absolute indices (12/13), since GenerateShowcaseMaterialTable()'s own
-    // per-slot recipes and GridSlot()'s own zone layout are keyed by absolute index, not by
-    // "distance from the end".
+    // so adding the water plane as the new last entity does not shift these -- both stay at
+    // kEntityCount-4/kEntityCount-3 (12/13 before the tree entities above were inserted, now
+    // shifted to 20/21), since GenerateShowcaseMaterialTable()'s own per-slot recipes are keyed by
+    // an EXPLICIT materialID override at those two entity indices (see BuildEntityData()'s own
+    // kWallMaterialIDA/B constants), not by an implicit materialID==entityIndex assumption.
     static constexpr uint32_t kWallEntityIndexA = kEntityCount - 4;
     static constexpr uint32_t kWallEntityIndexB = kEntityCount - 3;
     // The floor (a Phase 7b terrain heightfield) is generated right before the water plane -- see
@@ -345,11 +437,31 @@ private:
     // override).
     static constexpr uint32_t kWaterEntityIndex = kEntityCount - 1;
     // Phase 7a (UE5.8 parity roadmap, hero asset tessellation): the Icosphere -- generated FIRST
-    // (see GenerateGeometry()'s own "Icosphere-first" comment, `m_EntityData[2].meshID` used
-    // directly), the single tessellated/displaced hero asset, rendered by
-    // renderer::HeroTessellationPass instead of the opaque Nanite path -- see BuildEntityData()'s
-    // own kHeroMaterialID override.
+    // (see GenerateGeometry()'s own "Icosphere-first" comment, `m_InstanceRegistry[2].meshID` used
+    // directly). Originally the ONE hardcoded tessellated/displaced hero asset (back when this
+    // feature only ever rendered renderer::kHeroMaterialID via the single-entity
+    // "HeroTessellationPass"); still tessellated today, but now just one entry in
+    // kTessellatedEntityIndices below, same as any other opted-in entity -- see that constant's
+    // own comment for the generalization.
     static constexpr uint32_t kHeroEntityIndex = 2;
+
+    // Generalized Nanite Tessellation (renderer::TessellationPass, real UE5.8 Nanite Tessellation
+    // parity -- 5.5+ applies to any flagged mesh, not one hardcoded hero asset): every entity index
+    // BuildEntityData() marks core::EntityFlags::IsTessellated, rendered by renderer::
+    // TessellationPass's own screen-space-adaptive tessellation + procedural displacement instead
+    // of the opaque Nanite VisBuffer pipeline (see that class' own header comment). Deliberately
+    // chosen to be VISIBLY different from the pre-generalization single-hero-sphere look:
+    // kHeroEntityIndex (2, Icosphere -- already tessellated before this generalization, kept for
+    // continuity), slot 3 (Plane, "Dielectric A" -- originally a perfectly flat surface; tessellated
+    // displacement turns it into a rocky/eroded ground patch, the clearest possible before/after
+    // demonstration of this feature), and slot 9 (Pyramid, "Dielectric B" -- a simple flat-faced
+    // primitive that likewise reads very differently once its faces are subdivided and displaced).
+    // Every one of these keeps its own showcase materialID (see GenerateShowcaseMaterialTable()'s
+    // own zone-layout comment) unmodified except the hero (still overridden to kHeroMaterialID,
+    // exactly as before) -- renderer::TessellationPass now shades each entity with ITS OWN
+    // material, not a single shared one (see BuildEntityData()'s own IsTessellated assignment for
+    // the exact override rules).
+    static constexpr std::array<uint32_t, 3> kTessellatedEntityIndices = { kHeroEntityIndex, 3u, 9u };
 
     // --- Runtime World Partition streaming pool (world::StreamingManager / world::WorldCellStreamingLoader) ---
     // Bounded pool of extra entity slots appended AFTER the fixed showcase gallery (indices
@@ -365,12 +477,18 @@ private:
     // (see ClusterLODCompact.comp's own boundsMin/boundsMax comment) -- live re-baking of resident
     // Nanite geometry is not a supported operation in this pipeline.
     static constexpr uint32_t kStreamingArchetypeShapeCount = 4; // Rock, Bush, Tree, Debris -- see BuildEntityData()'s archetype block.
-    // Deliberately small: 16 base + 12 streaming == 28 total entities -- comfortably under
-    // mesh_sdf_trace.glsl's/SurfaceCacheTraceContext's kMaxTracedEntities (128, config::lumen::
-    // MAX_TRACED_ENTITIES), and each streaming slot's SDF bake is cheap (small pre-baked archetype
-    // props, not the scene's large primitives). Kept small mainly to bound GPU memory/Init cost,
-    // not to dodge any known capacity limit.
-    static constexpr uint32_t kStreamingUnitCount = 6;
+    // Phase 5 (Streaming & Monde roadmap, Part 2, Gap 3): grown from 6 (a small shared-archetype
+    // rotation pool) to 50, so GenerateGeometry() can dedicate one real, individually-baked unit to
+    // every one of BakeDemoWorld.cpp's 49 authored demo-grid cells (7x7, see that tool's own
+    // kGridRadiusCells) with one spare unit left over for the shared-archetype fallback pool (see
+    // main.cpp's own freeStreamingUnits comment). Ceiling verified, not guessed: kEntityCount (16) +
+    // kStreamingUnitCount*kStreamingSlotsPerUnit must stay <= SurfaceCacheTraceContext::
+    // kMaxTracedEntities (128, mesh_sdf_trace.glsl's own compile-time array size -- exceeding it
+    // doesn't crash, GlobalSDFPass/SurfaceCacheTraceContext just silently truncate the overflow
+    // entities out of GI/SDF tracing, see that constant's own comment) -- 16 + 50*2 = 116, leaving
+    // 12 of headroom. A prior attempt at 64 units (16 + 64*2 = 144) confirmed this ceiling by
+    // exceeding it by exactly 16 entities.
+    static constexpr uint32_t kStreamingUnitCount = 50;
     static constexpr uint32_t kStreamingSlotsPerUnit = 2; // 0 = coarse (HLOD), 1 = fine (FullDetail).
     static constexpr uint32_t kStreamingSlotCount = kStreamingUnitCount * kStreamingSlotsPerUnit;
     static constexpr uint32_t kStreamingSlotBase = kEntityCount;
@@ -379,23 +497,73 @@ private:
     static constexpr uint32_t StreamingUnitCoarseSlot(uint32_t unit) { return kStreamingSlotBase + unit * kStreamingSlotsPerUnit; }
     static constexpr uint32_t StreamingUnitFineSlot(uint32_t unit) { return kStreamingSlotBase + unit * kStreamingSlotsPerUnit + 1u; }
 
-    // CPU-authoritative entity records: built once by BuildEntityData() (meshID assigned via
-    // core::IDManager) before GenerateGeometry() runs, then copied to m_EntityBuffer by
-    // UploadEntityData(). Indices [0, kEntityCount) are the fixed showcase gallery; indices
-    // [kStreamingSlotBase, kTotalEntityCount) are the streaming pool above.
-    std::array<core::EntityData, kTotalEntityCount> m_EntityData{};
+    // Phase 0.1 (UE5.8-parity PCG roadmap, "Dynamic Instance Registry"): extra core::InstanceRegistry
+    // capacity, beyond kTotalEntityCount, reserved ONLY for RunInstanceRegistrySmokeTest()'s own
+    // probe slots (see that method's own comment) -- lets the smoke test AcquireSlot() genuinely
+    // brand-new indices instead of borrowing and restoring one of the kTotalEntityCount already-live
+    // real entities, which would risk corrupting it if the restore step ever had a bug. Zero in
+    // Release (#ifndef NDEBUG) so this headroom -- and the smoke test that is its only consumer --
+    // costs nothing in the shipping executable, matching this header's existing m_DebugMessenger/
+    // m_EnableValidationLayers convention below.
+#ifndef NDEBUG
+    static constexpr uint32_t kInstanceRegistryDebugHeadroom = 4;
+#else
+    static constexpr uint32_t kInstanceRegistryDebugHeadroom = 0;
+#endif
+    static constexpr uint32_t kInstanceRegistryCapacity = kTotalEntityCount + kInstanceRegistryDebugHeadroom;
 
-    // Phase 4 integration (UE5.8 parity roadmap, dynamic scenes onto main): CPU-readable mirror of
-    // m_EntityTransformBuffer's own per-frame contents -- see GetEntityTransformsCPU()'s own
-    // comment.
-    std::array<core::EntityTransformCPU, kTotalEntityCount> m_EntityTransformsCPU{};
+    // CPU-authoritative entity records + their CPU-side transform mirror. Generalized (Phase 0.1)
+    // from a fixed std::array<EntityData, kTotalEntityCount> into a core::InstanceRegistry: a
+    // capacity-bounded pool supporting runtime AcquireSlot()/ReleaseSlot() with LIFO free-list reuse
+    // (see InstanceRegistry.h's own header comment). BuildEntityData() acquires exactly
+    // kTotalEntityCount slots once at startup -- the 16 fixed showcase entities (indices
+    // [0, kEntityCount)) then the streaming pool (indices [kStreamingSlotBase, kTotalEntityCount)) --
+    // in that exact deterministic order on a registry that starts completely empty, so AcquireSlot()
+    // is guaranteed to hand back index == the loop's own absolute index every time, preserving every
+    // existing absolute-index constant (kWallEntityIndexA/B, kFloorEntityIndex, kWaterEntityIndex,
+    // kHeroEntityIndex, GridSlot()'s own zone layout) completely unchanged, and never releases them.
+    // Every existing consumer that iterates by GetEntityCount() (== kTotalEntityCount, unchanged)
+    // keeps working completely unmodified, since none of them can observe the registry's own extra
+    // Debug-only headroom capacity above that count. Data()/TransformData() give the exact same
+    // contiguous-array pointer semantics GetEntityData()/GetEntityTransformsCPU() always returned.
+    core::InstanceRegistry<kInstanceRegistryCapacity> m_InstanceRegistry;
 
-    // Per-streaming-UNIT (not per-slot: both the coarse and fine slot of a unit always share the
-    // same world position, see the pool comment above) desired world translation, set by
-    // SetStreamingUnitState() and consumed every frame by UpdateEntityRotations() -- persists
-    // across frames since UpdateEntityRotations() rebuilds the whole upload array from scratch
-    // every call and has no other memory of where a streaming unit was last placed.
-    std::array<maths::vec3, kStreamingUnitCount> m_StreamingUnitTranslation{};
+    // Phase 5 (Streaming & Monde roadmap, Part 2, Gap 3) BUG FIX: per-SLOT (not per-unit as before
+    // this fix), indexed by physical slot (StreamingUnitCoarseSlot(unit)/StreamingUnitFineSlot(unit)
+    // minus kStreamingSlotBase). struct_custo.glsl's EntityTransform composition is
+    // `worldPos = translation + center + rotation*(restPos - center)`; with center == 0 and
+    // rotation == identity for every streaming slot (see UpdateEntityRotations()'s own streaming-
+    // pool loop), this collapses to `worldPos = translation + restPos`, and restPos already bakes in
+    // this slot's own unique park offset (StreamingSlotParkPosition() -- GenerateGeometry()'s
+    // streaming block bakes every slot at its own parking position, never the origin, see that
+    // block's own header comment on why coarse/fine must never share one). A single shared
+    // per-UNIT translation set to the raw desired world position (the pre-fix behavior) therefore
+    // silently double-counted that park offset, rendering an active streaming slot ~560 units away
+    // from its intended cell -- SetStreamingUnitState() now subtracts EACH slot's own
+    // StreamingSlotParkPosition() before storing here, and coarse/fine need independent storage
+    // because their park positions differ (by kParkSpacing, see that function's own local
+    // constants) even though they represent the same unit/cell. Set by SetStreamingUnitState() and
+    // consumed every frame by UpdateEntityRotations() -- persists across frames since
+    // UpdateEntityRotations() rebuilds the whole upload array from scratch every call and has no
+    // other memory of where a streaming slot was last placed.
+    std::array<maths::vec3, kStreamingSlotCount> m_StreamingUnitTranslation{};
+
+    // Phase 5 (Streaming & Monde roadmap, Part 2, Gap 3): the manifest GenerateGeometry() reads once
+    // at startup to bake real per-cell HLOD proxies into the streaming pool (see that function's own
+    // streaming-pool block) -- kept alive as a member (not a Init()-local) only because
+    // BuildEntityData() ALSO needs it (to assign each dedicated unit's materialID/shape consistently
+    // with what GenerateGeometry() later bakes for that SAME unit) and runs before GenerateGeometry()
+    // in Init()'s own call order. Small enough to keep resident for the process's whole lifetime
+    // without concern (see world::CellManifest's own header comment on why reading it wholesale up
+    // front is fine at this demo's scale).
+    world::CellManifest m_CellManifest;
+
+    // Phase 5 (Streaming & Monde roadmap, Part 2, Gap 3): built once by GenerateGeometry()'s
+    // streaming-pool block, ALWAYS mapping to the contiguous range [0, GetDedicatedStreamingUnitCount())
+    // (unit index == that cell's index in m_CellManifest.GetOrderedCells()) -- backs
+    // GetDedicatedStreamingUnitForCell()/GetDedicatedStreamingUnitCount() above. Empty if
+    // world_data/cellmanifest.bin was missing/unreadable at startup.
+    std::unordered_map<world::CellCoord, uint32_t, world::CellCoordHash> m_CellToStreamingUnit;
 
     // Hand-authored PBR showcase materials (renderer::GenerateShowcaseMaterialTable), one slot per
     // entity -- built once by BuildEntityData(), uploaded to the GPU by ClusterResolvePass::Init()
@@ -494,25 +662,70 @@ private:
         uint32_t meshID, maths::vec2 slot,
         uint32_t& runningVertexOffset, uint32_t& runningIndexOffset);
 
-    // Authors m_EntityData on the CPU: assigns each of the kEntityCount entities a meshID via
-    // core::IDManager::GetNextID() (instead of a hardcoded literal). Must run before
-    // GenerateGeometry(), which reads m_EntityData[i].meshID into each primitive's push
+    // Rivers/waterfalls feature: dispatches m_RiverPipeline (geom_river.comp), generating the
+    // spline-following water ribbon (river course + waterfall segment, see river_spline.glsl's own
+    // kRiverControlHeight comment) CHAINED onto the same `meshID`/`runningVertexOffset`/
+    // `runningIndexOffset` as an immediately-preceding GenerateWaterPlane() call for the flat lake
+    // quad -- deliberately NOT a new renderer::EntityData slot (see geom_river.comp's own header
+    // comment for why: one shared renderer::WaterForwardPass draw, one shared kWaterMaterialID,
+    // zero VulkanContext::kEntityCount ripple). `segmentsAlong`/`segmentsAcross` size the ribbon's
+    // generation grid; the actual world-space path/width come from river_spline.glsl's own
+    // constants (kRiverControlXZ/kRiverControlHeight/kRiverHalfWidth), not from parameters here --
+    // unlike every other Generate*() primitive, this shape's authoring lives in the shared GLSL
+    // include specifically so terrain_noise.glsl's channel carve and this mesh generator can never
+    // silently drift apart (see that file's own header comment for the full 3-consumer contract).
+    void GenerateRiver(
+        uint32_t meshID, uint32_t segmentsAlong, uint32_t segmentsAcross,
+        uint32_t& runningVertexOffset, uint32_t& runningIndexOffset);
+
+    // Authors m_InstanceRegistry's entity records on the CPU: assigns each of the kEntityCount
+    // entities a meshID via core::IDManager::GetNextID() (instead of a hardcoded literal), then
+    // claims its slot via core::InstanceRegistry::AcquireSlot(). Must run before
+    // GenerateGeometry(), which reads m_InstanceRegistry[i].meshID into each primitive's push
     // constants / Params UBO.
     void BuildEntityData();
 
-    // One-shot upload of m_EntityData to the GPU-only m_EntityBuffer via a temporary staging
-    // buffer + vkCmdCopyBuffer, matching DispatchGeometryCompute's blocking one-time-submit
-    // pattern. Must run after m_EntityBuffer is allocated and before it is bound for reading.
+    // One-shot upload of m_InstanceRegistry's backing store to the GPU-only m_EntityBuffer via a
+    // temporary staging buffer + vkCmdCopyBuffer, matching DispatchGeometryCompute's blocking
+    // one-time-submit pattern. Must run after m_EntityBuffer is allocated and before it is bound
+    // for reading.
     void UploadEntityData();
 
     // Patches exactly the 2 core::EntityData elements at [kStreamingSlotBase + unit*2, +2) into
     // m_EntityBuffer via a small one-shot staging-buffer copy (same pattern as UploadEntityData(),
     // just a 2-element slice instead of the whole array) -- called by SetStreamingUnitState() after
-    // updating m_EntityData in place. A rare, small, main-thread-only patch (at most
+    // updating m_InstanceRegistry in place. A rare, small, main-thread-only patch (at most
     // maxConcurrentLoads streaming events per frame, see world::StreamingManager), so the brief
     // synchronous stall from ExecuteOneShotCommands' vkQueueWaitIdle is an accepted tradeoff over
     // building a batched per-frame dirty-range upload path for what is not a per-frame-hot path.
     void PatchStreamingUnitEntityData(uint32_t unit);
+
+    // Phase 5 (Streaming & Monde roadmap, Part 2, Gap 3): the deterministic (bake-time AND
+    // runtime-time both call this SAME function) parking position for ONE physical streaming slot,
+    // unique per slot (never per unit) so autosmooth's post-pass (GenerateGeometry()'s own
+    // AUTOSMOOTH POST-PASS block) never welds normals across two different archetype shapes baked
+    // in the same run -- see kStreamingUnitCount's own header comment on why this pool exists.
+    // Called by GenerateGeometry() (to bake each slot's mesh AT this offset) and by
+    // SetStreamingUnitState() (to CANCEL this same offset back out of the desired world position --
+    // see m_StreamingUnitTranslation's own comment for the exact bug this shared function fixes).
+    static maths::vec2 StreamingSlotParkPosition(uint32_t slotIndex);
+
+    // Phase 5 (Streaming & Monde roadmap, Part 2, Gap 3): CPU memcpy-into-staging + vkCmdCopyBuffer
+    // bake-in of one authored cell's already-simplified HLOD proxy mesh (`placement`, sliced out of
+    // m_CellManifest's own shared blob arrays) directly into the vertex/index SSBOs at
+    // [runningVertexOffset, +placement.hlodVertexCount) / [runningIndexOffset, +placement.hlodIndexCount)
+    // -- no compute shader dispatch, unlike every other GenerateXxx() primitive, because this
+    // geometry is already finalized on disk (see kStreamingUnitCount's own header comment on why
+    // live per-cell Nanite DAG builds are infeasible and proxies must instead be baked once at
+    // startup like this). Advances runningVertexOffset/runningIndexOffset by the ACTUAL proxy size
+    // (varies per cell, unlike the fixed-size archetype generators) on success. Returns false (both
+    // offsets left untouched, caller must fall back to a plain generated mesh) if the manifest's
+    // blob offsets are out of range for this record, or baking would overflow the fixed-size SSBOs
+    // -- defensive; should never trigger against a manifest this same build's WorldPartitionBakeTool
+    // produced, but a hand-edited/stale file must never read or write out of bounds.
+    bool BakeHlodProxyIntoSlot(const world::CellPlacement& placement, uint32_t meshID,
+                                const maths::vec2& worldOffset,
+                                uint32_t& runningVertexOffset, uint32_t& runningIndexOffset);
 
     // Single source of truth for the feature-gallery layout (also used by
     // UpdateEntityRotations() to recover each entity's rotation pivot, and duplicated by

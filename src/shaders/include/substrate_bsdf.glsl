@@ -174,6 +174,73 @@ vec3 EvaluateSubstrateEmissive(MaterialParams mat) {
     return mat.base.emissive + mat.top.emissive * mat.topWeight;
 }
 
+// Atmos weather system, surface response extension (UE5.8 Substrate / Ubisoft Atmos parity: dynamic
+// wet/snow surfaces): mutates `mat.base` in place to fake a thin surface layer of rainwater and/or
+// snow before the BSDF is evaluated -- a cheap material-parameter modulation, NOT a second Substrate
+// Slab/vertical-layering operator (a genuinely physical wet/snow layer would be exactly that, but a
+// full extra Slab per pixel is unjustified cost for a demoscene-scale global weather effect). Only
+// `mat.base` is touched -- `mat.top` (Clear Coat/Fuzz, see EvaluateSubstrateMaterial's own vertical-
+// layering comment) already models its own distinct surface response and is left alone, the same way
+// ComputeTerrainAlbedo (terrain_shading.glsl) only ever touches mat.base.diffuseAlbedo too.
+//
+// `wetness`/`snowCoverage` are both global [0,1] scalars (renderer::AtmosClimatePass::
+// GetSurfaceWetness()/GetSnowCoverage(), integrated once per frame CPU-side from the live climate
+// state -- see that class' own RecordUpdate() comment for the exact exponential-decay formula and
+// RAIN_STRENGTH/RELATIVE_HUMIDITY/TEMPERATURE_CELSIUS derivation) threaded down through
+// ResolveViewParamsUBO -- see ClusterResolve.comp's own binding comment for why this reuses that
+// UBO's previously-unused std140 padding floats rather than a new binding.
+//
+// Wetness (rain/humidity): darkens diffuse albedo (a wet surface absorbs more of the diffusely
+// scattered light -- water fills in a rough surface's micro-shadowing) and lowers roughness (a thin
+// water film smooths the effective micro-surface, sharpening the specular highlight), applied
+// UNIFORMLY across every exposed surface -- unlike snow below, rain wets front/side/top faces alike
+// (no normal-based masking), matching this feature's own "global, not per-surface" scope. The F0/F90
+// bump is a cheap stand-in for a genuine thin-film interference term (explicitly out of scope, see
+// this file's own header comment on what Substrate features this reproduces) -- just enough of a
+// grazing-angle sheen boost to read as "wet" without a real thin-film BRDF.
+//
+// Snow coverage (cold + precipitation): blends albedo/roughness/F0 toward a flat snow response,
+// MASKED by how upward-facing the surface normal is (dot(N, up), smoothstepped) -- snow settles on
+// roofs/ground/upward slopes, not vertical cliff faces or the undersides of overhangs, so skipping
+// this mask (a naive uniform blend like wetness's own) would look physically wrong in a way a
+// demoscene audience immediately notices, unlike wetness's uniform application which reads fine
+// because rain genuinely does wet every exposed face.
+MaterialParams ApplySurfaceWeather(MaterialParams mat, vec3 N, float wetness, float snowCoverage) {
+    if (wetness > 0.0) {
+        // Glossier (lower roughness) the wetter the surface is -- floor at 0.02 so a fully wet,
+        // already-smooth material (e.g. metal) never divides by a near-zero roughness downstream in
+        // EvaluateSlabSpecular's D_GGXAnisotropic/G_SmithGGXCorrelated terms.
+        float wetRoughnessScale = mix(1.0, 0.35, wetness);
+        mat.base.roughness = max(mat.base.roughness * wetRoughnessScale, 0.02);
+        // Darken toward ~65% of the dry albedo at full wetness (matches this feature's own "lerp
+        // toward ~60-70% of dry value" spec).
+        mat.base.diffuseAlbedo *= mix(vec3(1.0), vec3(0.65), wetness);
+        // Thin-film specular boost: raise F0 toward water's own ~0.03 dielectric baseline (a no-op
+        // for anything already at or above that, e.g. metals) and brighten the grazing-angle F90 edge
+        // tint -- see this function's own header comment on why this is a cheap stand-in, not a real
+        // thin-film BRDF term.
+        mat.base.f0 = mix(mat.base.f0, max(mat.base.f0, vec3(0.03)), wetness);
+        mat.base.f90Luminance = mix(mat.base.f90Luminance, max(mat.base.f90Luminance, 1.0), wetness * 0.5);
+    }
+    if (snowCoverage > 0.0) {
+        // smoothstep(0.3, 0.8, upFacing): near-0 on a vertical cliff face (dot ~= 0), ramping to
+        // near-full snow response only once a surface is genuinely mostly-upward-facing (dot >= 0.8,
+        // i.e. within ~37 degrees of straight up) -- a gentle, not binary, transition band so a
+        // rolling hillside doesn't show a hard snow-line seam at some arbitrary slope angle.
+        float upFacing = clamp(dot(N, vec3(0.0, 1.0, 0.0)), -1.0, 1.0);
+        float snowMask = smoothstep(0.3, 0.8, upFacing) * snowCoverage;
+        if (snowMask > 0.0) {
+            const vec3 kSnowAlbedo = vec3(0.92, 0.94, 0.98);
+            const float kSnowRoughness = 0.85; // Fresh snow is a soft, near-Lambertian diffuse scatterer, not glossy.
+            const vec3 kSnowF0 = vec3(0.03);   // Flat, uncolored dielectric F0 -- snow has no authored metal tint.
+            mat.base.diffuseAlbedo = mix(mat.base.diffuseAlbedo, kSnowAlbedo, snowMask);
+            mat.base.roughness = mix(mat.base.roughness, kSnowRoughness, snowMask);
+            mat.base.f0 = mix(mat.base.f0, kSnowF0, snowMask);
+        }
+    }
+    return mat;
+}
+
 // Lumen reflection composite weight: the Fresnel-only "Lumen Performance mode" weighting
 // ReflectionGather.comp already used pre-Substrate (see that file's own header comment), generalized
 // to Substrate's vertical layering the same way EvaluateSubstrateMaterial's direct-lighting term is

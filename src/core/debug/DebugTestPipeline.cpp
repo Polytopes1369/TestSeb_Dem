@@ -25,6 +25,17 @@
 //   9. Radiosity multi-bounce GI + Screen Trace GI on/off (renderer::SurfaceCacheGIInjectPass
 //      radiosity loop / renderer::ScreenTracePass)
 //  10. TAA/TSR temporal anti-aliasing/upscaling on/off (renderer::TAATSRPass)
+//  11. World Partition HLOD swap-in: real per-cell baked geometry (Phase 5, Streaming & Monde
+//      roadmap, Part 2, Gap 3 -- renderer::VulkanContext::GenerateGeometry()'s streaming-pool
+//      bake-in / tools/WorldPartition/HlodPipeline.cpp). Gracefully SKIPPED (not FAILED) if
+//      world_data/cellmanifest.bin is missing (fresh checkout that never ran
+//      WorldPartitionBakeTool.exe) -- matches this codebase's "streaming is additive, not
+//      load-bearing" convention.
+//  12. Procedural 3D Audio Engine (src/audio/AudioEngine.cpp) smoke test: confirms Init() succeeds
+//      (real XAudio2 device/mastering/source voices) and a real sequence of Update() calls with a
+//      moving camera neither crashes nor leaves the engine uninitialized, then Shutdown() tears
+//      down cleanly. Does NOT (cannot, headless) verify audio is actually audible/correctly
+//      panned -- see this feature's own delivery notes for how that was verified instead.
 #ifndef NDEBUG
 
 #include "core/debug/DebugTestPipeline.h"
@@ -36,6 +47,7 @@
 #include "core/Camera.h"
 #include "core/EngineConfig.h"
 #include "core/Logger.h"
+#include "audio/AudioEngine.h"
 #include "imgui.h"
 #include "backends/imgui_impl_glfw.h"
 #include "backends/imgui_impl_vulkan.h"
@@ -160,7 +172,12 @@ namespace debugpipeline {
                 }
 
                 azimuth += 0.05f;
-                vkContext.UpdateEntityRotations(static_cast<float>(glfwGetTime()));
+                // Phase 5 (Streaming & Monde roadmap, Part 1): this debug pipeline has its own
+                // separate camera instance and never tracks an LWC origin (see Camera::
+                // UpdateRebased/GetRebasedPosition's own comment on why Camera itself stays
+                // origin-agnostic) -- a zero offset here is exactly the pre-Phase-5 behavior,
+                // unchanged.
+                vkContext.UpdateEntityRotations(static_cast<float>(glfwGetTime()), maths::vec3{ 0.0f, 0.0f, 0.0f });
                 camera.CameraOrbit({ 0.0f, 0.0f, 0.0f }, 14.0f, azimuth, 28.0f);
                 float aspect = static_cast<float>(vkContext.GetSwapchainExtent().width) /
                                static_cast<float>(vkContext.GetSwapchainExtent().height);
@@ -571,6 +588,133 @@ namespace debugpipeline {
                     std::format("OFF: 3 frames OK. Default ({}): 5 frames OK.",
                                  config::temporal::ENABLED_BY_DEFAULT ? "ON" : "OFF"),
                     shot
+                };
+            });
+
+        // === 11. World Partition HLOD swap-in: real per-cell baked geometry ====================
+        runTest("World Partition HLOD Swap-In (Real Per-Cell Geometry)",
+            "src/renderer/vulkan/VulkanContext.cpp, tools/WorldPartition/HlodPipeline.cpp",
+            [&]() -> TestOutcome {
+                // Phase 5 (Streaming & Monde roadmap, Part 2, Gap 3): dedicated units are ALWAYS the
+                // contiguous range [0, GetDedicatedStreamingUnitCount()) (see that function's own
+                // comment) -- unit 0 is guaranteed dedicated to a real authored cell whenever this
+                // count is > 0.
+                uint32_t dedicatedCount = vkContext.GetDedicatedStreamingUnitCount();
+                if (dedicatedCount == 0) {
+                    return TestOutcome{
+                        TestStatus::Skip, 0,
+                        "At least 1 streaming unit dedicated to a real authored cell "
+                        "(GetDedicatedStreamingUnitCount() > 0).",
+                        "GetDedicatedStreamingUnitCount()=0 -- world_data/cellmanifest.bin was "
+                        "missing/unreadable at startup (fresh checkout that never ran "
+                        "WorldPartitionBakeTool.exe). Gracefully skipped, not failed, matching this "
+                        "codebase's \"streaming is additive, not load-bearing\" convention.",
+                        "Run WorldPartitionBakeTool.exe once (see tools/WorldPartition/BakeDemoWorld.cpp) "
+                        "to author the demo world and produce world_data/cellmanifest.bin, then re-run "
+                        "--test-pipeline to actually exercise this test."
+                    };
+                }
+
+                camera.SetDebugViewMode(DEBUG_VIEW_NORMAL);
+                constexpr uint32_t kTestUnit = 0;
+                // Position doesn't matter for this test (only the triangle-count DELTA between the
+                // two representations does) -- picked well clear of both the showcase gallery and
+                // the demo streaming grid so it's unambiguous in a screenshot.
+                const maths::vec3 testWorldPos{ 0.0f, 5.0f, 0.0f };
+
+                vkContext.SetStreamingUnitState(kTestUnit, true, /*useFineVariant=*/false, testWorldPos, 1u);
+                runFrames(5);
+                uint32_t hwCoarse = 0, swCoarse = 0;
+                clusterPipeline.GetDebugTriangleStats(hwCoarse, swCoarse);
+                uint32_t coarseTotal = hwCoarse + swCoarse;
+
+                vkContext.SetStreamingUnitState(kTestUnit, true, /*useFineVariant=*/true, testWorldPos, 1u);
+                std::string shot = runFrames(5, "11_hlod_swap_fine.bmp");
+                uint32_t hwFine = 0, swFine = 0;
+                clusterPipeline.GetDebugTriangleStats(hwFine, swFine);
+                uint32_t fineTotal = hwFine + swFine;
+
+                // Restore: park the test unit back out, so this test doesn't leave a stray entity
+                // visible for whatever runs after it.
+                vkContext.SetStreamingUnitState(kTestUnit, false, false, maths::vec3{}, 0u);
+                runFrames(2);
+
+                bool pass = (coarseTotal != fineTotal);
+                return TestOutcome{
+                    pass ? TestStatus::Pass : TestStatus::Fail, 12,
+                    "Toggling streaming unit 0's useFineVariant flag (coarse HLOD proxy -> fine "
+                    "unsimplified archetype mesh, both REAL per-cell baked geometry -- see "
+                    "VulkanContext::GenerateGeometry()'s streaming-pool bake-in block) changes the "
+                    "scene's total rasterized triangle count (ClusterTriangleStatsPass), proving this "
+                    "is a genuine geometry swap, not just a StreamingInactive flag flip between two "
+                    "identical meshes.",
+                    std::format("Coarse (HLOD proxy): {} triangles. Fine (archetype): {} triangles. "
+                                 "Delta: {}.", coarseTotal, fineTotal,
+                                 static_cast<int64_t>(fineTotal) - static_cast<int64_t>(coarseTotal)),
+                    shot
+                };
+            });
+
+        // === 12. Procedural 3D Audio Engine smoke test (src/audio/) ============================
+        // This codebase has no prior audio code to test against, so this is deliberately narrow:
+        // confirms AudioEngine::Init() succeeds (real XAudio2 device + mastering voice + 3
+        // positional source voices + 1 generative music bed voice all created) and a real sequence
+        // of Update() calls -- with a MOVING camera, so PositionalSource's pan/distance-attenuation
+        // math and every voice's streaming ring-buffer refill path are genuinely exercised across
+        // several distinct camera poses, not just called once from a fixed position -- neither
+        // crashes nor leaves the engine uninitialized, then that Shutdown() tears down cleanly.
+        // Uses its OWN local AudioEngine instance (not main()'s), so this test is fully self-
+        // contained and never interferes with (or depends on) the interactive loop's own instance.
+        // This does NOT (and cannot, from an automated headless pipeline with no audio-capture
+        // tooling) verify audio is actually AUDIBLE or that 3D panning sounds correct -- see this
+        // feature's own delivery notes for how that was verified instead (code-level review of the
+        // XAudio2 API contract against the real SDK header, plus a real ~49-second interactive run
+        // with continuous per-frame Update() calls and zero XAudio2 errors/warnings logged).
+        runTest("Procedural 3D Audio Engine (Init + Streaming Update)", "src/audio/AudioEngine.cpp",
+            [&]() -> TestOutcome {
+                audio::AudioEngine testAudioEngine;
+                bool initOk = testAudioEngine.Init();
+                if (!initOk) {
+                    return TestOutcome{
+                        TestStatus::Fail, 0,
+                        "audio::AudioEngine::Init() returns true (XAudio2 device + mastering voice + "
+                        "3 positional source voices + 1 generative music bed voice all created).",
+                        "Init() returned false -- see demo_log.txt for the specific XAudio2/COM HRESULT "
+                        "that failed (e.g. no audio device present on this machine/CI runner).",
+                        "A false return is treated as non-fatal in main.cpp (the demo simply runs "
+                        "silent), but is still reported as a FAIL here so a genuine regression doesn't "
+                        "go unnoticed."
+                    };
+                }
+
+                constexpr uint32_t kUpdateCount = 30;
+                for (uint32_t i = 0; i < kUpdateCount; ++i) {
+                    azimuth += 0.05f;
+                    camera.CameraOrbit({ 0.0f, 0.0f, 0.0f }, 14.0f, azimuth, 28.0f);
+                    float aspect = static_cast<float>(vkContext.GetSwapchainExtent().width) /
+                                   static_cast<float>(vkContext.GetSwapchainExtent().height);
+                    camera.Update(aspect);
+                    testAudioEngine.Update(1.0f / 60.0f, camera.GetFrameInfo(aspect));
+                }
+
+                bool stillInitialized = testAudioEngine.IsInitialized();
+                uint32_t noteCount = testAudioEngine.GetGenerativeActiveNoteCount();
+                testAudioEngine.Shutdown();
+                bool cleanlyShutdown = !testAudioEngine.IsInitialized();
+
+                bool pass = initOk && stillInitialized && cleanlyShutdown;
+                return TestOutcome{
+                    pass ? TestStatus::Pass : TestStatus::Fail, 0,
+                    std::format("Init() succeeds, stays initialized across {} real Update() calls with "
+                                 "a moving camera (streaming ring-buffer refills + 3D pan/attenuation "
+                                 "recomputed every call), and Shutdown() cleanly tears down "
+                                 "(IsInitialized() false afterward).", kUpdateCount),
+                    std::format("Init()={}, IsInitialized() after {} updates={}, active generative pad "
+                                 "notes at end={}, IsInitialized() after Shutdown()={}.",
+                                 initOk, kUpdateCount, stillInitialized, noteCount, !cleanlyShutdown),
+                    "Confirms real-time streaming synthesis code paths execute without crashing across "
+                    "many frames/camera positions; does not (cannot, headless) verify audible "
+                    "correctness -- see this test's own header comment."
                 };
             });
 

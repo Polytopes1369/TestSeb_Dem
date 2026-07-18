@@ -155,6 +155,18 @@ namespace renderer {
     // between them, not the look.
     inline constexpr uint32_t kStreamingArchetypeMaterialIDBase = 18u; // Occupies 18..21 (4 shapes).
 
+    // Procedural tree generator (renderer::ProceduralTreePass, see CLAUDE.md's "Arbres (generes
+    // par du code style speedtree)" requirement): two reserved slots, one past every streaming
+    // archetype above, same "never collides with a real entity's showcase material" convention.
+    // Split into two IDs (not one) because this codebase's cluster/material pipeline assigns
+    // exactly one materialID per whole entity mesh (see this file's own class comment) -- a tree's
+    // bark and its foliage need visibly different looks (and, for the foliage, an opacity-cutout
+    // mask + WPO wind sway neither the bark nor any other existing entity needs, see
+    // geometry::EntityMaterialTable.h's matching case for kTreeLeafMaterialID), so they are baked
+    // as two separate co-located entities, not one entity with per-vertex-varying materials.
+    inline constexpr uint32_t kTreeBarkMaterialID = 22u;
+    inline constexpr uint32_t kTreeLeafMaterialID = 23u;
+
     // One generated table: the PBR parameters themselves, plus a parallel convenience flag so
     // callers (VulkanContext::BuildEntityData, deciding each entity's core::EntityFlags::
     // IsTransparent bit) don't need to re-derive "alpha < 1.0" themselves.
@@ -299,9 +311,9 @@ namespace renderer {
         // Phase 7a (UE5.8 parity roadmap, hero asset tessellation): hero rocky/stone recipe --
         // earthy brown-gray, high roughness (no sharp specular, matching a weathered rock
         // surface), fully opaque, reflections ON (a subtle sheen, showcasing
-        // renderer::HeroTessellationPass's own GGX-VNDF reflection trace the same way the
+        // renderer::TessellationPass's own GGX-VNDF reflection trace the same way the
         // "Transparent/glass" material above showcases it for TransparentForwardPass). Rendered
-        // ONLY by renderer::HeroTessellationPass; never reaches the opaque Nanite resolve shaders
+        // ONLY by renderer::TessellationPass; never reaches the opaque Nanite resolve shaders
         // (its entity is unconditionally excluded from that path via core::EntityFlags::
         // IsTransparent, see VulkanContext::BuildEntityData()'s own comment) nor
         // TransparentForwardPass (table.isTransparent[kHeroMaterialID] stays false).
@@ -348,6 +360,24 @@ namespace renderer {
             MakeBaseSlab(maths::vec3(0.28f, 0.20f, 0.12f), 0.80f, maths::vec3(0.0f, 0.0f, 0.0f), 0.0f); // Tree: matte dark brown.
         table.params[kStreamingArchetypeMaterialIDBase + 3].base =
             MakeBaseSlab(maths::vec3(0.55f, 0.30f, 0.18f), 0.70f, maths::vec3(0.0f, 0.0f, 0.0f), 0.0f); // Debris: rusty orange-brown.
+
+        // Procedural tree generator (renderer::ProceduralTreePass): bark -- matte dark brown, high
+        // roughness, non-metal, fully opaque (no cutout mask -- geom_tree_bark.comp's cylinder mesh
+        // is already solid geometry, not a cutout card). kTreeBarkMaterialID likewise sits past
+        // every hand-authored slot above, untouched by the isTransparent loop.
+        table.params[kTreeBarkMaterialID].base =
+            MakeBaseSlab(maths::vec3(0.30f, 0.20f, 0.13f), 0.88f, maths::vec3(0.0f, 0.0f, 0.0f), 0.0f);
+
+        // Procedural tree generator: foliage -- matte green, high roughness, non-metal. Fully
+        // OPAQUE (alpha == 1.0, isTransparent stays false): the leaf cards use the opacity-CUTOUT
+        // mechanism (geometry::EntityMaterialTable.h's kTreeLeafMaterialID case, sampled via
+        // mask_sampling.glsl's hard discard/soft-edge-feather in ClusterRaster/ClusterResolve),
+        // which is a hard alpha-test on an otherwise fully-opaque surface -- NOT the separate alpha-
+        // BLEND transparency mechanism (MaterialParameters::alpha < 1.0) TransparentForwardPass
+        // handles, matching how every other masked/cutout material in a Nanite-style pipeline stays
+        // on the opaque VisBuffer path rather than being routed to a forward blend pass.
+        table.params[kTreeLeafMaterialID].base =
+            MakeBaseSlab(maths::vec3(0.16f, 0.42f, 0.12f), 0.75f, maths::vec3(0.0f, 0.0f, 0.0f), 0.0f);
 
         return table;
     }

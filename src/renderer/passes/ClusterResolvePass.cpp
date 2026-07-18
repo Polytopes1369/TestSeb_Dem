@@ -17,7 +17,7 @@ namespace renderer {
 
         // Byte-for-byte mirror of ResolveViewParamsUBO in ClusterResolve.comp/ClusterResolveBinned
         // .comp (std140): mat4 (64 bytes) + mat4 (64 bytes, prevViewProj -- DEBUG_VIEW_MOTION_VECTORS'
-        // own reprojection) + vec2 (8 bytes) + 2 pad floats rounding up to a 16-byte boundary (144
+        // own reprojection) + vec2 (8 bytes) + 2 floats rounding up to a 16-byte boundary (144
         // bytes) + vec3 sunDirection (Phase 3 -- points FROM the light TOWARD the scene, same
         // convention as renderer::DirectionalLight, needed so this shader's direct-lighting term
         // uses the SAME sun direction the shadow was rendered from) + 1 pad float rounding back up
@@ -25,14 +25,17 @@ namespace renderer {
         // renderer::DirectionalLight's own comment -- physically-based recalibration, 2026-07-17)
         // rounding up to 176 bytes + vec3 cameraPositionWorld (Substrate integration:
         // EvaluateSubstrateMaterial's view-direction term) + 1 pad float rounding up to 192 bytes
-        // total.
+        // total. The 2 floats immediately after viewportWidth/viewportHeight were originally dead
+        // std140 padding (still needed to round vec2 up to a 16-byte boundary) -- Atmos weather
+        // system's surface response extension repurposes them as real data (surfaceWetness/
+        // snowCoverage, see ClusterResolve.comp's own field comment) instead of growing the UBO.
         struct ResolveViewParams {
             maths::mat4 viewProj;
             maths::mat4 prevViewProj;
             float viewportWidth = 0.0f;
             float viewportHeight = 0.0f;
-            float _pad0 = 0.0f;
-            float _pad1 = 0.0f;
+            float surfaceWetness = 0.0f;
+            float snowCoverage = 0.0f;
             float sunDirectionX = 0.0f;
             float sunDirectionY = 0.0f;
             float sunDirectionZ = 0.0f;
@@ -235,7 +238,7 @@ namespace renderer {
         // Step 4's renderer::VirtualTextureManager resources -- see SetVirtualTexture()'s own
         // comment, 25 is Substrate's g_OutputMaterialID, 26 is Phase 1 Nanite advanced's
         // SplineControlPointsSSBO). ---
-        VkDescriptorSetLayoutBinding bindings[27]{};
+        VkDescriptorSetLayoutBinding bindings[29]{};
         bindings[0] = { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };         // ClusterCullMetadataSSBO
         bindings[1] = { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };         // CompressedClusterPoolSSBO
         bindings[2] = { 2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };          // g_HWClusterIDImage (r32ui)
@@ -266,16 +269,19 @@ namespace renderer {
         // 0-25 range (0-24 original + 25 Substrate's g_OutputMaterialID). See ClusterResolve.comp's
         // own identical binding comment.
         bindings[26] = { 26, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };       // SplineControlPointsSSBO
+        // Atmos weather system, Subtask 5 -- see SetAtmosCloudLighting()'s own comment.
+        bindings[27] = { 27, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // g_SkyViewLUT
+        bindings[28] = { 28, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // g_CloudShadowMap
 
         VkDescriptorSetLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-        layoutInfo.bindingCount = 27;
+        layoutInfo.bindingCount = 29;
         layoutInfo.pBindings = bindings;
         VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &layoutInfo, nullptr, &m_SetLayout));
 
         VkDescriptorPoolSize poolSizes[4]{};
         poolSizes[0] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 9 };  // + material params, shadow page table, shadow feedback, entity transform, entity data, VT feedback, spline control points.
         poolSizes[1] = { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 9 };   // + g_OutputMaterialID (Substrate integration).
-        poolSizes[2] = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3 + maskTextureCount + kMaxPhysicalPools }; // + g_ShadowPhysicalAtlas, g_PageTable, g_PhysicalPools[].
+        poolSizes[2] = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 5 + maskTextureCount + kMaxPhysicalPools }; // + g_ShadowPhysicalAtlas, g_PageTable, g_PhysicalPools[], g_SkyViewLUT, g_CloudShadowMap.
         poolSizes[3] = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 4 };  // + g_ShadowSunLevels, VirtualTextureVolumeUBO.
 
         VkDescriptorPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
@@ -485,12 +491,15 @@ namespace renderer {
     }
 
     void ClusterResolvePass::RecordResolve(VkCommandBuffer cmd, const maths::mat4& viewProj, const maths::mat4& prevViewProj,
-        const DirectionalLight& sun, const maths::vec3& cameraPositionWorld, uint32_t debugViewMode) {
+        const DirectionalLight& sun, const maths::vec3& cameraPositionWorld, float surfaceWetness, float snowCoverage,
+        uint32_t debugViewMode) {
         ResolveViewParams viewParams{};
         viewParams.viewProj = viewProj;
         viewParams.prevViewProj = prevViewProj;
         viewParams.viewportWidth = static_cast<float>(m_RenderExtent.width);
         viewParams.viewportHeight = static_cast<float>(m_RenderExtent.height);
+        viewParams.surfaceWetness = surfaceWetness;
+        viewParams.snowCoverage = snowCoverage;
         viewParams.sunDirectionX = sun.direction.x;
         viewParams.sunDirectionY = sun.direction.y;
         viewParams.sunDirectionZ = sun.direction.z;
@@ -550,7 +559,7 @@ namespace renderer {
         // shadow bindings rather than renumbering them. Bindings 20-23 are Step 4's renderer::
         // VirtualTextureManager resources -- see SetVirtualTexture()'s own comment. Binding 24 is
         // Substrate's g_OutputMaterialID, 25 is Phase 1 Nanite advanced's SplineControlPointsSSBO. ---
-        std::array<VkDescriptorSetLayoutBinding, 26> bindings{};
+        std::array<VkDescriptorSetLayoutBinding, 28> bindings{};
         bindings[0] = { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };  // ClusterCullMetadataSSBO
         bindings[1] = { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };  // CompressedClusterPoolSSBO
         bindings[2] = { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };  // g_SortedPixelList
@@ -580,6 +589,9 @@ namespace renderer {
         // 0-24 range (0-23 original + 24 Substrate's g_OutputMaterialID). See ClusterResolveBinned.
         // comp's own identical binding comment.
         bindings[25] = { 25, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // SplineControlPointsSSBO
+        // Atmos weather system, Subtask 5 -- see SetAtmosCloudLighting()'s own comment.
+        bindings[26] = { 26, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // g_SkyViewLUT
+        bindings[27] = { 27, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // g_CloudShadowMap
 
         VkDescriptorSetLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
         layoutInfo.bindingCount = static_cast<uint32_t>(bindings.size());
@@ -590,7 +602,7 @@ namespace renderer {
         poolSizes[0] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 12 }; // cluster metadata, compressed pool, sorted list, offsets, histogram, material params, shadow page table, shadow feedback, entity transform, entity data, VT feedback, spline control points
         poolSizes[1] = { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 6 };   // color, normal, depth, albedo, roughness-metallic, materialID
         poolSizes[2] = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 4 };  // view params, WPO globals, shadow sun levels, VT volume
-        poolSizes[3] = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, maskTextureCount + 2 + kMaxPhysicalPools }; // + shadow physical atlas, g_PageTable, g_PhysicalPools[]
+        poolSizes[3] = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, maskTextureCount + 4 + kMaxPhysicalPools }; // + shadow physical atlas, g_PageTable, g_PhysicalPools[], g_SkyViewLUT, g_CloudShadowMap
 
         VkDescriptorPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
         poolInfo.maxSets = 1;
@@ -663,7 +675,8 @@ namespace renderer {
     }
 
     void ClusterResolvePass::RecordResolveBinned(VkCommandBuffer cmd, const maths::mat4& viewProj,
-        const DirectionalLight& sun, const maths::vec3& cameraPositionWorld, const ClusterShadingBinPass& shadingBinPass) {
+        const DirectionalLight& sun, const maths::vec3& cameraPositionWorld, float surfaceWetness, float snowCoverage,
+        const ClusterShadingBinPass& shadingBinPass) {
         // prevViewProj is never read by ClusterResolveBinned.comp (this path never serves
         // DEBUG_VIEW_MOTION_VECTORS) -- `viewProj` itself is reused as a harmless placeholder value
         // rather than introducing a separate identity-matrix concept for an otherwise-dead field.
@@ -672,6 +685,8 @@ namespace renderer {
         viewParams.prevViewProj = viewProj;
         viewParams.viewportWidth = static_cast<float>(m_RenderExtent.width);
         viewParams.viewportHeight = static_cast<float>(m_RenderExtent.height);
+        viewParams.surfaceWetness = surfaceWetness;
+        viewParams.snowCoverage = snowCoverage;
         viewParams.sunDirectionX = sun.direction.x;
         viewParams.sunDirectionY = sun.direction.y;
         viewParams.sunDirectionZ = sun.direction.z;
@@ -735,6 +750,22 @@ namespace renderer {
         writes[6] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ResolveBinnedSet, 16, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &feedbackInfo, nullptr };
         writes[7] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ResolveBinnedSet, 17, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &sunLevelsInfo, nullptr };
         vkUpdateDescriptorSets(m_Device, 8, writes, 0, nullptr);
+    }
+
+    void ClusterResolvePass::SetAtmosCloudLighting(VkSampler skyViewLUTSampler, VkImageView skyViewLUTView,
+        VkSampler cloudShadowSampler, VkImageView cloudShadowView) {
+        VkDescriptorImageInfo skyViewInfo{ skyViewLUTSampler, skyViewLUTView, VK_IMAGE_LAYOUT_GENERAL };
+        VkDescriptorImageInfo cloudShadowInfo{ cloudShadowSampler, cloudShadowView, VK_IMAGE_LAYOUT_GENERAL };
+
+        // Same "both descriptor sets, different binding indices" convention as SetVirtualShadowMap
+        // above (27/28 in m_DescriptorSet, 26/27 in m_ResolveBinnedSet -- see each set's own layout
+        // comment for why the numbering differs).
+        VkWriteDescriptorSet writes[4]{};
+        writes[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_DescriptorSet, 27, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &skyViewInfo, nullptr, nullptr };
+        writes[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_DescriptorSet, 28, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &cloudShadowInfo, nullptr, nullptr };
+        writes[2] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ResolveBinnedSet, 26, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &skyViewInfo, nullptr, nullptr };
+        writes[3] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ResolveBinnedSet, 27, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &cloudShadowInfo, nullptr, nullptr };
+        vkUpdateDescriptorSets(m_Device, 4, writes, 0, nullptr);
     }
 
     void ClusterResolvePass::SetVirtualTexture(const VirtualTextureManager& vt, const maths::vec2& worldMinXZ,
