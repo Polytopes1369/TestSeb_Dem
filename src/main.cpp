@@ -107,10 +107,11 @@ struct DebugState {
     // enhanced_displacement.glsl). Key 'J' -- moved off 'B' (this branch's original key) during the
     // Substrate integration merge: 'B' was independently claimed there for the DEBUG_VIEW_SUBSTRATE_SLABS
     // view-mode toggle (see that case's own comment), a genuine concurrent-development key collision,
-    // not a duplicate. NOTE: entity 2 is ALSO now VulkanContext::kHeroEntityIndex (Phase 7a hero
-    // tessellation), which routes it through HeroTessellationPass instead of the Nanite VisBuffer path
-    // this flag gates -- see VulkanContext::BuildEntityData()'s own "KNOWN COLLISION" comment. This key
-    // currently has no visible effect until that separate collision is resolved.
+    // not a duplicate. NOTE: entity 2 is ALSO now VulkanContext::kHeroEntityIndex (part of the
+    // generalized Nanite Tessellation feature's kTessellatedEntityIndices), which routes it through
+    // renderer::TessellationPass instead of the Nanite VisBuffer path this flag gates -- see
+    // VulkanContext::BuildEntityData()'s own "KNOWN COLLISION" comment. This key currently has no
+    // visible effect until that separate collision is resolved.
     bool enhancedDisplacementEnabled = true;
     // Phase 1 (Nanite advanced): renderer::ClusterRenderPipeline::SetDebugSplineDeformationEnabled
     // -- gates the runtime Hermite-spline bend on entity 6 (Tube, see spline_deformation.glsl).

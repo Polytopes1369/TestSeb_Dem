@@ -680,46 +680,65 @@ bool ClusterRenderPipeline::Init(
                             m_SplineControlPointsBuffer.Handle());
   m_TransparentForward.SetVirtualShadowMap(m_VirtualShadowMap);
 
-  // Phase 7a (UE5.8 parity roadmap, hero asset tessellation): forward-rendered, tessellated/
-  // displaced hero Icosphere -- see ClusterRenderPipeline.h's own comment on m_HeroTessellation.
-  // Same borrowed-resource contract as m_TransparentForward above, resolved for the hero entity
-  // instead of every transparent entity; `heroMaterial` is the caller's own
-  // materialTable.params[renderer::kHeroMaterialID] slot (populated by
-  // GenerateShowcaseMaterialTable()'s own hero-recipe override, see that function's own comment).
+  // Generalized Nanite Tessellation (renderer::TessellationPass, generalized from the earlier
+  // Phase 7a single-hardcoded-entity "HeroTessellationPass") -- forward-rendered, tessellated/
+  // displaced entities -- see ClusterRenderPipeline.h's own comment on m_Tessellation. Same
+  // borrowed-resource contract as m_TransparentForward above, resolved for every
+  // core::EntityFlags::IsTessellated entity instead of a single hardcoded hero; `materialTable`
+  // passes the FULL table (each entity keeps its own materialID -- see VulkanContext::
+  // kTessellatedEntityIndices' own comment for the exact entity/material choices) instead of one
+  // hero-only slot.
   {
-    // Matches VulkanContext::kHeroEntityIndex exactly (the Icosphere, generated first -- see that
-    // class' own comment) -- a plain literal here rather than a cross-file constant reference,
-    // since ClusterRenderPipeline.cpp does not otherwise depend on VulkanContext.h.
-    constexpr uint32_t kHeroEntityID = 2u;
+    // Matches VulkanContext::kTessellatedEntityIndices exactly -- plain literals here rather than
+    // a cross-file constant reference, since ClusterRenderPipeline.cpp does not otherwise depend
+    // on VulkanContext.h (same convention the pre-generalization kHeroEntityID/kWaterEntityID
+    // literals right below already establish).
+    constexpr std::array<uint32_t, 3> kTessellatedEntityIDs = { 2u, 3u, 9u };
     const auto& entityRanges = m_SurfaceCache.GetEntityRanges();
-    const auto heroRangeIt = entityRanges.find(kHeroEntityID);
-    if (heroRangeIt == entityRanges.end()) {
-      LOG_ERROR("[ClusterRenderPipeline] Hero entity (meshID=2) has no Fallback Mesh draw range -- cannot initialize HeroTessellationPass.");
-      return false;
+
+    std::vector<TessellatedEntityDrawInfo> tessellatedEntities;
+    tessellatedEntities.reserve(kTessellatedEntityIDs.size());
+    for (uint32_t entityID : kTessellatedEntityIDs) {
+      const auto rangeIt = entityRanges.find(entityID);
+      if (rangeIt == entityRanges.end()) {
+        LOG_ERROR(std::format("[ClusterRenderPipeline] Tessellated entity (meshID={}) has no Fallback Mesh draw range -- cannot initialize TessellationPass.", entityID));
+        return false;
+      }
+      // Every tessellated entity keeps its OWN materialID exactly as VulkanContext::
+      // BuildEntityData() assigned it (the hero entity's own override to kHeroMaterialID already
+      // baked in by that point) -- read back from createInfo.entityDataCPU, the same CPU-side
+      // mirror (index == meshID) SurfaceCachePass::Init() above already reads for an identical
+      // reason (see that field's own comment).
+      TessellatedEntityDrawInfo info{};
+      info.drawRange = rangeIt->second;
+      info.entityID = entityID;
+      info.materialID = createInfo.entityDataCPU[entityID].materialID;
+      tessellatedEntities.push_back(info);
     }
-    if (!m_HeroTessellation.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
+
+    if (!m_Tessellation.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
                             GICompositePass::kOutputFormat, createInfo.depthFormat,
                             createInfo.entityTransformBuffer,
-                            createInfo.materialTable.params[kHeroMaterialID],
+                            createInfo.materialTable.params,
                             m_SurfaceCache.GetVertexBuffer(), m_SurfaceCache.GetIndexBuffer(),
-                            heroRangeIt->second, kHeroEntityID,
+                            tessellatedEntities,
                             m_SurfaceCacheRT.GetTLASHandle(), m_SurfaceCacheRT.GetDrawRangeBuffer(),
                             m_MegaLights.GetLightBufferHandle(), m_MegaLights.GetLightBufferSize(),
                             m_VirtualShadowMap, m_WorldProbes, m_TraceContext)) {
-      LOG_ERROR("[ClusterRenderPipeline] Failed to initialize HeroTessellationPass.");
+      LOG_ERROR("[ClusterRenderPipeline] Failed to initialize TessellationPass.");
       return false;
     }
   }
 
   // Phase 7c (UE5.8 parity roadmap, water/erosion): forward-rendered water plane -- see
   // ClusterRenderPipeline.h's own comment on m_WaterForward. Same borrowed-resource contract as
-  // m_HeroTessellation above, resolved for the water entity; `waterMaterial` is the caller's own
+  // m_Tessellation above, resolved for the water entity; `waterMaterial` is the caller's own
   // materialTable.params[renderer::kWaterMaterialID] slot (populated by
   // GenerateShowcaseMaterialTable()'s own water-recipe override, see that function's own comment).
   {
     // Matches VulkanContext::kWaterEntityIndex exactly (the water plane, generated last -- see
     // that class' own comment) -- a plain literal here rather than a cross-file constant
-    // reference, same convention kHeroEntityID above already establishes.
+    // reference, same convention kTessellatedEntityIDs above already establishes.
     constexpr uint32_t kWaterEntityID = 15u;
     const auto& entityRanges = m_SurfaceCache.GetEntityRanges();
     const auto waterRangeIt = entityRanges.find(kWaterEntityID);
@@ -1054,7 +1073,7 @@ void ClusterRenderPipeline::Shutdown() {
   m_DebugTraceMode = 0;
 #endif
 
-  m_HeroTessellation.Shutdown();
+  m_Tessellation.Shutdown();
   m_WaterForward.Shutdown();
   m_ParticleSystem.Shutdown();
   m_TransparentForward.Shutdown();
@@ -2389,12 +2408,12 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
     VkImage transparentTargetImage = m_GIComposite.GetOutputImage();
     VkImageView transparentTargetView = m_GIComposite.GetOutputView();
 
-    // Phase 7a (UE5.8 parity roadmap, hero asset tessellation): recorded BEFORE the glass/
-    // translucent draw below, deliberately -- this pass WRITES real depth (unlike glass, which
-    // only reads it), so glass's own subsequent depth test correctly occludes against this
-    // entity's real (displaced) surface. See HeroTessellationPass's own class comment for the
-    // widened synchronization scope this write requires on exit.
-    m_HeroTessellation.RecordDraw(cmdLate, viewProj, cameraFrameInfo.position,
+    // Generalized Nanite Tessellation: recorded BEFORE the glass/translucent draw below,
+    // deliberately -- this pass WRITES real depth (unlike glass, which only reads it), so glass's
+    // own subsequent depth test correctly occludes against every tessellated entity's real
+    // (displaced) surface. See TessellationPass's own class comment for the widened
+    // synchronization scope this write requires on exit.
+    m_Tessellation.RecordDraw(cmdLate, viewProj, cameraFrameInfo.position,
         transparentTargetImage, transparentTargetView, m_DepthImage, m_DepthImageView,
         m_RenderExtent, traceMode, m_FrameIndex, m_TraceContext, m_WorldProbes, m_SceneLights);
 

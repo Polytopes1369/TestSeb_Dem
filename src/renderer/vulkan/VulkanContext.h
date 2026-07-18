@@ -388,10 +388,30 @@ private:
     static constexpr uint32_t kWaterEntityIndex = kEntityCount - 1;
     // Phase 7a (UE5.8 parity roadmap, hero asset tessellation): the Icosphere -- generated FIRST
     // (see GenerateGeometry()'s own "Icosphere-first" comment, `m_EntityData[2].meshID` used
-    // directly), the single tessellated/displaced hero asset, rendered by
-    // renderer::HeroTessellationPass instead of the opaque Nanite path -- see BuildEntityData()'s
-    // own kHeroMaterialID override.
+    // directly). Originally the ONE hardcoded tessellated/displaced hero asset (back when this
+    // feature only ever rendered renderer::kHeroMaterialID via the single-entity
+    // "HeroTessellationPass"); still tessellated today, but now just one entry in
+    // kTessellatedEntityIndices below, same as any other opted-in entity -- see that constant's
+    // own comment for the generalization.
     static constexpr uint32_t kHeroEntityIndex = 2;
+
+    // Generalized Nanite Tessellation (renderer::TessellationPass, real UE5.8 Nanite Tessellation
+    // parity -- 5.5+ applies to any flagged mesh, not one hardcoded hero asset): every entity index
+    // BuildEntityData() marks core::EntityFlags::IsTessellated, rendered by renderer::
+    // TessellationPass's own screen-space-adaptive tessellation + procedural displacement instead
+    // of the opaque Nanite VisBuffer pipeline (see that class' own header comment). Deliberately
+    // chosen to be VISIBLY different from the pre-generalization single-hero-sphere look:
+    // kHeroEntityIndex (2, Icosphere -- already tessellated before this generalization, kept for
+    // continuity), slot 3 (Plane, "Dielectric A" -- originally a perfectly flat surface; tessellated
+    // displacement turns it into a rocky/eroded ground patch, the clearest possible before/after
+    // demonstration of this feature), and slot 9 (Pyramid, "Dielectric B" -- a simple flat-faced
+    // primitive that likewise reads very differently once its faces are subdivided and displaced).
+    // Every one of these keeps its own showcase materialID (see GenerateShowcaseMaterialTable()'s
+    // own zone-layout comment) unmodified except the hero (still overridden to kHeroMaterialID,
+    // exactly as before) -- renderer::TessellationPass now shades each entity with ITS OWN
+    // material, not a single shared one (see BuildEntityData()'s own IsTessellated assignment for
+    // the exact override rules).
+    static constexpr std::array<uint32_t, 3> kTessellatedEntityIndices = { kHeroEntityIndex, 3u, 9u };
 
     // --- Runtime World Partition streaming pool (world::StreamingManager / world::WorldCellStreamingLoader) ---
     // Bounded pool of extra entity slots appended AFTER the fixed showcase gallery (indices

@@ -9,7 +9,7 @@ namespace core {
         uint32_t cellID;
         uint32_t flags; // Bit 0: CastShadows, Bit 1: IsInteractive, Bit 2: IsDynamic, Bit 3: UseCustomFog,
                          // Bit 4: IsTransparent, Bit 5: HasEnhancedDisplacement, Bit 6: HasSplineDeformation,
-                         // Bit 7: StreamingInactive
+                         // Bit 7: StreamingInactive, Bit 8: IsTessellated
     };
 
     enum EntityFlags : uint32_t {
@@ -36,7 +36,21 @@ namespace core {
         // (always geometrically valid, just parked) mesh never actually rasterizes. Always 0 for
         // every non-streaming entity -- untouched by VulkanContext::BuildEntityData()'s original
         // showcase-entity loop, so this bit changes nothing about their existing behavior.
-        StreamingInactive = 1 << 7
+        StreamingInactive = 1 << 7,
+        // Generalized Nanite Tessellation (renderer::TessellationPass, generalized from the earlier
+        // Phase 7a single-hardcoded-entity "HeroTessellationPass"): opts ANY entity into the
+        // screen-space-adaptively-tessellated + procedurally-displaced forward pass instead of the
+        // opaque Nanite VisBuffer pipeline -- real UE5.8 Nanite Tessellation (5.5+) is a per-mesh
+        // opt-in flag, not a single hardcoded hero asset, and this bit is what makes that true here.
+        // Same exclusion mechanism as IsTransparent (ClusterLODCompact.comp's own per-entity
+        // candidate-routing stage also checks this bit -- see that shader's own EntityDataBuffer
+        // comment): an IsTessellated entity's clusters must never reach the opaque candidate list,
+        // since renderer::TessellationPass renders it directly from its own Fallback Mesh geometry
+        // instead, exactly like the hero entity's own pre-existing forced-IsTransparent exclusion
+        // did. VulkanContext::BuildEntityData() also still forces IsTransparent true for every
+        // IsTessellated entity (not just materialID-based alpha), for that same exclusion reason --
+        // NOT because tessellated entities are actually alpha-blended.
+        IsTessellated = 1 << 8
     };
 
     inline void SetFlag(uint32_t& flags, EntityFlags f, bool value) {

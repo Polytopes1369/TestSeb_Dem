@@ -30,7 +30,7 @@
 // and modulating the particle's own albedo. Same VSM include block as TransparentForward.frag /
 // SurfaceCacheCapture.frag (shadow_page_table/feedback/atlas_sampling/sun_sampling.glsl); same
 // world_probe_sampling.glsl macro contract every other consumer (TransparentForward.frag,
-// HeroTessellation.frag) already uses.
+// Tessellation.frag) already uses.
 //
 // --- Subtask 5: heat-shimmer refraction ---
 // When g_Params.heatShimmerStrength > 0 (an emitter-level toggle -- see renderer::

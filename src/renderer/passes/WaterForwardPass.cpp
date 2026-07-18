@@ -213,7 +213,7 @@ namespace renderer {
         // =====================================================================================
         // STEP 3 -- pipeline layout: 3 sets (own set 0 above, plus SurfaceCacheTraceContext's set
         // 1 / set 2, borrowed unmodified -- same 3-set shape TransparentForwardPass/
-        // HeroTessellationPass already establish).
+        // TessellationPass already establish).
         // =====================================================================================
         VkDescriptorSetLayout setLayouts[3] = {
             m_SetLayout, traceContext.GetMeshSdfTraceSetLayout(), traceContext.GetSurfaceCacheSamplingSetLayout()
@@ -234,7 +234,7 @@ namespace renderer {
         }
 
         // =====================================================================================
-        // STEP 4 -- graphics pipeline, built manually (same reasoning as HeroTessellationPass'
+        // STEP 4 -- graphics pipeline, built manually (same reasoning as TessellationPass'
         // own STEP 4): real vertex-attribute input (geometry::FallbackVertex), depth test ENABLED
         // but depth WRITE disabled (read-only against the opaque scene's own depth, like glass),
         // reversed-Z VK_COMPARE_OP_GREATER. blendEnable=FALSE -- this pass composes manually
@@ -390,8 +390,8 @@ namespace renderer {
         // Barriers: colorImage GENERAL->GENERAL (RAW, blit source) -- srcStageMask covers BOTH the
         // denoiser compute pass AND any forward pass' own fragment writes that may have run just
         // before this one this frame (this pass is recorded LAST, after TransparentForwardPass/
-        // HeroTessellationPass -- see ClusterRenderPipeline::RecordFrame's own call-site ordering),
-        // same defensive breadth as HeroTessellationPass::RecordDraw's own entry barrier comment.
+        // TessellationPass -- see ClusterRenderPipeline::RecordFrame's own call-site ordering),
+        // same defensive breadth as TessellationPass::RecordDraw's own entry barrier comment.
         // m_BackgroundSnapshotImage SHADER_READ_ONLY_OPTIMAL->TRANSFER_DST_OPTIMAL (WAR: this
         // frame's new blit write must wait on last frame's fragment-shader read of the same image).
         // =====================================================================================
@@ -441,7 +441,7 @@ namespace renderer {
         // =====================================================================================
         // STEP B -- transition color (GENERAL -> COLOR_ATTACHMENT_OPTIMAL, pure WAR against the
         // blit read above -- no memory to make visible, only ordering) and depth (READ_ONLY ->
-        // ATTACHMENT_OPTIMAL, test-only, identical to HeroTessellationPass' own entry barrier
+        // ATTACHMENT_OPTIMAL, test-only, identical to TessellationPass' own entry barrier
         // minus the WRITE access) for this pass' rendering scope, and finish bringing the
         // snapshot to SHADER_READ_ONLY_OPTIMAL (RAW against the blit write above).
         // =====================================================================================
@@ -548,7 +548,7 @@ namespace renderer {
         vkCmdEndRendering(cmd);
 
         // --- Restore color/depth to the layout the REST of the frame expects (identical to
-        // HeroTessellationPass' own restore, minus the depth-WRITE access this pass never uses --
+        // TessellationPass' own restore, minus the depth-WRITE access this pass never uses --
         // see that class' own comment). The background snapshot image needs NO restore barrier: it
         // is already in SHADER_READ_ONLY_OPTIMAL from STEP B above, which is exactly the
         // precondition STEP A expects at the start of next frame's call. ---

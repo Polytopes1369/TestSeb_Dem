@@ -129,7 +129,7 @@
 #include "renderer/passes/GlobalSDFPass.h"
 #include "renderer/vulkan/GpuBuffer.h"
 #include "renderer/streaming/GpuGeometryPagePool.h"
-#include "renderer/passes/HeroTessellationPass.h"
+#include "renderer/passes/TessellationPass.h"
 #include "renderer/passes/WaterForwardPass.h"
 #include "renderer/passes/ParticleSystemPass.h"
 #include "renderer/passes/HZBPass.h"
@@ -675,28 +675,31 @@ namespace renderer {
         // same build-separation rule as m_ShadingBin above.
         TransparentForwardPass m_TransparentForward;
 
-        // Phase 7a (UE5.8 parity roadmap, hero asset tessellation): forward-rendered, screen-space-
-        // adaptively-tessellated, procedurally-displaced hero Icosphere (materialID
-        // kHeroMaterialID, culled out of the opaque Nanite path entirely via core::EntityFlags::
-        // IsTransparent -- see VulkanContext::BuildEntityData()'s own comment) -- lit exactly like
-        // m_TransparentForward above (direct+shadowed sun, MegaLights RIS point lights,
-        // m_WorldProbes' indirect diffuse, an optional single-sample front-layer specular
+        // Generalized Nanite Tessellation (renderer::TessellationPass, generalized from the earlier
+        // Phase 7a single-hardcoded-entity "HeroTessellationPass" -- see that class' own class
+        // comment): forward-rendered, screen-space-adaptively-tessellated, procedurally-displaced
+        // pass for every core::EntityFlags::IsTessellated entity (VulkanContext::
+        // kTessellatedEntityIndices, culled out of the opaque Nanite path entirely via
+        // core::EntityFlags::IsTransparent -- see VulkanContext::BuildEntityData()'s own comment)
+        // -- lit exactly like m_TransparentForward above (direct+shadowed sun, MegaLights RIS point
+        // lights, m_WorldProbes' indirect diffuse, an optional single-sample front-layer specular
         // reflection), but fully OPAQUE and depth-WRITING (unlike glass). Recorded right BEFORE
         // m_TransparentForward's own draw -- specifically so that pass' own read-only depth test
-        // correctly occludes glass/translucent entities against this entity's real (displaced)
-        // surface, see HeroTessellationPass's own class comment for the resulting barrier-scope
-        // consequence.
-        HeroTessellationPass m_HeroTessellation;
+        // correctly occludes glass/translucent entities against every tessellated entity's real
+        // (displaced) surface, see TessellationPass's own class comment for the resulting
+        // barrier-scope consequence.
+        TessellationPass m_Tessellation;
 
         // Phase 7c (UE5.8 parity roadmap, water/erosion): forward-rendered water plane (materialID
         // kWaterMaterialID, culled out of the opaque Nanite path via core::EntityFlags::
-        // IsTransparent, same mechanism as m_HeroTessellation above -- see VulkanContext::
+        // IsTransparent, same mechanism as m_Tessellation above -- see VulkanContext::
         // BuildEntityData()'s own comment). Recorded LAST among the forward passes (after
         // m_TransparentForward) -- see WaterForwardPass's own class comment for why: it blits the
-        // ALREADY fully-composited frame (opaque + GI + glass + hero) into its own private
-        // background-snapshot image for its refraction term, so anything drawn after it would be
-        // invisible to that refraction (and anything drawn before it that skipped this ordering
-        // would show through unrealistically, since water is meant to be the top-most surface).
+        // ALREADY fully-composited frame (opaque + GI + glass + tessellated entities) into its own
+        // private background-snapshot image for its refraction term, so anything drawn after it
+        // would be invisible to that refraction (and anything drawn before it that skipped this
+        // ordering would show through unrealistically, since water is meant to be the top-most
+        // surface).
         WaterForwardPass m_WaterForward;
 
         // GPU-driven particle system (Niagara-style), particle_system_integration_plan.md (project
