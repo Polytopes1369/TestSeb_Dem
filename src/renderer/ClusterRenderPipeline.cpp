@@ -2101,17 +2101,25 @@ void ClusterRenderPipeline::RecordFrameMid(VkCommandBuffer cmdMid, VkCommandBuff
   // GI-related Global SDF state -- only renderer::VirtualShadowMapPass's own shadow UBOs (direct
   // sun shadowing, not indirect GI) and renderer::VirtualTextureManager's page table.
   // =========================================================================================
+  // Atmos weather system, surface response extension: global wetness/snow-coverage state, already
+  // integrated this frame by m_AtmosClimate.RecordUpdate() (called much earlier in RecordFrameEarly,
+  // well before this cmdMid section) -- threaded straight into whichever resolve path runs below,
+  // exactly the same way sun/cameraPositionWorld already are, and available in BOTH Debug and
+  // Release since this is a real rendering feature (only the ImGui inspector sliders are
+  // Debug-only), matching CLAUDE.md's requirement that this behave identically in both configs.
+  float surfaceWetness = m_AtmosClimate.GetSurfaceWetness();
+  float snowCoverage = m_AtmosClimate.GetSnowCoverage();
 #ifndef NDEBUG
   if (cameraCopy.debugViewMode == DEBUG_VIEW_NORMAL) {
     m_ShadingBin.RecordClassifyAndSort(cmdMid, m_RenderExtent);
-    m_Resolve.RecordResolveBinned(cmdMid, viewProj, m_SceneLights.sun, cameraPositionWorld, m_ShadingBin);
+    m_Resolve.RecordResolveBinned(cmdMid, viewProj, m_SceneLights.sun, cameraPositionWorld, surfaceWetness, snowCoverage, m_ShadingBin);
   } else {
     maths::mat4 prevViewProjForResolve = m_HasPrevViewProj ? m_PrevViewProj : viewProj;
-    m_Resolve.RecordResolve(cmdMid, viewProj, prevViewProjForResolve, m_SceneLights.sun, cameraPositionWorld, cameraCopy.debugViewMode);
+    m_Resolve.RecordResolve(cmdMid, viewProj, prevViewProjForResolve, m_SceneLights.sun, cameraPositionWorld, surfaceWetness, snowCoverage, cameraCopy.debugViewMode);
   }
 #else
   m_ShadingBin.RecordClassifyAndSort(cmdMid, m_RenderExtent);
-  m_Resolve.RecordResolveBinned(cmdMid, viewProj, m_SceneLights.sun, cameraPositionWorld, m_ShadingBin);
+  m_Resolve.RecordResolveBinned(cmdMid, viewProj, m_SceneLights.sun, cameraPositionWorld, surfaceWetness, snowCoverage, m_ShadingBin);
 #endif
 }
 

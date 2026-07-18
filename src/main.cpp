@@ -1008,6 +1008,20 @@ int main(int argc, char** argv) {
                 ImGui::TextDisabled("Dew Point: %.2f C", clusterPipeline.GetAtmosClimate().GetLastDewPointCelsius());
                 ImGui::TextDisabled("LCL Height: %.1f m", clusterPipeline.GetAtmosClimate().GetLastLCLHeightMeters());
 
+                // Surface response extension (Substrate material parity: dynamic wet/snow surfaces,
+                // see substrate_bsdf.glsl's own ApplySurfaceWeather comment): read-only inspectors --
+                // NOT authored sliders, per this feature's own requirement that the driving values
+                // come from AtmosClimatePass's own climate-driven accumulator, not manual authoring.
+                // A simple progress-bar visualization (rather than a plain DragFloat/SliderFloat,
+                // which would look editable even though ImGuiSliderFlags_ReadOnly does not exist)
+                // makes it visually obvious these two rows are inspect-only.
+                float surfaceWetness = clusterPipeline.GetAtmosClimate().GetSurfaceWetness();
+                float snowCoverage = clusterPipeline.GetAtmosClimate().GetSnowCoverage();
+                ImGui::TextUnformatted("Surface Wetness (climate-driven, read-only):");
+                ImGui::ProgressBar(surfaceWetness, ImVec2(-1.0f, 0.0f));
+                ImGui::TextUnformatted("Snow Coverage (climate-driven, read-only):");
+                ImGui::ProgressBar(snowCoverage, ImVec2(-1.0f, 0.0f));
+
                 // --- Precipitation (rain/snow particle emission tied to the climate simulation
                 // above, Ubisoft "Atmos"-style) -- live sliders over config::atmos::PRECIPITATION_*,
                 // consumed every frame by renderer::ClusterRenderPipeline::RecordFrameEarly's own

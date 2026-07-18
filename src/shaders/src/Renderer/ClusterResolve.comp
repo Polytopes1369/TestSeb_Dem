@@ -133,8 +133,15 @@ layout(std140, set = 0, binding = 7) uniform ResolveViewParamsUBO {
     mat4 viewProj;
     mat4 prevViewProj; // DEBUG_VIEW_MOTION_VECTORS' own reprojection -- see renderer::ClusterResolvePass::RecordResolve's comment.
     vec2 viewportSize;
-    float _pad0;
-    float _pad1;
+    // Atmos weather system, surface response extension: global [0,1] wetness/snow-coverage scalars
+    // (renderer::AtmosClimatePass::GetSurfaceWetness()/GetSnowCoverage(), see that class' own
+    // RecordUpdate() comment) -- repurposes what were two previously-unused std140 padding floats
+    // (the vec2 viewportSize above still needs padding to a 16-byte boundary before vec3 sunDirection
+    // below; these two floats now carry real data instead of being dead padding, at zero extra UBO
+    // size). Consumed by substrate_bsdf.glsl's ApplySurfaceWeather, called below right before the
+    // Substrate BSDF evaluation.
+    float surfaceWetness;
+    float snowCoverage;
     // Phase 3: sun direction (points FROM the light TOWARD the scene, matching renderer::
     // DirectionalLight's own convention) -- this shader's direct-lighting term now uses the SAME
     // sun direction the shadow was rendered from (see Step 3 below), instead of the pre-Phase-3
@@ -470,6 +477,14 @@ void main() {
         vec2 vtUV = (worldPos.xz - g_VTVolume.worldMinXZ) / (g_VTVolume.worldMaxXZ - g_VTVolume.worldMinXZ);
         vec3 vtAlbedo = SampleVirtualTextureLOD(0u, vtUV, vtLod, g_VTVolume.virtualTextureSize, g_VTVolume.tileSize, g_VTVolume.borderSize).rgb;
         mat.base.diffuseAlbedo *= vtAlbedo;
+
+        // Atmos weather system, surface response extension: wet/snow surface modulation, applied
+        // right before the BSDF is evaluated so both the direct sun term AND the sky-ambient
+        // multiply below (mat.base.diffuseAlbedo * skyAmbient) AND the GBuffer albedo/roughness
+        // outputs (gbufferAlbedo/gbufferRoughnessMetallic, set further below from this same `mat`)
+        // all see the weathered material consistently -- see substrate_bsdf.glsl's own
+        // ApplySurfaceWeather comment for the exact formula.
+        mat = ApplySurfaceWeather(mat, normal, g_ViewParams.surfaceWetness, g_ViewParams.snowCoverage);
 
         // Substrate: full Slab BSDF response (diffuse + anisotropic specular + second lobe/Haze +
         // fuzz, vertically layered with the Top slab if any -- see substrate_bsdf.glsl's own
