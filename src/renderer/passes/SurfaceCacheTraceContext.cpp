@@ -36,24 +36,24 @@ namespace renderer {
         m_Allocator = allocator;
 
         // =====================================================================================
-        // STEP 1 -- Gather traced-entity info (CPU side): clamp to this profile's traced-entity
-        // budget (config::lumen::MAX_TRACED_ENTITIES -- a genuine per-quality-profile performance
-        // knob, fewer entities = a cheaper TraceMeshSDFScene linear scan), itself further clamped to
-        // kMaxTracedEntities, the shader's FIXED g_EntitySDF array size -- see that constant's own
-        // header comment for why it must never be reassigned per-profile like this cap is. Persisted
-        // in m_TracedEntityInfos/m_TracedEntities (unlike a plain STEP-1 local) so RefreshCardTable()
-        // can rebuild the per-entity card grouping every frame without re-querying GlobalSDFPass --
-        // see both members' own header comments for why that grouping (not this list itself) is
-        // the part that needs re-deriving.
+        // STEP 1 -- Gather traced-entity info (CPU side): clamp to this quality tier's GI trace
+        // budget (config::lumen::MAX_TRACED_ENTITIES -- a genuine per-tier/live-debug-slider
+        // performance knob, see EngineConfig_Low/Medium/High/Extrem.h and main.cpp's "Max Traced
+        // Entities" DragInt), itself clamped to kMaxTracedEntities (the fixed, shader-matching
+        // descriptor array capacity -- see that constant's own header comment for why the budget
+        // must never exceed it). Persisted in m_TracedEntityInfos/m_TracedEntities (unlike a plain
+        // STEP-1 local) so RefreshCardTable() can rebuild the per-entity card grouping every frame
+        // without re-querying GlobalSDFPass -- see both members' own header comments for why that
+        // grouping (not this list itself) is the part that needs re-deriving.
         // =====================================================================================
         m_TracedEntityInfos = globalSDF.GetTracedEntityInfos();
-        const uint32_t tracedEntityCap = std::min(config::lumen::MAX_TRACED_ENTITIES, kMaxTracedEntities);
-        if (m_TracedEntityInfos.size() > tracedEntityCap) {
+        const uint32_t traceBudget = std::min(config::lumen::MAX_TRACED_ENTITIES, kMaxTracedEntities);
+        if (m_TracedEntityInfos.size() > traceBudget) {
             LOG_ERROR(std::format(
-                "[SurfaceCacheTraceContext] {} traced entities exceeds this profile's cap={} (hard ceiling "
-                "kMaxTracedEntities={}); truncating.",
-                m_TracedEntityInfos.size(), tracedEntityCap, kMaxTracedEntities));
-            m_TracedEntityInfos.resize(tracedEntityCap);
+                "[SurfaceCacheTraceContext] {} traced entities exceeds this quality tier's trace budget={} "
+                "(min(config::lumen::MAX_TRACED_ENTITIES={}, kMaxTracedEntities={})); truncating.",
+                m_TracedEntityInfos.size(), traceBudget, config::lumen::MAX_TRACED_ENTITIES, kMaxTracedEntities));
+            m_TracedEntityInfos.resize(traceBudget);
         }
         m_EntityCount = static_cast<uint32_t>(m_TracedEntityInfos.size());
 

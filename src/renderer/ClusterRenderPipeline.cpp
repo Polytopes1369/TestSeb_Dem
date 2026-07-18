@@ -635,7 +635,13 @@ bool ClusterRenderPipeline::Init(
   // Phase A of the MegaLights native-port roadmap: procedurally scatter kMaxMegaLights point
   // lights around the demo's 13-entity grid (see MegaLightsTypes.h's own GenerateProceduralLights
   // comment), then Init the pass -- needs m_Resolve's GBuffer (same as m_Reflection above) and
-  // m_SurfaceCacheRT's TLAS for its own shadow-visibility ray.
+  // m_SurfaceCacheRT's TLAS for its own shadow-visibility ray. Always called, on every tier --
+  // MegaLightsPass::Init() itself internally skips its own expensive GPU setup (raw radiance
+  // image, owned denoiser, both compute pipelines) whenever config::lumen::_MEGALIGHTS_ENABLE is
+  // false, while still creating its (tiny, ~8 KB) light SSBO unconditionally, since m_AtmosFog and
+  // m_TransparentForward below both bind that buffer's handle/size into their OWN descriptor sets
+  // at their own Init() time regardless of this tier's MegaLights setting -- see MegaLightsPass::
+  // Init's own comment for the full reasoning.
   {
     MegaLightsData megaLightsData = GenerateProceduralLights(4242u);
     if (!m_MegaLights.Init(createInfo.device, createInfo.allocator, createInfo.commandPool,
@@ -1562,12 +1568,19 @@ void ClusterRenderPipeline::RecordFrameEarly(VkCommandBuffer cmdEarly,
 
 
   // SWRT/HWRT back-end shared by m_GIInject ([1z] below) and m_WorldProbes' own trace pass ([12c]
-  // in RecordFrameLate) -- debug-only toggle (main.cpp's 'T' key via SetDebugTraceMode), Release
-  // always uses HWRT (no debug toggle to switch back to SWRT).
+  // in RecordFrameLate). Base mode comes from config::lumen::_HARDWARE_RAYTRACING (per-tier: Low
+  // defaults to false/SWRT -- see EngineConfig_Low.h's own HARDWARE_RAYTRACING comment, weaker
+  // hardware trades GI quality for the cheaper sphere-traced Mesh SDF path -- every other tier
+  // defaults to true/HWRT). Debug additionally lets 'T'/'Y' (main.cpp) override this LIVE for A/B
+  // comparison via m_DebugTraceMode -- main.cpp seeds that toggle's own starting value from this
+  // same cvar once at startup (see its own comment there), so a fresh session already reflects
+  // the active tier before either key is ever pressed. Release has no override, so it always
+  // honors the tier's choice exactly (previously hardcoded HWRT unconditionally here, silently
+  // ignoring every tier's own HARDWARE_RAYTRACING setting).
 #ifndef NDEBUG
   uint32_t traceMode = m_DebugTraceMode;
 #else
-  uint32_t traceMode = 1u;
+  uint32_t traceMode = config::lumen::_HARDWARE_RAYTRACING ? 1u : 0u;
 #endif
 
   // Phase 2 (Lumen advanced roadmap): this frame's async-compute routing decision -- read by
@@ -1576,11 +1589,12 @@ void ClusterRenderPipeline::RecordFrameEarly(VkCommandBuffer cmdEarly,
   // this is now stored there instead of an outer-function-scope local. Forced OFF whenever
   // traceMode is SWRT (0): moving GIInject's SWRT path to the async queue would additionally need
   // ownership-transfer barriers for every per-entity Global SDF image it samples
-  // (TraceMeshSDFScene), which only the Debug SWRT toggle ever exercises -- not worth doubling the
-  // barrier surface for a debug-only configuration when Release always uses HWRT anyway (see
-  // SetDebugAsyncComputeEnabled's own header comment). The Debug toggle additionally gates it off
-  // entirely for staged bring-up (false = prove the CPU/struct plumbing alone with everything still
-  // graphics-queue-serialized; true = exercise the real cross-queue barrier design).
+  // (TraceMeshSDFScene) -- not worth doubling the barrier surface for a path only the Low tier's
+  // own config::lumen::_HARDWARE_RAYTRACING default (or the Debug 'T' key, on any tier) ever
+  // exercises, see SetDebugAsyncComputeEnabled's own header comment. The Debug toggle additionally
+  // gates it off entirely for staged bring-up (false = prove the CPU/struct plumbing alone with
+  // everything still graphics-queue-serialized; true = exercise the real cross-queue barrier
+  // design).
   bool useAsyncCompute = (traceMode == 1u);
 #ifndef NDEBUG
   useAsyncCompute = useAsyncCompute && m_DebugAsyncComputeEnabled;
@@ -2622,9 +2636,18 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
   // ScreenTracePass/GICompositePass were wired up. See MegaLightsPass's own class comment for the
   // full "discovered mid-implementation" explanation.
   //
-  // `megaLightsEnabled` (debug-only toggle, main.cpp's 'X' key) gates the call entirely, same
-  // Release-always-on convention as `reflectionsEnabled` above (a real live consumer from frame
-  // one).
+  // `megaLightsEnabled` is gated by config::lumen::_MEGALIGHTS_ENABLE -- Low/Medium/High profiles
+  // set this false specifically to skip this pass' real per-frame cost (a full-render-resolution
+  // Shade compute dispatch + a 5-iteration A-Trous denoise + a Composite dispatch, every single
+  // frame); only Extrem enables it by default (see EngineConfig_{Low,Medium,High,Extrem}.h's own
+  // MEGALIGHTS_ENABLE). Previously Release hardcoded `true` here unconditionally, never consulting
+  // the config at all -- same bug Debug had too (its own toggle defaulted true independent of the
+  // active tier). Debug additionally ANDs in `m_DebugMegaLightsEnabled` (main.cpp's 'X' key) as a
+  // further manual override for A/B'ing this pass' cost/contribution -- it can only turn MegaLights
+  // OFF on top of the tier default, never force it ON for a tier that disables it, since
+  // MegaLightsPass::Init() itself (see that function's own comment) skips creating the GPU
+  // resources RecordShade needs whenever the tier disables it (RecordShade defends against exactly
+  // this with its own m_ShadePipeline == VK_NULL_HANDLE guard, see that function's own comment).
   //
   // Phase 4 of the "Nanite advanced" roadmap (light BVH for RIS spatial bias, temporal ReSTIR with
   // per-frame revalidated visibility): RecordShade now also takes `prevViewProjForMegaLights` --
@@ -2636,9 +2659,9 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
   // =========================================================================================
   {
 #ifndef NDEBUG
-    bool megaLightsEnabled = m_DebugMegaLightsEnabled;
+    bool megaLightsEnabled = config::lumen::_MEGALIGHTS_ENABLE && m_DebugMegaLightsEnabled;
 #else
-    bool megaLightsEnabled = true;
+    bool megaLightsEnabled = config::lumen::_MEGALIGHTS_ENABLE;
 #endif
     if (megaLightsEnabled) {
       maths::mat4 prevViewProjForMegaLights = m_HasPrevViewProj ? m_PrevViewProj : maths::mat4{};

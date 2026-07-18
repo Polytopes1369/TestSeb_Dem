@@ -23,6 +23,8 @@
 #include <chrono>
 #include <algorithm>
 #include <cmath>
+#include <atomic>
+#include <string>
 
 #ifndef NDEBUG
 #include "core/debug/DebugTestPipeline.h"
@@ -78,11 +80,14 @@ struct DebugState {
     uint32_t naniteSubMode = 1; // 1 to 7 for Nanite modes
     // renderer::ClusterRenderPipeline::SetDebugTraceMode -- 0 = SWRT (mesh SDF sphere tracing),
     // 1 = HWRT (inline rayQueryEXT). Shared by SurfaceCacheGIInjectPass and WorldProbeGridPass's
-    // own trace pass so both ray tracing back-ends stay exercised. Defaults to HWRT, matching
-    // Release's own fixed choice (see ClusterRenderPipeline::RecordFrame's own comment). Set by two
-    // explicit keys ('T'/'Y' below) rather than a single flip-toggle, matching how UE5.8 Lumen
-    // itself exposes this as one explicit project-wide back-end choice, never simultaneous
-    // dual-tracing.
+    // own trace pass so both ray tracing back-ends stay exercised. In-class default of 1 (HWRT)
+    // below is only a placeholder for the brief window before main()'s startup code overwrites it
+    // with the resolved quality tier's own config::lumen::_HARDWARE_RAYTRACING choice (see that
+    // seed's own comment, right before the frame loop) -- Release has no debug toggle at all and
+    // reads the same cvar directly every frame (see ClusterRenderPipeline::RecordFrameEarly's own
+    // traceMode comment). Set by two explicit keys ('T'/'Y' below) rather than a single flip-
+    // toggle, matching how UE5.8 Lumen itself exposes this as one explicit project-wide back-end
+    // choice, never simultaneous dual-tracing.
     uint32_t traceMode = 1;
     // renderer::ClusterRenderPipeline::SetDebugRadiosityEnabled -- gates the intra-frame
     // multi-bounce radiosity loop ([1z] in RecordFrame) so its cost/contribution can be A/B'd.
@@ -104,8 +109,12 @@ struct DebugState {
     bool reflectionsEnabled = true;
     // renderer::ClusterRenderPipeline::SetDebugMegaLightsEnabled -- Phase A of the MegaLights
     // native-port roadmap: gates the RIS-weighted stochastic multi-point-light direct lighting +
-    // shadow-ray pass ([12b3] in RecordFrame), same Release-always-on convention as
-    // reflectionsEnabled above (a real live consumer from its first frame).
+    // shadow-ray pass ([12b3] in RecordFrame). Manual A/B override only -- ANDed with
+    // config::lumen::_MEGALIGHTS_ENABLE at the [12b3] call site, so this key can disable MegaLights
+    // on a tier that enables it (e.g. Extrem) but can't re-enable it on a tier that disables it
+    // (Low/Medium/High default to off -- see EngineConfig_{Low,Medium,High}.h's own
+    // MEGALIGHTS_ENABLE, and MegaLightsPass::Init's own comment for why the GPU resources needed
+    // to shade don't even exist on those tiers).
     bool megaLightsEnabled = true;
     // Set by the 'K' key, consumed (and reset) once per frame by the main loop, which calls
     // renderer::ClusterRenderPipeline::RequestDebugDAGCutGapsDump() -- see that method's own
@@ -504,17 +513,55 @@ int main(int argc, char** argv) {
         LOG_INFO("[Main] scene.cache is up to date with current parameters. Skipping geometry cache build.");
     } else {
         LOG_INFO("[Main] scene.cache is missing or out of date. Rebuilding geometry cache...");
-        try {
-            geometryCacheTestPassed = geometry::RunVirtualGeometryCacheTest(
-                vkContext.GetDevice(), vkContext.GetAllocator(), vkContext.GetGraphicsQueue(), vkContext.GetCommandPool(),
-                vkContext.GetVertexBuffer(), vkContext.GetIndexBuffer(), vkContext.GetVertexSkinBuffer(),
-                vkContext.GetTotalVertexCount(), vkContext.GetTotalIndexCount(),
-                vkContext.GetEntityData(), vkContext.GetEntityCount());
+        // RunVirtualGeometryCacheTest is one monolithic, synchronous call (full GPU geometry
+        // readback + a per-entity cluster DAG build -- see ClusterDAG.h/VirtualGeometryCacheTest.h's
+        // own comments) that can block for minutes on a cold/mismatched cache. Calling it directly
+        // on this thread -- the same thread that owns the GLFW window -- would stop glfwPollEvents()
+        // from running for that whole time, so Win32 never services this window's message queue and
+        // the OS ghosts it as "Not Responding" (its standard hung-window detection) even though the
+        // engine is working correctly; the title bar can't even be dragged. There is no incremental-
+        // progress hook to poll here (it is a single function, not something restructured for this
+        // fix), so instead the whole call is moved onto a worker thread while this thread keeps
+        // pumping GLFW's message queue -- plus a small animated window-title cue so the user has
+        // some sign of life -- until the worker thread finishes.
+        std::atomic<bool> cacheBuildDone{ false };
+        bool cacheBuildResult = false;
+        std::thread cacheBuildThread([&]() {
+            try {
+                cacheBuildResult = geometry::RunVirtualGeometryCacheTest(
+                    vkContext.GetDevice(), vkContext.GetAllocator(), vkContext.GetGraphicsQueue(), vkContext.GetCommandPool(),
+                    vkContext.GetVertexBuffer(), vkContext.GetIndexBuffer(), vkContext.GetVertexSkinBuffer(),
+                    vkContext.GetTotalVertexCount(), vkContext.GetTotalIndexCount(),
+                    vkContext.GetEntityData(), vkContext.GetEntityCount());
+            }
+            catch (const std::exception& e) {
+                LOG_CRITICAL(std::format("[Main] RunVirtualGeometryCacheTest threw: {}", e.what()));
+                cacheBuildResult = false;
+            }
+            // Release-store: publishes cacheBuildResult to the polling loop's acquire-load below
+            // before that loop can stop and join this thread.
+            cacheBuildDone.store(true, std::memory_order_release);
+        });
+
+        // Minimal "please wait" pump -- deliberately not a loading screen (out of scope for this
+        // fix): it only keeps Win32 message processing alive, which is both what stops the OS from
+        // considering the window hung AND what a title-bar drag needs to actually track the mouse.
+        // No frame is presented here: the swapchain exists, but ClusterRenderPipeline (the only
+        // thing that knows how to record a frame) isn't built until after the cache is ready.
+        static const char* kSpinnerFrames[] = { "|", "/", "-", "\\" };
+        uint32_t spinnerIndex = 0;
+        while (!cacheBuildDone.load(std::memory_order_acquire)) {
+            glfwPollEvents();
+            std::string waitTitle = std::string("Vulkan 1.3 Bindless Demoscene - Building geometry cache ")
+                + kSpinnerFrames[spinnerIndex] + " (first run / scene change, please wait)";
+            glfwSetWindowTitle(window, waitTitle.c_str());
+            spinnerIndex = (spinnerIndex + 1) % 4;
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
-        catch (const std::exception& e) {
-            LOG_CRITICAL(std::format("[Main] RunVirtualGeometryCacheTest threw: {}", e.what()));
-            geometryCacheTestPassed = false;
-        }
+        cacheBuildThread.join();
+        glfwSetWindowTitle(window, "Vulkan 1.3 Bindless Demoscene");
+
+        geometryCacheTestPassed = cacheBuildResult;
         if (geometryCacheTestPassed) {
             geometry::SaveCacheConfig(vkContext.GetTotalVertexCount(), vkContext.GetTotalIndexCount(), vkContext.GetEntityCount());
         }
@@ -570,17 +617,48 @@ int main(int argc, char** argv) {
     // SurfaceCachePass::Init() to prune translucent-material cards at load time.
     pipelineInfo.entityDataCPU = vkContext.GetEntityData();
 
-    // Init is wrapped so an uncaught std::runtime_error (GpuBuffer allocation failure, missing
-    // SPIR-V file, ...) surfaces as a logged message instead of a silent std::terminate -- the
-    // console/log otherwise shows nothing at all for an exception escaping main.
+    // ClusterRenderPipeline::Init() sequentially creates ~40 render passes' worth of GPU buffers/
+    // images/pipelines (many involving first-time driver-side SPIR-V pipeline compilation -- there
+    // is no persisted VkPipelineCache anywhere in this codebase, so this cost is paid fresh on
+    // EVERY launch, not just a cold scene.cache) plus several one-shot staged uploads, all on
+    // whichever thread calls it. It has no GLFW dependency of its own (every handle it touches --
+    // device/allocator/queue/commandPool/images -- was already created by VulkanContext::Init()
+    // above) and, like geometry::RunVirtualGeometryCacheTest() before it, is a single self-contained
+    // call that returns a bool. Calling it directly here -- right after the cache-build wait, which
+    // already had this exact problem -- would again stop glfwPollEvents() from running for the
+    // whole 20-30+ second duration, so Win32 ghosts the window as "Not Responding" a second time.
+    // Same worker-thread + polling-pump pattern as the cache-build wait above, reused verbatim
+    // (including the try/catch, since GpuBuffer allocation failures/missing SPIR-V files can still
+    // throw std::runtime_error here).
     renderer::ClusterRenderPipeline clusterPipeline;
+    std::atomic<bool> pipelineInitDone{ false };
     bool pipelineInitOk = false;
-    try {
-        pipelineInitOk = clusterPipeline.Init(pipelineInfo);
+    std::thread pipelineInitThread([&]() {
+        try {
+            pipelineInitOk = clusterPipeline.Init(pipelineInfo);
+        }
+        catch (const std::exception& e) {
+            LOG_CRITICAL(std::format("[Main] ClusterRenderPipeline::Init threw: {}", e.what()));
+            pipelineInitOk = false;
+        }
+        // Release-store: publishes pipelineInitOk to the polling loop's acquire-load below before
+        // that loop can stop and join this thread.
+        pipelineInitDone.store(true, std::memory_order_release);
+    });
+
+    static const char* kPipelineInitSpinnerFrames[] = { "|", "/", "-", "\\" };
+    uint32_t pipelineInitSpinnerIndex = 0;
+    while (!pipelineInitDone.load(std::memory_order_acquire)) {
+        glfwPollEvents();
+        std::string waitTitle = std::string("Vulkan 1.3 Bindless Demoscene - Initializing render pipeline ")
+            + kPipelineInitSpinnerFrames[pipelineInitSpinnerIndex] + " (please wait)";
+        glfwSetWindowTitle(window, waitTitle.c_str());
+        pipelineInitSpinnerIndex = (pipelineInitSpinnerIndex + 1) % 4;
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
-    catch (const std::exception& e) {
-        LOG_CRITICAL(std::format("[Main] ClusterRenderPipeline::Init threw: {}", e.what()));
-    }
+    pipelineInitThread.join();
+    glfwSetWindowTitle(window, "Vulkan 1.3 Bindless Demoscene");
+
     if (!pipelineInitOk) {
         LOG_CRITICAL("[Main] ClusterRenderPipeline initialization FAILED.");
         clusterPipeline.Shutdown();
@@ -824,6 +902,22 @@ int main(int argc, char** argv) {
     // the update call site below.
     world::LwcOrigin lwcOrigin;
 
+#ifndef NDEBUG
+    // Seed the live Debug trace-mode toggle from the resolved quality tier's own
+    // config::lumen::_HARDWARE_RAYTRACING choice (see EngineConfig_Low.h's own HARDWARE_RAYTRACING
+    // comment: Low is meant to run SWRT-only on weaker hardware) instead of always starting at
+    // DebugState::traceMode's HWRT in-class default -- 'T'/'Y' below still override this live for
+    // the rest of the session (see ClusterRenderPipeline::RecordFrameEarly's own traceMode
+    // comment), this one-time seed only fixes the SESSION-START default so a fresh Debug launch
+    // actually reflects the active tier instead of ignoring it entirely, as every tier did before
+    // this fix. Placed here (profile resolution -- either LoadProfileLocal() above or
+    // InitializeProfileFromGPU() during Vulkan device setup -- is guaranteed complete by this
+    // point) rather than inside the frame loop below, since SetDebugTraceMode() is called there
+    // every frame and would otherwise stomp any live 'T'/'Y' key press right back to the tier
+    // default on the very next frame.
+    g_DebugState.traceMode = config::lumen::_HARDWARE_RAYTRACING ? 1u : 0u;
+#endif
+
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
 #ifndef NDEBUG
@@ -836,13 +930,16 @@ int main(int argc, char** argv) {
             float VERTEX_SPACING = config::VERTEX_SPACING;
             uint64_t VERTEX_BUFFER_BYTES = config::nanite::VERTEX_BUFFER_BYTES;
             uint64_t INDEX_BUFFER_BYTES = config::nanite::INDEX_BUFFER_BYTES;
-            uint32_t POOL_SIZE_MB = config::streaming::_POOL_SIZE_MB;
             float RENDER_SCALE = config::temporal::RENDER_SCALE;
             uint32_t SHADOW_MAX_RESOLUTION = config::shadows::_MAX_RESOLUTION;
             uint32_t PROBE_GRID_RESOLUTION = config::lumen::PROBE_GRID_RESOLUTION;
             uint32_t VSM_PHYSICAL_PAGE_CAPACITY = config::lumen::VSM_PHYSICAL_PAGE_CAPACITY;
             uint32_t TRANSLUCENCY_LIGHTING_VOLUME_DIM = config::postprocess::_TRANSLUCENCY_LIGHTING_VOLUME_DIM;
             uint32_t VOLUMETRIC_FOG_GRID_PIXEL_SIZE = config::volumetrics::_VOLUMETRIC_FOG_GRID_PIXEL_SIZE;
+            // The "Hardware Ray Tracing" checkbox's own value only takes effect at the NEXT session
+            // start (see main()'s g_DebugState.traceMode seeding comment, right before the frame
+            // loop) -- 'T'/'Y' remain the live, no-reload way to change trace mode mid-session.
+            bool HARDWARE_RAYTRACING = config::lumen::_HARDWARE_RAYTRACING;
             std::string profileName = config::g_ActiveProfileName;
         };
         static StartupConfig startup;
@@ -852,13 +949,13 @@ int main(int argc, char** argv) {
                 config::VERTEX_SPACING,
                 config::nanite::VERTEX_BUFFER_BYTES,
                 config::nanite::INDEX_BUFFER_BYTES,
-                config::streaming::_POOL_SIZE_MB,
                 config::temporal::RENDER_SCALE,
                 config::shadows::_MAX_RESOLUTION,
                 config::lumen::PROBE_GRID_RESOLUTION,
                 config::lumen::VSM_PHYSICAL_PAGE_CAPACITY,
                 config::postprocess::_TRANSLUCENCY_LIGHTING_VOLUME_DIM,
                 config::volumetrics::_VOLUMETRIC_FOG_GRID_PIXEL_SIZE,
+                config::lumen::_HARDWARE_RAYTRACING,
                 config::g_ActiveProfileName
             };
             startupCaptured = true;
@@ -870,13 +967,13 @@ int main(int argc, char** argv) {
         if (config::VERTEX_SPACING != startup.VERTEX_SPACING) { needsReload = true; reloadReason += "Vertex Spacing; "; }
         if (config::nanite::VERTEX_BUFFER_BYTES != startup.VERTEX_BUFFER_BYTES) { needsReload = true; reloadReason += "Vertex Buffer Size; "; }
         if (config::nanite::INDEX_BUFFER_BYTES != startup.INDEX_BUFFER_BYTES) { needsReload = true; reloadReason += "Index Buffer Size; "; }
-        if (config::streaming::_POOL_SIZE_MB != startup.POOL_SIZE_MB) { needsReload = true; reloadReason += "Streaming Pool Size; "; }
         if (config::temporal::RENDER_SCALE != startup.RENDER_SCALE) { needsReload = true; reloadReason += "Render Scale; "; }
         if (config::shadows::_MAX_RESOLUTION != startup.SHADOW_MAX_RESOLUTION) { needsReload = true; reloadReason += "VSM Max Resolution; "; }
         if (config::lumen::PROBE_GRID_RESOLUTION != startup.PROBE_GRID_RESOLUTION) { needsReload = true; reloadReason += "Probe Grid Resolution; "; }
         if (config::lumen::VSM_PHYSICAL_PAGE_CAPACITY != startup.VSM_PHYSICAL_PAGE_CAPACITY) { needsReload = true; reloadReason += "VSM Page Capacity; "; }
         if (config::postprocess::_TRANSLUCENCY_LIGHTING_VOLUME_DIM != startup.TRANSLUCENCY_LIGHTING_VOLUME_DIM) { needsReload = true; reloadReason += "Translucency Volume Dim; "; }
         if (config::volumetrics::_VOLUMETRIC_FOG_GRID_PIXEL_SIZE != startup.VOLUMETRIC_FOG_GRID_PIXEL_SIZE) { needsReload = true; reloadReason += "Volumetric Fog Grid Pixel Size; "; }
+        if (config::lumen::_HARDWARE_RAYTRACING != startup.HARDWARE_RAYTRACING) { needsReload = true; reloadReason += "Hardware Ray Tracing (takes effect next session -- 'T'/'Y' keys change it live without a restart); "; }
         if (config::g_ActiveProfileName != startup.profileName) { needsReload = true; reloadReason += "Profile Preset (changed to " + config::g_ActiveProfileName + "); "; }
 
         // UI Panel
@@ -916,8 +1013,7 @@ int main(int argc, char** argv) {
                 ImGui::DragFloat("Floor Vertex Spacing", &config::FLOOR_VERTEX_SPACING, 0.05f, 0.1f, 10.0f);
                 ImGui::DragFloat("Software Raster Threshold", &config::nanite::SOFTWARE_RASTER_THRESHOLD_PIXELS, 0.1f, 0.0f, 64.0f);
                 ImGui::DragFloat("LOD Pixel Error Threshold", &config::nanite::LOD_PIXEL_ERROR_THRESHOLD, 0.05f, 0.01f, 10.0f);
-                ImGui::DragFloat("Max Pixels Per Edge", &config::nanite::_MAX_PIXELS_PER_EDGE, 0.05f, 0.1f, 10.0f);
-                
+
                 int64_t vBytes = config::nanite::VERTEX_BUFFER_BYTES;
                 int vMB = static_cast<int>(vBytes / (1024 * 1024));
                 if (ImGui::DragInt("Vertex Buffer (MB)", &vMB, 64, 128, 4096)) {
@@ -933,15 +1029,6 @@ int main(int argc, char** argv) {
                 ImGui::EndTabItem();
             }
 
-            // --- Tab Streaming ---
-            if (ImGui::BeginTabItem("Streaming")) {
-                int poolMB = static_cast<int>(config::streaming::_POOL_SIZE_MB);
-                if (ImGui::DragInt("Texture Pool Size (MB)", &poolMB, 128, 512, 32000)) {
-                    config::streaming::_POOL_SIZE_MB = static_cast<uint32_t>(poolMB);
-                }
-                ImGui::EndTabItem();
-            }
-
             // --- Tab Temporal ---
             if (ImGui::BeginTabItem("Temporal")) {
                 ImGui::DragFloat("Render Scale", &config::temporal::RENDER_SCALE, 0.01f, 0.25f, 2.00f);
@@ -953,14 +1040,6 @@ int main(int argc, char** argv) {
                     config::temporal::JITTER_FRAME_COUNT = static_cast<uint32_t>(jitterCount);
                 }
                 ImGui::Checkbox("Enabled By Default", &config::temporal::ENABLED_BY_DEFAULT);
-                int aaQual = static_cast<int>(config::temporal::_ANTI_ALIASING_QUALITY);
-                if (ImGui::DragInt("Anti-Aliasing Quality", &aaQual, 1, 1, 5)) {
-                    config::temporal::_ANTI_ALIASING_QUALITY = static_cast<uint32_t>(aaQual);
-                }
-                int aaMethod = static_cast<int>(config::temporal::_ANTI_ALIASING_METHOD);
-                if (ImGui::DragInt("Anti-Aliasing Method", &aaMethod, 1, 0, 5)) {
-                    config::temporal::_ANTI_ALIASING_METHOD = static_cast<uint32_t>(aaMethod);
-                }
                 ImGui::DragFloat("Screen Percentage", &config::temporal::_SCREEN_PERCENTAGE, 1.0f, 10.0f, 200.0f);
                 int upscaler = static_cast<int>(config::temporal::_TEMPORAL_AA_UPSCALER);
                 if (ImGui::DragInt("Temporal AA Upscaler", &upscaler, 1, 0, 5)) {
@@ -1034,39 +1113,22 @@ int main(int argc, char** argv) {
                 if (ImGui::DragInt("VSM Page Capacity", &pageCap, 256, 256, 16384)) {
                     config::lumen::VSM_PHYSICAL_PAGE_CAPACITY = static_cast<uint32_t>(pageCap);
                 }
-                int giQual = static_cast<int>(config::lumen::_GI_QUALITY);
-                if (ImGui::DragInt("GI Quality", &giQual, 1, 1, 5)) {
-                    config::lumen::_GI_QUALITY = static_cast<uint32_t>(giQual);
-                }
                 ImGui::Checkbox("Hardware Ray Tracing", &config::lumen::_HARDWARE_RAYTRACING);
                 ImGui::Checkbox("Trace Mesh SDF", &config::lumen::_TRACE_MESH_SDF);
                 ImGui::Checkbox("Screen Space Probe Occlusion", &config::lumen::_SCREEN_SPACE_PROBE_OCCLUSION);
                 ImGui::Checkbox("Reflections Allow", &config::lumen::_REFLECTIONS_ALLOW);
-                ImGui::Checkbox("HWRT Nanite Mode", &config::lumen::_HARDWARE_RAYTRACING_NANITE_MODE);
                 ImGui::Checkbox("Megalights Enable", &config::lumen::_MEGALIGHTS_ENABLE);
                 ImGui::EndTabItem();
             }
 
             // --- Tab Reflection ---
             if (ImGui::BeginTabItem("Reflection")) {
-                int refQual = static_cast<int>(config::reflections::_QUALITY);
-                if (ImGui::DragInt("Reflection Quality", &refQual, 1, 1, 5)) {
-                    config::reflections::_QUALITY = static_cast<uint32_t>(refQual);
-                }
-                int refMethod = static_cast<int>(config::reflections::_METHOD);
-                if (ImGui::DragInt("Reflection Method", &refMethod, 1, 0, 5)) {
-                    config::reflections::_METHOD = static_cast<uint32_t>(refMethod);
-                }
                 ImGui::Checkbox("Screen Space Reflections", &config::reflections::_SCREEN_SPACE_REFLECTIONS);
                 ImGui::EndTabItem();
             }
 
             // --- Tab Postprocess ---
             if (ImGui::BeginTabItem("Postprocess")) {
-                int ppQual = static_cast<int>(config::postprocess::_QUALITY);
-                if (ImGui::DragInt("Postprocess Quality", &ppQual, 1, 1, 5)) {
-                    config::postprocess::_QUALITY = static_cast<uint32_t>(ppQual);
-                }
                 int fxQual = static_cast<int>(config::postprocess::_EFFECTS_QUALITY);
                 if (ImGui::DragInt("Effects Quality", &fxQual, 1, 1, 5)) {
                     config::postprocess::_EFFECTS_QUALITY = static_cast<uint32_t>(fxQual);
@@ -1074,10 +1136,6 @@ int main(int argc, char** argv) {
                 int dim = static_cast<int>(config::postprocess::_TRANSLUCENCY_LIGHTING_VOLUME_DIM);
                 if (ImGui::DragInt("Translucency Volume Dim", &dim, 8, 8, 256)) {
                     config::postprocess::_TRANSLUCENCY_LIGHTING_VOLUME_DIM = static_cast<uint32_t>(dim);
-                }
-                int refrQual = static_cast<int>(config::postprocess::_REFRACTION_QUALITY);
-                if (ImGui::DragInt("Refraction Quality", &refrQual, 1, 1, 5)) {
-                    config::postprocess::_REFRACTION_QUALITY = static_cast<uint32_t>(refrQual);
                 }
                 ImGui::EndTabItem();
             }
@@ -1155,10 +1213,6 @@ int main(int argc, char** argv) {
 
             // --- Tab Volumetric ---
             if (ImGui::BeginTabItem("Volumetric")) {
-                int texQual = static_cast<int>(config::volumetrics::_TEXTURE_QUALITY);
-                if (ImGui::DragInt("Texture Quality", &texQual, 1, 1, 5)) {
-                    config::volumetrics::_TEXTURE_QUALITY = static_cast<uint32_t>(texQual);
-                }
                 int skyQual = static_cast<int>(config::volumetrics::_SKY_ATMOSPHERE_QUALITY);
                 if (ImGui::DragInt("Sky Atmosphere Quality", &skyQual, 1, 1, 5)) {
                     config::volumetrics::_SKY_ATMOSPHERE_QUALITY = static_cast<uint32_t>(skyQual);

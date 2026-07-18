@@ -38,15 +38,16 @@ namespace renderer {
         SurfaceCacheTraceContext(const SurfaceCacheTraceContext&) = delete;
         SurfaceCacheTraceContext& operator=(const SurfaceCacheTraceContext&) = delete;
 
-        // Must match mesh_sdf_trace.glsl's kMaxTracedEntities exactly -- this is the shader's FIXED
-        // compile-time sampler3D array size (SPIR-V array length, baked in at glslc time), not a
-        // per-quality-profile tuning knob. It must stay constexpr: a VkDescriptorSetLayoutBinding's
-        // descriptorCount for this binding has to exactly match what the compiled shader declares,
-        // so re-deriving this from config::lumen::MAX_TRACED_ENTITIES (which legitimately DOES vary
-        // per profile -- see Init()'s own tracedEntityCap) desyncs the layout from the shader for
-        // every profile except whichever one happens to already equal 128, undersizing the
-        // descriptor pool/set on the others. See Init()'s own comment for how the per-profile cap
-        // is applied instead, without touching this constant.
+        // Must match mesh_sdf_trace.glsl's kMaxTracedEntities exactly -- this is the g_EntitySDF
+        // descriptor array's fixed PHYSICAL capacity, baked into the shader's SPIR-V at shader-
+        // compile time, so it can never track config::lumen::MAX_TRACED_ENTITIES (a per-quality-
+        // tier AND live-debug-slider RUNTIME value -- see EngineConfig_Low/Medium/High/Extrem.h and
+        // main.cpp's "Max Traced Entities" DragInt) without desyncing the descriptor set layout's
+        // descriptorCount from what the shader actually declares (undefined behavior per the Vulkan
+        // spec, caught by validation layers as an unwritten/undersized descriptor array). Init()
+        // instead clamps the ACTUAL traced-entity count to min(config::lumen::MAX_TRACED_ENTITIES,
+        // kMaxTracedEntities), so quality tiers still scale GI trace cost down as intended without
+        // ever resizing this fixed pool/layout/array.
         static constexpr uint32_t kMaxTracedEntities = 128u;
         // Sentinel SDF value the unused (>= entityCount) g_EntitySDF array slots are filled with --
         // matches GlobalSDFPass::kFarValue's role (always farther than kSphereTraceEpsilon, so a
