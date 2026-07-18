@@ -27,7 +27,12 @@ namespace renderer {
             maths::mat4 prevViewProj;
             float viewportWidth = 0.0f, viewportHeight = 0.0f;
             float spatialBiasRadius = 0.0f;
-            float _pad0 = 0.0f;
+            // Spatial reuse follow-up: config::megalights::SPATIAL_REUSE_RADIUS_PIXELS -- repurposes
+            // what used to be an unused padding float (total UBO size/std140 layout unchanged, see
+            // MegaLightsShade.comp's own field comment). Only MegaLightsSpatialReuse.comp's pipeline
+            // actually reads this; Stage 1/Stage 3 declare-but-ignore it, same convention as
+            // cameraPositionWorld below being unused by Stage 1/Stage 2.
+            float spatialReuseRadiusPixels = 0.0f;
             // Substrate integration: see MegaLightsShade.comp's own MegaLightsViewParamsUBO.
             // cameraPositionWorld comment.
             float cameraPositionWorldX = 0.0f, cameraPositionWorldY = 0.0f, cameraPositionWorldZ = 0.0f, _pad2 = 0.0f;
@@ -180,6 +185,18 @@ namespace renderer {
             static_cast<double>(reservoirBufferBytes) / (1024.0 * 1024.0)));
 
         // =====================================================================================
+        // STEP 2.6 -- Spatial reuse follow-up: m_SpatialReservoirBuffer, Stage 2's own per-frame
+        // output. Same size as each of m_ReservoirBuffers above, GPU_ONLY, but deliberately NOT
+        // ping-ponged and NOT sentinel-filled here -- see this class' own m_SpatialReservoirBuffer
+        // member comment for why neither is needed (fully overwritten every single frame, strictly
+        // before it is ever read, within the same RecordShade call).
+        // =====================================================================================
+        m_SpatialReservoirBuffer.Create(allocator, reservoirBufferBytes,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
+        LOG_INFO(std::format("[MegaLightsPass] Spatial reuse reservoir buffer initialized: {:.1f} MiB.",
+            static_cast<double>(reservoirBufferBytes) / (1024.0 * 1024.0)));
+
+        // =====================================================================================
         // STEP 3 -- Shade pipeline: set 0 (14 bindings, 2 slot-indexed variants -- Phase 4, Feature
         // 2's ping-pong). Bindings 8/9 (Substrate integration): this pixel's materialID GBuffer
         // image + the material params SSBO renderer::ClusterResolvePass already filled. Bindings
@@ -303,6 +320,175 @@ namespace renderer {
         }
 
         // =====================================================================================
+        // STEP 3.5 -- Spatial reuse follow-up: Spatial Reuse pipeline (MegaLightsSpatialReuse.comp).
+        // Set 0, 4 bindings, 2 slot-indexed variants (binding 0, the TEMPORAL reservoir INPUT, must
+        // track m_CurrentReservoirSlotIndex the same way Stage 1's own binding 12 write target
+        // does -- see this class' own m_SpatialReuseSet member comment).
+        // =====================================================================================
+        {
+            VkDescriptorSetLayoutBinding bindings[4]{};
+            bindings[0] = { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // TemporalReservoirBuffer (input, slot-indexed).
+            bindings[1] = { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // SpatialReservoirBuffer (output, fixed).
+            bindings[2] = { 2, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // MegaLightsViewParamsUBO (fixed).
+            bindings[3] = { 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // MegaLightsSSBO (lights, fixed).
+
+            VkDescriptorSetLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+            layoutInfo.bindingCount = 4;
+            layoutInfo.pBindings = bindings;
+            VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &layoutInfo, nullptr, &m_SpatialReuseSetLayout));
+
+            // Storage buffer count: bindings {0,1,3} == 3 per set, x2 variants. Uniform buffer: 1 per set, x2.
+            VkDescriptorPoolSize poolSizes[2] = {
+                { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3 * 2 },
+                { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 * 2 }
+            };
+            VkDescriptorPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
+            poolInfo.maxSets = 2;
+            poolInfo.poolSizeCount = 2;
+            poolInfo.pPoolSizes = poolSizes;
+            VK_CHECK(vkCreateDescriptorPool(m_Device, &poolInfo, nullptr, &m_SpatialReuseDescriptorPool));
+
+            VkDescriptorSetLayout setLayouts[2] = { m_SpatialReuseSetLayout, m_SpatialReuseSetLayout };
+            VkDescriptorSetAllocateInfo setAllocInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+            setAllocInfo.descriptorPool = m_SpatialReuseDescriptorPool;
+            setAllocInfo.descriptorSetCount = 2;
+            setAllocInfo.pSetLayouts = setLayouts;
+            VK_CHECK(vkAllocateDescriptorSets(m_Device, &setAllocInfo, m_SpatialReuseSet));
+
+            VkDescriptorBufferInfo spatialOutInfo{ m_SpatialReservoirBuffer.Handle(), 0, m_SpatialReservoirBuffer.Size() };
+            VkDescriptorBufferInfo viewParamsInfo{ m_ViewParamsBuffer.Handle(), 0, m_ViewParamsBuffer.Size() };
+            VkDescriptorBufferInfo lightBufferInfo{ m_LightBuffer.Handle(), 0, m_LightBuffer.Size() };
+
+            for (uint32_t slotIndex = 0; slotIndex < 2; ++slotIndex) {
+                // Binding 0: THIS frame's temporal reservoir -- whichever physical buffer Stage 1
+                // just wrote into (same m_CurrentReservoirSlotIndex-indexed handle as Stage 1's own
+                // binding 12 for this same slotIndex, see m_ShadeSet's own setup above).
+                VkDescriptorBufferInfo temporalInInfo{ m_ReservoirBuffers[slotIndex].Handle(), 0, m_ReservoirBuffers[slotIndex].Size() };
+
+                VkWriteDescriptorSet writes[4]{};
+                writes[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_SpatialReuseSet[slotIndex], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &temporalInInfo, nullptr };
+                writes[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_SpatialReuseSet[slotIndex], 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &spatialOutInfo, nullptr };
+                writes[2] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_SpatialReuseSet[slotIndex], 2, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &viewParamsInfo, nullptr };
+                writes[3] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_SpatialReuseSet[slotIndex], 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &lightBufferInfo, nullptr };
+                vkUpdateDescriptorSets(m_Device, 4, writes, 0, nullptr);
+            }
+
+            VkPushConstantRange pushRange{ VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(uint32_t) };
+            VkPipelineLayoutCreateInfo pipelineLayoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+            pipelineLayoutInfo.setLayoutCount = 1;
+            pipelineLayoutInfo.pSetLayouts = &m_SpatialReuseSetLayout;
+            pipelineLayoutInfo.pushConstantRangeCount = 1;
+            pipelineLayoutInfo.pPushConstantRanges = &pushRange;
+            VK_CHECK(vkCreatePipelineLayout(m_Device, &pipelineLayoutInfo, nullptr, &m_SpatialReusePipelineLayout));
+
+            VkShaderModule shaderModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/MegaLightsSpatialReuse.comp.spv");
+            VkComputePipelineCreateInfo pipelineInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
+            pipelineInfo.layout = m_SpatialReusePipelineLayout;
+            pipelineInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+            pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+            pipelineInfo.stage.module = shaderModule;
+            pipelineInfo.stage.pName = "main";
+            VK_CHECK(vkCreateComputePipelines(m_Device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_SpatialReusePipeline));
+            vkDestroyShaderModule(m_Device, shaderModule, nullptr);
+        }
+
+        // =====================================================================================
+        // STEP 3.75 -- Spatial reuse follow-up: Final Shade pipeline (MegaLightsFinalShade.comp).
+        // Set 0, 9 bindings, a SINGLE variant (every input is frame-invariant -- see this class' own
+        // m_FinalShadeSet member comment). Mirrors the pre-split Shade pipeline's own tail bindings
+        // (radiance image, GBuffer normal/depth, TLAS, lights, view params, material bindings) plus
+        // the new spatial reservoir input.
+        // =====================================================================================
+        {
+            VkDescriptorSetLayoutBinding bindings[9]{};
+            bindings[0] = { 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // g_ShadeRadiance.
+            bindings[1] = { 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // g_GBufferNormal.
+            bindings[2] = { 2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // g_GBufferDepth.
+            bindings[3] = { 3, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // g_TLAS.
+            bindings[4] = { 4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // MegaLightsSSBO.
+            bindings[5] = { 5, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // MegaLightsViewParamsUBO.
+            bindings[6] = { 6, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // g_GBufferMaterialID.
+            bindings[7] = { 7, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // MaterialParamsSSBO.
+            bindings[8] = { 8, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // SpatialReservoirBuffer.
+
+            VkDescriptorSetLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+            layoutInfo.bindingCount = 9;
+            layoutInfo.pBindings = bindings;
+            VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &layoutInfo, nullptr, &m_FinalShadeSetLayout));
+
+            VkDescriptorPoolSize poolSizes[4] = {
+                { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 3 },
+                { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1 },
+                { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3 },
+                { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 }
+            };
+            VkDescriptorPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
+            poolInfo.maxSets = 1;
+            poolInfo.poolSizeCount = 4;
+            poolInfo.pPoolSizes = poolSizes;
+            VK_CHECK(vkCreateDescriptorPool(m_Device, &poolInfo, nullptr, &m_FinalShadeDescriptorPool));
+
+            VkDescriptorSetAllocateInfo setAllocInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+            setAllocInfo.descriptorPool = m_FinalShadeDescriptorPool;
+            setAllocInfo.descriptorSetCount = 1;
+            setAllocInfo.pSetLayouts = &m_FinalShadeSetLayout;
+            VK_CHECK(vkAllocateDescriptorSets(m_Device, &setAllocInfo, &m_FinalShadeSet));
+
+            VkDescriptorImageInfo shadeRadianceInfo{ VK_NULL_HANDLE, m_RawRadianceView, VK_IMAGE_LAYOUT_GENERAL };
+            VkDescriptorImageInfo gbufferNormalInfo{ VK_NULL_HANDLE, resolvePass.GetOutputNormalView(), VK_IMAGE_LAYOUT_GENERAL };
+            VkDescriptorImageInfo gbufferDepthInfo{ VK_NULL_HANDLE, resolvePass.GetOutputDepthView(), VK_IMAGE_LAYOUT_GENERAL };
+            VkDescriptorBufferInfo lightBufferInfo2{ m_LightBuffer.Handle(), 0, m_LightBuffer.Size() };
+            VkDescriptorBufferInfo viewParamsInfo2{ m_ViewParamsBuffer.Handle(), 0, m_ViewParamsBuffer.Size() };
+            VkDescriptorImageInfo gbufferMaterialIDInfo{ VK_NULL_HANDLE, resolvePass.GetOutputMaterialIDView(), VK_IMAGE_LAYOUT_GENERAL };
+            VkDescriptorBufferInfo materialParamsInfo{ resolvePass.GetMaterialParamsBuffer(), 0, VK_WHOLE_SIZE };
+            VkDescriptorBufferInfo spatialReservoirInfo{ m_SpatialReservoirBuffer.Handle(), 0, m_SpatialReservoirBuffer.Size() };
+            VkAccelerationStructureKHR tlasHandle = rtPass.GetTLASHandle();
+
+            VkWriteDescriptorSet writes[8]{};
+            writes[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_FinalShadeSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &shadeRadianceInfo, nullptr, nullptr };
+            writes[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_FinalShadeSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &gbufferNormalInfo, nullptr, nullptr };
+            writes[2] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_FinalShadeSet, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &gbufferDepthInfo, nullptr, nullptr };
+            writes[3] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_FinalShadeSet, 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &lightBufferInfo2, nullptr };
+            writes[4] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_FinalShadeSet, 5, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &viewParamsInfo2, nullptr };
+            writes[5] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_FinalShadeSet, 6, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &gbufferMaterialIDInfo, nullptr, nullptr };
+            writes[6] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_FinalShadeSet, 7, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &materialParamsInfo, nullptr };
+            writes[7] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_FinalShadeSet, 8, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &spatialReservoirInfo, nullptr };
+            vkUpdateDescriptorSets(m_Device, 8, writes, 0, nullptr);
+
+            // Binding 3 (acceleration structure) written separately -- same pNext-chain reason as
+            // m_ShadeSet's own TLAS write above.
+            VkWriteDescriptorSetAccelerationStructureKHR accelWrite{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR };
+            accelWrite.accelerationStructureCount = 1;
+            accelWrite.pAccelerationStructures = &tlasHandle;
+            VkWriteDescriptorSet accelDescriptorWrite{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+            accelDescriptorWrite.pNext = &accelWrite;
+            accelDescriptorWrite.dstSet = m_FinalShadeSet;
+            accelDescriptorWrite.dstBinding = 3;
+            accelDescriptorWrite.descriptorCount = 1;
+            accelDescriptorWrite.descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+            vkUpdateDescriptorSets(m_Device, 1, &accelDescriptorWrite, 0, nullptr);
+
+            // No push constants -- MegaLightsFinalShade.comp never reads pc.frameIndex (only
+            // Stage 1/Stage 2's own RNG offsets need it, see each shader's own main()).
+            VkPipelineLayoutCreateInfo pipelineLayoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+            pipelineLayoutInfo.setLayoutCount = 1;
+            pipelineLayoutInfo.pSetLayouts = &m_FinalShadeSetLayout;
+            pipelineLayoutInfo.pushConstantRangeCount = 0;
+            pipelineLayoutInfo.pPushConstantRanges = nullptr;
+            VK_CHECK(vkCreatePipelineLayout(m_Device, &pipelineLayoutInfo, nullptr, &m_FinalShadePipelineLayout));
+
+            VkShaderModule shaderModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/MegaLightsFinalShade.comp.spv");
+            VkComputePipelineCreateInfo pipelineInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
+            pipelineInfo.layout = m_FinalShadePipelineLayout;
+            pipelineInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+            pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+            pipelineInfo.stage.module = shaderModule;
+            pipelineInfo.stage.pName = "main";
+            VK_CHECK(vkCreateComputePipelines(m_Device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_FinalShadePipeline));
+            vkDestroyShaderModule(m_Device, shaderModule, nullptr);
+        }
+
+        // =====================================================================================
         // STEP 4 -- Composite pipeline: set 0 (2 bindings). g_DenoisedRadiance reads m_Denoiser's
         // own output (already visible via ATrous's own trailing barrier); g_OutputColor
         // read-modify-writes resolvePass's output color image, same target renderer::ReflectionPass
@@ -375,6 +561,16 @@ namespace renderer {
             if (m_ShadeDescriptorPool != VK_NULL_HANDLE) vkDestroyDescriptorPool(m_Device, m_ShadeDescriptorPool, nullptr);
             if (m_ShadeSetLayout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(m_Device, m_ShadeSetLayout, nullptr);
 
+            if (m_SpatialReusePipeline != VK_NULL_HANDLE) vkDestroyPipeline(m_Device, m_SpatialReusePipeline, nullptr);
+            if (m_SpatialReusePipelineLayout != VK_NULL_HANDLE) vkDestroyPipelineLayout(m_Device, m_SpatialReusePipelineLayout, nullptr);
+            if (m_SpatialReuseDescriptorPool != VK_NULL_HANDLE) vkDestroyDescriptorPool(m_Device, m_SpatialReuseDescriptorPool, nullptr);
+            if (m_SpatialReuseSetLayout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(m_Device, m_SpatialReuseSetLayout, nullptr);
+
+            if (m_FinalShadePipeline != VK_NULL_HANDLE) vkDestroyPipeline(m_Device, m_FinalShadePipeline, nullptr);
+            if (m_FinalShadePipelineLayout != VK_NULL_HANDLE) vkDestroyPipelineLayout(m_Device, m_FinalShadePipelineLayout, nullptr);
+            if (m_FinalShadeDescriptorPool != VK_NULL_HANDLE) vkDestroyDescriptorPool(m_Device, m_FinalShadeDescriptorPool, nullptr);
+            if (m_FinalShadeSetLayout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(m_Device, m_FinalShadeSetLayout, nullptr);
+
             if (m_RawRadianceView != VK_NULL_HANDLE) vkDestroyImageView(m_Device, m_RawRadianceView, nullptr);
         }
         m_Denoiser.Shutdown();
@@ -388,10 +584,14 @@ namespace renderer {
         for (GpuBuffer& reservoirBuffer : m_ReservoirBuffers) {
             reservoirBuffer.Destroy();
         }
+        m_SpatialReservoirBuffer.Destroy();
 
         m_CompositePipeline = VK_NULL_HANDLE; m_CompositePipelineLayout = VK_NULL_HANDLE; m_CompositeDescriptorPool = VK_NULL_HANDLE; m_CompositeSetLayout = VK_NULL_HANDLE; m_CompositeSet = VK_NULL_HANDLE;
         m_ShadePipeline = VK_NULL_HANDLE; m_ShadePipelineLayout = VK_NULL_HANDLE; m_ShadeDescriptorPool = VK_NULL_HANDLE; m_ShadeSetLayout = VK_NULL_HANDLE;
         m_ShadeSet[0] = VK_NULL_HANDLE; m_ShadeSet[1] = VK_NULL_HANDLE;
+        m_SpatialReusePipeline = VK_NULL_HANDLE; m_SpatialReusePipelineLayout = VK_NULL_HANDLE; m_SpatialReuseDescriptorPool = VK_NULL_HANDLE; m_SpatialReuseSetLayout = VK_NULL_HANDLE;
+        m_SpatialReuseSet[0] = VK_NULL_HANDLE; m_SpatialReuseSet[1] = VK_NULL_HANDLE;
+        m_FinalShadePipeline = VK_NULL_HANDLE; m_FinalShadePipelineLayout = VK_NULL_HANDLE; m_FinalShadeDescriptorPool = VK_NULL_HANDLE; m_FinalShadeSetLayout = VK_NULL_HANDLE; m_FinalShadeSet = VK_NULL_HANDLE;
         m_RawRadianceImage = VK_NULL_HANDLE; m_RawRadianceAllocation = VK_NULL_HANDLE; m_RawRadianceView = VK_NULL_HANDLE;
         m_LightCount = 0;
         m_LightBVHNodeCount = 0;
@@ -419,6 +619,11 @@ namespace renderer {
         // MegaLightsShade.comp's own g_ViewParams.spatialBiasRadius comment) in the defensive,
         // never-expected-in-practice empty-BVH case.
         ubo.spatialBiasRadius = (m_LightBVHNodeCount > 0u) ? config::megalights::SPATIAL_BIAS_RADIUS : 0.0f;
+        // Spatial reuse follow-up: no defensive empty-BVH-style guard needed here -- unlike the
+        // light BVH, MegaLightsSpatialReuse.comp's own neighbor loop is always well-defined (it
+        // degrades gracefully to "0 valid neighbors found" whenever every sampled neighbor fails
+        // the geometry-similarity test, never a structural precondition like an empty BVH).
+        ubo.spatialReuseRadiusPixels = config::megalights::SPATIAL_REUSE_RADIUS_PIXELS;
         ubo.cameraPositionWorldX = cameraPositionWorld.x;
         ubo.cameraPositionWorldY = cameraPositionWorld.y;
         ubo.cameraPositionWorldZ = cameraPositionWorld.z;
@@ -431,19 +636,55 @@ namespace renderer {
         uint32_t groupCountX = (m_RenderExtent.width + kWorkgroupSize - 1u) / kWorkgroupSize;
         uint32_t groupCountY = (m_RenderExtent.height + kWorkgroupSize - 1u) / kWorkgroupSize;
 
-        // --- Shade: BVH-biased RIS + temporal ReSTIR combine + 1 shadow ray per pixel, writes raw
-        // noisy radiance AND this frame's combined reservoir (binding 12 of the slot variant bound
-        // below). ---
+        // --- Stage 1 (Shade / MegaLightsShade.comp): BVH-biased RIS + temporal ReSTIR combine.
+        // Writes ONLY this frame's temporally-combined reservoir (binding 12 of the slot variant
+        // bound below) -- no shading, no shadow ray, no radiance-image write anymore (see this
+        // file's own "Spatial reuse follow-up" header comment / MegaLightsShade.comp's own header
+        // comment for the full 3-stage split). ---
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_ShadePipeline);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_ShadePipelineLayout, 0, 1, &m_ShadeSet[m_CurrentReservoirSlotIndex], 0, nullptr);
         vkCmdPushConstants(cmd, m_ShadePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(uint32_t), &frameIndex);
         vkCmdDispatch(cmd, groupCountX, groupCountY, 1);
 
-        // Raw radiance image must be visible to the denoiser's own combined-image-sampler read; the
-        // reservoir SSBO just written (this dispatch's binding 12) must be visible to NEXT frame's
-        // own COMPUTE_SHADER read (as binding 13 of the OTHER slot variant, after the next flip) --
-        // both are covered by the same barrier since both are produced by this same dispatch's
-        // shader-storage writes.
+        // The temporal reservoir SSBO just written (m_ReservoirBuffers[m_CurrentReservoirSlotIndex],
+        // this dispatch's binding 12) must be visible to Stage 2's own COMPUTE_SHADER read (binding
+        // 0 of m_SpatialReuseSet[m_CurrentReservoirSlotIndex] below) before that dispatch can safely
+        // read ANY pixel's reservoir -- including neighbors written by a different workgroup, the
+        // exact race a single fused dispatch could not avoid (see MegaLightsSpatialReuse.comp's own
+        // header comment).
+        VulkanUtils::RecordMemoryBarrier(cmd,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+
+        // --- Stage 2 (Spatial Reuse / MegaLightsSpatialReuse.comp): resamples ~5 golden-angle-
+        // spaced screen-space neighbors' just-barrier-visible temporal reservoirs into
+        // m_SpatialReservoirBuffer, this frame's own ephemeral (non-ping-ponged) output -- see that
+        // shader's own header comment for the full ReSTIR spatial-reuse derivation. Slot-indexed the
+        // same way Stage 1 is (binding 0 must read the SAME physical buffer Stage 1 just wrote). ---
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_SpatialReusePipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_SpatialReusePipelineLayout, 0, 1, &m_SpatialReuseSet[m_CurrentReservoirSlotIndex], 0, nullptr);
+        vkCmdPushConstants(cmd, m_SpatialReusePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(uint32_t), &frameIndex);
+        vkCmdDispatch(cmd, groupCountX, groupCountY, 1);
+
+        // m_SpatialReservoirBuffer's writes must be visible to Stage 3's own COMPUTE_SHADER read
+        // before it shades a single pixel -- same cross-workgroup-write-then-read hazard as the
+        // barrier above, one stage later.
+        VulkanUtils::RecordMemoryBarrier(cmd,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+
+        // --- Stage 3 (Final Shade / MegaLightsFinalShade.comp): traces the one mandatory shadow-
+        // visibility ray toward the spatially-resampled winner, evaluates the Substrate BSDF, and
+        // writes the raw noisy radiance image -- exactly what Stage 1 used to do at its own tail
+        // before this split. Single descriptor-set variant (see m_FinalShadeSet's own member
+        // comment), no push constants (frameIndex is unused here). ---
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_FinalShadePipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_FinalShadePipelineLayout, 0, 1, &m_FinalShadeSet, 0, nullptr);
+        vkCmdDispatch(cmd, groupCountX, groupCountY, 1);
+
+        // Raw radiance image must be visible to the denoiser's own combined-image-sampler read --
+        // same barrier the pre-split Stage 1 used to record right after its own single dispatch, now
+        // simply moved to follow Stage 3's dispatch instead.
         VulkanUtils::RecordMemoryBarrier(cmd,
             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT);

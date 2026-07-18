@@ -3,7 +3,7 @@
 #extension GL_EXT_ray_query : require
 
 // Phase 7c (UE5.8 parity roadmap, water/erosion): forward-shaded water material fragment shader
-// for renderer::WaterForwardPass. Modeled on HeroTessellation.frag's reflection-trace structure
+// for renderer::WaterForwardPass. Modeled on Tessellation.frag's reflection-trace structure
 // (front-layer GGX-VNDF specular against the shared Surface Cache trace scene, identical math),
 // but with NO diffuse/shadowed/MegaLights term (water has none -- see WaterForwardPass' own class
 // comment) and a real REFRACTION term neither hero nor glass needed: samples g_BackgroundSnapshot
@@ -37,7 +37,7 @@
 
 // Single-element buffer -- this pass only ever shades ONE fixed material (see
 // renderer::WaterForwardPass.cpp's own `waterMaterial` parameter comment), same convention
-// renderer::HeroTessellationPass established.
+// renderer::TessellationPass established.
 layout(std430, set = 0, binding = 0) readonly buffer MaterialParamsSSBO {
     MaterialParams mat;
 } g_MaterialParams;
@@ -46,7 +46,7 @@ layout(std430, set = 0, binding = 0) readonly buffer MaterialParamsSSBO {
 // never needs it, the vertex shader already resolved world position.
 
 // HWRT resources (own set 0 bindings 3-5, NOT part of SurfaceCacheTraceContext's set 1/2 --
-// mirrors HeroTessellation.frag's own equivalent bindings).
+// mirrors Tessellation.frag's own equivalent bindings).
 layout(set = 0, binding = 2) uniform accelerationStructureEXT g_TLAS;
 struct FallbackVertexGpu { float posX, posY, posZ; float normX, normY, normZ; float u, v; };
 layout(std430, set = 0, binding = 3) readonly buffer FallbackVertexBuffer { FallbackVertexGpu g_Vertices[]; };
@@ -111,7 +111,7 @@ vec3 FetchPosition(uint globalVertexIndex) {
     return vec3(v.posX, v.posY, v.posZ);
 }
 
-// Nth copy of this codebase's established inline-rayQuery HWRT trace (see HeroTessellation.frag's
+// Nth copy of this codebase's established inline-rayQuery HWRT trace (see Tessellation.frag's
 // own header comment for the full list of existing copies and why a further one here follows the
 // existing convention rather than refactoring already-working files).
 bool TraceHWRT(vec3 rayOrigin, vec3 rayDir, float tMax, out uint outEntityIndex, out vec3 outLocalPos, out vec3 outLocalNormal) {
@@ -203,7 +203,7 @@ void main() {
     vec3 refractedTinted = mix(backgroundColor, mat.base.diffuseAlbedo, absorption);
 
     // --- Front-layer specular reflection (Lumen-style, single GGX-VNDF sample, identical
-    // technique to HeroTessellation.frag's own optional-reflection block) ---
+    // technique to Tessellation.frag's own optional-reflection block) ---
     vec3 cameraPositionWorld = vec3(pc.cameraPositionWorldX, pc.cameraPositionWorldY, pc.cameraPositionWorldZ);
     vec3 viewDir = normalize(cameraPositionWorld - inWorldPos);
     float NdotV = max(dot(n, viewDir), 0.0);
@@ -244,7 +244,7 @@ void main() {
         }
     }
     // Grazing-angle GGX-VNDF edge case and missed reflection rays both leave reflectionRadiance at
-    // 0.0 -- same handling as HeroTessellation.frag's own (no sky/ambient fallback exists anywhere
+    // 0.0 -- same handling as Tessellation.frag's own (no sky/ambient fallback exists anywhere
     // in this codebase; water inherits that same accepted limitation, not a regression).
 
     // --- Composite: Fresnel-weighted lerp between refraction and reflection (see this file's own

@@ -25,8 +25,34 @@ struct Particle {
     vec4 color;
     vec2 size;
     float rotation;      // Radians, billboard-plane rotation (Subtask 4).
-    uint randomSeed;     // Per-particle PRNG state, re-seeded at spawn (Subtask 2).
+    uint randomSeed;     // Per-particle PRNG state, re-seeded at spawn (Subtask 2). Precipitation
+                          // feature: the TOP 2 BITS (bits 30-31, see PackParticleKind/UnpackParticleKind
+                          // below) are stolen to tag which emitter "kind" spawned this particle --
+                          // GpuParticle's 64-byte layout is already fully packed (no spare field), and
+                          // randomSeed is otherwise dead after spawn (SpawnParticle re-seeds it once, no
+                          // other consumer -- CPU or GPU -- ever reads it as a raw PRNG value again), so
+                          // this is the only place a per-particle tag can live without breaking the
+                          // struct's byte-for-byte contract. The remaining 30 bits keep plenty of
+                          // entropy for UpdateParticle's own per-particle wobble phase (Subtask
+                          // precipitation, snow horizontal drift).
 };
+
+// Particle "kind" tag, packed into Particle.randomSeed's top 2 bits (see that field's own comment).
+// kKindEmber is 0 so every particle spawned before this feature existed (and every non-precipitation
+// spawn today) is correctly tagged without needing to touch SpawnParticle's existing embers path.
+const uint kParticleKindEmber = 0u;
+const uint kParticleKindRain = 1u;
+const uint kParticleKindSnow = 2u;
+
+uint PackParticleSeed(uint kind, uint rawSeed) {
+    return (kind << 30u) | (rawSeed & 0x3FFFFFFFu);
+}
+uint UnpackParticleKind(uint packedSeed) {
+    return packedSeed >> 30u;
+}
+uint UnpackParticleRawSeed(uint packedSeed) {
+    return packedSeed & 0x3FFFFFFFu;
+}
 
 // Double-buffered particle state (renderer::ParticleSystemPass::m_ParticleBuffer[2]) -- Subtask 2's
 // simulation compute shader reads the PREVIOUS frame's buffer and writes the buffer for THIS frame,
