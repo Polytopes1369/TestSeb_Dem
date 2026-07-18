@@ -70,6 +70,29 @@ namespace maths {
         }
     };
 
+    // PCG data model (Phase 1, PCG roadmap): the codebase previously had no 4-component vector --
+    // every existing UBO/SSBO mirror struct that needed 4 floats (color, etc.) used flat scalar
+    // fields instead (see e.g. renderer::GpuParticle's colorR/G/B/A). PcgPointData.h's CPU-facing
+    // point struct needs a genuine vec4 for its color/tint field (matching this header's own
+    // "reuse existing math types" convention for vec2/vec3/mat4/quat), so it is added here rather
+    // than as a PCG-local type -- any future feature needing a 4-component vector should reuse this
+    // one too, not invent a parallel type.
+    struct vec4 {
+        float x = 0.0f;
+        float y = 0.0f;
+        float z = 0.0f;
+        float w = 0.0f;
+
+        constexpr vec4() = default;
+        constexpr vec4(float _x, float _y, float _z, float _w) : x(_x), y(_y), z(_z), w(_w) {}
+
+        constexpr vec4 operator-(const vec4& v) const { return { x - v.x, y - v.y, z - v.z, w - v.w }; }
+        constexpr vec4 operator+(const vec4& v) const { return { x + v.x, y + v.y, z + v.z, w + v.w }; }
+        constexpr vec4 operator*(float scalar) const { return { x * scalar, y * scalar, z * scalar, w * scalar }; }
+
+        constexpr float Dot(const vec4& v) const { return x * v.x + y * v.y + z * v.z + w * v.w; }
+    };
+
     // Resets an accumulating AABB to its identity (inverted-infinite) extent, ready for a sequence
     // of ExpandAABB calls.
     inline void ResetAABB(vec3& boundsMin, vec3& boundsMax) {
@@ -92,6 +115,12 @@ namespace maths {
     inline float AABBRadius(const vec3& boundsMin, const vec3& boundsMax) {
         return (boundsMax - boundsMin).Length() * 0.5f;
     }
+
+    // Forward declaration: `quat` is defined below `mat4` in this file, but mat4::FromQuat (PCG
+    // data model, Phase 1) needs to name it in its signature -- the method's BODY is defined
+    // out-of-line, after quat's full definition, for the same reason (see that definition's own
+    // comment).
+    struct quat;
 
     struct mat4 {
         std::array<float, 16> m{};
@@ -116,6 +145,15 @@ namespace maths {
         static constexpr mat4 Translate(const vec3& v) {
             mat4 result;
             result.m[12] = v.x; result.m[13] = v.y; result.m[14] = v.z;
+            return result;
+        }
+
+        // PCG data model (Phase 1, PCG roadmap): non-uniform scale, needed by PcgPoint::GetLocalToWorld
+        // (position/rotation/scale -> a single local-to-world matrix, UE5.8 FPCGPoint::Transform
+        // parity). Same "override just the diagonal" pattern as the default-constructed identity.
+        static constexpr mat4 Scale(const vec3& s) {
+            mat4 result;
+            result.m[0] = s.x; result.m[5] = s.y; result.m[10] = s.z;
             return result;
         }
 
@@ -247,6 +285,13 @@ namespace maths {
             for (int i = 0; i < 16; ++i) result.m[i] = inv[i] * invDet;
             return result;
         }
+
+        // PCG data model (Phase 1, PCG roadmap): quaternion -> pure-rotation matrix, needed by
+        // PcgPoint::GetLocalToWorld (this codebase's `quat` is otherwise only ever fed to
+        // FromAxisAngle/RotateVector, never converted into a mat4, before this phase). Declared
+        // here, defined out-of-line below (after quat's full definition, see the forward
+        // declaration comment above `mat4` for why).
+        static mat4 FromQuat(const quat& q);
     };
 
     struct quat {
@@ -262,5 +307,33 @@ namespace maths {
             float s = std::sin(angleRadians * 0.5f);
             return { axis.x * s, axis.y * s, axis.z * s, std::cos(angleRadians * 0.5f) };
         }
+
+        // PCG data model (Phase 1, PCG roadmap): rotates `v` by this quaternion using the standard
+        // "v + 2*w*(qv x v) + 2*(qv x (qv x v))" identity (qv = this quaternion's vector part) --
+        // needed by PcgVolumeData::ContainsWorldPoint (OBB world-to-local test) and by future PCG
+        // sampler/filter phases that need to orient a per-point local-space offset into world space
+        // without building a full mat4 first. constexpr since every operation it composes
+        // (vec3::Cross/operator+/operator*) is itself constexpr.
+        constexpr vec3 RotateVector(const vec3& v) const {
+            vec3 qv{ x, y, z };
+            vec3 t = qv.Cross(v) * 2.0f;
+            return v + t * w + qv.Cross(t);
+        }
     };
+
+    // Out-of-line definition of mat4::FromQuat (declared above, before quat existed as a complete
+    // type) -- standard column-major rotation-from-quaternion derivation (columns = the rotated
+    // X/Y/Z basis vectors), consistent with mat4's own column-major storage (see its multiply
+    // operator's `m[row + col*4]` indexing and RotateX/Y/Z's identical convention).
+    inline mat4 mat4::FromQuat(const quat& q) {
+        mat4 result;
+        float xx = q.x * q.x, yy = q.y * q.y, zz = q.z * q.z;
+        float xy = q.x * q.y, xz = q.x * q.z, yz = q.y * q.z;
+        float wx = q.w * q.x, wy = q.w * q.y, wz = q.w * q.z;
+
+        result.m[0] = 1.0f - 2.0f * (yy + zz); result.m[1] = 2.0f * (xy + wz);        result.m[2] = 2.0f * (xz - wy);
+        result.m[4] = 2.0f * (xy - wz);        result.m[5] = 1.0f - 2.0f * (xx + zz);  result.m[6] = 2.0f * (yz + wx);
+        result.m[8] = 2.0f * (xz + wy);        result.m[9] = 2.0f * (yz - wx);         result.m[10] = 1.0f - 2.0f * (xx + yy);
+        return result;
+    }
 }

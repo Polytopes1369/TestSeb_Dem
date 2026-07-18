@@ -180,6 +180,15 @@ add_executable(BlockCodecTests
     tests/BlockCodecTests.cpp
 )
 target_include_directories(BlockCodecTests PRIVATE src ${Vulkan_INCLUDE_DIRS})
+
+# PCG framework roadmap, Phase 1 ("PCG Data Model"): src/pcg/*.h are header-only data types (no
+# accompanying .cpp yet -- nothing generates/consumes PCG data at runtime until a later phase), so
+# this target links no additional source beyond the test file itself.
+add_executable(PcgDataModelTests
+    tests/PcgDataModelTests.cpp
+)
+target_include_directories(PcgDataModelTests PRIVATE src ${Vulkan_INCLUDE_DIRS})
+add_test(NAME PcgDataModelTests COMMAND PcgDataModelTests)
 add_test(NAME BlockCodecTests COMMAND BlockCodecTests)
 
 add_executable(AsyncDecompressingLoaderTests
