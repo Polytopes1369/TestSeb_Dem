@@ -1,0 +1,171 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+#extension GL_EXT_ray_query : require
+
+// Stage 3 (final) of MegaLightsPass' 3-stage pipeline -- see MegaLightsShade.comp's own header
+// comment for Stage 1 (temporal combine) and MegaLightsSpatialReuse.comp's own header comment for
+// Stage 2 (spatial reuse), both of which run before this shader in renderer::MegaLightsPass::
+// RecordShade, each separated by a VkMemoryBarrier2 making the previous stage's SSBO writes visible.
+//
+// One invocation per pixel, full resolution. Does exactly what MegaLightsShade.comp's own tail used
+// to do before the spatial-reuse split (see that file's own "spatial reuse follow-up" comment):
+// trace the ONE mandatory ray-traced shadow-visibility query per pixel per frame -- still exactly
+// one ray, the entire point of RIS/ReSTIR being O(1) expensive rays per pixel regardless of how many
+// lights exist or how many reservoir candidates were streamed to get here -- then evaluate the full
+// Substrate BSDF response and write the raw noisy radiance image renderer::ATrousDenoisePass
+// consumes next (renderer::MegaLightsPass owns that dedicated denoiser instance -- see
+// MegaLightsPass.h's own header comment for why a dedicated one, not the shared [12d] instance).
+//
+// The ONLY thing that changed vs. the pre-split Stage 1 tail: the winning light index/weight now
+// comes from Stage 2's SPATIALLY-resampled reservoir (SpatialReservoirBuffer below) instead of
+// Stage 1's own raw temporal-only reservoir -- everything downstream of that lookup (shadow ray,
+// windowed inverse-square falloff, EvaluateSubstrateMaterial call) is unchanged.
+
+#include "include/math_utils.glsl"
+#include "include/octahedral.glsl"
+#include "include/material_params.glsl"
+#include "include/substrate_bsdf.glsl"
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+// rgba16f -- see MegaLightsShade.comp's own g_ShadeRadiance binding comment for why linear HDR is
+// mandatory here (unbounded near-light radiance, must survive unclipped into renderer::
+// PostProcessPass's own tonemap curve).
+layout(rgba16f, set = 0, binding = 0) uniform writeonly image2D g_ShadeRadiance;
+
+layout(rg16f, set = 0, binding = 1) uniform readonly image2D g_GBufferNormal;
+layout(r32f, set = 0, binding = 2) uniform readonly image2D g_GBufferDepth;
+
+layout(set = 0, binding = 3) uniform accelerationStructureEXT g_TLAS;
+
+#define MEGALIGHTS_LIGHTS_SET 0
+#define MEGALIGHTS_LIGHTS_BINDING 4
+#include "include/megalights_ris.glsl"
+
+// Same physical UBO as MegaLightsShade.comp/MegaLightsSpatialReuse.comp's own MegaLightsViewParamsUBO
+// (renderer::MegaLightsPass binds the same m_ViewParamsBuffer handle to all three pipelines) -- this
+// shader reads invViewProj (worldPos reconstruction), viewportSize, and cameraPositionWorld (the
+// Substrate view-direction term); prevViewProj/spatialBiasRadius/spatialReuseRadiusPixels are
+// declared-but-unused here, same "byte-layout mirror, not every field consumed" convention the other
+// two stages already establish.
+layout(std140, set = 0, binding = 5) uniform MegaLightsViewParamsUBO {
+    mat4 invViewProj;
+    mat4 prevViewProj;
+    vec2 viewportSize;
+    float spatialBiasRadius;
+    float spatialReuseRadiusPixels;
+    vec3 cameraPositionWorld;
+    float _pad2;
+} g_ViewParams;
+
+// Substrate integration: identical to MegaLightsShade.comp's own pre-split bindings 8/9 -- see that
+// file's own comment (now here verbatim since this is where the BSDF evaluation moved to).
+layout(r16ui, set = 0, binding = 6) uniform readonly uimage2D g_GBufferMaterialID;
+layout(std430, set = 0, binding = 7) readonly buffer MaterialParamsSSBO {
+    MaterialParams params[];
+} g_MaterialParams;
+
+// Byte-for-byte mirror of renderer::MegaLightReservoir -- see MegaLightsShade.comp's own copy for
+// the full derivation (duplicated per this codebase's established per-shader-mirror convention).
+struct MegaLightReservoir {
+    vec3 worldPos;
+    float M;
+    vec3 normal;
+    float W;
+    uint lightIndex;
+    float _pad0, _pad1, _pad2;
+};
+
+// Binding 8: Stage 2's own spatially-resampled output -- read-only here, the final winning light
+// index/unbiased contribution weight this shader shades with.
+layout(std430, set = 0, binding = 8) readonly buffer SpatialReservoirBuffer {
+    MegaLightReservoir spatialReservoirs[];
+};
+
+// Own copy of MegaLightsShade.comp's pre-split TraceShadowRay -- see that file's own NOTE comment
+// on why this trace function moved here (must target the spatially-resampled winner, which is only
+// known at this stage) and why it is duplicated rather than shared (established per-shader-
+// duplicated trace-code convention, see megalights_ris.glsl's own header comment).
+bool TraceShadowRay(vec3 origin, vec3 dir, float tMax) {
+    rayQueryEXT rq;
+    rayQueryInitializeEXT(rq, g_TLAS, gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT, 0xFF, origin, 1.0e-3, dir, tMax);
+    while (rayQueryProceedEXT(rq)) {
+        // Every BLAS triangle is unconditionally opaque -- nothing to confirm/reject manually.
+    }
+    return rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT;
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 viewportSize = ivec2(g_ViewParams.viewportSize);
+    if (pixel.x >= viewportSize.x || pixel.y >= viewportSize.y) {
+        return;
+    }
+
+    uint pixelIndex = uint(pixel.y) * uint(viewportSize.x) + uint(pixel.x);
+
+    float depth = imageLoad(g_GBufferDepth, pixel).r;
+    if (depth <= 0.0) {
+        // Background pixel (matches ClusterResolve.comp's own reversed-Z "depth == 0.0" sentinel,
+        // same check Stage 1/Stage 2 already independently perform on their own outputs).
+        imageStore(g_ShadeRadiance, pixel, vec4(0.0));
+        return;
+    }
+
+    MegaLightReservoir reservoir = spatialReservoirs[pixelIndex];
+    if (reservoir.lightIndex == 0xFFFFFFFFu) {
+        imageStore(g_ShadeRadiance, pixel, vec4(0.0));
+        return;
+    }
+
+    vec3 normal = OctDecode(imageLoad(g_GBufferNormal, pixel).rg);
+    vec2 ndcXY = ((vec2(pixel) + 0.5) / g_ViewParams.viewportSize) * 2.0 - 1.0;
+    vec4 worldPos4 = g_ViewParams.invViewProj * vec4(ndcXY, depth, 1.0);
+    vec3 worldPos = worldPos4.xyz / worldPos4.w;
+
+    MegaLight light = g_Lights.lights[reservoir.lightIndex];
+    vec3 toLight = light.position - worldPos;
+    float dist = length(toLight);
+    vec3 lightDir = toLight / max(dist, 1.0e-4);
+    float NdotL = saturate(dot(normal, lightDir));
+
+    // A grazing/back-facing candidate needs no shadow ray -- it already contributes zero.
+    vec3 biasedOrigin = worldPos + normal * 1.0e-2;
+    // Mandatory per-frame visibility revalidation: traces toward the SPATIALLY-RESAMPLED
+    // reservoir's current winner -- exactly one ray per pixel per frame, same ray-budget invariant
+    // Phase A originally established (see this file's own header comment). Never reuses a prior
+    // frame's (or a neighbor's) occlusion result -- every frame/every pixel independently
+    // revalidates visibility toward whatever light it ends up with right now.
+    bool occluded = (NdotL > 0.0) ? TraceShadowRay(biasedOrigin, lightDir, max(dist - 2.0e-2, 1.0e-3)) : true;
+    float visibility = occluded ? 0.0 : 1.0;
+
+    float distSq = max(dist * dist, 1.0e-4);
+    float normalizedDist = saturate(dist / max(light.radius, 1.0e-4));
+    float nd2 = normalizedDist * normalizedDist;
+    float windowSq = 1.0 - nd2 * nd2;
+    float window = saturate(windowSq * windowSq);
+
+    // Substrate integration: real per-pixel Slab BSDF response (diffuse + anisotropic specular +
+    // second lobe/Haze + fuzz, vertically layered with the Top slab if any) -- see
+    // MegaLightsShade.comp's own pre-split comment for the full derivation (unchanged here, only
+    // relocated).
+    vec3 viewDir = normalize(g_ViewParams.cameraPositionWorld - worldPos);
+    uint materialSlot = min(imageLoad(g_GBufferMaterialID, pixel).r, MATERIAL_TABLE_SIZE - 1u);
+    MaterialParams mat = g_MaterialParams.params[materialSlot];
+
+    // Full shading contribution of the spatially-resampled reservoir's winning light, times its
+    // unbiased contribution weight `reservoir.W` -- see MegaLightsSpatialReuse.comp's own combine
+    // loop for the derivation (replaces the pre-split single-frame `combinedW` now that the light
+    // being shaded is the SPATIALLY-COMBINED winner). EvaluateSubstrateMaterial already applies its
+    // own NdotL internally per BSDF lobe -- no separate NdotL multiply here (NdotL above is still
+    // used only for the shadow-ray early-out check). light.intensity is real luminous intensity in
+    // CANDELA (renderer::MegaLight's own comment) -- intensity/distSq is the standard inverse-square
+    // illuminance-at-a-point formula; EvaluateSubstrateMaterial's own contract ("caller multiplies by
+    // the light's real color/intensity", diffuse lobe already bakes in the /PI Lambertian
+    // normalization) means no extra factor is needed here.
+    vec3 radiance = EvaluateSubstrateMaterial(mat, normal, viewDir, lightDir) * light.color * light.intensity / distSq * window * visibility * reservoir.W;
+    // No saturate(): g_ShadeRadiance is linear HDR (rgba16f) -- clamping here would defeat the whole
+    // point of widening the format, re-introducing the hard-clip renderer::PostProcessPass exists to
+    // replace with a soft display-referred curve.
+    imageStore(g_ShadeRadiance, pixel, vec4(radiance, 1.0));
+}
