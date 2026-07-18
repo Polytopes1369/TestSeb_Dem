@@ -28,7 +28,10 @@ namespace geometry {
     // to bump this after such an edit just means a developer manually deletes scene.cache once
     // (same recovery as today, before this field existed) -- this is a convenience/correctness
     // improvement, not a safety-critical guarantee.
-    constexpr uint32_t kGeometryGenerationVersion = 1;
+    // Bumped 1 -> 2: added renderer::ProceduralTreePass's TREES block to GenerateGeometry() (new
+    // GenerateX()-equivalent generation step, plus the pre-existing entity-count check below also
+    // independently invalidates any pre-tree-feature scene.cache since kEntityCount itself grew).
+    constexpr uint32_t kGeometryGenerationVersion = 2;
 
     // Must be called after VulkanContext::GenerateGeometry() has completed (i.e. any time after
     // VulkanContext::Init() returns) so the Vertex/Index SSBOs already hold the live scene's
