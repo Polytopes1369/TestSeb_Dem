@@ -649,7 +649,13 @@ bool ClusterRenderPipeline::Init(
   // Phase A of the MegaLights native-port roadmap: procedurally scatter kMaxMegaLights point
   // lights around the demo's 13-entity grid (see MegaLightsTypes.h's own GenerateProceduralLights
   // comment), then Init the pass -- needs m_Resolve's GBuffer (same as m_Reflection above) and
-  // m_SurfaceCacheRT's TLAS for its own shadow-visibility ray.
+  // m_SurfaceCacheRT's TLAS for its own shadow-visibility ray. Always called, on every tier --
+  // MegaLightsPass::Init() itself internally skips its own expensive GPU setup (raw radiance
+  // image, owned denoiser, both compute pipelines) whenever config::lumen::_MEGALIGHTS_ENABLE is
+  // false, while still creating its (tiny, ~8 KB) light SSBO unconditionally, since m_AtmosFog and
+  // m_TransparentForward below both bind that buffer's handle/size into their OWN descriptor sets
+  // at their own Init() time regardless of this tier's MegaLights setting -- see MegaLightsPass::
+  // Init's own comment for the full reasoning.
   {
     MegaLightsData megaLightsData = GenerateProceduralLights(4242u);
     if (!m_MegaLights.Init(createInfo.device, createInfo.allocator, createInfo.commandPool,
@@ -2618,12 +2624,21 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
   // ScreenTracePass/GICompositePass were wired up. See MegaLightsPass's own class comment for the
   // full "discovered mid-implementation" explanation.
   //
-  // `megaLightsEnabled` (debug-only toggle, main.cpp's 'X' key) gates the call entirely, same
-  // Release-always-on convention as `reflectionsEnabled` above (a real live consumer from frame
-  // one).
+  // `megaLightsEnabled` is gated by config::lumen::_MEGALIGHTS_ENABLE -- Low/Medium/High profiles
+  // set this false specifically to skip this pass' real per-frame cost (a full-render-resolution
+  // Shade compute dispatch + a 5-iteration A-Trous denoise + a Composite dispatch, every single
+  // frame); only Extrem enables it by default (see EngineConfig_{Low,Medium,High,Extrem}.h's own
+  // MEGALIGHTS_ENABLE). Previously Release hardcoded `true` here unconditionally, never consulting
+  // the config at all -- same bug Debug had too (its own toggle defaulted true independent of the
+  // active tier). Debug additionally ANDs in `m_DebugMegaLightsEnabled` (main.cpp's 'X' key) as a
+  // further manual override for A/B'ing this pass' cost/contribution -- it can only turn MegaLights
+  // OFF on top of the tier default, never force it ON for a tier that disables it, since
+  // MegaLightsPass::Init() itself (see that function's own comment) skips creating the GPU
+  // resources RecordShade needs whenever the tier disables it (RecordShade defends against exactly
+  // this with its own m_ShadePipeline == VK_NULL_HANDLE guard, see that function's own comment).
   //
   // Phase 4 of the "Nanite advanced" roadmap (light BVH for RIS spatial bias, temporal ReSTIR with
-  // per-frame revalidated visibility): RecordShade now also takes `prevViewProjForMegaLights` --
+  // per-frame revalidated visibility): RecordShade also takes `prevViewProjForMegaLights` --
   // its own reservoir reprojection needs the previous frame's combined view-projection matrix, same
   // `m_HasPrevViewProj` frame-0-safety ternary already used for [12b2]'s own
   // prevViewProjForReflection above (identity matrix on the very first frame ever recorded; see
@@ -2632,9 +2647,9 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
   // =========================================================================================
   {
 #ifndef NDEBUG
-    bool megaLightsEnabled = m_DebugMegaLightsEnabled;
+    bool megaLightsEnabled = config::lumen::_MEGALIGHTS_ENABLE && m_DebugMegaLightsEnabled;
 #else
-    bool megaLightsEnabled = true;
+    bool megaLightsEnabled = config::lumen::_MEGALIGHTS_ENABLE;
 #endif
     if (megaLightsEnabled) {
       maths::mat4 prevViewProjForMegaLights = m_HasPrevViewProj ? m_PrevViewProj : maths::mat4{};
