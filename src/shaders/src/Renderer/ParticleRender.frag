@@ -33,10 +33,10 @@
 // HeroTessellation.frag) already uses.
 //
 // --- Subtask 5: heat-shimmer refraction ---
-// When g_Params.heatShimmerStrength > 0 (an emitter-level toggle -- see renderer::
-// ParticleSystemPass::RecordDraw's own comment for why this is per-draw-call, not per-particle:
-// GpuParticle's already-merged 64-byte layout has no spare "isRefractive" flag, and a demoscene
-// emitter is realistically one thermal "kind" or another, never a per-particle mix), writes a
+// When g_Params.heatShimmerStrength > 0 (a per-draw-call toggle -- see renderer::
+// ParticleSystemPass::RecordDraw's own comment for why this stays per-draw-call, not per-particle,
+// even after the multi-emitter roadmap's GpuParticle.emitterIndex addition: a demoscene emitter is
+// realistically one thermal "kind" or another, never a per-particle mix), writes a
 // small time-varying wobble into this pass' second color output -- renderer::
 // TransparentForwardPass's OWN shared g_RefractionOffset image (this codebase's first SECOND writer
 // of that image, see ParticleSystemPass::RecordDraw's own comment on why the load/store discipline

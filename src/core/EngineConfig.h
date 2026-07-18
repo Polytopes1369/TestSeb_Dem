@@ -379,14 +379,55 @@ inline float RAIN_STRENGTH = 0.0f; // [0,1] -- unconsumed until a future precipi
 // config::atmos:: above (not mirrored into EngineConfig_{Low,Medium,High,Extrem}.h), tuned live via
 // main.cpp's own Particles ImGui tab.
 namespace particles {
-inline float SPAWN_RATE_PER_SECOND = 200.0f; // New particles/second the emitter requests -- renderer::ClusterRenderPipeline accumulates the fractional remainder across frames (see its own m_ParticleSpawnAccumulator comment) so this is exact over time even at a variable framerate.
-inline float EMITTER_POSITION_X = 0.0f;
-inline float EMITTER_POSITION_Y = 3.0f;
-inline float EMITTER_POSITION_Z = 0.0f;
-inline float GRAVITY = -9.8f; // World-space Y acceleration, m/s^2 -- see ParticleSimulation.comp's own gravityY push-constant field.
-inline float BOUNCE_ELASTICITY = 0.4f; // [0,1] -- fraction of normal-relative speed kept after a Global SDF collision.
-inline float FRICTION = 0.85f; // [0,1] -- fraction of tangential-relative speed kept after a Global SDF collision.
-inline float DRAG_COEFFICIENT = 0.5f; // How strongly velocity relaxes toward the local Atmos wind vector each second.
+
+// Multi-emitter roadmap (subtask A1 of the Niagara-parity plan): must match
+// renderer::ParticleSystemPass::kMaxEmitters exactly -- kept as a plain literal (not a shared
+// constant) since core/ intentionally does not include any renderer/ header, matching this
+// codebase's own established convention of manually documenting cross-layer value parity in
+// comments rather than adding a layering dependency (see e.g. ParticleCommon.glsl's own byte-layout
+// comments for the same pattern applied to struct layouts).
+inline constexpr uint32_t kMaxEmitters = 4;
+
+// Per-emitter, live-tunable spawn/physics/rendering parameters -- one instance per EMITTERS[] slot,
+// edited directly by main.cpp's Particles ImGui tab (one collapsible section per emitter) and read
+// every frame by renderer::ClusterRenderPipeline to build the EmitterParams array it passes to
+// renderer::ParticleSystemPass::RecordSimulate(). Replaces the old single flat set of
+// SPAWN_RATE_PER_SECOND/EMITTER_POSITION_*/GRAVITY/BOUNCE_ELASTICITY/FRICTION/DRAG_COEFFICIENT
+// globals this namespace used to hold directly (subtask A1 keeps their per-emitter defaults exactly
+// equivalent to the old always-on single emitter -- see EMITTERS[0] below).
+struct EmitterConfig {
+    bool active = false;
+    float positionX = 0.0f, positionY = 0.0f, positionZ = 0.0f;
+    float spawnRate = 0.0f;       // New particles/second this emitter requests -- ClusterRenderPipeline accumulates the fractional remainder per-emitter so this is exact over time even at a variable framerate.
+    float colorR = 1.0f, colorG = 1.0f, colorB = 1.0f, colorA = 1.0f;
+    float sizeMin = 0.1f, sizeMax = 0.1f;
+    float lifetimeMin = 2.0f, lifetimeMax = 4.0f;
+    float gravityY = -9.8f;       // World-space Y acceleration, m/s^2.
+    float bounceElasticity = 0.4f; // [0,1] -- fraction of normal-relative speed kept after a Global SDF collision.
+    float friction = 0.85f;        // [0,1] -- fraction of tangential-relative speed kept after a Global SDF collision.
+    float dragCoefficient = 0.5f;  // How strongly velocity relaxes toward the local Atmos wind vector each second.
+    uint32_t spawnShape = 0;       // 0 = Cone burst ("embers" launch), 1 = Sphere volume drift ("ambient dust").
+    float shapeParam0 = 0.3f;      // Sphere shape's radius in world units; unused by Cone.
+};
+
+// Slot 0 preserves the ORIGINAL single-emitter defaults exactly (same position/spawn rate/physics
+// values the old flat globals held) so this roadmap step changes nothing about the existing "embers"
+// look by default. Slot 1 is a new "Ambient Dust" emitter proving multi-emitter support end-to-end
+// (a slow-drifting sphere-volume spawn, distinct color/physics/shape from slot 0, both active
+// simultaneously). Slots 2-3 start inactive, ready for further ImGui-driven experimentation.
+inline EmitterConfig EMITTERS[kMaxEmitters] = {
+    EmitterConfig{ /*active*/ true, /*position*/ 0.0f, 3.0f, 0.0f, /*spawnRate*/ 200.0f,
+        /*color*/ 1.0f, 0.7f, 0.3f, 1.0f, /*size*/ 0.1f, 0.1f, /*lifetime*/ 2.0f, 4.0f,
+        /*gravityY*/ -9.8f, /*bounce*/ 0.4f, /*friction*/ 0.85f, /*drag*/ 0.5f,
+        /*spawnShape*/ 0u, /*shapeParam0*/ 0.3f },
+    EmitterConfig{ /*active*/ true, /*position*/ 4.0f, 2.0f, 2.0f, /*spawnRate*/ 40.0f,
+        /*color*/ 0.6f, 0.7f, 0.85f, 0.5f, /*size*/ 0.03f, 0.07f, /*lifetime*/ 4.0f, 7.0f,
+        /*gravityY*/ -0.2f, /*bounce*/ 0.0f, /*friction*/ 0.0f, /*drag*/ 1.0f,
+        /*spawnShape*/ 1u, /*shapeParam0*/ 1.5f },
+    EmitterConfig{},
+    EmitterConfig{},
+};
+
 inline float SOFT_FADE_DISTANCE = 0.5f; // World units -- see ParticleRender.frag's own softFade comment.
 inline bool HEAT_SHIMMER_ENABLED = false;
 inline float HEAT_SHIMMER_STRENGTH = 0.02f; // Only applied when HEAT_SHIMMER_ENABLED is true -- see ParticleSystemPass::RecordDraw's own comment on why this is a per-draw-call, not per-particle, toggle.

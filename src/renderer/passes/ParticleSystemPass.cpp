@@ -27,22 +27,27 @@ namespace renderer {
         // established push-constant convention (see e.g. SDFRayMarchPC's own comment) of avoiding
         // vec3's implicit 16-byte alignment padding so the C++ and GLSL byte layouts are trivially
         // identical without needing manual padding fields.
+        //
+        // Multi-emitter roadmap (subtask A1): `emitterPosition`/`bounceElasticity`/`friction`/
+        // `dragCoefficient`/`gravityY` were REMOVED from this block -- every one of those is now a
+        // per-emitter value read from EmitterParamsBuffer inside the shader itself (SpawnParticle
+        // indexes it by `emitterIndex` below; UpdateParticle indexes it by the particle's own stored
+        // Particle.emitterIndex), not a single global passed in fresh every call. `emitterIndex` is
+        // the new field, meaningful only when mode == 1 (spawn) -- it selects which EmitterParams
+        // slot this particular spawn dispatch is spawning for (see RecordSimulate's own per-emitter
+        // dispatch loop).
         struct ParticleSimulationPC {
             float dt = 0.0f;
             float time = 0.0f;
-            float emitterPosition[3] = { 0.0f, 0.0f, 0.0f };
-            float bounceElasticity = 0.0f;
-            float friction = 0.0f;
-            float dragCoefficient = 0.0f;
-            float gravityY = 0.0f;
             float levelVoxelSize[4] = {};
             int32_t levelCenterVoxel[12] = {};
             int32_t clipmapResolution = 0;
             uint32_t spawnCount = 0;
             uint32_t randomSeedBase = 0;
+            uint32_t emitterIndex = 0;
             int32_t mode = 0;
         };
-        static_assert(sizeof(ParticleSimulationPC) == 116, "ParticleSimulationPC must match ParticleSimulation.comp's own push-constant block exactly");
+        static_assert(sizeof(ParticleSimulationPC) == 92, "ParticleSimulationPC must match ParticleSimulation.comp's own push-constant block exactly");
 
         // Byte-for-byte mirror of ParticleSort.comp's own SortedPair struct -- 8 bytes, std430
         // (two 4-byte scalars, no padding needed).
@@ -131,6 +136,22 @@ namespace renderer {
         m_IndirectDrawBuffer.Create(allocator, kIndirectDrawBufferBytes,
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
             VMA_MEMORY_USAGE_GPU_ONLY);
+        // Multi-emitter roadmap (subtask A1): never seeded here -- always fully rewritten by
+        // RecordSimulate()'s own vkCmdUpdateBuffer before any shader in the same call reads it (see
+        // this buffer's own declaration comment), so no one-shot staging upload is needed for it,
+        // unlike every other buffer in this STEP.
+        m_EmitterParamsBuffer.Create(allocator, static_cast<VkDeviceSize>(kMaxEmitters) * sizeof(EmitterParams),
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
+        // Debug/test instrumentation only -- see this buffer's own declaration comment. TRANSFER_DST
+        // for RecordSimulate's own per-frame vkCmdFillBuffer reset; TRANSFER_SRC so the Debug-only
+        // readback copy below can read out of it.
+        m_PerEmitterAliveCountBuffer.Create(allocator, static_cast<VkDeviceSize>(kMaxEmitters) * sizeof(uint32_t),
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            VMA_MEMORY_USAGE_GPU_ONLY);
+#ifndef NDEBUG
+        m_PerEmitterAliveCountReadbackBuffer.Create(allocator, static_cast<VkDeviceSize>(kMaxEmitters) * sizeof(uint32_t),
+            VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_CPU_TO_GPU, /*mapped=*/true);
+#endif
         // Subtask 3: always kMaxParticles entries long (a power of two, required for bitonic sort --
         // see ParticleSort.comp's own header comment for why this is NOT sized to the frame's actual
         // aliveCount instead). Never host-written -- ParticleSort.comp's own InitKeys pass fully
@@ -202,26 +223,30 @@ namespace renderer {
 
         // =====================================================================================
         // STEP 3 -- Single VkDescriptorSetLayout every particle shader (Subtasks 2-4) binds
-        // unmodified, matching src/shaders/include/ParticleCommon.glsl's 4 fixed bindings exactly:
-        // 0 = ParticleBuffer, 1 = DeadListBuffer, 2 = AliveListBuffer, 3 = CounterBuffer. Two
-        // VkDescriptorSet instances are allocated against it (m_ParticleSet[2]) -- one per physical
-        // m_ParticleBuffer[i], everything else (dead/alive/counter) shared and written identically
-        // into both sets, since only binding 0 ever differs between the two ping-pong sets (see this
-        // class' own header comment on why the free-lists are NOT ping-ponged).
+        // unmodified, matching src/shaders/include/ParticleCommon.glsl's 6 fixed bindings exactly:
+        // 0 = ParticleBuffer, 1 = DeadListBuffer, 2 = AliveListBuffer, 3 = CounterBuffer, 4 =
+        // EmitterParamsBuffer, 5 = PerEmitterAliveCountBuffer (multi-emitter roadmap, subtask A1 --
+        // binding 5 is debug/test instrumentation only, see its own declaration comment, but stays
+        // part of the ONE fixed descriptor-set layout shared by both configs). Two VkDescriptorSet
+        // instances are allocated against it (m_ParticleSet[2]) -- one per physical
+        // m_ParticleBuffer[i], everything else (dead/alive/counter/emitter-params/per-emitter-alive)
+        // shared and written identically into both sets, since only binding 0 ever differs between
+        // the two ping-pong sets (see this class' own header comment on why the free-lists are NOT
+        // ping-ponged).
         // =====================================================================================
         {
-            VkDescriptorSetLayoutBinding bindings[4]{};
-            for (uint32_t b = 0; b < 4; ++b) {
+            VkDescriptorSetLayoutBinding bindings[6]{};
+            for (uint32_t b = 0; b < 6; ++b) {
                 bindings[b] = { b, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, nullptr };
             }
 
             VkDescriptorSetLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-            layoutInfo.bindingCount = 4;
+            layoutInfo.bindingCount = 6;
             layoutInfo.pBindings = bindings;
             VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &layoutInfo, nullptr, &m_SetLayout));
 
             VkDescriptorPoolSize poolSizes[1] = {
-                { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4 * 2 } // 4 bindings x 2 ping-pong sets.
+                { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 6 * 2 } // 6 bindings x 2 ping-pong sets.
             };
             VkDescriptorPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
             poolInfo.maxSets = 2;
@@ -241,13 +266,17 @@ namespace renderer {
                 VkDescriptorBufferInfo deadListInfo{ m_DeadListBuffer.Handle(), 0, m_DeadListBuffer.Size() };
                 VkDescriptorBufferInfo aliveListInfo{ m_AliveListBuffer.Handle(), 0, m_AliveListBuffer.Size() };
                 VkDescriptorBufferInfo counterInfo{ m_CounterBuffer.Handle(), 0, m_CounterBuffer.Size() };
+                VkDescriptorBufferInfo emitterParamsInfo{ m_EmitterParamsBuffer.Handle(), 0, m_EmitterParamsBuffer.Size() };
+                VkDescriptorBufferInfo perEmitterAliveInfo{ m_PerEmitterAliveCountBuffer.Handle(), 0, m_PerEmitterAliveCountBuffer.Size() };
 
-                VkWriteDescriptorSet writes[4]{};
+                VkWriteDescriptorSet writes[6]{};
                 writes[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ParticleSet[i], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &particleInfo, nullptr };
                 writes[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ParticleSet[i], 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &deadListInfo, nullptr };
                 writes[2] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ParticleSet[i], 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &aliveListInfo, nullptr };
                 writes[3] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ParticleSet[i], 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &counterInfo, nullptr };
-                vkUpdateDescriptorSets(m_Device, 4, writes, 0, nullptr);
+                writes[4] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ParticleSet[i], 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &emitterParamsInfo, nullptr };
+                writes[5] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ParticleSet[i], 5, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &perEmitterAliveInfo, nullptr };
+                vkUpdateDescriptorSets(m_Device, 6, writes, 0, nullptr);
             }
         }
 
@@ -630,14 +659,33 @@ namespace renderer {
     }
 
     void ParticleSystemPass::RecordSimulate(VkCommandBuffer cmd, const GlobalSDFPass& globalSDF, float dt, float time,
-        const float emitterPositionWorld[3], uint32_t spawnCount) {
-        // Reset aliveCount to 0 (offset 4) and set spawnQueue to spawnCount (offset 8) -- leaves
-        // deadCount (offset 0) and _pad0 (offset 12) untouched, since only the GPU itself tracks
-        // deadCount's true current value (see this method's own header comment for why aliveCount's
-        // reset-then-rebuild is correct here).
+        const EmitterParams emitters[kMaxEmitters], const uint32_t spawnCounts[kMaxEmitters]) {
+        // Multi-emitter roadmap (subtask A1): this frame's (possibly ImGui-edited) per-emitter
+        // parameters, uploaded wholesale -- every field is live-tunable, so a full re-upload every
+        // call is simplest and cheap (kMaxEmitters * 80 bytes == 320 bytes today).
+        vkCmdUpdateBuffer(cmd, m_EmitterParamsBuffer.Handle(), 0, sizeof(EmitterParams) * kMaxEmitters, emitters);
+
+        // Reset aliveCount to 0 (offset 4) and set spawnQueue to the total requested across every
+        // emitter this call (offset 8, informational only -- see ParticleCommon.glsl's own
+        // CounterBuffer comment, no shader ever reads this field) -- leaves deadCount (offset 0) and
+        // _pad0 (offset 12) untouched, since only the GPU itself tracks deadCount's true current
+        // value (see this method's own header comment for why aliveCount's reset-then-rebuild is
+        // correct here).
         uint32_t zero = 0u;
         vkCmdUpdateBuffer(cmd, m_CounterBuffer.Handle(), 4, sizeof(uint32_t), &zero);
-        vkCmdUpdateBuffer(cmd, m_CounterBuffer.Handle(), 8, sizeof(uint32_t), &spawnCount);
+        uint32_t totalSpawnRequested = 0u;
+        for (uint32_t i = 0; i < kMaxEmitters; ++i) {
+            totalSpawnRequested += spawnCounts[i];
+        }
+        vkCmdUpdateBuffer(cmd, m_CounterBuffer.Handle(), 8, sizeof(uint32_t), &totalSpawnRequested);
+
+        // Debug/test instrumentation only -- zero every emitter's alive counter before this frame's
+        // update dispatch rebuilds it (see PerEmitterAliveCountBuffer's own declaration comment).
+        // Unconditional (not #ifndef NDEBUG-guarded): the fill itself is trivially cheap and matches
+        // this codebase's own "harmless always-there" convention (e.g. CounterBuffer's unused
+        // spawnQueue field) -- only the shader-side atomic increment that would make this buffer's
+        // CONTENTS meaningful is actually Release-excluded.
+        vkCmdFillBuffer(cmd, m_PerEmitterAliveCountBuffer.Handle(), 0, VK_WHOLE_SIZE, 0u);
 
         VulkanUtils::RecordMemoryBarrier(cmd, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
@@ -649,13 +697,6 @@ namespace renderer {
         ParticleSimulationPC pc{};
         pc.dt = dt;
         pc.time = time;
-        pc.emitterPosition[0] = emitterPositionWorld[0];
-        pc.emitterPosition[1] = emitterPositionWorld[1];
-        pc.emitterPosition[2] = emitterPositionWorld[2];
-        pc.bounceElasticity = 0.4f;
-        pc.friction = 0.85f;
-        pc.dragCoefficient = 0.5f;
-        pc.gravityY = -9.8f;
         for (uint32_t level = 0; level < GlobalSDFPass::kLevelCount; ++level) {
             pc.levelVoxelSize[level] = globalSDF.GetLevelVoxelSize(level);
             int32_t centerVoxel[3];
@@ -665,18 +706,28 @@ namespace renderer {
             pc.levelCenterVoxel[level * 3 + 2] = centerVoxel[2];
         }
         pc.clipmapResolution = static_cast<int32_t>(GlobalSDFPass::kClipmapResolution);
-        pc.spawnCount = spawnCount;
         pc.randomSeedBase = static_cast<uint32_t>(time * 1000.0f) * 2654435761u;
 
-        if (spawnCount > 0) {
+        // One spawn dispatch per active emitter this call -- every dispatch pops from the SAME
+        // shared dead-list (see this class' own header comment on why the free-lists are not
+        // per-emitter), so each one gets its own trailing barrier before the next runs, matching this
+        // codebase's own established "explicit barrier between every dependent compute dispatch"
+        // convention rather than relying solely on the dead-list pop's own atomic-hardware ordering.
+        for (uint32_t emitterIndex = 0; emitterIndex < kMaxEmitters; ++emitterIndex) {
+            if (spawnCounts[emitterIndex] == 0u) {
+                continue;
+            }
             pc.mode = 1;
+            pc.spawnCount = spawnCounts[emitterIndex];
+            pc.emitterIndex = emitterIndex;
             vkCmdPushConstants(cmd, m_SimPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-            uint32_t spawnGroups = (spawnCount + 63u) / 64u;
+            uint32_t spawnGroups = (spawnCounts[emitterIndex] + 63u) / 64u;
             vkCmdDispatch(cmd, spawnGroups, 1, 1);
 
-            // Spawn wrote fresh particles into slots the update dispatch below is about to read (and
-            // mutated deadCount) -- both dispatches are COMPUTE_SHADER-stage, so a same-stage
-            // execution + memory barrier is all that is needed between them.
+            // Spawn wrote fresh particles into slots the update dispatch below (and any subsequent
+            // spawn dispatch this same loop) is about to read (and mutated deadCount) -- both are
+            // COMPUTE_SHADER-stage, so a same-stage execution + memory barrier is all that is needed
+            // between them.
             VulkanUtils::RecordMemoryBarrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
                 VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
         }
@@ -685,6 +736,18 @@ namespace renderer {
         vkCmdPushConstants(cmd, m_SimPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
         uint32_t updateGroups = (kMaxParticles + 63u) / 64u;
         vkCmdDispatch(cmd, updateGroups, 1, 1);
+
+#ifndef NDEBUG
+        // Debug/test instrumentation only -- see GetLastPerEmitterAliveCountApprox()'s own comment.
+        // Needs its own COMPUTE_SHADER-write -> TRANSFER-read barrier (the trailing barrier below only
+        // covers the next COMPUTE_SHADER-stage consumer) before the readback copy; no fence-wait
+        // after it, same deliberately stale-tolerant convention as m_AliveCountReadbackBuffer's own
+        // copy in RecordSort().
+        VulkanUtils::RecordMemoryBarrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+        VkBufferCopy perEmitterAliveCopy{ 0, 0, static_cast<VkDeviceSize>(kMaxEmitters) * sizeof(uint32_t) };
+        vkCmdCopyBuffer(cmd, m_PerEmitterAliveCountBuffer.Handle(), m_PerEmitterAliveCountReadbackBuffer.Handle(), 1, &perEmitterAliveCopy);
+#endif
 
         // Trailing barrier for the next COMPUTE_SHADER-stage consumer (Subtask 3's sort dispatch) --
         // see this method's own header comment for why a future render-stage consumer (Subtask 4)
@@ -760,6 +823,14 @@ namespace renderer {
             return 0;
         }
         return *static_cast<const uint32_t*>(m_AliveCountReadbackBuffer.MappedData());
+    }
+
+    uint32_t ParticleSystemPass::GetLastPerEmitterAliveCountApprox(uint32_t emitterIndex) const {
+        if (m_PerEmitterAliveCountReadbackBuffer.MappedData() == nullptr || emitterIndex >= kMaxEmitters) {
+            return 0;
+        }
+        const uint32_t* counts = static_cast<const uint32_t*>(m_PerEmitterAliveCountReadbackBuffer.MappedData());
+        return counts[emitterIndex];
     }
 #endif
 
@@ -922,6 +993,11 @@ namespace renderer {
         m_AliveCountReadbackBuffer.Destroy();
 #endif
         m_IndirectDrawBuffer.Destroy();
+        m_EmitterParamsBuffer.Destroy();
+        m_PerEmitterAliveCountBuffer.Destroy();
+#ifndef NDEBUG
+        m_PerEmitterAliveCountReadbackBuffer.Destroy();
+#endif
         m_CounterBuffer.Destroy();
         m_AliveListBuffer.Destroy();
         m_DeadListBuffer.Destroy();

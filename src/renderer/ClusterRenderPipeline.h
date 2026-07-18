@@ -715,10 +715,12 @@ namespace renderer {
         // comment) but using the identical clamp-against-stalls formula.
         float m_LastParticleFrameTimeSeconds = 0.0f;
         bool m_HasLastParticleFrameTime = false;
-        // Fractional spawn-count carry-over across frames, so config::particles::SPAWN_RATE_PER_SECOND
-        // is exact over time regardless of framerate (e.g. 200/s at 300 fps spawns 0 or 1 particle
-        // most frames, never silently rounding every fractional request down to 0).
-        float m_ParticleSpawnAccumulator = 0.0f;
+        // Multi-emitter roadmap (subtask A1): one fractional spawn-count carry-over per emitter slot
+        // (was a single float pre-A1) so each emitter's own config::particles::EMITTERS[i].spawnRate
+        // stays exact over time regardless of framerate, independently of every other emitter (e.g.
+        // one emitter at 200/s and another at 40/s each round correctly on their own schedule, never
+        // silently rounding a fractional request down to 0).
+        float m_ParticleSpawnAccumulator[ParticleSystemPass::kMaxEmitters] = {};
 
         // Lumen-style GI infrastructure -- unlike the debug-only stats/overlay block below, these
         // are real (if not yet light-transport-consuming) systems, not visualization tools, so
