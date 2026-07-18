@@ -299,6 +299,18 @@ add_executable(PcgGraphEngineTests
 target_include_directories(PcgGraphEngineTests PRIVATE src ${Vulkan_INCLUDE_DIRS})
 add_test(NAME PcgGraphEngineTests COMMAND PcgGraphEngineTests)
 
+# PCG framework roadmap, Phase 3.3 ("Boolean Set Operations"): Union/Intersect/Difference over
+# point sets (volume-based inclusion/exclusion + spline-distance exclusion). PcgBooleanSetOps.cpp
+# depends on Phase 2.4's arc-length utilities (PcgSplineSampler.cpp's BuildSplineArcLengthTable),
+# so this target links that source file too, alongside its own .cpp and the test file.
+add_executable(PcgBooleanSetOpsTests
+    src/pcg/PcgBooleanSetOps.cpp
+    src/pcg/PcgSplineSampler.cpp
+    tests/PcgBooleanSetOpsTests.cpp
+)
+target_include_directories(PcgBooleanSetOpsTests PRIVATE src ${Vulkan_INCLUDE_DIRS})
+add_test(NAME PcgBooleanSetOpsTests COMMAND PcgBooleanSetOpsTests)
+
 add_executable(AsyncDecompressingLoaderTests
     src/io/AsyncFileStreamer.cpp
     src/io/BlockCodec.cpp
