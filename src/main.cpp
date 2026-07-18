@@ -980,6 +980,17 @@ int main(int argc, char** argv) {
                 }
                 ImGui::DragFloat("Cloud Ray Sample Scale", &config::volumetrics::_VOLUMETRIC_CLOUD_VIEW_RAY_SAMPLE_COUNT_SCALE, 0.05f, 0.1f, 10.0f);
 
+                // --- Local Fog Volumes (UE5.8 rendering-parity gap G8) -- localized box/sphere fog
+                // regions injected additively into the froxel grid (see config::localfog::VOLUMES
+                // and renderer::AtmosVolumetricFogPass). "Enable Local Fog Volumes" is a real runtime
+                // toggle (zeroes the injected count live); "Debug: Local Fog Volume Bounds" is a
+                // Debug-only visualization -- the whole config panel is already #ifndef NDEBUG-gated,
+                // and the config read that drives the shader flag is itself gated in RecordUpdate. ---
+                ImGui::Separator();
+                ImGui::TextUnformatted("Local Fog Volumes");
+                ImGui::Checkbox("Enable Local Fog Volumes", &config::localfog::ENABLE);
+                ImGui::Checkbox("Debug: Local Fog Volume Bounds", &config::debugview::LOCAL_FOG_VOLUME_BOUNDS_VIZ);
+
                 // --- Atmos weather system, Subtask 1: Climatic State Manager & Wind Simulation ---
                 // (atmos_integration_plan.md, project root) -- live sliders over config::atmos::*,
                 // consumed every frame by renderer::AtmosClimatePass::RecordUpdate. Grouped in this

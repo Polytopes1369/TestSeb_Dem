@@ -354,6 +354,12 @@ inline bool SSR_FALLBACK_ENABLED = true;
 // renderer::ClusterRenderPipeline::RecordFrame for the actual list/ordering this indexes into.
 namespace debugview {
 inline int SELECTED_BUFFER_INDEX = 0;
+// Debug-only (ImGui "Volumetric" tab, main.cpp) -- when true, renderer::AtmosVolumetricFogPass
+// renders each config::localfog::VOLUMES entry as a bright, per-volume distinct color inside the
+// froxel grid so its extent/shape is directly visible. Read ONLY inside #ifndef NDEBUG blocks (its
+// ImGui checkbox and the RecordUpdate read that drives the shader flag are both gated), so this
+// never contributes any GPU work in a Release build -- see AtmosVolumetricFogPass::RecordUpdate.
+inline bool LOCAL_FOG_VOLUME_BOUNDS_VIZ = false;
 } // namespace debugview
 
 namespace volumetrics {
@@ -363,6 +369,62 @@ inline bool _VOLUMETRIC_FOG_ENABLE = true;
 inline uint32_t _VOLUMETRIC_FOG_GRID_PIXEL_SIZE = 4;
 inline float _VOLUMETRIC_CLOUD_VIEW_RAY_SAMPLE_COUNT_SCALE = 2.0f;
 } // namespace volumetrics
+
+// Local Fog Volumes (UE5.8 rendering-parity gap G8) -- localized, oriented-box or sphere fog
+// regions, each with its own density/color/vertical-falloff and an optional shadowed sun
+// contribution, injected ADDITIVELY into renderer::AtmosVolumetricFogPass's froxel grid on top of
+// the global Exponential Height Fog (postprocess::FOG_*) + Froxel Volumetric Fog. Authored scene
+// content (like config::particles::EMITTERS[] and the VulkanContext zone layout), read ONCE at
+// AtmosVolumetricFogPass::Init to build a small std430 SSBO -- so unlike the postprocess::FOG_*
+// analytic knobs above these are NOT live-tunable per-parameter; only the master ENABLE toggle
+// below takes effect at runtime (it zeroes the injected count for one frame). Same live-toggle
+// convention as volumetrics::_VOLUMETRIC_FOG_ENABLE.
+namespace localfog {
+
+// SSBO capacity. Only the first `active` entries of VOLUMES[] below are uploaded/injected.
+constexpr uint32_t kMaxLocalFogVolumes = 8u;
+
+// 0 = oriented box (halfExtents + yaw), 1 = sphere (sphereRadius, orientation ignored).
+enum class Shape : uint32_t { Box = 0u, Sphere = 1u };
+
+struct LocalFogVolumeConfig {
+    bool active = false;
+    uint32_t shape = 0u;                        // Shape (cast from localfog::Shape).
+    float centerX = 0.0f, centerY = 0.0f, centerZ = 0.0f; // World-space center.
+    float halfX = 1.0f, halfY = 1.0f, halfZ = 1.0f;       // Box half-extents (world units); ignored for a sphere.
+    float sphereRadius = 1.0f;                  // Sphere radius (world units); ignored for a box.
+    float yawDegrees = 0.0f;                    // Box orientation about world +Y; ignored for a sphere.
+    float density = 0.2f;                       // Base extinction density (world^-1) at the volume's base.
+    float heightFalloff = 0.6f;                 // Vertical density decay rate (like FOG_HEIGHT_FALLOFF) within the volume.
+    float edgeSoftness = 0.3f;                  // [0, 1) fractional soft-edge shell so volumes blend into the air.
+    float colorR = 0.8f, colorG = 0.87f, colorB = 1.0f;   // Scattering albedo/tint.
+    bool receivesSunShadow = true;              // Sample the VSM sun shadow for this volume's in-scatter.
+};
+
+// Master runtime toggle (live ImGui "Volumetric" tab). OFF injects a count of 0 for that frame
+// without touching the uploaded SSBO -- see AtmosVolumetricFogPass::RecordUpdate.
+inline bool ENABLE = true;
+
+// Two authored showcase volumes (placed relative to the VulkanContext::GridSlot zone gallery,
+// which spans XZ ~[-5, +5] at ground level, and the rivers/waterfalls feature's waterfall base at
+// world ~(12, -0.6, 12) -- see config::particles::EMITTERS[3]):
+//   [0] a broad, low, gently-yawed box of ground-hugging valley mist blanketing the whole gallery.
+//   [1] a denser sphere of mist billowing at the waterfall base -- COMPLEMENTS (does not fight) the
+//       waterfall's mist/foam sprite particles by adding a soft volumetric body of in-scattered
+//       light around them, rather than re-emitting the same sprites.
+inline LocalFogVolumeConfig VOLUMES[kMaxLocalFogVolumes] = {
+    LocalFogVolumeConfig{ /*active*/ true, /*shape*/ static_cast<uint32_t>(Shape::Box),
+        /*center*/ 0.0f, -0.35f, 0.0f, /*half*/ 9.0f, 1.3f, 9.0f, /*sphereRadius*/ 0.0f,
+        /*yaw*/ 18.0f, /*density*/ 0.14f, /*heightFalloff*/ 0.9f, /*edgeSoftness*/ 0.35f,
+        /*color*/ 0.78f, 0.85f, 1.0f, /*receivesSunShadow*/ true },
+    LocalFogVolumeConfig{ /*active*/ true, /*shape*/ static_cast<uint32_t>(Shape::Sphere),
+        /*center*/ 12.0f, -0.3f, 12.0f, /*half*/ 0.0f, 0.0f, 0.0f, /*sphereRadius*/ 4.5f,
+        /*yaw*/ 0.0f, /*density*/ 0.4f, /*heightFalloff*/ 0.6f, /*edgeSoftness*/ 0.4f,
+        /*color*/ 0.85f, 0.92f, 1.0f, /*receivesSunShadow*/ true },
+    LocalFogVolumeConfig{}, LocalFogVolumeConfig{}, LocalFogVolumeConfig{},
+    LocalFogVolumeConfig{}, LocalFogVolumeConfig{},
+};
+} // namespace localfog
 
 // Atmos weather system (atmos_integration_plan.md, Subtask 1: Climatic State Manager & Wind
 // Simulation) -- live simulation knobs, not a quality-preset tier, so unlike volumetrics:: above
