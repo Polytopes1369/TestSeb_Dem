@@ -696,6 +696,27 @@ add_executable(PcgCellGeneratorTests
 target_include_directories(PcgCellGeneratorTests PRIVATE src tools ${Vulkan_INCLUDE_DIRS})
 add_test(NAME PcgCellGeneratorTests COMMAND PcgCellGeneratorTests)
 
+# PCG roadmap Phase 6.3 ("Runtime Generator Hook", src/world/PcgVolumeCellIndex.h/.cpp): the PURE,
+# Vulkan/PcgInstanceSpawnManager-free half of world::PcgCellLoader (volume-index construction, cell
+# lookup, world::CellCoord<->worldpartition::CellCoord conversion) -- see that header's own top-of-
+# file comment for why it is split out of world::PcgCellLoader.cpp itself. Links
+# ${WORLDPARTITION_PCG_VOLUME_SOURCES} for the same reason PcgCellGeneratorTests above does (a
+# standalone CTest executable never ships, so it is free to link the full offline toolset even
+# though the shipping DemoSceneVK target only links it for Debug -- see PcgVolumeCellIndex.h's own
+# "Debug-only, whole file" comment for that Release-linkage boundary). world::PcgCellLoader itself
+# (the live IWorldCellLoader, needing pcg::PcgInstanceSpawnManager/renderer::PcgInstanceDrawPass/a
+# real Vulkan device) is deliberately NOT linked here -- see PcgCellLoaderTests.cpp's own top-of-file
+# comment for why that end-to-end path is instead validated by
+# renderer::ClusterRenderPipeline::RunPcgCellLoaderSmokeTest() (an in-engine smoke test, not a CTest).
+add_executable(PcgCellLoaderTests
+    src/world/PcgVolumeCellIndex.cpp
+    ${WORLDPARTITION_PCG_VOLUME_SOURCES}
+    src/core/Logger.cpp
+    tests/PcgCellLoaderTests.cpp
+)
+target_include_directories(PcgCellLoaderTests PRIVATE src tools ${Vulkan_INCLUDE_DIRS})
+add_test(NAME PcgCellLoaderTests COMMAND PcgCellLoaderTests)
+
 add_executable(HlodPipelineTests
     ${WORLDPARTITION_HLOD_SOURCES}
     tests/HlodPipelineTests.cpp

@@ -149,7 +149,24 @@ inline uint32_t _TRANSLUCENCY_LIGHTING_VOLUME_DIM = 64;
 
 // Physical Camera
 inline float EXPOSURE_APERTURE = 4.0f;             // f-stop.
-inline float EXPOSURE_SHUTTER_SPEED_SECONDS = 1.0f / 60.0f;
+// 1/8000s (was 1/60s) as of the 2026-07-18 exposure re-tuning pass: the 2026-07-17 lighting
+// recalibration (LightingTypes.h's DirectionalLight::intensity) moved the sun to a real 10,000 lux,
+// but this manual EV100 (aperture/shutter/ISO -> log2(N^2/t * 100/ISO), see PostProcessPass.cpp's
+// ComputeManualEV100) was left at its old pre-recalibration value (EV100 ~9.9, MaxLuminance =
+// 1.2*2^EV100 ~= 1152), washing DEBUG_VIEW_NORMAL out toward white independently of Bloom state.
+// A first-pass theoretical correction (1/500s, EV100 ~13.0) accounted only for the direct sun term
+// (ClusterResolve.comp's `directResponse * sunRadiance`) and proved nowhere near enough once
+// measured -- ClusterResolve.comp's `diffuseAlbedo * skyAmbient` sky-view-LUT ambient term plus the
+// multi-bounce GI passes (Surface Cache / Screen Trace / World Probes) stack substantial additional
+// real-lux-scale radiance on top of direct lighting, pushing total scene luminance far past what a
+// direct-only estimate predicts. Retuned empirically instead (rebuild + --test-pipeline +
+// pixel-sampled luminance histogram of the DEBUG_VIEW_NORMAL screenshots, tests #8-10): 1/8000s
+// raises EV100 to ~17.0 (MaxLuminance ~153600), landing mid-scene luminance at ~160/255 (avg,
+// sampled) with zero clipped (255) pixels and real highlight/shadow contrast -- correctly exposed
+// with headroom above for specular highlights. Aperture left untouched (EXPOSURE_APERTURE also
+// drives DepthOfField.comp's circle-of-confusion f-stop, so changing it would shift DoF blur
+// strength as a side effect); 1/8000s is a realistic, if fast, daylight electronic-shutter speed.
+inline float EXPOSURE_SHUTTER_SPEED_SECONDS = 1.0f / 8000.0f;
 inline float EXPOSURE_ISO = 100.0f;
 // Manual (not Auto) for now: renderer::MegaLightsPass (Phase A) has no temporal reservoir reuse
 // yet (per-frame RIS re-samples a different light, spatially but not temporally denoised -- see
@@ -338,6 +355,16 @@ inline bool LOCAL_FOG_VOLUME_BOUNDS_VIZ = false;
 // this never contributes any GPU work in a Release build -- same convention as
 // LOCAL_FOG_VOLUME_BOUNDS_VIZ just above.
 inline bool PCG_POINT_CLOUD_VIZ = false;
+#ifndef NDEBUG
+// UE5.8 rendering-parity gap G10b (ImGui "Path Tracer" tab, main.cpp) -- when true, renderer::
+// ClusterRenderPipeline runs its reference offline Path Tracer (renderer::PathTracerPass) and blits
+// its progressively-accumulated, tonemapped result to the swapchain in place of the real-time
+// Lumen/MegaLights composite, as a ground-truth validation view (exactly what UE5.8's own Path
+// Tracer render mode is for). Wrapped in #ifndef NDEBUG (a "mode de visualisation", CLAUDE.md rule
+// 8 -- same strict Release-exclusion convention as config::vegetation::WIREFRAME): read ONLY inside
+// #ifndef NDEBUG blocks, so it contributes zero code/symbols to a Release build.
+inline bool PATH_TRACER_ENABLED = false;
+#endif
 } // namespace debugview
 
 // Local Fog Volumes (UE5.8 rendering-parity gap G8) -- localized, oriented-box or sphere fog
@@ -645,6 +672,30 @@ inline uint32_t SEED = 1337u;                // Global determinism seed.
 inline bool WIREFRAME = false;               // Debug-only wireframe/bounds visualization (gated out of Release per CLAUDE.md rule 8).
 #endif
 } // namespace vegetation
+
+// Hair/Fur shading model (UE5.8 rendering-parity gap G10a) -- GPU-instanced procedural fur strands
+// grown off the skinned creature entity's surface (renderer::FurStrandPass). Same "runtime state,
+// not a hardware-quality tier" convention as config::vegetation:: above (NOT mirrored into
+// EngineConfig_{Low,Medium,High,Extrem}.h). ENABLED / OCCLUSION_CULL_ENABLED / the appearance knobs
+// take effect live every frame; the strand-count/length/geometry knobs are consumed only when the
+// strands are (re)generated -- the Debug "Fur / Hair" ImGui tab exposes a Regenerate button that
+// reapplies them at runtime.
+namespace fur {
+inline bool ENABLED = true;                  // Master runtime toggle -- skip the per-frame cull+draw entirely.
+inline bool OCCLUSION_CULL_ENABLED = true;   // Per-strand HZB occlusion test (frustum culling always on).
+inline uint32_t STRAND_COUNT = 14000u;       // Strands baked onto the creature (clamped to FurStrandPass::kMaxStrands). Consumed on (re)generate.
+inline float LENGTH = 0.16f;                 // Base strand length, world units. Consumed on (re)generate (via lengthScale baking) + live at draw.
+inline float LENGTH_JITTER = 0.35f;          // [0,1] per-strand length variation half-range. Consumed on (re)generate.
+inline float WIDTH = 0.020f;                 // Ribbon width, world units (live at draw).
+inline float CURL_AMOUNT = 0.35f;            // Gravity droop + curl strength as a fraction of length (live at draw).
+inline float ROOT_LIFT = 0.008f;             // Outward root offset so a strand's base sits just clear of the skin. Consumed on (re)generate.
+inline float SPEC_INTENSITY = 0.55f;         // Overall hair specular scale (live at draw).
+inline float TRT_INTENSITY = 0.55f;          // Weight of the colored secondary (TRT) highlight (live at draw).
+inline uint32_t SEED = 1337u;                // Global determinism seed. Consumed on (re)generate.
+#ifndef NDEBUG
+inline bool WIREFRAME = false;               // Debug-only wireframe/bounds visualization (gated out of Release per CLAUDE.md rule 8).
+#endif
+} // namespace fur
 
 // Procedural 3D Audio Engine (src/audio/, closes the "moteur de son 3D + style FL studio" gap in
 // this project's own CLAUDE.md design brief -- a fully procedural, real-time-streamed-synthesis
