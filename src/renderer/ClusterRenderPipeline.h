@@ -349,6 +349,11 @@ namespace renderer {
         // convention as e.g. GetTracedEntityInfos() elsewhere in this class.
         const AtmosClimatePass& GetAtmosClimate() const { return m_AtmosClimate; }
 
+        // Exposes ParticleSystemPass for main.cpp's own Particles ImGui tab (Subtask 6's own
+        // Debug-only GetLastAliveCountApprox() readout) -- same "borrow a const ref" convention as
+        // GetAtmosClimate() above.
+        const ParticleSystemPass& GetParticleSystem() const { return m_ParticleSystem; }
+
 #ifndef NDEBUG
         // SWRT/HWRT back-end toggle shared by m_GIInject and m_WorldProbes' own trace pass (0 = SWRT
         // mesh-SDF sphere tracing, 1 = HWRT inline rayQueryEXT against m_SurfaceCacheRT's TLAS) --
@@ -694,16 +699,26 @@ namespace renderer {
         // would show through unrealistically, since water is meant to be the top-most surface).
         WaterForwardPass m_WaterForward;
 
-        // GPU-driven particle system (Niagara-style), Subtask 1 of particle_system_integration_plan.md
-        // (project root) -- currently just the buffer/descriptor-set skeleton (see
-        // renderer::ParticleSystemPass's own class comment); no RecordSimulate/RecordSort/RecordDraw
-        // exist yet (Subtasks 2-4), so this is Init'd/Shutdown'd here but not yet called from
-        // RecordFrame. Declared after m_WaterForward (not interleaved with the GI infrastructure
-        // below) since the eventual render call belongs among the other forward-rendered passes --
-        // see the plan doc's own "after opaque Nanite + m_TransparentForward, before post-process"
-        // ordering requirement, which Subtask 6 will wire up once RecordDraw exists. Always
-        // initialized (not Debug-only), same build-separation rule as m_TransparentForward above.
+        // GPU-driven particle system (Niagara-style), particle_system_integration_plan.md (project
+        // root), all 6 subtasks now integrated -- see renderer::ParticleSystemPass's own class
+        // comment. RecordSimulate/RecordSort run in RecordFrameEarly (right after m_GlobalSDF's own
+        // update, see that call site's own comment); RecordDraw runs in RecordFrameLate's [13c]
+        // forward block, right after m_WaterForward (matching the plan doc's own "after opaque
+        // Nanite + transparent, before post-process" ordering requirement). Declared after
+        // m_WaterForward (not interleaved with the GI infrastructure below) for the same reason.
+        // Always initialized (not Debug-only), same build-separation rule as m_TransparentForward
+        // above.
         ParticleSystemPass m_ParticleSystem;
+        // Subtask 6: this pass' own frame-to-frame delta-time tracking, computed independently from
+        // RecordFrameLate's own `deltaTimeSeconds` (that one isn't computed yet by the time
+        // RecordFrameEarly reaches m_ParticleSystem.RecordSimulate() -- see that call site's own
+        // comment) but using the identical clamp-against-stalls formula.
+        float m_LastParticleFrameTimeSeconds = 0.0f;
+        bool m_HasLastParticleFrameTime = false;
+        // Fractional spawn-count carry-over across frames, so config::particles::SPAWN_RATE_PER_SECOND
+        // is exact over time regardless of framerate (e.g. 200/s at 300 fps spawns 0 or 1 particle
+        // most frames, never silently rounding every fractional request down to 0).
+        float m_ParticleSpawnAccumulator = 0.0f;
 
         // Lumen-style GI infrastructure -- unlike the debug-only stats/overlay block below, these
         // are real (if not yet light-transport-consuming) systems, not visualization tools, so

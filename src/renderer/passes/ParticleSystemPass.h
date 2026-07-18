@@ -67,10 +67,27 @@ namespace renderer {
 
         // Total particle-buffer capacity (both the alive and dead lists are sized to this, and the
         // dead-list is fully populated with indices 0..kMaxParticles-1 at Init() time -- see Init's
-        // own "seed the dead-list" comment). A mid-range GPU-particle budget for a single demoscene
-        // scene's worth of emitters (smoke/sparks/embers, Subtask 6) -- not tied to any hardware
-        // limit, just the working set this system's buffers are sized for.
-        static constexpr uint32_t kMaxParticles = 65536;
+        // own "seed the dead-list" comment). Must stay a power of two (ParticleSort.comp's bitonic
+        // network requirement, see that shader's own header comment).
+        //
+        // Subtask 6 finding (real bug, found only once RecordSimulate/RecordSort/RecordDraw were
+        // actually wired into RecordFrame and run every frame for the first time -- Init-time
+        // validation alone never dispatches these): the original value here, 65536, made
+        // RecordSort()'s 136 full-buffer bitonic compare-exchange dispatches (see that method's own
+        // comment) expensive enough, EVERY single frame, to blow past the Windows driver's TDR
+        // (Timeout Detection and Recovery) budget under Debug + validation-layer overhead, killing
+        // the device (VK_ERROR_DEVICE_LOST) partway through --test-pipeline. At
+        // config::particles::SPAWN_RATE_PER_SECOND's own default (200/s) and a ~2-4s particle
+        // lifetime, steady-state alive count is only a few hundred -- 65536 slots was ~100x more
+        // capacity than this demo's own single test emitter would ever actually use. Reduced to
+        // 4096 (2^12): still generous headroom over realistic steady-state counts, and cuts
+        // RecordSort()'s own dispatch count from 136 to 78 ((12*13)/2) with each dispatch covering
+        // 16x fewer workgroups -- resolved the hang. If a future scene needs a much larger particle
+        // budget, RecordSort's O(log2(N)^2) full-buffer network is the thing to replace first (a
+        // shared-memory local-merge bitonic sort, or an indirect dispatch sized to the actual
+        // aliveCount rounded up to the next power of two instead of always sorting the full fixed
+        // capacity), not just raising this constant back up.
+        static constexpr uint32_t kMaxParticles = 4096;
 
         // Allocates every buffer this pass owns (see this class' own header comment for the full
         // list) via `allocator`, seeds the dead-list with every index 0..kMaxParticles-1 and the
@@ -119,6 +136,18 @@ namespace renderer {
         VkBuffer GetIndirectDrawBufferHandle() const { return m_IndirectDrawBuffer.Handle(); }
         VkBuffer GetCounterBufferHandle() const { return m_CounterBuffer.Handle(); }
 
+#ifndef NDEBUG
+        // Debug-only observability (Subtask 6's own "GPU Particles: alive/max" HUD/ImGui readout):
+        // the alive-particle count as of the last completed GPU->CPU readback, 1-2 frames stale
+        // (RecordSort() copies CounterBuffer.aliveCount into a small host-visible buffer every call,
+        // with no fence-wait for that specific copy -- reading whatever bytes are currently there is
+        // the same "necessarily stale, purely observability" convention this codebase's own World
+        // Partition streaming overlay already accepts). Never compiled into Release -- per CLAUDE.md's
+        // stats-overlay exclusion rule, this whole accessor and its backing buffer exist only in
+        // Debug builds; RecordSort()'s own copy into that buffer is equally `#ifndef NDEBUG`-guarded.
+        uint32_t GetLastAliveCountApprox() const;
+#endif
+
         // Dispatches ParticleSimulation.comp in two passes against GetCurrentSet() (see that
         // shader's own header comment for the full spawn/update contract):
         //   1. Spawn: resets CounterBuffer.aliveCount to 0 (full rebuild, see below) and
@@ -159,10 +188,11 @@ namespace renderer {
 
         // Dispatches ParticleSort.comp (see that shader's own header comment for the full InitKeys/
         // CompareExchange contract) against GetCurrentSet()'s particle state: one InitKeys pass,
-        // then the full O(log2(kMaxParticles)^2) bitonic compare-exchange network (136 dispatches
-        // for kMaxParticles == 65536), each followed by its own VkMemoryBarrier2 (global-memory
-        // bitonic sort has a genuine read-after-write dependency between every single step -- no
-        // shared-memory local-merge optimization exists yet, see ParticleSort.comp's own comment).
+        // then the full O(log2(kMaxParticles)^2) bitonic compare-exchange network (78 dispatches for
+        // kMaxParticles == 4096 -- see that constant's own comment on why it is NOT 65536), each
+        // followed by its own VkMemoryBarrier2 (global-memory bitonic sort has a genuine
+        // read-after-write dependency between every single step -- no shared-memory local-merge
+        // optimization exists yet, see ParticleSort.comp's own comment).
         // Finishes by copying CounterBuffer.aliveCount into the indirect-draw buffer's own
         // `instanceCount` field (a GPU-side vkCmdCopyBuffer, no CPU readback) so a future indirect
         // draw call (Subtask 4) always reflects this frame's real alive count with no extra work at
@@ -265,6 +295,13 @@ namespace renderer {
         VkDescriptorSet m_SortSet = VK_NULL_HANDLE;
         VkPipelineLayout m_SortPipelineLayout = VK_NULL_HANDLE;
         VkPipeline m_SortPipeline = VK_NULL_HANDLE;
+
+#ifndef NDEBUG
+        // Subtask 6, Debug-only: see GetLastAliveCountApprox()'s own comment. 4 bytes, CPU_TO_GPU,
+        // persistently mapped -- RecordSort() vkCmdCopyBuffer's CounterBuffer.aliveCount into this
+        // every call, no fence-wait (deliberately stale-tolerant, observability only).
+        GpuBuffer m_AliveCountReadbackBuffer;
+#endif
 
         // Subtask 4 -- ParticleRender.vert/.frag's own set 2 (ParticleRenderParamsUBO + the sampled
         // GBuffer depth copy borrowed from `resolvePass`, see Init()'s own comment) plus the graphics

@@ -121,8 +121,13 @@ namespace renderer {
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
         m_AliveListBuffer.Create(allocator, kIndexListBytes,
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
+        // TRANSFER_SRC_BIT (on top of the DST_BIT every other buffer here also needs, for the
+        // Init()-time seed upload): RecordSort()'s own instanceCountCopy reads aliveCount OUT of
+        // this buffer via vkCmdCopyBuffer (see that method's own comment), and so does Subtask 6's
+        // Debug-only alive-count readback -- both are genuine copy SOURCES, not just destinations,
+        // unlike the other three buffers below.
         m_CounterBuffer.Create(allocator, kCounterBufferBytes,
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
         m_IndirectDrawBuffer.Create(allocator, kIndirectDrawBufferBytes,
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
             VMA_MEMORY_USAGE_GPU_ONLY);
@@ -132,6 +137,12 @@ namespace renderer {
         // overwrites it every single frame it runs, so no seed upload is needed for this buffer.
         m_SortedPairsBuffer.Create(allocator, static_cast<VkDeviceSize>(kMaxParticles) * sizeof(SortedPair),
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
+
+#ifndef NDEBUG
+        // Subtask 6, Debug-only: see GetLastAliveCountApprox()'s own comment.
+        m_AliveCountReadbackBuffer.Create(allocator, sizeof(uint32_t),
+            VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_CPU_TO_GPU, /*mapped=*/true);
+#endif
 
         // =====================================================================================
         // STEP 2 -- One-shot host -> device seed upload: the dead-list starts holding every slot
@@ -726,6 +737,14 @@ namespace renderer {
         VkBufferCopy instanceCountCopy{ 4, 4, sizeof(uint32_t) };
         vkCmdCopyBuffer(cmd, m_CounterBuffer.Handle(), m_IndirectDrawBuffer.Handle(), 1, &instanceCountCopy);
 
+#ifndef NDEBUG
+        // Subtask 6, Debug-only: see GetLastAliveCountApprox()'s own comment -- deliberately no
+        // fence-wait/barrier around this specific copy, since the whole point is a cheap, stale-
+        // tolerant observability readout, not a value any GPU work this frame depends on.
+        VkBufferCopy aliveCountReadbackCopy{ 4, 0, sizeof(uint32_t) };
+        vkCmdCopyBuffer(cmd, m_CounterBuffer.Handle(), m_AliveCountReadbackBuffer.Handle(), 1, &aliveCountReadbackCopy);
+#endif
+
         // Trailing barrier for the next stage -- covers both a future COMPUTE_SHADER consumer and
         // the TRANSFER write just issued above; a render-stage consumer (Subtask 4) will additionally
         // need its own INDIRECT_COMMAND_READ barrier on the indirect-draw buffer specifically at that
@@ -734,6 +753,15 @@ namespace renderer {
             VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT,
             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
     }
+
+#ifndef NDEBUG
+    uint32_t ParticleSystemPass::GetLastAliveCountApprox() const {
+        if (m_AliveCountReadbackBuffer.MappedData() == nullptr) {
+            return 0;
+        }
+        return *static_cast<const uint32_t*>(m_AliveCountReadbackBuffer.MappedData());
+    }
+#endif
 
     void ParticleSystemPass::RecordDraw(VkCommandBuffer cmd, VkImage colorImage, VkImageView colorView, VkImageView depthView,
         VkImageView refractionOffsetView, VkExtent2D renderExtent,
@@ -890,6 +918,9 @@ namespace renderer {
         }
 
         m_SortedPairsBuffer.Destroy();
+#ifndef NDEBUG
+        m_AliveCountReadbackBuffer.Destroy();
+#endif
         m_IndirectDrawBuffer.Destroy();
         m_CounterBuffer.Destroy();
         m_AliveListBuffer.Destroy();

@@ -953,6 +953,33 @@ int main(int argc, char** argv) {
                 ImGui::EndTabItem();
             }
 
+            // --- Tab Particles (particle_system_integration_plan.md, Subtask 6) ---
+            // Live sliders over config::particles::*, consumed every frame by
+            // renderer::ClusterRenderPipeline::RecordFrame's own RecordSimulate/RecordDraw calls.
+            if (ImGui::BeginTabItem("Particles")) {
+                ImGui::TextUnformatted("Emitter");
+                ImGui::DragFloat("Spawn Rate (particles/s)", &config::particles::SPAWN_RATE_PER_SECOND, 5.0f, 0.0f, 5000.0f);
+                ImGui::DragFloat3("Emitter Position", &config::particles::EMITTER_POSITION_X, 0.05f);
+
+                ImGui::Separator();
+                ImGui::TextUnformatted("Physics");
+                ImGui::DragFloat("Gravity (Y, m/s^2)", &config::particles::GRAVITY, 0.1f, -30.0f, 30.0f);
+                ImGui::SliderFloat("Bounce Elasticity", &config::particles::BOUNCE_ELASTICITY, 0.0f, 1.0f);
+                ImGui::SliderFloat("Friction", &config::particles::FRICTION, 0.0f, 1.0f);
+                ImGui::DragFloat("Wind Drag", &config::particles::DRAG_COEFFICIENT, 0.02f, 0.0f, 5.0f);
+
+                ImGui::Separator();
+                ImGui::TextUnformatted("Rendering");
+                ImGui::DragFloat("Soft Fade Distance (m)", &config::particles::SOFT_FADE_DISTANCE, 0.02f, 0.0f, 5.0f);
+                ImGui::Checkbox("Heat Shimmer", &config::particles::HEAT_SHIMMER_ENABLED);
+                ImGui::SliderFloat("Heat Shimmer Strength", &config::particles::HEAT_SHIMMER_STRENGTH, 0.0f, 0.2f);
+
+                ImGui::Separator();
+                ImGui::TextDisabled("Alive: %u / %u", clusterPipeline.GetParticleSystem().GetLastAliveCountApprox(), renderer::ParticleSystemPass::kMaxParticles);
+
+                ImGui::EndTabItem();
+            }
+
             ImGui::EndTabBar();
         }
 
