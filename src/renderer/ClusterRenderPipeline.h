@@ -171,6 +171,11 @@
 // needed on this class.
 #include "renderer/debug/PcgPointCloudDebugView.h"
 #include "renderer/passes/SDFRayMarchPass.h"
+// UE5.8 rendering-parity gap G10b: DEBUG-only offline/reference Path Tracer -- a ground-truth
+// validation view against the real-time Lumen approximation, so per CLAUDE.md rule 8 ("modes de
+// visualisation") the whole feature (this include, m_PathTracer below, its Init/Shutdown/RecordFrame
+// call sites) lives inside #ifndef NDEBUG and produces zero code/symbols in Release.
+#include "renderer/passes/PathTracerPass.h"
 // Phase 0.2 (UE5.8-parity PCG roadmap, "PCG Instance Draw Path"): only ever instantiated (as a
 // local variable) inside RunPcgInstanceDrawSmokeTest() below -- see that method's own comment.
 // PcgInstanceDrawPass.cpp itself still compiles unconditionally in every build config (it is a
@@ -384,6 +389,12 @@ namespace renderer {
 #endif
 
 #ifndef NDEBUG
+        // UE5.8 rendering-parity gap G10b: number of samples-per-pixel the reference Path Tracer has
+        // progressively accumulated for the current stationary-camera view (resets to 0 on camera
+        // movement) -- read live by main.cpp's Debug ImGui path-tracer panel. 0 when the mode has
+        // never run this session. Debug-only, exactly like every SetDebug*/Get* member below.
+        uint32_t GetPathTracerSampleCount() const { return m_PathTracer.GetAccumulatedSampleCount(); }
+
         // SWRT/HWRT back-end toggle shared by m_GIInject and m_WorldProbes' own trace pass (0 = SWRT
         // mesh-SDF sphere tracing, 1 = HWRT inline rayQueryEXT against m_SurfaceCacheRT's TLAS) --
         // debug-only (main.cpp's 'T'/'Y' explicit-set keys) so both back-ends stay exercised; Release
@@ -1169,6 +1180,15 @@ namespace renderer {
         // comment. Only dispatched (and only ever blitted to the swapchain in place of
         // m_PostProcess's output) when config::debugview::SELECTED_BUFFER_INDEX != 0.
         debug::DebugBufferViewPass m_DebugBufferView;
+
+        // UE5.8 rendering-parity gap G10b: offline/reference unbiased Path Tracer -- traces the SAME
+        // scene TLAS m_SurfaceCacheRT built, evaluates the full Substrate BSDF + NEE per hit,
+        // progressively accumulates samples while the camera is stationary, and (when
+        // config::debugview::PATH_TRACER_ENABLED) blits its tonemapped result to the swapchain in
+        // place of the normal composite. A ground-truth reference to validate the real-time Lumen
+        // view against, exactly like UE5.8's own Path Tracer render mode -- Debug-only per CLAUDE.md
+        // rule 8, same build-separation convention as m_SDFRayMarch/m_DebugBufferView above.
+        PathTracerPass m_PathTracer;
 
         // Phase 0.2 (UE5.8-parity PCG roadmap, "PCG Instance Draw Path"): retains Init()'s own
         // local `indexEntries`/`dagEntries` vectors (STEP 1 above; normally discarded once every

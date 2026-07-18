@@ -1,0 +1,383 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+#extension GL_EXT_ray_tracing : require
+#extension GL_EXT_ray_query : require
+
+// UE5.8 rendering-parity gap G10b -- DEBUG-ONLY offline/reference unbiased Path Tracer (the whole
+// feature is gated out of Release per CLAUDE.md rule 8: "modes de visualisation" -- see
+// renderer::PathTracerPass, which is itself wholly wrapped in #ifndef NDEBUG). This is the
+// ground-truth reference UE5.8 ships specifically to validate Lumen's real-time approximation
+// against; it is NOT a shipping render path.
+//
+// Structure follows the existing SurfaceCacheHWRT.rgen/.rchit/.rmiss ray-tracing-pipeline
+// convention (ray-gen / closest-hit / miss triple + a Shader Binding Table built by
+// renderer::PathTracerPass, reusing renderer::g_RTFunctions / RayTracingFunctions.cpp helpers).
+// It is a single-kernel path tracer: this ray-gen shader drives the whole per-pixel light-transport
+// integration (primary ray, indirect bounces, next-event-estimation shadow rays), the closest-hit
+// shader only resolves surface data into the payload, and the miss shader only flags a miss.
+//
+// Scene-intersection rays (primary + BSDF bounces) use traceRayEXT against the SAME scene TLAS
+// renderer::SurfaceCacheRayTracingPass already built for Lumen (bound at binding 1 -- no second
+// acceleration structure). NEE shadow-visibility rays use inline rayQueryEXT (GL_EXT_ray_query),
+// this codebase's own established convention for a boolean occlusion test (see e.g.
+// MegaLightsFinalShade.comp's TraceShadowRay) -- cheaper than a second SBT hit group + shadow miss
+// shader, and legal in a ray-gen stage since VK_KHR_ray_query is enabled device-wide.
+//
+// Sampling strategy (unbiased Monte Carlo):
+//   - Direct lighting: NEE. The sun (a delta directional light) is sampled every vertex; point
+//     lights (MegaLights' population) are sampled by uniform light selection (config-driven
+//     lightSamples draws, each weighted by lightCount) -- deliberately NOT MegaLights' RIS
+//     reservoir approximation, since a reference path tracer must be unbiased.
+//   - Indirect: one BSDF-importance-sampled bounce direction per vertex, chosen from a
+//     diffuse-cosine / GGX-VNDF specular lobe mixture, with the exact one-sample mixture PDF so the
+//     throughput update f*cos/pdf stays unbiased (reuses ggx_brdf.glsl's SampleGGXVNDF, the same
+//     GGX-VNDF importance sampler ReflectionTrace.comp already validated in this codebase).
+//   - Russian roulette after a couple of bounces for unbiased termination.
+// The full Substrate Slab BSDF (substrate_bsdf.glsl, EvaluateSubstrateMaterial) is evaluated at
+// every hit, so this reference matches the same material model the real-time Lumen path shades with.
+//
+// Progressive accumulation lives in renderer::PathTracerPass: this shader accumulates one sample
+// per pixel per frame into a persistent rgba32f sum image (imageLoad the running sum, add this
+// frame's radiance, imageStore) -- sampleIndex == 0 overwrites (a fresh accumulation start after a
+// camera-movement reset), any later index adds. PathTracerResolve.comp divides the sum by the
+// sample count and tonemaps it to the display image.
+
+#include "include/math_utils.glsl"
+#include "include/ggx_brdf.glsl"
+#include "include/material_params.glsl"
+#include "include/substrate_bsdf.glsl"
+
+// MegaLights point-light population (same SSBO the RIS/ReSTIR real-time path reads) -- binding 7.
+#define MEGALIGHTS_LIGHTS_SET 0
+#define MEGALIGHTS_LIGHTS_BINDING 7
+#include "include/megalights_ris.glsl"
+
+// Persistent HDR accumulation buffer (running SUM of per-sample radiance, NOT the average -- the
+// resolve pass divides by the sample count). rgba32f, not rgba16f: hundreds of accumulated samples
+// of unbounded HDR radiance would lose precision / saturate a half-float sum.
+layout(rgba32f, set = 0, binding = 0) uniform image2D g_Accum;
+
+// The scene TLAS -- SAME handle renderer::SurfaceCacheRayTracingPass built (bound once, its
+// per-frame in-place refit keeps the handle stable). Used by both traceRayEXT (scene rays) and
+// rayQueryEXT (shadow rays) below.
+layout(set = 0, binding = 1) uniform accelerationStructureEXT g_TLAS;
+
+// Bindings 2/3/4 (Fallback Mesh vertex/index/draw-range buffers) are declared and consumed by
+// PathTracer.rchit, NOT here -- the ray-gen shader never touches raw geometry, the closest-hit
+// shader resolves a hit into worldPos/normal/materialID for the payload. They are still part of
+// THIS pipeline's single shared descriptor set 0 (VulkanUtils::WriteSharedGeometryBindings writes
+// TLAS+vertex+index+drawRange at consecutive bindings 1..4).
+
+// renderer::GenerateShowcaseMaterialTable()'s result -- the SAME SSBO handle renderer::
+// ClusterResolvePass uploaded (bound via ClusterResolvePass::GetMaterialParamsBuffer()).
+layout(std430, set = 0, binding = 6) readonly buffer MaterialParamsSSBO {
+    MaterialParams params[];
+} g_MaterialParams;
+
+// binding 7 == g_Lights (megalights_ris.glsl, MegaLightsSSBO -- lightCount + MegaLight[]).
+
+layout(std140, set = 0, binding = 8) uniform PathTracerViewParamsUBO {
+    mat4 invViewProj;          // Un-projects an NDC point to world space for primary-ray generation.
+    vec4 cameraPosWorld;       // xyz = eye position; w unused.
+    vec4 sunDirection;         // xyz = direction FROM the sun TOWARD the scene (LightingTypes.h convention); w unused.
+    vec4 sunColorIntensity;    // rgb = sun color, w = illuminance in LUX (LightingTypes.h DirectionalLight::intensity).
+    vec4 skyHorizon;           // rgb = pre-scaled horizon sky radiance; w unused.
+    vec4 skyZenith;            // rgb = pre-scaled zenith sky radiance; w unused.
+    vec2 viewportSize;         // Render-resolution width/height in pixels.
+    uint sampleIndex;          // 0-based accumulation index for the current stationary-camera period (0 = overwrite).
+    uint frameIndex;           // Ever-incrementing engine frame index -- decorrelates the per-sample RNG across frames.
+    uint maxBounces;           // Indirect bounce budget (e.g. 4-8).
+    uint lightSamples;         // Point-light NEE draws per vertex.
+    uint _pad0;
+    uint _pad1;
+} g_View;
+
+// Closest-hit payload -- byte-layout must match PathTracer.rchit / PathTracer.rmiss exactly.
+struct PTPayload {
+    vec3 hitPos;      // World-space hit position.
+    vec3 hitNormal;   // World-space geometric face normal (NOT yet oriented against the view ray).
+    uint materialID;  // Per-traced-entity materialID (resolved by the closest-hit shader).
+    float hitT;       // Ray parameter at the hit; < 0.0 == miss (set by PathTracer.rmiss).
+};
+layout(location = 0) rayPayloadEXT PTPayload g_Payload;
+
+// ---------------------------------------------------------------------------------------------
+// Small, self-contained RNG (PCG hash-based) -- per this codebase's per-shader-duplicated helper
+// convention. Seeded per pixel + per frame so every accumulated sample uses a distinct sequence
+// (otherwise every frame would trace the identical path and the average would never converge).
+// ---------------------------------------------------------------------------------------------
+uint NextRandUint(inout uint state) {
+    state = state * 747796405u + 2891336453u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+float RandFloat(inout uint state) {
+    return float(NextRandUint(state) & 0x00FFFFFFu) / float(0x01000000u);
+}
+
+// Isotropic Trowbridge-Reitz GGX terms written with the GGX alpha passed DIRECTLY (no perceptual
+// squaring) -- deliberately matches substrate_bsdf.glsl's EvaluateSlabSpecular, whose
+// D_GGXAnisotropic treats slab.roughness AS the GGX alpha (roughnessU == slab.roughness for the
+// isotropic case). Using the same alpha convention here keeps the importance-sampling PDF below
+// consistent with the BSDF actually being evaluated, which is what makes f*cos/pdf unbiased.
+float PT_D_GGX(float NdotH, float alpha) {
+    float a2 = alpha * alpha;
+    float d = NdotH * NdotH * (a2 - 1.0) + 1.0;
+    return a2 / max(PI * d * d, 1.0e-9);
+}
+// Smith GGX masking term G1 for a single direction (Heitz 2014), alpha passed directly.
+float PT_G1_Smith(float NdotX, float alpha) {
+    float a2 = alpha * alpha;
+    float denom = NdotX + sqrt(a2 + (1.0 - a2) * NdotX * NdotX);
+    return 2.0 * NdotX / max(denom, 1.0e-9);
+}
+
+// Cheap analytic sky dome radiance for a ray that leaves the scene -- a vertical horizon->zenith
+// gradient (colors pre-scaled CPU-side to plausible HDR radiance relative to the sun's lux, so the
+// exposure/tonemap resolve lands it in a sensible display range). NO sun disk is added here: the
+// sun is a delta directional light handled exclusively by NEE, so adding it via BSDF-sampled ray
+// misses too would double-count. That keeps the estimator unbiased and gives primary-ray misses a
+// clean sky background.
+vec3 SampleSky(vec3 dir) {
+    float t = saturate(dir.y * 0.5 + 0.5);
+    return mix(g_View.skyHorizon.rgb, g_View.skyZenith.rgb, t);
+}
+
+// Removes non-finite components (a degenerate BSDF/PDF ratio can produce a NaN/Inf) and applies a
+// generous per-sample luminance clamp so a rare firefly (e.g. a near-zero-PDF specular direction,
+// or a uniform light draw landing on a very close point light) cannot poison the whole progressive
+// average. The clamp is high enough that its bias is negligible for this demo's scene scale, while
+// still bounding variance -- the same firefly-suppression every practical path tracer (UE5.8's own
+// included) applies.
+const float kMaxSampleRadiance = 2.0e4;
+vec3 SanitizeRadiance(vec3 c) {
+    // Component-wise NaN/Inf scrub -- `||` is scalar-only in GLSL, so isnan/isinf (which return
+    // bvec3) are applied per-component via two mix() selects rather than a bvec3 `||`.
+    c = mix(c, vec3(0.0), vec3(isnan(c)));
+    c = mix(c, vec3(0.0), vec3(isinf(c)));
+    return clamp(c, vec3(0.0), vec3(kMaxSampleRadiance));
+}
+
+// Inline ray-query boolean occlusion test (GL_EXT_ray_query) -- same technique/flags as
+// MegaLightsFinalShade.comp's TraceShadowRay. TerminateOnFirstHit: any hit at all occludes.
+bool Occluded(vec3 origin, vec3 dir, float tMax) {
+    rayQueryEXT rq;
+    rayQueryInitializeEXT(rq, g_TLAS,
+        gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT, 0xFF, origin, 1.0e-3, dir, tMax);
+    while (rayQueryProceedEXT(rq)) {
+        // Every BLAS triangle is unconditionally opaque -- nothing to confirm/reject manually.
+    }
+    return rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT;
+}
+
+// Next-event estimation at a surface vertex: the sun (delta directional, always sampled) plus a
+// uniform-selection Monte Carlo estimate of the point-light sum. `mat` is the already
+// horizontal-mix-resolved material; N is oriented to face V. Returns the direct radiance leaving
+// this vertex toward V (the caller multiplies by the path throughput).
+vec3 DirectLighting(MaterialParams mat, vec3 P, vec3 N, vec3 V, inout uint rng) {
+    vec3 sum = vec3(0.0);
+    vec3 shadowOrigin = P + N * 1.0e-2;
+
+    // --- Sun (directional delta light) ---
+    {
+        vec3 L = normalize(-g_View.sunDirection.xyz); // surface -> sun.
+        if (dot(N, L) > 0.0) {
+            if (!Occluded(shadowOrigin, L, 1.0e4)) {
+                // EvaluateSubstrateMaterial already returns the NdotL-weighted, /PI-normalized BSDF
+                // response; the caller multiplies by the light's real illuminance (LightingTypes.h).
+                sum += EvaluateSubstrateMaterial(mat, N, V, L) * g_View.sunColorIntensity.rgb * g_View.sunColorIntensity.w;
+            }
+        }
+    }
+
+    // --- Point lights (MegaLights population), uniform-selection unbiased NEE ---
+    uint lc = g_Lights.lightCount;
+    if (lc > 0u && g_View.lightSamples > 0u) {
+        uint K = min(g_View.lightSamples, lc);
+        float weight = float(lc) / float(K); // 1 / pdf(uniform light selection), averaged over K draws.
+        for (uint k = 0u; k < K; ++k) {
+            uint idx = min(uint(RandFloat(rng) * float(lc)), lc - 1u);
+            MegaLight light = g_Lights.lights[idx];
+            vec3 toL = light.position - P;
+            float dist = length(toL);
+            vec3 L = toL / max(dist, 1.0e-4);
+            if (dot(N, L) <= 0.0) {
+                continue;
+            }
+            float distSq = max(dist * dist, 1.0e-4);
+            // Same UE-style windowed falloff as megalights_ris.glsl / MegaLightsFinalShade.comp.
+            float nd = saturate(dist / max(light.radius, 1.0e-4));
+            float nd2 = nd * nd;
+            float ws = 1.0 - nd2 * nd2;
+            float window = saturate(ws * ws);
+            if (window <= 0.0) {
+                continue;
+            }
+            if (Occluded(shadowOrigin, L, max(dist - 2.0e-2, 1.0e-3))) {
+                continue;
+            }
+            // Standard inverse-square illuminance-at-a-point * windowed falloff; intensity is real
+            // candela (LightingTypes.h / MegaLight). Same formula as MegaLightsFinalShade.comp.
+            vec3 contrib = EvaluateSubstrateMaterial(mat, N, V, L) * light.color * light.intensity / distSq * window;
+            sum += contrib * weight;
+        }
+    }
+    return sum;
+}
+
+// Samples one BSDF bounce direction (diffuse-cosine / GGX-VNDF specular lobe mixture) and returns
+// its world-space direction `wi`, the one-sample mixture PDF, and f(wi)*cos(wi) (the full Substrate
+// BSDF response, already NdotL-weighted by EvaluateSubstrateMaterial). Returns false for a
+// below-horizon / degenerate sample.
+bool SampleBSDF(MaterialParams mat, vec3 N, vec3 V, inout uint rng, out vec3 wi, out float pdf, out vec3 brdfCos) {
+    SubstrateSlab s = mat.base;
+    // GGX alpha == slab.roughness (see PT_D_GGX comment -- matches EvaluateSlabSpecular).
+    float alpha = clamp(s.roughness, 1.0e-3, 1.0);
+
+    // Lobe selection probability from luminance-weighted specular-vs-diffuse reflectance, clamped so
+    // neither lobe is ever sampled with zero probability (which would make the mixture PDF zero in a
+    // region where that lobe's BSDF is non-zero -> biased). This mirrors the standard lobe-selection
+    // heuristic; a slightly imperfect split only affects variance, never unbiasedness, because the
+    // PDF below always accounts for BOTH lobes.
+    float lumSpec = dot(s.f0, vec3(0.2126, 0.7152, 0.0722));
+    float lumDiff = dot(s.diffuseAlbedo, vec3(0.2126, 0.7152, 0.0722));
+    float pSpec = clamp(lumSpec / max(lumSpec + lumDiff, 1.0e-4), 0.1, 0.9);
+
+    vec3 T, B;
+    BuildTangentBasis(N, T, B);
+
+    float lobePick = RandFloat(rng);
+    vec2 xi = vec2(RandFloat(rng), RandFloat(rng));
+
+    if (lobePick < pSpec) {
+        // GGX-VNDF specular lobe (ggx_brdf.glsl SampleGGXVNDF -- same importance sampler
+        // ReflectionTrace.comp uses; its `roughness` argument IS the GGX alpha, matching `alpha`).
+        vec3 Vt = vec3(dot(V, T), dot(V, B), dot(V, N));
+        if (Vt.z < 0.0) {
+            Vt = -Vt; // VNDF derivation assumes the view vector in the upper hemisphere.
+        }
+        vec3 Ht = SampleGGXVNDF(xi, Vt, alpha);
+        vec3 H = normalize(T * Ht.x + B * Ht.y + N * Ht.z);
+        wi = reflect(-V, H);
+    } else {
+        // Cosine-weighted diffuse hemisphere sample (Malley's method).
+        float r = sqrt(xi.x);
+        float phi = TAU * xi.y;
+        vec3 local = vec3(r * cos(phi), r * sin(phi), sqrt(max(0.0, 1.0 - xi.x)));
+        wi = normalize(T * local.x + B * local.y + N * local.z);
+    }
+
+    float NdotL = dot(N, wi);
+    if (NdotL <= 0.0) {
+        return false;
+    }
+
+    // One-sample mixture PDF: pSpec * pdf_specular(wi) + (1-pSpec) * pdf_diffuse(wi).
+    vec3 H = normalize(V + wi);
+    float NdotH = max(dot(N, H), 0.0);
+    float NdotV = max(dot(N, V), 1.0e-4);
+    // GGX-VNDF reflected-direction PDF = G1(V) * D(H) / (4 * NdotV) (the VdotH factors cancel).
+    float pdfSpec = PT_G1_Smith(NdotV, alpha) * PT_D_GGX(NdotH, alpha) / (4.0 * NdotV);
+    float pdfDiff = NdotL / PI;
+    pdf = pSpec * pdfSpec + (1.0 - pSpec) * pdfDiff;
+
+    brdfCos = EvaluateSubstrateMaterial(mat, N, V, wi);
+    return pdf > 1.0e-8;
+}
+
+void main() {
+    uvec2 pixel = gl_LaunchIDEXT.xy;
+    if (float(pixel.x) >= g_View.viewportSize.x || float(pixel.y) >= g_View.viewportSize.y) {
+        return;
+    }
+
+    // Per-pixel / per-frame RNG seed (kept odd, non-zero).
+    uint rng = (pixel.x * 1973u + pixel.y * 9277u + g_View.frameIndex * 26699u) | 1u;
+    NextRandUint(rng); // Warm up so adjacent seeds decorrelate immediately.
+
+    // Sub-pixel jitter (Halton, indexed by the accumulation sample count) -> free anti-aliasing that
+    // converges as samples accumulate. Independent of the real-time TAA jitter baked into
+    // invViewProj -- both simply add more sub-pixel coverage, which is exactly what a progressive
+    // path tracer wants.
+    vec2 jitter = Halton23(g_View.sampleIndex + 1u) - vec2(0.5);
+    vec2 ndc = ((vec2(pixel) + vec2(0.5) + jitter) / g_View.viewportSize) * 2.0 - 1.0;
+
+    vec3 rayOrigin = g_View.cameraPosWorld.xyz;
+    // Un-project a mid-depth NDC point (finite w regardless of reversed-Z / infinite-far) to get a
+    // world point on the pixel's ray; the direction is that point minus the eye.
+    vec4 midWorld = g_View.invViewProj * vec4(ndc, 0.5, 1.0);
+    vec3 rayDir = normalize(midWorld.xyz / midWorld.w - rayOrigin);
+
+    vec3 radiance = vec3(0.0);
+    vec3 throughput = vec3(1.0);
+
+    for (uint bounce = 0u; bounce <= g_View.maxBounces; ++bounce) {
+        g_Payload.hitT = -1.0;
+        traceRayEXT(g_TLAS, gl_RayFlagsOpaqueEXT, 0xFF,
+            0, 0, 0, // sbtRecordOffset/stride, missIndex -- single hit group + single miss.
+            rayOrigin, 1.0e-3, rayDir, 1.0e4, 0);
+
+        if (g_Payload.hitT < 0.0) {
+            // Miss -> the sky dome. On the primary ray this is the visible background; on a bounce
+            // it is ambient sky light.
+            radiance += throughput * SampleSky(rayDir);
+            break;
+        }
+
+        vec3 P = g_Payload.hitPos;
+        vec3 N = g_Payload.hitNormal;
+        vec3 V = -rayDir; // toward the previous vertex.
+        if (dot(N, V) < 0.0) {
+            N = -N; // two-sided shading (BLAS uses TRIANGLE_FACING_CULL_DISABLE).
+        }
+
+        uint matSlot = min(g_Payload.materialID, MATERIAL_TABLE_SIZE - 1u);
+        MaterialParams mat = g_MaterialParams.params[matSlot];
+        // Resolve Substrate horizontal mixing (rust-over-metal etc.) into one effective base slab
+        // exactly like ClusterResolve.comp does, so the reference shades the same blended surface.
+        float mixMask;
+        mat = ApplySubstrateHorizontalMix(mat, P, 1.0, mixMask);
+
+        // Emissive surfaces act as area lights via BSDF-sampled path hits (they are never NEE-
+        // sampled, so this is the only contribution path -> no double counting).
+        radiance += throughput * EvaluateSubstrateEmissive(mat);
+
+        // Direct lighting via NEE at this vertex.
+        radiance += throughput * DirectLighting(mat, P, N, V, rng);
+
+        // Russian roulette (after a couple of guaranteed bounces) for unbiased termination.
+        if (bounce >= 2u) {
+            float q = clamp(max(throughput.r, max(throughput.g, throughput.b)), 0.05, 1.0);
+            if (RandFloat(rng) > q) {
+                break;
+            }
+            throughput /= q;
+        }
+
+        if (bounce == g_View.maxBounces) {
+            break; // Last vertex: NEE already added, no further indirect bounce.
+        }
+
+        // Indirect: importance-sample the BSDF for the next bounce direction.
+        vec3 wi;
+        float pdf;
+        vec3 brdfCos;
+        if (!SampleBSDF(mat, N, V, rng, wi, pdf, brdfCos)) {
+            break;
+        }
+        throughput *= brdfCos / pdf;
+        if (max(throughput.r, max(throughput.g, throughput.b)) <= 0.0) {
+            break;
+        }
+        rayOrigin = P + N * 1.0e-3; // offset off the surface along the (view-facing) normal.
+        rayDir = wi;
+    }
+
+    radiance = SanitizeRadiance(radiance);
+
+    // Progressive accumulation: sampleIndex 0 starts a fresh sum (after a camera-movement reset),
+    // otherwise add to the running sum. Each invocation only ever touches its own pixel, so the
+    // imageLoad/imageStore round-trip on the same storage image is race-free.
+    vec3 prevSum = (g_View.sampleIndex == 0u) ? vec3(0.0) : imageLoad(g_Accum, ivec2(pixel)).rgb;
+    imageStore(g_Accum, ivec2(pixel), vec4(prevSum + radiance, 1.0));
+}
