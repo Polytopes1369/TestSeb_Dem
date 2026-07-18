@@ -4,6 +4,8 @@ REM (src/core/debug/DebugTestPipeline.cpp) in one command. Writes test_reports/<
 REM (+ screenshots/) and exits with the number of FAILed tests (0 = every feature passed).
 setlocal
 
+cd /d "%~dp0.."
+
 set PRESET=x64-debug
 set BUILD_DIR=out\build\%PRESET%
 

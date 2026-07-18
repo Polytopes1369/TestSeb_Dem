@@ -1,7 +1,10 @@
 #include "StreamingManager.h"
 
+#include "core/Logger.h"
+
 #include <algorithm>
 #include <cmath>
+#include <format>
 
 namespace world {
 
@@ -13,6 +16,7 @@ namespace world {
 
     StreamingManager::StreamingManager(float cellSize, IWorldCellLoader& loader, core::LoadingManager& workerPool, uint32_t maxConcurrentLoads)
         : m_CellSize(cellSize), m_Loader(loader), m_WorkerPool(workerPool), m_MaxConcurrentLoads(maxConcurrentLoads) {
+        LOG_INFO(std::format("[StreamingManager] Initialized: cellSize={}, maxConcurrentLoads={}.", cellSize, maxConcurrentLoads));
     }
 
     CellCoord StreamingManager::WorldToCell(const maths::vec3& worldPos) const {
@@ -140,6 +144,8 @@ namespace world {
     }
 
     void StreamingManager::Update() {
+        uint32_t dispatchedThisCall = 0;
+
         for (;;) {
             if (m_InFlightCount.load(std::memory_order_relaxed) >= m_MaxConcurrentLoads) break;
 
@@ -160,6 +166,7 @@ namespace world {
             if (!record) continue; // Cannot happen in practice: EnqueueRequest is only ever called right after GetOrCreateCellRecord for the same coord. Defensive only.
 
             m_InFlightCount.fetch_add(1, std::memory_order_acq_rel);
+            ++dispatchedThisCall;
 
             CellRepresentation target = request.targetRepresentation;
             CellCoord coord = request.coord;
@@ -186,6 +193,16 @@ namespace world {
                 }
                 m_InFlightCount.fetch_sub(1, std::memory_order_acq_rel);
                 });
+        }
+
+        // Only logged when this call actually dispatched something -- a steady-state frame with an
+        // empty queue (the common case once the scene has converged) must not spam demo_log.txt,
+        // matching renderer::GeometryStreamingCoordinator::Update's own "summary only if non-trivial"
+        // convention for this codebase's other streaming systems.
+        if (dispatchedThisCall > 0) {
+            std::lock_guard<std::mutex> lock(m_QueueMutex);
+            LOG_INFO(std::format("[StreamingManager] Dispatched {} cell load/unload request(s) this call; {} still in flight, {} pending in queue.",
+                dispatchedThisCall, m_InFlightCount.load(std::memory_order_relaxed), m_PendingQueue.size()));
         }
     }
 

@@ -1,6 +1,6 @@
 @echo off
 call "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat"
-cd /d "%~dp0"
+cd /d "%~dp0.."
 cmake --preset x64-debug
 if errorlevel 1 (
     echo CONFIGURE_FAILED
