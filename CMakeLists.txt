@@ -61,9 +61,21 @@ target_include_directories(${PROJECT_NAME} PRIVATE
 )
 
 # --- Linking ---
+# xaudio2.lib: src/audio/AudioEngine.cpp's XAudio2 backend (procedural 3D audio engine -- see that
+# file's own header comment). Verified against the Windows 10 SDK actually installed on this
+# toolchain (10.0.22621.0 and 10.0.26100.0, both ship xaudio2.h + xaudio2.lib/xaudio2_8.lib under
+# um/x64) -- `xaudio2.lib` (NOT the version-pinned `xaudio2_8.lib`) is the correct modern import
+# library: on this SDK/OS target (_WIN32_WINNT >= _WIN32_WINNT_WIN10), xaudio2.h's own
+# XAudio2Create is an inline function that resolves XAudio2CreateWithVersionInfo via
+# LoadLibraryEx("xaudio2_9.dll")/GetProcAddress at runtime rather than a static DLL import, so
+# XAudio2_9.dll (part of Windows 10/11 itself, System32) is the actual runtime dependency -- zero
+# redistributable/vendoring weight, matching this project's "no heavy frameworks" rule. xaudio2.lib
+# is still linked (small, header-only-adjacent import lib, no bundled weight) both to satisfy any
+# non-inlined symbol reference and to match Microsoft's own documented linking guidance for xaudio2.h.
 target_link_libraries(${PROJECT_NAME} PRIVATE
     glfw
     Vulkan::Vulkan
+    xaudio2.lib
 )
 
 # --- Git commit hash, Debug-only report metadata ---

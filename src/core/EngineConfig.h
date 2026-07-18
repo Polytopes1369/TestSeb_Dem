@@ -489,6 +489,47 @@ inline bool HEAT_SHIMMER_ENABLED = false;
 inline float HEAT_SHIMMER_STRENGTH = 0.02f; // Only applied when HEAT_SHIMMER_ENABLED is true -- see ParticleSystemPass::RecordDraw's own comment on why this is a per-draw-call, not per-particle, toggle.
 } // namespace particles
 
+// Procedural 3D Audio Engine (src/audio/, closes the "moteur de son 3D + style FL studio" gap in
+// this project's own CLAUDE.md design brief -- a fully procedural, real-time-streamed-synthesis
+// audio subsystem, zero .wav/.ogg assets, see audio::AudioEngine's own class comment) -- live-
+// tunable mix/generative knobs, same "runtime state, not a quality-preset tier" convention as
+// config::atmos::/config::particles:: above (NOT mirrored into EngineConfig_{Low,Medium,High,
+// Extrem}.h), tuned live via main.cpp's own Debug-only "Audio" ImGui tab. The underlying
+// audio::AudioEngine itself runs unconditionally in Debug AND Release (a real feature, per
+// CLAUDE.md's build-separation rule) -- only that ImGui tab is #ifndef NDEBUG-gated.
+namespace audio {
+// Master output gain, applied at the XAudio2 mastering voice (IXAudio2MasteringVoice::SetVolume) --
+// scales EVERYTHING (generative music bed + all positional environmental sources) in one place.
+inline float MASTER_VOLUME = 0.8f; // [0,1]
+
+// --- Generative composition layer ("FL Studio style" procedural pattern/sequencer-driven ambient
+// score, audio::GenerativeComposer) -- a non-positional, always-audible 2-channel bed. See that
+// class' own header comment for the pentatonic-scale/chord-progression/step-sequencer design this
+// drives, and why. ---
+inline bool GENERATIVE_MUSIC_ENABLED = true; // OFF stops new notes from triggering; already-sounding notes still ring out through their own release tail (see GenerativeComposer::RenderBlock's own comment) rather than being cut off.
+inline float GENERATIVE_MUSIC_VOLUME = 0.5f; // [0,1] -- this voice's own IXAudio2SourceVoice::SetVolume.
+inline float GENERATIVE_TEMPO_BPM = 66.0f; // Slow, ambient tempo -- see GenerativeComposer.h's own comment for why.
+inline float GENERATIVE_NOTE_DENSITY = 0.35f; // [0,1] -- probability a given 16th-note step actually triggers a new pad note (sparse, Eno "Music for Airports"-style density, not a constant arpeggio).
+inline uint32_t GENERATIVE_SEED = 1337u; // Deterministic-from-seed by default -- matches this codebase's own established "same seed -> same output" procedural-generation discipline (terrain, clusters, HLOD, ...).
+
+// --- 3D positional environmental sources (audio::PositionalSource, audio::AudioEngine) -- world-
+// space sound sources with distance attenuation + stereo panning relative to the camera. Each
+// volume below is that source's own IXAudio2SourceVoice::SetVolume, multiplied every frame by its
+// live-computed distance-attenuation gain (see AudioEngine::Update's own comment) -- independent of
+// MASTER_VOLUME/GENERATIVE_MUSIC_VOLUME above, which apply elsewhere in the mix. ---
+inline bool POSITIONAL_AUDIO_ENABLED = true;
+inline float EMBERS_VOLUME = 0.8f;    // Fire crackle + low rumble bed -- positioned at config::particles::EMITTERS[0]'s own position (the "Embers" emitter).
+inline float WATERFALL_VOLUME = 0.9f; // Continuous filtered-noise rush -- positioned at config::particles::EMITTERS[3]'s own position (the waterfall mist emitter, itself kept in sync with river_spline.glsl's kRiverControlXZ[3]/kRiverControlHeight[3] -- see that EmitterConfig's own comment above).
+inline float WIND_VOLUME = 0.5f;      // Filtered-noise "whoosh" driven by config::atmos::WIND_SPEED_MPS/WIND_DIRECTION_DEGREES -- see PositionalSource.h's own comment for why this source's position tracks the camera rather than sitting at a fixed point.
+
+// Distance attenuation model (audio::PositionalSource::ComputeDistanceAttenuation): OpenAL-style
+// "inverse clamped distance" -- gain = referenceDistance / (referenceDistance + rolloff * max(0,
+// distance - referenceDistance)), clamped to [0,1] and hard-zeroed beyond maxDistance.
+inline float ATTENUATION_REFERENCE_DISTANCE_METERS = 3.0f; // Distance at which gain == 1 (no attenuation).
+inline float ATTENUATION_ROLLOFF = 1.0f; // Higher = falls off faster past the reference distance.
+inline float ATTENUATION_MAX_DISTANCE_METERS = 60.0f; // Beyond this, a source is fully inaudible (gain hard-clamped to 0).
+} // namespace audio
+
 // Active loaded state
 inline bool g_ProfileLoaded = false;
 inline std::string g_ActiveProfileName = "High"; // Default to High properties
