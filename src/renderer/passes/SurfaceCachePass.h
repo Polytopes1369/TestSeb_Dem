@@ -63,7 +63,7 @@
 #include <vulkan/vulkan.h>
 #include <vk_mem_alloc.h>
 
-#include "core/EntityData.h" // core::EntityTransformCPU -- Phase 6's RecordCapture priority ordering.
+#include "core/EntityData.h" // core::EntityTransformCPU/core::EntityData -- Phase 6's RecordCapture priority ordering + Feature 2's translucent-card exclusion.
 #include "core/maths/Maths.h"
 #include "core/EngineConfig.h"
 #include "geometry/CardGenerator.h" // geometry::kSurfaceCacheAtlasSize
@@ -72,6 +72,7 @@
 #include "renderer/vulkan/GpuBuffer.h"
 #include "renderer/vulkan/GpuImage.h"
 #include "renderer/LightingTypes.h"
+#include "renderer/MaterialParameterTable.h" // renderer::MaterialTable -- Feature 2's translucent-card exclusion.
 
 namespace renderer {
 
@@ -142,8 +143,21 @@ namespace renderer {
         // so SurfaceCacheCapture.frag can look up each entity's real materialID and sample the same
         // Substrate material table every other shading pass reads, instead of an independently
         // invented procedural color.
+        //
+        // Feature 2 (Lumen advanced roadmap, translucent-material cache exclusion): `entityDataCPU`
+        // (renderer::VulkanContext::GetEntityData(), index == meshID == card.entityID) and
+        // `materialTable` (the SAME CPU-authored table renderer::VulkanContext::GetMaterialTable()
+        // returns, ClusterRenderPipelineCreateInfo::materialTable) are read ONCE here, right after
+        // m_Cards is populated from the cache file, to std::erase_if every card whose owning
+        // entity's REAL material alpha is < 1.0 (glass/water) -- see this method's own .cpp comment
+        // for why this uses the material's real alpha, NOT core::EntityFlags::IsTransparent (a
+        // VisBuffer-routing flag also forced true on the fully-opaque hero entity, which would
+        // wrongly strip its cards too). A real UE5.8 Lumen Surface Cache never captures translucent
+        // surfaces either -- glass/water are already lit BY this cache via TransparentForwardPass/
+        // WaterForwardPass, they must not also BAKE INTO it as if opaque.
         bool Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
-            const std::filesystem::path& cacheFilePath, VkBuffer entityDataBuffer, VkBuffer materialParamsBuffer);
+            const std::filesystem::path& cacheFilePath, VkBuffer entityDataBuffer, VkBuffer materialParamsBuffer,
+            const core::EntityData* entityDataCPU, const renderer::MaterialTable& materialTable);
 
         void Shutdown();
 

@@ -15,8 +15,24 @@
 // entirely (a long history would smear a sharp reflection across camera motion), while a rough
 // surface (roughness -> 1) keeps a long history for stability (its reflection lobe is already wide
 // and low-frequency, so temporal noise reduction matters far more than responsiveness).
+//
+// Phase 2 (Lumen advanced roadmap): the reprojected history sample is now ALSO variance-clamped
+// against a 3x3 mean/variance AABB in YCoCg space (include/temporal_variance_clamp.glsl, the exact
+// same technique TAATSR.comp already uses for its own history clip) before being blended in --
+// bounds a history value that has drifted too far from what this frame's neighborhood actually
+// produced (e.g. a moving specular highlight sweeping across a surface), on top of the existing
+// world-position/normal disocclusion test above, which only catches a FULLY invalid reprojection
+// (occluded/off-screen), not a still-valid-but-stale one. The 3x3 neighborhood is read from
+// g_ReflectionRawRadiance (a FIXED, non-ping-ponged copy of this frame's raw trace output written by
+// ReflectionTrace.comp), never from g_ReflectionRadiance itself -- see g_ReflectionRawRadiance's own
+// binding comment for why: this very shader invocation is about to read-modify-write
+// g_ReflectionRadiance's CURRENT slot in place, and a neighboring workgroup racing through the same
+// dispatch may already have overwritten ITS pixel with the blended result by the time this
+// invocation's neighborhood loop reaches it -- reading the untouched raw copy instead removes that
+// race entirely.
 
 #include "include/octahedral.glsl"
+#include "include/temporal_variance_clamp.glsl"
 
 layout(local_size_x = 8, local_size_y = 8) in;
 
@@ -43,6 +59,18 @@ layout(rg8, set = 0, binding = 6) uniform readonly image2D g_GBufferRoughnessMet
 #define REFLECTION_VIEW_PARAMS_BINDING 7
 #include "include/reflection_view_params.glsl"
 
+// Phase 2 (Lumen advanced roadmap): fixed (non-ping-ponged), read-only -- see this file's own header
+// comment and renderer::ReflectionPass::m_RawRadianceImage's member comment for why this must be a
+// separate image from g_ReflectionRadiance above, not a self-read of it.
+layout(rgba16f, set = 0, binding = 8) uniform readonly image2D g_ReflectionRawRadiance;
+
+// Variance-clamp box half-width in standard deviations -- matches TAATSR's own EngineConfig-driven
+// varianceClampFactor's typical operating range; this pass has no dedicated UBO field for it (unlike
+// TAATSR.comp's own ubo.varianceClampFactor), so a fixed constant is used instead -- a reflection's
+// own roughness-dependent blend factor (kTemporalAlphaMirror/kTemporalAlphaRough above) already does
+// most of the stability/responsiveness tuning work TAATSR's per-scene tunable exists for.
+const float kVarianceClampFactor = 1.25;
+
 void main() {
     ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
     if (pixel.x >= int(g_ViewParams.viewportSize.x) || pixel.y >= int(g_ViewParams.viewportSize.y)) {
@@ -58,6 +86,33 @@ void main() {
     vec3 newNormal = OctDecode(imageLoad(g_ReflectionNormal, pixel).rg);
     vec4 newRadiance = imageLoad(g_ReflectionRadiance, pixel);
     float roughness = imageLoad(g_GBufferRoughnessMetallic, pixel).r;
+
+    // 3x3 mean/variance AABB in YCoCg space, built from g_ReflectionRawRadiance -- see this file's
+    // own header comment for why this reads the fixed raw copy, not g_ReflectionRadiance's own
+    // ping-pong slot (which this very invocation is about to read-modify-write below).
+    ivec2 viewportSize = ivec2(g_ViewParams.viewportSize);
+    vec3 centerYCoCg = RGBToYCoCg(imageLoad(g_ReflectionRawRadiance, pixel).rgb);
+    vec3 boxMin = centerYCoCg;
+    vec3 boxMax = centerYCoCg;
+    vec3 m1 = centerYCoCg;
+    vec3 m2 = centerYCoCg * centerYCoCg;
+    for (int y = -1; y <= 1; ++y) {
+        for (int x = -1; x <= 1; ++x) {
+            if (x == 0 && y == 0) continue;
+            ivec2 samplePixel = clamp(pixel + ivec2(x, y), ivec2(0), viewportSize - ivec2(1));
+            vec3 neighborYCoCg = RGBToYCoCg(imageLoad(g_ReflectionRawRadiance, samplePixel).rgb);
+            boxMin = min(boxMin, neighborYCoCg);
+            boxMax = max(boxMax, neighborYCoCg);
+            m1 += neighborYCoCg;
+            m2 += neighborYCoCg * neighborYCoCg;
+        }
+    }
+    vec3 mean = m1 / 9.0;
+    vec3 stdDev = sqrt(max(vec3(0.0), (m2 / 9.0) - (mean * mean)));
+    vec3 varianceMin = mean - kVarianceClampFactor * stdDev;
+    vec3 varianceMax = mean + kVarianceClampFactor * stdDev;
+    boxMin = max(boxMin, varianceMin);
+    boxMax = min(boxMax, varianceMax);
 
     vec4 prevClip = g_ViewParams.prevViewProj * vec4(newWorldPos.xyz, 1.0);
 
@@ -77,7 +132,9 @@ void main() {
                 || dot(historyNormal, newNormal) < kDisocclusionCosThreshold;
 
             if (!disoccluded) {
-                historyRadiance = texture(g_HistoryRadiance, prevUV);
+                vec4 rawHistoryRadiance = texture(g_HistoryRadiance, prevUV);
+                vec3 clampedHistoryYCoCg = ClipToAABB(RGBToYCoCg(rawHistoryRadiance.rgb), boxMin, boxMax);
+                historyRadiance = vec4(YCoCgToRGB(clampedHistoryYCoCg), rawHistoryRadiance.a);
                 alpha = mix(kTemporalAlphaMirror, kTemporalAlphaRough, roughness);
             }
         }

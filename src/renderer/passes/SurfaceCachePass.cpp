@@ -130,7 +130,8 @@ namespace renderer {
     } // namespace
 
     bool SurfaceCachePass::Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
-        const std::filesystem::path& cacheFilePath, VkBuffer entityDataBuffer, VkBuffer materialParamsBuffer) {
+        const std::filesystem::path& cacheFilePath, VkBuffer entityDataBuffer, VkBuffer materialParamsBuffer,
+        const core::EntityData* entityDataCPU, const renderer::MaterialTable& materialTable) {
         kCardsPerFrameBudget = config::lumen::CARDS_PER_FRAME_BUDGET;
         kEvictionFrameDelay = config::lumen::EVICTION_FRAME_DELAY;
 
@@ -152,6 +153,37 @@ namespace renderer {
             LOG_ERROR("[SurfaceCachePass] Failed to read the surface-cache card table.");
             return false;
         }
+
+        // Feature 2 (Lumen advanced roadmap): prune every card whose owning entity's REAL material
+        // alpha is < 1.0 -- a static, load-once list (unlike ClusterLODCompact.comp's per-frame
+        // GPU-rebuilt candidate list), so pruning here eliminates atlas page allocation AND capture
+        // draw cost for excluded cards entirely, not just an in-shader early return.
+        //
+        // Deliberately NOT core::EntityFlags::IsTransparent: that flag is a VisBuffer-ROUTING signal
+        // (diverts an entity's clusters out of the opaque Nanite candidate list at
+        // ClusterLODCompact.comp), also forced true on the fully-opaque hero entity (kHeroMaterialID,
+        // alpha 1.0 -- see renderer::VulkanContext::BuildEntityData()'s own comment) purely so that
+        // entity is diverted to HeroTessellationPass instead of the opaque path. Filtering cards on
+        // that flag would wrongly strip the opaque hero's own Surface Cache cards too. The entity's
+        // REAL material alpha (materialTable.params[entityDataCPU[card.entityID].materialID].alpha)
+        // correctly catches water (kWaterMaterialID, alpha 0.85) while correctly sparing the hero
+        // (alpha 1.0) -- exactly matching what TransparentForwardPass/WaterForwardPass's own
+        // materialTable.isTransparent[materialID] filter already does for THEIR candidate lists (see
+        // that member's own comment: computed straight from each material's alpha, never overridden
+        // per-entity).
+        //
+        // A real UE5.8 Lumen Surface Cache never captures translucent surfaces into its own radiance
+        // cache either -- glass/water are already lit BY this cache (via TransparentForwardPass/
+        // WaterForwardPass sampling it at their own shading time), they must not also bake INTO it as
+        // if they were opaque geometry.
+        std::erase_if(m_Cards, [&](const geometry::SurfaceCacheCardEntry& card) {
+            uint32_t materialID = entityDataCPU[card.entityID].materialID;
+            return materialTable.params[materialID].alpha < 1.0f;
+            });
+        LOG_INFO(std::format(
+            "[SurfaceCachePass] {} card(s) remain after excluding translucent-material entities from Surface Cache capture.",
+            m_Cards.size()));
+
         // Every card starts non-resident (see CardRuntimeState's own comment) -- UpdateVisibility()
         // is what grants a card its first atlas page, the first time it is actually on screen.
         m_CardStates.assign(m_Cards.size(), CardRuntimeState{});

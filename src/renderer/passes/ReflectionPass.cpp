@@ -60,6 +60,13 @@ namespace renderer {
         // GetHitMaskView()'s own comment for why).
         VulkanUtils::CreateStorageSampledImage2D(allocator, device, kHitMaskFormat, renderExtent, m_HitMaskImage, m_HitMaskAllocation, m_HitMaskView);
 
+        // Phase 2 (Lumen advanced roadmap): raw radiance + half-vector -- both single fixed images,
+        // same "consumed same-frame, never reprojected" lifetime as m_HitMaskImage above (see
+        // m_RawRadianceImage/m_HalfVectorImage's own member comments in the header for why each is
+        // NOT one of the two ping-pong ReflectionSlot fields).
+        VulkanUtils::CreateStorageSampledImage2D(allocator, device, kRawRadianceFormat, renderExtent, m_RawRadianceImage, m_RawRadianceAllocation, m_RawRadianceView);
+        VulkanUtils::CreateStorageSampledImage2D(allocator, device, kHalfVectorFormat, renderExtent, m_HalfVectorImage, m_HalfVectorAllocation, m_HalfVectorView);
+
         VkSamplerCreateInfo samplerInfo{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
         samplerInfo.magFilter = VK_FILTER_LINEAR;
         samplerInfo.minFilter = VK_FILTER_LINEAR;
@@ -91,6 +98,8 @@ namespace renderer {
                 }
             }
             VulkanUtils::ClearComputeImageToGeneral(cmd, m_HitMaskImage, zeroClear);
+            VulkanUtils::ClearComputeImageToGeneral(cmd, m_RawRadianceImage, zeroClear);
+            VulkanUtils::ClearComputeImageToGeneral(cmd, m_HalfVectorImage, normalClear); // Arbitrary but valid oct-encoded direction, same convention as m_Slots' own normal clear.
             });
 
         // =====================================================================================
@@ -98,8 +107,11 @@ namespace renderer {
         // trace scene) + set 2 (surface cache sampling), both shared unmodified from traceContext.
         // =====================================================================================
         {
-            VkDescriptorSetLayoutBinding bindings[12]{};
-            for (uint32_t b : { 0u, 1u, 2u, 3u, 9u, 10u, 11u }) {
+            // Bindings 12/13 (Phase 2, Lumen advanced roadmap): m_RawRadianceImage/m_HalfVectorImage
+            // -- see those members' own header comments. Both single fixed images (bound identically
+            // for both slot variants below, exactly like binding 11's hitMaskInfo already is).
+            VkDescriptorSetLayoutBinding bindings[14]{};
+            for (uint32_t b : { 0u, 1u, 2u, 3u, 9u, 10u, 11u, 12u, 13u }) {
                 bindings[b] = { b, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
             }
             bindings[4] = { 4, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
@@ -109,12 +121,13 @@ namespace renderer {
             bindings[8] = { 8, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
 
             VkDescriptorSetLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-            layoutInfo.bindingCount = 12;
+            layoutInfo.bindingCount = 14;
             layoutInfo.pBindings = bindings;
             VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &layoutInfo, nullptr, &m_TraceSetLayout));
 
+            // Storage image count: bindings {0,1,2,3,9,10,11,12,13} == 9 per set.
             VkDescriptorPoolSize poolSizes[4] = {
-                { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 7 * 2 },
+                { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 9 * 2 },
                 { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1 * 2 },
                 { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3 * 2 },
                 { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 * 2 }
@@ -138,6 +151,10 @@ namespace renderer {
             VkDescriptorImageInfo gbufferDepthInfo{ VK_NULL_HANDLE, resolvePass.GetOutputDepthView(), VK_IMAGE_LAYOUT_GENERAL };
             VkDescriptorImageInfo gbufferRoughnessMetallicInfo{ VK_NULL_HANDLE, resolvePass.GetOutputRoughnessMetallicView(), VK_IMAGE_LAYOUT_GENERAL };
             VkDescriptorImageInfo hitMaskInfo{ VK_NULL_HANDLE, m_HitMaskView, VK_IMAGE_LAYOUT_GENERAL };
+            // Single fixed images (Phase 2, Lumen advanced roadmap) -- bound identically for both
+            // slot variants below, exactly like hitMaskInfo above.
+            VkDescriptorImageInfo rawRadianceInfo{ VK_NULL_HANDLE, m_RawRadianceView, VK_IMAGE_LAYOUT_GENERAL };
+            VkDescriptorImageInfo halfVectorInfo{ VK_NULL_HANDLE, m_HalfVectorView, VK_IMAGE_LAYOUT_GENERAL };
 
             for (uint32_t slotIndex = 0; slotIndex < 2; ++slotIndex) {
                 const ReflectionSlot& slot = m_Slots[slotIndex];
@@ -145,7 +162,7 @@ namespace renderer {
                 VkDescriptorImageInfo worldPosInfo{ VK_NULL_HANDLE, slot.worldPosView, VK_IMAGE_LAYOUT_GENERAL };
                 VkDescriptorImageInfo normalInfo{ VK_NULL_HANDLE, slot.normalView, VK_IMAGE_LAYOUT_GENERAL };
 
-                VkWriteDescriptorSet writes[8]{};
+                VkWriteDescriptorSet writes[10]{};
                 writes[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_TraceSet[slotIndex], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &radianceInfo, nullptr, nullptr };
                 writes[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_TraceSet[slotIndex], 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &gbufferNormalInfo, nullptr, nullptr };
                 writes[2] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_TraceSet[slotIndex], 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &gbufferDepthInfo, nullptr, nullptr };
@@ -154,7 +171,9 @@ namespace renderer {
                 writes[5] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_TraceSet[slotIndex], 9, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &worldPosInfo, nullptr, nullptr };
                 writes[6] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_TraceSet[slotIndex], 10, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &normalInfo, nullptr, nullptr };
                 writes[7] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_TraceSet[slotIndex], 11, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &hitMaskInfo, nullptr, nullptr };
-                vkUpdateDescriptorSets(m_Device, 8, writes, 0, nullptr);
+                writes[8] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_TraceSet[slotIndex], 12, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &rawRadianceInfo, nullptr, nullptr };
+                writes[9] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_TraceSet[slotIndex], 13, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &halfVectorInfo, nullptr, nullptr };
+                vkUpdateDescriptorSets(m_Device, 10, writes, 0, nullptr);
 
                 VulkanUtils::WriteSharedGeometryBindings(m_Device, m_TraceSet[slotIndex], 4, tlasHandle,
                     surfaceCache.GetVertexBuffer(), surfaceCache.GetIndexBuffer(), rtPass.GetDrawRangeBuffer());
@@ -184,7 +203,11 @@ namespace renderer {
         // STEP 3 -- Temporal pipeline: set 0 (8 bindings, 2 slot-indexed variants).
         // =====================================================================================
         {
-            VkDescriptorSetLayoutBinding bindings[8]{};
+            // Binding 8 (Phase 2, Lumen advanced roadmap): m_RawRadianceImage, read-only -- feeds the
+            // new 3x3 neighborhood variance-clamp box (see ReflectionTemporal.comp's own header
+            // comment and m_RawRadianceImage's own member comment for why this must be a separate
+            // fixed image rather than a self-read of binding 0's own ping-pong slot).
+            VkDescriptorSetLayoutBinding bindings[9]{};
             bindings[0] = { 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
             bindings[1] = { 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
             bindings[2] = { 2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
@@ -193,14 +216,16 @@ namespace renderer {
             bindings[5] = { 5, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
             bindings[6] = { 6, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
             bindings[7] = { 7, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+            bindings[8] = { 8, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
 
             VkDescriptorSetLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-            layoutInfo.bindingCount = 8;
+            layoutInfo.bindingCount = 9;
             layoutInfo.pBindings = bindings;
             VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &layoutInfo, nullptr, &m_TemporalSetLayout));
 
+            // Storage image count: bindings {0,1,2,6,8} == 5 per set.
             VkDescriptorPoolSize poolSizes[3] = {
-                { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 4 * 2 },
+                { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 5 * 2 },
                 { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3 * 2 },
                 { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 * 2 }
             };
@@ -219,6 +244,9 @@ namespace renderer {
 
             VkDescriptorBufferInfo viewParamsInfo{ m_ViewParamsBuffer.Handle(), 0, m_ViewParamsBuffer.Size() };
             VkDescriptorImageInfo gbufferRoughnessMetallicInfo{ VK_NULL_HANDLE, resolvePass.GetOutputRoughnessMetallicView(), VK_IMAGE_LAYOUT_GENERAL };
+            // Single fixed image (Phase 2, Lumen advanced roadmap) -- bound identically for both slot
+            // variants below, same convention as m_TraceSet's own hitMaskInfo/rawRadianceInfo.
+            VkDescriptorImageInfo rawRadianceReadInfo{ VK_NULL_HANDLE, m_RawRadianceView, VK_IMAGE_LAYOUT_GENERAL };
 
             for (uint32_t slotIndex = 0; slotIndex < 2; ++slotIndex) {
                 const ReflectionSlot& current = m_Slots[slotIndex];
@@ -231,7 +259,7 @@ namespace renderer {
                 VkDescriptorImageInfo histWorldPos{ m_ReflectionSampler, history.worldPosView, VK_IMAGE_LAYOUT_GENERAL };
                 VkDescriptorImageInfo histNormal{ m_ReflectionSampler, history.normalView, VK_IMAGE_LAYOUT_GENERAL };
 
-                VkWriteDescriptorSet writes[8]{};
+                VkWriteDescriptorSet writes[9]{};
                 writes[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_TemporalSet[slotIndex], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &curRadiance, nullptr, nullptr };
                 writes[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_TemporalSet[slotIndex], 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &curWorldPos, nullptr, nullptr };
                 writes[2] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_TemporalSet[slotIndex], 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &curNormal, nullptr, nullptr };
@@ -240,7 +268,8 @@ namespace renderer {
                 writes[5] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_TemporalSet[slotIndex], 5, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &histNormal, nullptr, nullptr };
                 writes[6] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_TemporalSet[slotIndex], 6, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &gbufferRoughnessMetallicInfo, nullptr, nullptr };
                 writes[7] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_TemporalSet[slotIndex], 7, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &viewParamsInfo, nullptr };
-                vkUpdateDescriptorSets(m_Device, 8, writes, 0, nullptr);
+                writes[8] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_TemporalSet[slotIndex], 8, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &rawRadianceReadInfo, nullptr, nullptr };
+                vkUpdateDescriptorSets(m_Device, 9, writes, 0, nullptr);
             }
 
             VkPipelineLayoutCreateInfo pipelineLayoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
@@ -269,21 +298,26 @@ namespace renderer {
         // per-slot curRadiance binding.
         // =====================================================================================
         {
-            VkDescriptorSetLayoutBinding bindings[9]{};
+            // Binding 9 (Phase 2, Lumen advanced roadmap): m_HalfVectorImage, read-only -- see that
+            // member's own header comment. Like bindings 7/8, the SAME resource for both slot
+            // variants below.
+            VkDescriptorSetLayoutBinding bindings[10]{};
             for (uint32_t b = 0; b <= 5; ++b) {
                 bindings[b] = { b, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
             }
             bindings[6] = { 6, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
             bindings[7] = { 7, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
             bindings[8] = { 8, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+            bindings[9] = { 9, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
 
             VkDescriptorSetLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-            layoutInfo.bindingCount = 9;
+            layoutInfo.bindingCount = 10;
             layoutInfo.pBindings = bindings;
             VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &layoutInfo, nullptr, &m_GatherSetLayout));
 
+            // Storage image count: bindings {0,1,2,3,4,5,7,9} == 8 per set.
             VkDescriptorPoolSize poolSizes[3] = {
-                { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 7 * 2 },
+                { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 8 * 2 },
                 { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 * 2 },
                 { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1 * 2 }
             };
@@ -308,6 +342,9 @@ namespace renderer {
             VkDescriptorBufferInfo viewParamsInfo{ m_ViewParamsBuffer.Handle(), 0, m_ViewParamsBuffer.Size() };
             VkDescriptorImageInfo gbufferMaterialIDInfo{ VK_NULL_HANDLE, resolvePass.GetOutputMaterialIDView(), VK_IMAGE_LAYOUT_GENERAL };
             VkDescriptorBufferInfo materialParamsInfo{ resolvePass.GetMaterialParamsBuffer(), 0, VK_WHOLE_SIZE };
+            // Single fixed image (Phase 2, Lumen advanced roadmap) -- bound identically for both slot
+            // variants below, same convention as gbufferMaterialIDInfo above.
+            VkDescriptorImageInfo halfVectorReadInfo{ VK_NULL_HANDLE, m_HalfVectorView, VK_IMAGE_LAYOUT_GENERAL };
 
             for (uint32_t slotIndex = 0; slotIndex < 2; ++slotIndex) {
                 const ReflectionSlot& current = m_Slots[slotIndex];
@@ -315,14 +352,15 @@ namespace renderer {
 
                 VkDescriptorImageInfo* storageInfos[6] = { &curRadiance, &gbufferNormalInfo, &gbufferDepthInfo, &gbufferAlbedoInfo, &gbufferRoughnessMetallicInfo, &outputColorInfo };
 
-                VkWriteDescriptorSet writes[9]{};
+                VkWriteDescriptorSet writes[10]{};
                 for (uint32_t b = 0; b <= 5; ++b) {
                     writes[b] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_GatherSet[slotIndex], b, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, storageInfos[b], nullptr, nullptr };
                 }
                 writes[6] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_GatherSet[slotIndex], 6, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &viewParamsInfo, nullptr };
                 writes[7] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_GatherSet[slotIndex], 7, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &gbufferMaterialIDInfo, nullptr, nullptr };
                 writes[8] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_GatherSet[slotIndex], 8, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &materialParamsInfo, nullptr };
-                vkUpdateDescriptorSets(m_Device, 9, writes, 0, nullptr);
+                writes[9] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_GatherSet[slotIndex], 9, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &halfVectorReadInfo, nullptr, nullptr };
+                vkUpdateDescriptorSets(m_Device, 10, writes, 0, nullptr);
             }
 
             VkPipelineLayoutCreateInfo pipelineLayoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
@@ -373,6 +411,8 @@ namespace renderer {
                 if (slot.normalView != VK_NULL_HANDLE) vkDestroyImageView(m_Device, slot.normalView, nullptr);
             }
             if (m_HitMaskView != VK_NULL_HANDLE) vkDestroyImageView(m_Device, m_HitMaskView, nullptr);
+            if (m_RawRadianceView != VK_NULL_HANDLE) vkDestroyImageView(m_Device, m_RawRadianceView, nullptr);
+            if (m_HalfVectorView != VK_NULL_HANDLE) vkDestroyImageView(m_Device, m_HalfVectorView, nullptr);
         }
         if (m_Allocator != VK_NULL_HANDLE) {
             for (ReflectionSlot& slot : m_Slots) {
@@ -381,6 +421,8 @@ namespace renderer {
                 vmaDestroyImage(m_Allocator, slot.normalImage, slot.normalAllocation);
             }
             vmaDestroyImage(m_Allocator, m_HitMaskImage, m_HitMaskAllocation);
+            vmaDestroyImage(m_Allocator, m_RawRadianceImage, m_RawRadianceAllocation);
+            vmaDestroyImage(m_Allocator, m_HalfVectorImage, m_HalfVectorAllocation);
         }
         m_ViewParamsBuffer.Destroy();
 
@@ -394,6 +436,8 @@ namespace renderer {
         m_Slots[0] = ReflectionSlot{};
         m_Slots[1] = ReflectionSlot{};
         m_HitMaskImage = VK_NULL_HANDLE; m_HitMaskAllocation = VK_NULL_HANDLE; m_HitMaskView = VK_NULL_HANDLE;
+        m_RawRadianceImage = VK_NULL_HANDLE; m_RawRadianceAllocation = VK_NULL_HANDLE; m_RawRadianceView = VK_NULL_HANDLE;
+        m_HalfVectorImage = VK_NULL_HANDLE; m_HalfVectorAllocation = VK_NULL_HANDLE; m_HalfVectorView = VK_NULL_HANDLE;
         m_CurrentSlotIndex = 0;
         m_RenderExtent = { 0, 0 };
         m_Allocator = VK_NULL_HANDLE;

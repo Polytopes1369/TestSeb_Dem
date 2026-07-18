@@ -26,7 +26,7 @@ namespace debugpipeline {
     class ScreenshotCapture {
     public:
         // Records, into the caller's already-open `cmd` (mid-frame, right after
-        // ClusterRenderPipeline::RecordFrame() has recorded its own final PRESENT_SRC_KHR barrier
+        // ClusterRenderPipeline::RecordFrameLate() has recorded its own final PRESENT_SRC_KHR barrier
         // and before vkEndCommandBuffer()), a transition to TRANSFER_SRC_OPTIMAL, a copy into a
         // freshly allocated staging buffer, and a transition back to PRESENT_SRC_KHR (matching the
         // layout RecordFrame's own barrier already left the image in, so this frame's own

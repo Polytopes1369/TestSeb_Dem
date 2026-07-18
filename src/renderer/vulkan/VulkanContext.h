@@ -33,7 +33,41 @@ public:
     VkImageView GetDepthImageView() const { return m_DepthImageView; }
     VkImage GetDepthImage() const { return m_DepthImage; }
     VkFormat GetDepthFormat() const { return m_DepthFormat; }
-    VkCommandBuffer GetCommandBuffer() const { return m_CommandBuffer; }
+    // Phase 2 (Lumen advanced roadmap) fix: this frame's Nanite/GI work is now split across THREE
+    // separate graphics-queue command buffers/submissions (previously one) so the async-compute
+    // queue's Surface Cache TLAS-refit + radiosity injection can run genuinely CONCURRENTLY with
+    // this queue's own Nanite VisBuffer culling/raster work, instead of only ever starting after
+    // the entire graphics frame had already finished (a single vkQueueSubmit's signal semaphores
+    // only fire once every command buffer in that submission completes -- see
+    // renderer::ClusterRenderPipeline::RecordFrameEarly's own class-comment addendum for the full
+    // root-cause explanation). All three are allocated from the SAME m_CommandPool (same graphics
+    // queue family) -- same-queue submission order alone (no semaphore) is what makes cmdEarly's
+    // trailing barriers visible to cmdMid, and cmdMid's to cmdLate, exactly like this codebase's
+    // existing single-command-buffer intra-frame barriers already relied on same-queue ordering
+    // across the [13] HZB rebuild -> next frame boundary.
+    //   - GetCommandBufferEarly(): Virtual Shadow Map/Virtual Texture "begin frame", Surface Cache
+    //     capture, Global SDF update, and (only when async compute is active this frame) the
+    //     RELEASE half of the Surface Cache atlas/TLAS ownership transfer to the async-compute
+    //     queue family. Submitted first, signals GetAsyncComputeCanStartSemaphore(), waits on
+    //     nothing.
+    //   - GetCommandBufferMid(): the Nanite VisBuffer pipeline (LOD selection/culling, HW+SW
+    //     raster, resolve) plus this frame's geometry-streaming triage -- none of this samples the
+    //     Surface Cache atlas/TLAS, so it needs no wait on the async-compute queue at all. It DOES
+    //     wait on GetTransferFinishedSemaphore() (the geometry page pool's own queue-family-
+    //     ownership acquire + decompression + raster reads run here, not in cmdEarly/cmdLate).
+    //     Submitted second (same queue as cmdEarly, so implicitly ordered after it).
+    //   - GetCommandBufferLate(): (only when async compute is active this frame) the ACQUIRE half
+    //     of the Surface Cache ownership transfer back from the async-compute queue family, then
+    //     every GI/reflection/forward pass that reads the Surface Cache atlas/TLAS this same frame
+    //     (Reflection, World Probes, MegaLights' shadow rays, the 3 forward passes), post-process,
+    //     and the final swapchain blit + present transition. Submitted third (same queue,
+    //     implicitly ordered after cmdMid), additionally waits on GetImageAvailableSemaphore() and
+    //     GetAsyncComputeFinishedSemaphore(), and is the ONE submission guarded by the per-frame
+    //     frameFence (main.cpp) -- see that fence's own declaration-site comment for why cmdEarly/
+    //     cmdMid need no fence of their own.
+    VkCommandBuffer GetCommandBufferEarly() const { return m_CommandBuffer; }
+    VkCommandBuffer GetCommandBufferMid() const { return m_CommandBufferMid; }
+    VkCommandBuffer GetCommandBufferLate() const { return m_CommandBufferLate; }
 
     // Visibility Buffer attachments (replaces the classic lit-color G-Buffer target): two
     // single-channel R32_UINT images, index-aligned per-pixel -- ClusterID and local TriangleID
@@ -61,6 +95,33 @@ public:
     // waits on this before consuming anything the transfer queue uploaded this frame. See
     // main.cpp's per-frame submit sequence.
     VkSemaphore GetTransferFinishedSemaphore() const { return m_TransferFinishedSemaphore; }
+
+    // Dedicated async-compute queue (Phase 2, Lumen advanced roadmap -- UE 5.8 RHI parity, mirrors
+    // GetTransferQueue()'s own "prefer dedicated, fall back to graphics family" query exactly, just
+    // searching for a family that advertises COMPUTE_BIT but NOT GRAPHICS_BIT instead of a
+    // transfer-only family). Used by renderer::ClusterRenderPipeline to move
+    // SurfaceCacheRayTracingPass::RecordRefreshTLAS + SurfaceCacheGIInjectPass::RecordInject's
+    // radiosity bounce loop off the graphics queue -- see that class' own RecordFrame comment for
+    // the full per-frame cross-queue sequencing contract. Falls back to the graphics queue/family
+    // when the GPU exposes no distinct async-compute-capable family (e.g. Intel iGPUs, or any GPU
+    // whose only non-graphics queue happens to also be transfer-only) -- HasDedicatedAsyncComputeQueue()
+    // tells a caller whether queue-family-ownership-transfer barriers are actually needed (same
+    // family == none needed), exactly like HasDedicatedTransferQueue() above.
+    VkQueue GetAsyncComputeQueue() const { return m_AsyncComputeQueue; }
+    uint32_t GetAsyncComputeQueueFamilyIndex() const { return m_AsyncComputeQueueFamilyIndex; }
+    bool HasDedicatedAsyncComputeQueue() const { return m_HasDedicatedAsyncComputeQueue; }
+    VkCommandBuffer GetAsyncComputeCommandBuffer() const { return m_AsyncComputeCommandBuffer; }
+    // Bidirectional semaphore pair (unlike the transfer queue's one-way m_TransferFinishedSemaphore):
+    // signaled by the GRAPHICS queue after this frame's Surface Cache capture writes the atlas
+    // (releasing ownership of the 5 atlas images the async-compute work reads/writes), waited on by
+    // the ASYNC-COMPUTE queue's own submission before it acquires them and starts TLAS refit + GI
+    // injection. See main.cpp's per-frame submit sequence.
+    VkSemaphore GetAsyncComputeCanStartSemaphore() const { return m_AsyncComputeCanStartSemaphore; }
+    // Signaled by the ASYNC-COMPUTE queue after it releases m_Radiance + the TLAS back to the
+    // graphics queue family, waited on by the GRAPHICS queue's own submission before any same-frame
+    // consumer (Screen Trace / World Probes / GI Composite / Reflection) reads either. See main.cpp's
+    // per-frame submit sequence.
+    VkSemaphore GetAsyncComputeFinishedSemaphore() const { return m_AsyncComputeFinishedSemaphore; }
 
     VkSemaphore GetImageAvailableSemaphore() const { return m_ImageAvailableSemaphore; }
     // One render-finished semaphore per swapchain image (indexed by the acquired image index),
@@ -140,7 +201,12 @@ private:
     VkQueue m_GraphicsQueue = VK_NULL_HANDLE;
     uint32_t m_GraphicsQueueFamilyIndex = 0;
     VkCommandPool m_CommandPool = VK_NULL_HANDLE;
-    VkCommandBuffer m_CommandBuffer = VK_NULL_HANDLE;
+    VkCommandBuffer m_CommandBuffer = VK_NULL_HANDLE; // "cmdEarly" -- see GetCommandBufferEarly()'s own comment.
+    // "cmdMid"/"cmdLate" -- see GetCommandBufferMid()/GetCommandBufferLate()'s own comment. Same
+    // pool as m_CommandBuffer above (same graphics queue family), just 2 more primary command
+    // buffers allocated out of it.
+    VkCommandBuffer m_CommandBufferMid = VK_NULL_HANDLE;
+    VkCommandBuffer m_CommandBufferLate = VK_NULL_HANDLE;
 
     // Dedicated transfer queue (or a fallback alias of m_GraphicsQueue/m_GraphicsQueueFamilyIndex)
     // -- see GetTransferQueue()'s own comment.
@@ -150,6 +216,16 @@ private:
     VkCommandPool m_TransferCommandPool = VK_NULL_HANDLE;
     VkCommandBuffer m_TransferCommandBuffer = VK_NULL_HANDLE;
     VkSemaphore m_TransferFinishedSemaphore = VK_NULL_HANDLE;
+
+    // Dedicated async-compute queue (or a fallback alias of m_GraphicsQueue/m_GraphicsQueueFamilyIndex)
+    // -- see GetAsyncComputeQueue()'s own comment.
+    VkQueue m_AsyncComputeQueue = VK_NULL_HANDLE;
+    uint32_t m_AsyncComputeQueueFamilyIndex = 0;
+    bool m_HasDedicatedAsyncComputeQueue = false;
+    VkCommandPool m_AsyncComputeCommandPool = VK_NULL_HANDLE;
+    VkCommandBuffer m_AsyncComputeCommandBuffer = VK_NULL_HANDLE;
+    VkSemaphore m_AsyncComputeCanStartSemaphore = VK_NULL_HANDLE;
+    VkSemaphore m_AsyncComputeFinishedSemaphore = VK_NULL_HANDLE;
 
     VkDescriptorSetLayout m_BindlessLayout = VK_NULL_HANDLE;
     VkDescriptorPool m_DescriptorPool = VK_NULL_HANDLE;

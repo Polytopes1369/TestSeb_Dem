@@ -1,6 +1,8 @@
 #version 460
 #extension GL_GOOGLE_include_directive : enable
 
+#include "include/temporal_variance_clamp.glsl"
+
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
 layout(set = 0, binding = 0) uniform sampler2D g_LowResColor;
@@ -23,24 +25,9 @@ layout(std140, set = 0, binding = 4) uniform TAATSRViewParamsUBO {
     float _pad;
 } ubo;
 
-// Convert RGB to YCoCg space for better variance clamping
-vec3 RGBToYCoCg(vec3 rgb) {
-    float y = dot(rgb, vec3(0.25, 0.5, 0.25));
-    float co = dot(rgb, vec3(0.5, 0.0, -0.5));
-    float cg = dot(rgb, vec3(-0.25, 0.5, -0.25));
-    return vec3(y, co, cg);
-}
-
-// Convert YCoCg space back to RGB
-vec3 YCoCgToRGB(vec3 ycocg) {
-    float y = ycocg.x;
-    float co = ycocg.y;
-    float cg = ycocg.z;
-    float r = y + co - cg;
-    float g = y + cg;
-    float b = y - co - cg;
-    return vec3(r, g, b);
-}
+// RGBToYCoCg/YCoCgToRGB/ClipToAABB now live in include/temporal_variance_clamp.glsl (Phase 2, Lumen
+// advanced roadmap: factored out so ReflectionTemporal.comp's own new variance clamp can share the
+// exact same implementation -- see that include's own header comment).
 
 // 9-tap Catmull-Rom filter to reconstruct high-quality upscaled source pixels
 vec3 SampleLowResColorCatmullRom(vec2 uv) {
@@ -71,22 +58,6 @@ vec3 SampleLowResColorCatmullRom(vec2 uv) {
     vec3 c8 = textureLod(g_LowResColor, vec2(tc3.x, tc3.y), 0.0).rgb * w3.x * w3.y;
     
     return c0 + c1 + c2 + c3 + c4 + c5 + c6 + c7 + c8;
-}
-
-// Clip history color towards local AABB center in YCoCg color space
-vec3 ClipToAABB(vec3 color, vec3 boxMin, vec3 boxMax) {
-    vec3 center = 0.5 * (boxMax + boxMin);
-    vec3 extents = 0.5 * (boxMax - boxMin) + 0.0001;
-    
-    vec3 dir = color - center;
-    vec3 absDir = abs(dir);
-    
-    float max_t = 0.0;
-    if (absDir.x > extents.x) max_t = max(max_t, (absDir.x - extents.x) / absDir.x);
-    if (absDir.y > extents.y) max_t = max(max_t, (absDir.y - extents.y) / absDir.y);
-    if (absDir.z > extents.z) max_t = max(max_t, (absDir.z - extents.z) / absDir.z);
-    
-    return color - max_t * dir;
 }
 
 void main() {

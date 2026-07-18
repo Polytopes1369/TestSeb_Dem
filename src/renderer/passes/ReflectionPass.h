@@ -58,6 +58,12 @@ namespace renderer {
         static constexpr VkFormat kWorldPosFormat = VK_FORMAT_R32G32B32A32_SFLOAT; // rgb = world pos, a = validity.
         static constexpr VkFormat kNormalFormat = VK_FORMAT_R16G16_SFLOAT;         // Octahedral-encoded.
 
+        // Phase 2 (Lumen advanced roadmap): fixed (non-ping-ponged) auxiliary images, same lifetime
+        // convention as m_HitMaskImage below (consumed same-frame, never reprojected) -- see this
+        // class' own member comments for why each exists.
+        static constexpr VkFormat kRawRadianceFormat = VK_FORMAT_R16G16B16A16_SFLOAT; // Same layout as kRadianceFormat.
+        static constexpr VkFormat kHalfVectorFormat = VK_FORMAT_R16G16_SFLOAT;        // Octahedral-encoded, same layout as kNormalFormat.
+
         // `traceContext`/`surfaceCache`/`rtPass`/`resolvePass` must all already be Init'd and must
         // outlive this pass -- their resources are bound into this pass' own descriptor sets
         // unmodified (mirrors renderer::ScreenProbeGIPass's own borrowing convention).
@@ -127,6 +133,32 @@ namespace renderer {
         VkImage m_HitMaskImage = VK_NULL_HANDLE;
         VmaAllocation m_HitMaskAllocation = VK_NULL_HANDLE;
         VkImageView m_HitMaskView = VK_NULL_HANDLE;
+
+        // Phase 2 (Lumen advanced roadmap): raw (pre-temporal-blend) radiance, written by
+        // ReflectionTrace.comp alongside its existing per-slot g_ReflectionRadiance write, read
+        // read-only by ReflectionTemporal.comp's new 3x3 neighborhood variance-clamp box (mirrors
+        // TAATSR.comp's own YCoCg mean/variance AABB technique, factored into include/
+        // temporal_variance_clamp.glsl). A FIXED image, like m_HitMaskImage above, not one of the two
+        // ping-pong ReflectionSlot fields: ReflectionTemporal.comp reads AND writes the CURRENT slot's
+        // g_ReflectionRadiance in place (the roughness-weighted exponential history blend), so a
+        // neighboring workgroup's own in-place write could race with this workgroup's neighborhood
+        // read if the clamp sampled that same ping-pong image -- this dedicated, write-once-per-frame,
+        // read-only-thereafter copy of the raw trace output removes that race entirely.
+        VkImage m_RawRadianceImage = VK_NULL_HANDLE;
+        VmaAllocation m_RawRadianceAllocation = VK_NULL_HANDLE;
+        VkImageView m_RawRadianceView = VK_NULL_HANDLE;
+
+        // Phase 2 (Lumen advanced roadmap): this pixel's GGX-VNDF-sampled half-vector (octahedral-
+        // encoded, mirrors g_ReflectionNormal's own encoding), written by ReflectionTrace.comp right
+        // after it computes halfVectorWorld for its VNDF sampling. A FIXED image (same "consumed
+        // same-frame, never reprojected" rationale as m_HitMaskImage): ReflectionGather.comp
+        // reconstructs H from this image to derive NdotH/NdotV/NdotL/VdotH and evaluate the complete
+        // D_GGX * G_SmithGGXCorrelated * F_Schlick specular BRDF product, replacing the previous
+        // Fresnel-only composite weight -- see ReflectionGather.comp's own header comment for why this
+        // replaces (not adds to) the old bare Fresnel term.
+        VkImage m_HalfVectorImage = VK_NULL_HANDLE;
+        VmaAllocation m_HalfVectorAllocation = VK_NULL_HANDLE;
+        VkImageView m_HalfVectorView = VK_NULL_HANDLE;
 
         VkSampler m_ReflectionSampler = VK_NULL_HANDLE; // Linear, clamp-to-edge -- history reprojection taps.
 

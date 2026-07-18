@@ -325,12 +325,29 @@ namespace renderer {
 
         // --- Pre-build barrier (WAR): the previous frame's HWRT consumers (rayQueryEXT reads
         // against this same TLAS, e.g. Surface Cache radiosity injection) must have finished
-        // reading before this frame's build can start overwriting it. This engine records and
-        // submits exactly one command buffer per frame behind a single frameFence (see main.cpp),
-        // i.e. single-frame-in-flight -- by the time THIS frame's command buffer begins recording,
-        // the GPU has already fully retired the previous frame's work, so a same-command-buffer
-        // barrier (no extra cross-frame semaphore) correctly resolves this hazard, matching every
-        // other per-frame WAR pattern already established in this codebase.
+        // reading before this frame's build can start overwriting it.
+        //
+        // Phase 2 (Lumen advanced roadmap) fix, 2026-07-17: this engine's per-frame graphics work
+        // is now split across 3 command buffers/submissions (cmdEarly/cmdMid/cmdLate -- see
+        // renderer::ClusterRenderPipeline.h's own "Per-frame GPU work" class comment), so "this
+        // frame's command buffer" is no longer singular -- this call site is reached from either
+        // cmdEarly (the fallback, fully-graphics-serialized path) or asyncComputeCmd (the async-
+        // compute-queue path, renderer::ClusterRenderPipeline::RecordAsyncCompute), depending on
+        // this frame's own routing decision, which can differ from LAST frame's. The underlying
+        // safety property still holds, just via a longer (still fully synchronous, no data race)
+        // chain instead of literally being "the same command buffer": whichever queue the PREVIOUS
+        // frame's HWRT consumers ran on (they always live in that frame's own cmdLate -- Reflection/
+        // World Probes/MegaLights/the forward passes, or asyncComputeCmd's own GIInject bounce loop
+        // when that frame used the async path), cmdLate's own submission always WAITS on that
+        // frame's asyncComputeFinished semaphore before executing (see RecordFrameLate()'s own
+        // ACQUIRE-barrier comment), and frameFence guards ONLY cmdLate's submission -- so frameFence
+        // signaling transitively proves BOTH that frame's cmdLate AND its asyncComputeCmd have fully
+        // retired. main.cpp's very first action every loop iteration is waiting on frameFence before
+        // recording ANYTHING new (including this call, wherever it lands THIS frame) -- so by the
+        // time this barrier's srcStage/srcAccess (above) actually need to be true, the previous
+        // frame's read is unconditionally already retired, exactly as robustly as the old single-
+        // command-buffer design guaranteed it, matching every other per-frame WAR pattern already
+        // established in this codebase.
         // --- Post-build barrier (RAW): makes the freshly-rebuilt TLAS visible to every HWRT
         // consumer THIS frame (radiosity injection and anything recorded after it). ---
         VkMemoryBarrier2 preBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };

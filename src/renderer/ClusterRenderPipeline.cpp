@@ -98,6 +98,13 @@ bool ClusterRenderPipeline::Init(
   Shutdown();
 
   m_Device = createInfo.device;
+  m_GraphicsQueueFamilyIndex = createInfo.graphicsQueueFamilyIndex;
+  // Phase 2 (Lumen advanced roadmap): async-compute queue handles -- see this class' own
+  // m_AsyncComputeAvailableThisBuild member comment for exactly what m_AsyncComputeAvailableThisBuild
+  // does and does not gate.
+  m_AsyncComputeQueue = createInfo.asyncComputeQueue;
+  m_AsyncComputeQueueFamilyIndex = createInfo.asyncComputeQueueFamilyIndex;
+  m_AsyncComputeAvailableThisBuild = createInfo.hasDedicatedAsyncComputeQueue;
   m_RenderExtent = createInfo.renderExtent;
   m_DisplayExtent = createInfo.displayExtent;
   m_VisBufferClusterIDImage = createInfo.visBufferClusterIDImage;
@@ -418,7 +425,8 @@ bool ClusterRenderPipeline::Init(
   if (!m_SurfaceCache.Init(createInfo.device, createInfo.allocator,
                            createInfo.commandPool, createInfo.queue,
                            createInfo.cacheFilePath, createInfo.entityDataBuffer,
-                           m_Resolve.GetMaterialParamsBuffer())) {
+                           m_Resolve.GetMaterialParamsBuffer(),
+                           createInfo.entityDataCPU, createInfo.materialTable)) {
     LOG_ERROR("[ClusterRenderPipeline] Failed to initialize SurfaceCachePass.");
     return false;
   }
@@ -1095,16 +1103,93 @@ void ClusterRenderPipeline::BeginVisBufferRendering(
   vkCmdBeginRendering(cmd, &renderingInfo);
 }
 
-void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
-                                        VkCommandBuffer transferCmd,
-                                        const CameraPushConstants &camera,
-                                        const maths::vec3 &cameraPositionWorld,
-                                        const CameraFrameInfo &cameraFrameInfo,
-                                        float globalTimeSeconds,
-                                        VkImage swapchainImage,
-                                        VkImageView swapchainImageView,
-                                        const core::EntityTransformCPU *entityTransformsCPU) {
-  assert(m_ClusterCount > 0 && "RecordFrame called before a successful Init");
+void ClusterRenderPipeline::RecordSurfaceCacheOwnershipTransfer(VkCommandBuffer cmd, bool isRelease,
+    uint32_t srcFamily, uint32_t dstFamily, VkPipelineStageFlags2 activeStageMask,
+    VkAccessFlags2 activeImageAccessMask, VkAccessFlags2 activeBufferAccessMask) {
+  if (!m_AsyncComputeAvailableThisBuild) {
+    return; // Same queue family as the graphics/async-compute consumer -- nothing to transfer. See
+             // this method's own header comment.
+  }
+
+  // Per the Vulkan spec, a queue family ownership transfer's RELEASE operation's dstAccessMask/
+  // dstStageMask are ignored (the acquiring queue's own barrier is what actually makes the data
+  // visible to it), and the matching ACQUIRE's srcAccessMask/srcStageMask are likewise ignored --
+  // see GpuGeometryPagePool::ReleasePhysicalPoolOwnership/AcquirePhysicalPoolOwnership's own
+  // comments for the same reasoning applied to a plain buffer. `activeStageMask`/
+  // `activeImageAccessMask`/`activeBufferAccessMask` are therefore routed to src* on the release
+  // side and dst* on the acquire side; the unused triple is left NONE/0 either way.
+  VkPipelineStageFlags2 releaseStage = isRelease ? activeStageMask : VK_PIPELINE_STAGE_2_NONE;
+  VkPipelineStageFlags2 acquireStage = isRelease ? VK_PIPELINE_STAGE_2_NONE : activeStageMask;
+  VkAccessFlags2 releaseImageAccess = isRelease ? activeImageAccessMask : VK_ACCESS_2_NONE;
+  VkAccessFlags2 acquireImageAccess = isRelease ? VK_ACCESS_2_NONE : activeImageAccessMask;
+  VkAccessFlags2 releaseBufferAccess = isRelease ? activeBufferAccessMask : VK_ACCESS_2_NONE;
+  VkAccessFlags2 acquireBufferAccess = isRelease ? VK_ACCESS_2_NONE : activeBufferAccessMask;
+
+  // The 5 atlas images SurfaceCacheGIInjectPass::Init actually binds (confirmed by reading that
+  // method's own descriptor writes) -- Albedo/Normal/Emissive/Radiance/WorldPos. NOT
+  // DirectLighting: GIInject never binds it (only RecordCapture writes it, and only downstream
+  // consumers other than GIInject ever sample it), so it stays on the graphics queue family the
+  // whole time and needs no transfer at all.
+  VkImage images[5] = {
+      m_SurfaceCache.GetAlbedoImage(), m_SurfaceCache.GetNormalImage(), m_SurfaceCache.GetEmissiveImage(),
+      m_SurfaceCache.GetRadianceImage(), m_SurfaceCache.GetWorldPosImage()
+  };
+  VkImageMemoryBarrier2 imageBarriers[5]{};
+  for (uint32_t i = 0; i < 5; ++i) {
+    imageBarriers[i].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+    imageBarriers[i].srcStageMask = releaseStage;
+    imageBarriers[i].srcAccessMask = releaseImageAccess;
+    imageBarriers[i].dstStageMask = acquireStage;
+    imageBarriers[i].dstAccessMask = acquireImageAccess;
+    // Layout unchanged -- these atlas images live permanently in GENERAL for their entire lifetime
+    // (see SurfaceCachePass' own class comment's "Atlas layout convention" section), exactly like
+    // GpuGeometryPagePool's own buffers never change layout across their ownership transfer either.
+    imageBarriers[i].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    imageBarriers[i].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    imageBarriers[i].srcQueueFamilyIndex = srcFamily;
+    imageBarriers[i].dstQueueFamilyIndex = dstFamily;
+    imageBarriers[i].image = images[i];
+    imageBarriers[i].subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+  }
+
+  // The 4 buffers RecordRefreshTLAS (rebuilds the TLAS) / GIInject's own TraceHWRT (reads the
+  // Fallback Mesh vertex/index buffers + the draw-range table to resolve a ray hit) touch every
+  // frame on whichever queue they now run on -- see this method's own header comment for why
+  // SurfaceCacheRayTracingPass::TlasRefitResources' internal scratch/instance buffers are
+  // deliberately excluded.
+  VkBuffer buffers[4] = {
+      m_SurfaceCache.GetVertexBuffer(), m_SurfaceCache.GetIndexBuffer(),
+      m_SurfaceCacheRT.GetDrawRangeBuffer(), m_SurfaceCacheRT.GetTLASBufferHandle()
+  };
+  VkBufferMemoryBarrier2 bufferBarriers[4]{};
+  for (uint32_t i = 0; i < 4; ++i) {
+    bufferBarriers[i].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2;
+    bufferBarriers[i].srcStageMask = releaseStage;
+    bufferBarriers[i].srcAccessMask = releaseBufferAccess;
+    bufferBarriers[i].dstStageMask = acquireStage;
+    bufferBarriers[i].dstAccessMask = acquireBufferAccess;
+    bufferBarriers[i].srcQueueFamilyIndex = srcFamily;
+    bufferBarriers[i].dstQueueFamilyIndex = dstFamily;
+    bufferBarriers[i].buffer = buffers[i];
+    bufferBarriers[i].offset = 0;
+    bufferBarriers[i].size = VK_WHOLE_SIZE;
+  }
+
+  VkDependencyInfo depInfo{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+  depInfo.imageMemoryBarrierCount = 5;
+  depInfo.pImageMemoryBarriers = imageBarriers;
+  depInfo.bufferMemoryBarrierCount = 4;
+  depInfo.pBufferMemoryBarriers = bufferBarriers;
+  vkCmdPipelineBarrier2(cmd, &depInfo);
+}
+
+void ClusterRenderPipeline::RecordFrameEarly(VkCommandBuffer cmdEarly,
+                                              const CameraPushConstants &camera,
+                                              const maths::vec3 &cameraPositionWorld,
+                                              const CameraFrameInfo &cameraFrameInfo,
+                                              float globalTimeSeconds,
+                                              const core::EntityTransformCPU *entityTransformsCPU) {
+  assert(m_ClusterCount > 0 && "RecordFrameEarly called before a successful Init");
 
   CameraPushConstants cameraCopy = camera;
   float jitterX = 0.0f;
@@ -1146,22 +1231,54 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
 
 
   // SWRT/HWRT back-end shared by m_GIInject ([1z] below) and m_WorldProbes' own trace pass ([12c]
-  // below) -- debug-only toggle (main.cpp's 'T' key via SetDebugTraceMode), Release always uses
-  // HWRT (no debug toggle to switch back to SWRT).
+  // in RecordFrameLate) -- debug-only toggle (main.cpp's 'T' key via SetDebugTraceMode), Release
+  // always uses HWRT (no debug toggle to switch back to SWRT).
 #ifndef NDEBUG
   uint32_t traceMode = m_DebugTraceMode;
 #else
   uint32_t traceMode = 1u;
 #endif
 
-  // =========================================================================================
-  // [1] Per-frame worklist clears. Each Record*() carries its own
-  // CLEAR->COMPUTE barrier, so the culling/raster dispatches below can never
-  // read a stale counter.
-  // =========================================================================================
-  m_OcclusionCulling.RecordClearFrame(cmd);
-  m_SoftwareRaster.RecordClear(cmd);
-  m_LODSelection.RecordClear(cmd);
+  // Phase 2 (Lumen advanced roadmap): this frame's async-compute routing decision -- read by
+  // RecordAsyncCompute() (whether to record anything at all) and RecordFrameLate() (whether to
+  // ACQUIRE the atlas back), both later this same frame -- see m_FrameScratch's own comment for why
+  // this is now stored there instead of an outer-function-scope local. Forced OFF whenever
+  // traceMode is SWRT (0): moving GIInject's SWRT path to the async queue would additionally need
+  // ownership-transfer barriers for every per-entity Global SDF image it samples
+  // (TraceMeshSDFScene), which only the Debug SWRT toggle ever exercises -- not worth doubling the
+  // barrier surface for a debug-only configuration when Release always uses HWRT anyway (see
+  // SetDebugAsyncComputeEnabled's own header comment). The Debug toggle additionally gates it off
+  // entirely for staged bring-up (false = prove the CPU/struct plumbing alone with everything still
+  // graphics-queue-serialized; true = exercise the real cross-queue barrier design).
+  bool useAsyncCompute = (traceMode == 1u);
+#ifndef NDEBUG
+  useAsyncCompute = useAsyncCompute && m_DebugAsyncComputeEnabled;
+#endif
+
+  bool radiosityEnabled = true;
+#ifndef NDEBUG
+  radiosityEnabled = m_DebugRadiosityEnabled;
+#endif
+
+  // Persist everything RecordAsyncCompute()/RecordFrameMid()/RecordFrameLate() need later THIS
+  // SAME frame -- see FrameScratch's own comment. Written exactly once, here, at the top of the
+  // frame's first call.
+  m_FrameScratch.camera = camera;
+  m_FrameScratch.cameraCopy = cameraCopy;
+  m_FrameScratch.cameraPositionWorld = cameraPositionWorld;
+  m_FrameScratch.cameraFrameInfo = cameraFrameInfo;
+  m_FrameScratch.globalTimeSeconds = globalTimeSeconds;
+  m_FrameScratch.entityTransformsCPU = entityTransformsCPU;
+  m_FrameScratch.viewProj = viewProj;
+  m_FrameScratch.invViewProj = invViewProj;
+  m_FrameScratch.viewParams = viewParams;
+  m_FrameScratch.projScaleY = projScaleY;
+  m_FrameScratch.jitterX = jitterX;
+  m_FrameScratch.jitterY = jitterY;
+  m_FrameScratch.taatsrEnabled = taatsrEnabled;
+  m_FrameScratch.traceMode = traceMode;
+  m_FrameScratch.useAsyncCompute = useAsyncCompute;
+  m_FrameScratch.radiosityEnabled = radiosityEnabled;
 
   // =========================================================================================
   // [1y] Atmos weather system, Subtask 1: refresh AtmosGlobalsUBO (wind, Magnus-Tetens dew point /
@@ -1169,29 +1286,33 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
   // AtmosClimatePass.h's own class comment); placed immediately before [1z] so a future Fog/Cloud
   // consumer added inside that same block always sees an already-current buffer this frame.
   // =========================================================================================
-  m_AtmosClimate.RecordUpdate(cmd, globalTimeSeconds);
+  m_AtmosClimate.RecordUpdate(cmdEarly, globalTimeSeconds);
   // Atmos weather system, Subtask 2: Sky-View LUT refresh -- see AtmosSkyPass::RecordUpdate's own
   // comment for the Transmittance/Multi-Scattering dirty-tracking policy. Sun direction/intensity
   // sourced the same way m_Resolve's own sun uniform below is (m_SceneLights.sun).
-  m_AtmosSky.RecordUpdate(cmd, m_SceneLights.sun.direction, m_SceneLights.sun.intensity);
+  m_AtmosSky.RecordUpdate(cmdEarly, m_SceneLights.sun.direction, m_SceneLights.sun.intensity);
 
   // =========================================================================================
   // [1z] Lumen-style GI infrastructure: Virtual Shadow Map page requests/renders (Phase 3) ->
   // Surface Cache capture -> Global SDF clipmap streaming -> (Debug-only) SDF ray march debug
-  // visualization. Independent of the Nanite VisBuffer/HZB machinery above and below (no shared
+  // visualization. Independent of the Nanite VisBuffer/HZB machinery in RecordFrameMid (no shared
   // images, no fence contention -- see ClusterRenderPipeline.h's own class-comment addendum), so
-  // it can run anywhere in the frame; placed early, right after the worklist clears, so it
-  // overlaps with the GPU's own internal scheduling of the culling/streaming work that follows
-  // rather than sitting at the tail end.
+  // it can run anywhere in the frame; placed in this class' own first per-frame call, cmdEarly, so
+  // its release below can signal VulkanContext::GetAsyncComputeCanStartSemaphore() as early as
+  // possible, letting the async-compute queue's work start overlapping with RecordFrameMid()'s own
+  // GPU work as soon as the GPU actually reaches it.
+  //
+  // Phase 2 (Lumen advanced roadmap) fix, 2026-07-17: this frame's own RELEASE (below, when
+  // useAsyncCompute) now happens HERE, immediately after RecordCapture/GlobalSDF.RecordUpdate --
+  // NOT after every graphics-side consumer has read the atlas, the way the old single-command-
+  // buffer design had to (see this class' own header comment for the full root-cause). The matching
+  // ACQUIRE now happens at the very start of RecordFrameLate(), THIS SAME FRAME (not the top of
+  // NEXT frame's own [1z] block the way the old m_AtlasOwnedByAsync cross-frame design worked) --
+  // RecordFrameMid() (in between) never reads the Surface Cache atlas/TLAS at all (confirmed by
+  // reading its own passes' descriptor bindings), so releasing this early strands no graphics-side
+  // consumer.
   // =========================================================================================
   {
-    // 0. Phase 4 integration (UE5.8 parity roadmap, dynamic scenes onto main): per-frame TLAS
-    // refit so ray-traced GI/reflections see this frame's entity rotations -- must run before
-    // anything below traces against m_SurfaceCacheRT's TLAS (radiosity injection, step 4, and any
-    // later HWRT consumer this same frame). A no-op rebuild (identity transforms) whenever
-    // config::ENTITY_SELF_ROTATION_ENABLED is off -- see RecordRefreshTLAS's own comment.
-    m_SurfaceCacheRT.RecordRefreshTLAS(cmd, entityTransformsCPU);
-
     // Sun direction is fixed for now (m_SceneLights' own default, see LightingTypes.h) -- a
     // future day/night system would rotate it per frame instead.
     const maths::vec3 sunDirection = m_SceneLights.sun.direction;
@@ -1200,66 +1321,92 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
     // [12]) need THIS frame's VSM view-projection matrices + any pages rendered this frame already
     // visible -- RecordBeginFrame()'s own trailing barrier (when it renders any page) covers that.
     // See VirtualShadowMapPass's own class comment for the full one-frame-lag feedback contract.
-    m_VirtualShadowMap.RecordBeginFrame(cmd, sunDirection, m_SceneLights, cameraFrameInfo.position);
+    m_VirtualShadowMap.RecordBeginFrame(cmdEarly, sunDirection, m_SceneLights, cameraFrameInfo.position);
 
     // 1b. Virtual Texture streaming: reads back LAST frame's page-miss feedback (m_Resolve's own
     // ClusterResolve.comp/ClusterResolveBinned.comp VT sampling call, see SetVirtualTexture()'s own
     // comment), issues new async tile reads, and drains/uploads completed ones -- must run before
-    // m_Resolve's own dispatch below (same one-frame-lag contract as VirtualShadowMapPass's own
-    // RecordBeginFrame, see VirtualTextureStreamingCoordinator's own class comment).
-    m_VTStreaming.RecordBeginFrame(cmd);
+    // m_Resolve's own dispatch in RecordFrameMid() (same one-frame-lag contract as
+    // VirtualShadowMapPass's own RecordBeginFrame, see VirtualTextureStreamingCoordinator's own
+    // class comment).
+    m_VTStreaming.RecordBeginFrame(cmdEarly);
 
     // 2. Surface Cache: feed this frame's light data before the visibility-driven capture draws --
     // shadow lookups now read renderer::VirtualShadowMapPass's own UBOs directly (bound once via
-    // SetVirtualShadowMap()), no per-frame light-view-proj parameter needed here anymore.
+    // SetVirtualShadowMap()), no per-frame light-view-proj parameter needed here anymore. STAYS on
+    // the graphics queue (Feature 1's plan: only TLAS refit + GIInject move) -- this is a render
+    // pass (vkCmdBeginRendering), not a compute dispatch, and async-compute queues on most hardware
+    // cannot execute graphics-pipeline work at all.
     m_SurfaceCache.UpdateLighting(m_SceneLights);
     m_SurfaceCache.UpdateVisibility(cameraFrameInfo.position, cameraFrameInfo.forward,
                                     maths::vec3{0.0f, 1.0f, 0.0f}, cameraFrameInfo.fovYRadians,
                                     cameraFrameInfo.aspectRatio, cameraFrameInfo.nearZ,
                                     cameraFrameInfo.farZ);
-    m_SurfaceCache.RecordCapture(cmd, cameraFrameInfo.position, entityTransformsCPU);
+    m_SurfaceCache.RecordCapture(cmdEarly, cameraFrameInfo.position, entityTransformsCPU);
 
-    // 3. Global SDF clipmap streaming, from this frame's camera position.
-    m_GlobalSDF.RecordUpdate(cmd, cameraFrameInfo.position, entityTransformsCPU);
+    // 3. Global SDF clipmap streaming, from this frame's camera position. STAYS on the graphics
+    // queue (Feature 1's plan explicitly excludes it -- GIInject's HWRT path, the only mode ever
+    // moved to async, does not sample the Global SDF at all).
+    m_GlobalSDF.RecordUpdate(cmdEarly, cameraFrameInfo.position, entityTransformsCPU);
 
-    // 4. Secondary-bounce injection into m_SurfaceCache's own radiance atlas (budgeted, a handful
-    // of cards per call -- see SurfaceCacheGIInjectPass::kCardsPerFrameBudget) via m_TraceContext's
-    // shared trace-scene sets against m_SurfaceCacheRT's static TLAS or the per-entity mesh SDFs,
-    // depending on `traceMode`. Called kRadiosityBounceCount times in a row, each isolated from the
-    // next by the exact same barrier RecordInject itself doesn't carry (see the comment below) --
-    // this turns the pass's single budgeted round into a genuine INTRA-FRAME multi-bounce chain:
-    // m_GIInject's own round-robin cursor advances across every call in the loop, so bounce N+1's
-    // newly-processed cards sample the atlas including bounce N's own fresh writes wherever their
-    // footprints overlap, on top of (not instead of) the pass's existing cross-frame convergence.
-    // `radiosityEnabled` (debug-only toggle, main.cpp's 'G' key) lets this whole loop be switched
-    // off to isolate its cost/visual contribution from the rest of the GI stack; Release always
-    // runs it.
-#ifndef NDEBUG
-    bool radiosityEnabled = m_DebugRadiosityEnabled;
-#else
-    bool radiosityEnabled = true;
-#endif
-    if (radiosityEnabled) {
-      for (uint32_t bounce = 0; bounce < kRadiosityBounceCount; ++bounce) {
-        m_GIInject.RecordInject(cmd, m_TraceContext, m_SurfaceCache, traceMode);
+    // 4. Secondary-bounce injection into m_SurfaceCache's own radiance atlas + the TLAS refit that
+    // must precede it (Phase 4 integration) -- `useAsyncCompute` (m_FrameScratch, see its own
+    // comment above) picks between two mutually exclusive paths:
+    //   - false: the FALLBACK path -- TLAS refit + the radiosity bounce loop run right here, fully
+    //     graphics-queue-serialized, exactly as before Phase 2 (the pre-Phase-2 behavior). Correct
+    //     to do inline here specifically (not deferred to RecordAsyncCompute(), which will no-op)
+    //     since nothing needs to hand anything off to a different queue in this case.
+    //   - true: both are skipped here and instead recorded, once, by RecordAsyncCompute() into
+    //     asyncComputeCmd -- see this class' own header comment for the full redesign. The RELEASE
+    //     immediately below (this same `if`'s `else` branch) hands the atlas off for that.
+    if (!useAsyncCompute) {
+      // Phase 4 integration (UE5.8 parity roadmap, dynamic scenes onto main): per-frame TLAS
+      // refit so ray-traced GI/reflections see this frame's entity rotations -- must run before
+      // anything below traces against m_SurfaceCacheRT's TLAS (radiosity injection right below,
+      // and any later HWRT consumer this same frame). A no-op rebuild (identity transforms)
+      // whenever config::ENTITY_SELF_ROTATION_ENABLED is off -- see RecordRefreshTLAS's own comment.
+      m_SurfaceCacheRT.RecordRefreshTLAS(cmdEarly, entityTransformsCPU);
 
-        // Unlike SurfaceCachePass::RecordCapture/VirtualShadowMapPass::RecordBeginFrame/
-        // GlobalSDFPass::RecordUpdate, SurfaceCacheGIInjectPass::RecordInject does NOT end with its own trailing
-        // barrier -- its read-modify-write of the radiance atlas (imageLoad/imageStore, STORAGE
-        // access) must be made visible here, explicitly, before the NEXT bounce's own RecordInject
-        // call samples that same atlas (surface_cache_sampling.glsl's g_SurfaceCacheRadiance) --
-        // and, after the loop's final iteration, before m_ScreenTrace's own near-field hit samples
-        // and m_WorldProbes' own trace pass do the same later this frame.
-        VkMemoryBarrier2 giInjectBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
-        giInjectBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-        giInjectBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-        giInjectBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
-        giInjectBarrier.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
-        VkDependencyInfo giInjectDepInfo{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
-        giInjectDepInfo.memoryBarrierCount = 1;
-        giInjectDepInfo.pMemoryBarriers = &giInjectBarrier;
-        vkCmdPipelineBarrier2(cmd, &giInjectDepInfo);
+      if (radiosityEnabled) {
+        for (uint32_t bounce = 0; bounce < kRadiosityBounceCount; ++bounce) {
+          m_GIInject.RecordInject(cmdEarly, m_TraceContext, m_SurfaceCache, traceMode);
+
+          // Unlike SurfaceCachePass::RecordCapture/VirtualShadowMapPass::RecordBeginFrame/
+          // GlobalSDFPass::RecordUpdate, SurfaceCacheGIInjectPass::RecordInject does NOT end with
+          // its own trailing barrier -- its read-modify-write of the radiance atlas (imageLoad/
+          // imageStore, STORAGE access) must be made visible here, explicitly, before the NEXT
+          // bounce's own RecordInject call samples that same atlas (surface_cache_sampling.glsl's
+          // g_SurfaceCacheRadiance) -- and, after the loop's final iteration, before m_ScreenTrace's
+          // own near-field hit samples and m_WorldProbes' own trace pass do the same later this
+          // frame (RecordFrameLate()).
+          VkMemoryBarrier2 giInjectBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+          giInjectBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+          giInjectBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+          giInjectBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
+          giInjectBarrier.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+          VkDependencyInfo giInjectDepInfo{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+          giInjectDepInfo.memoryBarrierCount = 1;
+          giInjectDepInfo.pMemoryBarriers = &giInjectBarrier;
+          vkCmdPipelineBarrier2(cmdEarly, &giInjectDepInfo);
+        }
       }
+    } else {
+      // RELEASE (graphics -> async-compute), moved HERE by the Phase 2 fix -- see this block's own
+      // header comment above for why this timing is correct. Unlike the OLD design's LATE release
+      // (which had to cover everything a full frame's worth of graphics-side consumers had already
+      // done -- RecordCapture's writes AND every later COMPUTE_SHADER/RAY_TRACING_SHADER_BIT_KHR
+      // read from Reflection/World Probes/the forward passes), this EARLY release only needs to
+      // cover what has ACTUALLY happened to these 9 resources by THIS point in the frame:
+      // RecordCapture's own COLOR_ATTACHMENT_OUTPUT write to the 5 atlas images + its VERTEX_INPUT
+      // read of the Fallback Mesh vertex/index buffers (SurfaceCachePass::RecordCapture's own
+      // vkCmdBindVertexBuffers/vkCmdBindIndexBuffer/vkCmdDrawIndexed) -- GlobalSDF.RecordUpdate
+      // touches none of these 9 resources at all, and RefreshTLAS/GIInject haven't run yet this
+      // frame (deferred to RecordAsyncCompute() below).
+      RecordSurfaceCacheOwnershipTransfer(cmdEarly, /*isRelease=*/true,
+          m_GraphicsQueueFamilyIndex, m_AsyncComputeQueueFamilyIndex,
+          VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_2_VERTEX_INPUT_BIT,
+          VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+          VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_2_INDEX_READ_BIT);
     }
 
 #ifndef NDEBUG
@@ -1268,7 +1415,7 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
     // imageLoad/imageStore) -- SDFRayMarchPass instead samples it through a COMBINED IMAGE
     // SAMPLER (SetGlobalSDFViews), which needs SHADER_SAMPLED_READ, a distinct access flag the
     // barrier above does not cover. Same "STORAGE_WRITE -> SAMPLED_READ" extension this class's
-    // own HZB rebuilds already need (see the barriers around m_HZB.Generate() below).
+    // own HZB rebuilds already need (see the barriers around m_HZB.Generate() in RecordFrameMid).
     VkMemoryBarrier2 globalSDFToSampledBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
     globalSDFToSampledBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
     globalSDFToSampledBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
@@ -1277,22 +1424,109 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
     VkDependencyInfo globalSDFToSampledDep{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
     globalSDFToSampledDep.memoryBarrierCount = 1;
     globalSDFToSampledDep.pMemoryBarriers = &globalSDFToSampledBarrier;
-    vkCmdPipelineBarrier2(cmd, &globalSDFToSampledDep);
+    vkCmdPipelineBarrier2(cmdEarly, &globalSDFToSampledDep);
 
     // 4. Two-tier SDF ray march DEBUG VISUALIZATION -- only its OUTPUT IMAGE is ever displayed
-    // (via the DEBUG_VIEW_GLOBAL_SDF blit-swap below; DEBUG_VIEW_LUMEN sources m_GIComposite's own
-    // output instead, see the blit-swap's own comment), but it is always recorded so that view
-    // shows this frame's state the instant it's selected, with no one-frame lag. `coarseOnly`
-    // selects DEBUG_VIEW_GLOBAL_SDF's own coarse-clipmap-only trace (see SDFRayMarch.comp's own
-    // comment on why that's a distinct, useful signal from the full two-tier march); any other view
-    // mode gets the normal full march, which costs nothing extra since this dispatch runs either
-    // way.
-    m_SDFRayMarch.RecordRayMarch(cmd, m_GlobalSDF, cameraFrameInfo.position, cameraFrameInfo.forward,
+    // (via the DEBUG_VIEW_GLOBAL_SDF blit-swap in RecordFrameLate; DEBUG_VIEW_LUMEN sources
+    // m_GIComposite's own output instead, see that blit-swap's own comment), but it is always
+    // recorded so that view shows this frame's state the instant it's selected, with no one-frame
+    // lag. `coarseOnly` selects DEBUG_VIEW_GLOBAL_SDF's own coarse-clipmap-only trace (see
+    // SDFRayMarch.comp's own comment on why that's a distinct, useful signal from the full two-tier
+    // march); any other view mode gets the normal full march, which costs nothing extra since this
+    // dispatch runs either way.
+    m_SDFRayMarch.RecordRayMarch(cmdEarly, m_GlobalSDF, cameraFrameInfo.position, cameraFrameInfo.forward,
                                  maths::vec3{0.0f, 1.0f, 0.0f}, cameraFrameInfo.fovYRadians,
                                  cameraFrameInfo.aspectRatio, cameraFrameInfo.nearZ, cameraFrameInfo.farZ,
                                  cameraCopy.debugViewMode == DEBUG_VIEW_GLOBAL_SDF, m_SceneLights.sun.direction);
 #endif
   }
+}
+
+// =========================================================================================
+// RecordAsyncCompute() -- see ClusterRenderPipeline.h's own declaration-site comment and this
+// class' header comment for the full redesign. Content below is otherwise UNCHANGED from the old
+// design's [1z2] block (just relocated into its own function and re-timed relative to the rest of
+// the frame -- RecordSurfaceCacheOwnershipTransfer's own barrier logic is untouched per this fix's
+// own constraints).
+// =========================================================================================
+void ClusterRenderPipeline::RecordAsyncCompute(VkCommandBuffer asyncComputeCmd) {
+  if (!m_FrameScratch.useAsyncCompute) {
+    return; // Fallback path already ran fully graphics-queue-serialized in RecordFrameEarly().
+  }
+
+  const uint32_t traceMode = m_FrameScratch.traceMode;
+  const bool radiosityEnabled = m_FrameScratch.radiosityEnabled;
+  const core::EntityTransformCPU* entityTransformsCPU = m_FrameScratch.entityTransformsCPU;
+
+  // ACQUIRE (by async-compute): the graphics queue's own RecordFrameEarly() already released these
+  // 9 resources (RecordSurfaceCacheOwnershipTransfer's own release half) into
+  // VulkanContext::GetAsyncComputeCanStartSemaphore()'s signal, which main.cpp's per-frame
+  // asyncComputeCmd submission waits on before this command buffer's own execution reaches this
+  // barrier's dstStageMask -- see RecordSurfaceCacheOwnershipTransfer()'s own comment for exactly
+  // which 5 images + 4 buffers this covers.
+  RecordSurfaceCacheOwnershipTransfer(asyncComputeCmd, /*isRelease=*/false,
+      m_GraphicsQueueFamilyIndex, m_AsyncComputeQueueFamilyIndex,
+      VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+      VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+      VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR |
+          VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR);
+
+  // Phase 4 integration (UE5.8 parity roadmap, dynamic scenes onto main): per-frame TLAS refit,
+  // forced HWRT-only here (traceMode == 1u whenever useAsyncCompute, see RecordFrameEarly()'s own
+  // useAsyncCompute derivation) -- must run before the bounce loop below traces against it.
+  m_SurfaceCacheRT.RecordRefreshTLAS(asyncComputeCmd, entityTransformsCPU);
+
+  if (radiosityEnabled) {
+    for (uint32_t bounce = 0; bounce < kRadiosityBounceCount; ++bounce) {
+      m_GIInject.RecordInject(asyncComputeCmd, m_TraceContext, m_SurfaceCache, traceMode);
+
+      // Intra-queue (asyncComputeCmd both sides), so purely the usual execution/memory
+      // dependency -- no queue-family-ownership concern here. Same rationale as the fallback
+      // path's own identical barrier in RecordFrameEarly().
+      VkMemoryBarrier2 giInjectBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+      giInjectBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+      giInjectBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+      giInjectBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
+      giInjectBarrier.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+      VkDependencyInfo giInjectDepInfo{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+      giInjectDepInfo.memoryBarrierCount = 1;
+      giInjectDepInfo.pMemoryBarriers = &giInjectBarrier;
+      vkCmdPipelineBarrier2(asyncComputeCmd, &giInjectDepInfo);
+    }
+  }
+
+  // RELEASE (async-compute -> graphics): makes the bounce loop's Radiance writes + the TLAS
+  // refit's rebuild available back to the graphics queue family -- consumed by THIS SAME frame's
+  // own RecordFrameLate() ACQUIRE (a same-frame hand-off now, not the old design's one-frame
+  // pipeline lag -- see this class' own header comment).
+  RecordSurfaceCacheOwnershipTransfer(asyncComputeCmd, /*isRelease=*/true,
+      m_AsyncComputeQueueFamilyIndex, m_GraphicsQueueFamilyIndex,
+      VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+      VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+      VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR |
+          VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR);
+  // Signals m_AsyncComputeFinishedSemaphore as part of asyncComputeCmd's own submission completing
+  // (main.cpp) -- waited on by THIS SAME frame's cmdLate submission before RecordFrameLate()'s own
+  // ACQUIRE (above, mirrored) is allowed to execute.
+}
+
+void ClusterRenderPipeline::RecordFrameMid(VkCommandBuffer cmdMid, VkCommandBuffer transferCmd) {
+  const CameraPushConstants& camera = m_FrameScratch.camera;
+  const CameraPushConstants& cameraCopy = m_FrameScratch.cameraCopy;
+  const maths::vec3& cameraPositionWorld = m_FrameScratch.cameraPositionWorld;
+  const maths::mat4& viewProj = m_FrameScratch.viewProj;
+  const ClusterCullViewParams& viewParams = m_FrameScratch.viewParams;
+  const float projScaleY = m_FrameScratch.projScaleY;
+  const float globalTimeSeconds = m_FrameScratch.globalTimeSeconds;
+
+  // =========================================================================================
+  // [1] Per-frame worklist clears. Each Record*() carries its own
+  // CLEAR->COMPUTE barrier, so the culling/raster dispatches below can never
+  // read a stale counter.
+  // =========================================================================================
+  m_OcclusionCulling.RecordClearFrame(cmdMid);
+  m_SoftwareRaster.RecordClear(cmdMid);
+  m_LODSelection.RecordClear(cmdMid);
 
   // =========================================================================================
   // [1a] Async streaming triage: read back LAST frame's residency misses (captured by this
@@ -1300,9 +1534,20 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
   // whatever completed since last frame -- see GeometryStreamingCoordinator's own class comment.
   // Recorded before the LOD cut below so any page bound this frame is already resident by the
   // time this frame's own residency checks (ClusterLODResidencyFallback.comp/ClusterLODCompact
-  // .comp) run.
+  // .comp) run. Confirmed (by reading ClusterOcclusionCullingPass/ClusterLODSelectionPass/
+  // ClusterHardwareRasterPass/ClusterSoftwareRasterPass/ClusterResolvePass/ClusterShadingBinPass'
+  // own descriptor bindings) that nothing in this whole cmdMid command buffer samples the Surface
+  // Cache atlas images, the TLAS, or Global SDF -- this geometry-streaming/culling/raster/resolve
+  // pipeline is entirely independent of the GI work RecordFrameEarly()/RecordAsyncCompute()
+  // record, hence needs no wait on the async-compute queue's own submission. It DOES need
+  // GetTransferFinishedSemaphore() (main.cpp) -- this method is what actually records the geometry
+  // page pool's own ownership-transfer ACQUIRE (GpuGeometryPagePool::AcquirePhysicalPoolOwnership,
+  // inside ProcessFeedbackAndDrainCompletions below) + the decompression + raster reads of
+  // whatever the transfer queue just copied, so THIS command buffer -- not cmdEarly, which never
+  // touches page-pool data at all -- is the one that must wait for the transfer queue's release +
+  // copy to have completed first.
   // =========================================================================================
-  m_Streaming.ProcessFeedbackAndDrainCompletions(cmd, transferCmd, m_LODSelection.GetFeedbackBuffer(),
+  m_Streaming.ProcessFeedbackAndDrainCompletions(cmdMid, transferCmd, m_LODSelection.GetFeedbackBuffer(),
                                                  m_PagePool, m_Decompression);
 
   // =========================================================================================
@@ -1325,7 +1570,7 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
     lodViewParams.viewportHeight = static_cast<float>(m_RenderExtent.height);
     lodViewParams.aspectRatio = static_cast<float>(m_RenderExtent.width) / static_cast<float>(m_RenderExtent.height);
 
-    m_LODSelection.RecordEvaluateAndCompact(cmd, lodViewParams);
+    m_LODSelection.RecordEvaluateAndCompact(cmdMid, lodViewParams);
 
 #ifndef NDEBUG
     // See RequestDebugDAGCutGapsDump()'s own comment: state 1 means main.cpp's 'K' key armed a
@@ -1333,7 +1578,7 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
     // just wrote this frame's decisions) and advance to state 2 so PumpDebugDAGCutGapsDump() logs
     // it once this frame's fence confirms the copy has landed.
     if (m_DebugDAGCutGapsDumpState == 1) {
-        m_LODSelection.RecordDebugReadback(cmd);
+        m_LODSelection.RecordDebugReadback(cmdMid);
         m_DebugDAGCutGapsDumpState = 2;
     }
 #endif
@@ -1343,9 +1588,9 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
     // ProcessFeedbackAndDrainCompletions() to consume next frame -- see FeedbackBuffer::
     // RecordReadback()'s own doc comment for why "next frame" (not this one) is the earliest safe
     // point to read it back on the CPU.
-    m_LODSelection.GetFeedbackBuffer().RecordReadback(cmd);
+    m_LODSelection.GetFeedbackBuffer().RecordReadback(cmdMid);
 
-    m_LODSelection.RecordBuildEarlyDispatchArgs(cmd);
+    m_LODSelection.RecordBuildEarlyDispatchArgs(cmdMid);
   }
 
   // =========================================================================================
@@ -1366,7 +1611,7 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
     wpoGlobals.enhancedDisplacementDebugMultiplier = 1.0f;
     wpoGlobals.splineDeformationDebugMultiplier = 1.0f;
 #endif
-    vkCmdUpdateBuffer(cmd, m_WPOGlobalsBuffer.Handle(), 0, sizeof(WPOGlobalsUBO), &wpoGlobals);
+    vkCmdUpdateBuffer(cmdMid, m_WPOGlobalsBuffer.Handle(), 0, sizeof(WPOGlobalsUBO), &wpoGlobals);
 
     VkMemoryBarrier2 wpoBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
     wpoBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
@@ -1377,16 +1622,16 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
     VkDependencyInfo wpoDepInfo{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
     wpoDepInfo.memoryBarrierCount = 1;
     wpoDepInfo.pMemoryBarriers = &wpoBarrier;
-    vkCmdPipelineBarrier2(cmd, &wpoDepInfo);
+    vkCmdPipelineBarrier2(cmdMid, &wpoDepInfo);
   }
 
   // =========================================================================================
   // [2] EARLY cull: every leaf candidate vs frustum/backface + LAST frame's HZB
-  // (rebuilt at the end of the previous RecordFrame from that frame's complete
+  // (rebuilt at the end of the previous frame's RecordFrameLate from that frame's complete
   // depth). Its trailing barrier makes the early draw list/count visible to
   // DRAW_INDIRECT and the pending + software lists visible to later COMPUTE.
   // =========================================================================================
-  m_OcclusionCulling.RecordEarlyPass(cmd, viewParams, viewProj, projScaleY,
+  m_OcclusionCulling.RecordEarlyPass(cmdMid, viewParams, viewProj, projScaleY,
                                      m_LODSelection.GetEarlyDispatchArgsBuffer(),
                                      kSoftwareRasterThresholdPixels
 #ifndef NDEBUG
@@ -1444,7 +1689,7 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
     VkDependencyInfo depInfo{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
     depInfo.imageMemoryBarrierCount = 3;
     depInfo.pImageMemoryBarriers = barriers;
-    vkCmdPipelineBarrier2(cmd, &depInfo);
+    vkCmdPipelineBarrier2(cmdMid, &depInfo);
   }
 
   // =========================================================================================
@@ -1454,18 +1699,18 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
   // is a perf-only ordering choice (lets the masked pipeline's depth test reject more fragments
   // before running its non-early-Z frag shader); final depth/VisBuffer content is order-independent.
   // =========================================================================================
-  BeginVisBufferRendering(cmd, /*clearAttachments=*/true);
+  BeginVisBufferRendering(cmdMid, /*clearAttachments=*/true);
   m_HardwareRaster.RecordDraw(
-      cmd, camera, m_RenderExtent,
+      cmdMid, camera, m_RenderExtent,
       m_Decompression.GetDecompressedIndexPoolBuffer(),
       m_OcclusionCulling.GetEarlyIndirectCommandOpaqueBuffer(),
       m_OcclusionCulling.GetEarlyDrawCountOpaqueBuffer(), m_ClusterCount, /*opaque=*/true);
   m_HardwareRaster.RecordDraw(
-      cmd, camera, m_RenderExtent,
+      cmdMid, camera, m_RenderExtent,
       m_Decompression.GetDecompressedIndexPoolBuffer(),
       m_OcclusionCulling.GetEarlyIndirectCommandBuffer(),
       m_OcclusionCulling.GetEarlyDrawCountBuffer(), m_ClusterCount, /*opaque=*/false);
-  vkCmdEndRendering(cmd);
+  vkCmdEndRendering(cmdMid);
 
   // =========================================================================================
   // [5] Depth -> sampled-readable for the HZB rebuild: the early pass's depth
@@ -1489,7 +1734,7 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
     VkDependencyInfo depInfo{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
     depInfo.imageMemoryBarrierCount = 1;
     depInfo.pImageMemoryBarriers = &barrier;
-    vkCmdPipelineBarrier2(cmd, &depInfo);
+    vkCmdPipelineBarrier2(cmdMid, &depInfo);
   }
 
   // =========================================================================================
@@ -1503,7 +1748,7 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
   // (textureLod through a combined image sampler) -- the exact contract
   // documented on ClusterOcclusionCullingPass step 5.
   // =========================================================================================
-  m_HZB.Generate(cmd);
+  m_HZB.Generate(cmdMid);
   {
     VkMemoryBarrier2 barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
     barrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
@@ -1514,7 +1759,7 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
     VkDependencyInfo depInfo{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
     depInfo.memoryBarrierCount = 1;
     depInfo.pMemoryBarriers = &barrier;
-    vkCmdPipelineBarrier2(cmd, &depInfo);
+    vkCmdPipelineBarrier2(cmdMid, &depInfo);
   }
 
   // =========================================================================================
@@ -1525,8 +1770,8 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
   // dispatch-args build + raster reads), which that trailing barrier does not
   // cover.
   // =========================================================================================
-  m_OcclusionCulling.RecordBuildLateDispatchArgs(cmd);
-  m_OcclusionCulling.RecordLatePass(cmd
+  m_OcclusionCulling.RecordBuildLateDispatchArgs(cmdMid);
+  m_OcclusionCulling.RecordLatePass(cmdMid
 #ifndef NDEBUG
     , cameraCopy.disableOcclusionCulling
 #endif
@@ -1541,7 +1786,7 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
     VkDependencyInfo depInfo{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
     depInfo.memoryBarrierCount = 1;
     depInfo.pMemoryBarriers = &barrier;
-    vkCmdPipelineBarrier2(cmd, &depInfo);
+    vkCmdPipelineBarrier2(cmdMid, &depInfo);
   }
 
   // =========================================================================================
@@ -1591,7 +1836,7 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
     VkDependencyInfo depInfo{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
     depInfo.imageMemoryBarrierCount = 3;
     depInfo.pImageMemoryBarriers = barriers;
-    vkCmdPipelineBarrier2(cmd, &depInfo);
+    vkCmdPipelineBarrier2(cmdMid, &depInfo);
   }
 
   // =========================================================================================
@@ -1599,18 +1844,18 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
   // early pass could not confirm, on top of the early output. Opaque first, same rationale as
   // the early pass above.
   // =========================================================================================
-  BeginVisBufferRendering(cmd, /*clearAttachments=*/false);
-  m_HardwareRaster.RecordDraw(cmd, camera, m_RenderExtent,
+  BeginVisBufferRendering(cmdMid, /*clearAttachments=*/false);
+  m_HardwareRaster.RecordDraw(cmdMid, camera, m_RenderExtent,
                               m_Decompression.GetDecompressedIndexPoolBuffer(),
                               m_OcclusionCulling.GetLateIndirectCommandOpaqueBuffer(),
                               m_OcclusionCulling.GetLateDrawCountOpaqueBuffer(),
                               m_ClusterCount, /*opaque=*/true);
-  m_HardwareRaster.RecordDraw(cmd, camera, m_RenderExtent,
+  m_HardwareRaster.RecordDraw(cmdMid, camera, m_RenderExtent,
                               m_Decompression.GetDecompressedIndexPoolBuffer(),
                               m_OcclusionCulling.GetLateIndirectCommandBuffer(),
                               m_OcclusionCulling.GetLateDrawCountBuffer(),
                               m_ClusterCount, /*opaque=*/false);
-  vkCmdEndRendering(cmd);
+  vkCmdEndRendering(cmdMid);
 
   // =========================================================================================
   // [10] Software raster of every micro-triangle cluster (early- and
@@ -1619,7 +1864,7 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
   // ordering against [9] is required beyond what its own internal barriers
   // already record.
   // =========================================================================================
-  m_SoftwareRaster.RecordRaster(cmd, viewProj);
+  m_SoftwareRaster.RecordRaster(cmdMid, viewProj);
 
   // =========================================================================================
   // [11] Hand the hardware VisBuffer + depth to the resolve pass: color
@@ -1660,7 +1905,7 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
     VkDependencyInfo depInfo{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
     depInfo.imageMemoryBarrierCount = 3;
     depInfo.pImageMemoryBarriers = barriers;
-    vkCmdPipelineBarrier2(cmd, &depInfo);
+    vkCmdPipelineBarrier2(cmdMid, &depInfo);
   }
 
   // =========================================================================================
@@ -1676,20 +1921,67 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
   // [12] Resolve: per-pixel hardware-vs-software arbitration + barycentric reconstruction +
   // material evaluation into the resolve pass's own RGBA8 output image (either path). The
   // software rasterizer's atomic writes are already visible (RecordRaster's trailing COMPUTE ->
-  // COMPUTE barrier).
+  // COMPUTE barrier). Confirmed (by reading ClusterResolvePass.h/.cpp/ClusterShadingBinPass.h) that
+  // neither pass' own descriptor bindings reference the Surface Cache atlas, the TLAS, or any
+  // GI-related Global SDF state -- only renderer::VirtualShadowMapPass's own shadow UBOs (direct
+  // sun shadowing, not indirect GI) and renderer::VirtualTextureManager's page table.
   // =========================================================================================
 #ifndef NDEBUG
   if (cameraCopy.debugViewMode == DEBUG_VIEW_NORMAL) {
-    m_ShadingBin.RecordClassifyAndSort(cmd, m_RenderExtent);
-    m_Resolve.RecordResolveBinned(cmd, viewProj, m_SceneLights.sun, cameraPositionWorld, m_ShadingBin);
+    m_ShadingBin.RecordClassifyAndSort(cmdMid, m_RenderExtent);
+    m_Resolve.RecordResolveBinned(cmdMid, viewProj, m_SceneLights.sun, cameraPositionWorld, m_ShadingBin);
   } else {
     maths::mat4 prevViewProjForResolve = m_HasPrevViewProj ? m_PrevViewProj : viewProj;
-    m_Resolve.RecordResolve(cmd, viewProj, prevViewProjForResolve, m_SceneLights.sun, cameraPositionWorld, cameraCopy.debugViewMode);
+    m_Resolve.RecordResolve(cmdMid, viewProj, prevViewProjForResolve, m_SceneLights.sun, cameraPositionWorld, cameraCopy.debugViewMode);
   }
 #else
-  m_ShadingBin.RecordClassifyAndSort(cmd, m_RenderExtent);
-  m_Resolve.RecordResolveBinned(cmd, viewProj, m_SceneLights.sun, cameraPositionWorld, m_ShadingBin);
+  m_ShadingBin.RecordClassifyAndSort(cmdMid, m_RenderExtent);
+  m_Resolve.RecordResolveBinned(cmdMid, viewProj, m_SceneLights.sun, cameraPositionWorld, m_ShadingBin);
 #endif
+}
+
+void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swapchainImage, VkImageView swapchainImageView) {
+  const CameraPushConstants& cameraCopy = m_FrameScratch.cameraCopy;
+  const maths::vec3& cameraPositionWorld = m_FrameScratch.cameraPositionWorld;
+  const CameraFrameInfo& cameraFrameInfo = m_FrameScratch.cameraFrameInfo;
+  const float globalTimeSeconds = m_FrameScratch.globalTimeSeconds;
+  const maths::mat4& viewProj = m_FrameScratch.viewProj;
+  const maths::mat4& invViewProj = m_FrameScratch.invViewProj;
+  const float jitterX = m_FrameScratch.jitterX;
+  const float jitterY = m_FrameScratch.jitterY;
+  const bool taatsrEnabled = m_FrameScratch.taatsrEnabled;
+  const uint32_t traceMode = m_FrameScratch.traceMode;
+  const bool useAsyncCompute = m_FrameScratch.useAsyncCompute;
+
+  // =========================================================================================
+  // [1z-acquire] Phase 2 (Lumen advanced roadmap) fix: THIS SAME FRAME's own RecordFrameEarly()
+  // released the Surface Cache atlas/TLAS to the async-compute queue (when useAsyncCompute); its
+  // work (RecordAsyncCompute()) has, by the time this command buffer's execution actually reaches
+  // this barrier, signaled VulkanContext::GetAsyncComputeFinishedSemaphore() -- this cmdLate
+  // submission waits on it (main.cpp) before any GPU work below this point executes, so the
+  // ACQUIRE below is safe the instant it's reached. Recorded as the very FIRST thing in this
+  // command buffer since every pass below that reads the Surface Cache atlas/TLAS needs it.
+  //
+  // Narrower than the OLD design's top-of-frame acquire (which additionally covered
+  // COLOR_ATTACHMENT_OUTPUT_BIT/VERTEX_INPUT_BIT/COLOR_ATTACHMENT_WRITE_BIT/
+  // VERTEX_ATTRIBUTE_READ_BIT/INDEX_READ_BIT, because THAT acquire immediately preceded
+  // RecordCapture's own raster draw into the atlas) -- RecordCapture already ran earlier THIS
+  // frame, in RecordFrameEarly(), so nothing below this acquire writes to the atlas images or
+  // reads the Fallback Mesh vertex/index buffers as actual raster vertex input. Verified (not
+  // assumed) by reading VulkanUtils::WriteSharedGeometryBindings -- every one of Reflection/World
+  // Probes/MegaLights/the 3 forward passes binds the Fallback Mesh vertex/index/draw-range buffers
+  // as VK_DESCRIPTOR_TYPE_STORAGE_BUFFER (SHADER_STORAGE_READ_BIT) and the TLAS as
+  // VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR (ACCELERATION_STRUCTURE_READ_BIT_KHR), never as
+  // actual bound vertex/index buffers -- and none of them write to the 5 atlas images (only
+  // GIInject/RecordCapture do, both already complete by this point).
+  // =========================================================================================
+  if (useAsyncCompute) {
+    RecordSurfaceCacheOwnershipTransfer(cmdLate, /*isRelease=*/false,
+        m_AsyncComputeQueueFamilyIndex, m_GraphicsQueueFamilyIndex,
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
+        VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
+        VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR);
+  }
 
   // =========================================================================================
   // [12a] Phase PP4 (post-process stack roadmap): GTAO + Screen-Space Contact Shadows.
@@ -1711,8 +2003,8 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
     ssfxSettings.ssrFallbackThicknessWorld = config::postprocess::SSR_FALLBACK_THICKNESS_WORLD;
     ssfxSettings.ssrFallbackIntensity = config::postprocess::SSR_FALLBACK_INTENSITY;
 
-    m_ScreenSpaceEffects.RecordAmbientOcclusion(cmd, viewProj, cameraPositionWorld, cameraFrameInfo.fovYRadians, ssfxSettings);
-    m_ScreenSpaceEffects.RecordContactShadows(cmd, viewProj, cameraPositionWorld, m_SceneLights.sun.direction, ssfxSettings);
+    m_ScreenSpaceEffects.RecordAmbientOcclusion(cmdLate, viewProj, cameraPositionWorld, cameraFrameInfo.fovYRadians, ssfxSettings);
+    m_ScreenSpaceEffects.RecordContactShadows(cmdLate, viewProj, cameraPositionWorld, m_SceneLights.sun.direction, ssfxSettings);
   }
 
   // Captures THIS frame's shadow-page miss reports (written by SurfaceCacheCapture.frag at [1z]
@@ -1720,13 +2012,13 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
   // VirtualShadowMapPass::RecordBeginFrame() to consume next frame -- see that class' own
   // one-frame-lag contract. Placed here, right after every pass that can call
   // RequestShadowPageResidency() this frame has run.
-  m_VirtualShadowMap.RecordEndFrame(cmd);
+  m_VirtualShadowMap.RecordEndFrame(cmdLate);
 
   // Captures THIS frame's virtual texture page-miss reports (written by the same ClusterResolve
   // .comp/ClusterResolveBinned.comp path that just ran, see virtual_texture_lookup.glsl's own
   // miss-detection comment) for VirtualTextureStreamingCoordinator::RecordBeginFrame() to consume
   // next frame -- identical one-frame-lag placement to m_VirtualShadowMap.RecordEndFrame() above.
-  m_VTStreaming.RecordEndFrame(cmd);
+  m_VTStreaming.RecordEndFrame(cmdLate);
 
   // [12b] Screen Trace GI (Lumen Screen Trace + World Probe fallback): traces linear screen-space
   // rays against the GBuffer depth/normal, falling back to the 3D world probe grid on miss.
@@ -1739,14 +2031,14 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
     bool ssrtEnabled = true;
 #endif
     if (ssrtEnabled) {
-      m_ScreenTrace.RecordTrace(cmd, cameraCopy, cameraPositionWorld, m_WorldProbes.GetGridOriginWorld(), m_FrameIndex);
+      m_ScreenTrace.RecordTrace(cmdLate, cameraCopy, cameraPositionWorld, m_WorldProbes.GetGridOriginWorld(), m_FrameIndex);
     } else {
       VkClearColorValue blackClear{};
       blackClear.float32[0] = 0.0f;
       blackClear.float32[1] = 0.0f;
       blackClear.float32[2] = 0.0f;
       blackClear.float32[3] = 0.0f;
-      VulkanUtils::ClearComputeImageToGeneral(cmd, m_ScreenTrace.GetOutputImage(), blackClear);
+      VulkanUtils::ClearComputeImageToGeneral(cmdLate, m_ScreenTrace.GetOutputImage(), blackClear);
     }
   }
 
@@ -1767,7 +2059,7 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
   // =========================================================================================
   {
     maths::mat4 prevViewProjForReflection = m_HasPrevViewProj ? m_PrevViewProj : maths::mat4{};
-    m_Reflection.RecordUpdateViewParams(cmd, viewProj, prevViewProjForReflection, cameraPositionWorld);
+    m_Reflection.RecordUpdateViewParams(cmdLate, viewProj, prevViewProjForReflection, cameraPositionWorld);
 
 #ifndef NDEBUG
     bool reflectionsEnabled = m_DebugReflectionsEnabled;
@@ -1775,9 +2067,9 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
     bool reflectionsEnabled = true;
 #endif
     if (reflectionsEnabled) {
-      m_Reflection.RecordTrace(cmd, m_TraceContext, m_TraceContext.GetEntityCount(), traceMode, m_FrameIndex);
-      m_Reflection.RecordTemporal(cmd);
-      m_Reflection.RecordGather(cmd);
+      m_Reflection.RecordTrace(cmdLate, m_TraceContext, m_TraceContext.GetEntityCount(), traceMode, m_FrameIndex);
+      m_Reflection.RecordTemporal(cmdLate);
+      m_Reflection.RecordGather(cmdLate);
 
       // Phase PP4: SSR Fallback -- needs m_Reflection's own hit-mask, just written by RecordTrace()
       // above this same frame, so gated under the same `reflectionsEnabled` toggle (a stale
@@ -1787,7 +2079,7 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
       ssrFallbackSettings.ssrFallbackMaxDistanceWorld = config::postprocess::SSR_FALLBACK_MAX_DISTANCE_WORLD;
       ssrFallbackSettings.ssrFallbackThicknessWorld = config::postprocess::SSR_FALLBACK_THICKNESS_WORLD;
       ssrFallbackSettings.ssrFallbackIntensity = config::postprocess::SSR_FALLBACK_ENABLED ? config::postprocess::SSR_FALLBACK_INTENSITY : 0.0f;
-      m_ScreenSpaceEffects.RecordSSRFallback(cmd, viewProj, cameraPositionWorld, ssrFallbackSettings);
+      m_ScreenSpaceEffects.RecordSSRFallback(cmdLate, viewProj, cameraPositionWorld, ssrFallbackSettings);
     }
   }
 
@@ -1815,7 +2107,7 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
     bool megaLightsEnabled = true;
 #endif
     if (megaLightsEnabled) {
-      m_MegaLights.RecordShade(cmd, viewProj, cameraPositionWorld, m_FrameIndex);
+      m_MegaLights.RecordShade(cmdLate, viewProj, cameraPositionWorld, m_FrameIndex);
     }
   }
 
@@ -1843,7 +2135,7 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
   bool worldProbesEnabled = true;
 #endif
   if (worldProbesEnabled) {
-    m_WorldProbes.RecordUpdate(cmd, cameraFrameInfo.position, m_TraceContext, traceMode);
+    m_WorldProbes.RecordUpdate(cmdLate, cameraFrameInfo.position, m_TraceContext, traceMode);
     {
       VkMemoryBarrier2 barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
       barrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
@@ -1854,7 +2146,7 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
       VkDependencyInfo depInfo{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
       depInfo.memoryBarrierCount = 1;
       depInfo.pMemoryBarriers = &barrier;
-      vkCmdPipelineBarrier2(cmd, &depInfo);
+      vkCmdPipelineBarrier2(cmdLate, &depInfo);
     }
   }
 
@@ -1875,13 +2167,13 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
   bool applyDenoise = true;
 #endif
   if (applyDenoise) {
-    m_Denoiser.RecordDenoise(cmd);
+    m_Denoiser.RecordDenoise(cmdLate);
   }
 
   // =========================================================================================
   // [12e] GI Composite: blends direct lit color/reflections with denoised indirect GI.
   // =========================================================================================
-  m_GIComposite.RecordComposite(cmd
+  m_GIComposite.RecordComposite(cmdLate
 #ifndef NDEBUG
       , cameraCopy, cameraPositionWorld, m_WorldProbes.GetGridOriginWorld()
 #endif
@@ -1898,7 +2190,7 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
     VkDependencyInfo depInfo{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
     depInfo.memoryBarrierCount = 1;
     depInfo.pMemoryBarriers = &barrier;
-    vkCmdPipelineBarrier2(cmd, &depInfo);
+    vkCmdPipelineBarrier2(cmdLate, &depInfo);
   }
 
   // =========================================================================================
@@ -1921,14 +2213,20 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
     VkDependencyInfo depInfo{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
     depInfo.memoryBarrierCount = 1;
     depInfo.pMemoryBarriers = &barrier;
-    vkCmdPipelineBarrier2(cmd, &depInfo);
+    vkCmdPipelineBarrier2(cmdLate, &depInfo);
   }
-  m_HZB.Generate(cmd);
+  m_HZB.Generate(cmdLate);
   {
     // Next frame's early cull samples the pyramid; same STORAGE_WRITE ->
-    // SAMPLED_READ extension as [6]. Barriers order against subsequent commands
-    // in submission order on the same queue, so this correctly covers the next
-    // command buffer too.
+    // SAMPLED_READ extension as [6]. Barriers order against subsequent commands in submission
+    // order on the same queue, so this correctly covers a LATER command buffer too -- and still
+    // does, now that this frame's own graphics work spans 3 command buffers (cmdEarly/cmdMid/
+    // cmdLate, this barrier is recorded in cmdLate) rather than 1: the graphics queue's per-frame
+    // submission order is cmdEarly(N) -> cmdMid(N) -> cmdLate(N) -> cmdEarly(N+1) -> cmdMid(N+1) ->
+    // ..., so cmdMid(N+1) (next frame's own [2] early cull, the actual consumer) is still strictly
+    // LATER in this queue's submission order than THIS barrier (in cmdLate(N)), even though
+    // cmdEarly(N+1) is sandwiched in between them -- cmdEarly(N+1) never touches the HZB pyramid at
+    // all, so its presence in between changes nothing about this ordering guarantee.
     VkMemoryBarrier2 barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
     barrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
     barrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
@@ -1938,7 +2236,7 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
     VkDependencyInfo depInfo{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
     depInfo.memoryBarrierCount = 1;
     depInfo.pMemoryBarriers = &barrier;
-    vkCmdPipelineBarrier2(cmd, &depInfo);
+    vkCmdPipelineBarrier2(cmdLate, &depInfo);
   }
 
   // =========================================================================================
@@ -1958,11 +2256,11 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
     // only reads it), so glass's own subsequent depth test correctly occludes against this
     // entity's real (displaced) surface. See HeroTessellationPass's own class comment for the
     // widened synchronization scope this write requires on exit.
-    m_HeroTessellation.RecordDraw(cmd, viewProj, cameraFrameInfo.position,
+    m_HeroTessellation.RecordDraw(cmdLate, viewProj, cameraFrameInfo.position,
         transparentTargetImage, transparentTargetView, m_DepthImage, m_DepthImageView,
         m_RenderExtent, traceMode, m_FrameIndex, m_TraceContext, m_WorldProbes, m_SceneLights);
 
-    m_TransparentForward.RecordDraw(cmd, transparentTargetImage, transparentTargetView, m_DepthImageView,
+    m_TransparentForward.RecordDraw(cmdLate, transparentTargetImage, transparentTargetView, m_DepthImageView,
         m_RenderExtent, cameraCopy.view, cameraCopy.proj, m_Decompression.GetDecompressedIndexPoolBuffer(),
         cameraFrameInfo.position, m_SceneLights, globalTimeSeconds, m_TraceContext, traceMode, m_FrameIndex);
 
@@ -1970,10 +2268,20 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
     // see ClusterRenderPipeline.h's own comment on m_WaterForward for why (it snapshots the
     // already fully-composited frame, including the glass/translucent draw just above, for its
     // own refraction term).
-    m_WaterForward.RecordDraw(cmd, viewProj, cameraFrameInfo.position,
+    m_WaterForward.RecordDraw(cmdLate, viewProj, cameraFrameInfo.position,
         transparentTargetImage, transparentTargetView, m_DepthImage, m_DepthImageView,
         m_RenderExtent, traceMode, m_FrameIndex, globalTimeSeconds, m_TraceContext);
   }
+
+  // Phase 2 (Lumen advanced roadmap) fix, 2026-07-17: the old [1z2] hand-off block that used to
+  // live HERE (release the Surface Cache atlas/TLAS to the async-compute queue, late in the
+  // frame, after every graphics-side consumer had read it) is GONE -- the release now happens in
+  // RecordFrameEarly() (right after RecordCapture/GlobalSDF.RecordUpdate) and the matching acquire
+  // + TLAS refit + radiosity bounce loop + release-back now live in RecordAsyncCompute(), both
+  // executed earlier this same frame, before this method (RecordFrameLate) even began recording --
+  // see this class' own header comment for the full redesign this fixed and why. Nothing here
+  // needs to touch the Surface Cache atlas/TLAS again this frame (TAA/DoF/Bloom/PostProcess/blit
+  // below are pure post-process, no GI sampling).
 
   // =========================================================================================
   // [13d] TAA & TSR pass (Temporal Anti-Aliasing and Temporal Super Resolution):
@@ -1990,7 +2298,7 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
       VkImageView currentLowResColorView = m_GIComposite.GetOutputView();
       m_TAATSR.UpdateDescriptorSets(currentLowResColorView, m_Resolve.GetOutputDepthView());
 
-      m_TAATSR.RecordPass(cmd, viewProj, prevViewProjForTAA, invViewProj, passJitterX, passJitterY, m_FrameIndex, resetHistory);
+      m_TAATSR.RecordPass(cmdLate, viewProj, prevViewProjForTAA, invViewProj, passJitterX, passJitterY, m_FrameIndex, resetHistory);
   }
 
   // =========================================================================================
@@ -2014,13 +2322,13 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
       VkDependencyInfo taatsrToDofDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
       taatsrToDofDep.memoryBarrierCount = 1;
       taatsrToDofDep.pMemoryBarriers = &taatsrToDofBarrier;
-      vkCmdPipelineBarrier2(cmd, &taatsrToDofDep);
+      vkCmdPipelineBarrier2(cmdLate, &taatsrToDofDep);
 
       DepthOfFieldPass::Settings dofSettings{};
       dofSettings.focalLengthMM = config::postprocess::DOF_FOCAL_LENGTH_MM;
       dofSettings.focusDistanceWorldUnits = config::postprocess::DOF_FOCUS_DISTANCE_WORLD_UNITS;
       dofSettings.maxCoCRadiusPixels = config::postprocess::DOF_ENABLED ? config::postprocess::DOF_MAX_COC_RADIUS_PIXELS : 0.0f;
-      m_DepthOfField.RecordGenerate(cmd, invViewProj, cameraPositionWorld, config::postprocess::EXPOSURE_APERTURE, dofSettings);
+      m_DepthOfField.RecordGenerate(cmdLate, invViewProj, cameraPositionWorld, config::postprocess::EXPOSURE_APERTURE, dofSettings);
   }
 
   // =========================================================================================
@@ -2059,7 +2367,7 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
       bloomSettings.anamorphicStretch = config::postprocess::ANAMORPHIC_FLARE_STRETCH;
       bloomSettings.dirtIntensity = config::postprocess::LENS_DIRT_INTENSITY;
       bloomSettings.dirtScale = config::postprocess::LENS_DIRT_SCALE;
-      m_Bloom.RecordGenerate(cmd, bloomSettings);
+      m_Bloom.RecordGenerate(cmdLate, bloomSettings);
 
       float deltaTimeSeconds = m_HasLastFrameTime ? (globalTimeSeconds - m_LastFrameTimeSeconds) : (1.0f / 60.0f);
       deltaTimeSeconds = std::clamp(deltaTimeSeconds, 0.0f, 0.25f); // Guard against alt-tab/breakpoint stalls.
@@ -2123,7 +2431,7 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
       // resolved into its own block-scoped prevViewProjForTAA (out of scope here) -- Motion Blur's
       // own per-pixel reprojection needs the identical semantics, recomputed inline.
       maths::mat4 prevViewProjForPostProcess = m_HasPrevViewProj ? m_PrevViewProj : viewProj;
-      m_PostProcess.RecordComposite(cmd, deltaTimeSeconds, ppSettings, invViewProj, prevViewProjForPostProcess, cameraPositionWorld,
+      m_PostProcess.RecordComposite(cmdLate, deltaTimeSeconds, ppSettings, invViewProj, prevViewProjForPostProcess, cameraPositionWorld,
           viewProj, m_SceneLights.sun.direction,
           cameraFrameInfo.fovYRadians, cameraFrameInfo.aspectRatio, m_FrameIndex);
   }
@@ -2134,7 +2442,7 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
   // one exception that actually produces new GPU work this frame) so it's recorded before both the
   // HUD-targeting selection and the final blit's own selection reference its output image.
   if (config::debugview::SELECTED_BUFFER_INDEX != 0) {
-    RecordDebugBufferView(cmd);
+    RecordDebugBufferView(cmdLate);
   }
 
   // =========================================================================================
@@ -2151,9 +2459,9 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
     m_LastHWTriangleCount = hwTriangleCount;
     m_LastSWTriangleCount = swTriangleCount;
 
-    m_TriangleStats.RecordClear(cmd);
-    m_TriangleStats.RecordCompute(cmd);
-    m_TriangleStats.RecordReadback(cmd);
+    m_TriangleStats.RecordClear(cmdLate);
+    m_TriangleStats.RecordCompute(cmdLate);
+    m_TriangleStats.RecordReadback(cmdLate);
 
     const VkPhysicalDeviceMemoryProperties* memProps = nullptr;
     vmaGetMemoryProperties(m_Allocator, &memProps);
@@ -2249,7 +2557,7 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
         overlayTargetFormat = debug::DebugTextOverlay::kHdrTargetFormat;
     }
 
-    m_DebugOverlay.RecordDraw(cmd, overlayTargetImage, overlayTargetView, overlayExtent, overlayTargetFormat);
+    m_DebugOverlay.RecordDraw(cmdLate, overlayTargetImage, overlayTargetView, overlayExtent, overlayTargetFormat);
   }
 #endif
 
@@ -2335,7 +2643,7 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
     depInfo.pMemoryBarriers = &resolveToBlitBarrier;
     depInfo.imageMemoryBarrierCount = 1;
     depInfo.pImageMemoryBarriers = &swapchainToBlitBarrier;
-    vkCmdPipelineBarrier2(cmd, &depInfo);
+    vkCmdPipelineBarrier2(cmdLate, &depInfo);
   }
 
   VkImageBlit blitRegion{};
@@ -2347,7 +2655,7 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
                               static_cast<int32_t>(m_DisplayExtent.height), 1};
   // Same extent both sides -- the "blit" is a 1:1 copy that also performs the
   // RGBA8 -> B8G8R8A8 component reordering the swapchain format requires.
-  vkCmdBlitImage(cmd, blitSourceImage, VK_IMAGE_LAYOUT_GENERAL,
+  vkCmdBlitImage(cmdLate, blitSourceImage, VK_IMAGE_LAYOUT_GENERAL,
                  swapchainImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
                  &blitRegion, VK_FILTER_NEAREST);
 
@@ -2369,7 +2677,7 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
     VkDependencyInfo depInfo{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
     depInfo.imageMemoryBarrierCount = 1;
     depInfo.pImageMemoryBarriers = &attachmentBarrier;
-    vkCmdPipelineBarrier2(cmd, &depInfo);
+    vkCmdPipelineBarrier2(cmdLate, &depInfo);
   }
 
   // Draw ImGui onto the swapchain image attachment
@@ -2385,9 +2693,9 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
   renderingInfo.colorAttachmentCount = 1;
   renderingInfo.pColorAttachments = &colorAttachment;
 
-  vkCmdBeginRendering(cmd, &renderingInfo);
-  ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), cmd);
-  vkCmdEndRendering(cmd);
+  vkCmdBeginRendering(cmdLate, &renderingInfo);
+  ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), cmdLate);
+  vkCmdEndRendering(cmdLate);
 
   {
     VkImageMemoryBarrier2 presentBarrier{
@@ -2406,7 +2714,7 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
     VkDependencyInfo depInfo{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
     depInfo.imageMemoryBarrierCount = 1;
     depInfo.pImageMemoryBarriers = &presentBarrier;
-    vkCmdPipelineBarrier2(cmd, &depInfo);
+    vkCmdPipelineBarrier2(cmdLate, &depInfo);
   }
 #else
   {
@@ -2426,13 +2734,13 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
     VkDependencyInfo depInfo{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
     depInfo.imageMemoryBarrierCount = 1;
     depInfo.pImageMemoryBarriers = &presentBarrier;
-    vkCmdPipelineBarrier2(cmd, &depInfo);
+    vkCmdPipelineBarrier2(cmdLate, &depInfo);
   }
 #endif
 
   // Recorded last, after every consumer of "the previous frame's" viewProj above (m_Resolve's own
   // motion-vector debug view) has already read it -- this frame's own matrix becomes "the previous
-  // frame's" for the NEXT RecordFrame() call.
+  // frame's" for NEXT frame's own RecordFrameMid()/RecordFrameLate() calls.
   m_PrevViewProj = viewProj;
   m_HasPrevViewProj = true;
   ++m_FrameIndex;

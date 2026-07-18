@@ -122,6 +122,15 @@ namespace debugpipeline {
         TestReport report;
         report.SetHeader(BuildHeader(vkContext));
 
+        // Phase 2 (Lumen advanced roadmap): see main.cpp's own asyncComputeFence declaration-site
+        // comment -- `frameFence` (this function's own parameter) only guards the graphics queue's
+        // submission, not vkContext.GetAsyncComputeCommandBuffer()'s own independent one. Local to
+        // this function (not threaded in from main.cpp) since RunAll owns its whole frame loop.
+        VkFence asyncComputeFence = VK_NULL_HANDLE;
+        VkFenceCreateInfo asyncComputeFenceInfo{ VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+        asyncComputeFenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+        VK_CHECK(vkCreateFence(vkContext.GetDevice(), &asyncComputeFenceInfo, nullptr, &asyncComputeFence));
+
         Camera camera({ 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f });
         float azimuth = 0.0f;
         bool windowClosedEarly = false;
@@ -132,8 +141,9 @@ namespace debugpipeline {
         // debug toggles this group of frames should exercise before this runs.
         //
         // `screenshotFileName` (optional): when non-empty, the LAST frame of this batch also
-        // records a ScreenshotCapture::RecordCapture() into ITS OWN command buffer, right after
-        // RecordFrame() and before vkEndCommandBuffer() -- see ScreenshotCapture.h's own header
+        // records a ScreenshotCapture::RecordCapture() into cmdLate (the command buffer that
+        // records RecordFrameLate()'s own final blit + present-layout transition), right after that
+        // call returns and before vkEndCommandBuffer() -- see ScreenshotCapture.h's own header
         // comment for why capturing via a separate post-present one-shot command buffer is a
         // validation error and this in-frame recording is the correct fix. Returns the screenshot's
         // path (relative to outputDir), or empty if none was requested/it failed. ---
@@ -168,42 +178,82 @@ namespace debugpipeline {
                 VkSemaphore imgAvailable = vkContext.GetImageAvailableSemaphore();
                 VkSemaphore rndFinished = vkContext.GetRenderFinishedSemaphore(imageIndex);
 
-                // ClusterRenderPipeline::RecordFrame() unconditionally composites ImGui::GetDrawData()
-                // onto the swapchain image in every Debug build (see its own [ImGui] block) -- a
-                // NewFrame()/Render() pair is required every frame regardless of whether this
-                // pipeline draws any widgets itself, otherwise GetDrawData() returns stale/invalid
-                // data. No UI content is built here (empty frame is valid ImGui usage).
+                // ClusterRenderPipeline::RecordFrameLate() unconditionally composites
+                // ImGui::GetDrawData() onto the swapchain image in every Debug build (see its own
+                // [ImGui] block) -- a NewFrame()/Render() pair is required every frame regardless of
+                // whether this pipeline draws any widgets itself, otherwise GetDrawData() returns
+                // stale/invalid data. No UI content is built here (empty frame is valid ImGui usage).
                 ImGui_ImplVulkan_NewFrame();
                 ImGui_ImplGlfw_NewFrame();
                 ImGui::NewFrame();
                 ImGui::Render();
 
+                // Phase 2 (Lumen advanced roadmap) fix: mirrors main.cpp's own identical 3-phase
+                // (cmdEarly/asyncComputeCmd/cmdMid+transferCmd/cmdLate) sequence -- see that file's
+                // own comments for the full per-frame submit contract and root-cause explanation.
+
+                VkCommandBuffer cmdEarly = vkContext.GetCommandBufferEarly();
+                vkResetCommandBuffer(cmdEarly, 0);
+                VkCommandBufferBeginInfo cmdEarlyBeginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+                vkBeginCommandBuffer(cmdEarly, &cmdEarlyBeginInfo);
+
+                clusterPipeline.RecordFrameEarly(cmdEarly, camera.GetPushConstants(),
+                    camera.GetPosition(), camera.GetFrameInfo(aspect), static_cast<float>(glfwGetTime()),
+                    vkContext.GetEntityTransformsCPU());
+
+                vkEndCommandBuffer(cmdEarly);
+
+                VkSemaphore asyncComputeCanStart = vkContext.GetAsyncComputeCanStartSemaphore();
+                VkSubmitInfo cmdEarlySubmitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
+                cmdEarlySubmitInfo.commandBufferCount = 1;
+                cmdEarlySubmitInfo.pCommandBuffers = &cmdEarly;
+                cmdEarlySubmitInfo.signalSemaphoreCount = 1;
+                cmdEarlySubmitInfo.pSignalSemaphores = &asyncComputeCanStart;
+                VK_CHECK(vkQueueSubmit(vkContext.GetGraphicsQueue(), 1, &cmdEarlySubmitInfo, VK_NULL_HANDLE));
+
+                // Deferred wait (see main.cpp's own asyncComputeFence declaration-site comment for
+                // why): right before this frame resets/re-records asyncComputeCmd, not upfront.
+                VK_CHECK(vkWaitForFences(vkContext.GetDevice(), 1, &asyncComputeFence, VK_TRUE, UINT64_MAX));
+                VK_CHECK(vkResetFences(vkContext.GetDevice(), 1, &asyncComputeFence));
+
+                VkCommandBuffer asyncComputeCmd = vkContext.GetAsyncComputeCommandBuffer();
+                vkResetCommandBuffer(asyncComputeCmd, 0);
+                VkCommandBufferBeginInfo asyncComputeBeginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+                vkBeginCommandBuffer(asyncComputeCmd, &asyncComputeBeginInfo);
+
+                clusterPipeline.RecordAsyncCompute(asyncComputeCmd);
+
+                vkEndCommandBuffer(asyncComputeCmd);
+
+                VkSemaphore asyncComputeFinished = vkContext.GetAsyncComputeFinishedSemaphore();
+                VkSubmitInfo asyncComputeSubmitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
+                asyncComputeSubmitInfo.waitSemaphoreCount = 1;
+                asyncComputeSubmitInfo.pWaitSemaphores = &asyncComputeCanStart;
+                VkPipelineStageFlags asyncComputeWaitStage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
+                asyncComputeSubmitInfo.pWaitDstStageMask = &asyncComputeWaitStage;
+                asyncComputeSubmitInfo.commandBufferCount = 1;
+                asyncComputeSubmitInfo.pCommandBuffers = &asyncComputeCmd;
+                asyncComputeSubmitInfo.signalSemaphoreCount = 1;
+                asyncComputeSubmitInfo.pSignalSemaphores = &asyncComputeFinished;
+                VK_CHECK(vkQueueSubmit(vkContext.GetAsyncComputeQueue(), 1, &asyncComputeSubmitInfo, asyncComputeFence));
+
                 // Transfer queue's per-frame command buffer (see main.cpp's identical sequence for
-                // the full rationale) -- geometry page uploads land here, ahead of the graphics
+                // the full rationale) -- geometry page uploads land here, ahead of cmdMid's own
                 // submission below.
                 VkCommandBuffer transferCmd = vkContext.GetTransferCommandBuffer();
                 vkResetCommandBuffer(transferCmd, 0);
                 VkCommandBufferBeginInfo transferBeginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
                 vkBeginCommandBuffer(transferCmd, &transferBeginInfo);
 
-                vkResetCommandBuffer(vkContext.GetCommandBuffer(), 0);
-                VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-                vkBeginCommandBuffer(vkContext.GetCommandBuffer(), &beginInfo);
+                VkCommandBuffer cmdMid = vkContext.GetCommandBufferMid();
+                vkResetCommandBuffer(cmdMid, 0);
+                VkCommandBufferBeginInfo cmdMidBeginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+                vkBeginCommandBuffer(cmdMid, &cmdMidBeginInfo);
 
-                clusterPipeline.RecordFrame(vkContext.GetCommandBuffer(), transferCmd, camera.GetPushConstants(),
-                    camera.GetPosition(), camera.GetFrameInfo(aspect), static_cast<float>(glfwGetTime()),
-                    vkContext.GetSwapchainImages()[imageIndex], vkContext.GetSwapchainImageViews()[imageIndex],
-                    vkContext.GetEntityTransformsCPU());
-
-                if (captureRequested && f == frameCount - 1) {
-                    debugpipeline::ScreenshotCapture::RecordCapture(
-                        vkContext.GetCommandBuffer(), vkContext.GetAllocator(),
-                        vkContext.GetSwapchainImages()[imageIndex], vkContext.GetSwapchainImageFormat(),
-                        vkContext.GetSwapchainExtent(), pendingStagingBuffer, pendingStagingAllocation);
-                }
+                clusterPipeline.RecordFrameMid(cmdMid, transferCmd);
 
                 vkEndCommandBuffer(transferCmd);
-                vkEndCommandBuffer(vkContext.GetCommandBuffer());
+                vkEndCommandBuffer(cmdMid);
 
                 VkSemaphore transferFinished = vkContext.GetTransferFinishedSemaphore();
                 VkSubmitInfo transferSubmitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
@@ -213,18 +263,45 @@ namespace debugpipeline {
                 transferSubmitInfo.pSignalSemaphores = &transferFinished;
                 VK_CHECK(vkQueueSubmit(vkContext.GetTransferQueue(), 1, &transferSubmitInfo, VK_NULL_HANDLE));
 
-                VkCommandBuffer cmd = vkContext.GetCommandBuffer();
-                VkSubmitInfo submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
-                VkSemaphore waitSemaphores[] = { imgAvailable, transferFinished };
-                VkPipelineStageFlags waitStages[] = { VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT };
-                submitInfo.waitSemaphoreCount = 2;
-                submitInfo.pWaitSemaphores = waitSemaphores;
-                submitInfo.pWaitDstStageMask = waitStages;
-                submitInfo.commandBufferCount = 1;
-                submitInfo.pCommandBuffers = &cmd;
-                submitInfo.signalSemaphoreCount = 1;
-                submitInfo.pSignalSemaphores = &rndFinished;
-                VK_CHECK(vkQueueSubmit(vkContext.GetGraphicsQueue(), 1, &submitInfo, frameFence));
+                VkSubmitInfo cmdMidSubmitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
+                cmdMidSubmitInfo.waitSemaphoreCount = 1;
+                cmdMidSubmitInfo.pWaitSemaphores = &transferFinished;
+                VkPipelineStageFlags cmdMidWaitStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+                cmdMidSubmitInfo.pWaitDstStageMask = &cmdMidWaitStage;
+                cmdMidSubmitInfo.commandBufferCount = 1;
+                cmdMidSubmitInfo.pCommandBuffers = &cmdMid;
+                VK_CHECK(vkQueueSubmit(vkContext.GetGraphicsQueue(), 1, &cmdMidSubmitInfo, VK_NULL_HANDLE));
+
+                VkCommandBuffer cmdLate = vkContext.GetCommandBufferLate();
+                vkResetCommandBuffer(cmdLate, 0);
+                VkCommandBufferBeginInfo cmdLateBeginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+                vkBeginCommandBuffer(cmdLate, &cmdLateBeginInfo);
+
+                clusterPipeline.RecordFrameLate(cmdLate, vkContext.GetSwapchainImages()[imageIndex],
+                    vkContext.GetSwapchainImageViews()[imageIndex]);
+
+                if (captureRequested && f == frameCount - 1) {
+                    debugpipeline::ScreenshotCapture::RecordCapture(
+                        cmdLate, vkContext.GetAllocator(),
+                        vkContext.GetSwapchainImages()[imageIndex], vkContext.GetSwapchainImageFormat(),
+                        vkContext.GetSwapchainExtent(), pendingStagingBuffer, pendingStagingAllocation);
+                }
+
+                vkEndCommandBuffer(cmdLate);
+
+                VkSubmitInfo cmdLateSubmitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
+                VkSemaphore cmdLateWaitSemaphores[] = { imgAvailable, asyncComputeFinished };
+                VkPipelineStageFlags cmdLateWaitStages[] = {
+                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
+                };
+                cmdLateSubmitInfo.waitSemaphoreCount = 2u;
+                cmdLateSubmitInfo.pWaitSemaphores = cmdLateWaitSemaphores;
+                cmdLateSubmitInfo.pWaitDstStageMask = cmdLateWaitStages;
+                cmdLateSubmitInfo.commandBufferCount = 1;
+                cmdLateSubmitInfo.pCommandBuffers = &cmdLate;
+                cmdLateSubmitInfo.signalSemaphoreCount = 1;
+                cmdLateSubmitInfo.pSignalSemaphores = &rndFinished;
+                VK_CHECK(vkQueueSubmit(vkContext.GetGraphicsQueue(), 1, &cmdLateSubmitInfo, frameFence));
 
                 VkSwapchainKHR swapchain = vkContext.GetSwapchain();
                 VkPresentInfoKHR presentInfo{ VK_STRUCTURE_TYPE_PRESENT_INFO_KHR };
@@ -238,8 +315,12 @@ namespace debugpipeline {
             // Fully settle the GPU before any post-group readback/screenshot write-out: safe here
             // (this pipeline is a one-shot offline validation run, not the perf-sensitive
             // interactive loop main.cpp's own comments explain the fence-only wait for) and
-            // required before mapping pendingStagingBuffer below.
+            // required before mapping pendingStagingBuffer below. Also waits on the async-compute
+            // queue (Phase 2, Lumen advanced roadmap) -- falls back transparently to a second,
+            // harmless idle-wait on the same queue as the graphics one above when this GPU exposes
+            // no dedicated async-compute family.
             vkQueueWaitIdle(vkContext.GetGraphicsQueue());
+            vkQueueWaitIdle(vkContext.GetAsyncComputeQueue());
 
             if (captureRequested && pendingStagingBuffer != VK_NULL_HANDLE) {
                 std::string relPath = "screenshots/" + screenshotFileName;
@@ -499,6 +580,12 @@ namespace debugpipeline {
         }
 
         vkQueueWaitIdle(vkContext.GetGraphicsQueue());
+        // Phase 2 (Lumen advanced roadmap): also idle the async-compute queue before tearing down
+        // asyncComputeFence below -- falls back transparently to a second, harmless idle-wait on
+        // the same queue as the graphics one above when this GPU exposes no dedicated async-compute
+        // family.
+        vkQueueWaitIdle(vkContext.GetAsyncComputeQueue());
+        vkDestroyFence(vkContext.GetDevice(), asyncComputeFence, nullptr);
         std::string reportPath = report.WriteMarkdown(outputDir);
         uint32_t failCount = report.FailCount();
         LOG_INFO(std::format("[DebugTestPipeline] Done. Report: '{}'. {} test(s) FAILED.", reportPath, failCount));
