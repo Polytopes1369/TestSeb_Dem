@@ -45,6 +45,61 @@
 // StreamingManager would trigger, without needing a live StreamingManager/CellManifest/camera at
 // all -- see that method's own header comment for why this is still genuine, real validation.
 //
+// --- Phase 6.4 ("Generation Caching"): per-cell generation-result cache -------------------------
+// The gap this phase closes: world::StreamingManager's own streaming loop can (and, for a camera
+// oscillating near a cell boundary, WILL) call LoadCellFullDetail() for the SAME coord many times
+// across a session, each preceded by an UnloadCell() for that same coord as the cell briefly drops
+// out of range. Before this phase, EVERY one of those reloads re-ran the full
+// pcg::GeneratePcgContentForCell() evaluation (disk read + JSON parse + graph evaluation per
+// overlapping volume) from scratch -- pure waste, since that function is a documented pure,
+// deterministic function of its input (see PcgCellGenerator.h's own "Determinism" comment: the
+// exact same (volumeDesc, cellCoord) pair always reproduces byte-identical output).
+//
+// Cache key: `CellCoord` ALONE (m_GenerationResultCache below), not a hash of coord+volumes+seed.
+// This is deliberate, not an oversight: m_VolumeIndex is built ONCE at construction and NEVER
+// mutated afterward (see this class' own constructor comment), and m_CellSize is likewise fixed for
+// this instance's entire lifetime. So, for a GIVEN PcgCellLoader instance, `coord` alone already
+// fully determines the PcgCellGenerationInput (both overlappingVolumes AND cellSize) that
+// StageFullDetailGeneration() would otherwise rebuild -- which, since GeneratePcgContentForCell is
+// pure, fully determines its output too. Hashing volume ids/seeds into the key as well would just
+// re-derive information m_VolumeIndex already pins down per-coord; it would never change the
+// key-to-result mapping for THIS instance.
+//
+// Critically, UnloadCell() does NOT evict this cache -- only m_CellToAcquiredSlots (main-thread,
+// Pump()-side bookkeeping) is touched on unload. A generation result, once computed, survives for
+// this loader instance's entire session lifetime regardless of how many times its cell gets
+// unloaded and reloaded -- this is exactly what makes the "camera oscillates across a cell
+// boundary" scenario above a guaranteed cache HIT on every reload after the first.
+//
+// Eviction policy: none -- an unbounded (for this instance's lifetime) unordered_map. Two
+// independent reasons converge on this being safe rather than a leak risk:
+//   1. This cache can only ever grow via StageFullDetailGeneration(), which returns BEFORE ever
+//      touching the cache for any coord absent from m_VolumeIndex (see that method's own early-out).
+//      Its size is therefore hard-bounded by m_VolumeIndex.size() (== GetIndexedCellCount()) --
+//      an AUTHORING-TIME quantity fixed at construction, which does NOT grow with how far or how
+//      long a camera travels/streams. For this codebase's own current authored content
+//      (tools/WorldPartition/BakeDemoWorld.cpp's kGridRadiusCells == 3, a 7x7 == 49-cell patch),
+//      that is a firm upper bound of 49 entries, each holding at most a handful of small
+//      pcg::PcgSpawnRequest structs -- kilobytes, not a concern.
+//   2. Precedent: world::StreamingManager::m_Cells (StreamingManager.h) is ALREADY an unbounded,
+//      never-erased unordered_map<CellCoord, ...> in this exact codebase, and that one has a WEAKER
+//      bound (it grows with every distinct cell a camera ever visits, not just ones with authored
+//      PCG content) -- this cache's own bound is strictly tighter.
+// This is a Debug-only dev/streaming aid (see this class' own Debug-only rationale below), not a
+// shipping persistence system -- an LRU or explicit size cap would be solving a problem this class
+// provably cannot have, so none is built.
+//
+// Thread-safety: m_GenerationResultCache/m_CacheHitCount/m_CacheMissCount are guarded by their OWN
+// mutex (m_CacheMutex), deliberately separate from m_EventsMutex -- an unrelated concern (staging a
+// cross-thread load/unload event vs. memoizing a pure function's result), kept as two independent
+// locks so a worker thread's cache lookup for one cell never contends with another worker thread's
+// event-staging for a different cell. A cache MISS races a fresh pcg::GeneratePcgContentForCell()
+// call OUTSIDE the lock (never hold m_CacheMutex across that potentially-slow call), then inserts
+// via unordered_map::emplace (insert-only-if-absent) -- if two worker threads race a miss for the
+// SAME coord, both compute and offer up a byte-identical result (determinism, again), so whichever
+// one's emplace() actually wins the slot is immaterial; the loser's own local copy is simply
+// discarded after use.
+//
 // --- Debug-only, whole file (see the #ifndef NDEBUG guard below) --------------------------------
 // Two independent reasons converge on the same conclusion:
 //   1. This class' constructor builds its volume index via PcgVolumeCellIndex.h's
@@ -163,13 +218,27 @@ namespace world {
         size_t GetIndexedCellCount() const { return m_VolumeIndex.size(); }
         size_t GetLoadedCellCount() const { return m_CellToAcquiredSlots.size(); } // Main-thread-only -- only meaningful after at least one Pump() call.
 
+        // --- Phase 6.4 ("Generation Caching") accessors -- worker-thread-safe (lock m_CacheMutex),
+        // unlike GetLoadedCellCount() above, since m_GenerationResultCache/m_CacheHitCount/
+        // m_CacheMissCount ARE touched from worker threads (see this class' own top-of-file "Phase
+        // 6.4" comment). Mainly for RunPcgCellLoaderSmokeTest's own cache-hit verification: a test
+        // can snapshot GetCacheHitCount()/GetCacheMissCount() before and after a repeat
+        // LoadCellFullDetail() call for the same coord to prove a reload actually skipped
+        // pcg::GeneratePcgContentForCell() rather than merely re-deriving the same deterministic
+        // answer the slow way. ---
+        size_t GetCacheHitCount() const { std::lock_guard<std::mutex> lock(m_CacheMutex); return m_CacheHitCount; }
+        size_t GetCacheMissCount() const { std::lock_guard<std::mutex> lock(m_CacheMutex); return m_CacheMissCount; }
+        size_t GetCachedCellCount() const { std::lock_guard<std::mutex> lock(m_CacheMutex); return m_GenerationResultCache.size(); }
+
     private:
         // Shared staging helper for LoadCellFullDetail(): looks up `coord`, runs
         // pcg::GeneratePcgContentForCell() for every overlapping volume, and stages a combined load
         // event if the combined result is non-empty. LoadCellHlod() deliberately does NOT call this
         // (see that method's own comment) -- kept as its own private helper rather than a shared
         // "activate" entry point specifically so that distinction cannot silently blur in a future
-        // edit.
+        // edit. Since Phase 6.4, this ALSO consults/populates m_GenerationResultCache before/after
+        // calling pcg::GeneratePcgContentForCell -- see this class' own top-of-file "Phase 6.4"
+        // comment for the full caching rationale, and the .cpp for the exact lock-scoping.
         void StageFullDetailGeneration(const CellCoord& coord);
 
         float m_CellSize;
@@ -177,6 +246,18 @@ namespace world {
 
         size_t m_VolumeCount = 0; // Total authored volumes found at construction (before cell-bucketing) -- see GetVolumeCount().
         PcgVolumeCellIndex m_VolumeIndex; // Built once at construction, read-only afterward -- see this class' own constructor comment.
+
+        // Phase 6.4 ("Generation Caching"): coord -> the pcg::PcgCellGenerationResult
+        // pcg::GeneratePcgContentForCell() previously produced for that coord, memoized for this
+        // loader instance's entire lifetime (NEVER evicted by UnloadCell() -- see this class' own
+        // top-of-file "Phase 6.4" comment for the full key/eviction-policy/thread-safety rationale).
+        // `mutable` on the mutex only (not the map/counters) -- the map/counters are only ever
+        // mutated from StageFullDetailGeneration() (a non-const method); the mutex itself must be
+        // lockable from the const accessors above too, hence `mutable`.
+        mutable std::mutex m_CacheMutex;
+        std::unordered_map<CellCoord, pcg::PcgCellGenerationResult, CellCoordHash> m_GenerationResultCache; // Guarded by m_CacheMutex.
+        size_t m_CacheHitCount = 0;  // Guarded by m_CacheMutex.
+        size_t m_CacheMissCount = 0; // Guarded by m_CacheMutex.
 
         std::mutex m_EventsMutex;
         std::vector<PcgCellLoadEvent> m_PendingEvents; // Guarded by m_EventsMutex.
