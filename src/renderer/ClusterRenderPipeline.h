@@ -651,6 +651,13 @@ namespace renderer {
         //      generation is out of scope for this phase.
         //   4. UnloadCell() + Pump() drives a real DespawnInstances() call that releases every
         //      instance the cell's own generation had acquired (live instance count back to 0).
+        //   5. PCG roadmap Phase 6.4 ("Generation Caching"): a SECOND LoadCellFullDetail() + Pump()
+        //      for the SAME coord, issued right after step 4's UnloadCell() -- exactly the "camera
+        //      re-crosses a cell boundary" reload scenario Phase 6.4 exists to fix (see
+        //      world::PcgCellLoader.h's own top-of-file "Phase 6.4" comment) -- reproduces the exact
+        //      same instance count as step 2 while world::PcgCellLoader::GetCacheHitCount()/
+        //      GetCacheMissCount() prove pcg::GeneratePcgContentForCell was NOT called again (exactly
+        //      1 total cache hit, 0 additional misses beyond the 1 the first load already produced).
         // Not fatal on failure (logged only), matching every other smoke test's own convention. Whole
         // declaration + definition compiled out of Release, matching RunPcgFullPipelineSmokeTest's
         // own convention -- world::PcgCellLoader itself is ALSO whole-file Debug-only (see that
