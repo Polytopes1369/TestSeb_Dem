@@ -35,9 +35,22 @@ namespace renderer {
         // `traceContext` and `surfaceCache` must already be Init'd and must outlive this pass
         // (their sets 1/2 are reused unmodified in this pipeline's layout, and this pass builds
         // its BLAS geometry directly against surfaceCache's own vertex/index buffers).
+        //
+        // Skeletal-animation feature (ray-traced GI/reflections fix): `boneMatricesBuffer`
+        // (animation::SkeletalAnimator::GetBoneMatricesBuffer(), the SAME per-frame SSBO
+        // ClusterRaster.vert already binds) and `entityDataCPU` (index == meshID, the SAME array
+        // renderer::VirtualShadowMapPass::Init already receives) together let this method find the
+        // ONE traced entity with core::EntityFlags::IsSkeletallyAnimated set (at most one, by this
+        // codebase's own design -- see CLAUDE.md's scope note on this being a single-creature
+        // feature) and give ONLY that entity's BLAS the ALLOW_UPDATE build flags + a dedicated
+        // per-frame-skinned vertex buffer + compute pipeline (see RecordCreatureBlasUpdate below) --
+        // every other entity's BLAS is built exactly as before, unaffected. `entityDataCPU == nullptr`
+        // is tolerated (skips creature detection entirely, degrading to this feature's pre-fix
+        // behavior) but every real caller in this codebase always has a valid array to pass.
         bool Init(VkPhysicalDevice physicalDevice, VkDevice device, VmaAllocator allocator,
             VkCommandPool commandPool, VkQueue queue,
-            const SurfaceCacheTraceContext& traceContext, const SurfaceCachePass& surfaceCache);
+            const SurfaceCacheTraceContext& traceContext, const SurfaceCachePass& surfaceCache,
+            VkBuffer boneMatricesBuffer, const core::EntityData* entityDataCPU);
 
         void Shutdown();
 
@@ -59,6 +72,44 @@ namespace renderer {
         // traces against GetTLASHandle() -- see ClusterRenderPipeline::RecordFrame's own call site
         // comment for why it runs first in the [1z] GI block.
         void RecordRefreshTLAS(VkCommandBuffer cmd, const core::EntityTransformCPU* entityTransformsCPU);
+
+        // Skeletal-animation feature (ray-traced GI/reflections fix): dispatches
+        // CreatureBlasSkinning.comp (writes this frame's skinned Fallback Mesh vertex positions into
+        // m_CreatureSkinnedVertexBuffer from `entityTransformsCPU`'s current bone matrices), records
+        // the compute-write -> AS-build-read barrier, then calls RecordUpdateBLAS to refit the
+        // creature's BLAS in UPDATE mode -- a no-op (returns immediately) if Init() found no
+        // skeletally-animated entity. MUST be called:
+        //   - AFTER animation::SkeletalAnimator::RecordUpdate has uploaded THIS frame's bone
+        //     matrices (this method's own compute dispatch reads that SSBO) -- see
+        //     renderer::ClusterRenderPipeline::RecordFrameEarly's own call-site comment for why that
+        //     upload was moved earlier in the frame specifically to satisfy this.
+        //   - ON THE SAME command buffer/queue as, and immediately BEFORE, whichever RecordRefreshTLAS
+        //     call executes this same frame (the TLAS refit reads this BLAS's device address/bounds,
+        //     so it must observe this update's result, not a stale one -- see RecordRefreshTLAS's own
+        //     comment and renderer::ClusterRenderPipeline::RecordFrameEarly/RecordAsyncCompute's own
+        //     two call sites for the exact fallback-path/async-compute-path pairing this requires).
+        void RecordCreatureBlasUpdate(VkCommandBuffer cmd, const core::EntityTransformCPU* entityTransformsCPU);
+
+        // KNOWN, DOCUMENTED SIMPLIFICATION (mirrors renderer::ClusterRenderPipeline::
+        // RecordSurfaceCacheOwnershipTransfer's own identical, already-accepted precedent for
+        // TlasRefitResources -- see that method's own header comment): m_CreatureSkinnedVertexBuffer,
+        // the creature BLAS's own backing buffer, and m_CreatureBlasUpdateResources.scratchBuffer are
+        // NOT included in any cross-queue ownership-transfer barrier. All 3 are written and read
+        // ENTIRELY within one RecordCreatureBlasUpdate() call, always on whichever single queue that
+        // call's own `cmd` targets THIS frame (the SAME queue RecordRefreshTLAS runs on this same
+        // frame, by the caller's own sequencing contract -- see RecordCreatureBlasUpdate's own
+        // comment) -- so within a frame, and across consecutive frames with the SAME routing
+        // decision, no cross-queue hazard exists at all. The only residual risk, exactly like
+        // TlasRefitResources' own accepted one, is SetDebugAsyncComputeEnabled() toggling routing
+        // between two consecutive frames (rare, Debug-only) leaving one of these 3 buffers "owned"
+        // by whichever queue family last touched it -- accepted here for the same reason: these are
+        // purely-internal, single-call-scoped resources with no other consumer, not worth a third
+        // whole-resource-group ownership transfer (alongside RecordSurfaceCacheOwnershipTransfer's
+        // existing 9-resource one and ClusterRenderPipeline's own dedicated bone-matrices-buffer one,
+        // which DOES need real per-frame handling -- see that method's own comment for why the
+        // bone-matrices case is NOT analogous: it is read every async-compute-routed frame by THIS
+        // method's own compute dispatch, not just on a rare toggle).
+        bool HasCreatureBlas() const { return m_CreatureBlasListIndex != kInvalidBlasListIndex; }
 
         // Exposed so renderer::SurfaceCacheGIInjectPass can bind the SAME TLAS + draw-range table
         // into its own inline-ray-query (VK_KHR_ray_query) descriptor set, instead of building a
@@ -97,6 +148,44 @@ namespace renderer {
         TlasRefitResources m_TlasRefitResources;
 
         GpuBuffer m_DrawRangeBuffer; // set 3, binding 2 -- EntityDrawRangeGpu[], index-aligned with m_BLASList.
+
+        // =====================================================================================
+        // Skeletal-animation feature (ray-traced GI/reflections fix): per-frame BLAS refit state
+        // for the ONE traced entity with core::EntityFlags::IsSkeletallyAnimated set (found during
+        // Init()'s own per-entity loop -- see that method's own comment). kInvalidBlasListIndex
+        // (never a valid m_BLASList index) means "no skeletally-animated entity was traced this
+        // Init() call" -- RecordCreatureBlasUpdate is then a no-op and none of the resources below
+        // are ever allocated.
+        // =====================================================================================
+        static constexpr uint32_t kInvalidBlasListIndex = 0xFFFFFFFFu;
+        uint32_t m_CreatureBlasListIndex = kInvalidBlasListIndex; // Index into m_BLASList/m_RefitInstanceInfos.
+        uint32_t m_CreatureEntityID = 0; // meshID -- indexes entityTransformsCPU in RecordCreatureBlasUpdate.
+        uint32_t m_CreatureSrcVertexOffset = 0; // Element offset into surfaceCache.GetVertexBuffer() where this entity's span begins.
+        uint32_t m_CreatureVertexCount = 0;     // Element count of that span == m_CreatureSkinnedVertexBuffer's own element count.
+        uint32_t m_CreatureMaxVertex = 0;       // BLAS triangles.maxVertex, mirrors every other entity's own conservative-bound derivation (see Init()'s .cpp comment).
+        VkBuffer m_CreatureIndexBuffer = VK_NULL_HANDLE;   // Shared surfaceCache.GetIndexBuffer() -- topology never changes, no dedicated copy needed.
+        VkDeviceSize m_CreatureIndexOffsetBytes = 0;
+        uint32_t m_CreatureTriangleCount = 0;
+
+        // Dedicated per-frame-skinned Fallback Mesh vertex buffer (geometry::FallbackVertex-shaped,
+        // GPU_ONLY) -- written every frame by CreatureBlasSkinning.comp, then read as RecordUpdateBLAS's
+        // own UPDATE-mode geometry input. Kept SEPARATE from surfaceCache's own shared, static vertex
+        // buffer (which every OTHER entity's one-shot BLAS still reads directly, and which this
+        // pass' own m_GeometrySet/SurfaceCacheHWRT.rchit continue to sample unmodified -- see
+        // CreatureBlasSkinning.comp's own header comment for why that shared buffer is deliberately
+        // left untouched).
+        GpuBuffer m_CreatureSkinnedVertexBuffer;
+        BlasUpdateResources m_CreatureBlasUpdateResources;
+
+        // CreatureBlasSkinning.comp's own compute pipeline + dedicated 3-binding descriptor set
+        // (source vertex buffer / bone matrices SSBO / dest skinned vertex buffer, all COMPUTE-stage
+        // STORAGE_BUFFER) -- kept separate from m_RaySetLayout/m_GeometrySetLayout above (different
+        // pipeline bind point entirely, VK_PIPELINE_BIND_POINT_COMPUTE not ...RAY_TRACING_KHR).
+        VkDescriptorSetLayout m_SkinningSetLayout = VK_NULL_HANDLE;
+        VkDescriptorPool m_SkinningDescriptorPool = VK_NULL_HANDLE;
+        VkDescriptorSet m_SkinningSet = VK_NULL_HANDLE;
+        VkPipelineLayout m_SkinningPipelineLayout = VK_NULL_HANDLE;
+        VkPipeline m_SkinningPipeline = VK_NULL_HANDLE;
 
         VkDescriptorSetLayout m_RaySetLayout = VK_NULL_HANDLE;      // set 0: ray I/O + TLAS.
         VkDescriptorSetLayout m_GeometrySetLayout = VK_NULL_HANDLE; // set 3: vertex/index/draw-range buffers.

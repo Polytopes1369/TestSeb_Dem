@@ -5,6 +5,7 @@
 #include <format>
 #include <stdexcept>
 
+#include "core/EntityData.h" // core::GetFlag/EntityFlags::IsSkeletallyAnimated -- creature detection, see Init()'s own comment.
 #include "core/Logger.h"
 #include "geometry/ClusterFormat.h"
 #include "renderer/vulkan/RayTracingFunctions.h"
@@ -36,11 +37,22 @@ namespace renderer {
             uint32_t rayCount = 0;
         };
 
+        // Skeletal-animation feature: byte-for-byte layout match for CreatureSkinningConstants in
+        // CreatureBlasSkinning.comp.
+        struct CreatureSkinningConstants {
+            uint32_t srcVertexOffset = 0;
+            uint32_t vertexCount = 0;
+            float centerX = 0.0f;
+            float centerY = 0.0f;
+            float centerZ = 0.0f;
+        };
+
     } // namespace
 
     bool SurfaceCacheRayTracingPass::Init(VkPhysicalDevice physicalDevice, VkDevice device, VmaAllocator allocator,
         VkCommandPool commandPool, VkQueue queue,
-        const SurfaceCacheTraceContext& traceContext, const SurfaceCachePass& surfaceCache) {
+        const SurfaceCacheTraceContext& traceContext, const SurfaceCachePass& surfaceCache,
+        VkBuffer boneMatricesBuffer, const core::EntityData* entityDataCPU) {
         Shutdown();
         m_Device = device;
 
@@ -95,11 +107,23 @@ namespace renderer {
             const uint32_t maxVertex = totalVertexCount > static_cast<uint32_t>(range.vertexOffset)
                 ? (totalVertexCount - static_cast<uint32_t>(range.vertexOffset) - 1u) : 0u;
 
+            // Skeletal-animation feature (ray-traced GI/reflections fix): the ONE traced entity
+            // with core::EntityFlags::IsSkeletallyAnimated set gets ALLOW_UPDATE build flags instead
+            // of every other entity's default PREFER_FAST_TRACE -- see this method's own header
+            // comment and AccelerationStructure.h's own BuildBLAS comment for why. `entityDataCPU`
+            // is indexed by tracedEntities[i].entityID (a meshID, the same index every OTHER
+            // entityDataCPU consumer in this codebase uses), which is always in-bounds for a real
+            // traced entity by construction (see SurfaceCacheTraceContext::TracedEntity's own
+            // comment) -- guarded by entityDataCPU != nullptr regardless, per this method's own
+            // tolerance for a null array (see its own header comment).
+            const bool isCreature = entityDataCPU != nullptr &&
+                core::GetFlag(entityDataCPU[tracedEntities[i].entityID].flags, core::EntityFlags::IsSkeletallyAnimated);
+
             AccelerationStructure blas = BuildBLAS(physicalDevice, device, allocator, commandPool, queue,
                 vertexBuffer, sizeof(geometry::FallbackVertex), maxVertex,
                 static_cast<VkDeviceSize>(range.vertexOffset) * sizeof(geometry::FallbackVertex),
                 indexBuffer, static_cast<VkDeviceSize>(range.firstIndex) * sizeof(uint32_t),
-                triangleCount);
+                triangleCount, /*allowUpdate=*/isCreature);
 
             VkAccelerationStructureInstanceKHR instance{};
             instance.transform = identityTransform;
@@ -110,6 +134,20 @@ namespace renderer {
             instance.accelerationStructureReference = blas.DeviceAddress();
             instances.push_back(instance);
 
+            if (isCreature) {
+                // Recorded BEFORE the push_back below, so this index lands exactly on the entry
+                // that push_back is about to append -- mirrors m_RefitInstanceInfos' own "record
+                // the about-to-be-appended entry's index" pattern one line below.
+                m_CreatureBlasListIndex = static_cast<uint32_t>(m_BLASList.size());
+                m_CreatureEntityID = tracedEntities[i].entityID;
+                m_CreatureSrcVertexOffset = static_cast<uint32_t>(range.vertexOffset);
+                m_CreatureVertexCount = maxVertex + 1u; // == totalVertexCount - vertexOffset (see maxVertex's own comment) -- from this entity's own span to the end of the shared buffer, the same conservative bound maxVertex itself already uses.
+                m_CreatureMaxVertex = maxVertex;
+                m_CreatureIndexBuffer = indexBuffer;
+                m_CreatureIndexOffsetBytes = static_cast<VkDeviceSize>(range.firstIndex) * sizeof(uint32_t);
+                m_CreatureTriangleCount = triangleCount;
+            }
+
             m_BLASList.push_back(std::move(blas));
             // Phase 4 integration: records exactly which tracedEntities index/entityID this BLAS
             // (now m_BLASList's newest entry) corresponds to -- see m_RefitInstanceInfos' own
@@ -119,6 +157,106 @@ namespace renderer {
 
         LOG_INFO(std::format("[SurfaceCacheRayTracingPass] Built {} BLAS / {} TLAS instance(s).",
             m_BLASList.size(), instances.size()));
+
+        // =====================================================================================
+        // STEP 1.5 -- Skeletal-animation feature (ray-traced GI/reflections fix): if STEP 1 found a
+        // skeletally-animated entity, allocate its dedicated per-frame-skinned vertex buffer + BLAS
+        // UPDATE-mode scratch resources + CreatureBlasSkinning.comp's own compute pipeline/
+        // descriptor set. Entirely skipped (every m_Creature*/m_Skinning* member stays at its
+        // default/empty state) if no such entity was traced -- RecordCreatureBlasUpdate() checks
+        // HasCreatureBlas() and is a no-op in that case.
+        // =====================================================================================
+        if (HasCreatureBlas()) {
+            const VkDeviceSize creatureVertexBytes = static_cast<VkDeviceSize>(m_CreatureVertexCount) * sizeof(geometry::FallbackVertex);
+            m_CreatureSkinnedVertexBuffer.Create(allocator, creatureVertexBytes,
+                VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
+
+            m_CreatureBlasUpdateResources = CreateBlasUpdateResources(physicalDevice, device, allocator,
+                sizeof(geometry::FallbackVertex), m_CreatureMaxVertex, m_CreatureTriangleCount);
+
+            // --- CreatureBlasSkinning.comp's own compute pipeline: 3-binding descriptor set (source
+            // vertex buffer / bone matrices SSBO / dest skinned vertex buffer), all COMPUTE-stage
+            // STORAGE_BUFFER -- kept separate from m_RaySetLayout/m_GeometrySetLayout above (a
+            // different pipeline bind point entirely). ---
+            VkDescriptorSetLayoutBinding skinningBindings[3]{};
+            for (uint32_t b = 0; b < 3; ++b) {
+                skinningBindings[b].binding = b;
+                skinningBindings[b].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                skinningBindings[b].descriptorCount = 1;
+                skinningBindings[b].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+            }
+            VkDescriptorSetLayoutCreateInfo skinningSetLayoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+            skinningSetLayoutInfo.bindingCount = 3;
+            skinningSetLayoutInfo.pBindings = skinningBindings;
+            VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &skinningSetLayoutInfo, nullptr, &m_SkinningSetLayout));
+
+            VkDescriptorPoolSize skinningPoolSize{ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3 };
+            VkDescriptorPoolCreateInfo skinningPoolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
+            skinningPoolInfo.maxSets = 1;
+            skinningPoolInfo.poolSizeCount = 1;
+            skinningPoolInfo.pPoolSizes = &skinningPoolSize;
+            VK_CHECK(vkCreateDescriptorPool(m_Device, &skinningPoolInfo, nullptr, &m_SkinningDescriptorPool));
+
+            VkDescriptorSetAllocateInfo skinningSetAllocInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+            skinningSetAllocInfo.descriptorPool = m_SkinningDescriptorPool;
+            skinningSetAllocInfo.descriptorSetCount = 1;
+            skinningSetAllocInfo.pSetLayouts = &m_SkinningSetLayout;
+            VK_CHECK(vkAllocateDescriptorSets(m_Device, &skinningSetAllocInfo, &m_SkinningSet));
+
+            // Binding 0 is the SHARED surfaceCache vertex buffer (read-only source -- every other
+            // entity's BLAS/SurfaceCacheHWRT.rchit continue to read it unmodified, see
+            // CreatureBlasSkinning.comp's own header comment), NOT m_CreatureSkinnedVertexBuffer.
+            VkDescriptorBufferInfo skinningSrcInfo{ vertexBuffer, 0, VK_WHOLE_SIZE };
+            VkDescriptorBufferInfo skinningBoneInfo{ boneMatricesBuffer, 0, VK_WHOLE_SIZE };
+            VkDescriptorBufferInfo skinningDstInfo{ m_CreatureSkinnedVertexBuffer.Handle(), 0, VK_WHOLE_SIZE };
+
+            VkWriteDescriptorSet skinningWrites[3]{};
+            skinningWrites[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+            skinningWrites[0].dstSet = m_SkinningSet;
+            skinningWrites[0].dstBinding = 0;
+            skinningWrites[0].descriptorCount = 1;
+            skinningWrites[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            skinningWrites[0].pBufferInfo = &skinningSrcInfo;
+            skinningWrites[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+            skinningWrites[1].dstSet = m_SkinningSet;
+            skinningWrites[1].dstBinding = 1;
+            skinningWrites[1].descriptorCount = 1;
+            skinningWrites[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            skinningWrites[1].pBufferInfo = &skinningBoneInfo;
+            skinningWrites[2] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+            skinningWrites[2].dstSet = m_SkinningSet;
+            skinningWrites[2].dstBinding = 2;
+            skinningWrites[2].descriptorCount = 1;
+            skinningWrites[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            skinningWrites[2].pBufferInfo = &skinningDstInfo;
+            vkUpdateDescriptorSets(m_Device, 3, skinningWrites, 0, nullptr);
+
+            VkPushConstantRange skinningPushConstantRange{};
+            skinningPushConstantRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+            skinningPushConstantRange.offset = 0;
+            skinningPushConstantRange.size = sizeof(CreatureSkinningConstants);
+
+            VkPipelineLayoutCreateInfo skinningLayoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+            skinningLayoutInfo.setLayoutCount = 1;
+            skinningLayoutInfo.pSetLayouts = &m_SkinningSetLayout;
+            skinningLayoutInfo.pushConstantRangeCount = 1;
+            skinningLayoutInfo.pPushConstantRanges = &skinningPushConstantRange;
+            VK_CHECK(vkCreatePipelineLayout(m_Device, &skinningLayoutInfo, nullptr, &m_SkinningPipelineLayout));
+
+            VkShaderModule skinningModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/CreatureBlasSkinning.comp.spv");
+            VkComputePipelineCreateInfo skinningPipelineInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
+            skinningPipelineInfo.layout = m_SkinningPipelineLayout;
+            skinningPipelineInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+            skinningPipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+            skinningPipelineInfo.stage.module = skinningModule;
+            skinningPipelineInfo.stage.pName = "main";
+            VK_CHECK(vkCreateComputePipelines(m_Device, VK_NULL_HANDLE, 1, &skinningPipelineInfo, nullptr, &m_SkinningPipeline));
+            vkDestroyShaderModule(m_Device, skinningModule, nullptr);
+
+            LOG_INFO(std::format("[SurfaceCacheRayTracingPass] Skeletal-animation feature: creature entityID={} BLAS is per-frame UPDATE-refit ({} vertices, {} triangles).",
+                m_CreatureEntityID, m_CreatureVertexCount, m_CreatureTriangleCount));
+        }
 
         // =====================================================================================
         // STEP 2 -- TLAS.
@@ -369,6 +507,12 @@ namespace renderer {
             if (m_DescriptorPool != VK_NULL_HANDLE) vkDestroyDescriptorPool(m_Device, m_DescriptorPool, nullptr);
             if (m_RaySetLayout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(m_Device, m_RaySetLayout, nullptr);
             if (m_GeometrySetLayout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(m_Device, m_GeometrySetLayout, nullptr);
+            // Skeletal-animation feature: CreatureBlasSkinning.comp's own pipeline/layout/descriptor
+            // pool+layout -- mirrors the ray tracing pipeline's own teardown just above.
+            if (m_SkinningPipeline != VK_NULL_HANDLE) vkDestroyPipeline(m_Device, m_SkinningPipeline, nullptr);
+            if (m_SkinningPipelineLayout != VK_NULL_HANDLE) vkDestroyPipelineLayout(m_Device, m_SkinningPipelineLayout, nullptr);
+            if (m_SkinningDescriptorPool != VK_NULL_HANDLE) vkDestroyDescriptorPool(m_Device, m_SkinningDescriptorPool, nullptr);
+            if (m_SkinningSetLayout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(m_Device, m_SkinningSetLayout, nullptr);
         }
         m_BLASList.clear();
         m_RefitInstanceInfos.clear();
@@ -392,6 +536,26 @@ namespace renderer {
         m_MissRegion = {};
         m_HitRegion = {};
         m_CallableRegion = {};
+
+        // Skeletal-animation feature: creature BLAS-refit state, reset to "no skeletally-animated
+        // entity traced" (see m_CreatureBlasListIndex's own header comment).
+        m_CreatureBlasListIndex = kInvalidBlasListIndex;
+        m_CreatureEntityID = 0;
+        m_CreatureSrcVertexOffset = 0;
+        m_CreatureVertexCount = 0;
+        m_CreatureMaxVertex = 0;
+        m_CreatureIndexBuffer = VK_NULL_HANDLE;
+        m_CreatureIndexOffsetBytes = 0;
+        m_CreatureTriangleCount = 0;
+        m_CreatureSkinnedVertexBuffer.Destroy();
+        m_CreatureBlasUpdateResources.scratchBuffer.Destroy();
+        m_CreatureBlasUpdateResources.scratchAddress = 0;
+        m_SkinningPipeline = VK_NULL_HANDLE;
+        m_SkinningPipelineLayout = VK_NULL_HANDLE;
+        m_SkinningDescriptorPool = VK_NULL_HANDLE;
+        m_SkinningSetLayout = VK_NULL_HANDLE;
+        m_SkinningSet = VK_NULL_HANDLE;
+
         m_Device = VK_NULL_HANDLE;
     }
 
@@ -454,6 +618,75 @@ namespace renderer {
         }
 
         RecordRefitTLAS(cmd, m_Device, m_TLAS.Handle(), m_TlasRefitResources, instances);
+    }
+
+    void SurfaceCacheRayTracingPass::RecordCreatureBlasUpdate(VkCommandBuffer cmd, const core::EntityTransformCPU* entityTransformsCPU) {
+        if (!HasCreatureBlas()) {
+            return; // Init() found no skeletally-animated entity -- see this method's own declaration comment.
+        }
+
+        // =========================================================================================
+        // Step 1 -- CreatureBlasSkinning.comp: writes this frame's skinned vertex positions into
+        // m_CreatureSkinnedVertexBuffer from entityTransformsCPU[m_CreatureEntityID].center + the
+        // bone-matrices SSBO this pipeline's descriptor set was bound to at Init() (the CALLER's
+        // responsibility to have already refreshed THIS frame -- see this method's own declaration
+        // comment).
+        // =========================================================================================
+        const core::EntityTransformCPU& xform = entityTransformsCPU[m_CreatureEntityID];
+
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_SkinningPipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_SkinningPipelineLayout, 0, 1, &m_SkinningSet, 0, nullptr);
+
+        CreatureSkinningConstants pc{};
+        pc.srcVertexOffset = m_CreatureSrcVertexOffset;
+        pc.vertexCount = m_CreatureVertexCount;
+        pc.centerX = xform.center.x;
+        pc.centerY = xform.center.y;
+        pc.centerZ = xform.center.z;
+        vkCmdPushConstants(cmd, m_SkinningPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+
+        constexpr uint32_t kSkinningLocalSizeX = 64; // Matches CreatureBlasSkinning.comp's own layout(local_size_x = 64).
+        const uint32_t groupCount = (m_CreatureVertexCount + kSkinningLocalSizeX - 1u) / kSkinningLocalSizeX;
+        vkCmdDispatch(cmd, groupCount, 1, 1);
+
+        // =========================================================================================
+        // Step 2 -- compute-write -> acceleration-structure-build-read barrier. Per the
+        // VK_KHR_acceleration_structure spec's own synchronization guidance (and this file's own
+        // BuildAccelerationStructure/RecordRefitTLAS precedent just above, both of which already use
+        // VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR for "this stage reads X as acceleration-
+        // structure build input", never the WRITE bit, which describes writing the acceleration
+        // structure's OWN memory, not reading a geometry input buffer feeding into that write): the
+        // destination access for "an UPDATE-mode build reading m_CreatureSkinnedVertexBuffer as its
+        // vertex geometry input" is ACCELERATION_STRUCTURE_READ_BIT_KHR at the
+        // ACCELERATION_STRUCTURE_BUILD_BIT_KHR stage -- the buffer is consumed as build INPUT, it is
+        // never written by the build itself (only the acceleration structure's own backing buffer,
+        // `blas`'s m_Buffer, is written -- RecordUpdateBLAS below issues its own separate barrier for
+        // that write, scoped to the AS object itself, not this vertex buffer).
+        // =========================================================================================
+        VkMemoryBarrier2 barrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+        barrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        barrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+        barrier.dstStageMask = VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
+        barrier.dstAccessMask = VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR;
+        VkDependencyInfo depInfo{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+        depInfo.memoryBarrierCount = 1;
+        depInfo.pMemoryBarriers = &barrier;
+        vkCmdPipelineBarrier2(cmd, &depInfo);
+
+        // =========================================================================================
+        // Step 3 -- BLAS UPDATE refit, reading m_CreatureSkinnedVertexBuffer (just written above)
+        // instead of the shared, static surfaceCache vertex buffer Init()'s own one-shot build read
+        // -- the index buffer/offset/triangleCount stay the SAME as Init()'s own build (this BLAS's
+        // topology never changes, only vertex positions do). RecordUpdateBLAS records its own
+        // internal pre/post ACCELERATION_STRUCTURE_BUILD barriers around the actual
+        // vkCmdBuildAccelerationStructuresKHR call -- see that function's own comment
+        // (AccelerationStructure.h/.cpp). Caller (renderer::ClusterRenderPipeline) is responsible for
+        // sequencing this method's own call before whichever RecordRefreshTLAS call executes this
+        // same frame, on the SAME command buffer/queue -- see this method's own declaration comment.
+        // =========================================================================================
+        RecordUpdateBLAS(cmd, m_Device, m_BLASList[m_CreatureBlasListIndex].Handle(), m_CreatureBlasUpdateResources,
+            m_CreatureSkinnedVertexBuffer.Handle(), sizeof(geometry::FallbackVertex), m_CreatureMaxVertex, /*vertexOffsetBytes=*/0,
+            m_CreatureIndexBuffer, m_CreatureIndexOffsetBytes, m_CreatureTriangleCount);
     }
 
 }
