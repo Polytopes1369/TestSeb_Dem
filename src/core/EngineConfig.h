@@ -205,16 +205,24 @@ inline float DISPLAY_GAMMA = 2.2f;
 // Bloom
 inline float BLOOM_THRESHOLD = 1.0f;        // Bright-pass threshold, linear HDR luminance.
 inline float BLOOM_SOFT_KNEE = 0.5f;
-// Disabled (was 1.0f) as of the 2026-07-17 light-unit recalibration: renderer::BloomPass produces
-// a corrupted (not simply NaN -- see project_light_units_ue58_recalibration memory for the full
-// investigation, including the SanitizeHDR guards added to BloomDownsample.comp/
-// BloomUpsampleComposite.comp/PostProcessComposite.comp, which did NOT fix this) result once the
-// scene's real HDR brightness increased to real UE5.8-parity lux/candela levels, crushing
-// PostProcessComposite.comp's entire final output to black via clamp()'s implementation-defined
-// handling of a non-finite input. Root cause not yet found (BloomPass's own per-mip barriers
-// inspected and appear structurally correct) -- disabling this is the confirmed, working interim
-// fix; re-enable once BloomPass's real bug is found and fixed.
-inline float BLOOM_INTENSITY = 0.0f;
+// Re-enabled (2026-07-18, fix/bloom-hdr-overflow): restored to the original 1.0 pre-workaround
+// default now that the "BloomPass crushes the whole frame to black once the scene reached real
+// UE5.8-parity lux/candela brightness" bug is root-caused and fixed. Root cause was an fp16 (+Inf)
+// overflow in the bloom mip chain -- NOT the per-mip barriers (which were correct):
+// BloomUpsampleComposite.comp's `result = detail + blurred` is a raw ADDITION of two terms each only
+// INDIVIDUALLY clamped to 50000 by the existing SanitizeHDR guards (those guards were sized for the
+// box/tent filters' normalized averages, not this sum), so it reached ~100000 and the imageStore
+// into the R16G16B16A16_SFLOAT bloom image wrote +Inf. That +Inf then flowed into
+// PostProcessComposite.comp's g_Bloom read -- the ONE HDR read in that shader that was (unlike
+// g_HDRColor / g_SkyViewLUT) NOT SanitizeHDR-guarded -- became NaN through the ACES tonemap, and
+// clamp(NaN, 0, 1) collapsed the entire frame to black. THAT is why the earlier SanitizeHDR guards
+// did not help: they clamp per-input-tap, upstream of the overflow-producing sum and the unguarded
+// read. Fixed at both real points: BloomUpsampleComposite.comp now clamps its store to a finite
+// fp16-safe range, and PostProcessComposite.comp now SanitizeHDR-wraps the bloom read. Restoring 1.0
+// was verified safe: with the fix, toggling bloom fully off vs. on at 1.0 produces an identical final
+// image in --test-pipeline, i.e. bloom no longer introduces any non-finite value (the pre-existing
+// overexposure of that fixed test camera's framing is a separate, bloom-independent matter).
+inline float BLOOM_INTENSITY = 1.0f;
 inline float BLOOM_UPSAMPLE_RADIUS = 1.0f;
 
 // Lens Flare (procedural radial ghosts, no texture asset)

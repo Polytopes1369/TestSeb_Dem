@@ -467,8 +467,15 @@ void main() {
 
     // --- Bloom (+ Lens Flare / Anamorphic Lens Flare / Lens Dirt, already baked into
     // renderer::BloomPass's own output -- see that pass' own class comment) -- added at the same
-    // exposed scale as the rest of the scene color. ---
-    color += texture(g_Bloom, distortedUV).rgb * exposureMultiplier * g_Params.bloomIntensity;
+    // exposed scale as the rest of the scene color. The g_Bloom read is SanitizeHDR-guarded exactly
+    // like every other HDR read in this shader (g_HDRColor via SampleWithChromaticAberration,
+    // g_SkyViewLUT above) -- this guard was previously MISSING on the bloom path alone, which let a
+    // non-finite bloom texel poison `color`, survive ACES tonemapping as NaN, and collapse the whole
+    // frame to black at the final clamp(color, 0, 1). Sanitizing here also makes the Bloom-disabled
+    // case (bloomIntensity == 0) safe: a raw +Inf times 0.0 is NaN, but SanitizeHDR(+Inf) is 0, so
+    // 0 * exposureMultiplier * 0 stays a clean 0. (BloomUpsampleComposite.comp now also clamps its
+    // own store so a +Inf should no longer reach this point at all -- this is defense in depth.) ---
+    color += SanitizeHDR(texture(g_Bloom, distortedUV).rgb) * exposureMultiplier * g_Params.bloomIntensity;
 
     // --- Volumetric Light Shafts / God Rays: sampled from `screenUV` (the TRUE rectilinear screen
     // position, NOT the Panini-warped `uv` -- its own raymarch target `sunScreenUV` was projected
