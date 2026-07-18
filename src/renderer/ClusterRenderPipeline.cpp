@@ -735,11 +735,15 @@ bool ClusterRenderPipeline::Init(
     }
   }
 
-  // GPU particle system, Subtask 1 (particle_system_integration_plan.md): buffer/descriptor-set
-  // skeleton only -- see renderer::ParticleSystemPass's own class comment. No render/simulate call
-  // exists yet (Subtasks 2-4 add those), so this Init() is standalone, not order-dependent on
-  // anything above/below it.
-  if (!m_ParticleSystem.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue)) {
+  // GPU particle system (particle_system_integration_plan.md): buffer/descriptor-set skeleton
+  // (Subtask 1) + simulation compute pipeline (Subtask 2) -- see renderer::ParticleSystemPass's own
+  // class comment. Depends on m_AtmosClimate (wind, Init'd above at STEP 7) and m_GlobalSDF
+  // (collision clipmaps, also Init'd above at STEP 7), both already ready by this point in Init().
+  // No RecordSort/RecordDraw exist yet (Subtasks 3-4), and RecordSimulate() itself is not yet
+  // called from RecordFrame (Subtask 6 wires that up), so this Init() has no RecordFrame ordering
+  // consequence yet.
+  if (!m_ParticleSystem.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
+                             m_AtmosClimate, m_GlobalSDF)) {
     LOG_ERROR("[ClusterRenderPipeline] Failed to initialize ParticleSystemPass.");
     return false;
   }
