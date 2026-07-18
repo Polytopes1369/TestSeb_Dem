@@ -1,0 +1,101 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+
+// Fur-strand system (UE5.8 rendering-parity gap G10a), per-strand GPU culling. Runs every frame, one
+// invocation per live strand, compacting survivors into a single non-indexed instanced draw command
+// -- the exact same GPU-driven culling shape renderer::VegetationScatterPass uses
+// (VegetationInstanceCull.comp): a per-instance frustum test plus an HZB occlusion test against the
+// same Hierarchical-Z pyramid (renderer::HZBPass) the Nanite cluster cull samples, with the visible
+// count written entirely on the GPU into a VkDrawIndirectCommand a later vkCmdDrawIndirect consumes.
+// Hair strand counts are large, so this is a genuine per-strand cull, never a brute-force unculled
+// draw (gap G10a's explicit culling requirement).
+//
+// The one difference from VegetationInstanceCull.comp: a fur root is SKINNED (it rides the animated
+// creature's surface), so its bounding sphere is centered on this frame's SKINNED world-space root
+// position -- computed here via FurCommon.glsl's FurSkinRestToWorld, the identical transform
+// composition FurStrand.vert applies to draw the strand. The bone-matrices + entity-transform SSBOs
+// are therefore bound into this compute set too (bindings 6/7).
+
+#include "include/FurCommon.glsl"   // FurStrandRoot, FurSkinRestToWorld, unpack helpers
+
+#define HZB_TEXTURE_SET 0
+#define HZB_TEXTURE_BINDING 3
+#include "include/hzb_occlusion.glsl"   // g_HZBTexture, IsClusterOccluded
+
+layout(local_size_x = 64) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer StrandRootBuffer { FurStrandRoot roots[]; };
+layout(std430, set = 0, binding = 1) writeonly buffer VisibleIndexBuffer { uint visibleIndices[]; };
+
+// Byte-for-byte mirror of VkDrawIndirectCommand (NON-indexed: fur strands are a procedural ribbon
+// generated from gl_VertexIndex, no bound vertex/index buffer -- see FurStrand.vert).
+struct DrawIndirectCommand {
+    uint vertexCount;
+    uint instanceCount;
+    uint firstVertex;
+    uint firstInstance;
+};
+layout(std430, set = 0, binding = 2) buffer IndirectCommandBuffer { DrawIndirectCommand command; };
+
+// binding 3 == g_HZBTexture (declared by hzb_occlusion.glsl).
+
+layout(std140, set = 0, binding = 4) uniform CullParams {
+    vec4 frustumPlanes[6]; // xyz = outward unit normal, w = signed distance (Gribb-Hartmann); outside plane i when dot(xyz,p)+w < 0.
+    vec4 cameraPos;
+    mat4 viewProj;         // proj * view -- for the HZB AABB projection.
+    vec2 hzbMip0Size;
+    float hzbMipCount;
+    uint enableOcclusion;  // Debug toggle: 0 disables the HZB test (frustum only).
+    uint creatureMeshID;   // Index of the creature's EntityTransform (== VulkanContext::kCreatureEntityIndex's meshID).
+    uint maxStrands;       // Visible-index buffer capacity guard.
+    float boundingRadius;  // Conservative world-space strand bounding-sphere radius (root-centered, covers full length + curl droop).
+    uint _pad0;
+} g_Cull;
+
+layout(std430, set = 0, binding = 5) readonly buffer CounterBuffer {
+    uint strandCount;      // Live strand count (written by FurStrandGen.comp).
+};
+
+// This frame's SkeletalBoneMatricesSSBO (animation::SkeletalAnimator::GetBoneMatricesBuffer()) and
+// the shared per-entity transform buffer -- both consumed only to re-skin the root to its current
+// animated world position for the bounding test.
+layout(std430, set = 0, binding = 6) readonly buffer SkeletalBoneMatricesSSBO { mat4 boneMatrices[SKELETAL_MAX_BONES]; };
+layout(std430, set = 0, binding = 7) readonly buffer EntityTransformBuffer { EntityTransform entityTransforms[]; };
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= strandCount) {
+        return;
+    }
+
+    FurStrandRoot r = roots[idx];
+    EntityTransform xform = entityTransforms[g_Cull.creatureMeshID];
+    uvec4 boneIndices = FurUnpackBoneIndices(r.boneIndicesPacked);
+    vec4 boneWeights = FurUnpackBoneWeights(r.boneWeightsPacked);
+
+    // Skinned world-space root position this frame -- the bounding sphere follows the animation.
+    vec3 center = FurSkinRestToWorld(r.rootRestPos, boneIndices, boneWeights, xform, boneMatrices);
+    float radius = g_Cull.boundingRadius * max(r.lengthScale, 1.0e-3);
+
+    // Frustum test (sphere vs 6 planes).
+    for (int i = 0; i < 6; ++i) {
+        if (dot(g_Cull.frustumPlanes[i].xyz, center) + g_Cull.frustumPlanes[i].w < -radius) {
+            return;
+        }
+    }
+
+    // HZB occlusion test against the same pyramid the Nanite cluster cull uses.
+    if (g_Cull.enableOcclusion != 0u) {
+        vec3 boundsMin = center - vec3(radius);
+        vec3 boundsMax = center + vec3(radius);
+        if (IsClusterOccluded(boundsMin, boundsMax, g_Cull.viewProj, g_Cull.hzbMip0Size, g_Cull.hzbMipCount)) {
+            return;
+        }
+    }
+
+    // Survivor: append into the compacted visible list + grow the single draw's instanceCount.
+    uint slot = atomicAdd(command.instanceCount, 1u);
+    if (slot < g_Cull.maxStrands) {
+        visibleIndices[slot] = idx;
+    }
+}

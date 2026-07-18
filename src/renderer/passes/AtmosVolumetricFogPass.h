@@ -25,6 +25,7 @@
 
 #include "core/maths/Maths.h"
 #include "renderer/vulkan/GpuBuffer.h" // Local Fog Volumes (G8): RAII owner of the volumes SSBO.
+#include "renderer/vulkan/RenderPass.h"
 
 namespace renderer {
 
@@ -32,7 +33,12 @@ namespace renderer {
     class MegaLightsPass;
     class VirtualShadowMapPass;
 
-    class AtmosVolumetricFogPass {
+    // Migrated to RenderPass<Derived> (see renderer/vulkan/RenderPass.h): Init()/Shutdown() are
+    // inherited -- InitImpl() registers each resource's cleanup right after creating it, in creation
+    // order, and Shutdown() runs those cleanups in reverse.
+    class AtmosVolumetricFogPass : public RenderPass<AtmosVolumetricFogPass> {
+        friend class RenderPass<AtmosVolumetricFogPass>; // Lets Init() call our private InitImpl().
+
     public:
         AtmosVolumetricFogPass() = default;
 
@@ -57,10 +63,9 @@ namespace renderer {
         // into this pass' own descriptor set -- no deferred SetXxx() call needed (unlike
         // SDFRayMarchPass's own convention) since all 3 producers are guaranteed already Init'd by
         // the time this pass is (see ClusterRenderPipeline::Init's own call-order comment).
-        bool Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
-            const AtmosClimatePass& atmosClimate, const MegaLightsPass& megaLights, const VirtualShadowMapPass& vsm);
-
-        void Shutdown();
+        // Init(VkDevice, VmaAllocator, VkCommandPool, VkQueue, const AtmosClimatePass&,
+        // const MegaLightsPass&, const VirtualShadowMapPass&) -> bool and Shutdown() are inherited
+        // from RenderPass<AtmosVolumetricFogPass>; see InitImpl() below.
 
         // `cameraPosition`/`cameraForward`/`upHint` drive each froxel's world-position reconstruction
         // (view-space depth along `cameraForward`, NOT Euclidean ray length -- see
@@ -87,10 +92,12 @@ namespace renderer {
             VkImageView view = VK_NULL_HANDLE;
         };
 
+        bool InitImpl(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
+            const AtmosClimatePass& atmosClimate, const MegaLightsPass& megaLights, const VirtualShadowMapPass& vsm);
+
         void CreateFroxelImage(VmaAllocator allocator, VkDevice device, VkFormat format, FroxelImage& outImage);
 
-        VkDevice m_Device = VK_NULL_HANDLE;
-        VmaAllocator m_Allocator = VK_NULL_HANDLE;
+        // m_Device / m_Allocator are inherited (protected) from RenderPass<AtmosVolumetricFogPass>.
 
         FroxelImage m_MediaProps;   // RG16F: (scatteringCoeff, extinctionCoeff).
         FroxelImage m_RawLight;     // RGBA16F: unintegrated per-voxel in-scattered radiance (rgb).
