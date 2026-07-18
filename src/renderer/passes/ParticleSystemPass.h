@@ -30,12 +30,14 @@
 #include <vulkan/vulkan.h>
 #include <vk_mem_alloc.h>
 
+#include "core/maths/Maths.h"
 #include "renderer/vulkan/GpuBuffer.h"
 
 namespace renderer {
 
     class AtmosClimatePass;
     class GlobalSDFPass;
+    class ClusterResolvePass;
 
     // Byte-for-byte mirror of ParticleCommon.glsl's `Particle` struct -- 64 bytes, std430 (vec3
     // members are 16-byte aligned in std430, so the trailing scalar after each vec3 packs into the
@@ -77,8 +79,17 @@ namespace renderer {
         // borrows `atmosClimate`'s AtmosGlobalsUBO (wind) and `globalSDF`'s 4 clipmap levels
         // (collision), so both must already be Init'd and must outlive this pass, same "borrowed,
         // unmodified" convention as e.g. renderer::AtmosVolumetricFogPass::Init's own parameters.
+        // (Subtask 4) Also builds the ParticleRender.vert/.frag graphics pipeline -- its own set 2
+        // borrows `resolvePass`'s GBuffer depth copy (GetOutputDepthView(), soft-particle
+        // reconstruction) with a dedicated NEAREST sampler, same one-time-bind convention as the
+        // Subtask 2 environment set above. `colorFormat`/`depthFormat` are the render target formats
+        // (matching e.g. renderer::TransparentForwardPass::Init's own plain-VkFormat parameters) --
+        // this pass draws onto the SAME color image and real depth-stencil attachment every other
+        // forward pass (Hero/Water/TransparentForward) targets, not `resolvePass`'s own GBuffer
+        // images (those are read-only inputs here, see GetOutputDepthView()'s own comment above).
         bool Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
-            const AtmosClimatePass& atmosClimate, const GlobalSDFPass& globalSDF);
+            const AtmosClimatePass& atmosClimate, const GlobalSDFPass& globalSDF, const ClusterResolvePass& resolvePass,
+            VkFormat colorFormat, VkFormat depthFormat);
 
         void Shutdown();
 
@@ -151,6 +162,32 @@ namespace renderer {
         // including one for INDIRECT_COMMAND_READ on the indirect-draw buffer specifically).
         void RecordSort(VkCommandBuffer cmd, const float cameraPositionWorld[3], const float cameraForwardWorld[3]);
 
+        // Draws every alive particle (see ParticleRender.vert's own header comment) via
+        // vkCmdDrawIndirect against `colorView`/`depthView` -- the SAME forward-pass color/depth
+        // attachment pair renderer::TransparentForwardPass/HeroTessellationPass/WaterForwardPass
+        // already target (`colorImage` is needed for a trailing layout-transition barrier, same
+        // convention as those passes' own RecordDraw). Depth is bound read-only (loadOp=LOAD,
+        // depthWriteEnable=FALSE, VK_COMPARE_OP_GREATER reversed-Z) -- particles are correctly
+        // hidden behind opaque geometry but never occlude each other via the depth buffer (their
+        // relative order comes entirely from Subtask 3's back-to-front sort instead). `viewProj`
+        // mirrors renderer::ScreenSpaceEffectsPass::RecordAmbientOcclusion's own convention (a single
+        // combined matrix, `.Inverse()`'d internally for the fragment shader's soft-particle
+        // reconstruction) rather than separate view/proj. `cameraRightWorld`/`cameraUpWorld` are the
+        // camera's own right/up basis vectors (already computed once per frame by whatever call site
+        // tracks the camera, e.g. CameraFrameInfo) -- billboarding needs them directly, not
+        // re-derived from `viewProj` in-shader. `softFadeDistanceWorld` is the world-unit band a
+        // particle fades over as it nears intersecting opaque geometry (Subtask 6's ImGui panel will
+        // make this tunable; a fixed default is used until then). Caller owns the barrier before this
+        // call (particle/sorted-pair/indirect-draw-buffer state visible to VERTEX_SHADER/
+        // DRAW_INDIRECT -- Subtask 3's RecordSort does not fully cover this on its own, see that
+        // method's own comment) and after it (this call ends with vkCmdEndRendering and its own
+        // color-attachment-to-whatever-the-caller-needs-next transition, same pattern as
+        // TransparentForwardPass::RecordDraw's own trailing barrier).
+        void RecordDraw(VkCommandBuffer cmd, VkImage colorImage, VkImageView colorView, VkImageView depthView,
+            VkExtent2D renderExtent, const maths::mat4& viewProj, const maths::vec3& cameraPositionWorld,
+            const maths::vec3& cameraRightWorld, const maths::vec3& cameraUpWorld,
+            float softFadeDistanceWorld, float globalTimeSeconds);
+
     private:
         VkDevice m_Device = VK_NULL_HANDLE;
         VmaAllocator m_Allocator = VK_NULL_HANDLE;
@@ -203,6 +240,19 @@ namespace renderer {
         VkDescriptorSet m_SortSet = VK_NULL_HANDLE;
         VkPipelineLayout m_SortPipelineLayout = VK_NULL_HANDLE;
         VkPipeline m_SortPipeline = VK_NULL_HANDLE;
+
+        // Subtask 4 -- ParticleRender.vert/.frag's own set 2 (ParticleRenderParamsUBO + the sampled
+        // GBuffer depth copy borrowed from `resolvePass`, see Init()'s own comment) plus the graphics
+        // pipeline itself. Set 0/1 for this pipeline are m_SetLayout/m_SortSetLayout, REUSED
+        // unmodified from Subtasks 1/3 (the render pass reads the exact same particle state and
+        // sorted-pair order those own, no reason to duplicate either descriptor set).
+        GpuBuffer m_RenderParamsBuffer; // ParticleRenderParamsUBO, std140, GPU_ONLY, updated once per RecordDraw() call.
+        VkSampler m_SceneDepthSampler = VK_NULL_HANDLE; // Nearest -- avoids blending genuinely different NDC depths across a geometry silhouette edge.
+        VkDescriptorSetLayout m_RenderSetLayout = VK_NULL_HANDLE;
+        VkDescriptorPool m_RenderDescriptorPool = VK_NULL_HANDLE;
+        VkDescriptorSet m_RenderSet = VK_NULL_HANDLE;
+        VkPipelineLayout m_RenderPipelineLayout = VK_NULL_HANDLE;
+        VkPipeline m_RenderPipeline = VK_NULL_HANDLE;
     };
 
 }

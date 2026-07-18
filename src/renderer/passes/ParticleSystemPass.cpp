@@ -6,6 +6,7 @@
 
 #include "core/Logger.h"
 #include "renderer/passes/AtmosClimatePass.h"
+#include "renderer/passes/ClusterResolvePass.h"
 #include "renderer/passes/GlobalSDFPass.h"
 #include "renderer/vulkan/VulkanPipeline.h"
 #include "renderer/vulkan/VulkanUtils.h"
@@ -59,10 +60,25 @@ namespace renderer {
         };
         static_assert(sizeof(ParticleSortPC) == 36, "ParticleSortPC must match ParticleSort.comp's own push-constant block exactly");
 
+        // Byte-for-byte mirror of ParticleRender.vert/.frag's own ParticleRenderParamsUBO (std140).
+        // maths::mat4 is used directly (not decomposed into a flat float array like the push-constant
+        // structs above) since a UBO's std140 mat4 member is what this codebase's OTHER UBO-mirror
+        // structs already do (see e.g. ScreenSpaceEffectsPass.cpp's own GTAOParamsUBO::invViewProj).
+        struct ParticleRenderParamsUBO {
+            maths::mat4 viewProj{};
+            maths::mat4 invViewProj{};
+            float cameraPositionX = 0.0f, cameraPositionY = 0.0f, cameraPositionZ = 0.0f, _pad0 = 0.0f;
+            float cameraRightX = 0.0f, cameraRightY = 0.0f, cameraRightZ = 0.0f, _pad1 = 0.0f;
+            float cameraUpX = 0.0f, cameraUpY = 0.0f, cameraUpZ = 0.0f, _pad2 = 0.0f;
+            float viewportWidth = 0.0f, viewportHeight = 0.0f, softFadeDistance = 0.0f, globalTime = 0.0f;
+        };
+        static_assert(sizeof(ParticleRenderParamsUBO) == 192, "ParticleRenderParamsUBO must match ParticleRender.vert/.frag's own UBO exactly (std140 layout)");
+
     } // namespace
 
     bool ParticleSystemPass::Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
-        const AtmosClimatePass& atmosClimate, const GlobalSDFPass& globalSDF) {
+        const AtmosClimatePass& atmosClimate, const GlobalSDFPass& globalSDF, const ClusterResolvePass& resolvePass,
+        VkFormat colorFormat, VkFormat depthFormat) {
         Shutdown();
 
         m_Device = device;
@@ -292,7 +308,11 @@ namespace renderer {
         // set 1 from Subtask 2's environment set, not a shared/extended one).
         // =====================================================================================
         {
-            VkDescriptorSetLayoutBinding sortBinding{ 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+            // VERTEX_BIT included alongside COMPUTE_BIT: this same set/layout is reused unmodified
+            // by Subtask 4's render pipeline (ParticleRender.vert reads sortedPairs[gl_InstanceIndex]
+            // to find which particle each billboard instance draws) -- see renderer::
+            // ParticleSystemPass::Init's own STEP 6 comment for why no separate set is built for it.
+            VkDescriptorSetLayoutBinding sortBinding{ 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_VERTEX_BIT, nullptr };
             VkDescriptorSetLayoutCreateInfo sortLayoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
             sortLayoutInfo.bindingCount = 1;
             sortLayoutInfo.pBindings = &sortBinding;
@@ -335,7 +355,157 @@ namespace renderer {
             vkDestroyShaderModule(m_Device, sortShaderModule, nullptr);
         }
 
-        LOG_INFO(std::format("[ParticleSystemPass] Initialized: {} max particles, {} KB particle buffer x2, simulation + sort pipelines ready.",
+        // =====================================================================================
+        // STEP 6 (Subtask 4) -- ParticleRender.vert/.frag's own set 2 (ParticleRenderParamsUBO +
+        // `resolvePass`'s sampled GBuffer depth copy, borrowed unmodified and bound once here, same
+        // one-time convention as STEP 4's environment set) plus the graphics pipeline itself. Sets 0
+        // and 1 for this pipeline are m_SetLayout/m_SortSetLayout, REUSED unmodified -- no new
+        // descriptor sets needed for the particle-state/sorted-order bindings this pipeline reads.
+        // =====================================================================================
+        {
+            m_RenderParamsBuffer.Create(allocator, sizeof(ParticleRenderParamsUBO),
+                VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
+
+            VkSamplerCreateInfo depthSamplerInfo{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
+            depthSamplerInfo.magFilter = VK_FILTER_NEAREST;
+            depthSamplerInfo.minFilter = VK_FILTER_NEAREST;
+            depthSamplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+            depthSamplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+            depthSamplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+            depthSamplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+            depthSamplerInfo.minLod = 0.0f;
+            depthSamplerInfo.maxLod = 0.0f;
+            depthSamplerInfo.unnormalizedCoordinates = VK_FALSE;
+            VK_CHECK(vkCreateSampler(m_Device, &depthSamplerInfo, nullptr, &m_SceneDepthSampler));
+
+            VkDescriptorSetLayoutBinding renderBindings[2]{};
+            renderBindings[0] = { 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, nullptr };
+            renderBindings[1] = { 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr };
+
+            VkDescriptorSetLayoutCreateInfo renderLayoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+            renderLayoutInfo.bindingCount = 2;
+            renderLayoutInfo.pBindings = renderBindings;
+            VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &renderLayoutInfo, nullptr, &m_RenderSetLayout));
+
+            VkDescriptorPoolSize renderPoolSizes[2] = {
+                { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 },
+                { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1 }
+            };
+            VkDescriptorPoolCreateInfo renderPoolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
+            renderPoolInfo.maxSets = 1;
+            renderPoolInfo.poolSizeCount = 2;
+            renderPoolInfo.pPoolSizes = renderPoolSizes;
+            VK_CHECK(vkCreateDescriptorPool(m_Device, &renderPoolInfo, nullptr, &m_RenderDescriptorPool));
+
+            VkDescriptorSetAllocateInfo renderSetAllocInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+            renderSetAllocInfo.descriptorPool = m_RenderDescriptorPool;
+            renderSetAllocInfo.descriptorSetCount = 1;
+            renderSetAllocInfo.pSetLayouts = &m_RenderSetLayout;
+            VK_CHECK(vkAllocateDescriptorSets(m_Device, &renderSetAllocInfo, &m_RenderSet));
+
+            VkDescriptorBufferInfo renderParamsInfo{ m_RenderParamsBuffer.Handle(), 0, m_RenderParamsBuffer.Size() };
+            VkDescriptorImageInfo sceneDepthInfo{ m_SceneDepthSampler, resolvePass.GetOutputDepthView(), VK_IMAGE_LAYOUT_GENERAL };
+            VkWriteDescriptorSet renderWrites[2]{};
+            renderWrites[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_RenderSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &renderParamsInfo, nullptr };
+            renderWrites[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_RenderSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &sceneDepthInfo, nullptr, nullptr };
+            vkUpdateDescriptorSets(m_Device, 2, renderWrites, 0, nullptr);
+
+            VkDescriptorSetLayout renderPipelineSetLayouts[3] = { m_SetLayout, m_SortSetLayout, m_RenderSetLayout };
+            VkPipelineLayoutCreateInfo renderPipelineLayoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+            renderPipelineLayoutInfo.setLayoutCount = 3;
+            renderPipelineLayoutInfo.pSetLayouts = renderPipelineSetLayouts;
+            VK_CHECK(vkCreatePipelineLayout(m_Device, &renderPipelineLayoutInfo, nullptr, &m_RenderPipelineLayout));
+
+            VkShaderModule vertModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/ParticleRender.vert.spv");
+            VkShaderModule fragModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/ParticleRender.frag.spv");
+            VkPipelineShaderStageCreateInfo stages[2]{};
+            stages[0] = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_VERTEX_BIT, vertModule, "main", nullptr };
+            stages[1] = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT, fragModule, "main", nullptr };
+
+            // No bound vertex buffer -- ParticleRender.vert generates every corner from
+            // gl_VertexIndex, see that shader's own header comment.
+            VkPipelineVertexInputStateCreateInfo vertexInputInfo{ VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
+
+            VkPipelineInputAssemblyStateCreateInfo inputAssembly{ VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
+            inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+            inputAssembly.primitiveRestartEnable = VK_FALSE;
+
+            VkPipelineViewportStateCreateInfo viewportState{ VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
+            viewportState.viewportCount = 1;
+            viewportState.scissorCount = 1;
+
+            // No culling -- a camera-facing billboard's "back face" should never be visible in
+            // practice (it is always oriented toward the camera by construction), but disabling
+            // culling costs nothing here and avoids a silent black quad if a future rotation/size
+            // edge case ever flips winding order.
+            VkPipelineRasterizationStateCreateInfo rasterizer{ VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
+            rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
+            rasterizer.lineWidth = 1.0f;
+            rasterizer.cullMode = VK_CULL_MODE_NONE;
+            rasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+
+            VkPipelineMultisampleStateCreateInfo multisampling{ VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
+            multisampling.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+            // Standard "over" alpha blend against the already-composited scene -- same state as
+            // renderer::TransparentForwardPass's own colorBlendAttachment (see that class' own
+            // comment for the rationale, identical here).
+            VkPipelineColorBlendAttachmentState colorBlendAttachment{};
+            colorBlendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+            colorBlendAttachment.blendEnable = VK_TRUE;
+            colorBlendAttachment.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+            colorBlendAttachment.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+            colorBlendAttachment.colorBlendOp = VK_BLEND_OP_ADD;
+            colorBlendAttachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+            colorBlendAttachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+            colorBlendAttachment.alphaBlendOp = VK_BLEND_OP_ADD;
+
+            VkPipelineColorBlendStateCreateInfo colorBlending{ VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
+            colorBlending.attachmentCount = 1;
+            colorBlending.pAttachments = &colorBlendAttachment;
+
+            VkDynamicState dynamicStates[2] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+            VkPipelineDynamicStateCreateInfo dynamicState{ VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
+            dynamicState.dynamicStateCount = 2;
+            dynamicState.pDynamicStates = dynamicStates;
+
+            VkPipelineRenderingCreateInfo pipelineRendering{ VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO };
+            pipelineRendering.colorAttachmentCount = 1;
+            pipelineRendering.pColorAttachmentFormats = &colorFormat;
+            pipelineRendering.depthAttachmentFormat = depthFormat;
+
+            // Depth-tested (reversed-Z) but NOT written, same rationale as
+            // renderer::TransparentForwardPass's own depthStencil state -- particles must be hidden
+            // behind opaque geometry but never occlude each other via the real depth buffer (Subtask
+            // 3's sort already gives them a correct relative draw order).
+            VkPipelineDepthStencilStateCreateInfo depthStencil{ VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
+            depthStencil.depthTestEnable = VK_TRUE;
+            depthStencil.depthWriteEnable = VK_FALSE;
+            depthStencil.depthCompareOp = VK_COMPARE_OP_GREATER;
+            depthStencil.depthBoundsTestEnable = VK_FALSE;
+            depthStencil.stencilTestEnable = VK_FALSE;
+
+            VkGraphicsPipelineCreateInfo pipelineInfo{ VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
+            pipelineInfo.pNext = &pipelineRendering;
+            pipelineInfo.stageCount = 2;
+            pipelineInfo.pStages = stages;
+            pipelineInfo.pVertexInputState = &vertexInputInfo;
+            pipelineInfo.pInputAssemblyState = &inputAssembly;
+            pipelineInfo.pViewportState = &viewportState;
+            pipelineInfo.pRasterizationState = &rasterizer;
+            pipelineInfo.pMultisampleState = &multisampling;
+            pipelineInfo.pColorBlendState = &colorBlending;
+            pipelineInfo.pDepthStencilState = &depthStencil;
+            pipelineInfo.pDynamicState = &dynamicState;
+            pipelineInfo.layout = m_RenderPipelineLayout;
+
+            VK_CHECK(vkCreateGraphicsPipelines(m_Device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_RenderPipeline));
+
+            vkDestroyShaderModule(m_Device, vertModule, nullptr);
+            vkDestroyShaderModule(m_Device, fragModule, nullptr);
+        }
+
+        LOG_INFO(std::format("[ParticleSystemPass] Initialized: {} max particles, {} KB particle buffer x2, simulation + sort + render pipelines ready.",
             kMaxParticles, static_cast<uint32_t>(kParticleBufferBytes / 1024)));
         return true;
     }
@@ -457,8 +627,120 @@ namespace renderer {
             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
     }
 
+    void ParticleSystemPass::RecordDraw(VkCommandBuffer cmd, VkImage colorImage, VkImageView colorView, VkImageView depthView,
+        VkExtent2D renderExtent, const maths::mat4& viewProj, const maths::vec3& cameraPositionWorld,
+        const maths::vec3& cameraRightWorld, const maths::vec3& cameraUpWorld,
+        float softFadeDistanceWorld, float globalTimeSeconds) {
+        ParticleRenderParamsUBO ubo{};
+        ubo.viewProj = viewProj;
+        ubo.invViewProj = viewProj.Inverse();
+        ubo.cameraPositionX = cameraPositionWorld.x; ubo.cameraPositionY = cameraPositionWorld.y; ubo.cameraPositionZ = cameraPositionWorld.z;
+        ubo.cameraRightX = cameraRightWorld.x; ubo.cameraRightY = cameraRightWorld.y; ubo.cameraRightZ = cameraRightWorld.z;
+        ubo.cameraUpX = cameraUpWorld.x; ubo.cameraUpY = cameraUpWorld.y; ubo.cameraUpZ = cameraUpWorld.z;
+        ubo.viewportWidth = static_cast<float>(renderExtent.width);
+        ubo.viewportHeight = static_cast<float>(renderExtent.height);
+        ubo.softFadeDistance = softFadeDistanceWorld;
+        ubo.globalTime = globalTimeSeconds;
+        vkCmdUpdateBuffer(cmd, m_RenderParamsBuffer.Handle(), 0, sizeof(ubo), &ubo);
+
+        // Covers both this UBO update AND Subtask 3's own trailing barrier scope gap (RecordSort's
+        // own trailing barrier only makes the sorted-pair/indirect-draw data visible to
+        // COMPUTE_SHADER, not to this draw's VERTEX_SHADER/DRAW_INDIRECT reads -- see RecordSort's
+        // own comment).
+        VulkanUtils::RecordMemoryBarrier(cmd, VK_PIPELINE_STAGE_2_TRANSFER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            VK_ACCESS_2_TRANSFER_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+            VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_2_UNIFORM_READ_BIT);
+
+        VkImageMemoryBarrier2 toAttachment{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
+        toAttachment.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+        toAttachment.srcAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+        toAttachment.dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+        toAttachment.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+        toAttachment.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+        toAttachment.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        toAttachment.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toAttachment.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toAttachment.image = colorImage;
+        toAttachment.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+        VkDependencyInfo toAttachmentDependency{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+        toAttachmentDependency.imageMemoryBarrierCount = 1;
+        toAttachmentDependency.pImageMemoryBarriers = &toAttachment;
+        vkCmdPipelineBarrier2(cmd, &toAttachmentDependency);
+
+        VkRenderingAttachmentInfo colorAttachment{ VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
+        colorAttachment.imageView = colorView;
+        colorAttachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD; // Preserve the already-composited scene underneath.
+        colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+
+        // Same "already read-only by this point in the frame" assumption as
+        // renderer::TransparentForwardPass::RecordDraw's own depth attachment -- see that method's
+        // own comment. No transition/barrier needed: depthWriteEnable=FALSE means this pass never
+        // writes it either.
+        VkRenderingAttachmentInfo depthAttachment{ VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
+        depthAttachment.imageView = depthView;
+        depthAttachment.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+        depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+        depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+
+        VkRenderingInfo renderingInfo{ VK_STRUCTURE_TYPE_RENDERING_INFO };
+        renderingInfo.renderArea = { { 0, 0 }, renderExtent };
+        renderingInfo.layerCount = 1;
+        renderingInfo.colorAttachmentCount = 1;
+        renderingInfo.pColorAttachments = &colorAttachment;
+        renderingInfo.pDepthAttachment = &depthAttachment;
+
+        vkCmdBeginRendering(cmd, &renderingInfo);
+
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_RenderPipeline);
+        VkDescriptorSet renderSets[3] = { GetCurrentSet(), m_SortSet, m_RenderSet };
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_RenderPipelineLayout, 0, 3, renderSets, 0, nullptr);
+
+        VkViewport viewport{};
+        viewport.width = static_cast<float>(renderExtent.width);
+        viewport.height = static_cast<float>(renderExtent.height);
+        viewport.minDepth = 0.0f;
+        viewport.maxDepth = 1.0f;
+        vkCmdSetViewport(cmd, 0, 1, &viewport);
+
+        VkRect2D scissor{};
+        scissor.extent = renderExtent;
+        vkCmdSetScissor(cmd, 0, 1, &scissor);
+
+        // This codebase's first vkCmdDrawIndirect call (every prior indirect-draw consumer uses the
+        // INDEXED variant -- see m_IndirectDrawBuffer's own declaration comment). `vertexCount=6`/
+        // `instanceCount=aliveCount` were both already written into this buffer -- the former once
+        // at Init(), the latter every RecordSort() call (see that method's own trailing comment).
+        vkCmdDrawIndirect(cmd, m_IndirectDrawBuffer.Handle(), 0, 1, sizeof(VkDrawIndirectCommand));
+
+        vkCmdEndRendering(cmd);
+
+        VkImageMemoryBarrier2 toGeneral{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
+        toGeneral.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+        toGeneral.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+        toGeneral.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+        toGeneral.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+        toGeneral.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        toGeneral.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        toGeneral.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toGeneral.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toGeneral.image = colorImage;
+        toGeneral.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+        VkDependencyInfo toGeneralDependency{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+        toGeneralDependency.imageMemoryBarrierCount = 1;
+        toGeneralDependency.pImageMemoryBarriers = &toGeneral;
+        vkCmdPipelineBarrier2(cmd, &toGeneralDependency);
+    }
+
     void ParticleSystemPass::Shutdown() {
         if (m_Device != VK_NULL_HANDLE) {
+            if (m_RenderPipeline != VK_NULL_HANDLE) vkDestroyPipeline(m_Device, m_RenderPipeline, nullptr);
+            if (m_RenderPipelineLayout != VK_NULL_HANDLE) vkDestroyPipelineLayout(m_Device, m_RenderPipelineLayout, nullptr);
+            if (m_RenderDescriptorPool != VK_NULL_HANDLE) vkDestroyDescriptorPool(m_Device, m_RenderDescriptorPool, nullptr);
+            if (m_RenderSetLayout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(m_Device, m_RenderSetLayout, nullptr);
+            if (m_SceneDepthSampler != VK_NULL_HANDLE) vkDestroySampler(m_Device, m_SceneDepthSampler, nullptr);
+
             if (m_SortPipeline != VK_NULL_HANDLE) vkDestroyPipeline(m_Device, m_SortPipeline, nullptr);
             if (m_SortPipelineLayout != VK_NULL_HANDLE) vkDestroyPipelineLayout(m_Device, m_SortPipelineLayout, nullptr);
             if (m_SortDescriptorPool != VK_NULL_HANDLE) vkDestroyDescriptorPool(m_Device, m_SortDescriptorPool, nullptr);
@@ -482,6 +764,15 @@ namespace renderer {
         for (uint32_t i = 0; i < 2; ++i) {
             m_ParticleBuffer[i].Destroy();
         }
+
+        m_RenderParamsBuffer.Destroy();
+
+        m_RenderPipeline = VK_NULL_HANDLE;
+        m_RenderPipelineLayout = VK_NULL_HANDLE;
+        m_RenderDescriptorPool = VK_NULL_HANDLE;
+        m_RenderSetLayout = VK_NULL_HANDLE;
+        m_RenderSet = VK_NULL_HANDLE;
+        m_SceneDepthSampler = VK_NULL_HANDLE;
 
         m_SortPipeline = VK_NULL_HANDLE;
         m_SortPipelineLayout = VK_NULL_HANDLE;
