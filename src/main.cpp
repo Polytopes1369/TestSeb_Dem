@@ -332,6 +332,18 @@ int main(int argc, char** argv) {
     }
 
 #ifndef NDEBUG
+    // Phase 0.1 (UE5.8-parity PCG roadmap, "Dynamic Instance Registry"): CPU-only Acquire/Release
+    // smoke test for the new core::InstanceRegistry backing VulkanContext's entity storage -- see
+    // VulkanContext::RunInstanceRegistrySmokeTest's own comment for exactly what it checks. Not
+    // fatal on failure (logged only): this validates a mechanism no runtime caller depends on yet
+    // (Phase 0.1 only lays the groundwork later PCG phases build on), so it must not block startup
+    // the way a real content-load failure would.
+    if (!vkContext.RunInstanceRegistrySmokeTest()) {
+        LOG_ERROR("[Main] InstanceRegistry smoke test FAILED -- see log above for the specific check.");
+    }
+#endif
+
+#ifndef NDEBUG
     // Setup Dear ImGui context
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();

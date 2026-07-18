@@ -2,6 +2,7 @@
 #include "renderer/vulkan/VulkanPipeline.h"
 #include "core/EngineConfig.h" // Centralized engine configurations (config::WINDOW_WIDTH, etc.)
 #include "core/EntityData.h"
+#include "core/InstanceRegistry.h"
 #include "core/Logger.h"
 #include "renderer/MaterialParameterTable.h"
 #include "renderer/RenderTypes.h"
@@ -1539,7 +1540,11 @@ void VulkanContext::BuildEntityData() {
   for (uint32_t i = 0; i < kEntityCount; ++i) {
     core::EntityID id = core::IDManager::GetNextID();
 
-    core::EntityData &entity = m_EntityData[i];
+    // Phase 0.1 (dynamic instance registry): built as a local value, not a reference into the
+    // registry, then handed to AcquireSlot() at the end of the loop body -- see
+    // m_InstanceRegistry's own declaration-site comment for why AcquireSlot() is guaranteed to
+    // return index == i here.
+    core::EntityData entity{};
     entity.meshID = static_cast<uint32_t>(id & 0xFFFFFFFFu);
     entity.materialID = i;
     entity.cellID = 0u;
@@ -1605,6 +1610,14 @@ void VulkanContext::BuildEntityData() {
     if (i == 6u) {
       core::SetFlag(entity.flags, core::EntityFlags::HasSplineDeformation, true);
     }
+
+    // Phase 0.1 (dynamic instance registry): claims this entity's slot via the registry's
+    // Acquire path instead of writing directly into a fixed array element. The registry starts
+    // completely empty and this loop runs before anything else ever calls AcquireSlot(), so the
+    // "bump the high-water mark" path is guaranteed to hand back slotIndex == i.
+    uint32_t slotIndex = m_InstanceRegistry.AcquireSlot(entity);
+    assert(slotIndex == i && "BuildEntityData(): showcase entity did not land at its expected absolute index");
+    (void)slotIndex;
   }
 
   // --- Runtime World Partition streaming pool (see kStreamingUnitCount's own comment) ---
@@ -1619,7 +1632,10 @@ void VulkanContext::BuildEntityData() {
     uint32_t unit = (i - kEntityCount) / kStreamingSlotsPerUnit;
     uint32_t shape = unit % kStreamingArchetypeShapeCount;
 
-    core::EntityData &entity = m_EntityData[i];
+    // Phase 0.1 (dynamic instance registry): same local-value + AcquireSlot() pattern as the
+    // showcase loop above -- this loop continues immediately where that one left off (registry
+    // high-water mark == kEntityCount already), so slotIndex is guaranteed == i here too.
+    core::EntityData entity{};
     entity.meshID = static_cast<uint32_t>(id & 0xFFFFFFFFu);
     entity.materialID = renderer::kStreamingArchetypeMaterialIDBase + shape;
     entity.cellID = 0u;
@@ -1632,14 +1648,20 @@ void VulkanContext::BuildEntityData() {
     // as the loop above does, since materialID == i only holds for the fixed showcase gallery.
     bool isTransparent = m_MaterialTable.isTransparent[entity.materialID];
     core::SetFlag(entity.flags, core::EntityFlags::IsTransparent, isTransparent);
+
+    uint32_t slotIndex = m_InstanceRegistry.AcquireSlot(entity);
+    assert(slotIndex == i && "BuildEntityData(): streaming-pool slot did not land at its expected absolute index");
+    (void)slotIndex;
   }
 }
 
 void VulkanContext::UploadEntityData() {
   // m_EntityBuffer is VMA_MEMORY_USAGE_GPU_ONLY (not host-visible), so
-  // uploading the CPU-authored m_EntityData requires a temporary host-visible
-  // staging buffer plus an explicit GPU-side copy, mirroring the
-  // one-time-submit pattern used elsewhere in Init().
+  // uploading the CPU-authored entity records (m_InstanceRegistry's backing store) requires a
+  // temporary host-visible staging buffer plus an explicit GPU-side copy, mirroring the
+  // one-time-submit pattern used elsewhere in Init(). Only the first kTotalEntityCount slots are
+  // uploaded -- m_InstanceRegistry's own Debug-only headroom capacity (if any) never reaches the
+  // GPU, since it exists solely for RunInstanceRegistrySmokeTest()'s own probe slots.
   VkDeviceSize uploadSize = sizeof(core::EntityData) * kTotalEntityCount;
 
   VkBufferCreateInfo stagingInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
@@ -1658,7 +1680,7 @@ void VulkanContext::UploadEntityData() {
                       &stagingAllocResultInfo) != VK_SUCCESS) {
     throw std::runtime_error("Failed to allocate entity data staging buffer!");
   }
-  std::memcpy(stagingAllocResultInfo.pMappedData, m_EntityData.data(),
+  std::memcpy(stagingAllocResultInfo.pMappedData, m_InstanceRegistry.Data(),
               static_cast<size_t>(uploadSize));
 
   VkCommandBufferAllocateInfo cmdAllocInfo{
@@ -2263,7 +2285,7 @@ void VulkanContext::GenerateGeometry() {
     bool Icosa = true;
 
     GenerateIcosphere(Radius, Tetra, Octa, Icosa,
-                      m_EntityData[2].meshID, slot,
+                      m_InstanceRegistry[2].meshID, slot,
                       runningVertexOffset, runningIndexOffset,
                       icosphereBaseFaceCount, icosphereVertsPerFace);
 
@@ -2282,7 +2304,7 @@ void VulkanContext::GenerateGeometry() {
   // -------------------------------------------------------------------------
   {
     maths::vec2 slot = gridSlot(0);
-    GenerateBox(1.4f, 1.4f, 1.4f, m_EntityData[0].meshID, slot, runningVertexOffset, runningIndexOffset);
+    GenerateBox(1.4f, 1.4f, 1.4f, m_InstanceRegistry[0].meshID, slot, runningVertexOffset, runningIndexOffset);
   }
 
   // -------------------------------------------------------------------------
@@ -2290,7 +2312,7 @@ void VulkanContext::GenerateGeometry() {
   // -------------------------------------------------------------------------
   {
     maths::vec2 slot = gridSlot(1);
-    GenerateCone(0.7f, 0.35f, 1.4f, m_EntityData[1].meshID, slot, runningVertexOffset, runningIndexOffset);
+    GenerateCone(0.7f, 0.35f, 1.4f, m_InstanceRegistry[1].meshID, slot, runningVertexOffset, runningIndexOffset);
   }
 
   // -------------------------------------------------------------------------
@@ -2305,7 +2327,7 @@ void VulkanContext::GenerateGeometry() {
     float Width = 1.4f;
 
     GeneratePlane(Length, Width,
-                  m_EntityData[3].meshID, slot,
+                  m_InstanceRegistry[3].meshID, slot,
                   runningVertexOffset, runningIndexOffset);
   }
 
@@ -2314,7 +2336,7 @@ void VulkanContext::GenerateGeometry() {
   // -------------------------------------------------------------------------
   {
     maths::vec2 slot = gridSlot(4);
-    GenerateSphere(0.8f, m_EntityData[4].meshID, slot, runningVertexOffset, runningIndexOffset);
+    GenerateSphere(0.8f, m_InstanceRegistry[4].meshID, slot, runningVertexOffset, runningIndexOffset);
   }
 
   // -------------------------------------------------------------------------
@@ -2331,7 +2353,7 @@ void VulkanContext::GenerateGeometry() {
     float Twist = 0.0f;
 
     GenerateTorus(Radius1, Radius2, Rotation, Twist,
-                  m_EntityData[5].meshID, slot,
+                  m_InstanceRegistry[5].meshID, slot,
                   runningVertexOffset, runningIndexOffset);
   }
 
@@ -2349,7 +2371,7 @@ void VulkanContext::GenerateGeometry() {
     float Height = 1.4f;
 
     GenerateTube(Radius1, Radius2, Height,
-                 m_EntityData[6].meshID, slot,
+                 m_InstanceRegistry[6].meshID, slot,
                  runningVertexOffset, runningIndexOffset);
   }
 
@@ -2365,7 +2387,7 @@ void VulkanContext::GenerateGeometry() {
     float Height = 0.8f; // cylindrical body length
 
     GenerateCapsule(Radius, Height,
-                    m_EntityData[7].meshID, slot,
+                    m_InstanceRegistry[7].meshID, slot,
                     runningVertexOffset, runningIndexOffset);
   }
 
@@ -2381,7 +2403,7 @@ void VulkanContext::GenerateGeometry() {
     float Height = 1.4f;
 
     GenerateCylinder(Radius, Height,
-                     m_EntityData[8].meshID, slot,
+                     m_InstanceRegistry[8].meshID, slot,
                      runningVertexOffset, runningIndexOffset);
   }
 
@@ -2399,7 +2421,7 @@ void VulkanContext::GenerateGeometry() {
     float Height = 1.2f;
 
     GeneratePyramid(Width, Depth, Height,
-                    m_EntityData[9].meshID, slot,
+                    m_InstanceRegistry[9].meshID, slot,
                     runningVertexOffset, runningIndexOffset);
   }
 
@@ -2420,7 +2442,7 @@ void VulkanContext::GenerateGeometry() {
     params.nbRadSeg = std::max(3u, static_cast<uint32_t>(std::round(curveLength / config::VERTEX_SPACING)));
     params.nbSides = std::max(3u, static_cast<uint32_t>(std::round(2.0f * PI * params.tube / config::VERTEX_SPACING)));
 
-    params.meshID = m_EntityData[10].meshID;
+    params.meshID = m_InstanceRegistry[10].meshID;
     params.materialID = 0.0f;
     params.vertexOffset = runningVertexOffset;
     params.indexOffset = runningIndexOffset;
@@ -2458,7 +2480,7 @@ void VulkanContext::GenerateGeometry() {
 
     params.chamferPower =
         6.0f; // > 2 required (see geom_chamferBox.comp); higher = sharper edges
-    params.meshID = m_EntityData[11].meshID;
+    params.meshID = m_InstanceRegistry[11].meshID;
     params.materialID = 0.0f;
     params.vertexOffset = runningVertexOffset;
     params.indexOffset = runningIndexOffset;
@@ -2514,7 +2536,7 @@ void VulkanContext::GenerateGeometry() {
     // pinned), which is why the wall's OWN world-space X position comes from `slot.x` below.
     {
       maths::vec2 slot = {-1.8f, 0.0f};
-      GeneratePlane(kWallSpan, kWallSpan, m_EntityData[kWallEntityIndexA].meshID, slot,
+      GeneratePlane(kWallSpan, kWallSpan, m_InstanceRegistry[kWallEntityIndexA].meshID, slot,
                     runningVertexOffset, runningIndexOffset, kWallCenterY,
                     config::FLOOR_VERTEX_SPACING);
     }
@@ -2524,7 +2546,7 @@ void VulkanContext::GenerateGeometry() {
     // leaving X and Z pinned) -- perpendicular to Wall A, closing the corner.
     {
       maths::vec2 slot = {0.0f, -1.8f};
-      GeneratePlane(kWallSpan, kWallSpan, m_EntityData[kWallEntityIndexB].meshID, slot,
+      GeneratePlane(kWallSpan, kWallSpan, m_InstanceRegistry[kWallEntityIndexB].meshID, slot,
                     runningVertexOffset, runningIndexOffset, kWallCenterY,
                     config::FLOOR_VERTEX_SPACING);
     }
@@ -2554,7 +2576,7 @@ void VulkanContext::GenerateGeometry() {
     // own mesh sidesteps it entirely: 4x coarser (75x75 = 5625 vertices) still reads as a genuine
     // rolling backdrop at this terrain's own small kTerrainAmplitude.
     constexpr float kTerrainVertexSpacing = 4.0f;
-    GenerateTerrain(300.0f, 300.0f, m_EntityData[kFloorEntityIndex].meshID, slot,
+    GenerateTerrain(300.0f, 300.0f, m_InstanceRegistry[kFloorEntityIndex].meshID, slot,
                   runningVertexOffset, runningIndexOffset, -0.8f,
                   kTerrainVertexSpacing);
   }
@@ -2572,7 +2594,7 @@ void VulkanContext::GenerateGeometry() {
     maths::vec2 slot = {0.0f, 0.0f}; // centered at the world origin, same as the terrain itself
     constexpr float kWaterPlaneSpan = 24.0f; // Mirrors the zone-grid's own ~16-unit extent with margin.
     constexpr float kWaterLevel = -1.0f; // Mirrors water_params.glsl's kWaterLevel -- keep in sync.
-    GenerateWaterPlane(kWaterPlaneSpan, kWaterPlaneSpan, 2u, 2u, m_EntityData[kWaterEntityIndex].meshID, slot,
+    GenerateWaterPlane(kWaterPlaneSpan, kWaterPlaneSpan, 2u, 2u, m_InstanceRegistry[kWaterEntityIndex].meshID, slot,
                        kWaterLevel, runningVertexOffset, runningIndexOffset);
   }
 
@@ -2602,25 +2624,25 @@ void VulkanContext::GenerateGeometry() {
 
       uint32_t coarseIdx = StreamingUnitCoarseSlot(unit);
       maths::vec2 coarseSlot{ kParkBaseX + static_cast<float>(coarseIdx) * kParkSpacing, kParkBaseZ };
-      GenerateBox(0.6f, 0.6f, 0.6f, m_EntityData[coarseIdx].meshID, coarseSlot, runningVertexOffset, runningIndexOffset);
+      GenerateBox(0.6f, 0.6f, 0.6f, m_InstanceRegistry[coarseIdx].meshID, coarseSlot, runningVertexOffset, runningIndexOffset);
 
       uint32_t fineIdx = StreamingUnitFineSlot(unit);
       maths::vec2 fineSlot{ kParkBaseX + static_cast<float>(fineIdx) * kParkSpacing, kParkBaseZ };
       switch (shape) {
         case 0: { // Rock: icosphere.
           uint32_t baseFaceCount = 20u, vertsPerFace = 0u;
-          GenerateIcosphere(0.5f, false, false, true, m_EntityData[fineIdx].meshID, fineSlot,
+          GenerateIcosphere(0.5f, false, false, true, m_InstanceRegistry[fineIdx].meshID, fineSlot,
                              runningVertexOffset, runningIndexOffset, baseFaceCount, vertsPerFace);
           break;
         }
         case 1: // Bush: UV sphere.
-          GenerateSphere(0.5f, m_EntityData[fineIdx].meshID, fineSlot, runningVertexOffset, runningIndexOffset);
+          GenerateSphere(0.5f, m_InstanceRegistry[fineIdx].meshID, fineSlot, runningVertexOffset, runningIndexOffset);
           break;
         case 2: // Tree: capsule (trunk + canopy silhouette stand-in).
-          GenerateCapsule(0.25f, 0.8f, m_EntityData[fineIdx].meshID, fineSlot, runningVertexOffset, runningIndexOffset);
+          GenerateCapsule(0.25f, 0.8f, m_InstanceRegistry[fineIdx].meshID, fineSlot, runningVertexOffset, runningIndexOffset);
           break;
         default: // Debris: torus (irregular scrap silhouette stand-in).
-          GenerateTorus(0.35f, 0.12f, 0.0f, 0.0f, m_EntityData[fineIdx].meshID, fineSlot, runningVertexOffset, runningIndexOffset);
+          GenerateTorus(0.35f, 0.12f, 0.0f, 0.0f, m_InstanceRegistry[fineIdx].meshID, fineSlot, runningVertexOffset, runningIndexOffset);
           break;
       }
     }
@@ -2766,7 +2788,7 @@ void VulkanContext::UpdateEntityRotations(float timeSeconds) {
     // Phase 4 integration (UE5.8 parity roadmap, dynamic scenes onto main): CPU-readable mirror of
     // the SAME values just computed above for GPU upload -- zero extra computation, see
     // GetEntityTransformsCPU()'s own comment on why this exists.
-    m_EntityTransformsCPU[meshID] = core::EntityTransformCPU{
+    m_InstanceRegistry.Transform(meshID) = core::EntityTransformCPU{
         xform.rotation, maths::vec3{xform.centerX, xform.centerY, xform.centerZ}};
   }
 
@@ -2789,7 +2811,7 @@ void VulkanContext::UpdateEntityRotations(float timeSeconds) {
       xform.translationY = t.y;
       xform.translationZ = t.z;
       xform._pad1 = 0.0f;
-      m_EntityTransformsCPU[i] = core::EntityTransformCPU{ xform.rotation, maths::vec3{0.0f, 0.0f, 0.0f}, t };
+      m_InstanceRegistry.Transform(i) = core::EntityTransformCPU{ xform.rotation, maths::vec3{0.0f, 0.0f, 0.0f}, t };
     }
   }
 
@@ -2819,11 +2841,11 @@ void VulkanContext::SetStreamingUnitState(uint32_t unit, bool active, bool useFi
   bool coarseActive = active && !useFineVariant;
   bool fineActive = active && useFineVariant;
 
-  core::EntityData &coarse = m_EntityData[coarseIdx];
+  core::EntityData &coarse = m_InstanceRegistry[coarseIdx];
   core::SetFlag(coarse.flags, core::EntityFlags::StreamingInactive, !coarseActive);
   coarse.cellID = coarseActive ? cellID : 0u;
 
-  core::EntityData &fine = m_EntityData[fineIdx];
+  core::EntityData &fine = m_InstanceRegistry[fineIdx];
   core::SetFlag(fine.flags, core::EntityFlags::StreamingInactive, !fineActive);
   fine.cellID = fineActive ? cellID : 0u;
 
@@ -2854,7 +2876,7 @@ void VulkanContext::PatchStreamingUnitEntityData(uint32_t unit) {
     LOG_ERROR("[VulkanContext] Failed to allocate streaming-slot EntityData staging buffer!");
     return;
   }
-  std::memcpy(stagingAllocResultInfo.pMappedData, &m_EntityData[coarseIdx],
+  std::memcpy(stagingAllocResultInfo.pMappedData, &m_InstanceRegistry[coarseIdx],
               static_cast<size_t>(patchSize));
 
   renderer::VulkanUtils::ExecuteOneShotCommands(m_Device, m_CommandPool, m_GraphicsQueue, [&](VkCommandBuffer cmd) {
@@ -2879,6 +2901,154 @@ void VulkanContext::PatchStreamingUnitEntityData(uint32_t unit) {
 
   vmaDestroyBuffer(m_Allocator, stagingBuffer, stagingAllocation);
 }
+
+#ifndef NDEBUG
+bool VulkanContext::RunInstanceRegistrySmokeTest() {
+  // Phase 0.1 (UE5.8-parity PCG roadmap, "Dynamic Instance Registry"): proves core::InstanceRegistry's
+  // AcquireSlot()/ReleaseSlot() bookkeeping actually works end-to-end -- LIFO free-list reuse, correct
+  // live-count/high-water-mark tracking -- WITHOUT ever touching (let alone corrupting) any of the
+  // kTotalEntityCount real entities BuildEntityData() already acquired. Every probe slot this test
+  // uses comes from m_InstanceRegistry's own kInstanceRegistryDebugHeadroom (its declaration-site
+  // comment explains why that headroom exists), so even a bug in this test's own logic cannot alias a
+  // live showcase/streaming-pool index. Called once from main.cpp right after VulkanContext::Init()
+  // returns (i.e. after BuildEntityData() has already run). Whole function compiled out of Release.
+  LOG_INFO("[VulkanContext] Running core::InstanceRegistry Acquire/Release smoke test...");
+
+  // Snapshot every currently-live entity's data before touching the registry at all, so any
+  // corruption of the real showcase/streaming slots is caught by a plain field comparison at the end,
+  // regardless of what the Acquire/Release calls below actually did internally.
+  std::array<core::EntityData, kTotalEntityCount> beforeSnapshot{};
+  std::copy_n(m_InstanceRegistry.Data(), kTotalEntityCount, beforeSnapshot.data());
+  const uint32_t liveCountBefore = m_InstanceRegistry.GetLiveCount();
+  const uint32_t highWaterMarkBefore = m_InstanceRegistry.GetHighWaterMark();
+
+  if (highWaterMarkBefore != kTotalEntityCount) {
+    LOG_ERROR(std::format(
+        "[VulkanContext] InstanceRegistry smoke test FAILED: expected high-water mark == {} "
+        "(BuildEntityData() should have already acquired exactly the showcase + streaming pool), got {}.",
+        kTotalEntityCount, highWaterMarkBefore));
+    return false;
+  }
+
+  // --- Acquire a handful of BRAND NEW slots, exercising the "grow into never-yet-used headroom"
+  // path -- never touches/releases any of the kTotalEntityCount already-live entities. ---
+  constexpr uint32_t kProbeCount = 3;
+  static_assert(kProbeCount <= kInstanceRegistryDebugHeadroom,
+      "RunInstanceRegistrySmokeTest needs at least kProbeCount slots of spare registry headroom.");
+
+  using Registry = core::InstanceRegistry<kInstanceRegistryCapacity>;
+  std::array<uint32_t, kProbeCount> probeIndices{};
+  for (uint32_t p = 0; p < kProbeCount; ++p) {
+    core::EntityData probe{};
+    // Distinctive sentinel values, never used by real geometry (BuildEntityData() only ever
+    // assigns meshIDs sequentially starting at 0 via core::IDManager).
+    probe.meshID = 0xDEADBEEFu - p;
+    probe.materialID = 0u;
+    probe.cellID = 0u;
+    probe.flags = 0u;
+
+    uint32_t index = m_InstanceRegistry.AcquireSlot(probe);
+    if (index == Registry::kInvalidSlot) {
+      LOG_ERROR("[VulkanContext] InstanceRegistry smoke test FAILED: AcquireSlot() returned "
+                "kInvalidSlot despite spare Debug headroom being available.");
+      return false;
+    }
+    if (index < kTotalEntityCount) {
+      LOG_ERROR(std::format(
+          "[VulkanContext] InstanceRegistry smoke test FAILED: AcquireSlot() returned index {} "
+          "which aliases a live showcase/streaming entity (< kTotalEntityCount={}).",
+          index, kTotalEntityCount));
+      return false;
+    }
+    if (m_InstanceRegistry[index].meshID != probe.meshID) {
+      LOG_ERROR("[VulkanContext] InstanceRegistry smoke test FAILED: readback meshID does not "
+                "match what AcquireSlot() was given.");
+      return false;
+    }
+    probeIndices[p] = index;
+  }
+
+  if (m_InstanceRegistry.GetLiveCount() != liveCountBefore + kProbeCount) {
+    LOG_ERROR("[VulkanContext] InstanceRegistry smoke test FAILED: GetLiveCount() did not "
+              "increase by kProbeCount after acquiring the probe slots.");
+    return false;
+  }
+
+  // --- Release every probe, then re-acquire the same count: the free list is LIFO, so this must
+  // hand back the exact same indices in reverse-release order -- proving ReleaseSlot() actually
+  // recycles capacity instead of leaking it. ---
+  for (uint32_t p = kProbeCount; p-- > 0; ) {
+    m_InstanceRegistry.ReleaseSlot(probeIndices[p]);
+  }
+  if (m_InstanceRegistry.GetLiveCount() != liveCountBefore) {
+    LOG_ERROR("[VulkanContext] InstanceRegistry smoke test FAILED: GetLiveCount() did not return "
+              "to its pre-probe value after releasing every probe slot.");
+    return false;
+  }
+
+  // IMPORTANT: verify every re-acquired index FIRST, in its own complete pass, THEN release them
+  // all in a second pass below -- releasing a probe immediately inside this same loop (before the
+  // next iteration's AcquireSlot() call) would put that just-verified index back on top of the
+  // free-list stack, so the very next AcquireSlot() would just hand it right back out again
+  // instead of exercising the LIFO order this test is actually trying to prove.
+  for (uint32_t p = 0; p < kProbeCount; ++p) {
+    core::EntityData probe{};
+    probe.meshID = 0xC0FFEEu + p;
+    uint32_t index = m_InstanceRegistry.AcquireSlot(probe);
+    if (index != probeIndices[p]) {
+      LOG_ERROR(std::format(
+          "[VulkanContext] InstanceRegistry smoke test FAILED: LIFO free-list re-acquire returned "
+          "index {}, expected {} (release order was not preserved).",
+          index, probeIndices[p]));
+      return false;
+    }
+  }
+  // Leave the registry in exactly the state BuildEntityData() left it: every probe released again
+  // (release order does not matter here -- all kProbeCount are being freed, not re-verified).
+  for (uint32_t p = 0; p < kProbeCount; ++p) {
+    m_InstanceRegistry.ReleaseSlot(probeIndices[p]);
+  }
+  if (m_InstanceRegistry.GetLiveCount() != liveCountBefore) {
+    LOG_ERROR("[VulkanContext] InstanceRegistry smoke test FAILED: GetLiveCount() did not return "
+              "to its pre-probe value after the final cleanup release pass.");
+    return false;
+  }
+
+  if (m_InstanceRegistry.GetHighWaterMark() != highWaterMarkBefore + kProbeCount) {
+    // The high-water mark only ever grows (ReleaseSlot() recycles via the free list, it never
+    // rewinds the mark -- see InstanceRegistry.h's own comment): it should have advanced by
+    // exactly kProbeCount from the very first AcquireSlot() burst above, then stayed flat through
+    // the LIFO release/re-acquire/release pass, which only ever reused those same free-listed
+    // indices.
+    LOG_ERROR(std::format(
+        "[VulkanContext] InstanceRegistry smoke test FAILED: unexpected final high-water mark "
+        "(expected {}, got {}).", highWaterMarkBefore + kProbeCount, m_InstanceRegistry.GetHighWaterMark()));
+    return false;
+  }
+
+  // --- Final check: every one of the kTotalEntityCount real entities is byte-identical to the
+  // snapshot taken before any of the above ran -- the actual "did not corrupt other entities" proof. ---
+  for (uint32_t i = 0; i < kTotalEntityCount; ++i) {
+    const core::EntityData& current = m_InstanceRegistry[i];
+    const core::EntityData& snapshot = beforeSnapshot[i];
+    if (current.meshID != snapshot.meshID || current.materialID != snapshot.materialID ||
+        current.cellID != snapshot.cellID || current.flags != snapshot.flags) {
+      LOG_ERROR(std::format(
+          "[VulkanContext] InstanceRegistry smoke test FAILED: entity index {} was mutated by the "
+          "Acquire/Release probe sequence (meshID {}->{}, materialID {}->{}, cellID {}->{}, flags {}->{}).",
+          i, snapshot.meshID, current.meshID, snapshot.materialID, current.materialID,
+          snapshot.cellID, current.cellID, snapshot.flags, current.flags));
+      return false;
+    }
+  }
+
+  LOG_INFO(std::format(
+      "[VulkanContext] InstanceRegistry smoke test PASSED ({} probe slots acquired/released via "
+      "LIFO free-list reuse in Debug headroom, all {} live entities unchanged).",
+      kProbeCount, kTotalEntityCount));
+  return true;
+}
+#endif // NDEBUG
 
 void VulkanContext::DebugReadbackGeometrySample(uint32_t vertsPerFace,
                                                 uint32_t expectedIndexCount) {
