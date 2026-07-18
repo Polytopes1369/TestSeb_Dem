@@ -21,6 +21,14 @@
 
 namespace world {
 
+    // Phase 5 (Streaming & Monde roadmap, Part 2, Gap 3): the ONE path both main.cpp's
+    // world::CellManifest (used by WorldCellStreamingLoader for runtime cell->placement lookups) and
+    // renderer::VulkanContext::Init() (used to bake real per-cell HLOD proxies into the fixed-size
+    // vertex/index SSBOs at startup, see that class' own GenerateGeometry() streaming block) must
+    // agree on -- kept as one shared constant, rather than two independently-duplicated literals, so
+    // the two loaders can never silently drift onto different files.
+    inline constexpr const char* kDefaultManifestPath = "world_data/cellmanifest.bin";
+
     // One HLOD proxy vertex, byte-for-byte mirror of worldpartition::RuntimeCellManifestHlodVertex
     // (tools/WorldPartition/RuntimeCellManifest.h) -- position + UV only, see that header's own
     // comment for why normals are deliberately excluded (recomputed at load time instead, via
@@ -68,6 +76,15 @@ namespace world {
         // cells, outside the small baked demo grid, will not).
         std::optional<CellPlacement> GetPlacement(const CellCoord& coord) const;
 
+        // Phase 5 (Streaming & Monde roadmap, Part 2, Gap 3): every authored cell's coordinate, in
+        // the SAME deterministic order Load() read them off disk (== BakeDemoWorld.cpp's own
+        // authoring order, see that tool's own grid-scan loop) -- used by
+        // renderer::VulkanContext::GenerateGeometry() to assign each authored cell its own
+        // dedicated streaming unit (unit index == this vector's index), one-to-one and
+        // deterministically, so the SAME cell always lands on the SAME baked unit for the lifetime
+        // of one run. Empty if !IsLoaded().
+        const std::vector<CellCoord>& GetOrderedCells() const { return m_OrderedCells; }
+
         // Every cell's HLOD proxy vertices/indices, concatenated in file order -- a CellPlacement's
         // own hlodVertexOffset/hlodIndexOffset index into these SAME arrays. Indices within one
         // cell's own [hlodIndexOffset, +hlodIndexCount) range are LOCAL to that cell's own
@@ -88,6 +105,7 @@ namespace world {
         bool m_Loaded = false;
         float m_CellSize = 0.0f;
         std::unordered_map<CellCoord, CellPlacement, CellCoordHash> m_Placements;
+        std::vector<CellCoord> m_OrderedCells; // Insertion order == on-disk record order, see GetOrderedCells()'s own comment.
         std::vector<CellHlodVertex> m_HlodVertices;
         std::vector<uint32_t> m_HlodIndices;
     };

@@ -45,6 +45,7 @@ namespace world {
     bool CellManifest::Load(const std::filesystem::path& filePath) {
         m_Loaded = false;
         m_Placements.clear();
+        m_OrderedCells.clear();
         m_HlodVertices.clear();
         m_HlodIndices.clear();
 
@@ -78,6 +79,7 @@ namespace world {
         }
 
         m_Placements.reserve(records.size());
+        m_OrderedCells.reserve(records.size());
         for (const RuntimeCellManifestRecord& record : records) {
             CellCoord coord{ record.cellX, record.cellZ };
             m_Placements[coord] = CellPlacement{
@@ -86,6 +88,7 @@ namespace world {
                 record.hlodVertexOffset, record.hlodVertexCount,
                 record.hlodIndexOffset, record.hlodIndexCount
             };
+            m_OrderedCells.push_back(coord);
         }
 
         m_HlodVertices.reserve(hlodVertices.size());

@@ -25,6 +25,12 @@
 //   9. Radiosity multi-bounce GI + Screen Trace GI on/off (renderer::SurfaceCacheGIInjectPass
 //      radiosity loop / renderer::ScreenTracePass)
 //  10. TAA/TSR temporal anti-aliasing/upscaling on/off (renderer::TAATSRPass)
+//  11. World Partition HLOD swap-in: real per-cell baked geometry (Phase 5, Streaming & Monde
+//      roadmap, Part 2, Gap 3 -- renderer::VulkanContext::GenerateGeometry()'s streaming-pool
+//      bake-in / tools/WorldPartition/HlodPipeline.cpp). Gracefully SKIPPED (not FAILED) if
+//      world_data/cellmanifest.bin is missing (fresh checkout that never ran
+//      WorldPartitionBakeTool.exe) -- matches this codebase's "streaming is additive, not
+//      load-bearing" convention.
 #ifndef NDEBUG
 
 #include "core/debug/DebugTestPipeline.h"
@@ -575,6 +581,70 @@ namespace debugpipeline {
                     "render without a validation-layer message.",
                     std::format("OFF: 3 frames OK. Default ({}): 5 frames OK.",
                                  config::temporal::ENABLED_BY_DEFAULT ? "ON" : "OFF"),
+                    shot
+                };
+            });
+
+        // === 11. World Partition HLOD swap-in: real per-cell baked geometry ====================
+        runTest("World Partition HLOD Swap-In (Real Per-Cell Geometry)",
+            "src/renderer/vulkan/VulkanContext.cpp, tools/WorldPartition/HlodPipeline.cpp",
+            [&]() -> TestOutcome {
+                // Phase 5 (Streaming & Monde roadmap, Part 2, Gap 3): dedicated units are ALWAYS the
+                // contiguous range [0, GetDedicatedStreamingUnitCount()) (see that function's own
+                // comment) -- unit 0 is guaranteed dedicated to a real authored cell whenever this
+                // count is > 0.
+                uint32_t dedicatedCount = vkContext.GetDedicatedStreamingUnitCount();
+                if (dedicatedCount == 0) {
+                    return TestOutcome{
+                        TestStatus::Skip, 0,
+                        "At least 1 streaming unit dedicated to a real authored cell "
+                        "(GetDedicatedStreamingUnitCount() > 0).",
+                        "GetDedicatedStreamingUnitCount()=0 -- world_data/cellmanifest.bin was "
+                        "missing/unreadable at startup (fresh checkout that never ran "
+                        "WorldPartitionBakeTool.exe). Gracefully skipped, not failed, matching this "
+                        "codebase's \"streaming is additive, not load-bearing\" convention.",
+                        "Run WorldPartitionBakeTool.exe once (see tools/WorldPartition/BakeDemoWorld.cpp) "
+                        "to author the demo world and produce world_data/cellmanifest.bin, then re-run "
+                        "--test-pipeline to actually exercise this test."
+                    };
+                }
+
+                camera.SetDebugViewMode(DEBUG_VIEW_NORMAL);
+                constexpr uint32_t kTestUnit = 0;
+                // Position doesn't matter for this test (only the triangle-count DELTA between the
+                // two representations does) -- picked well clear of both the showcase gallery and
+                // the demo streaming grid so it's unambiguous in a screenshot.
+                const maths::vec3 testWorldPos{ 0.0f, 5.0f, 0.0f };
+
+                vkContext.SetStreamingUnitState(kTestUnit, true, /*useFineVariant=*/false, testWorldPos, 1u);
+                runFrames(5);
+                uint32_t hwCoarse = 0, swCoarse = 0;
+                clusterPipeline.GetDebugTriangleStats(hwCoarse, swCoarse);
+                uint32_t coarseTotal = hwCoarse + swCoarse;
+
+                vkContext.SetStreamingUnitState(kTestUnit, true, /*useFineVariant=*/true, testWorldPos, 1u);
+                std::string shot = runFrames(5, "11_hlod_swap_fine.bmp");
+                uint32_t hwFine = 0, swFine = 0;
+                clusterPipeline.GetDebugTriangleStats(hwFine, swFine);
+                uint32_t fineTotal = hwFine + swFine;
+
+                // Restore: park the test unit back out, so this test doesn't leave a stray entity
+                // visible for whatever runs after it.
+                vkContext.SetStreamingUnitState(kTestUnit, false, false, maths::vec3{}, 0u);
+                runFrames(2);
+
+                bool pass = (coarseTotal != fineTotal);
+                return TestOutcome{
+                    pass ? TestStatus::Pass : TestStatus::Fail, 12,
+                    "Toggling streaming unit 0's useFineVariant flag (coarse HLOD proxy -> fine "
+                    "unsimplified archetype mesh, both REAL per-cell baked geometry -- see "
+                    "VulkanContext::GenerateGeometry()'s streaming-pool bake-in block) changes the "
+                    "scene's total rasterized triangle count (ClusterTriangleStatsPass), proving this "
+                    "is a genuine geometry swap, not just a StreamingInactive flag flip between two "
+                    "identical meshes.",
+                    std::format("Coarse (HLOD proxy): {} triangles. Fine (archetype): {} triangles. "
+                                 "Delta: {}.", coarseTotal, fineTotal,
+                                 static_cast<int64_t>(fineTotal) - static_cast<int64_t>(coarseTotal)),
                     shot
                 };
             });

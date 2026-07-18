@@ -13,6 +13,7 @@
 #include "world/WorldCellStreamingLoader.h"
 #include "world/LwcOrigin.h"
 #include <exception>
+#include <optional>
 #include <unordered_map>
 #include <vector>
 #include <format>
@@ -581,14 +582,14 @@ int main(int argc, char** argv) {
     // gracefully disabled (the fixed showcase gallery still renders normally) rather than treated
     // as a fatal error, unlike scene.cache above: streaming is additive, not load-bearing. ---
     world::CellManifest cellManifest;
-    bool streamingEnabled = cellManifest.Load("world_data/cellmanifest.bin");
+    bool streamingEnabled = cellManifest.Load(world::kDefaultManifestPath);
     if (streamingEnabled) {
         LOG_INFO(std::format("[Main] World Partition streaming ENABLED: {} authored cells (cellSize={:.1f}).",
                               cellManifest.RecordCount(), cellManifest.CellSize()));
     } else {
-        LOG_WARNING("[Main] world_data/cellmanifest.bin not found or unreadable -- World Partition "
+        LOG_WARNING(std::format("[Main] '{}' not found or unreadable -- World Partition "
                     "streaming disabled. Run WorldPartitionBakeTool.exe once (see tools/WorldPartition/"
-                    "BakeDemoWorld.cpp) to author the demo world and enable it.");
+                    "BakeDemoWorld.cpp) to author the demo world and enable it.", world::kDefaultManifestPath));
     }
 
     world::WorldCellStreamingLoader worldCellLoader(cellManifest);
@@ -602,9 +603,24 @@ int main(int argc, char** argv) {
     // unit currently rendering it. If more cells fall within g_StreamingHlodRadius simultaneously
     // than there are free units, the newest ones are silently skipped (logged) until an older cell
     // streams back out -- an explicit, accepted degradation of the bounded pool, not a crash.
+    //
+    // Phase 5 (Streaming & Monde roadmap, Part 2, Gap 3): units [0, GetDedicatedStreamingUnitCount())
+    // are NEVER added to this free-list -- VulkanContext::GenerateGeometry() already baked a real,
+    // specific authored cell's own HLOD proxy + fine archetype mesh into each of them at startup
+    // (see that class' own streaming-pool bake-in comment), and always in this exact contiguous
+    // [0, dedicatedCount) range (unit index == that cell's index in world::CellManifest::
+    // GetOrderedCells(), see GenerateGeometry()'s own loop). Handing one of those units to a
+    // DIFFERENT cell via this free-list would show that cell some other cell's baked geometry --
+    // dedicated cells are instead looked up directly every frame via
+    // GetDedicatedStreamingUnitForCell() in the activation loop below. Only the remaining spare
+    // units (kStreamingUnitCount - dedicatedCount -- always >= 1 by construction, and every unit
+    // when world_data/cellmanifest.bin was missing at startup, dedicatedCount == 0) ever enter this
+    // pool, preserving the pre-Gap-3 shared-archetype-rotation fallback for any cell beyond the
+    // dedicated pool's capacity.
     std::unordered_map<world::CellCoord, uint32_t, world::CellCoordHash> cellToStreamingUnit;
     std::vector<uint32_t> freeStreamingUnits;
-    for (uint32_t u = 0; u < vkContext.GetStreamingUnitCount(); ++u) freeStreamingUnits.push_back(u);
+    const uint32_t dedicatedStreamingUnitCount = vkContext.GetDedicatedStreamingUnitCount();
+    for (uint32_t u = dedicatedStreamingUnitCount; u < vkContext.GetStreamingUnitCount(); ++u) freeStreamingUnits.push_back(u);
 
     auto hashCellCoord = [](const world::CellCoord& c) -> uint32_t {
         return static_cast<uint32_t>(c.x) * 73856093u ^ static_cast<uint32_t>(c.z) * 19349663u;
@@ -1167,29 +1183,47 @@ int main(int argc, char** argv) {
             clusterPipeline.GetLoadingManager().PumpCompletions(8u);
 
             for (const world::StreamingPlacementEvent& event : worldCellLoader.DrainEvents()) {
+                // Phase 5 (Streaming & Monde roadmap, Part 2, Gap 3): a cell with its own dedicated,
+                // pre-baked unit ALWAYS uses that exact unit -- looked up fresh every time (cheap,
+                // O(1) unordered_map lookup against a <=kStreamingUnitCount-sized table), never
+                // recorded into cellToStreamingUnit/freeStreamingUnits (see those variables' own
+                // updated header comment), since a dedicated unit is never reassigned to a different
+                // cell for the lifetime of the run.
+                std::optional<uint32_t> dedicatedUnit = vkContext.GetDedicatedStreamingUnitForCell(event.coord);
+
                 if (event.activate) {
                     uint32_t unit;
-                    auto it = cellToStreamingUnit.find(event.coord);
-                    if (it != cellToStreamingUnit.end()) {
-                        unit = it->second;
-                    } else if (!freeStreamingUnits.empty()) {
-                        unit = freeStreamingUnits.back();
-                        freeStreamingUnits.pop_back();
-                        cellToStreamingUnit[event.coord] = unit;
+                    if (dedicatedUnit.has_value()) {
+                        unit = *dedicatedUnit;
                     } else {
-                        LOG_WARNING(std::format(
-                            "[Streaming] Pool exhausted ({} units) -- cannot claim a slot for cell ({}, {}).",
-                            vkContext.GetStreamingUnitCount(), event.coord.x, event.coord.z));
-                        continue;
+                        auto it = cellToStreamingUnit.find(event.coord);
+                        if (it != cellToStreamingUnit.end()) {
+                            unit = it->second;
+                        } else if (!freeStreamingUnits.empty()) {
+                            unit = freeStreamingUnits.back();
+                            freeStreamingUnits.pop_back();
+                            cellToStreamingUnit[event.coord] = unit;
+                        } else {
+                            LOG_WARNING(std::format(
+                                "[Streaming] Pool exhausted ({} units, {} dedicated) -- cannot claim a slot for cell ({}, {}).",
+                                vkContext.GetStreamingUnitCount(), dedicatedStreamingUnitCount, event.coord.x, event.coord.z));
+                            continue;
+                        }
                     }
                     vkContext.SetStreamingUnitState(unit, true, event.useFineVariant,
                                                      event.worldPosition, hashCellCoord(event.coord));
                 } else {
-                    auto it = cellToStreamingUnit.find(event.coord);
-                    if (it != cellToStreamingUnit.end()) {
-                        vkContext.SetStreamingUnitState(it->second, false, false, {}, 0u);
-                        freeStreamingUnits.push_back(it->second);
-                        cellToStreamingUnit.erase(it);
+                    if (dedicatedUnit.has_value()) {
+                        // Simply parked (StreamingInactive) until this same cell reclaims it again --
+                        // never returned to freeStreamingUnits, see this loop's own header comment.
+                        vkContext.SetStreamingUnitState(*dedicatedUnit, false, false, {}, 0u);
+                    } else {
+                        auto it = cellToStreamingUnit.find(event.coord);
+                        if (it != cellToStreamingUnit.end()) {
+                            vkContext.SetStreamingUnitState(it->second, false, false, {}, 0u);
+                            freeStreamingUnits.push_back(it->second);
+                            cellToStreamingUnit.erase(it);
+                        }
                     }
                 }
             }
