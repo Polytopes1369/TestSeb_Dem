@@ -2686,7 +2686,7 @@ void VulkanContext::GenerateGeometry() {
                        m_IndexBufferBytes / sizeof(uint32_t)));
 }
 
-void VulkanContext::UpdateEntityRotations(float timeSeconds) {
+void VulkanContext::UpdateEntityRotations(float timeSeconds, const maths::vec3 &originOffset) {
   // Distinct per-axis angular speeds (radians/sec) and a per-entity phase
   // offset so the 12 primitives tumble out of sync with each other rather than
   // spinning in lockstep. The floor plane and the 2 Lumen-corner walls remain
@@ -2774,11 +2774,30 @@ void VulkanContext::UpdateEntityRotations(float timeSeconds) {
       xform._pad0 = 0.0f;
     }
 
+    // Phase 5 (Streaming & Monde roadmap, Part 1): rebase this entity into the current LWC origin
+    // cell's frame by subtracting `originOffset` from the `translation` channel ONLY (never
+    // `center` -- see this function's own declaration comment in VulkanContext.h for the full
+    // worked-out reason). Every entity above leaves `translation` at its default zero (the "no
+    // additional world-space offset" case struct_custo.glsl's own comment documents for every
+    // original showcase/wall/floor/water entity), so this uniformly turns that zero into exactly
+    // `-originOffset` -- the entire rebase, applied once, correct regardless of this entity's own
+    // rotation.
+    xform.translationX = -originOffset.x;
+    xform.translationY = -originOffset.y;
+    xform.translationZ = -originOffset.z;
+    xform._pad1 = 0.0f;
+
     // Phase 4 integration (UE5.8 parity roadmap, dynamic scenes onto main): CPU-readable mirror of
     // the SAME values just computed above for GPU upload -- zero extra computation, see
-    // GetEntityTransformsCPU()'s own comment on why this exists.
+    // GetEntityTransformsCPU()'s own comment on why this exists. Phase 5: now includes the same
+    // rebased `translation`, so every consumer of this CPU mirror (TLAS refit, Global SDF
+    // object-space compositing) operates in the SAME current-frame LWC-rebased reference frame as
+    // the rasterized VisBuffer pipeline -- one single "world space" notion per frame, never two
+    // divergent ones (see renderer::ClusterRenderPipeline.h's own m_FrameScratch header comment for
+    // why that single-choke-point property matters).
     m_EntityTransformsCPU[meshID] = core::EntityTransformCPU{
-        xform.rotation, maths::vec3{xform.centerX, xform.centerY, xform.centerZ}};
+        xform.rotation, maths::vec3{xform.centerX, xform.centerY, xform.centerZ},
+        maths::vec3{xform.translationX, xform.translationY, xform.translationZ}};
   }
 
   // --- Runtime World Partition streaming pool: static (no self-rotation), positioned entirely by
@@ -2796,11 +2815,15 @@ void VulkanContext::UpdateEntityRotations(float timeSeconds) {
       xform.centerY = 0.0f;
       xform.centerZ = 0.0f;
       xform._pad0 = 0.0f;
-      xform.translationX = t.x;
-      xform.translationY = t.y;
-      xform.translationZ = t.z;
+      // Phase 5 (Streaming & Monde roadmap, Part 1): same rebase as the gallery loop above --
+      // subtract `originOffset` from `translation` only (`center` is already 0 here, the streaming
+      // pool's own local-origin-baked convention, see struct_custo.glsl's EntityTransform comment).
+      xform.translationX = t.x - originOffset.x;
+      xform.translationY = t.y - originOffset.y;
+      xform.translationZ = t.z - originOffset.z;
       xform._pad1 = 0.0f;
-      m_EntityTransformsCPU[i] = core::EntityTransformCPU{ xform.rotation, maths::vec3{0.0f, 0.0f, 0.0f}, t };
+      maths::vec3 rebasedTranslation{ xform.translationX, xform.translationY, xform.translationZ };
+      m_EntityTransformsCPU[i] = core::EntityTransformCPU{ xform.rotation, maths::vec3{0.0f, 0.0f, 0.0f}, rebasedTranslation };
     }
   }
 

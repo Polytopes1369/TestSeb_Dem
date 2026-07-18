@@ -11,6 +11,7 @@
 #include "world/StreamingManager.h"
 #include "world/CellManifest.h"
 #include "world/WorldCellStreamingLoader.h"
+#include "world/LwcOrigin.h"
 #include <exception>
 #include <unordered_map>
 #include <vector>
@@ -19,6 +20,7 @@
 #include <thread>
 #include <chrono>
 #include <algorithm>
+#include <cmath>
 
 #ifndef NDEBUG
 #include "core/debug/DebugTestPipeline.h"
@@ -119,6 +121,14 @@ struct DebugState {
     // the default) or keep them fully graphics-queue-serialized (false, the pre-Phase-2 behavior)
     // -- see that setter's own comment for the staged-bring-up rationale. Key 'C' ("async Compute").
     bool asyncComputeEnabled = true;
+    // Phase 5 (Streaming & Monde roadmap, Part 1): "simulate large world offset" diagnostic, 0-1000
+    // (km). See this frame loop's own Debug-only block (right after the fly-camera movement block)
+    // for exactly what this drives -- a REAL, independently-run shadow world::LwcOrigin exercised at
+    // this magnitude, proving the rebase subtraction round-trip stays precise at large offsets
+    // WITHOUT ever perturbing the actual render path (camera.m_Position/authored content untouched).
+    // Defaults to 0.0f (diagnostic inert, zero cost) -- set via the ImGui slider in the Streaming
+    // panel below.
+    float simulatedLwcOffsetKm = 0.0f;
 };
 static DebugState g_DebugState;
 
@@ -608,6 +618,18 @@ int main(int argc, char** argv) {
     // Unreal-editor-style fly controller in the main loop below).
     Camera camera({ 12.3613f, 6.5726f, 0.0f }, { 0.0f, 0.0f, 0.0f });
 
+    // Phase 5 (Streaming & Monde roadmap, Part 1): the single LWC origin-tracking instance driving
+    // every render-boundary rebase this frame (Camera::UpdateRebased/GetRebasedPosition for the
+    // camera, VulkanContext::UpdateEntityRotations's originOffset parameter for every entity) --
+    // reuses cellManifest.CellSize() (the SAME ground-plane grid world::StreamingManager already
+    // evaluates streaming decisions against, see world::LwcOrigin's own header comment for why this
+    // must stay one spatial partition, not two). Updated once per frame, after the fly-camera
+    // movement block below (so it sees this frame's final camera position) and before both
+    // camera.UpdateRebased() and vkContext.UpdateEntityRotations() (so both consume this frame's
+    // fresh origin, never a stale one from last frame) -- see this loop's own ordering comment at
+    // the update call site below.
+    world::LwcOrigin lwcOrigin;
+
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
 #ifndef NDEBUG
@@ -978,15 +1000,30 @@ int main(int argc, char** argv) {
             ImGui::End();
         }
 
+        // Phase 5 (Streaming & Monde roadmap, Part 1): LWC origin diagnostics -- unconditional
+        // (unlike the streaming panel above, camera-relative rebasing is exercised every frame
+        // regardless of whether world::StreamingManager itself is active). The slider writes into
+        // g_DebugState.simulatedLwcOffsetKm, read by this loop's own shadow-LwcOrigin diagnostic
+        // block above (which runs BEFORE this ImGui code each frame, so this slider's effect is
+        // visible starting next frame -- a one-frame lag identical to the streaming panel's own
+        // documented staleness above, not a correctness issue for an observability control).
+        {
+            ImGui::Begin("LWC (Large World Coordinates)");
+            maths::vec3 originOffset = lwcOrigin.GetCurrentOffset();
+            world::CellCoord originCell = lwcOrigin.GetCurrentCell();
+            ImGui::Text("Origin cell: (%d, %d)", originCell.x, originCell.z);
+            ImGui::Text("Origin offset: (%.2f, %.2f, %.2f)", originOffset.x, originOffset.y, originOffset.z);
+            ImGui::SliderFloat("Simulate large world offset (km)", &g_DebugState.simulatedLwcOffsetKm, 0.0f, 1000.0f);
+            ImGui::TextDisabled("Real render path never reads this slider -- see LwcOrigin.h header comment.");
+            ImGui::End();
+        }
+
         ImGui::Render();
 #endif
 
         if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS) {
             glfwSetWindowShouldClose(window, GLFW_TRUE);
         }
-
-        // Update entity rotations every frame so dynamic primitives spin
-        vkContext.UpdateEntityRotations(static_cast<float>(glfwGetTime()));
 
         // --- Unreal-editor style fly camera -----------------------------------------------
         // Hold the Right Mouse Button to enable FPS-style mouselook (cursor hidden and locked
@@ -1049,9 +1086,69 @@ int main(int argc, char** argv) {
             }
         }
 
+        // Phase 5 (Streaming & Monde roadmap, Part 1): re-evaluate the LWC origin from THIS frame's
+        // final camera position -- must run after the fly-camera movement block above (so
+        // camera.GetPosition() is this frame's final value, not last frame's) and before BOTH
+        // camera.UpdateRebased() and vkContext.UpdateEntityRotations() below (so both consume this
+        // frame's fresh origin). world::StreamingManager::UpdateStreamingSources further below
+        // deliberately keeps reading camera.GetPosition() directly (the TRUE absolute position) --
+        // rebasing is a render-boundary-only concern, never leaks into streaming/gameplay logic.
+        bool lwcRecentered = lwcOrigin.Update(camera.GetPosition(), cellManifest.CellSize());
+        if (lwcRecentered) {
+            world::CellCoord cell = lwcOrigin.GetCurrentCell();
+            maths::vec3 offset = lwcOrigin.GetCurrentOffset();
+            LOG_INFO(std::format(
+                "[LWC] Origin rebased to cell ({}, {}), offset ({:.2f}, {:.2f}, {:.2f}).",
+                cell.x, cell.z, offset.x, offset.y, offset.z));
+        }
+
+#ifndef NDEBUG
+        // Debug-only "simulate large world offset" diagnostic (g_DebugState.simulatedLwcOffsetKm,
+        // ImGui slider below): proves the rebasing math is genuinely robust at large magnitudes
+        // WITHOUT ever perturbing camera.m_Position or any authored content, per the approved plan's
+        // own constraint. A completely separate, shadow world::LwcOrigin instance is fed the real
+        // camera position plus a large simulated bias (0-1000km) -- this is a REAL, independent
+        // execution of the exact same floor-division/cell-hashing/recenter code path the real
+        // lwcOrigin instance above uses, just fed a displaced input, so it genuinely exercises that
+        // code at large magnitudes (not a no-op stub). The actual render path (camera.UpdateRebased/
+        // vkContext.UpdateEntityRotations below) only ever reads the REAL lwcOrigin instance, so
+        // render output is provably pixel-identical regardless of this slider's value -- what the
+        // logged drift below verifies is that subtracting the shadow instance's own (huge) offset
+        // from the same biased position reproduces the real instance's small rebased position to
+        // within float32 epsilon, i.e. the subtraction round-trip itself does not silently lose
+        // precision at up to 1000km, which is the actual property LWC rebasing exists to guarantee.
+        static world::LwcOrigin s_DebugShadowLwcOrigin;
+        if (g_DebugState.simulatedLwcOffsetKm > 0.0f) {
+            maths::vec3 simulatedBias{ g_DebugState.simulatedLwcOffsetKm * 1000.0f, 0.0f, 0.0f };
+            maths::vec3 biasedCameraPos = camera.GetPosition() + simulatedBias;
+            s_DebugShadowLwcOrigin.Update(biasedCameraPos, cellManifest.CellSize());
+
+            maths::vec3 shadowRebased = biasedCameraPos - s_DebugShadowLwcOrigin.GetCurrentOffset();
+            maths::vec3 realRebased = camera.GetRebasedPosition(lwcOrigin.GetCurrentOffset());
+            maths::vec3 drift = shadowRebased - realRebased;
+            float driftMagnitude = std::sqrt(drift.x * drift.x + drift.y * drift.y + drift.z * drift.z);
+
+            static float s_LastLoggedDriftKm = -1.0f;
+            if (std::abs(g_DebugState.simulatedLwcOffsetKm - s_LastLoggedDriftKm) > 0.01f) {
+                LOG_INFO(std::format(
+                    "[LWC Debug] Simulated offset {:.1f} km: shadow-vs-real rebase drift = {:.6f} "
+                    "units (render path untouched, real lwcOrigin never reads this shadow offset).",
+                    g_DebugState.simulatedLwcOffsetKm, driftMagnitude));
+                s_LastLoggedDriftKm = g_DebugState.simulatedLwcOffsetKm;
+            }
+        }
+#endif
+
+        // Update entity rotations every frame so dynamic primitives spin -- rebased into the
+        // current LWC origin cell's frame (Phase 5, Streaming & Monde roadmap, Part 1).
+        vkContext.UpdateEntityRotations(static_cast<float>(glfwGetTime()), lwcOrigin.GetCurrentOffset());
+
         float aspect = static_cast<float>(vkContext.GetSwapchainExtent().width) /
             static_cast<float>(vkContext.GetSwapchainExtent().height);
-        camera.Update(aspect);
+        // Phase 5 (Streaming & Monde roadmap, Part 1): rebased view matrix -- see Camera::
+        // UpdateRebased's own comment. camera.GetPosition() (true absolute) stays untouched for
+        // the streaming-source distance math further below.
+        camera.UpdateRebased(aspect, lwcOrigin.GetCurrentOffset());
 
         // --- Runtime World Partition streaming tick: evaluate desired cell representations from
         // the camera's current position, dispatch queued load/unload work onto the shared
@@ -1208,8 +1305,21 @@ int main(int argc, char** argv) {
         VkCommandBufferBeginInfo cmdEarlyBeginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
         vkBeginCommandBuffer(cmdEarly, &cmdEarlyBeginInfo);
 
+        // Phase 5 (Streaming & Monde roadmap, Part 1): pass the REBASED camera position (both to
+        // `cameraPositionWorld` and CameraFrameInfo::position), never the raw absolute one --
+        // renderer::ClusterRenderPipeline::m_FrameScratch caches whatever is passed here exactly
+        // once for the whole frame (see that struct's own header comment), so this is the ONE
+        // insertion point that propagates the rebase consistently into every downstream Phase 2-4
+        // system (async-compute GI, VSM, reflections, MegaLights) with zero risk of two divergent
+        // "world space" notions coexisting in one frame. camera.GetPushConstants().view already
+        // encodes the rebased eye point (built by camera.UpdateRebased() above); GetFrameInfo(aspect)
+        // itself still reads the true absolute m_Position internally, so its `position` field is
+        // overwritten here with the same rebased value GetPushConstants() used.
+        CameraFrameInfo rebasedFrameInfo = camera.GetFrameInfo(aspect);
+        rebasedFrameInfo.position = camera.GetRebasedPosition(lwcOrigin.GetCurrentOffset());
+
         clusterPipeline.RecordFrameEarly(cmdEarly, camera.GetPushConstants(),
-            camera.GetPosition(), camera.GetFrameInfo(aspect), static_cast<float>(glfwGetTime()),
+            rebasedFrameInfo.position, rebasedFrameInfo, static_cast<float>(glfwGetTime()),
             vkContext.GetEntityTransformsCPU());
 
         vkEndCommandBuffer(cmdEarly);

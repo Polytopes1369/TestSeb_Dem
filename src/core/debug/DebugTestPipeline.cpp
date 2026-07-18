@@ -160,7 +160,12 @@ namespace debugpipeline {
                 }
 
                 azimuth += 0.05f;
-                vkContext.UpdateEntityRotations(static_cast<float>(glfwGetTime()));
+                // Phase 5 (Streaming & Monde roadmap, Part 1): this debug pipeline has its own
+                // separate camera instance and never tracks an LWC origin (see Camera::
+                // UpdateRebased/GetRebasedPosition's own comment on why Camera itself stays
+                // origin-agnostic) -- a zero offset here is exactly the pre-Phase-5 behavior,
+                // unchanged.
+                vkContext.UpdateEntityRotations(static_cast<float>(glfwGetTime()), maths::vec3{ 0.0f, 0.0f, 0.0f });
                 camera.CameraOrbit({ 0.0f, 0.0f, 0.0f }, 14.0f, azimuth, 28.0f);
                 float aspect = static_cast<float>(vkContext.GetSwapchainExtent().width) /
                                static_cast<float>(vkContext.GetSwapchainExtent().height);

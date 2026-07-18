@@ -147,7 +147,21 @@ public:
     // Recomputes every entity's self-rotation (tumbling on all 3 axes) from elapsed scene
     // time and re-uploads the whole EntityTransform array to the GPU. Must be called once per
     // frame, before recording the draw, so the vertex shader picks up this frame's rotation.
-    void UpdateEntityRotations(float timeSeconds);
+    //
+    // Phase 5 (Streaming & Monde roadmap, Part 1): `originOffset` is the current LWC origin cell's
+    // world-space center (world::LwcOrigin::GetCurrentOffset(), computed by main.cpp earlier this
+    // same frame, after the fly-camera movement block so this call sees this frame's fresh origin,
+    // never a stale one -- see main.cpp's own per-frame ordering comment). Subtracted from every
+    // entity's `translation` channel ONLY, not `center` -- see this method's .cpp definition for the
+    // exact worked-out reason `center` must stay untouched (it is also the rotation pivot inside
+    // struct_custo.glsl's `rotation*(restPos-center)` term, baked against the immutable, always-
+    // absolute GPU vertex buffer; rebasing it there would introduce a spurious rotation*offset error
+    // term on every rotating entity, growing with the offset's own magnitude -- exactly the kind of
+    // "close enough" approximation CLAUDE.md's zero-approximation rule forbids). `translation` is
+    // already the pure world-space-additive-after-rotation channel struct_custo.glsl's own
+    // composition comment documents, so subtracting there alone rebases the FINAL composed world
+    // position by exactly `-originOffset`, correct regardless of any entity's current rotation.
+    void UpdateEntityRotations(float timeSeconds, const maths::vec3& originOffset);
 
     // --- Accessors exposing the raw GPU handles needed by geometry::RunVirtualGeometryCacheTest
     // to read back the live procedural Vertex/Index SSBOs for the virtual geometry cache test.
