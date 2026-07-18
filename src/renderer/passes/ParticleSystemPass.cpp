@@ -41,6 +41,24 @@ namespace renderer {
         };
         static_assert(sizeof(ParticleSimulationPC) == 116, "ParticleSimulationPC must match ParticleSimulation.comp's own push-constant block exactly");
 
+        // Byte-for-byte mirror of ParticleSort.comp's own SortedPair struct -- 8 bytes, std430
+        // (two 4-byte scalars, no padding needed).
+        struct SortedPair {
+            uint32_t index = 0;
+            float key = 0.0f;
+        };
+        static_assert(sizeof(SortedPair) == 8, "SortedPair must match ParticleSort.comp's own struct exactly (std430 layout)");
+
+        // Byte-for-byte mirror of ParticleSort.comp's own ParticleSortPC push-constant block.
+        struct ParticleSortPC {
+            float cameraPosition[3] = { 0.0f, 0.0f, 0.0f };
+            float cameraForward[3] = { 0.0f, 0.0f, 0.0f };
+            uint32_t stageSize = 0;
+            uint32_t passSize = 0;
+            int32_t mode = 0;
+        };
+        static_assert(sizeof(ParticleSortPC) == 36, "ParticleSortPC must match ParticleSort.comp's own push-constant block exactly");
+
     } // namespace
 
     bool ParticleSystemPass::Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
@@ -75,6 +93,12 @@ namespace renderer {
         m_IndirectDrawBuffer.Create(allocator, kIndirectDrawBufferBytes,
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
             VMA_MEMORY_USAGE_GPU_ONLY);
+        // Subtask 3: always kMaxParticles entries long (a power of two, required for bitonic sort --
+        // see ParticleSort.comp's own header comment for why this is NOT sized to the frame's actual
+        // aliveCount instead). Never host-written -- ParticleSort.comp's own InitKeys pass fully
+        // overwrites it every single frame it runs, so no seed upload is needed for this buffer.
+        m_SortedPairsBuffer.Create(allocator, static_cast<VkDeviceSize>(kMaxParticles) * sizeof(SortedPair),
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
 
         // =====================================================================================
         // STEP 2 -- One-shot host -> device seed upload: the dead-list starts holding every slot
@@ -262,7 +286,56 @@ namespace renderer {
             vkDestroyShaderModule(m_Device, shaderModule, nullptr);
         }
 
-        LOG_INFO(std::format("[ParticleSystemPass] Initialized: {} max particles, {} KB particle buffer x2, simulation pipeline ready.",
+        // =====================================================================================
+        // STEP 5 (Subtask 3) -- ParticleSort.comp's own set 1 (a single SortedPairsBuffer binding --
+        // see m_SortedPairsBuffer's own declaration comment for why this is a completely independent
+        // set 1 from Subtask 2's environment set, not a shared/extended one).
+        // =====================================================================================
+        {
+            VkDescriptorSetLayoutBinding sortBinding{ 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+            VkDescriptorSetLayoutCreateInfo sortLayoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+            sortLayoutInfo.bindingCount = 1;
+            sortLayoutInfo.pBindings = &sortBinding;
+            VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &sortLayoutInfo, nullptr, &m_SortSetLayout));
+
+            VkDescriptorPoolSize sortPoolSize{ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1 };
+            VkDescriptorPoolCreateInfo sortPoolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
+            sortPoolInfo.maxSets = 1;
+            sortPoolInfo.poolSizeCount = 1;
+            sortPoolInfo.pPoolSizes = &sortPoolSize;
+            VK_CHECK(vkCreateDescriptorPool(m_Device, &sortPoolInfo, nullptr, &m_SortDescriptorPool));
+
+            VkDescriptorSetAllocateInfo sortSetAllocInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+            sortSetAllocInfo.descriptorPool = m_SortDescriptorPool;
+            sortSetAllocInfo.descriptorSetCount = 1;
+            sortSetAllocInfo.pSetLayouts = &m_SortSetLayout;
+            VK_CHECK(vkAllocateDescriptorSets(m_Device, &sortSetAllocInfo, &m_SortSet));
+
+            VkDescriptorBufferInfo sortedPairsInfo{ m_SortedPairsBuffer.Handle(), 0, m_SortedPairsBuffer.Size() };
+            VkWriteDescriptorSet sortWrite{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_SortSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &sortedPairsInfo, nullptr };
+            vkUpdateDescriptorSets(m_Device, 1, &sortWrite, 0, nullptr);
+
+            VkDescriptorSetLayout sortSetLayouts[2] = { m_SetLayout, m_SortSetLayout };
+            VkPushConstantRange sortPushRange{ VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(ParticleSortPC) };
+            VkPipelineLayoutCreateInfo sortPipelineLayoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+            sortPipelineLayoutInfo.setLayoutCount = 2;
+            sortPipelineLayoutInfo.pSetLayouts = sortSetLayouts;
+            sortPipelineLayoutInfo.pushConstantRangeCount = 1;
+            sortPipelineLayoutInfo.pPushConstantRanges = &sortPushRange;
+            VK_CHECK(vkCreatePipelineLayout(m_Device, &sortPipelineLayoutInfo, nullptr, &m_SortPipelineLayout));
+
+            VkShaderModule sortShaderModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/ParticleSort.comp.spv");
+            VkComputePipelineCreateInfo sortPipelineInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
+            sortPipelineInfo.layout = m_SortPipelineLayout;
+            sortPipelineInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+            sortPipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+            sortPipelineInfo.stage.module = sortShaderModule;
+            sortPipelineInfo.stage.pName = "main";
+            VK_CHECK(vkCreateComputePipelines(m_Device, VK_NULL_HANDLE, 1, &sortPipelineInfo, nullptr, &m_SortPipeline));
+            vkDestroyShaderModule(m_Device, sortShaderModule, nullptr);
+        }
+
+        LOG_INFO(std::format("[ParticleSystemPass] Initialized: {} max particles, {} KB particle buffer x2, simulation + sort pipelines ready.",
             kMaxParticles, static_cast<uint32_t>(kParticleBufferBytes / 1024)));
         return true;
     }
@@ -331,8 +404,66 @@ namespace renderer {
             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
     }
 
+    void ParticleSystemPass::RecordSort(VkCommandBuffer cmd, const float cameraPositionWorld[3], const float cameraForwardWorld[3]) {
+        VkDescriptorSet sets[2] = { GetCurrentSet(), m_SortSet };
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_SortPipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_SortPipelineLayout, 0, 2, sets, 0, nullptr);
+
+        ParticleSortPC pc{};
+        pc.cameraPosition[0] = cameraPositionWorld[0];
+        pc.cameraPosition[1] = cameraPositionWorld[1];
+        pc.cameraPosition[2] = cameraPositionWorld[2];
+        pc.cameraForward[0] = cameraForwardWorld[0];
+        pc.cameraForward[1] = cameraForwardWorld[1];
+        pc.cameraForward[2] = cameraForwardWorld[2];
+
+        uint32_t groups = (kMaxParticles + 255u) / 256u;
+
+        // --- InitKeys (mode 0) ---
+        pc.mode = 0;
+        vkCmdPushConstants(cmd, m_SortPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+        vkCmdDispatch(cmd, groups, 1, 1);
+        VulkanUtils::RecordMemoryBarrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+
+        // --- Bitonic compare-exchange network (mode 1) -- see ParticleSort.comp's own header
+        // comment for the (stageSize, passSize) iteration this reproduces and why a full memory
+        // barrier is required after EVERY single step, not just between stages. ---
+        pc.mode = 1;
+        for (uint32_t stageSize = 2; stageSize <= kMaxParticles; stageSize *= 2) {
+            for (uint32_t passSize = stageSize / 2; passSize > 0; passSize /= 2) {
+                pc.stageSize = stageSize;
+                pc.passSize = passSize;
+                vkCmdPushConstants(cmd, m_SortPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+                vkCmdDispatch(cmd, groups, 1, 1);
+                VulkanUtils::RecordMemoryBarrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                    VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+            }
+        }
+
+        // Propagate this frame's real alive count into the indirect-draw buffer's own
+        // `instanceCount` field (VkDrawIndirectCommand's second uint32_t, byte offset 4) -- a
+        // GPU-side copy, no CPU readback, so a future indirect draw call (Subtask 4) always reflects
+        // the count this exact RecordSort() call just finished sorting for.
+        VkBufferCopy instanceCountCopy{ 4, 4, sizeof(uint32_t) };
+        vkCmdCopyBuffer(cmd, m_CounterBuffer.Handle(), m_IndirectDrawBuffer.Handle(), 1, &instanceCountCopy);
+
+        // Trailing barrier for the next stage -- covers both a future COMPUTE_SHADER consumer and
+        // the TRANSFER write just issued above; a render-stage consumer (Subtask 4) will additionally
+        // need its own INDIRECT_COMMAND_READ barrier on the indirect-draw buffer specifically at that
+        // call site (this method does not know yet whether/when a draw call follows it).
+        VulkanUtils::RecordMemoryBarrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+            VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+    }
+
     void ParticleSystemPass::Shutdown() {
         if (m_Device != VK_NULL_HANDLE) {
+            if (m_SortPipeline != VK_NULL_HANDLE) vkDestroyPipeline(m_Device, m_SortPipeline, nullptr);
+            if (m_SortPipelineLayout != VK_NULL_HANDLE) vkDestroyPipelineLayout(m_Device, m_SortPipelineLayout, nullptr);
+            if (m_SortDescriptorPool != VK_NULL_HANDLE) vkDestroyDescriptorPool(m_Device, m_SortDescriptorPool, nullptr);
+            if (m_SortSetLayout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(m_Device, m_SortSetLayout, nullptr);
+
             if (m_SimPipeline != VK_NULL_HANDLE) vkDestroyPipeline(m_Device, m_SimPipeline, nullptr);
             if (m_SimPipelineLayout != VK_NULL_HANDLE) vkDestroyPipelineLayout(m_Device, m_SimPipelineLayout, nullptr);
             if (m_EnvironmentDescriptorPool != VK_NULL_HANDLE) vkDestroyDescriptorPool(m_Device, m_EnvironmentDescriptorPool, nullptr);
@@ -343,6 +474,7 @@ namespace renderer {
             if (m_SetLayout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(m_Device, m_SetLayout, nullptr);
         }
 
+        m_SortedPairsBuffer.Destroy();
         m_IndirectDrawBuffer.Destroy();
         m_CounterBuffer.Destroy();
         m_AliveListBuffer.Destroy();
@@ -350,6 +482,12 @@ namespace renderer {
         for (uint32_t i = 0; i < 2; ++i) {
             m_ParticleBuffer[i].Destroy();
         }
+
+        m_SortPipeline = VK_NULL_HANDLE;
+        m_SortPipelineLayout = VK_NULL_HANDLE;
+        m_SortDescriptorPool = VK_NULL_HANDLE;
+        m_SortSetLayout = VK_NULL_HANDLE;
+        m_SortSet = VK_NULL_HANDLE;
 
         m_SimPipeline = VK_NULL_HANDLE;
         m_SimPipelineLayout = VK_NULL_HANDLE;
