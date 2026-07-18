@@ -4,6 +4,7 @@
 #include <cfloat>
 #include <cstring>
 #include <format>
+#include <span>
 #include <vector>
 
 #include "core/EngineConfig.h"
@@ -59,13 +60,9 @@ namespace renderer {
 
     } // namespace
 
-    bool MegaLightsPass::Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
+    bool MegaLightsPass::InitImpl(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
         VkExtent2D renderExtent, const ClusterResolvePass& resolvePass,
         const SurfaceCacheRayTracingPass& rtPass, const MegaLightsData& lightsData) {
-        Shutdown();
-
-        m_Device = device;
-        m_Allocator = allocator;
         m_RenderExtent = renderExtent;
         m_LightCount = lightsData.count;
 
@@ -93,6 +90,7 @@ namespace renderer {
         constexpr uint32_t kTotalLightCapacity = kMaxMegaLights + kMaxParticleDerivedLights;
         VkDeviceSize lightBufferBytes = kHeaderBytes + static_cast<VkDeviceSize>(kTotalLightCapacity) * sizeof(MegaLight);
         m_LightBuffer.Create(allocator, lightBufferBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VMA_MEMORY_USAGE_CPU_TO_GPU, /*mapped=*/true);
+        RegisterResource([this] { m_LightBuffer.Destroy(); });
         {
             uint8_t* dst = static_cast<uint8_t*>(m_LightBuffer.MappedData());
             uint32_t header[4] = { kTotalLightCapacity, 0u, 0u, 0u };
@@ -152,6 +150,10 @@ namespace renderer {
 
             m_LightBVHNodesBuffer.Create(allocator, nodesBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VMA_MEMORY_USAGE_CPU_TO_GPU, /*mapped=*/true);
             m_LightBVHIndicesBuffer.Create(allocator, indicesBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VMA_MEMORY_USAGE_CPU_TO_GPU, /*mapped=*/true);
+            RegisterResource([this] {
+                m_LightBVHNodesBuffer.Destroy();
+                m_LightBVHIndicesBuffer.Destroy();
+            });
 
             if (m_LightBVHNodeCount > 0u) {
                 std::memcpy(m_LightBVHNodesBuffer.MappedData(), lightBVH.nodes.data(), lightBVH.nodes.size() * sizeof(geometry::LightBVHNode));
@@ -186,6 +188,11 @@ namespace renderer {
         // =====================================================================================
         VulkanUtils::CreateStorageSampledImage2D(allocator, device, kRadianceFormat, renderExtent,
             m_RawRadianceImage, m_RawRadianceAllocation, m_RawRadianceView);
+        RegisterResource([this] {
+            vkDestroyImageView(m_Device, m_RawRadianceView, nullptr);
+            vmaDestroyImage(m_Allocator, m_RawRadianceImage, m_RawRadianceAllocation);
+            m_RawRadianceImage = VK_NULL_HANDLE; m_RawRadianceAllocation = VK_NULL_HANDLE; m_RawRadianceView = VK_NULL_HANDLE;
+        });
         VulkanUtils::ExecuteOneShotCommands(m_Device, commandPool, queue, [&](VkCommandBuffer cmd) {
             VkClearColorValue zeroClear{}; zeroClear.float32[0] = 0.0f; zeroClear.float32[1] = 0.0f; zeroClear.float32[2] = 0.0f; zeroClear.float32[3] = 0.0f;
             VulkanUtils::ClearComputeImageToGeneral(cmd, m_RawRadianceImage, zeroClear);
@@ -193,9 +200,11 @@ namespace renderer {
 
         m_Denoiser.Init(device, allocator, commandPool, queue, renderExtent,
             m_RawRadianceView, resolvePass.GetOutputDepthView(), resolvePass.GetOutputNormalView());
+        RegisterResource([this] { m_Denoiser.Shutdown(); });
 
         m_ViewParamsBuffer.Create(allocator, sizeof(MegaLightsViewParamsUBO),
             VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
+        RegisterResource([this] { m_ViewParamsBuffer.Destroy(); });
 
         // =====================================================================================
         // STEP 2.5 -- Phase 4, Feature 2: ping-ponged reservoir SSBOs, GPU_ONLY, sentinel-filled --
@@ -208,6 +217,11 @@ namespace renderer {
             reservoirBuffer.Create(allocator, reservoirBufferBytes,
                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
         }
+        RegisterResource([this] {
+            for (GpuBuffer& reservoirBuffer : m_ReservoirBuffers) {
+                reservoirBuffer.Destroy();
+            }
+        });
         VulkanUtils::ExecuteOneShotCommands(m_Device, commandPool, queue, [&](VkCommandBuffer cmd) {
             // Every 32-bit word of MegaLightReservoir set to 0xFFFFFFFFu -- lightIndex lands
             // exactly on the reserved invalid sentinel; worldPos/normal/M/W become NaN-bit-pattern
@@ -242,6 +256,7 @@ namespace renderer {
         // =====================================================================================
         m_SpatialReservoirBuffer.Create(allocator, reservoirBufferBytes,
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
+        RegisterResource([this] { m_SpatialReservoirBuffer.Destroy(); });
         LOG_INFO(std::format("[MegaLightsPass] Spatial reuse reservoir buffer initialized: {:.1f} MiB.",
             static_cast<double>(reservoirBufferBytes) / (1024.0 * 1024.0)));
 
@@ -272,6 +287,7 @@ namespace renderer {
             layoutInfo.bindingCount = 14;
             layoutInfo.pBindings = bindings;
             VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &layoutInfo, nullptr, &m_ShadeSetLayout));
+            RegisterResource([this] { vkDestroyDescriptorSetLayout(m_Device, m_ShadeSetLayout, nullptr); m_ShadeSetLayout = VK_NULL_HANDLE; });
 
             // Storage image count: bindings {0,1,2,3,4,8} == 6 per set. Storage buffer count:
             // bindings {6,9,10,11,12,13} == 6 per set. Both x2 for the 2 slot-indexed variants.
@@ -286,6 +302,11 @@ namespace renderer {
             poolInfo.poolSizeCount = 4;
             poolInfo.pPoolSizes = poolSizes;
             VK_CHECK(vkCreateDescriptorPool(m_Device, &poolInfo, nullptr, &m_ShadeDescriptorPool));
+            RegisterResource([this] {
+                vkDestroyDescriptorPool(m_Device, m_ShadeDescriptorPool, nullptr);
+                m_ShadeDescriptorPool = VK_NULL_HANDLE;
+                m_ShadeSet[0] = VK_NULL_HANDLE; m_ShadeSet[1] = VK_NULL_HANDLE;
+            });
 
             VkDescriptorSetLayout setLayouts[2] = { m_ShadeSetLayout, m_ShadeSetLayout };
             VkDescriptorSetAllocateInfo setAllocInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
@@ -356,6 +377,7 @@ namespace renderer {
             pipelineLayoutInfo.pushConstantRangeCount = 1;
             pipelineLayoutInfo.pPushConstantRanges = &pushRange;
             VK_CHECK(vkCreatePipelineLayout(m_Device, &pipelineLayoutInfo, nullptr, &m_ShadePipelineLayout));
+            RegisterResource([this] { vkDestroyPipelineLayout(m_Device, m_ShadePipelineLayout, nullptr); m_ShadePipelineLayout = VK_NULL_HANDLE; });
 
             VkShaderModule shaderModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/MegaLightsShade.comp.spv");
             VkComputePipelineCreateInfo pipelineInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
@@ -366,6 +388,7 @@ namespace renderer {
             pipelineInfo.stage.pName = "main";
             VK_CHECK(vkCreateComputePipelines(m_Device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_ShadePipeline));
             vkDestroyShaderModule(m_Device, shaderModule, nullptr);
+            RegisterResource([this] { vkDestroyPipeline(m_Device, m_ShadePipeline, nullptr); m_ShadePipeline = VK_NULL_HANDLE; });
         }
 
         // =====================================================================================
@@ -385,6 +408,7 @@ namespace renderer {
             layoutInfo.bindingCount = 4;
             layoutInfo.pBindings = bindings;
             VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &layoutInfo, nullptr, &m_SpatialReuseSetLayout));
+            RegisterResource([this] { vkDestroyDescriptorSetLayout(m_Device, m_SpatialReuseSetLayout, nullptr); m_SpatialReuseSetLayout = VK_NULL_HANDLE; });
 
             // Storage buffer count: bindings {0,1,3} == 3 per set, x2 variants. Uniform buffer: 1 per set, x2.
             VkDescriptorPoolSize poolSizes[2] = {
@@ -396,6 +420,11 @@ namespace renderer {
             poolInfo.poolSizeCount = 2;
             poolInfo.pPoolSizes = poolSizes;
             VK_CHECK(vkCreateDescriptorPool(m_Device, &poolInfo, nullptr, &m_SpatialReuseDescriptorPool));
+            RegisterResource([this] {
+                vkDestroyDescriptorPool(m_Device, m_SpatialReuseDescriptorPool, nullptr);
+                m_SpatialReuseDescriptorPool = VK_NULL_HANDLE;
+                m_SpatialReuseSet[0] = VK_NULL_HANDLE; m_SpatialReuseSet[1] = VK_NULL_HANDLE;
+            });
 
             VkDescriptorSetLayout setLayouts[2] = { m_SpatialReuseSetLayout, m_SpatialReuseSetLayout };
             VkDescriptorSetAllocateInfo setAllocInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
@@ -429,6 +458,7 @@ namespace renderer {
             pipelineLayoutInfo.pushConstantRangeCount = 1;
             pipelineLayoutInfo.pPushConstantRanges = &pushRange;
             VK_CHECK(vkCreatePipelineLayout(m_Device, &pipelineLayoutInfo, nullptr, &m_SpatialReusePipelineLayout));
+            RegisterResource([this] { vkDestroyPipelineLayout(m_Device, m_SpatialReusePipelineLayout, nullptr); m_SpatialReusePipelineLayout = VK_NULL_HANDLE; });
 
             VkShaderModule shaderModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/MegaLightsSpatialReuse.comp.spv");
             VkComputePipelineCreateInfo pipelineInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
@@ -439,6 +469,7 @@ namespace renderer {
             pipelineInfo.stage.pName = "main";
             VK_CHECK(vkCreateComputePipelines(m_Device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_SpatialReusePipeline));
             vkDestroyShaderModule(m_Device, shaderModule, nullptr);
+            RegisterResource([this] { vkDestroyPipeline(m_Device, m_SpatialReusePipeline, nullptr); m_SpatialReusePipeline = VK_NULL_HANDLE; });
         }
 
         // =====================================================================================
@@ -460,28 +491,22 @@ namespace renderer {
             bindings[7] = { 7, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // MaterialParamsSSBO.
             bindings[8] = { 8, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // SpatialReservoirBuffer.
 
-            VkDescriptorSetLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-            layoutInfo.bindingCount = 9;
-            layoutInfo.pBindings = bindings;
-            VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &layoutInfo, nullptr, &m_FinalShadeSetLayout));
-
             VkDescriptorPoolSize poolSizes[4] = {
                 { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 3 },
                 { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1 },
                 { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3 },
                 { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 }
             };
-            VkDescriptorPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
-            poolInfo.maxSets = 1;
-            poolInfo.poolSizeCount = 4;
-            poolInfo.pPoolSizes = poolSizes;
-            VK_CHECK(vkCreateDescriptorPool(m_Device, &poolInfo, nullptr, &m_FinalShadeDescriptorPool));
-
-            VkDescriptorSetAllocateInfo setAllocInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-            setAllocInfo.descriptorPool = m_FinalShadeDescriptorPool;
-            setAllocInfo.descriptorSetCount = 1;
-            setAllocInfo.pSetLayouts = &m_FinalShadeSetLayout;
-            VK_CHECK(vkAllocateDescriptorSets(m_Device, &setAllocInfo, &m_FinalShadeSet));
+            auto descSet = VulkanUtils::CreateDescriptorSetLayoutPoolAndSet(m_Device,
+                std::span{ bindings, 9 }, std::span{ poolSizes, 4 });
+            m_FinalShadeSetLayout = descSet.layout;
+            m_FinalShadeDescriptorPool = descSet.pool;
+            m_FinalShadeSet = descSet.set;
+            RegisterResource([this] {
+                vkDestroyDescriptorPool(m_Device, m_FinalShadeDescriptorPool, nullptr);
+                vkDestroyDescriptorSetLayout(m_Device, m_FinalShadeSetLayout, nullptr);
+                m_FinalShadeDescriptorPool = VK_NULL_HANDLE; m_FinalShadeSetLayout = VK_NULL_HANDLE; m_FinalShadeSet = VK_NULL_HANDLE;
+            });
 
             VkDescriptorImageInfo shadeRadianceInfo{ VK_NULL_HANDLE, m_RawRadianceView, VK_IMAGE_LAYOUT_GENERAL };
             VkDescriptorImageInfo gbufferNormalInfo{ VK_NULL_HANDLE, resolvePass.GetOutputNormalView(), VK_IMAGE_LAYOUT_GENERAL };
@@ -525,6 +550,7 @@ namespace renderer {
             pipelineLayoutInfo.pushConstantRangeCount = 0;
             pipelineLayoutInfo.pPushConstantRanges = nullptr;
             VK_CHECK(vkCreatePipelineLayout(m_Device, &pipelineLayoutInfo, nullptr, &m_FinalShadePipelineLayout));
+            RegisterResource([this] { vkDestroyPipelineLayout(m_Device, m_FinalShadePipelineLayout, nullptr); m_FinalShadePipelineLayout = VK_NULL_HANDLE; });
 
             VkShaderModule shaderModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/MegaLightsFinalShade.comp.spv");
             VkComputePipelineCreateInfo pipelineInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
@@ -535,6 +561,7 @@ namespace renderer {
             pipelineInfo.stage.pName = "main";
             VK_CHECK(vkCreateComputePipelines(m_Device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_FinalShadePipeline));
             vkDestroyShaderModule(m_Device, shaderModule, nullptr);
+            RegisterResource([this] { vkDestroyPipeline(m_Device, m_FinalShadePipeline, nullptr); m_FinalShadePipeline = VK_NULL_HANDLE; });
         }
 
         // =====================================================================================
@@ -548,23 +575,17 @@ namespace renderer {
             bindings[0] = { 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
             bindings[1] = { 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
 
-            VkDescriptorSetLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-            layoutInfo.bindingCount = 2;
-            layoutInfo.pBindings = bindings;
-            VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &layoutInfo, nullptr, &m_CompositeSetLayout));
-
             VkDescriptorPoolSize poolSizes[1] = { { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2 } };
-            VkDescriptorPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
-            poolInfo.maxSets = 1;
-            poolInfo.poolSizeCount = 1;
-            poolInfo.pPoolSizes = poolSizes;
-            VK_CHECK(vkCreateDescriptorPool(m_Device, &poolInfo, nullptr, &m_CompositeDescriptorPool));
-
-            VkDescriptorSetAllocateInfo setAllocInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-            setAllocInfo.descriptorPool = m_CompositeDescriptorPool;
-            setAllocInfo.descriptorSetCount = 1;
-            setAllocInfo.pSetLayouts = &m_CompositeSetLayout;
-            VK_CHECK(vkAllocateDescriptorSets(m_Device, &setAllocInfo, &m_CompositeSet));
+            auto descSet = VulkanUtils::CreateDescriptorSetLayoutPoolAndSet(m_Device,
+                std::span{ bindings, 2 }, std::span{ poolSizes, 1 });
+            m_CompositeSetLayout = descSet.layout;
+            m_CompositeDescriptorPool = descSet.pool;
+            m_CompositeSet = descSet.set;
+            RegisterResource([this] {
+                vkDestroyDescriptorPool(m_Device, m_CompositeDescriptorPool, nullptr);
+                vkDestroyDescriptorSetLayout(m_Device, m_CompositeSetLayout, nullptr);
+                m_CompositeDescriptorPool = VK_NULL_HANDLE; m_CompositeSetLayout = VK_NULL_HANDLE; m_CompositeSet = VK_NULL_HANDLE;
+            });
 
             VkDescriptorImageInfo denoisedInfo{ VK_NULL_HANDLE, m_Denoiser.GetOutputView(), VK_IMAGE_LAYOUT_GENERAL };
             VkDescriptorImageInfo outputColorInfo{ VK_NULL_HANDLE, resolvePass.GetOutputColorView(), VK_IMAGE_LAYOUT_GENERAL };
@@ -580,6 +601,7 @@ namespace renderer {
             pipelineLayoutInfo.pushConstantRangeCount = 0;
             pipelineLayoutInfo.pPushConstantRanges = nullptr;
             VK_CHECK(vkCreatePipelineLayout(m_Device, &pipelineLayoutInfo, nullptr, &m_CompositePipelineLayout));
+            RegisterResource([this] { vkDestroyPipelineLayout(m_Device, m_CompositePipelineLayout, nullptr); m_CompositePipelineLayout = VK_NULL_HANDLE; });
 
             VkShaderModule shaderModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/MegaLightsComposite.comp.spv");
             VkComputePipelineCreateInfo pipelineInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
@@ -590,66 +612,31 @@ namespace renderer {
             pipelineInfo.stage.pName = "main";
             VK_CHECK(vkCreateComputePipelines(m_Device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_CompositePipeline));
             vkDestroyShaderModule(m_Device, shaderModule, nullptr);
+            RegisterResource([this] { vkDestroyPipeline(m_Device, m_CompositePipeline, nullptr); m_CompositePipeline = VK_NULL_HANDLE; });
         }
 
         m_CurrentReservoirSlotIndex = 0;
+        // Not Vulkan handles -- registered together so a Shutdown() not immediately followed by
+        // Init() resets them exactly like the original Shutdown()'s own tail did.
+        RegisterResource([this] {
+            m_LightCount = 0;
+            m_LightBVHNodeCount = 0;
+            m_LightBVHIndexCount = 0;
+            m_CurrentReservoirSlotIndex = 0;
+            m_RenderExtent = { 0, 0 };
+        });
+
         LOG_INFO(std::format("[MegaLightsPass] Initialized: {} lights, {} candidates/pixel, {} x {}.",
             m_LightCount, 16u, m_RenderExtent.width, m_RenderExtent.height));
         return true;
     }
 
-    void MegaLightsPass::Shutdown() {
-        if (m_Device != VK_NULL_HANDLE) {
-            if (m_CompositePipeline != VK_NULL_HANDLE) vkDestroyPipeline(m_Device, m_CompositePipeline, nullptr);
-            if (m_CompositePipelineLayout != VK_NULL_HANDLE) vkDestroyPipelineLayout(m_Device, m_CompositePipelineLayout, nullptr);
-            if (m_CompositeDescriptorPool != VK_NULL_HANDLE) vkDestroyDescriptorPool(m_Device, m_CompositeDescriptorPool, nullptr);
-            if (m_CompositeSetLayout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(m_Device, m_CompositeSetLayout, nullptr);
-
-            if (m_ShadePipeline != VK_NULL_HANDLE) vkDestroyPipeline(m_Device, m_ShadePipeline, nullptr);
-            if (m_ShadePipelineLayout != VK_NULL_HANDLE) vkDestroyPipelineLayout(m_Device, m_ShadePipelineLayout, nullptr);
-            if (m_ShadeDescriptorPool != VK_NULL_HANDLE) vkDestroyDescriptorPool(m_Device, m_ShadeDescriptorPool, nullptr);
-            if (m_ShadeSetLayout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(m_Device, m_ShadeSetLayout, nullptr);
-
-            if (m_SpatialReusePipeline != VK_NULL_HANDLE) vkDestroyPipeline(m_Device, m_SpatialReusePipeline, nullptr);
-            if (m_SpatialReusePipelineLayout != VK_NULL_HANDLE) vkDestroyPipelineLayout(m_Device, m_SpatialReusePipelineLayout, nullptr);
-            if (m_SpatialReuseDescriptorPool != VK_NULL_HANDLE) vkDestroyDescriptorPool(m_Device, m_SpatialReuseDescriptorPool, nullptr);
-            if (m_SpatialReuseSetLayout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(m_Device, m_SpatialReuseSetLayout, nullptr);
-
-            if (m_FinalShadePipeline != VK_NULL_HANDLE) vkDestroyPipeline(m_Device, m_FinalShadePipeline, nullptr);
-            if (m_FinalShadePipelineLayout != VK_NULL_HANDLE) vkDestroyPipelineLayout(m_Device, m_FinalShadePipelineLayout, nullptr);
-            if (m_FinalShadeDescriptorPool != VK_NULL_HANDLE) vkDestroyDescriptorPool(m_Device, m_FinalShadeDescriptorPool, nullptr);
-            if (m_FinalShadeSetLayout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(m_Device, m_FinalShadeSetLayout, nullptr);
-
-            if (m_RawRadianceView != VK_NULL_HANDLE) vkDestroyImageView(m_Device, m_RawRadianceView, nullptr);
-        }
-        m_Denoiser.Shutdown();
-        if (m_Allocator != VK_NULL_HANDLE && m_RawRadianceImage != VK_NULL_HANDLE) {
-            vmaDestroyImage(m_Allocator, m_RawRadianceImage, m_RawRadianceAllocation);
-        }
-        m_ViewParamsBuffer.Destroy();
-        m_LightBuffer.Destroy();
-        m_LightBVHNodesBuffer.Destroy();
-        m_LightBVHIndicesBuffer.Destroy();
-        for (GpuBuffer& reservoirBuffer : m_ReservoirBuffers) {
-            reservoirBuffer.Destroy();
-        }
-        m_SpatialReservoirBuffer.Destroy();
-
-        m_CompositePipeline = VK_NULL_HANDLE; m_CompositePipelineLayout = VK_NULL_HANDLE; m_CompositeDescriptorPool = VK_NULL_HANDLE; m_CompositeSetLayout = VK_NULL_HANDLE; m_CompositeSet = VK_NULL_HANDLE;
-        m_ShadePipeline = VK_NULL_HANDLE; m_ShadePipelineLayout = VK_NULL_HANDLE; m_ShadeDescriptorPool = VK_NULL_HANDLE; m_ShadeSetLayout = VK_NULL_HANDLE;
-        m_ShadeSet[0] = VK_NULL_HANDLE; m_ShadeSet[1] = VK_NULL_HANDLE;
-        m_SpatialReusePipeline = VK_NULL_HANDLE; m_SpatialReusePipelineLayout = VK_NULL_HANDLE; m_SpatialReuseDescriptorPool = VK_NULL_HANDLE; m_SpatialReuseSetLayout = VK_NULL_HANDLE;
-        m_SpatialReuseSet[0] = VK_NULL_HANDLE; m_SpatialReuseSet[1] = VK_NULL_HANDLE;
-        m_FinalShadePipeline = VK_NULL_HANDLE; m_FinalShadePipelineLayout = VK_NULL_HANDLE; m_FinalShadeDescriptorPool = VK_NULL_HANDLE; m_FinalShadeSetLayout = VK_NULL_HANDLE; m_FinalShadeSet = VK_NULL_HANDLE;
-        m_RawRadianceImage = VK_NULL_HANDLE; m_RawRadianceAllocation = VK_NULL_HANDLE; m_RawRadianceView = VK_NULL_HANDLE;
-        m_LightCount = 0;
-        m_LightBVHNodeCount = 0;
-        m_LightBVHIndexCount = 0;
-        m_CurrentReservoirSlotIndex = 0;
-        m_RenderExtent = { 0, 0 };
-        m_Allocator = VK_NULL_HANDLE;
-        m_Device = VK_NULL_HANDLE;
-    }
+    // Shutdown() is inherited from RenderPass<MegaLightsPass>: runs the RegisterResource()
+    // cleanups above in reverse (POD state reset -> Composite pipeline/layout/descriptor ->
+    // FinalShade pipeline/layout/descriptor -> SpatialReuse pipeline/layout/descriptor -> Shade
+    // pipeline/layout/descriptor -> spatial reservoir buffer -> reservoir ping-pong buffers ->
+    // view-params buffer -> denoiser -> raw radiance image+view -> LightBVH buffers -> light
+    // buffer), the same dependency-safe order the hand-written Shutdown() used.
 
     void MegaLightsPass::RecordShade(VkCommandBuffer cmd, const maths::mat4& viewProj, const maths::mat4& prevViewProj,
         const maths::vec3& cameraPositionWorld, uint32_t frameIndex) {
