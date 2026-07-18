@@ -63,7 +63,19 @@ namespace renderer {
         // back every UpdateParticle() invocation so a particle's physics response stays tied to its
         // OWN emitter's (live-tunable) gravity/bounce/friction/drag, not a single global value.
         uint32_t emitterIndex = 0;
-        float _pad0 = 0.0f, _pad1 = 0.0f, _pad2 = 0.0f;
+        // Subtask A4 (color-over-life / size-over-life curves): this particle's own spawn-time BASE
+        // size -- the mix(sizeMin, sizeMax, random) roll SpawnParticle drew (ParticleSimulation.comp)
+        // -- preserved here, separate from `sizeX`/`sizeY` above, because UpdateParticle now
+        // overwrites sizeX/sizeY every single frame with `baseSize * SampleSizeCurve(age)`. Without a
+        // separately stored base, next frame's multiply would compound against an ALREADY-curve-
+        // modulated value instead of the original per-particle roll, drifting the size every frame
+        // instead of following the curve. Repurposes what was `_pad0` (this struct's total size does
+        // not change) -- only meaningful for kKindEmber particles; precipitation's own rain/snow sizes
+        // are asymmetric width/length (see ParticleSimulation.comp's own SpawnPrecipitationParticle
+        // comment) and never reach the curve-evaluation code path at all (see UpdateParticle's own
+        // comment on why that branch is ember-only).
+        float baseSize = 0.0f;
+        float _pad1 = 0.0f, _pad2 = 0.0f;
     };
     static_assert(sizeof(GpuParticle) == 80, "GpuParticle must match ParticleCommon.glsl's Particle struct exactly (std430 layout)");
 
@@ -74,13 +86,30 @@ namespace renderer {
         ParticleSystemPass(const ParticleSystemPass&) = delete;
         ParticleSystemPass& operator=(const ParticleSystemPass&) = delete;
 
-        // Byte-for-byte mirror of ParticleCommon.glsl's `EmitterParams` struct -- 80 bytes, std430,
+        // Byte-for-byte mirror of ParticleCommon.glsl's `EmitterParams` struct -- 112 bytes, std430,
         // same flat-float convention as GpuParticle above (avoids vec3's implicit alignment surprises
         // when reasoning about the byte layout by eye). One instance per emitter slot (kMaxEmitters
         // below); renderer::ClusterRenderPipeline builds a full kMaxEmitters-length array of these
         // from config::particles::EMITTERS[] every frame and passes it to RecordSimulate(), which
         // re-uploads it wholesale (see that method's own comment) -- every field here is meant to be
         // edited live via main.cpp's Particles ImGui tab with no restart required.
+        //
+        // Module stack roadmap (subtask A3): Niagara-style artists stack independent modules onto an
+        // emitter rather than tuning one fixed hardcoded physics block -- a full visual-scripting graph
+        // is out of scope for a "zero data in the .exe" demoscene binary, so this is instead a small,
+        // fixed-size, DATA-DRIVEN set of additional force modules layered on top of the existing
+        // gravity/wind-drag/SDF-bounce physics (which keeps working exactly as before -- see
+        // ParticleSimulation.comp's UpdateParticle, whose ember branch now applies these additively).
+        // Two modules, each independently toggleable per emitter, added in the two 16-byte slots this
+        // struct grows by below:
+        //   1. Curl-noise turbulence (curlNoiseEnabled/Strength/Scale) -- a divergence-free procedural
+        //      force via AtmosNoiseCommon.glsl's existing AtmosFractalCurlNoise3D (same helper Atmos
+        //      wind turbulence already uses, kept consistent with this codebase's established
+        //      noise-generation conventions rather than introducing a second implementation).
+        //   2. Radial attractor/repulsor (attractorEnabled/Offset/Strength/Radius) -- a smoothstep
+        //      falloff force toward (positive strength) or away from (negative strength) a point that
+        //      is an OFFSET from the emitter's own live position (so it tags along with a moving
+        //      emitter instead of needing a separately-authored fixed world point).
         struct EmitterParams {
             float positionX = 0.0f, positionY = 0.0f, positionZ = 0.0f;
             float shapeParam0 = 0.0f;
@@ -89,9 +118,63 @@ namespace renderer {
             float lifetimeMin = 2.0f, lifetimeMax = 4.0f;
             float gravityY = -9.8f, bounceElasticity = 0.4f, friction = 0.85f, dragCoefficient = 0.5f;
             uint32_t spawnShape = 0;
-            float _pad0 = 0.0f, _pad1 = 0.0f, _pad2 = 0.0f;
+            // Module stack roadmap (subtask A3): curl-noise turbulence module -- replaces the 3
+            // previously-unused trailing pad floats that used to close spawnShape's own 16-byte slot,
+            // so this swap costs no extra bytes.
+            uint32_t curlNoiseEnabled = 0;   // Nonzero = apply turbulence force every UpdateParticle() call for embers spawned from this emitter.
+            float curlNoiseStrength = 0.0f;  // Force magnitude, m/s^2 applied to velocity per second at full strength.
+            float curlNoiseScale = 0.0f;     // World-space frequency multiplier fed into the curl-noise field (bigger = finer swirls).
+            // Module stack roadmap (subtask A3): radial attractor/repulsor module -- its own new
+            // 16+16-byte slot pair (matches this struct's existing "vec3 + trailing scalar" convention).
+            float attractorOffsetX = 0.0f, attractorOffsetY = 0.0f, attractorOffsetZ = 0.0f; // World-space offset from this emitter's own live position.
+            float attractorStrength = 0.0f;  // Positive = attract toward the point, negative = repel away from it, m/s^2 at zero distance (before falloff below).
+            float attractorRadius = 1.0f;    // World units -- force falls off smoothly (smoothstep) to zero at this distance.
+            uint32_t attractorEnabled = 0;
+            float _pad0 = 0.0f, _pad1 = 0.0f;
+
+            // Subtask A4 (Niagara-parity roadmap: color-over-life / size-over-life curves): 4
+            // evenly-spaced keyframes at normalized age 0.0/0.33/0.67/1.0, linearly interpolated
+            // between the two bracketing keys every UpdateParticle() call in ParticleSimulation.comp
+            // (see that file's own SampleColorCurve/SampleSizeCurve comment) -- lets an emitter fade,
+            // shrink, or recolor over a particle's lifetime instead of holding one fixed appearance
+            // from spawn to death, exactly as `color`/`sizeMin`/`sizeMax` above used to do alone.
+            //
+            // colorCurve is DIRECT/authoritative, NOT a multiplier on `color` above: UpdateParticle
+            // assigns p.color = SampleColorCurve(age) outright every frame for ember-kind particles,
+            // matching real Niagara "Color over Life" module semantics (a later module in the stack
+            // overrides an earlier one's output, it does not tint it) -- keeping every key within
+            // [0,1] per channel also matches plain ImGui::ColorEdit4's own normalized display range
+            // (no HDR authoring UI needed). `color` above still matters as this curve's sensible
+            // "flat" default (see config::particles::EMITTERS[]'s own comment) and as the one-frame
+            // spawn-instant value SpawnParticle sets before this same call's Update dispatch
+            // immediately overwrites it -- but editing `color` alone no longer changes steady-state
+            // appearance once a custom curve is set, exactly like adding a Niagara module downstream
+            // of Initialize Particle.
+            //
+            // sizeCurve IS a multiplier (per this roadmap step's own explicit design), applied on top
+            // of the existing mix(sizeMin, sizeMax, random) per-particle roll at spawn -- see
+            // GpuParticle::baseSize's own declaration comment for why that roll must be preserved
+            // per-particle rather than re-derived from sizeMin/sizeMax alone (they only bound the
+            // RANGE, not which value THIS particle actually drew). All-ones is a universally safe,
+            // no-op default regardless of an emitter's own sizeMin/sizeMax -- unlike colorCurve, whose
+            // safe default must equal `color` above exactly, a multiplier's neutral element does not
+            // depend on the base value it multiplies, so no OTHER emitter slot needs an explicit
+            // override to stay visually unchanged by this feature.
+            //
+            // Flat C arrays (key-major, channel-minor for colorCurve) rather than maths::vec4[4] or
+            // std::array, matching this codebase's own established "flat float array" struct
+            // convention (see e.g. ParticleSimulationPC::levelVoxelSize/levelCenterVoxel in
+            // ParticleSystemPass.cpp) -- guarantees the byte layout mirrors ParticleCommon.glsl's own
+            // `vec4 colorCurve[4]` / `float sizeCurve[4]` std430 arrays exactly (tightly packed, no
+            // vec4-rounding of the float array: std430, unlike std140, does not round a scalar array's
+            // stride up to 16 bytes per element).
+            float colorCurve[4][4] = {
+                { 1.0f, 1.0f, 1.0f, 1.0f }, { 1.0f, 1.0f, 1.0f, 1.0f },
+                { 1.0f, 1.0f, 1.0f, 1.0f }, { 1.0f, 1.0f, 1.0f, 1.0f }
+            };
+            float sizeCurve[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
         };
-        static_assert(sizeof(EmitterParams) == 80, "EmitterParams must match ParticleCommon.glsl's EmitterParams struct exactly (std430 layout)");
+        static_assert(sizeof(EmitterParams) == 192, "EmitterParams must match ParticleCommon.glsl's EmitterParams struct exactly (std430 layout)");
 
         // Maximum simultaneous emitter slots (multi-emitter roadmap, subtask A1) -- small and fixed
         // (unlike kMaxParticles, no sort/perf pressure motivates a larger number yet; a future
@@ -115,14 +198,33 @@ namespace renderer {
         // config::particles::SPAWN_RATE_PER_SECOND's own default (200/s) and a ~2-4s particle
         // lifetime, steady-state alive count is only a few hundred -- 65536 slots was ~100x more
         // capacity than this demo's own single test emitter would ever actually use. Reduced to
-        // 4096 (2^12): still generous headroom over realistic steady-state counts, and cuts
-        // RecordSort()'s own dispatch count from 136 to 78 ((12*13)/2) with each dispatch covering
-        // 16x fewer workgroups -- resolved the hang. If a future scene needs a much larger particle
-        // budget, RecordSort's O(log2(N)^2) full-buffer network is the thing to replace first (a
-        // shared-memory local-merge bitonic sort, or an indirect dispatch sized to the actual
-        // aliveCount rounded up to the next power of two instead of always sorting the full fixed
-        // capacity), not just raising this constant back up.
-        static constexpr uint32_t kMaxParticles = 4096;
+        // 4096 (2^12) at the time: still generous headroom over realistic steady-state counts, and
+        // cut RecordSort()'s own dispatch count from 136 to 78 ((12*13)/2) with each dispatch
+        // covering 16x fewer workgroups -- resolved the hang, but only by shrinking the CAPACITY,
+        // not by fixing the actual root inefficiency (every dispatch always covered the full fixed
+        // capacity regardless of how many particles were actually alive).
+        //
+        // Subtask A2 (particle sort & budget scaling roadmap) fix: raised back up to 65536 (the
+        // ORIGINAL pre-incident value) now that the root inefficiency above is actually fixed --
+        // see RecordSort()'s own comment and ParticleSort.comp's SortDispatchArgsBuffer for the full
+        // mechanism. In short: InitKeys (mode 0) still touches all kMaxParticles slots every frame
+        // (a cheap, bandwidth-bound single pass -- never the expensive part, so left unchanged and
+        // un-indirected), but every one of the O(log2(N)^2) CompareExchange dispatches (mode 1, the
+        // actually expensive part that caused the original TDR) is now issued via
+        // vkCmdDispatchIndirect with a workgroup count computed FRESH, same-frame, by a tiny
+        // single-thread compute pre-pass (mode 2) from THIS frame's real CounterBuffer.aliveCount,
+        // rounded up to the next power of two -- zero staleness, unlike this class' own Debug-only
+        // GetLastAliveCountApprox() readback, since it never leaves the GPU this frame. Any
+        // CompareExchange thread this shrinks away (index >= that padded count) is PROVABLY a
+        // sentinel-vs-sentinel no-op: InitKeys still unconditionally fills the ENTIRE
+        // [aliveCount, kMaxParticles) tail with the identical sentinel key every frame, and the
+        // padded count is by construction >= aliveCount, so skipping those threads can never drop a
+        // real particle or corrupt a real compare-exchange -- see RecordSort()'s own comment for the
+        // full argument. Net effect: steady-state GPU cost now tracks actual alive count again
+        // (typically a few hundred to a few thousand for this demo's default emitters, see
+        // config::particles::EMITTERS[]), regardless of how large this capacity constant is, so
+        // raising it back to 65536 does not reintroduce the original TDR. Must remain a power of two.
+        static constexpr uint32_t kMaxParticles = 65536;
 
         // Allocates every buffer this pass owns (see this class' own header comment for the full
         // list) via `allocator`, seeds the dead-list with every index 0..kMaxParticles-1 and the
@@ -402,6 +504,14 @@ namespace renderer {
         // (uint index + float key per entry), GPU_ONLY, never host-written (ParticleSort.comp's own
         // InitKeys pass is this buffer's only writer, every single frame it runs).
         GpuBuffer m_SortedPairsBuffer;
+        // Subtask A2 (particle sort & budget scaling roadmap) -- set 1, binding 1 (alongside
+        // m_SortedPairsBuffer's own binding 0): a VkDispatchIndirectCommand-compatible
+        // (uint32 x/y/z, 12 bytes) GPU-only buffer, COMPUTE-only (ParticleRender.vert/.frag, this
+        // set's OTHER consumer pipeline, never reads it). RecordSort()'s own mode == 2 pre-pass
+        // rewrites it every call from THIS frame's real aliveCount; every subsequent mode == 1
+        // CompareExchange dispatch reads its workgroup count via vkCmdDispatchIndirect -- see
+        // kMaxParticles' own comment and RecordSort()'s own comment for the full mechanism/proof.
+        GpuBuffer m_SortDispatchArgsBuffer;
         VkDescriptorSetLayout m_SortSetLayout = VK_NULL_HANDLE;
         VkDescriptorPool m_SortDescriptorPool = VK_NULL_HANDLE;
         VkDescriptorSet m_SortSet = VK_NULL_HANDLE;
