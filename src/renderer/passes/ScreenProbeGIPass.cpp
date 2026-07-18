@@ -2,6 +2,7 @@
 
 #include <array>
 #include <format>
+#include <span>
 #include <stdexcept>
 
 #include "core/Logger.h"
@@ -107,7 +108,7 @@ namespace renderer {
 
     } // namespace
 
-    bool ScreenProbeGIPass::Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
+    bool ScreenProbeGIPass::InitImpl(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
         VkExtent2D renderExtent, const SurfaceCacheTraceContext& traceContext, const SurfaceCachePass& surfaceCache,
         const SurfaceCacheRayTracingPass& rtPass, const ClusterResolvePass& resolvePass) {
         kProbeTileSize = config::lumen::SCREEN_PROBE_TILE_SIZE;
@@ -115,8 +116,10 @@ namespace renderer {
         kProbeRayCount = config::lumen::SCREEN_PROBE_RAY_COUNT;
         kTemporalAlpha = config::lumen::SCREEN_PROBE_TEMPORAL_ALPHA;
 
+        // Self-reinit (see ShadowMapPass's own migration comment for the identical pattern):
+        // Shutdown() clears m_Device/m_Allocator, which RenderPass<ScreenProbeGIPass>::Init()
+        // already set to this call's values just before invoking this function -- restore them.
         Shutdown();
-
         m_Device = device;
         m_Allocator = allocator;
         m_RenderExtent = renderExtent;
@@ -140,6 +143,21 @@ namespace renderer {
             CreateFineProbeImage(allocator, device, kWorldPosFormat, probeExtent, slot.worldPosImage, slot.worldPosAllocation, slot.worldPosView);
             CreateFineProbeImage(allocator, device, kNormalFormat, probeExtent, slot.normalImage, slot.normalAllocation, slot.normalView);
         }
+        RegisterResource([this] {
+            for (ProbeSlot& slot : m_Slots) {
+                vkDestroyImageView(m_Device, slot.shRView, nullptr);
+                vkDestroyImageView(m_Device, slot.shGView, nullptr);
+                vkDestroyImageView(m_Device, slot.shBView, nullptr);
+                vkDestroyImageView(m_Device, slot.worldPosView, nullptr);
+                vkDestroyImageView(m_Device, slot.normalView, nullptr);
+                vmaDestroyImage(m_Allocator, slot.shRImage, slot.shRAllocation);
+                vmaDestroyImage(m_Allocator, slot.shGImage, slot.shGAllocation);
+                vmaDestroyImage(m_Allocator, slot.shBImage, slot.shBAllocation);
+                vmaDestroyImage(m_Allocator, slot.worldPosImage, slot.worldPosAllocation);
+                vmaDestroyImage(m_Allocator, slot.normalImage, slot.normalAllocation);
+                slot = ProbeSlot{};
+            }
+        });
         for (ProbeSlot& slot : m_CoarseSlots) {
             VulkanUtils::CreateStorageSampledImage2D(allocator, device, kSHFormat, probeCoarseExtent, slot.shRImage, slot.shRAllocation, slot.shRView);
             VulkanUtils::CreateStorageSampledImage2D(allocator, device, kSHFormat, probeCoarseExtent, slot.shGImage, slot.shGAllocation, slot.shGView);
@@ -147,6 +165,21 @@ namespace renderer {
             VulkanUtils::CreateStorageSampledImage2D(allocator, device, kWorldPosFormat, probeCoarseExtent, slot.worldPosImage, slot.worldPosAllocation, slot.worldPosView);
             VulkanUtils::CreateStorageSampledImage2D(allocator, device, kNormalFormat, probeCoarseExtent, slot.normalImage, slot.normalAllocation, slot.normalView);
         }
+        RegisterResource([this] {
+            for (ProbeSlot& slot : m_CoarseSlots) {
+                vkDestroyImageView(m_Device, slot.shRView, nullptr);
+                vkDestroyImageView(m_Device, slot.shGView, nullptr);
+                vkDestroyImageView(m_Device, slot.shBView, nullptr);
+                vkDestroyImageView(m_Device, slot.worldPosView, nullptr);
+                vkDestroyImageView(m_Device, slot.normalView, nullptr);
+                vmaDestroyImage(m_Allocator, slot.shRImage, slot.shRAllocation);
+                vmaDestroyImage(m_Allocator, slot.shGImage, slot.shGAllocation);
+                vmaDestroyImage(m_Allocator, slot.shBImage, slot.shBAllocation);
+                vmaDestroyImage(m_Allocator, slot.worldPosImage, slot.worldPosAllocation);
+                vmaDestroyImage(m_Allocator, slot.normalImage, slot.normalAllocation);
+                slot = ProbeSlot{};
+            }
+        });
 
         VkSamplerCreateInfo samplerInfo{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
         samplerInfo.magFilter = VK_FILTER_LINEAR;
@@ -159,9 +192,11 @@ namespace renderer {
         samplerInfo.maxLod = 0.0f;
         samplerInfo.unnormalizedCoordinates = VK_FALSE;
         VK_CHECK(vkCreateSampler(m_Device, &samplerInfo, nullptr, &m_ProbeSampler));
+        RegisterResource([this] { vkDestroySampler(m_Device, m_ProbeSampler, nullptr); m_ProbeSampler = VK_NULL_HANDLE; });
 
         m_ViewParamsBuffer.Create(allocator, sizeof(ScreenProbeViewParamsUBO),
             VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
+        RegisterResource([this] { m_ViewParamsBuffer.Destroy(); });
 
         // One-time UNDEFINED -> GENERAL transition + neutral-default clear, mirrors
         // renderer::SurfaceCachePass::Init's own STEP 3 pattern: SH channels start at zero (no
@@ -208,6 +243,11 @@ namespace renderer {
                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
             m_FineTemporalDispatchArgsBuffer.Create(allocator, sizeof(uint32_t) * 3,
                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
+            RegisterResource([this] {
+                m_ActiveFineTileListBuffer.Destroy();
+                m_FineTraceDispatchArgsBuffer.Destroy();
+                m_FineTemporalDispatchArgsBuffer.Destroy();
+            });
         }
 
         // =====================================================================================
@@ -235,6 +275,7 @@ namespace renderer {
             layoutInfo.bindingCount = 13;
             layoutInfo.pBindings = bindings;
             VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &layoutInfo, nullptr, &m_TraceSetLayout));
+            RegisterResource([this] { vkDestroyDescriptorSetLayout(m_Device, m_TraceSetLayout, nullptr); m_TraceSetLayout = VK_NULL_HANDLE; });
 
             VkDescriptorPoolSize poolSizes[4] = {
                 { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 7 * 4 },
@@ -257,6 +298,12 @@ namespace renderer {
             VK_CHECK(vkAllocateDescriptorSets(m_Device, &setAllocInfo, allocatedSets));
             m_TraceSet[0] = allocatedSets[0]; m_TraceSet[1] = allocatedSets[1];
             m_CoarseTraceSet[0] = allocatedSets[2]; m_CoarseTraceSet[1] = allocatedSets[3];
+            RegisterResource([this] {
+                vkDestroyDescriptorPool(m_Device, m_TraceDescriptorPool, nullptr);
+                m_TraceDescriptorPool = VK_NULL_HANDLE;
+                m_TraceSet[0] = VK_NULL_HANDLE; m_TraceSet[1] = VK_NULL_HANDLE;
+                m_CoarseTraceSet[0] = VK_NULL_HANDLE; m_CoarseTraceSet[1] = VK_NULL_HANDLE;
+            });
 
             VkAccelerationStructureKHR tlasHandle = rtPass.GetTLASHandle();
             VkDescriptorBufferInfo viewParamsInfo{ m_ViewParamsBuffer.Handle(), 0, m_ViewParamsBuffer.Size() };
@@ -299,10 +346,12 @@ namespace renderer {
             pipelineLayoutInfo.pushConstantRangeCount = 1;
             pipelineLayoutInfo.pPushConstantRanges = &pushRange;
             VK_CHECK(vkCreatePipelineLayout(m_Device, &pipelineLayoutInfo, nullptr, &m_TracePipelineLayout));
+            RegisterResource([this] { vkDestroyPipelineLayout(m_Device, m_TracePipelineLayout, nullptr); m_TracePipelineLayout = VK_NULL_HANDLE; });
 
             VkShaderModule shaderModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/ScreenProbeTrace.comp.spv");
             m_TracePipeline = VulkanPipeline::CreateComputePipeline(m_Device, m_TracePipelineLayout, shaderModule);
             vkDestroyShaderModule(m_Device, shaderModule, nullptr);
+            RegisterResource([this] { vkDestroyPipeline(m_Device, m_TracePipeline, nullptr); m_TracePipeline = VK_NULL_HANDLE; });
         }
 
         // =====================================================================================
@@ -325,6 +374,7 @@ namespace renderer {
             layoutInfo.bindingCount = 12;
             layoutInfo.pBindings = bindings;
             VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &layoutInfo, nullptr, &m_TemporalSetLayout));
+            RegisterResource([this] { vkDestroyDescriptorSetLayout(m_Device, m_TemporalSetLayout, nullptr); m_TemporalSetLayout = VK_NULL_HANDLE; });
 
             VkDescriptorPoolSize poolSizes[4] = {
                 { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 5 * 4 },
@@ -347,6 +397,12 @@ namespace renderer {
             VK_CHECK(vkAllocateDescriptorSets(m_Device, &setAllocInfo, allocatedSets));
             m_TemporalSet[0] = allocatedSets[0]; m_TemporalSet[1] = allocatedSets[1];
             m_CoarseTemporalSet[0] = allocatedSets[2]; m_CoarseTemporalSet[1] = allocatedSets[3];
+            RegisterResource([this] {
+                vkDestroyDescriptorPool(m_Device, m_TemporalDescriptorPool, nullptr);
+                m_TemporalDescriptorPool = VK_NULL_HANDLE;
+                m_TemporalSet[0] = VK_NULL_HANDLE; m_TemporalSet[1] = VK_NULL_HANDLE;
+                m_CoarseTemporalSet[0] = VK_NULL_HANDLE; m_CoarseTemporalSet[1] = VK_NULL_HANDLE;
+            });
 
             VkDescriptorBufferInfo viewParamsInfo{ m_ViewParamsBuffer.Handle(), 0, m_ViewParamsBuffer.Size() };
             VkDescriptorBufferInfo activeFineTileListInfo{ m_ActiveFineTileListBuffer.Handle(), 0, m_ActiveFineTileListBuffer.Size() };
@@ -390,10 +446,12 @@ namespace renderer {
             pipelineLayoutInfo.pushConstantRangeCount = 1;
             pipelineLayoutInfo.pPushConstantRanges = &pushRange;
             VK_CHECK(vkCreatePipelineLayout(m_Device, &pipelineLayoutInfo, nullptr, &m_TemporalPipelineLayout));
+            RegisterResource([this] { vkDestroyPipelineLayout(m_Device, m_TemporalPipelineLayout, nullptr); m_TemporalPipelineLayout = VK_NULL_HANDLE; });
 
             VkShaderModule shaderModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/ScreenProbeTemporal.comp.spv");
             m_TemporalPipeline = VulkanPipeline::CreateComputePipeline(m_Device, m_TemporalPipelineLayout, shaderModule);
             vkDestroyShaderModule(m_Device, shaderModule, nullptr);
+            RegisterResource([this] { vkDestroyPipeline(m_Device, m_TemporalPipeline, nullptr); m_TemporalPipeline = VK_NULL_HANDLE; });
         }
 
         // =====================================================================================
@@ -416,6 +474,7 @@ namespace renderer {
             layoutInfo.bindingCount = 15;
             layoutInfo.pBindings = bindings;
             VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &layoutInfo, nullptr, &m_GatherSetLayout));
+            RegisterResource([this] { vkDestroyDescriptorSetLayout(m_Device, m_GatherSetLayout, nullptr); m_GatherSetLayout = VK_NULL_HANDLE; });
 
             VkDescriptorPoolSize poolSizes[3] = {
                 { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 10 * 2 },
@@ -434,6 +493,11 @@ namespace renderer {
             setAllocInfo.descriptorSetCount = 2;
             setAllocInfo.pSetLayouts = setLayouts;
             VK_CHECK(vkAllocateDescriptorSets(m_Device, &setAllocInfo, m_GatherSet));
+            RegisterResource([this] {
+                vkDestroyDescriptorPool(m_Device, m_GatherDescriptorPool, nullptr);
+                m_GatherDescriptorPool = VK_NULL_HANDLE;
+                m_GatherSet[0] = VK_NULL_HANDLE; m_GatherSet[1] = VK_NULL_HANDLE;
+            });
 
             VkDescriptorImageInfo gbufferNormalInfo{ VK_NULL_HANDLE, resolvePass.GetOutputNormalView(), VK_IMAGE_LAYOUT_GENERAL };
             VkDescriptorImageInfo gbufferDepthInfo{ VK_NULL_HANDLE, resolvePass.GetOutputDepthView(), VK_IMAGE_LAYOUT_GENERAL };
@@ -479,10 +543,12 @@ namespace renderer {
             pipelineLayoutInfo.pushConstantRangeCount = 1;
             pipelineLayoutInfo.pPushConstantRanges = &pushRange;
             VK_CHECK(vkCreatePipelineLayout(m_Device, &pipelineLayoutInfo, nullptr, &m_GatherPipelineLayout));
+            RegisterResource([this] { vkDestroyPipelineLayout(m_Device, m_GatherPipelineLayout, nullptr); m_GatherPipelineLayout = VK_NULL_HANDLE; });
 
             VkShaderModule shaderModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/ScreenProbeGather.comp.spv");
             m_GatherPipeline = VulkanPipeline::CreateComputePipeline(m_Device, m_GatherPipelineLayout, shaderModule);
             vkDestroyShaderModule(m_Device, shaderModule, nullptr);
+            RegisterResource([this] { vkDestroyPipeline(m_Device, m_GatherPipeline, nullptr); m_GatherPipeline = VK_NULL_HANDLE; });
         }
 
         // =====================================================================================
@@ -497,6 +563,7 @@ namespace renderer {
         // =====================================================================================
         {
             m_BuildArgsSetLayout = VulkanPipeline::CreateBuildDispatchIndirectArgsSetLayout(m_Device);
+            RegisterResource([this] { vkDestroyDescriptorSetLayout(m_Device, m_BuildArgsSetLayout, nullptr); m_BuildArgsSetLayout = VK_NULL_HANDLE; });
 
             VkDescriptorPoolSize poolSizes[1] = { { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4 } }; // 2 bindings x 2 sets.
             VkDescriptorPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
@@ -511,6 +578,11 @@ namespace renderer {
             setAllocInfo.descriptorSetCount = 2;
             setAllocInfo.pSetLayouts = buildArgsSetLayouts;
             VK_CHECK(vkAllocateDescriptorSets(m_Device, &setAllocInfo, m_BuildArgsSet));
+            RegisterResource([this] {
+                vkDestroyDescriptorPool(m_Device, m_BuildArgsDescriptorPool, nullptr);
+                m_BuildArgsDescriptorPool = VK_NULL_HANDLE;
+                m_BuildArgsSet[0] = VK_NULL_HANDLE; m_BuildArgsSet[1] = VK_NULL_HANDLE;
+            });
 
             VkDescriptorBufferInfo sourceCountInfo{ m_ActiveFineTileListBuffer.Handle(), 0, sizeof(uint32_t) };
             VkDescriptorBufferInfo traceArgsInfo{ m_FineTraceDispatchArgsBuffer.Handle(), 0, m_FineTraceDispatchArgsBuffer.Size() };
@@ -527,6 +599,11 @@ namespace renderer {
             vkUpdateDescriptorSets(m_Device, 2, temporalWrites, 0, nullptr);
 
             VulkanPipeline::CreateBuildDispatchIndirectArgsPipeline(m_Device, m_BuildArgsSetLayout, m_BuildArgsPipelineLayout, m_BuildArgsPipeline);
+            RegisterResource([this] {
+                vkDestroyPipeline(m_Device, m_BuildArgsPipeline, nullptr);
+                vkDestroyPipelineLayout(m_Device, m_BuildArgsPipelineLayout, nullptr);
+                m_BuildArgsPipeline = VK_NULL_HANDLE; m_BuildArgsPipelineLayout = VK_NULL_HANDLE;
+            });
         }
 
         // =====================================================================================
@@ -542,27 +619,21 @@ namespace renderer {
             bindings[2] = { 2, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
             bindings[3] = { 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
 
-            VkDescriptorSetLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-            layoutInfo.bindingCount = 4;
-            layoutInfo.pBindings = bindings;
-            VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &layoutInfo, nullptr, &m_ClassifySetLayout));
-
             VkDescriptorPoolSize poolSizes[3] = {
                 { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2 },
                 { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 },
                 { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1 }
             };
-            VkDescriptorPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
-            poolInfo.maxSets = 1;
-            poolInfo.poolSizeCount = 3;
-            poolInfo.pPoolSizes = poolSizes;
-            VK_CHECK(vkCreateDescriptorPool(m_Device, &poolInfo, nullptr, &m_ClassifyDescriptorPool));
-
-            VkDescriptorSetAllocateInfo setAllocInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-            setAllocInfo.descriptorPool = m_ClassifyDescriptorPool;
-            setAllocInfo.descriptorSetCount = 1;
-            setAllocInfo.pSetLayouts = &m_ClassifySetLayout;
-            VK_CHECK(vkAllocateDescriptorSets(m_Device, &setAllocInfo, &m_ClassifySet));
+            auto descSet = VulkanUtils::CreateDescriptorSetLayoutPoolAndSet(m_Device,
+                std::span{ bindings, 4 }, std::span{ poolSizes, 3 });
+            m_ClassifySetLayout = descSet.layout;
+            m_ClassifyDescriptorPool = descSet.pool;
+            m_ClassifySet = descSet.set;
+            RegisterResource([this] {
+                vkDestroyDescriptorPool(m_Device, m_ClassifyDescriptorPool, nullptr);
+                vkDestroyDescriptorSetLayout(m_Device, m_ClassifySetLayout, nullptr);
+                m_ClassifyDescriptorPool = VK_NULL_HANDLE; m_ClassifySetLayout = VK_NULL_HANDLE; m_ClassifySet = VK_NULL_HANDLE;
+            });
 
             VkDescriptorImageInfo gbufferNormalInfo{ VK_NULL_HANDLE, resolvePass.GetOutputNormalView(), VK_IMAGE_LAYOUT_GENERAL };
             VkDescriptorImageInfo gbufferDepthInfo{ VK_NULL_HANDLE, resolvePass.GetOutputDepthView(), VK_IMAGE_LAYOUT_GENERAL };
@@ -583,109 +654,37 @@ namespace renderer {
             pipelineLayoutInfo.pushConstantRangeCount = 1;
             pipelineLayoutInfo.pPushConstantRanges = &pushRange;
             VK_CHECK(vkCreatePipelineLayout(m_Device, &pipelineLayoutInfo, nullptr, &m_ClassifyPipelineLayout));
+            RegisterResource([this] { vkDestroyPipelineLayout(m_Device, m_ClassifyPipelineLayout, nullptr); m_ClassifyPipelineLayout = VK_NULL_HANDLE; });
 
             VkShaderModule shaderModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/ScreenProbeClassify.comp.spv");
             m_ClassifyPipeline = VulkanPipeline::CreateComputePipeline(m_Device, m_ClassifyPipelineLayout, shaderModule);
             vkDestroyShaderModule(m_Device, shaderModule, nullptr);
+            RegisterResource([this] { vkDestroyPipeline(m_Device, m_ClassifyPipeline, nullptr); m_ClassifyPipeline = VK_NULL_HANDLE; });
         }
 
         m_CurrentSlotIndex = 0;
+        // Not Vulkan handles, no public getters -- registered anyway (cheap) given this pass'
+        // complexity, matching MegaLightsPass's own migration precedent.
+        RegisterResource([this] {
+            m_CurrentSlotIndex = 0;
+            m_ProbeCountX = 0;
+            m_ProbeCountY = 0;
+            m_ProbeCoarseCountX = 0;
+            m_ProbeCoarseCountY = 0;
+            m_RenderExtent = { 0, 0 };
+        });
         LOG_INFO(std::format("[ScreenProbeGIPass] Initialized: {} x {} probes ({} x {} coarse).",
             m_ProbeCountX, m_ProbeCountY, m_ProbeCoarseCountX, m_ProbeCoarseCountY));
         return true;
     }
 
-    void ScreenProbeGIPass::Shutdown() {
-        if (m_Device != VK_NULL_HANDLE) {
-            if (m_ClassifyPipeline != VK_NULL_HANDLE) vkDestroyPipeline(m_Device, m_ClassifyPipeline, nullptr);
-            if (m_ClassifyPipelineLayout != VK_NULL_HANDLE) vkDestroyPipelineLayout(m_Device, m_ClassifyPipelineLayout, nullptr);
-            if (m_ClassifyDescriptorPool != VK_NULL_HANDLE) vkDestroyDescriptorPool(m_Device, m_ClassifyDescriptorPool, nullptr);
-            if (m_ClassifySetLayout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(m_Device, m_ClassifySetLayout, nullptr);
-
-            if (m_BuildArgsPipeline != VK_NULL_HANDLE) vkDestroyPipeline(m_Device, m_BuildArgsPipeline, nullptr);
-            if (m_BuildArgsPipelineLayout != VK_NULL_HANDLE) vkDestroyPipelineLayout(m_Device, m_BuildArgsPipelineLayout, nullptr);
-            if (m_BuildArgsDescriptorPool != VK_NULL_HANDLE) vkDestroyDescriptorPool(m_Device, m_BuildArgsDescriptorPool, nullptr);
-            if (m_BuildArgsSetLayout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(m_Device, m_BuildArgsSetLayout, nullptr);
-
-            if (m_GatherPipeline != VK_NULL_HANDLE) vkDestroyPipeline(m_Device, m_GatherPipeline, nullptr);
-            if (m_GatherPipelineLayout != VK_NULL_HANDLE) vkDestroyPipelineLayout(m_Device, m_GatherPipelineLayout, nullptr);
-            if (m_GatherDescriptorPool != VK_NULL_HANDLE) vkDestroyDescriptorPool(m_Device, m_GatherDescriptorPool, nullptr);
-            if (m_GatherSetLayout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(m_Device, m_GatherSetLayout, nullptr);
-
-            if (m_TemporalPipeline != VK_NULL_HANDLE) vkDestroyPipeline(m_Device, m_TemporalPipeline, nullptr);
-            if (m_TemporalPipelineLayout != VK_NULL_HANDLE) vkDestroyPipelineLayout(m_Device, m_TemporalPipelineLayout, nullptr);
-            if (m_TemporalDescriptorPool != VK_NULL_HANDLE) vkDestroyDescriptorPool(m_Device, m_TemporalDescriptorPool, nullptr);
-            if (m_TemporalSetLayout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(m_Device, m_TemporalSetLayout, nullptr);
-
-            if (m_TracePipeline != VK_NULL_HANDLE) vkDestroyPipeline(m_Device, m_TracePipeline, nullptr);
-            if (m_TracePipelineLayout != VK_NULL_HANDLE) vkDestroyPipelineLayout(m_Device, m_TracePipelineLayout, nullptr);
-            if (m_TraceDescriptorPool != VK_NULL_HANDLE) vkDestroyDescriptorPool(m_Device, m_TraceDescriptorPool, nullptr);
-            if (m_TraceSetLayout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(m_Device, m_TraceSetLayout, nullptr);
-
-            if (m_ProbeSampler != VK_NULL_HANDLE) vkDestroySampler(m_Device, m_ProbeSampler, nullptr);
-
-            for (ProbeSlot& slot : m_Slots) {
-                if (slot.shRView != VK_NULL_HANDLE) vkDestroyImageView(m_Device, slot.shRView, nullptr);
-                if (slot.shGView != VK_NULL_HANDLE) vkDestroyImageView(m_Device, slot.shGView, nullptr);
-                if (slot.shBView != VK_NULL_HANDLE) vkDestroyImageView(m_Device, slot.shBView, nullptr);
-                if (slot.worldPosView != VK_NULL_HANDLE) vkDestroyImageView(m_Device, slot.worldPosView, nullptr);
-                if (slot.normalView != VK_NULL_HANDLE) vkDestroyImageView(m_Device, slot.normalView, nullptr);
-            }
-            for (ProbeSlot& slot : m_CoarseSlots) {
-                if (slot.shRView != VK_NULL_HANDLE) vkDestroyImageView(m_Device, slot.shRView, nullptr);
-                if (slot.shGView != VK_NULL_HANDLE) vkDestroyImageView(m_Device, slot.shGView, nullptr);
-                if (slot.shBView != VK_NULL_HANDLE) vkDestroyImageView(m_Device, slot.shBView, nullptr);
-                if (slot.worldPosView != VK_NULL_HANDLE) vkDestroyImageView(m_Device, slot.worldPosView, nullptr);
-                if (slot.normalView != VK_NULL_HANDLE) vkDestroyImageView(m_Device, slot.normalView, nullptr);
-            }
-        }
-        if (m_Allocator != VK_NULL_HANDLE) {
-            for (ProbeSlot& slot : m_Slots) {
-                vmaDestroyImage(m_Allocator, slot.shRImage, slot.shRAllocation);
-                vmaDestroyImage(m_Allocator, slot.shGImage, slot.shGAllocation);
-                vmaDestroyImage(m_Allocator, slot.shBImage, slot.shBAllocation);
-                vmaDestroyImage(m_Allocator, slot.worldPosImage, slot.worldPosAllocation);
-                vmaDestroyImage(m_Allocator, slot.normalImage, slot.normalAllocation);
-            }
-            for (ProbeSlot& slot : m_CoarseSlots) {
-                vmaDestroyImage(m_Allocator, slot.shRImage, slot.shRAllocation);
-                vmaDestroyImage(m_Allocator, slot.shGImage, slot.shGAllocation);
-                vmaDestroyImage(m_Allocator, slot.shBImage, slot.shBAllocation);
-                vmaDestroyImage(m_Allocator, slot.worldPosImage, slot.worldPosAllocation);
-                vmaDestroyImage(m_Allocator, slot.normalImage, slot.normalAllocation);
-            }
-        }
-        m_ViewParamsBuffer.Destroy();
-        m_ActiveFineTileListBuffer.Destroy();
-        m_FineTraceDispatchArgsBuffer.Destroy();
-        m_FineTemporalDispatchArgsBuffer.Destroy();
-
-        m_ClassifyPipeline = VK_NULL_HANDLE; m_ClassifyPipelineLayout = VK_NULL_HANDLE; m_ClassifyDescriptorPool = VK_NULL_HANDLE; m_ClassifySetLayout = VK_NULL_HANDLE;
-        m_ClassifySet = VK_NULL_HANDLE;
-        m_BuildArgsPipeline = VK_NULL_HANDLE; m_BuildArgsPipelineLayout = VK_NULL_HANDLE; m_BuildArgsDescriptorPool = VK_NULL_HANDLE; m_BuildArgsSetLayout = VK_NULL_HANDLE;
-        m_BuildArgsSet[0] = VK_NULL_HANDLE; m_BuildArgsSet[1] = VK_NULL_HANDLE;
-        m_GatherPipeline = VK_NULL_HANDLE; m_GatherPipelineLayout = VK_NULL_HANDLE; m_GatherDescriptorPool = VK_NULL_HANDLE; m_GatherSetLayout = VK_NULL_HANDLE;
-        m_GatherSet[0] = VK_NULL_HANDLE; m_GatherSet[1] = VK_NULL_HANDLE;
-        m_TemporalPipeline = VK_NULL_HANDLE; m_TemporalPipelineLayout = VK_NULL_HANDLE; m_TemporalDescriptorPool = VK_NULL_HANDLE; m_TemporalSetLayout = VK_NULL_HANDLE;
-        m_TemporalSet[0] = VK_NULL_HANDLE; m_TemporalSet[1] = VK_NULL_HANDLE;
-        m_CoarseTemporalSet[0] = VK_NULL_HANDLE; m_CoarseTemporalSet[1] = VK_NULL_HANDLE;
-        m_TracePipeline = VK_NULL_HANDLE; m_TracePipelineLayout = VK_NULL_HANDLE; m_TraceDescriptorPool = VK_NULL_HANDLE; m_TraceSetLayout = VK_NULL_HANDLE;
-        m_TraceSet[0] = VK_NULL_HANDLE; m_TraceSet[1] = VK_NULL_HANDLE;
-        m_CoarseTraceSet[0] = VK_NULL_HANDLE; m_CoarseTraceSet[1] = VK_NULL_HANDLE;
-        m_ProbeSampler = VK_NULL_HANDLE;
-        m_Slots[0] = ProbeSlot{};
-        m_Slots[1] = ProbeSlot{};
-        m_CoarseSlots[0] = ProbeSlot{};
-        m_CoarseSlots[1] = ProbeSlot{};
-        m_CurrentSlotIndex = 0;
-        m_ProbeCountX = 0;
-        m_ProbeCountY = 0;
-        m_ProbeCoarseCountX = 0;
-        m_ProbeCoarseCountY = 0;
-        m_RenderExtent = { 0, 0 };
-        m_Allocator = VK_NULL_HANDLE;
-        m_Device = VK_NULL_HANDLE;
-    }
+    // Shutdown() is inherited from RenderPass<ScreenProbeGIPass>: runs the RegisterResource()
+    // cleanups above in reverse (POD state reset -> Classify pipeline/layout/descriptor ->
+    // BuildArgs pipeline/layout/descriptor/set-layout -> Gather pipeline/layout/descriptor ->
+    // Temporal pipeline/layout/descriptor/set-layout -> Trace pipeline/layout/descriptor/
+    // set-layout -> view-params buffer -> fine-tile-list + dispatch-args buffers -> probe sampler
+    // -> coarse probe images -> fine probe images), the same dependency-safe order the
+    // hand-written Shutdown() used.
 
     void ScreenProbeGIPass::RecordUpdateViewParams(VkCommandBuffer cmd, const maths::mat4& viewProj, const maths::mat4& prevViewProj) {
         ScreenProbeViewParamsUBO ubo{};

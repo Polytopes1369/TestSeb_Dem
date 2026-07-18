@@ -105,12 +105,14 @@ namespace renderer {
 
     } // namespace
 
-    bool VegetationScatterPass::Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
+    bool VegetationScatterPass::InitImpl(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
         const VirtualShadowMapPass& vsm, const WorldProbeGridPass& worldProbes,
         VkImageView hzbView, VkExtent2D hzbMip0Extent, uint32_t hzbMipCount,
         VkFormat colorFormat, VkFormat depthFormat) {
+        // Self-reinit (see ShadowMapPass's own migration comment for the identical pattern):
+        // Shutdown() clears m_Device/m_Allocator, which RenderPass<VegetationScatterPass>::Init()
+        // already set to this call's values just before invoking this function -- restore them.
         Shutdown();
-
         m_Device = device;
         m_Allocator = allocator;
         m_CommandPool = commandPool;
@@ -168,6 +170,18 @@ namespace renderer {
             VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
         m_CountReadbackBuffer.Create(allocator, sizeof(uint32_t),
             VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_CPU_TO_GPU, /*mapped=*/true);
+        RegisterResource([this] {
+            m_ArchetypeVertexBuffer.Destroy();
+            m_ArchetypeIndexBuffer.Destroy();
+            m_InstanceBuffer.Destroy();
+            m_CounterBuffer.Destroy();
+            m_VisibleIndexBuffer.Destroy();
+            m_IndirectCommandBuffer.Destroy();
+            m_CullParamsBuffer.Destroy();
+            m_RenderParamsBuffer.Destroy();
+            m_WorldProbeGridParamsBuffer.Destroy();
+            m_CountReadbackBuffer.Destroy();
+        });
 
         // Initialize the indirect commands once (instanceCount 0) so a frame that never culls (e.g.
         // zero instances) still issues a well-defined zero-instance draw rather than reading garbage.
@@ -247,9 +261,25 @@ namespace renderer {
         m_RenderInstanceSet = allocSet(m_RenderInstanceSetLayout);
         m_RenderParamsSet = allocSet(m_RenderParamsSetLayout);
         m_LightingSet = allocSet(m_LightingSetLayout);
+        RegisterResource([this] {
+            // Destroying the pool implicitly frees all 6 sets allocated from it.
+            vkDestroyDescriptorPool(m_Device, m_DescriptorPool, nullptr);
+            vkDestroyDescriptorSetLayout(m_Device, m_GeomSetLayout, nullptr);
+            vkDestroyDescriptorSetLayout(m_Device, m_ScatterGenSetLayout, nullptr);
+            vkDestroyDescriptorSetLayout(m_Device, m_CullSetLayout, nullptr);
+            vkDestroyDescriptorSetLayout(m_Device, m_RenderInstanceSetLayout, nullptr);
+            vkDestroyDescriptorSetLayout(m_Device, m_RenderParamsSetLayout, nullptr);
+            vkDestroyDescriptorSetLayout(m_Device, m_LightingSetLayout, nullptr);
+            m_DescriptorPool = VK_NULL_HANDLE;
+            m_GeomSetLayout = VK_NULL_HANDLE; m_ScatterGenSetLayout = VK_NULL_HANDLE; m_CullSetLayout = VK_NULL_HANDLE;
+            m_RenderInstanceSetLayout = VK_NULL_HANDLE; m_RenderParamsSetLayout = VK_NULL_HANDLE; m_LightingSetLayout = VK_NULL_HANDLE;
+            m_GeomSet = VK_NULL_HANDLE; m_ScatterGenSet = VK_NULL_HANDLE; m_CullSet = VK_NULL_HANDLE;
+            m_RenderInstanceSet = VK_NULL_HANDLE; m_RenderParamsSet = VK_NULL_HANDLE; m_LightingSet = VK_NULL_HANDLE;
+        });
 
         // HZB sampler: nearest / nearest-mip across the whole pyramid (see hzb_occlusion.glsl).
         m_HZBSampler = VulkanUtils::CreateNearestSampler(m_Device, static_cast<float>(m_HZBMipCount > 0 ? m_HZBMipCount - 1u : 0u));
+        RegisterResource([this] { vkDestroySampler(m_Device, m_HZBSampler, nullptr); m_HZBSampler = VK_NULL_HANDLE; });
 
         // --- Descriptor writes (every binding here is stable for this pass' lifetime). ---
         VkDescriptorBufferInfo vtxInfo{ m_ArchetypeVertexBuffer.Handle(), 0, VK_WHOLE_SIZE };
@@ -341,6 +371,12 @@ namespace renderer {
             VkShaderModule blobModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/geom_scatter_blob.comp.spv");
             m_BlobGenPipeline = VulkanPipeline::CreateComputePipeline(m_Device, m_GeomPipelineLayout, blobModule);
             vkDestroyShaderModule(m_Device, blobModule, nullptr);
+            RegisterResource([this] {
+                vkDestroyPipeline(m_Device, m_GrassGenPipeline, nullptr);
+                vkDestroyPipeline(m_Device, m_BlobGenPipeline, nullptr);
+                vkDestroyPipelineLayout(m_Device, m_GeomPipelineLayout, nullptr);
+                m_GrassGenPipeline = VK_NULL_HANDLE; m_BlobGenPipeline = VK_NULL_HANDLE; m_GeomPipelineLayout = VK_NULL_HANDLE;
+            });
         }
         // Scatter generator.
         {
@@ -354,6 +390,11 @@ namespace renderer {
             VkShaderModule module = VulkanPipeline::LoadShaderModule(m_Device, "shaders/VegetationScatterGen.comp.spv");
             m_ScatterGenPipeline = VulkanPipeline::CreateComputePipeline(m_Device, m_ScatterGenPipelineLayout, module);
             vkDestroyShaderModule(m_Device, module, nullptr);
+            RegisterResource([this] {
+                vkDestroyPipeline(m_Device, m_ScatterGenPipeline, nullptr);
+                vkDestroyPipelineLayout(m_Device, m_ScatterGenPipelineLayout, nullptr);
+                m_ScatterGenPipeline = VK_NULL_HANDLE; m_ScatterGenPipelineLayout = VK_NULL_HANDLE;
+            });
         }
         // Per-instance cull.
         {
@@ -364,6 +405,11 @@ namespace renderer {
             VkShaderModule module = VulkanPipeline::LoadShaderModule(m_Device, "shaders/VegetationInstanceCull.comp.spv");
             m_CullPipeline = VulkanPipeline::CreateComputePipeline(m_Device, m_CullPipelineLayout, module);
             vkDestroyShaderModule(m_Device, module, nullptr);
+            RegisterResource([this] {
+                vkDestroyPipeline(m_Device, m_CullPipeline, nullptr);
+                vkDestroyPipelineLayout(m_Device, m_CullPipelineLayout, nullptr);
+                m_CullPipeline = VK_NULL_HANDLE; m_CullPipelineLayout = VK_NULL_HANDLE;
+            });
         }
         // Instanced forward render pipeline (+ Debug wireframe variant).
         {
@@ -456,6 +502,16 @@ namespace renderer {
 
             vkDestroyShaderModule(m_Device, vertModule, nullptr);
             vkDestroyShaderModule(m_Device, fragModule, nullptr);
+
+            RegisterResource([this] {
+#ifndef NDEBUG
+                vkDestroyPipeline(m_Device, m_WireframePipeline, nullptr);
+                m_WireframePipeline = VK_NULL_HANDLE;
+#endif
+                vkDestroyPipeline(m_Device, m_RenderPipeline, nullptr);
+                vkDestroyPipelineLayout(m_Device, m_RenderPipelineLayout, nullptr);
+                m_RenderPipeline = VK_NULL_HANDLE; m_RenderPipelineLayout = VK_NULL_HANDLE;
+            });
         }
 
         // =====================================================================================
@@ -463,6 +519,9 @@ namespace renderer {
         // =====================================================================================
         BakeArchetypeGeometry();
         GenerateScatter();
+        // GetInstanceCount() is a public getter -- register its reset so a Shutdown() not
+        // immediately followed by Init() doesn't leave a caller reading a stale count.
+        RegisterResource([this] { m_InstanceCount = 0; });
 
         LOG_INFO(std::format("[VegetationScatterPass] Initialized: {} archetype verts / {} indices, {} instances scattered (cap {}).",
             totalVerts, totalIndices, m_InstanceCount, kMaxInstances));
@@ -763,71 +822,9 @@ namespace renderer {
         vkCmdPipelineBarrier2(cmd, &restoreDep);
     }
 
-    void VegetationScatterPass::Shutdown() {
-        if (m_Device == VK_NULL_HANDLE) {
-            return;
-        }
-
-        if (m_RenderPipeline != VK_NULL_HANDLE) vkDestroyPipeline(m_Device, m_RenderPipeline, nullptr);
-#ifndef NDEBUG
-        if (m_WireframePipeline != VK_NULL_HANDLE) vkDestroyPipeline(m_Device, m_WireframePipeline, nullptr);
-        m_WireframePipeline = VK_NULL_HANDLE;
-#endif
-        if (m_RenderPipelineLayout != VK_NULL_HANDLE) vkDestroyPipelineLayout(m_Device, m_RenderPipelineLayout, nullptr);
-        if (m_CullPipeline != VK_NULL_HANDLE) vkDestroyPipeline(m_Device, m_CullPipeline, nullptr);
-        if (m_CullPipelineLayout != VK_NULL_HANDLE) vkDestroyPipelineLayout(m_Device, m_CullPipelineLayout, nullptr);
-        if (m_ScatterGenPipeline != VK_NULL_HANDLE) vkDestroyPipeline(m_Device, m_ScatterGenPipeline, nullptr);
-        if (m_ScatterGenPipelineLayout != VK_NULL_HANDLE) vkDestroyPipelineLayout(m_Device, m_ScatterGenPipelineLayout, nullptr);
-        if (m_GrassGenPipeline != VK_NULL_HANDLE) vkDestroyPipeline(m_Device, m_GrassGenPipeline, nullptr);
-        if (m_BlobGenPipeline != VK_NULL_HANDLE) vkDestroyPipeline(m_Device, m_BlobGenPipeline, nullptr);
-        if (m_GeomPipelineLayout != VK_NULL_HANDLE) vkDestroyPipelineLayout(m_Device, m_GeomPipelineLayout, nullptr);
-
-        if (m_HZBSampler != VK_NULL_HANDLE) vkDestroySampler(m_Device, m_HZBSampler, nullptr);
-
-        if (m_DescriptorPool != VK_NULL_HANDLE) vkDestroyDescriptorPool(m_Device, m_DescriptorPool, nullptr);
-        if (m_GeomSetLayout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(m_Device, m_GeomSetLayout, nullptr);
-        if (m_ScatterGenSetLayout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(m_Device, m_ScatterGenSetLayout, nullptr);
-        if (m_CullSetLayout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(m_Device, m_CullSetLayout, nullptr);
-        if (m_RenderInstanceSetLayout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(m_Device, m_RenderInstanceSetLayout, nullptr);
-        if (m_RenderParamsSetLayout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(m_Device, m_RenderParamsSetLayout, nullptr);
-        if (m_LightingSetLayout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(m_Device, m_LightingSetLayout, nullptr);
-
-        m_ArchetypeVertexBuffer.Destroy();
-        m_ArchetypeIndexBuffer.Destroy();
-        m_InstanceBuffer.Destroy();
-        m_CounterBuffer.Destroy();
-        m_VisibleIndexBuffer.Destroy();
-        m_IndirectCommandBuffer.Destroy();
-        m_CullParamsBuffer.Destroy();
-        m_RenderParamsBuffer.Destroy();
-        m_WorldProbeGridParamsBuffer.Destroy();
-        m_CountReadbackBuffer.Destroy();
-
-        m_RenderPipeline = VK_NULL_HANDLE;
-        m_RenderPipelineLayout = VK_NULL_HANDLE;
-        m_CullPipeline = VK_NULL_HANDLE;
-        m_CullPipelineLayout = VK_NULL_HANDLE;
-        m_ScatterGenPipeline = VK_NULL_HANDLE;
-        m_ScatterGenPipelineLayout = VK_NULL_HANDLE;
-        m_GrassGenPipeline = VK_NULL_HANDLE;
-        m_BlobGenPipeline = VK_NULL_HANDLE;
-        m_GeomPipelineLayout = VK_NULL_HANDLE;
-        m_HZBSampler = VK_NULL_HANDLE;
-        m_DescriptorPool = VK_NULL_HANDLE;
-        m_GeomSetLayout = VK_NULL_HANDLE;
-        m_ScatterGenSetLayout = VK_NULL_HANDLE;
-        m_CullSetLayout = VK_NULL_HANDLE;
-        m_RenderInstanceSetLayout = VK_NULL_HANDLE;
-        m_RenderParamsSetLayout = VK_NULL_HANDLE;
-        m_LightingSetLayout = VK_NULL_HANDLE;
-        m_GeomSet = VK_NULL_HANDLE;
-        m_ScatterGenSet = VK_NULL_HANDLE;
-        m_CullSet = VK_NULL_HANDLE;
-        m_RenderInstanceSet = VK_NULL_HANDLE;
-        m_RenderParamsSet = VK_NULL_HANDLE;
-        m_LightingSet = VK_NULL_HANDLE;
-        m_InstanceCount = 0;
-        m_Device = VK_NULL_HANDLE;
-    }
+    // Shutdown() is inherited from RenderPass<VegetationScatterPass>: runs the RegisterResource()
+    // cleanups above in reverse (instance-count reset -> render/wireframe pipeline -> cull pipeline
+    // -> scatter-gen pipeline -> geom pipelines -> HZB sampler -> descriptor pool + 6 set layouts
+    // -> the 10 owned buffers), the same dependency-safe order the hand-written Shutdown() used.
 
 }

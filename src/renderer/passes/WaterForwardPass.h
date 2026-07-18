@@ -38,6 +38,7 @@
 
 #include "core/maths/Maths.h"
 #include "renderer/vulkan/GpuBuffer.h"
+#include "renderer/vulkan/RenderPass.h"
 #include "renderer/MaterialParameterTable.h" // MaterialParameters
 #include "renderer/passes/SurfaceCachePass.h" // EntityDrawRange
 
@@ -45,7 +46,12 @@ namespace renderer {
 
     class SurfaceCacheTraceContext;
 
-    class WaterForwardPass {
+    // Migrated to RenderPass<Derived> (see renderer/vulkan/RenderPass.h): Init()/Shutdown() are
+    // inherited. Note InitImpl() still calls the inherited Shutdown() as its own first statement
+    // (self-reinit, same pattern/reason as ShadowMapPass's own migration comment).
+    class WaterForwardPass : public RenderPass<WaterForwardPass> {
+        friend class RenderPass<WaterForwardPass>; // Lets Init() call our private InitImpl().
+
     public:
         WaterForwardPass() = default;
 
@@ -63,16 +69,11 @@ namespace renderer {
         // established. `fallbackVertexBuffer`/`fallbackIndexBuffer`, `waterEntityDrawRange`/
         // `waterEntityID`, `tlasHandle`/`drawRangeBuffer`, `traceContext` -- identical borrowed-
         // resource contract to TessellationPass::Init's own parameters of the same name.
-        bool Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
-            VkFormat colorFormat, VkFormat depthFormat,
-            VkBuffer entityTransformBuffer,
-            const MaterialParameters& waterMaterial,
-            VkBuffer fallbackVertexBuffer, VkBuffer fallbackIndexBuffer,
-            const SurfaceCachePass::EntityDrawRange& waterEntityDrawRange, uint32_t waterEntityID,
-            VkAccelerationStructureKHR tlasHandle, VkBuffer drawRangeBuffer,
-            const SurfaceCacheTraceContext& traceContext, VkExtent2D renderExtent);
-
-        void Shutdown();
+        // Init(VkDevice, VmaAllocator, VkCommandPool, VkQueue, VkFormat, VkFormat, VkBuffer,
+        // const MaterialParameters&, VkBuffer, VkBuffer, const SurfaceCachePass::EntityDrawRange&,
+        // uint32_t, VkAccelerationStructureKHR, VkBuffer, const SurfaceCacheTraceContext&,
+        // VkExtent2D) -> bool and Shutdown() are inherited from RenderPass<WaterForwardPass>; see
+        // InitImpl() below.
 
         // Records the water entity's single indexed draw. Same layout contract as
         // TessellationPass::RecordDraw (color: GENERAL on entry/exit, depth:
@@ -87,8 +88,16 @@ namespace renderer {
             const SurfaceCacheTraceContext& traceContext);
 
     private:
-        VkDevice m_Device = VK_NULL_HANDLE;
-        VmaAllocator m_Allocator = VK_NULL_HANDLE;
+        bool InitImpl(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
+            VkFormat colorFormat, VkFormat depthFormat,
+            VkBuffer entityTransformBuffer,
+            const MaterialParameters& waterMaterial,
+            VkBuffer fallbackVertexBuffer, VkBuffer fallbackIndexBuffer,
+            const SurfaceCachePass::EntityDrawRange& waterEntityDrawRange, uint32_t waterEntityID,
+            VkAccelerationStructureKHR tlasHandle, VkBuffer drawRangeBuffer,
+            const SurfaceCacheTraceContext& traceContext, VkExtent2D renderExtent);
+
+        // m_Device / m_Allocator are inherited (protected) from RenderPass<WaterForwardPass>.
 
         SurfaceCachePass::EntityDrawRange m_WaterEntityDrawRange{};
         uint32_t m_WaterEntityID = 0;
