@@ -983,6 +983,12 @@ int main(int argc, char** argv) {
                     "Denoised GI (A-Trous)",
                     "GI Composite",
                     "Final Composite (Post-Process)",
+                    // Subtask E3 (Debug Buffer Viewer extension): one pixel per particle SLOT (a
+                    // 256x256 grid, renderer::ParticleSystemPass::kMaxParticles exactly) -- dead
+                    // slots render as a faint gray, alive slots are color-coded by which emitter
+                    // spawned them and brightness-faded by remaining life. See
+                    // renderer::debug::ParticleDebugViewPass's own class comment.
+                    "Particles: Alive/Emitter Heatmap",
                 };
                 ImGui::Combo("Buffer", &config::debugview::SELECTED_BUFFER_INDEX, kBufferNames, IM_ARRAYSIZE(kBufferNames));
                 ImGui::TextWrapped("Shows the selected buffer instead of the normal final image. Not tied to the Numpad debug-view-mode keys.");

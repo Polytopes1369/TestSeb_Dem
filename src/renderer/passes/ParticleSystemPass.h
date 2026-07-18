@@ -317,6 +317,17 @@ namespace renderer {
         float GetLastSimMs() const;
         float GetLastSortMs() const;
         float GetLastDrawMs() const;
+
+        // Subtask E3 (Debug Buffer Viewer extension): the CURRENTLY active raw particle-state
+        // buffer handle/size (GetCurrentSet()'s own physical binding 0, see that accessor's own
+        // comment) -- exposed specifically for renderer::debug::ParticleDebugViewPass's own
+        // read-only compute bake (an alive-list occupancy heatmap + per-emitter color overlay for
+        // the ImGui "Buffer Viewer" dropdown), which needs the raw VkBuffer handle directly rather
+        // than going through GetSetLayout()'s full descriptor-set contract like every real particle
+        // shader does. Never used by Release code -- guarded `#ifndef NDEBUG` like every other
+        // Debug-only accessor on this class.
+        VkBuffer GetParticleBufferHandleForDebugView() const { return m_ParticleBuffer[m_CurrentIndex].Handle(); }
+        VkDeviceSize GetParticleBufferSizeForDebugView() const { return m_ParticleBuffer[m_CurrentIndex].Size(); }
 #endif
 
         // Dispatches ParticleSimulation.comp in up to three passes against GetCurrentSet() (see that

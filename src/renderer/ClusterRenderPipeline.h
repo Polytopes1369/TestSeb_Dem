@@ -159,6 +159,7 @@
 #include "renderer/debug/ClusterTriangleStatsPass.h"
 #include "renderer/debug/DebugBufferViewPass.h"
 #include "renderer/debug/DebugTextOverlay.h"
+#include "renderer/debug/ParticleDebugViewPass.h"
 #include "renderer/passes/SDFRayMarchPass.h"
 #endif
 
@@ -966,6 +967,12 @@ namespace renderer {
         // comment. Only dispatched (and only ever blitted to the swapchain in place of
         // m_PostProcess's output) when config::debugview::SELECTED_BUFFER_INDEX != 0.
         debug::DebugBufferViewPass m_DebugBufferView;
+
+        // Subtask E3 (Debug Buffer Viewer extension): backs Buffer Viewer index 15 (see
+        // debug::ParticleDebugViewPass's own class comment) -- only baked (RecordDebugBufferView's
+        // own case 15) when that specific index is selected, same "additive, only-when-selected"
+        // convention as m_DebugBufferView itself.
+        debug::ParticleDebugViewPass m_ParticleDebugView;
 #endif
     };
 
