@@ -330,6 +330,33 @@ add_executable(PcgBiomeRulesTests
 target_include_directories(PcgBiomeRulesTests PRIVATE src ${Vulkan_INCLUDE_DIRS})
 add_test(NAME PcgBiomeRulesTests COMMAND PcgBiomeRulesTests)
 
+# PCG framework roadmap, Phase 8.2 ("Ecosystem Exclusion" -- second subtask of Phase 8,
+# Biome/Ecosystem): PcgEcosystemExclusion.cpp adds cross-layer suppression on top of Phase 8.1's
+# ApplyBiome output, reusing Phase 3.2's PcgSpatialHashGrid (PcgSelfPruningFilter.h/.cpp) directly
+# for its two-set proximity query rather than reimplementing spatial hashing. This test target's
+# own end-to-end test builds a real PcgBiomeRuleSet and runs ApplyBiome before applying ecosystem
+# rules to its output, so it links the identical dependency set PcgBiomeRulesTests above already
+# establishes (every Phase 3 filter file ApplyBiomeLayer composes, plus their own transitive
+# dependencies) alongside PcgEcosystemExclusion.cpp itself. Also links src/core/Logger.cpp: unlike
+# PcgBiomeRules.cpp, PcgEcosystemExclusion.cpp's ApplyEcosystemRules calls LOG_WARNING (an unknown
+# layer-name rule is logged, not a crash -- see PcgEcosystemExclusion.h's own header comment), the
+# same "link Logger.cpp because this file's own code calls into it" precedent every other LOG_*-
+# calling test target above already follows (e.g. LoadingManagerTests).
+add_executable(PcgEcosystemExclusionTests
+    src/pcg/PcgEcosystemExclusion.cpp
+    src/pcg/PcgBiomeRules.cpp
+    src/pcg/PcgDensityTransformFilter.cpp
+    src/pcg/PcgSlopeHeightFilter.cpp
+    src/pcg/PcgTerrainSampler.cpp
+    src/pcg/PcgBooleanSetOps.cpp
+    src/pcg/PcgSplineSampler.cpp
+    src/pcg/PcgSelfPruningFilter.cpp
+    src/core/Logger.cpp
+    tests/PcgEcosystemExclusionTests.cpp
+)
+target_include_directories(PcgEcosystemExclusionTests PRIVATE src ${Vulkan_INCLUDE_DIRS})
+add_test(NAME PcgEcosystemExclusionTests COMMAND PcgEcosystemExclusionTests)
+
 # PCG framework roadmap, Phase 5.1+5.2 ("PCG Graph Engine Core"): the node/link graph data model +
 # JSON serialization (src/pcg/PcgGraph.cpp) and the CPU topological evaluator + subgraph support
 # (src/pcg/PcgGraphEvaluator.cpp), built directly on Phase 1's data model. PcgGraph.cpp reuses
