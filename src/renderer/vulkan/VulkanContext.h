@@ -7,6 +7,7 @@
 #include "core/EngineConfig.h" // config::VERTEX_SPACING default arg for GeneratePlane()
 #include "core/EntityData.h"
 #include "core/IDManager.h"
+#include "core/InstanceRegistry.h"
 #include "renderer/MaterialParameterTable.h"
 // Phase 5 (Streaming & Monde roadmap, Part 2, Gap 3): world::CellManifest/world::CellCoord --
 // VulkanContext::GenerateGeometry() reads the same offline-baked world_data/cellmanifest.bin
@@ -16,6 +17,7 @@
 // acyclic addition.
 #include "world/CellManifest.h"
 #include <array>
+#include <cassert>
 #include <optional>
 #include <string_view>
 #include <unordered_map>
@@ -194,7 +196,7 @@ public:
     // influence" -- harmless since it is only ever consumed for entities carrying
     // core::EntityFlags::IsSkeletallyAnimated.
     VkBuffer GetVertexSkinBuffer() const { return m_VertexSkinBuffer; }
-    const core::EntityData* GetEntityData() const { return m_EntityData.data(); }
+    const core::EntityData* GetEntityData() const { return m_InstanceRegistry.Data(); }
     // Returns the TOTAL entity count including the streaming pool (kTotalEntityCount), not just
     // the fixed showcase gallery -- every existing "iterate every entity" consumer (GlobalSDFPass's
     // per-entity SDF bake, EntityBVH, TLAS build, shadow maps) picks up the streaming slots
@@ -209,7 +211,7 @@ public:
     // a GPU buffer handle to bind) -- currently only SurfaceCacheRayTracingPass's per-frame TLAS
     // refit and GlobalSDFPass's object-space compositing (see core::EntityTransformCPU's own
     // comment for why this lives in EntityData.h, not here).
-    const core::EntityTransformCPU* GetEntityTransformsCPU() const { return m_EntityTransformsCPU.data(); }
+    const core::EntityTransformCPU* GetEntityTransformsCPU() const { return m_InstanceRegistry.TransformData(); }
     VkBuffer GetEntityBuffer() const { return m_EntityBuffer; }
     const renderer::MaterialTable& GetMaterialTable() const { return m_MaterialTable; }
 
@@ -244,6 +246,37 @@ public:
     // world_data/cellmanifest.bin was missing/unreadable at startup (every unit then falls back to
     // the pre-Phase-5 shared 4-archetype rotation, exactly as before this feature).
     uint32_t GetDedicatedStreamingUnitCount() const { return static_cast<uint32_t>(m_CellToStreamingUnit.size()); }
+
+    // Phase 0.2 (UE5.8-parity PCG roadmap, "PCG Instance Draw Path"): the real, already-baked
+    // meshID/materialID of streaming unit `unit`'s FINE (full-detail) archetype variant -- lets a
+    // caller (main.cpp's PcgInstanceDrawPass smoke test) point new PCG draw instances at already-
+    // resident geometry without needing this class's own private streaming-slot layout constants
+    // (StreamingUnitFineSlot/kStreamingSlotBase, both private -- see this class' own header comment
+    // on why every existing "iterate every entity" consumer instead goes through GetEntityData()/
+    // GetEntityCount()). `unit` must be < GetStreamingUnitCount(). Valid any time after Init() has
+    // run BuildEntityData() -- every streaming unit's fine-variant EntityData is authored there
+    // unconditionally, regardless of whether any world cell has actually claimed the unit yet (see
+    // SetStreamingUnitState()'s own comment: an idle unit still carries a real, valid meshID, only
+    // core::EntityFlags::StreamingInactive hides it from being drawn by the normal per-frame cut).
+    struct StreamingArchetypeMeshInfo { uint32_t meshID = 0; uint32_t materialID = 0; };
+    StreamingArchetypeMeshInfo GetStreamingArchetypeFineMeshInfo(uint32_t unit) const {
+        assert(unit < kStreamingUnitCount);
+        uint32_t fineIdx = StreamingUnitFineSlot(unit);
+        return { m_InstanceRegistry[fineIdx].meshID, m_InstanceRegistry[fineIdx].materialID };
+    }
+
+#ifndef NDEBUG
+    // Phase 0.1 (UE5.8-parity PCG roadmap, "Dynamic Instance Registry"): CPU-only startup smoke test
+    // proving core::InstanceRegistry::AcquireSlot()/ReleaseSlot() free-list bookkeeping is correct
+    // and cannot corrupt any of the kTotalEntityCount already-live entities BuildEntityData()
+    // acquired at Init() time. Whole declaration + definition compiled out in Release (matching this
+    // class's existing m_DebugMessenger/m_EnableValidationLayers convention below) -- see the .cpp
+    // definition for exactly what it checks. Returns false (after LOG_ERROR-ing the specific failing
+    // check) on the first failing check, true if every check passes. Safe to call any time after
+    // Init() has run BuildEntityData() -- main.cpp calls it exactly once, right after
+    // VulkanContext::Init() returns.
+    bool RunInstanceRegistrySmokeTest();
+#endif
 
 private:
     VkInstance m_Instance = VK_NULL_HANDLE;
@@ -443,7 +476,7 @@ private:
     // override).
     static constexpr uint32_t kWaterEntityIndex = kEntityCount - 1;
     // Phase 7a (UE5.8 parity roadmap, hero asset tessellation): the Icosphere -- generated FIRST
-    // (see GenerateGeometry()'s own "Icosphere-first" comment, `m_EntityData[2].meshID` used
+    // (see GenerateGeometry()'s own "Icosphere-first" comment, `m_InstanceRegistry[2].meshID` used
     // directly). Originally the ONE hardcoded tessellated/displaced hero asset (back when this
     // feature only ever rendered renderer::kHeroMaterialID via the single-entity
     // "HeroTessellationPass"); still tessellated today, but now just one entry in
@@ -503,16 +536,36 @@ private:
     static constexpr uint32_t StreamingUnitCoarseSlot(uint32_t unit) { return kStreamingSlotBase + unit * kStreamingSlotsPerUnit; }
     static constexpr uint32_t StreamingUnitFineSlot(uint32_t unit) { return kStreamingSlotBase + unit * kStreamingSlotsPerUnit + 1u; }
 
-    // CPU-authoritative entity records: built once by BuildEntityData() (meshID assigned via
-    // core::IDManager) before GenerateGeometry() runs, then copied to m_EntityBuffer by
-    // UploadEntityData(). Indices [0, kEntityCount) are the fixed showcase gallery; indices
-    // [kStreamingSlotBase, kTotalEntityCount) are the streaming pool above.
-    std::array<core::EntityData, kTotalEntityCount> m_EntityData{};
+    // Phase 0.1 (UE5.8-parity PCG roadmap, "Dynamic Instance Registry"): extra core::InstanceRegistry
+    // capacity, beyond kTotalEntityCount, reserved ONLY for RunInstanceRegistrySmokeTest()'s own
+    // probe slots (see that method's own comment) -- lets the smoke test AcquireSlot() genuinely
+    // brand-new indices instead of borrowing and restoring one of the kTotalEntityCount already-live
+    // real entities, which would risk corrupting it if the restore step ever had a bug. Zero in
+    // Release (#ifndef NDEBUG) so this headroom -- and the smoke test that is its only consumer --
+    // costs nothing in the shipping executable, matching this header's existing m_DebugMessenger/
+    // m_EnableValidationLayers convention below.
+#ifndef NDEBUG
+    static constexpr uint32_t kInstanceRegistryDebugHeadroom = 4;
+#else
+    static constexpr uint32_t kInstanceRegistryDebugHeadroom = 0;
+#endif
+    static constexpr uint32_t kInstanceRegistryCapacity = kTotalEntityCount + kInstanceRegistryDebugHeadroom;
 
-    // Phase 4 integration (UE5.8 parity roadmap, dynamic scenes onto main): CPU-readable mirror of
-    // m_EntityTransformBuffer's own per-frame contents -- see GetEntityTransformsCPU()'s own
-    // comment.
-    std::array<core::EntityTransformCPU, kTotalEntityCount> m_EntityTransformsCPU{};
+    // CPU-authoritative entity records + their CPU-side transform mirror. Generalized (Phase 0.1)
+    // from a fixed std::array<EntityData, kTotalEntityCount> into a core::InstanceRegistry: a
+    // capacity-bounded pool supporting runtime AcquireSlot()/ReleaseSlot() with LIFO free-list reuse
+    // (see InstanceRegistry.h's own header comment). BuildEntityData() acquires exactly
+    // kTotalEntityCount slots once at startup -- the 16 fixed showcase entities (indices
+    // [0, kEntityCount)) then the streaming pool (indices [kStreamingSlotBase, kTotalEntityCount)) --
+    // in that exact deterministic order on a registry that starts completely empty, so AcquireSlot()
+    // is guaranteed to hand back index == the loop's own absolute index every time, preserving every
+    // existing absolute-index constant (kWallEntityIndexA/B, kFloorEntityIndex, kWaterEntityIndex,
+    // kHeroEntityIndex, GridSlot()'s own zone layout) completely unchanged, and never releases them.
+    // Every existing consumer that iterates by GetEntityCount() (== kTotalEntityCount, unchanged)
+    // keeps working completely unmodified, since none of them can observe the registry's own extra
+    // Debug-only headroom capacity above that count. Data()/TransformData() give the exact same
+    // contiguous-array pointer semantics GetEntityData()/GetEntityTransformsCPU() always returned.
+    core::InstanceRegistry<kInstanceRegistryCapacity> m_InstanceRegistry;
 
     // Phase 5 (Streaming & Monde roadmap, Part 2, Gap 3) BUG FIX: per-SLOT (not per-unit as before
     // this fix), indexed by physical slot (StreamingUnitCoarseSlot(unit)/StreamingUnitFineSlot(unit)
@@ -683,21 +736,23 @@ private:
         uint32_t sidesPerRing, uint32_t ringsPerSegment, float radiusMin, float radiusMax,
         uint32_t& runningVertexOffset, uint32_t& runningIndexOffset);
 
-    // Authors m_EntityData on the CPU: assigns each of the kEntityCount entities a meshID via
-    // core::IDManager::GetNextID() (instead of a hardcoded literal). Must run before
-    // GenerateGeometry(), which reads m_EntityData[i].meshID into each primitive's push
+    // Authors m_InstanceRegistry's entity records on the CPU: assigns each of the kEntityCount
+    // entities a meshID via core::IDManager::GetNextID() (instead of a hardcoded literal), then
+    // claims its slot via core::InstanceRegistry::AcquireSlot(). Must run before
+    // GenerateGeometry(), which reads m_InstanceRegistry[i].meshID into each primitive's push
     // constants / Params UBO.
     void BuildEntityData();
 
-    // One-shot upload of m_EntityData to the GPU-only m_EntityBuffer via a temporary staging
-    // buffer + vkCmdCopyBuffer, matching DispatchGeometryCompute's blocking one-time-submit
-    // pattern. Must run after m_EntityBuffer is allocated and before it is bound for reading.
+    // One-shot upload of m_InstanceRegistry's backing store to the GPU-only m_EntityBuffer via a
+    // temporary staging buffer + vkCmdCopyBuffer, matching DispatchGeometryCompute's blocking
+    // one-time-submit pattern. Must run after m_EntityBuffer is allocated and before it is bound
+    // for reading.
     void UploadEntityData();
 
     // Patches exactly the 2 core::EntityData elements at [kStreamingSlotBase + unit*2, +2) into
     // m_EntityBuffer via a small one-shot staging-buffer copy (same pattern as UploadEntityData(),
     // just a 2-element slice instead of the whole array) -- called by SetStreamingUnitState() after
-    // updating m_EntityData in place. A rare, small, main-thread-only patch (at most
+    // updating m_InstanceRegistry in place. A rare, small, main-thread-only patch (at most
     // maxConcurrentLoads streaming events per frame, see world::StreamingManager), so the brief
     // synchronous stall from ExecuteOneShotCommands' vkQueueWaitIdle is an accepted tradeoff over
     // building a batched per-frame dirty-range upload path for what is not a per-frame-hot path.

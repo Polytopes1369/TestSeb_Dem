@@ -176,6 +176,17 @@ namespace renderer {
         m_SortedPairsBuffer.Create(allocator, static_cast<VkDeviceSize>(kMaxParticles) * sizeof(SortedPair),
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
 
+        // Subtask A2 (particle sort & budget scaling roadmap): VkDispatchIndirectCommand-compatible
+        // (3x uint32 -- x/y/z workgroup counts, 12 bytes), GPU_ONLY. TRANSFER_DST_BIT only for the
+        // defensive Init-time seed below (STEP 2) -- RecordSort()'s own mode == 2 pre-pass
+        // unconditionally overwrites it every real call, before anything reads it, so the seed only
+        // guards a pathological "RecordSort() called before any RecordSimulate()/prior RecordSort()"
+        // ordering that never actually happens in this codebase's own RecordFrame sequence. See
+        // kMaxParticles' own comment and RecordSort()'s own comment for the full mechanism.
+        m_SortDispatchArgsBuffer.Create(allocator, sizeof(VkDispatchIndirectCommand),
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            VMA_MEMORY_USAGE_GPU_ONLY);
+
 #ifndef NDEBUG
         // Subtask 6, Debug-only: see GetLastAliveCountApprox()'s own comment.
         m_AliveCountReadbackBuffer.Create(allocator, sizeof(uint32_t),
@@ -226,6 +237,14 @@ namespace renderer {
 
                 VkBufferCopy indirectCopy{ indirectOffset, 0, kIndirectDrawBufferBytes };
                 vkCmdCopyBuffer(cmd, staging.Handle(), m_IndirectDrawBuffer.Handle(), 1, &indirectCopy);
+
+                // Subtask A2: defensive seed for m_SortDispatchArgsBuffer -- see that buffer's own
+                // declaration comment for why this is belt-and-suspenders only (RecordSort()'s own
+                // mode == 2 pre-pass always overwrites it before any real read). A small, 4-byte-
+                // aligned, 12-byte payload qualifies for vkCmdUpdateBuffer's own inline-data path, so
+                // no extra staging-buffer region is needed for it.
+                VkDispatchIndirectCommand dispatchArgsInitial{ 1u, 1u, 1u };
+                vkCmdUpdateBuffer(cmd, m_SortDispatchArgsBuffer.Handle(), 0, sizeof(dispatchArgsInitial), &dispatchArgsInitial);
 
                 // Every later reader (Subtask 2's simulation compute dispatch, Subtask 4's indirect
                 // draw) issues its own COMPUTE_SHADER/DRAW_INDIRECT-stage barrier before touching
@@ -387,22 +406,29 @@ namespace renderer {
         }
 
         // =====================================================================================
-        // STEP 5 (Subtask 3) -- ParticleSort.comp's own set 1 (a single SortedPairsBuffer binding --
-        // see m_SortedPairsBuffer's own declaration comment for why this is a completely independent
-        // set 1 from Subtask 2's environment set, not a shared/extended one).
+        // STEP 5 (Subtask 3, extended by Subtask A2) -- ParticleSort.comp's own set 1: binding 0 is
+        // SortedPairsBuffer (unchanged); binding 1 (new, Subtask A2) is SortDispatchArgsBuffer -- see
+        // m_SortedPairsBuffer's own declaration comment for why this is a completely independent set
+        // 1 from Subtask 2's environment set, not a shared/extended one.
         // =====================================================================================
         {
-            // VERTEX_BIT included alongside COMPUTE_BIT: this same set/layout is reused unmodified
-            // by Subtask 4's render pipeline (ParticleRender.vert reads sortedPairs[gl_InstanceIndex]
-            // to find which particle each billboard instance draws) -- see renderer::
-            // ParticleSystemPass::Init's own STEP 6 comment for why no separate set is built for it.
-            VkDescriptorSetLayoutBinding sortBinding{ 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_VERTEX_BIT, nullptr };
+            // VERTEX_BIT included alongside COMPUTE_BIT on binding 0 only: this same set/layout is
+            // reused unmodified by Subtask 4's render pipeline (ParticleRender.vert reads
+            // sortedPairs[gl_InstanceIndex] to find which particle each billboard instance draws) --
+            // see renderer::ParticleSystemPass::Init's own STEP 6 comment for why no separate set is
+            // built for it. Binding 1 (SortDispatchArgsBuffer) is COMPUTE-only: ParticleRender.vert/
+            // .frag never reads it, only RecordSort()'s own indirect dispatches do (see that
+            // buffer's own declaration comment) -- Vulkan does not require every binding in a bound
+            // set to be referenced by every pipeline that binds it, so this asymmetry is legal.
+            VkDescriptorSetLayoutBinding sortBindings[2]{};
+            sortBindings[0] = { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_VERTEX_BIT, nullptr };
+            sortBindings[1] = { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
             VkDescriptorSetLayoutCreateInfo sortLayoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-            sortLayoutInfo.bindingCount = 1;
-            sortLayoutInfo.pBindings = &sortBinding;
+            sortLayoutInfo.bindingCount = 2;
+            sortLayoutInfo.pBindings = sortBindings;
             VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &sortLayoutInfo, nullptr, &m_SortSetLayout));
 
-            VkDescriptorPoolSize sortPoolSize{ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1 };
+            VkDescriptorPoolSize sortPoolSize{ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 };
             VkDescriptorPoolCreateInfo sortPoolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
             sortPoolInfo.maxSets = 1;
             sortPoolInfo.poolSizeCount = 1;
@@ -416,8 +442,11 @@ namespace renderer {
             VK_CHECK(vkAllocateDescriptorSets(m_Device, &sortSetAllocInfo, &m_SortSet));
 
             VkDescriptorBufferInfo sortedPairsInfo{ m_SortedPairsBuffer.Handle(), 0, m_SortedPairsBuffer.Size() };
-            VkWriteDescriptorSet sortWrite{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_SortSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &sortedPairsInfo, nullptr };
-            vkUpdateDescriptorSets(m_Device, 1, &sortWrite, 0, nullptr);
+            VkDescriptorBufferInfo dispatchArgsInfo{ m_SortDispatchArgsBuffer.Handle(), 0, m_SortDispatchArgsBuffer.Size() };
+            VkWriteDescriptorSet sortWrites[2]{};
+            sortWrites[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_SortSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &sortedPairsInfo, nullptr };
+            sortWrites[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_SortSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &dispatchArgsInfo, nullptr };
+            vkUpdateDescriptorSets(m_Device, 2, sortWrites, 0, nullptr);
 
             VkDescriptorSetLayout sortSetLayouts[2] = { m_SetLayout, m_SortSetLayout };
             VkPushConstantRange sortPushRange{ VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(ParticleSortPC) };
@@ -693,7 +722,9 @@ namespace renderer {
         float precipRainFallSpeedMps, float precipSnowFallSpeedMps, float precipSnowWobbleStrength) {
         // Multi-emitter roadmap (subtask A1): this frame's (possibly ImGui-edited) per-emitter
         // parameters, uploaded wholesale -- every field is live-tunable, so a full re-upload every
-        // call is simplest and cheap (kMaxEmitters * 80 bytes == 320 bytes today). The waterfall mist
+        // call is simplest and cheap (kMaxEmitters * 112 bytes == 448 bytes today -- grew from 80
+        // bytes/emitter when the module stack roadmap's subtask A3 added its two new force modules,
+        // still comfortably under vkCmdUpdateBuffer's 65536-byte limit). The waterfall mist
         // (rivers/waterfalls feature) rides this same array as EMITTERS[3], see RecordSimulate's own
         // header comment.
         vkCmdUpdateBuffer(cmd, m_EmitterParamsBuffer.Handle(), 0, sizeof(EmitterParams) * kMaxEmitters, emitters);
@@ -847,7 +878,34 @@ namespace renderer {
 
         uint32_t groups = (kMaxParticles + 255u) / 256u;
 
-        // --- InitKeys (mode 0) ---
+        // --- Subtask A2: Compute Dispatch Args (mode 2) -- a single-thread pre-pass (fixed (1,1,1)
+        // DIRECT dispatch, not itself indirect -- it only ever needs one thread) that rounds THIS
+        // frame's real CounterBuffer.aliveCount up to the next power of two and derives the 256-wide
+        // workgroup count every CompareExchange dispatch below will read via vkCmdDispatchIndirect.
+        // See m_SortDispatchArgsBuffer's own declaration comment and ParticleSort.comp's own
+        // SortDispatchArgsBuffer comment for the full mechanism/correctness proof. Must run (and be
+        // made visible) before the very first vkCmdDispatchIndirect call below. ---
+        pc.mode = 2;
+        vkCmdPushConstants(cmd, m_SortPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+        vkCmdDispatch(cmd, 1, 1, 1);
+
+        // The indirect-args buffer is consumed by every vkCmdDispatchIndirect call in the
+        // CompareExchange loop below at the DRAW_INDIRECT pipeline stage (Vulkan's indirect-command
+        // read stage -- covers vkCmdDispatchIndirect exactly like an indirect draw's own
+        // VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT). A SINGLE barrier here covers the ENTIRE loop below:
+        // nothing writes m_SortDispatchArgsBuffer again until the next RecordSort() call, and a
+        // Vulkan memory dependency's guarantee extends to every subsequent command in the buffer,
+        // not just the immediately-following one.
+        VulkanUtils::RecordMemoryBarrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT, VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT);
+
+        // --- InitKeys (mode 0) -- deliberately UNCHANGED from before Subtask A2: still a fixed,
+        // full-kMaxParticles-width DIRECT dispatch (not indirect). InitKeys is a cheap, bandwidth-
+        // bound single pass (never the O(log2(N)^2) part that caused the original TDR incident, see
+        // kMaxParticles' own comment) that must keep filling the ENTIRE [aliveCount, kMaxParticles)
+        // tail with the identical sentinel key every frame -- that full-width fill is exactly what
+        // makes shrinking ONLY the CompareExchange dispatches below provably safe (see
+        // SortDispatchArgsBuffer's own comment in ParticleSort.comp for the argument). ---
         pc.mode = 0;
         vkCmdPushConstants(cmd, m_SortPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
         vkCmdDispatch(cmd, groups, 1, 1);
@@ -856,14 +914,24 @@ namespace renderer {
 
         // --- Bitonic compare-exchange network (mode 1) -- see ParticleSort.comp's own header
         // comment for the (stageSize, passSize) iteration this reproduces and why a full memory
-        // barrier is required after EVERY single step, not just between stages. ---
+        // barrier is required after EVERY single step, not just between stages.
+        //
+        // Subtask A2: the LOOP STRUCTURE itself is completely unchanged -- every (stageSize,
+        // passSize) pair the original O(log2(kMaxParticles)^2) network required still runs here,
+        // each still followed by its own full VkMemoryBarrier2 exactly as before this subtask; only
+        // the DISPATCH CALL changes, from a fixed vkCmdDispatch(groups,1,1) to
+        // vkCmdDispatchIndirect() against m_SortDispatchArgsBuffer -- so every single stage's actual
+        // GPU work now scales with THIS frame's real alive count (rounded up to the next power of
+        // two) instead of unconditionally covering the full kMaxParticles capacity. See
+        // m_SortDispatchArgsBuffer's own declaration comment and kMaxParticles' own comment for why
+        // this is safe with no other change required. ---
         pc.mode = 1;
         for (uint32_t stageSize = 2; stageSize <= kMaxParticles; stageSize *= 2) {
             for (uint32_t passSize = stageSize / 2; passSize > 0; passSize /= 2) {
                 pc.stageSize = stageSize;
                 pc.passSize = passSize;
                 vkCmdPushConstants(cmd, m_SortPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-                vkCmdDispatch(cmd, groups, 1, 1);
+                vkCmdDispatchIndirect(cmd, m_SortDispatchArgsBuffer.Handle(), 0);
                 VulkanUtils::RecordMemoryBarrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
                     VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
             }
@@ -1065,6 +1133,7 @@ namespace renderer {
         }
 
         m_SortedPairsBuffer.Destroy();
+        m_SortDispatchArgsBuffer.Destroy();
 #ifndef NDEBUG
         m_AliveCountReadbackBuffer.Destroy();
 #endif

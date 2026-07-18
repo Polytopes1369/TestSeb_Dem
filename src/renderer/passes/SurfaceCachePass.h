@@ -44,6 +44,19 @@
 // shared depth image stays in VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL for its entire lifetime
 // (purely an internal scratch buffer for this pass, never sampled externally).
 //
+// --- Phase 0.3 (PCG roadmap, dynamic Lumen registration) ---
+// UpdateVisibility()'s dynamic atlas RESIDENCY (below) is orthogonal to what card ENTRIES even
+// exist in the first place: m_Cards/m_EntityRanges/the combined vertex-index buffer were, until
+// Phase 0.3, a fixed list built once at Init() from the cache file's card table + fallback-mesh
+// table. RegisterEntity()/UnregisterEntity() additively extend that with a small, capacity-bounded
+// (kMaxDynamicEntities) set of entities addable/removable at runtime -- see those methods' own
+// comments. A registered entity's Cards start non-resident exactly like any other card and are
+// picked up by the very next UpdateVisibility() call through the SAME frustum-test/
+// m_AtlasAllocator/eviction machinery every other card already uses -- no new atlas-placement logic
+// was needed for this, only a way to grow/shrink the card LIST itself. Consistent with
+// GlobalSDFPass's own Phase 0.3 scope note: this is deliberately NOT meant for every PCG-scattered
+// instance, just a handful of large/hero objects.
+//
 // --- Dynamic atlas residency ---
 // Cards are NOT all resident in the atlas simultaneously: UpdateVisibility() frustum-culls every
 // card's entity AABB each frame and grants/revokes atlas pages via m_AtlasAllocator (geometry::
@@ -127,6 +140,12 @@ namespace renderer {
         // grace period absorbs a card flickering in and out of the frustum (e.g. an entity near
         // the screen edge) without paying a re-capture every single time it comes back.
         static inline uint32_t kEvictionFrameDelay = 600u;
+
+        // Phase 0.3 (PCG roadmap, dynamic Lumen registration): upper bound on how many entities may
+        // be registered via RegisterEntity() at any one time -- a small, fixed headroom mirroring
+        // GlobalSDFPass::kMaxDynamicEntities (both passes use the same bound for the same reason:
+        // "a handful of large scattered rocks or hero trees", not an unbounded PCG instance count).
+        static constexpr uint32_t kMaxDynamicEntities = 8;
 
         // Reads the surface-cache card table + every fallback mesh's geometry from
         // `cacheFilePath` (written by geometry::CacheFileManager::WriteCacheFile), uploads one
@@ -220,6 +239,62 @@ namespace renderer {
         void RecordCapture(VkCommandBuffer cmd, const maths::vec3& cameraPositionWorld,
             const core::EntityTransformCPU* entityTransformsCPU);
 
+        // Phase 0.3 (PCG roadmap, dynamic Lumen registration): registers a NEW entity's Cards + a
+        // dedicated small vertex/index buffer at runtime, after Init(). Rather than requiring a
+        // brand-new offline bake, this REUSES `sourceEntityID`'s ALREADY-BAKED Fallback Mesh
+        // geometry + AABB (read fresh from the same cache file Init() consumed, reopened here) --
+        // e.g. one of the World Partition streaming pool's archetype meshes -- and registers Cards
+        // for it under the caller-chosen `newEntityID` identity via geometry::GenerateEntityCards
+        // (the SAME per-entity Phase-1 function CardGenerator's own offline bake calls -- see
+        // CardGenerator.h's two-phase API comment; Phase 2's PackCardsIntoAtlas is NOT called here,
+        // since m_AtlasAllocator already IS a live allocator, see the class comment). The new Cards
+        // are appended non-resident, exactly like a freshly-loaded card, and will be picked up by
+        // the very next UpdateVisibility() call.
+        // `newEntityID`'s geometry is uploaded into its OWN dedicated GPU vertex/index buffer (kept
+        // separate from the shared Init()-time combined buffer, which cannot be grown at runtime) --
+        // RecordCapture() binds whichever buffer a given card's owning entity actually needs, per
+        // draw (see EntityDrawRange::isDynamic).
+        // Returns false (logged), touching no state, if: `newEntityID` already names a resident
+        // entity (from Init() or a prior RegisterEntity() call); kMaxDynamicEntities dynamically-
+        // registered entities are already live; `sourceEntityID` has no Fallback Mesh in the cache
+        // file; the read fails; or GenerateEntityCards produces zero cards for its AABB (fully
+        // degenerate).
+        // NOTE (risk -- same caveat as GlobalSDFPass::RegisterEntity): `newEntityID` is NOT
+        // validated against renderer::VulkanContext's own entity-transform array bounds. If
+        // config::ENTITY_SELF_ROTATION_ENABLED is (or later becomes) enabled and RecordCapture() is
+        // ever called with a non-null `entityTransformsCPU` while a dynamically-registered entity
+        // whose `newEntityID` is outside that array's valid range is still live,
+        // ComputeCardPriority()'s/MarkAllRotatingEntityCardsDirty()'s (indirect, via
+        // ComputeCardPriority) `entityTransformsCPU[card.entityID]` indexing is an out-of-bounds
+        // read. Callers using synthetic IDs outside the engine's normal dense entity range MUST
+        // keep rotation disabled, or pass entityTransformsCPU == nullptr to RecordCapture() and keep
+        // the dirty queue within kCardsPerFrameBudget (so ComputeCardPriority() is never invoked),
+        // for the lifetime of any such registration -- a deliberate, documented boundary Phase 0.3
+        // does not attempt to close (composite-list/card-list add/remove only).
+        bool RegisterEntity(uint32_t newEntityID, uint32_t sourceEntityID, VkCommandPool commandPool, VkQueue queue);
+
+        // Phase 0.3: reverses RegisterEntity() -- evicts (frees the atlas page of, if resident) and
+        // tombstones every Card belonging to `entityID` (returning their slots to a free list a
+        // LATER RegisterEntity() call can reuse, WITHOUT shifting any other card's index -- other
+        // cards' indices must stay stable, since m_AtlasAllocator/m_DirtyCardQueue/external GI
+        // consumers reference them by position across frames, unlike GlobalSDFPass's own
+        // m_Entities list, which has no such cross-frame index dependency), erases its
+        // EntityDrawRange, and destroys its dedicated vertex/index buffer. Only ever removes an
+        // entity that was ITSELF added via RegisterEntity() -- a no-op (logged) for any entityID
+        // that is either not currently registered at all, or is one of Init()'s own fixed-roster
+        // entities (never removable through this API, by design -- see GlobalSDFPass::
+        // UnregisterEntity's identical rule).
+        void UnregisterEntity(uint32_t entityID);
+
+        // Phase 0.3: number of card slots currently ACTIVE (a real Init-time card, or a currently-
+        // claimed RegisterEntity() slot) -- unlike GetCardCount() (== m_Cards.size(), a monotonic
+        // high-water mark that never shrinks, since freed dynamic slots are tombstoned/reused in
+        // place rather than erased -- see UnregisterEntity's own comment), this returns to its
+        // pre-registration value once every dynamically-registered entity is unregistered again,
+        // making it the more useful before/after metric for a caller validating a register/
+        // unregister round trip.
+        uint32_t GetActiveCardCount() const;
+
         uint32_t GetCardCount() const { return static_cast<uint32_t>(m_Cards.size()); }
         // NOTE: atlasOffset/uvMin/uvMax are now a DYNAMIC placement (see UpdateVisibility()), not
         // the static one geometry::CardGenerator::PackCardsIntoAtlas originally baked into the
@@ -252,6 +327,11 @@ namespace renderer {
             int32_t vertexOffset = 0;
             uint32_t firstIndex = 0;
             uint32_t indexCount = 0;
+            // Phase 0.3: true for an entity registered via RegisterEntity() -- its geometry lives in
+            // that entity's OWN dedicated buffer (m_DynamicEntityGeometry[entityID]), not the shared
+            // Init()-time combined m_VertexBuffer/m_IndexBuffer this struct's offsets normally index
+            // into. RecordCapture() checks this to decide which buffer to bind before each draw.
+            bool isDynamic = false;
         };
         const std::unordered_map<uint32_t, EntityDrawRange>& GetEntityRanges() const { return m_EntityRanges; }
 
@@ -276,6 +356,14 @@ namespace renderer {
             bool dirty = false; // Queued in m_DirtyCardQueue, awaiting its first/next capture.
             uint32_t framesSinceVisible = 0; // Reset to 0 every UpdateVisibility() call the card is wanted in.
             geometry::AtlasRect rect{}; // The gutter-PADDED allocation (what must be passed to Free()); valid only while resident == true.
+            // Phase 0.3: true for every Init()-time real card AND for a currently-claimed
+            // RegisterEntity() slot; false for a tombstoned (UnregisterEntity()'d) slot sitting in
+            // m_FreeDynamicCardSlots, awaiting reuse. UpdateVisibility() skips inactive slots
+            // outright (their m_Cards[] entry may hold stale data from before eviction) -- every
+            // other per-card loop in this class (EvictAllUnwantedCards/DefragmentAtlas/
+            // RecordCapture) already only ever touches a slot that is resident and/or dirty, both
+            // of which are always false on an inactive slot, so no other change was needed.
+            bool active = true;
         };
 
         // Tries to place `card` (its atlasSize, gutter-padded) into m_AtlasAllocator, evicting
@@ -333,6 +421,19 @@ namespace renderer {
         // just the one being allocated for.
         void DefragmentAtlas();
 
+        // Phase 0.3: one dynamically-registered entity's own dedicated Fallback Mesh vertex/index
+        // buffers -- kept separate from the shared Init()-time combined m_VertexBuffer/m_IndexBuffer
+        // (see the class comment's own "Phase 0.3" section for why: that buffer cannot be grown at
+        // runtime). Same usage flags as the shared buffers (VERTEX/INDEX_BUFFER_BIT | STORAGE_BUFFER_BIT
+        // | TRANSFER_DST_BIT | ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
+        // SHADER_DEVICE_ADDRESS_BIT) for parity, even though no current Phase 0.3 consumer needs the
+        // acceleration-structure/SSBO usages -- avoids a landmine for a future consumer expecting
+        // every entity's geometry buffer to share one usage contract.
+        struct DynamicEntityGeometry {
+            GpuBuffer vertexBuffer;
+            GpuBuffer indexBuffer;
+        };
+
         VkDevice m_Device = VK_NULL_HANDLE;
         VmaAllocator m_Allocator = VK_NULL_HANDLE;
 
@@ -341,6 +442,12 @@ namespace renderer {
         std::unordered_map<uint32_t, EntityDrawRange> m_EntityRanges; // Keyed by entityID.
         geometry::SurfaceCacheAtlasAllocator m_AtlasAllocator{ geometry::kSurfaceCacheAtlasSize };
         std::deque<uint32_t> m_DirtyCardQueue; // Card indices queued for capture by UpdateVisibility(), drained by RecordCapture().
+
+        // Phase 0.3 (PCG roadmap, dynamic Lumen registration):
+        std::filesystem::path m_CacheFilePath; // Stashed at Init() so RegisterEntity() can reopen it later.
+        std::unordered_map<uint32_t, DynamicEntityGeometry> m_DynamicEntityGeometry; // Keyed by entityID.
+        std::unordered_map<uint32_t, std::vector<uint32_t>> m_DynamicEntityCardSlots; // entityID -> its claimed indices into m_Cards/m_CardStates.
+        std::vector<uint32_t> m_FreeDynamicCardSlots; // Tombstoned slots (see CardRuntimeState::active) available for reuse.
 
         GpuBuffer m_VertexBuffer; // geometry::FallbackVertex[], GPU_ONLY.
         GpuBuffer m_IndexBuffer;  // uint32_t[], GPU_ONLY.

@@ -354,6 +354,12 @@ inline bool SSR_FALLBACK_ENABLED = true;
 // renderer::ClusterRenderPipeline::RecordFrame for the actual list/ordering this indexes into.
 namespace debugview {
 inline int SELECTED_BUFFER_INDEX = 0;
+// Debug-only (ImGui "Volumetric" tab, main.cpp) -- when true, renderer::AtmosVolumetricFogPass
+// renders each config::localfog::VOLUMES entry as a bright, per-volume distinct color inside the
+// froxel grid so its extent/shape is directly visible. Read ONLY inside #ifndef NDEBUG blocks (its
+// ImGui checkbox and the RecordUpdate read that drives the shader flag are both gated), so this
+// never contributes any GPU work in a Release build -- see AtmosVolumetricFogPass::RecordUpdate.
+inline bool LOCAL_FOG_VOLUME_BOUNDS_VIZ = false;
 } // namespace debugview
 
 namespace volumetrics {
@@ -363,6 +369,62 @@ inline bool _VOLUMETRIC_FOG_ENABLE = true;
 inline uint32_t _VOLUMETRIC_FOG_GRID_PIXEL_SIZE = 4;
 inline float _VOLUMETRIC_CLOUD_VIEW_RAY_SAMPLE_COUNT_SCALE = 2.0f;
 } // namespace volumetrics
+
+// Local Fog Volumes (UE5.8 rendering-parity gap G8) -- localized, oriented-box or sphere fog
+// regions, each with its own density/color/vertical-falloff and an optional shadowed sun
+// contribution, injected ADDITIVELY into renderer::AtmosVolumetricFogPass's froxel grid on top of
+// the global Exponential Height Fog (postprocess::FOG_*) + Froxel Volumetric Fog. Authored scene
+// content (like config::particles::EMITTERS[] and the VulkanContext zone layout), read ONCE at
+// AtmosVolumetricFogPass::Init to build a small std430 SSBO -- so unlike the postprocess::FOG_*
+// analytic knobs above these are NOT live-tunable per-parameter; only the master ENABLE toggle
+// below takes effect at runtime (it zeroes the injected count for one frame). Same live-toggle
+// convention as volumetrics::_VOLUMETRIC_FOG_ENABLE.
+namespace localfog {
+
+// SSBO capacity. Only the first `active` entries of VOLUMES[] below are uploaded/injected.
+constexpr uint32_t kMaxLocalFogVolumes = 8u;
+
+// 0 = oriented box (halfExtents + yaw), 1 = sphere (sphereRadius, orientation ignored).
+enum class Shape : uint32_t { Box = 0u, Sphere = 1u };
+
+struct LocalFogVolumeConfig {
+    bool active = false;
+    uint32_t shape = 0u;                        // Shape (cast from localfog::Shape).
+    float centerX = 0.0f, centerY = 0.0f, centerZ = 0.0f; // World-space center.
+    float halfX = 1.0f, halfY = 1.0f, halfZ = 1.0f;       // Box half-extents (world units); ignored for a sphere.
+    float sphereRadius = 1.0f;                  // Sphere radius (world units); ignored for a box.
+    float yawDegrees = 0.0f;                    // Box orientation about world +Y; ignored for a sphere.
+    float density = 0.2f;                       // Base extinction density (world^-1) at the volume's base.
+    float heightFalloff = 0.6f;                 // Vertical density decay rate (like FOG_HEIGHT_FALLOFF) within the volume.
+    float edgeSoftness = 0.3f;                  // [0, 1) fractional soft-edge shell so volumes blend into the air.
+    float colorR = 0.8f, colorG = 0.87f, colorB = 1.0f;   // Scattering albedo/tint.
+    bool receivesSunShadow = true;              // Sample the VSM sun shadow for this volume's in-scatter.
+};
+
+// Master runtime toggle (live ImGui "Volumetric" tab). OFF injects a count of 0 for that frame
+// without touching the uploaded SSBO -- see AtmosVolumetricFogPass::RecordUpdate.
+inline bool ENABLE = true;
+
+// Two authored showcase volumes (placed relative to the VulkanContext::GridSlot zone gallery,
+// which spans XZ ~[-5, +5] at ground level, and the rivers/waterfalls feature's waterfall base at
+// world ~(12, -0.6, 12) -- see config::particles::EMITTERS[3]):
+//   [0] a broad, low, gently-yawed box of ground-hugging valley mist blanketing the whole gallery.
+//   [1] a denser sphere of mist billowing at the waterfall base -- COMPLEMENTS (does not fight) the
+//       waterfall's mist/foam sprite particles by adding a soft volumetric body of in-scattered
+//       light around them, rather than re-emitting the same sprites.
+inline LocalFogVolumeConfig VOLUMES[kMaxLocalFogVolumes] = {
+    LocalFogVolumeConfig{ /*active*/ true, /*shape*/ static_cast<uint32_t>(Shape::Box),
+        /*center*/ 0.0f, -0.35f, 0.0f, /*half*/ 9.0f, 1.3f, 9.0f, /*sphereRadius*/ 0.0f,
+        /*yaw*/ 18.0f, /*density*/ 0.14f, /*heightFalloff*/ 0.9f, /*edgeSoftness*/ 0.35f,
+        /*color*/ 0.78f, 0.85f, 1.0f, /*receivesSunShadow*/ true },
+    LocalFogVolumeConfig{ /*active*/ true, /*shape*/ static_cast<uint32_t>(Shape::Sphere),
+        /*center*/ 12.0f, -0.3f, 12.0f, /*half*/ 0.0f, 0.0f, 0.0f, /*sphereRadius*/ 4.5f,
+        /*yaw*/ 0.0f, /*density*/ 0.4f, /*heightFalloff*/ 0.6f, /*edgeSoftness*/ 0.4f,
+        /*color*/ 0.85f, 0.92f, 1.0f, /*receivesSunShadow*/ true },
+    LocalFogVolumeConfig{}, LocalFogVolumeConfig{}, LocalFogVolumeConfig{},
+    LocalFogVolumeConfig{}, LocalFogVolumeConfig{},
+};
+} // namespace localfog
 
 // Atmos weather system (atmos_integration_plan.md, Subtask 1: Climatic State Manager & Wind
 // Simulation) -- live simulation knobs, not a quality-preset tier, so unlike volumetrics:: above
@@ -437,6 +499,14 @@ inline constexpr uint32_t kMaxEmitters = 4;
 // SPAWN_RATE_PER_SECOND/EMITTER_POSITION_*/GRAVITY/BOUNCE_ELASTICITY/FRICTION/DRAG_COEFFICIENT
 // globals this namespace used to hold directly (subtask A1 keeps their per-emitter defaults exactly
 // equivalent to the old always-on single emitter -- see EMITTERS[0] below).
+// Module stack roadmap (subtask A3): two independently-toggleable force modules layered on top of
+// the physics fields above (which are unchanged) -- deliberately added at the END of this struct so
+// every existing positional EmitterConfig{...} aggregate initializer below (which lists fewer values
+// than there are members) keeps relying on THESE new fields' own default member initializers rather
+// than needing to be rewritten; only EMITTERS[1] below explicitly opts into curl-noise turbulence by
+// listing values through that field. A full visual-scripting module graph is out of scope for this
+// project (see renderer::ParticleSystemPass::EmitterParams' own header comment) -- this mirrors that
+// struct's small fixed-size data-driven set exactly, field-for-field.
 struct EmitterConfig {
     bool active = false;
     float positionX = 0.0f, positionY = 0.0f, positionZ = 0.0f;
@@ -450,13 +520,44 @@ struct EmitterConfig {
     float dragCoefficient = 0.5f;  // How strongly velocity relaxes toward the local Atmos wind vector each second.
     uint32_t spawnShape = 0;       // 0 = Cone burst ("embers" launch), 1 = Sphere volume drift ("ambient dust").
     float shapeParam0 = 0.3f;      // Sphere shape's radius in world units; unused by Cone.
+    // Module stack roadmap (subtask A3): curl-noise turbulence module.
+    bool curlNoiseEnabled = false;
+    float curlNoiseStrength = 0.5f; // m/s^2 -- only applied while curlNoiseEnabled is true.
+    float curlNoiseScale = 0.3f;    // World-space frequency multiplier -- bigger = finer swirls.
+    // Module stack roadmap (subtask A3): radial attractor/repulsor module.
+    bool attractorEnabled = false;
+    float attractorOffsetX = 0.0f, attractorOffsetY = 0.0f, attractorOffsetZ = 0.0f; // World-space offset from this emitter's own live position.
+    float attractorStrength = 1.0f; // Positive = attract, negative = repel, m/s^2 at zero distance (before falloff).
+    float attractorRadius = 3.0f;   // World units -- smoothstep falloff to zero at this distance.
+
+    // Subtask A4 (color-over-life / size-over-life curves) -- see renderer::ParticleSystemPass::
+    // EmitterParams::colorCurve/sizeCurve's own declaration comment (src/renderer/passes/
+    // ParticleSystemPass.h) for the full evaluation contract: 4 keyframes at normalized age
+    // 0.0/0.33/0.67/1.0, colorCurve DIRECT/authoritative (overrides colorR/G/B/A above once a custom
+    // curve is set), sizeCurve a MULTIPLIER on sizeMin/sizeMax's own per-particle roll. The defaults
+    // below intentionally reproduce a FLAT, unchanging curve -- colorCurve every key equal to
+    // (colorR, colorG, colorB, colorA) above, sizeCurve every key 1.0 -- so an emitter that never
+    // touches these new fields (every slot below except EMITTERS[0]'s Embers) renders IDENTICALLY to
+    // how it did before this roadmap step: a flat colorCurve reproduces the old "one fixed color for
+    // the particle's entire life" behavior exactly, and a flat 1.0 sizeCurve is a pure no-op
+    // multiplier on the existing size roll.
+    float colorCurve[4][4] = {
+        { 1.0f, 1.0f, 1.0f, 1.0f }, { 1.0f, 1.0f, 1.0f, 1.0f },
+        { 1.0f, 1.0f, 1.0f, 1.0f }, { 1.0f, 1.0f, 1.0f, 1.0f }
+    };
+    float sizeCurve[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
 };
 
 // Slot 0 preserves the ORIGINAL single-emitter defaults exactly (same position/spawn rate/physics
 // values the old flat globals held) so this roadmap step changes nothing about the existing "embers"
 // look by default. Slot 1 is a new "Ambient Dust" emitter proving multi-emitter support end-to-end
 // (a slow-drifting sphere-volume spawn, distinct color/physics/shape from slot 0, both active
-// simultaneously). Slot 2 starts inactive, ready for further ImGui-driven experimentation.
+// simultaneously) -- module stack roadmap (subtask A3): this emitter's curl-noise turbulence module
+// is also enabled by default here, as a visible proof the new force module actually works, since its
+// already-slow drift (drag=1.0, gentle initial velocity) reads turbulence clearly instead of being
+// swamped by a fast base motion the way embers' own launched-burst velocity would. Slot 2 starts
+// inactive, ready for further ImGui-driven experimentation (including the new attractor/repulsor
+// module, left off by default on every slot here since no existing emitter's look calls for it).
 //
 // Slot 3 is the rivers/waterfalls feature's own waterfall mist/foam emitter -- rides this same
 // multi-emitter array rather than a bespoke dispatch, using the same "Sphere volume drift" shape
@@ -467,16 +568,46 @@ struct EmitterConfig {
 // explicitly-documented mirror (same "keep in sync" convention as water_params.glsl's own
 // kWaterLevel vs. VulkanContext.cpp's identical literal) rather than plumbing the GLSL-side spline
 // data back into C++, since this is the only C++ call site that needs it. Y is roughly midway down
-// the P2->P3 drop (0.8 to -1.0), where the falling sheet breaks up into mist.
+// the P2->P3 drop (0.8 to -1.0), where the falling sheet breaks up into mist. Neither of slot 3's
+// module-stack fields (curl-noise/attractor) are set here -- it stays off, matching mist's existing
+// tuned look, which was already validated before this roadmap subtask existed.
 inline EmitterConfig EMITTERS[kMaxEmitters] = {
+    // Subtask A4's own visible proof-of-feature: Embers now cool and die over their lifetime instead
+    // of holding one fixed orange from spawn to recycle -- bright warm-white glow at birth, settling
+    // to the original base orange mid-life, cooling to a dim dark red, then fully extinguishing
+    // (alpha -> 0) right at death. sizeCurve gives it a quick "pop" to full size followed by a gradual
+    // shrink as it burns out, on top of the existing sizeMin/sizeMax per-particle roll below.
     EmitterConfig{ /*active*/ true, /*position*/ 0.0f, 3.0f, 0.0f, /*spawnRate*/ 200.0f,
         /*color*/ 1.0f, 0.7f, 0.3f, 1.0f, /*size*/ 0.1f, 0.1f, /*lifetime*/ 2.0f, 4.0f,
         /*gravityY*/ -9.8f, /*bounce*/ 0.4f, /*friction*/ 0.85f, /*drag*/ 0.5f,
-        /*spawnShape*/ 0u, /*shapeParam0*/ 0.3f },
+        /*spawnShape*/ 0u, /*shapeParam0*/ 0.3f,
+        /*curlNoiseEnabled*/ false, /*curlNoiseStrength*/ 0.5f, /*curlNoiseScale*/ 0.3f,
+        /*attractorEnabled*/ false, /*attractorOffset*/ 0.0f, 0.0f, 0.0f, /*attractorStrength*/ 1.0f, /*attractorRadius*/ 3.0f,
+        /*colorCurve*/ {
+            { 1.0f, 0.85f, 0.65f, 1.0f },  // Age 0.00 -- bright warm-white glow at birth.
+            { 1.0f, 0.7f, 0.3f, 1.0f },    // Age 0.33 -- settles to the original base orange.
+            { 0.55f, 0.15f, 0.05f, 0.8f }, // Age 0.67 -- cooling into a dim, dark red ember.
+            { 0.0f, 0.0f, 0.0f, 0.0f }     // Age 1.00 -- fully extinguished/transparent at death.
+        },
+        /*sizeCurve*/ { 0.6f, 1.0f, 0.8f, 0.0f } },
+    // Ambient Dust keeps an explicit FLAT curve matching its own Base Color exactly (rather than
+    // relying on EmitterConfig's own in-class default, which only matches the DEFAULT Base Color
+    // (1,1,1,1), not this emitter's actual dusty blue-gray one) -- see EmitterConfig::colorCurve's own
+    // declaration comment: this reproduces today's unchanged "one fixed color for life" look with zero
+    // visual regression from this roadmap step. Also carries subtask A3's curl-noise turbulence,
+    // enabled by default here as that module's own visible proof-of-feature (see the EMITTERS[] array
+    // comment above).
     EmitterConfig{ /*active*/ true, /*position*/ 4.0f, 2.0f, 2.0f, /*spawnRate*/ 40.0f,
         /*color*/ 0.6f, 0.7f, 0.85f, 0.5f, /*size*/ 0.03f, 0.07f, /*lifetime*/ 4.0f, 7.0f,
         /*gravityY*/ -0.2f, /*bounce*/ 0.0f, /*friction*/ 0.0f, /*drag*/ 1.0f,
-        /*spawnShape*/ 1u, /*shapeParam0*/ 1.5f },
+        /*spawnShape*/ 1u, /*shapeParam0*/ 1.5f,
+        /*curlNoiseEnabled*/ true, /*curlNoiseStrength*/ 0.5f, /*curlNoiseScale*/ 0.35f,
+        /*attractorEnabled*/ false, /*attractorOffset*/ 0.0f, 0.0f, 0.0f, /*attractorStrength*/ 1.0f, /*attractorRadius*/ 3.0f,
+        /*colorCurve*/ {
+            { 0.6f, 0.7f, 0.85f, 0.5f }, { 0.6f, 0.7f, 0.85f, 0.5f },
+            { 0.6f, 0.7f, 0.85f, 0.5f }, { 0.6f, 0.7f, 0.85f, 0.5f }
+        },
+        /*sizeCurve*/ { 1.0f, 1.0f, 1.0f, 1.0f } },
     EmitterConfig{},
     EmitterConfig{ /*active*/ true, /*position*/ 12.0f, -0.6f, 12.0f, /*spawnRate*/ 60.0f,
         /*color*/ 0.85f, 0.92f, 1.0f, 0.65f, /*size*/ 0.18f, 0.40f, /*lifetime*/ 0.8f, 1.7f,
@@ -488,6 +619,68 @@ inline float SOFT_FADE_DISTANCE = 0.5f; // World units -- see ParticleRender.fra
 inline bool HEAT_SHIMMER_ENABLED = false;
 inline float HEAT_SHIMMER_STRENGTH = 0.02f; // Only applied when HEAT_SHIMMER_ENABLED is true -- see ParticleSystemPass::RecordDraw's own comment on why this is a per-draw-call, not per-particle, toggle.
 } // namespace particles
+
+// GPU-instanced procedural vegetation scatter (UE5.8 rendering-parity gap G2) -- grass tufts,
+// shrubs and small rocks scattered PCG-style across the terrain. Authored scene content read at
+// scatter-generation time (renderer::VegetationScatterPass), same "runtime state, not a hardware-
+// quality tier" convention as config::atmos:: / config::particles:: above (NOT mirrored into
+// EngineConfig_{Low,Medium,High,Extrem}.h). ENABLED / OCCLUSION_CULL_ENABLED take effect live every
+// frame; the density/region/seed knobs are consumed only when the scatter is (re)generated -- the
+// Debug "Vegetation" ImGui tab exposes a Regenerate button that reapplies them at runtime.
+namespace vegetation {
+inline bool ENABLED = true;                  // Master runtime toggle -- skip the per-frame cull+draw entirely.
+inline bool OCCLUSION_CULL_ENABLED = true;   // Per-instance HZB occlusion test (frustum culling always on).
+inline float REGION_HALF_EXTENT = 45.0f;     // World units -- scatter over the square [-H, +H]^2 around the origin (the terrain is 300x300, but foliage is bounded to the showcase area to stay real-time).
+inline float CELL_SIZE = 0.9f;               // Candidate-cell size (== average instance spacing before jitter/pruning).
+inline float GRASS_DENSITY = 0.85f;          // [0,1] placement weight on the grass band.
+inline float BUSH_DENSITY = 0.10f;           // [0,1] placement weight on the grass band (shrubs are sparser than grass).
+inline float ROCK_DENSITY = 0.45f;           // [0,1] placement weight on cliffs/slopes + the beach transition.
+inline uint32_t SEED = 1337u;                // Global determinism seed.
+#ifndef NDEBUG
+inline bool WIREFRAME = false;               // Debug-only wireframe/bounds visualization (gated out of Release per CLAUDE.md rule 8).
+#endif
+} // namespace vegetation
+
+// Procedural 3D Audio Engine (src/audio/, closes the "moteur de son 3D + style FL studio" gap in
+// this project's own CLAUDE.md design brief -- a fully procedural, real-time-streamed-synthesis
+// audio subsystem, zero .wav/.ogg assets, see audio::AudioEngine's own class comment) -- live-
+// tunable mix/generative knobs, same "runtime state, not a quality-preset tier" convention as
+// config::atmos::/config::particles:: above (NOT mirrored into EngineConfig_{Low,Medium,High,
+// Extrem}.h), tuned live via main.cpp's own Debug-only "Audio" ImGui tab. The underlying
+// audio::AudioEngine itself runs unconditionally in Debug AND Release (a real feature, per
+// CLAUDE.md's build-separation rule) -- only that ImGui tab is #ifndef NDEBUG-gated.
+namespace audio {
+// Master output gain, applied at the XAudio2 mastering voice (IXAudio2MasteringVoice::SetVolume) --
+// scales EVERYTHING (generative music bed + all positional environmental sources) in one place.
+inline float MASTER_VOLUME = 0.8f; // [0,1]
+
+// --- Generative composition layer ("FL Studio style" procedural pattern/sequencer-driven ambient
+// score, audio::GenerativeComposer) -- a non-positional, always-audible 2-channel bed. See that
+// class' own header comment for the pentatonic-scale/chord-progression/step-sequencer design this
+// drives, and why. ---
+inline bool GENERATIVE_MUSIC_ENABLED = true; // OFF stops new notes from triggering; already-sounding notes still ring out through their own release tail (see GenerativeComposer::RenderBlock's own comment) rather than being cut off.
+inline float GENERATIVE_MUSIC_VOLUME = 0.5f; // [0,1] -- this voice's own IXAudio2SourceVoice::SetVolume.
+inline float GENERATIVE_TEMPO_BPM = 66.0f; // Slow, ambient tempo -- see GenerativeComposer.h's own comment for why.
+inline float GENERATIVE_NOTE_DENSITY = 0.35f; // [0,1] -- probability a given 16th-note step actually triggers a new pad note (sparse, Eno "Music for Airports"-style density, not a constant arpeggio).
+inline uint32_t GENERATIVE_SEED = 1337u; // Deterministic-from-seed by default -- matches this codebase's own established "same seed -> same output" procedural-generation discipline (terrain, clusters, HLOD, ...).
+
+// --- 3D positional environmental sources (audio::PositionalSource, audio::AudioEngine) -- world-
+// space sound sources with distance attenuation + stereo panning relative to the camera. Each
+// volume below is that source's own IXAudio2SourceVoice::SetVolume, multiplied every frame by its
+// live-computed distance-attenuation gain (see AudioEngine::Update's own comment) -- independent of
+// MASTER_VOLUME/GENERATIVE_MUSIC_VOLUME above, which apply elsewhere in the mix. ---
+inline bool POSITIONAL_AUDIO_ENABLED = true;
+inline float EMBERS_VOLUME = 0.8f;    // Fire crackle + low rumble bed -- positioned at config::particles::EMITTERS[0]'s own position (the "Embers" emitter).
+inline float WATERFALL_VOLUME = 0.9f; // Continuous filtered-noise rush -- positioned at config::particles::EMITTERS[3]'s own position (the waterfall mist emitter, itself kept in sync with river_spline.glsl's kRiverControlXZ[3]/kRiverControlHeight[3] -- see that EmitterConfig's own comment above).
+inline float WIND_VOLUME = 0.5f;      // Filtered-noise "whoosh" driven by config::atmos::WIND_SPEED_MPS/WIND_DIRECTION_DEGREES -- see PositionalSource.h's own comment for why this source's position tracks the camera rather than sitting at a fixed point.
+
+// Distance attenuation model (audio::PositionalSource::ComputeDistanceAttenuation): OpenAL-style
+// "inverse clamped distance" -- gain = referenceDistance / (referenceDistance + rolloff * max(0,
+// distance - referenceDistance)), clamped to [0,1] and hard-zeroed beyond maxDistance.
+inline float ATTENUATION_REFERENCE_DISTANCE_METERS = 3.0f; // Distance at which gain == 1 (no attenuation).
+inline float ATTENUATION_ROLLOFF = 1.0f; // Higher = falls off faster past the reference distance.
+inline float ATTENUATION_MAX_DISTANCE_METERS = 60.0f; // Beyond this, a source is fully inaudible (gain hard-clamped to 0).
+} // namespace audio
 
 // Active loaded state
 inline bool g_ProfileLoaded = false;

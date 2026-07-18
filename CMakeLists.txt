@@ -41,29 +41,79 @@ set(IMGUI_SOURCES
     ${IMGUI_DIR}/backends/imgui_impl_vulkan.cpp
 )
 
+# --- Configuration Node Editor (Phase 7.1 -- PCG Graph Editor scaffold, editor-tooling only) ---
+# Vendored from thedmd/imgui-node-editor (MIT license), master branch commit
+# 021aa0ea4da13fed864bafb2a92d4c5205076866 (2026-02-20). That project's own docs/README.md states
+# its only dependency is "Vanilla ImGui 1.72+" and that integration is source-only -- "Node Editor
+# sources are located in root project directory. To use it, simply copy&paste sources into your
+# project" -- exactly the same copy-the-sources-in approach already used for ${IMGUI_SOURCES}
+# above, so it is wired in identically. Builds clean against this project's own vendored ImGui
+# 1.92.9 WIP (docking branch) since it only touches ImGui's public API. Only the library's own 4
+# .cpp translation units are vendored (crude_json/imgui_canvas/imgui_node_editor/
+# imgui_node_editor_api) -- the upstream repo's examples/, external/ (its own private ImGui fork
+# submodule, unused here) and docs/ are deliberately NOT copied in, keeping the vendored footprint
+# to exactly what src/renderer/debug/PcgGraphEditorPanel.cpp needs to link against.
+# The 3 files below (imgui_canvas/imgui_node_editor/imgui_node_editor_api) are purely editor tool
+# code (an ImGui node-canvas widget), same exclusion discipline as ${IMGUI_SOURCES}: Debug-only,
+# zero object code and zero string/symbol footprint in Release.
+set(NODE_EDITOR_DIR "${CMAKE_CURRENT_SOURCE_DIR}/vendor/imgui-node-editor")
+set(NODE_EDITOR_SOURCES
+    ${NODE_EDITOR_DIR}/imgui_canvas.cpp
+    ${NODE_EDITOR_DIR}/imgui_node_editor.cpp
+    ${NODE_EDITOR_DIR}/imgui_node_editor_api.cpp
+)
+
+# crude_json.cpp is vendored alongside the 3 files above (same upstream library, same provenance
+# comment) but is compiled UNCONDITIONALLY (both Debug and Release), NOT Debug-only like them --
+# unlike the other 3, it has zero ImGui dependency (crude_json.h/.cpp is a small freestanding JSON
+# value/parser, see that header's own comment) and is reused by the PCG graph roadmap's Phase 5.1
+# graph engine (src/pcg/PcgGraph.cpp) for its human-inspectable graph serialization format, which is
+# core engine functionality, not an editor/debug-only tool -- see PcgGraph.cpp's own top-of-file
+# comment for the full rationale. src/pcg/PcgGraph.cpp includes crude_json.h via a relative path
+# (not through NODE_EDITOR_DIR's include directory, which stays Debug-only below), so this is the
+# only CMake wiring crude_json.cpp itself actually needs.
+set(CRUDE_JSON_SOURCES
+    ${NODE_EDITOR_DIR}/crude_json.cpp
+)
+
 # --- Création de l'exécutable ---
-add_executable(${PROJECT_NAME} 
-    ${ALL_SOURCES} 
-    ${ALL_HEADERS} 
+add_executable(${PROJECT_NAME}
+    ${ALL_SOURCES}
+    ${ALL_HEADERS}
 )
 
 target_sources(${PROJECT_NAME} PRIVATE
+    ${CRUDE_JSON_SOURCES}
     $<$<CONFIG:Debug>:${IMGUI_SOURCES}>
+    $<$<CONFIG:Debug>:${NODE_EDITOR_SOURCES}>
 )
 
 # --- Includes ---
-target_include_directories(${PROJECT_NAME} PRIVATE 
+target_include_directories(${PROJECT_NAME} PRIVATE
     src
     ${Vulkan_INCLUDE_DIRS}
     vendor/vma
     $<$<CONFIG:Debug>:${IMGUI_DIR}>
     $<$<CONFIG:Debug>:${IMGUI_DIR}/backends>
+    $<$<CONFIG:Debug>:${NODE_EDITOR_DIR}>
 )
 
 # --- Linking ---
+# xaudio2.lib: src/audio/AudioEngine.cpp's XAudio2 backend (procedural 3D audio engine -- see that
+# file's own header comment). Verified against the Windows 10 SDK actually installed on this
+# toolchain (10.0.22621.0 and 10.0.26100.0, both ship xaudio2.h + xaudio2.lib/xaudio2_8.lib under
+# um/x64) -- `xaudio2.lib` (NOT the version-pinned `xaudio2_8.lib`) is the correct modern import
+# library: on this SDK/OS target (_WIN32_WINNT >= _WIN32_WINNT_WIN10), xaudio2.h's own
+# XAudio2Create is an inline function that resolves XAudio2CreateWithVersionInfo via
+# LoadLibraryEx("xaudio2_9.dll")/GetProcAddress at runtime rather than a static DLL import, so
+# XAudio2_9.dll (part of Windows 10/11 itself, System32) is the actual runtime dependency -- zero
+# redistributable/vendoring weight, matching this project's "no heavy frameworks" rule. xaudio2.lib
+# is still linked (small, header-only-adjacent import lib, no bundled weight) both to satisfy any
+# non-inlined symbol reference and to match Microsoft's own documented linking guidance for xaudio2.h.
 target_link_libraries(${PROJECT_NAME} PRIVATE
     glfw
     Vulkan::Vulkan
+    xaudio2.lib
 )
 
 # --- Git commit hash, Debug-only report metadata ---
@@ -181,7 +231,73 @@ add_executable(BlockCodecTests
     tests/BlockCodecTests.cpp
 )
 target_include_directories(BlockCodecTests PRIVATE src ${Vulkan_INCLUDE_DIRS})
+
+# PCG framework roadmap, Phase 1 ("PCG Data Model"): src/pcg/*.h are header-only data types (no
+# accompanying .cpp yet -- nothing generates/consumes PCG data at runtime until a later phase), so
+# this target links no additional source beyond the test file itself.
+add_executable(PcgDataModelTests
+    tests/PcgDataModelTests.cpp
+)
+target_include_directories(PcgDataModelTests PRIVATE src ${Vulkan_INCLUDE_DIRS})
+add_test(NAME PcgDataModelTests COMMAND PcgDataModelTests)
 add_test(NAME BlockCodecTests COMMAND BlockCodecTests)
+
+# PCG framework roadmap, Phase 2.3 ("Volume Sampler"): PcgVolumeSampler.cpp is the sampler
+# implementation under test; it depends only on the header-only Phase 1 PCG data-model types
+# (PcgPointData.h/PcgSpatialData.h/PcgSeededRandom.h), so this target links no other project
+# source beyond the sampler and the test file itself.
+add_executable(PcgVolumeSamplerTests
+    src/pcg/PcgVolumeSampler.cpp
+    tests/PcgVolumeSamplerTests.cpp
+)
+target_include_directories(PcgVolumeSamplerTests PRIVATE src ${Vulkan_INCLUDE_DIRS})
+add_test(NAME PcgVolumeSamplerTests COMMAND PcgVolumeSamplerTests)
+
+# PCG framework roadmap, Phase 2.4 ("Spline Sampler"): unlike Phase 1's header-only data model,
+# PcgSplineSampler.h has a real accompanying PcgSplineSampler.cpp (the arc-length lookup table
+# build/resolve + the sampler itself), so this test target links that source file too.
+add_executable(PcgSplineSamplerTests
+    src/pcg/PcgSplineSampler.cpp
+    tests/PcgSplineSamplerTests.cpp
+)
+target_include_directories(PcgSplineSamplerTests PRIVATE src ${Vulkan_INCLUDE_DIRS})
+add_test(NAME PcgSplineSamplerTests COMMAND PcgSplineSamplerTests)
+
+# PCG framework roadmap, Phase 2.1 ("Surface Sampler"): unlike Phase 1's header-only data types,
+# this phase's sampling algorithm lives in a real .cpp (src/pcg/PcgSurfaceSampler.cpp), so this
+# target links it explicitly, same pattern as every other tests/*.cpp target above.
+add_executable(PcgSurfaceSamplerTests
+    src/pcg/PcgSurfaceSampler.cpp
+    tests/PcgSurfaceSamplerTests.cpp
+)
+target_include_directories(PcgSurfaceSamplerTests PRIVATE src ${Vulkan_INCLUDE_DIRS})
+add_test(NAME PcgSurfaceSamplerTests COMMAND PcgSurfaceSamplerTests)
+
+# PCG framework roadmap, Phase 2.2 ("Landscape / Terrain Sampler"): src/pcg/PcgTerrainSampler.cpp
+# is a real .cpp (unlike Phase 1's header-only types) -- the terrain-noise CPU port + jittered-grid
+# scatter sampler both live there, so this target links it directly alongside the test file.
+add_executable(PcgTerrainSamplerTests
+    src/pcg/PcgTerrainSampler.cpp
+    tests/PcgTerrainSamplerTests.cpp
+)
+target_include_directories(PcgTerrainSamplerTests PRIVATE src ${Vulkan_INCLUDE_DIRS})
+add_test(NAME PcgTerrainSamplerTests COMMAND PcgTerrainSamplerTests)
+
+# PCG framework roadmap, Phase 5.1+5.2 ("PCG Graph Engine Core"): the node/link graph data model +
+# JSON serialization (src/pcg/PcgGraph.cpp) and the CPU topological evaluator + subgraph support
+# (src/pcg/PcgGraphEvaluator.cpp), built directly on Phase 1's data model. PcgGraph.cpp reuses
+# vendor/imgui-node-editor's crude_json.cpp for JSON (see CRUDE_JSON_SOURCES's own comment above --
+# that file is compiled unconditionally, not Debug-only, precisely because this engine-core target
+# needs it in every config); crude_json.h is included via a relative path from PcgGraph.cpp, so no
+# extra include directory beyond `src` is needed here.
+add_executable(PcgGraphEngineTests
+    src/pcg/PcgGraph.cpp
+    src/pcg/PcgGraphEvaluator.cpp
+    ${CRUDE_JSON_SOURCES}
+    tests/PcgGraphEngineTests.cpp
+)
+target_include_directories(PcgGraphEngineTests PRIVATE src ${Vulkan_INCLUDE_DIRS})
+add_test(NAME PcgGraphEngineTests COMMAND PcgGraphEngineTests)
 
 add_executable(AsyncDecompressingLoaderTests
     src/io/AsyncFileStreamer.cpp

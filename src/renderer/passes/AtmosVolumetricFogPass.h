@@ -24,6 +24,7 @@
 #include <vk_mem_alloc.h>
 
 #include "core/maths/Maths.h"
+#include "renderer/vulkan/GpuBuffer.h" // Local Fog Volumes (G8): RAII owner of the volumes SSBO.
 
 namespace renderer {
 
@@ -102,6 +103,15 @@ namespace renderer {
         VkDescriptorSet m_Set = VK_NULL_HANDLE;
         VkPipelineLayout m_PipelineLayout = VK_NULL_HANDLE;
         VkPipeline m_Pipeline = VK_NULL_HANDLE;
+
+        // Local Fog Volumes (G8): std430 SSBO (binding 11) of config::localfog::VOLUMES' active
+        // entries, built ONCE from config at Init (they are static authored scene content, like the
+        // showcase zone layout). Host-visible/mapped, written once -- same "tiny static data, no
+        // staging needed" convention as renderer::MegaLightsPass::m_LightBuffer. m_LocalFogVolumeCount
+        // is the number of active entries actually uploaded (pushed to the shader each frame, or 0
+        // when config::localfog::ENABLE is false -- see RecordUpdate).
+        GpuBuffer m_LocalFogVolumes;
+        uint32_t m_LocalFogVolumeCount = 0u;
     };
 
 }

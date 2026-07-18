@@ -32,7 +32,12 @@
 //
 // --- Scope ---
 // A fixed entity list, built once at Init() (one Mesh SDF per entity, from that entity's Fallback
-// Mesh), is sufficient -- dynamic object add/remove is still out of scope. Rigid ROTATION, however,
+// Mesh), covers every entity known at load time. Phase 0.3 (PCG roadmap, dynamic Lumen
+// registration) additively extends this with RegisterEntity()/UnregisterEntity(): a SMALL, capacity-
+// bounded (kMaxDynamicEntities) set of entities can be added/removed from the composite list at
+// runtime, after Init() -- see those methods' own comments. This is a deliberate, UE5.8-faithful
+// scope reduction (real Lumen does not give every PCG-scattered instance its own Distance Field
+// either), not a fully unbounded "any entity, any time" design. Rigid ROTATION, however,
 // is handled (Phase 4 integration, UE5.8 parity roadmap, dynamic scenes onto main): when
 // config::ENTITY_SELF_ROTATION_ENABLED is on, RecordUpdate()'s mode==1 composite dispatch
 // inverse-rotates the world-space query point back to each entity's rest pose before sampling its
@@ -82,6 +87,14 @@ namespace renderer {
         // Upper bound on how many dirty slabs RecordUpdate() drains (i.e. actually dispatches
         // compositing work for) in one call -- see the class comment's "asynchronous" note.
         static constexpr uint32_t kMaxDirtySlabsPerCall = 6;
+
+        // Phase 0.3 (PCG roadmap, dynamic Lumen registration): upper bound on how many entities may
+        // be registered via RegisterEntity() at any one time, on top of whatever Init() loaded from
+        // the cache file -- a small, fixed headroom (mirrors core::InstanceRegistry's own bounded-
+        // capacity philosophy from Phase 0.1), not an unbounded/dynamically-growing pool. Sized for
+        // "a handful of large scattered rocks or hero trees" per the roadmap's own scope note, not
+        // for thousands of PCG-scattered instances.
+        static constexpr uint32_t kMaxDynamicEntities = 8;
 
         static constexpr VkFormat kClipmapFormat = VK_FORMAT_R32_SFLOAT;
 
@@ -134,6 +147,46 @@ namespace renderer {
         // behavior change from main's own pre-integration behavior in that case.
         void RecordUpdate(VkCommandBuffer cmd, const maths::vec3& cameraPositionWorld,
             const core::EntityTransformCPU* entityTransformsCPU);
+
+        // Phase 0.3 (PCG roadmap, dynamic Lumen registration): registers a NEW composite-list entry
+        // at runtime, after Init() -- e.g. a large/hero PCG-scattered object (see the class comment's
+        // scope note: NOT meant for every scattered instance, just a small bounded set of hero/large
+        // objects). Rather than requiring a brand-new offline bake, this REUSES `sourceEntityID`'s
+        // ALREADY-BAKED Fallback Mesh geometry (read fresh from the same cache file Init() consumed,
+        // reopened here) -- e.g. one of the World Partition streaming pool's archetype meshes -- and
+        // registers it under the caller-chosen `newEntityID` identity, building its Mesh SDF
+        // (geometry::BuildMeshSDF, same kEntitySDFResolution Init() uses) on the calling thread (not
+        // fanned out via core::LoadingManager -- a single ad hoc registration is not the bulk-Init
+        // hot path that parallelization targets), uploading it via a one-shot command buffer on
+        // `commandPool`/`queue`, and enqueuing its own dirty region (EnqueueDirtyRegionsForEntity) in
+        // every clipmap level so the next RecordUpdate() composites it in.
+        // Returns false (logged), touching no state, if: `newEntityID` already names a resident
+        // entity (from Init() or a prior RegisterEntity() call); kMaxDynamicEntities dynamically-
+        // registered entities are already live; `sourceEntityID` has no Fallback Mesh in the cache
+        // file; or BuildMeshSDF produces an empty SDF for it.
+        // NOTE (risk, see the class comment): `newEntityID` is NOT validated against
+        // renderer::VulkanContext's own entity-transform array bounds -- if
+        // config::ENTITY_SELF_ROTATION_ENABLED is (or later becomes) enabled and RecordUpdate() is
+        // ever called with a non-null `entityTransformsCPU` while a dynamically-registered entity
+        // whose `newEntityID` is >= that array's element count is still live, RecordSlab's
+        // `entityTransformsCPU[entitySdf.entityID]` indexing is an out-of-bounds read. Callers using
+        // synthetic IDs outside the engine's normal dense entity range MUST either keep rotation
+        // disabled or pass entityTransformsCPU == nullptr to RecordUpdate() for the lifetime of any
+        // such registration -- this is a deliberate, documented boundary Phase 0.3 does not attempt
+        // to close (see this repo's Phase 0.3 task scope: composite-list add/remove only).
+        bool RegisterEntity(uint32_t newEntityID, uint32_t sourceEntityID, VkCommandPool commandPool, VkQueue queue);
+
+        // Phase 0.3: reverses RegisterEntity() -- destroys `entityID`'s per-object SDF image/view,
+        // frees its descriptor set back to the pool (reclaiming one unit of kMaxDynamicEntities
+        // headroom), and enqueues its own (now-vacated) region dirty in every level so the next
+        // RecordUpdate() clears-and-recomposites those slabs without it (RecordSlab's normal
+        // clear-then-min-over-every-STILL-registered-entity discipline handles the "erase this
+        // entity's contribution" case with no other change needed). Only ever removes an entity
+        // that was ITSELF added via RegisterEntity() -- a no-op (logged) for any entityID that is
+        // either not currently registered at all, or is one of Init()'s own fixed-roster entities
+        // (never removable through this API, by design: this bounded, additive escape hatch must
+        // never be able to silently break the always-rendered base scene).
+        void UnregisterEntity(uint32_t entityID);
 
         // True once the dirty-slab FIFO is empty, i.e. every level's currently-covered window is
         // fully up to date -- lets a caller (e.g. a debug HUD) show streaming progress after a
@@ -191,6 +244,10 @@ namespace renderer {
             float voxelSize = 0.0f;
             uint32_t resolution = 0;
             uint32_t entityID = 0; // See GetTracedEntityInfos()'s own comment for why this is not implicitly the array index.
+            // Phase 0.3: true only for an entry added via RegisterEntity() -- gates UnregisterEntity()
+            // (which must never be able to remove one of Init()'s own fixed-roster entries, see that
+            // method's own comment) and the kMaxDynamicEntities live-count check in RegisterEntity().
+            bool dynamic = false;
         };
 
         // One axis-aligned "newly revealed" region, in absolute world-voxel-index space (see the
@@ -212,6 +269,16 @@ namespace renderer {
         ClipmapLevel m_Levels[kLevelCount];
         std::vector<EntitySDF> m_Entities;
         std::deque<DirtySlab> m_PendingSlabs;
+
+        // Phase 0.3: cache file path stashed at Init() so RegisterEntity() can reopen it later to
+        // read a `sourceEntityID`'s Fallback Mesh geometry (RegisterEntity() itself is not a hot
+        // path -- reopening/re-scanning the file per call is acceptable, same tradeoff Init()'s own
+        // one-time STEP 1 read already made for the bulk case).
+        std::filesystem::path m_CacheFilePath;
+        // Phase 0.3: how many entries in m_Entities currently have dynamic == true -- checked
+        // against kMaxDynamicEntities by RegisterEntity(), incremented/decremented there and in
+        // UnregisterEntity().
+        uint32_t m_DynamicEntityCount = 0;
 
         VkSampler m_EntitySampler = VK_NULL_HANDLE;
         VkDescriptorSetLayout m_LevelSetLayout = VK_NULL_HANDLE; // set 0
