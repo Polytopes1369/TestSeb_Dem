@@ -625,8 +625,6 @@ int main(int argc, char** argv) {
             uint32_t SHADOW_MAX_RESOLUTION = config::shadows::_MAX_RESOLUTION;
             uint32_t PROBE_GRID_RESOLUTION = config::lumen::PROBE_GRID_RESOLUTION;
             uint32_t VSM_PHYSICAL_PAGE_CAPACITY = config::lumen::VSM_PHYSICAL_PAGE_CAPACITY;
-            uint32_t TRANSLUCENCY_LIGHTING_VOLUME_DIM = config::postprocess::_TRANSLUCENCY_LIGHTING_VOLUME_DIM;
-            uint32_t VOLUMETRIC_FOG_GRID_PIXEL_SIZE = config::volumetrics::_VOLUMETRIC_FOG_GRID_PIXEL_SIZE;
             std::string profileName = config::g_ActiveProfileName;
         };
         static StartupConfig startup;
@@ -641,8 +639,6 @@ int main(int argc, char** argv) {
                 config::shadows::_MAX_RESOLUTION,
                 config::lumen::PROBE_GRID_RESOLUTION,
                 config::lumen::VSM_PHYSICAL_PAGE_CAPACITY,
-                config::postprocess::_TRANSLUCENCY_LIGHTING_VOLUME_DIM,
-                config::volumetrics::_VOLUMETRIC_FOG_GRID_PIXEL_SIZE,
                 config::g_ActiveProfileName
             };
             startupCaptured = true;
@@ -659,8 +655,6 @@ int main(int argc, char** argv) {
         if (config::shadows::_MAX_RESOLUTION != startup.SHADOW_MAX_RESOLUTION) { needsReload = true; reloadReason += "VSM Max Resolution; "; }
         if (config::lumen::PROBE_GRID_RESOLUTION != startup.PROBE_GRID_RESOLUTION) { needsReload = true; reloadReason += "Probe Grid Resolution; "; }
         if (config::lumen::VSM_PHYSICAL_PAGE_CAPACITY != startup.VSM_PHYSICAL_PAGE_CAPACITY) { needsReload = true; reloadReason += "VSM Page Capacity; "; }
-        if (config::postprocess::_TRANSLUCENCY_LIGHTING_VOLUME_DIM != startup.TRANSLUCENCY_LIGHTING_VOLUME_DIM) { needsReload = true; reloadReason += "Translucency Volume Dim; "; }
-        if (config::volumetrics::_VOLUMETRIC_FOG_GRID_PIXEL_SIZE != startup.VOLUMETRIC_FOG_GRID_PIXEL_SIZE) { needsReload = true; reloadReason += "Volumetric Fog Grid Pixel Size; "; }
         if (config::g_ActiveProfileName != startup.profileName) { needsReload = true; reloadReason += "Profile Preset (changed to " + config::g_ActiveProfileName + "); "; }
 
         // UI Panel
@@ -820,7 +814,6 @@ int main(int argc, char** argv) {
                 }
                 ImGui::Checkbox("Hardware Ray Tracing", &config::lumen::_HARDWARE_RAYTRACING);
                 ImGui::Checkbox("Trace Mesh SDF", &config::lumen::_TRACE_MESH_SDF);
-                ImGui::Checkbox("Screen Space Probe Occlusion", &config::lumen::_SCREEN_SPACE_PROBE_OCCLUSION);
                 ImGui::Checkbox("Reflections Allow", &config::lumen::_REFLECTIONS_ALLOW);
                 ImGui::Checkbox("HWRT Nanite Mode", &config::lumen::_HARDWARE_RAYTRACING_NANITE_MODE);
                 ImGui::Checkbox("Megalights Enable", &config::lumen::_MEGALIGHTS_ENABLE);
@@ -850,10 +843,6 @@ int main(int argc, char** argv) {
                 int fxQual = static_cast<int>(config::postprocess::_EFFECTS_QUALITY);
                 if (ImGui::DragInt("Effects Quality", &fxQual, 1, 1, 5)) {
                     config::postprocess::_EFFECTS_QUALITY = static_cast<uint32_t>(fxQual);
-                }
-                int dim = static_cast<int>(config::postprocess::_TRANSLUCENCY_LIGHTING_VOLUME_DIM);
-                if (ImGui::DragInt("Translucency Volume Dim", &dim, 8, 8, 256)) {
-                    config::postprocess::_TRANSLUCENCY_LIGHTING_VOLUME_DIM = static_cast<uint32_t>(dim);
                 }
                 int refrQual = static_cast<int>(config::postprocess::_REFRACTION_QUALITY);
                 if (ImGui::DragInt("Refraction Quality", &refrQual, 1, 1, 5)) {
@@ -923,11 +912,6 @@ int main(int argc, char** argv) {
                     config::volumetrics::_SKY_ATMOSPHERE_QUALITY = static_cast<uint32_t>(skyQual);
                 }
                 ImGui::Checkbox("Volumetric Fog", &config::volumetrics::_VOLUMETRIC_FOG_ENABLE);
-                int fogGrid = static_cast<int>(config::volumetrics::_VOLUMETRIC_FOG_GRID_PIXEL_SIZE);
-                if (ImGui::DragInt("Fog Grid Pixel Size", &fogGrid, 2, 2, 32)) {
-                    config::volumetrics::_VOLUMETRIC_FOG_GRID_PIXEL_SIZE = static_cast<uint32_t>(fogGrid);
-                }
-                ImGui::DragFloat("Cloud Ray Sample Scale", &config::volumetrics::_VOLUMETRIC_CLOUD_VIEW_RAY_SAMPLE_COUNT_SCALE, 0.05f, 0.1f, 10.0f);
 
                 // --- Atmos weather system, Subtask 1: Climatic State Manager & Wind Simulation ---
                 // (atmos_integration_plan.md, project root) -- live sliders over config::atmos::*,
