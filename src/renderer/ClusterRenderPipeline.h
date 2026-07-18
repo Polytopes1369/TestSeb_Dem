@@ -108,6 +108,7 @@
 #include <vulkan/vulkan.h>
 #include <vk_mem_alloc.h>
 
+#include "animation/SkeletalAnimator.h"
 #include "core/Camera.h"
 #include "core/EngineConfig.h"
 #include "core/EntityData.h" // core::EntityTransformCPU
@@ -163,6 +164,12 @@
 #include "renderer/debug/DebugBufferViewPass.h"
 #include "renderer/debug/DebugTextOverlay.h"
 #include "renderer/debug/ParticleDebugViewPass.h"
+// PCG editor-tooling roadmap, Phase 7.2 ("PCG Point Cloud Debug Visualization"): draws
+// RunPcgFullPipelineSmokeTest()'s own point set as wireframe box gizmos -- see that class' own
+// header comment. Owned by m_PcgPointCloudDebugView below; RunPcgFullPipelineSmokeTest() uploads
+// into it directly (its own local `filteredPoints`), so no extra CPU-side point-set member is
+// needed on this class.
+#include "renderer/debug/PcgPointCloudDebugView.h"
 #include "renderer/passes/SDFRayMarchPass.h"
 // Phase 0.2 (UE5.8-parity PCG roadmap, "PCG Instance Draw Path"): only ever instantiated (as a
 // local variable) inside RunPcgInstanceDrawSmokeTest() below -- see that method's own comment.
@@ -445,6 +452,23 @@ namespace renderer {
         void SetDebugSSSEnabled(bool enabled) { m_DebugSSSEnabled = enabled; }
         void SetDebugSSSRadiusScale(float scale) { m_DebugSSSRadiusScale = scale; }
 
+        // UE5.8 rendering-parity gap G5 (Substrate Glint/sparkle): live Debug-only tuning multipliers
+        // on every material's authored SubstrateSlab::glintDensity/glintIntensity, threaded into
+        // ResolveViewParamsUBO by RecordFrame's resolve call and consumed by substrate_bsdf.glsl's
+        // EvaluateSubstrateGlint. Both default to 1.0 (authored value unchanged) -- Release has no
+        // toggle and always renders at 1.0 (the material's own authored sparkle), matching every other
+        // Set*Enabled/Set*Scale setter's Release-always-on convention. Main.cpp's Post FX ImGui tab
+        // drives them (a checkbox that zeroes the intensity scale, plus a density and intensity slider).
+        void SetDebugGlintDensityScale(float scale) { m_DebugGlintDensityScale = scale; }
+        void SetDebugGlintIntensityScale(float scale) { m_DebugGlintIntensityScale = scale; }
+
+        // UE5.8 rendering-parity gap G6 (Substrate horizontal mixing): live Debug-only tuning
+        // multiplier on every horizontally-mixed material's authored mixContrast (the A/B blend
+        // sharpness) -- 1.0 in Release (always the material's own authored sharpness, no toggle
+        // exists there), matching the Set*Scale setters above. Main.cpp's Post FX ImGui tab drives
+        // it via the "Mix Sharpness" slider; consumed by substrate_bsdf.glsl's EvaluateSubstrateMixMask.
+        void SetDebugMixMaskSharpnessScale(float scale) { m_DebugMixMaskSharpnessScale = scale; }
+
         // Phase 1 (Nanite advanced): gates RecordFrame()'s per-frame WPOGlobalsUBO upload of
         // `enhancedDisplacementDebugMultiplier` -- 1.0 when enabled (full effect, the Release-
         // always-on value, matching SetDebugReflectionsEnabled's own convention -- Release hardcodes
@@ -536,6 +560,84 @@ namespace renderer {
         // convention (renderer::VulkanContext.h).
         bool RunPcgInstanceDrawSmokeTest(const std::vector<PcgSmokeTestInstanceDesc>& instances,
             VkCommandPool commandPool, VkQueue queue);
+
+        // Phase 4.2 (PCG roadmap, "Spawner-to-DrawPass Glue" capstone): one weighted candidate mesh
+        // for RunPcgFullPipelineSmokeTest()'s own pcg::SpawnFromPoints() call -- the same
+        // {meshID, materialID} shape PcgSmokeTestInstanceDesc above already uses (the caller
+        // resolves both via renderer::VulkanContext::GetStreamingArchetypeFineMeshInfo(), same as
+        // main.cpp's own RunPcgInstanceDrawSmokeTest call site -- this class has no VulkanContext
+        // dependency of its own, see PcgSmokeTestInstanceDesc's own comment), plus a relative spawn
+        // `weight` (pcg::PcgMeshSpawnEntry::weight parity -- see PcgMeshSpawner.h's own comment for
+        // exactly how weights are normalized into a selection probability).
+        struct PcgFullPipelineSmokeTestMeshDesc {
+            uint32_t meshID = 0;
+            uint32_t materialID = 0;
+            float weight = 1.0f;
+        };
+
+        // Phase 4.2 capstone: runs the ENTIRE PCG pipeline for the first time in this roadmap --
+        // sampler (pcg::SampleVolume, Phase 2.3) -> filter (pcg::PruneByDistance, Phase 3.2) ->
+        // spawner (pcg::SpawnFromPoints, Phase 4.1) -> glue (pcg::PcgInstanceSpawnManager, THIS
+        // phase, wrapping a throwaway renderer::PcgInstanceDrawPass) -> the same GPU cull/draw path
+        // RunPcgInstanceDrawSmokeTest() above already proves -> an offscreen render + CPU readback --
+        // proving every phase from Phase 0 through Phase 4 composes end-to-end, not just each phase
+        // in isolation. Mirrors RunPcgInstanceDrawSmokeTest()'s own "throwaway pass, offscreen
+        // render, readback, log PASS/FAIL" structure, self-contained offscreen color+depth pair, and
+        // non-fatal-on-failure convention (logged only, never throws) -- see that method's own
+        // comment for the parts of this structure reused verbatim (never touches any live scene
+        // attachment or the real per-frame RecordFrame*() sequence). `weightedMeshes` supplies the
+        // same streaming archetype meshes RunPcgInstanceDrawSmokeTest's own caller (main.cpp)
+        // already resolves. `commandPool`/`queue` are the caller's own one-shot-command resources,
+        // exactly like RunPcgInstanceDrawSmokeTest's own parameters. Logs and returns false (never
+        // throws) on the first failing check, at any stage of the pipeline. Safe to call any time
+        // after this pipeline's own Init() has returned true. Whole declaration + definition
+        // compiled out of Release, matching RunPcgInstanceDrawSmokeTest's own convention.
+        bool RunPcgFullPipelineSmokeTest(const std::vector<PcgFullPipelineSmokeTestMeshDesc>& weightedMeshes,
+            VkCommandPool commandPool, VkQueue queue);
+
+        // PCG roadmap Phase 6.3 ("Runtime Generator Hook", world::PcgCellLoader): proves the LIVE
+        // streaming-triggered path -- world::IWorldCellLoader::LoadCellFullDetail()/UnloadCell() ->
+        // pcg::GeneratePcgContentForCell() -> world::PcgCellLoader::Pump() ->
+        // pcg::PcgInstanceSpawnManager::SpawnInstances()/DespawnInstances() -- actually runs
+        // end-to-end, simulating exactly what world::StreamingManager would trigger from a worker
+        // thread, WITHOUT needing a real StreamingManager/CellManifest/camera. Reuses
+        // `weightedMeshes` for the same reason RunPcgFullPipelineSmokeTest() does (real, already-
+        // resident streaming archetype meshes as spawner palette content). Writes a real, throwaway
+        // PcgVolume .actor file + PcgGraph JSON asset to a scratch temp directory (mirrors
+        // tests/PcgCellGeneratorTests.cpp's own WriteGraphAssetToDisk pattern, and
+        // renderer::debug::PcgVolumeInspector::BuildSyntheticDemoVolumes' own "write a real graph
+        // asset to disk" precedent), then constructs a real world::PcgCellLoader against that
+        // directory and a throwaway PcgInstanceDrawPass/PcgInstanceSpawnManager pair (same "borrow
+        // this pipeline's already-resident m_PagePool" convention as RunPcgFullPipelineSmokeTest's
+        // own STEP 4). Verifies, via renderer::PcgInstanceDrawPass::GetLiveInstanceCount() (no pixel
+        // readback needed -- see this phase's own task brief, "log-based PASS/FAIL confirmation is
+        // sufficient"):
+        //   1. The volume index found exactly 1 volume, overlapping exactly the 1 cell it was
+        //      authored to overlap.
+        //   2. LoadCellFullDetail() + Pump() drives a real SpawnInstances() call that acquires
+        //      exactly the expected number of instances (the synthetic grid-points source node's own
+        //      deterministic point count).
+        //   3. LoadCellHlod() + Pump() is a documented no-op (live instance count unchanged) -- see
+        //      world::PcgCellLoader::LoadCellHlod()'s own header comment for why HLOD-tier PCG
+        //      generation is out of scope for this phase.
+        //   4. UnloadCell() + Pump() drives a real DespawnInstances() call that releases every
+        //      instance the cell's own generation had acquired (live instance count back to 0).
+        // Not fatal on failure (logged only), matching every other smoke test's own convention. Whole
+        // declaration + definition compiled out of Release, matching RunPcgFullPipelineSmokeTest's
+        // own convention -- world::PcgCellLoader itself is ALSO whole-file Debug-only (see that
+        // class' own header comment for why), so this smoke test is its only in-engine validation.
+        bool RunPcgCellLoaderSmokeTest(const std::vector<PcgFullPipelineSmokeTestMeshDesc>& weightedMeshes,
+            VkCommandPool commandPool, VkQueue queue);
+
+        // PCG editor-tooling roadmap, Phase 7.2 ("PCG Point Cloud Debug Visualization"): last
+        // point count RunPcgFullPipelineSmokeTest() uploaded into m_PcgPointCloudDebugView (its own
+        // STEP 2 filter output -- see that method's own comment for exactly where). 0 before that
+        // method has ever run successfully far enough to reach its filter step. Read by the "PCG
+        // Graph Editor" tab's own point-cloud-visualization toggle (main.cpp) to show a live count
+        // next to the checkbox -- the actual draw is entirely internal to RecordFrame (gated by
+        // config::debugview::PCG_POINT_CLOUD_VIZ), main.cpp never touches the raw pcg::PcgPoint
+        // data itself.
+        uint32_t GetDebugPcgPointCloudCount() const { return m_PcgPointCloudDebugView.GetPointCount(); }
 #endif
 
     private:
@@ -649,6 +751,13 @@ namespace renderer {
         // entity 6 (Tube)'s clusters (see spline_deformation.glsl's own header comment for why this
         // is applied in local space before rotation).
         GpuBuffer m_SplineControlPointsBuffer;
+
+        // Skeletal-animation feature: procedural creature's bone hierarchy + per-frame animation
+        // evaluation -- see animation::SkeletalAnimator's own class comment. Owned here (not by
+        // VulkanContext) matching m_SplineControlPointsBuffer's own "the pipeline that consumes it
+        // also owns/updates it" placement; RecordFrameMid() calls RecordUpdate() once per frame,
+        // right alongside the existing WPOGlobalsUBO upload, before either raster pass runs.
+        animation::SkeletalAnimator m_SkeletalAnimator;
 
         // Generates the bindless procedural cutout mask array (mask_sampling.glsl) once at Init()
         // time, before any raster/resolve pass is initialized -- see ProceduralMaskGenerator's own
@@ -1045,6 +1154,15 @@ namespace renderer {
         // equivalent), radius scale 1.0 (the material's authored radius unmodified).
         bool m_DebugSSSEnabled = true;
         float m_DebugSSSRadiusScale = 1.0f;
+        // UE5.8 rendering-parity gap G5 (Substrate Glint/sparkle): see SetDebugGlintDensityScale/
+        // SetDebugGlintIntensityScale's own comments. Both default to 1.0 (the material's authored
+        // glint density/intensity unmodified -- the Release-always value, no toggle exists there).
+        float m_DebugGlintDensityScale = 1.0f;
+        float m_DebugGlintIntensityScale = 1.0f;
+        // UE5.8 rendering-parity gap G6 (Substrate horizontal mixing): see
+        // SetDebugMixMaskSharpnessScale's own comment. Defaults to 1.0 (the material's authored
+        // mixContrast unmodified -- the Release-always value, no toggle exists there).
+        float m_DebugMixMaskSharpnessScale = 1.0f;
         // Phase 1 (Nanite advanced): see SetDebugEnhancedDisplacementEnabled/
         // SetDebugSplineDeformationEnabled's own comments -- both default to true (Release-always-on
         // equivalent, no toggle exists there, matching m_DebugReflectionsEnabled's own convention).
@@ -1101,6 +1219,13 @@ namespace renderer {
         // own case 15) when that specific index is selected, same "additive, only-when-selected"
         // convention as m_DebugBufferView itself.
         debug::ParticleDebugViewPass m_ParticleDebugView;
+
+        // PCG editor-tooling roadmap, Phase 7.2 ("PCG Point Cloud Debug Visualization"): draws
+        // RunPcgFullPipelineSmokeTest()'s own sampler->filter point set as wireframe box gizmos in
+        // the live 3D scene -- see debug::PcgPointCloudDebugView's own class comment. Recorded in
+        // RecordFrame's [13c] forward block, right after m_ParticleSystem.RecordDraw, gated by
+        // config::debugview::PCG_POINT_CLOUD_VIZ (the "PCG Graph Editor" tab's own checkbox).
+        debug::PcgPointCloudDebugView m_PcgPointCloudDebugView;
 #endif
     };
 

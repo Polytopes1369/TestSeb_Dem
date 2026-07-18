@@ -17,6 +17,7 @@
 // No external mesh-processing library is used: quadric accumulation, the edge priority queue,
 // and the fold-over/degenerate-triangle safeguards are all implemented here in native C++23.
 
+#include <array>
 #include <cstdint>
 #include <vector>
 #include "core/maths/Maths.h"
@@ -45,6 +46,25 @@ namespace geometry {
         // that builds a SimplifiableMesh (ClusterGrouping::GroupAdjacentClusters,
         // ClusterDAG.cpp's leaf-node construction and coarser-level merge).
         std::vector<maths::vec2> uvs;
+
+        // Skeletal-animation feature: per-vertex bone indices/weights (parallel to positions, same
+        // convention as uvs above), populated ONLY for a core::EntityFlags::IsSkeletallyAnimated
+        // entity's level-0 leaf mesh (ClusterDAG.cpp's BuildClusterDAG, leaf loop) -- left EMPTY
+        // (size 0) for every other entity's SimplifiableMesh, which every consumer must check for
+        // before indexing. Unlike uvs, this attribute is NEVER carried through
+        // ClusterGrouping::GroupAdjacentClusters / MergeLevelMeshes / SplitSimplifiableMesh /
+        // SimplifyMeshQEM: bone influence is categorical authoring data, not a continuous quantity
+        // a midpoint blend (QEM's own UV convention) is meaningful for -- naively averaging two
+        // different bone indices produces a semantically unrelated third joint, and no
+        // weight-renormalizing categorical merge exists in this codebase to do it correctly (see
+        // ClusterDAG.cpp's own comment on BuildClusterDAG's forceSingleLevelDAG parameter). A
+        // skeletally-animated entity's DAG is therefore always built with forceSingleLevelDAG =
+        // true, so this field's leaf-level population is the only place it is ever read from --
+        // level 1+ nodes are never created for such an entity, and this field is correctly left
+        // empty on every node produced by grouping/merging/re-splitting code paths that don't know
+        // about it.
+        std::vector<std::array<uint8_t, 4>> boneIndices;
+        std::vector<std::array<uint8_t, 4>> boneWeights;
     };
 
     // Simplifies `mesh` in place via iterative QEM edge collapses until BOTH the triangle count

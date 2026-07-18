@@ -145,6 +145,18 @@ namespace renderer {
         // simulation is actually driving, not just the manual baseline slider.
         float GetEffectiveTemperatureCelsius() const { return m_HasLastFrameTime ? (config::atmos::DYNAMIC_WEATHER_ENABLED ? m_CurrentTemperatureCelsius : config::atmos::TEMPERATURE_CELSIUS) : config::atmos::TEMPERATURE_CELSIUS; }
 
+        // Effective relative humidity ([0,1] fraction) this frame's AtmosGlobalsUBO was built from --
+        // added for the PCG framework roadmap's Phase 8.3 ("Climate-Driven Biome Selection",
+        // src/pcg/PcgClimateBiomeSelector.h/.cpp), which needed a CPU-side humidity/moisture read-back
+        // the same way GetEffectiveTemperatureCelsius() already provided one for temperature, but no
+        // such getter existed yet (only the raw config::atmos::RELATIVE_HUMIDITY baseline was
+        // reachable from outside this class). Mirrors GetEffectiveTemperatureCelsius()'s own exact
+        // ternary pattern byte-for-byte: the simulation's smoothed/seasonally-offset value when
+        // config::atmos::DYNAMIC_WEATHER_ENABLED, or the raw config::atmos::RELATIVE_HUMIDITY slider
+        // otherwise (including before the very first RecordUpdate() call, i.e. m_HasLastFrameTime is
+        // still false).
+        float GetEffectiveRelativeHumidity() const { return m_HasLastFrameTime ? (config::atmos::DYNAMIC_WEATHER_ENABLED ? m_CurrentRelativeHumidity : config::atmos::RELATIVE_HUMIDITY) : config::atmos::RELATIVE_HUMIDITY; }
+
     private:
         bool InitImpl(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue);
 

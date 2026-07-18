@@ -181,6 +181,27 @@ namespace renderer {
                 m_LightBVHNodeCount, m_LightBVHIndexCount, m_LightCount));
         }
 
+        // Steps 2-4 below (raw radiance image + the owned ATrousDenoisePass instance + both compute
+        // pipelines) are this pass' expensive setup -- skipped entirely when the active quality tier
+        // disables MegaLights (config::lumen::_MEGALIGHTS_ENABLE; EngineConfig_Low/Medium/High.h all
+        // set MEGALIGHTS_ENABLE = false, only EngineConfig_Extrem.h leaves it true), mirroring
+        // RecordShade's own per-frame gating in renderer::ClusterRenderPipeline::RecordFrame ([12b3]).
+        // Step 1's light SSBO above stays unconditional regardless of this flag -- renderer::
+        // AtmosVolumetricFogPass::Init and renderer::TransparentForwardPass::Init both bind
+        // GetLightBufferHandle()/GetLightBufferSize() into their OWN descriptor sets at their own
+        // Init() time (see those call sites in ClusterRenderPipeline::Init), which requires a real,
+        // valid VkBuffer handle regardless of whether MegaLights itself will ever shade with it --
+        // unlike Steps 2-4 (a full-resolution rgba16f image, an entire second owned pass, and 2
+        // compute pipelines), Step 1 costs only ~8 KB (kHeaderBytes + kMaxMegaLights * sizeof(
+        // MegaLight), see above) and must never be skipped. Step 1.5's light BVH above is likewise
+        // left unconditional, for the same "too cheap to bother gating" reason as Step 1 (not the
+        // "no other consumer needs it" reason) -- it has zero external readers (only STEP 3's
+        // descriptor writes below touch m_LightBVHNodesBuffer/m_LightBVHIndicesBuffer, and STEP 3 is
+        // itself inside this gate), but it's sized by kTotalLightCapacity (a few hundred lights, see
+        // above), not by renderExtent -- a CPU-side build over that many entries plus two
+        // correspondingly small GPU buffers costs nothing close to Steps 2-4's per-render-resolution
+        // image/pipelines, so there is no meaningful win from also gating it.
+        if (config::lumen::_MEGALIGHTS_ENABLE) {
         // =====================================================================================
         // STEP 2 -- Raw shade radiance image (rgba16f linear HDR -- see MegaLightsPass::
         // kRadianceFormat's own comment for why this format is forced) + the dedicated
@@ -491,8 +512,21 @@ namespace renderer {
             bindings[7] = { 7, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // MaterialParamsSSBO.
             bindings[8] = { 8, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // SpatialReservoirBuffer.
 
+            // Pre-existing bug fix (found on main while investigating an unrelated skeletal-animation-
+            // feature crash-reproduction run, reconciled here against Wave1's CreateDescriptorSetLayoutPoolAndSet
+            // refactor which had mechanically carried over the original buggy count of 3): bindings[]
+            // above declares 4 STORAGE_IMAGE entries (0 g_ShadeRadiance, 1 g_GBufferNormal, 2
+            // g_GBufferDepth, 6 g_GBufferMaterialID) -- binding 6 (g_GBufferMaterialID, the
+            // Substrate-integration image) was added to this later "Final Shade" pipeline by copying
+            // the earlier "Shade" pipeline's own tail-binding pattern (which DOES correctly count it,
+            // see that pipeline's own "bindings {0,1,2,3,4,8} == 6 per set" pool-size comment above)
+            // without correspondingly bumping this pool's own STORAGE_IMAGE count. Confirmed via
+            // vkAllocateDescriptorSets(): "Trying to allocate 4 ... but this pool only has a total of
+            // 3 descriptors for this type" validation warning -- was tipping over into an actual
+            // VK_ERROR_OUT_OF_POOL_MEMORY_KHR-induced heap-corruption crash under some allocation
+            // patterns.
             VkDescriptorPoolSize poolSizes[4] = {
-                { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 3 },
+                { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 4 },
                 { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1 },
                 { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3 },
                 { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 }
@@ -628,6 +662,16 @@ namespace renderer {
 
         LOG_INFO(std::format("[MegaLightsPass] Initialized: {} lights, {} candidates/pixel, {} x {}.",
             m_LightCount, 16u, m_RenderExtent.width, m_RenderExtent.height));
+        } else {
+            // Tier disables MegaLights: m_ShadePipeline/m_CompositePipeline/m_Denoiser/
+            // m_RawRadianceImage/m_ViewParamsBuffer are all deliberately left at their default-
+            // constructed VK_NULL_HANDLE state -- RecordShade() early-outs on m_ShadePipeline ==
+            // VK_NULL_HANDLE (see that function's own comment) so this is safe even if the live
+            // Debug-only ImGui "Megalights Enable" checkbox (main.cpp, Lumen tab) flips
+            // config::lumen::_MEGALIGHTS_ENABLE mid-session without a matching re-Init.
+            LOG_INFO(std::format("[MegaLightsPass] Skipped (tier disables MegaLights): {} lights uploaded, shading resources not allocated ({} x {}).",
+                m_LightCount, m_RenderExtent.width, m_RenderExtent.height));
+        }
         return true;
     }
 
@@ -640,6 +684,18 @@ namespace renderer {
 
     void MegaLightsPass::RecordShade(VkCommandBuffer cmd, const maths::mat4& viewProj, const maths::mat4& prevViewProj,
         const maths::vec3& cameraPositionWorld, uint32_t frameIndex) {
+        // Belt-and-braces guard: Init() skips creating m_ShadePipeline (Steps 2-4, see that
+        // function's own comment) whenever config::lumen::_MEGALIGHTS_ENABLE was false at Init time.
+        // RecordShade's only caller (renderer::ClusterRenderPipeline::RecordFrame, [12b3]) already
+        // gates this call on that same flag, but the flag is ALSO a live Debug-only ImGui checkbox
+        // ("Megalights Enable", main.cpp Lumen tab) a developer can flip mid-session with no matching
+        // re-Init -- without this guard that would dispatch into null pipeline/descriptor-set handles
+        // the instant the checkbox flips true on a tier that skipped setup. Checked before the
+        // reservoir-slot flip below since neither ping-pong buffer exists yet on a skipped tier.
+        if (m_ShadePipeline == VK_NULL_HANDLE) {
+            return;
+        }
+
         // Phase 4, Feature 2: flip FIRST -- whichever slot held the PREVIOUS frame's write becomes
         // this frame's history source (bound as binding 13 below), and this frame writes into the
         // other one (binding 12) -- mirrors ReflectionPass::RecordTrace's own "flip first"

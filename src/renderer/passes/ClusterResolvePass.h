@@ -118,13 +118,19 @@ namespace renderer {
         // re-derive the same spline-bent triangle both rasterizers already drew (Phase 1, Nanite
         // advanced). Retained (like entityDataBuffer) so InitBinnedResolve() below needs no
         // duplicate parameter for it.
+        // `boneMatricesBuffer` (skeletal-animation feature) is animation::SkeletalAnimator::
+        // GetBoneMatricesBuffer() -- bound read-only at binding 29 (the first free slot past this
+        // shader's full 0-28 range, including the Atmos weather Sky-View LUT/Cloud Shadow Map
+        // bindings 27/28) so ClusterResolve.comp/ClusterResolveBinned.comp can re-derive the same
+        // skinned triangle both rasterizers already drew. Same "retained, no duplicate parameter"
+        // convention as splineControlPointsBuffer above.
         void Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue, VkExtent2D renderExtent,
             VkBuffer clusterMetadataBuffer, VkBuffer compressedPhysicalPoolBuffer,
             VkImageView hwClusterIDView, VkImageView hwTriangleIDView, VkImageView hwDepthView,
             VkImageView swVisBufferAtomicView, const std::vector<VkDescriptorImageInfo>& maskImageInfos,
             VkBuffer wpoGlobalsBuffer, VkBuffer entityTransformBuffer, VkBuffer entityDataBuffer,
             const std::array<MaterialParameters, kMaxMaterials>& materialTable,
-            VkBuffer splineControlPointsBuffer);
+            VkBuffer splineControlPointsBuffer, VkBuffer boneMatricesBuffer);
 
         void Shutdown();
 
@@ -151,8 +157,22 @@ namespace renderer {
         // (previously dead-padding) fields and consumed by substrate_bsdf.glsl's
         // ApplySurfaceWeather -- see that function's own comment for the exact wet/snow BSDF
         // modulation.
+        // `glintDensityScale`/`glintIntensityScale` (UE5.8 rendering-parity gap G5, Substrate Glint/
+        // sparkle): Debug-only tuning multipliers on every material's authored SubstrateSlab::
+        // glintDensity/glintIntensity, threaded into ResolveViewParamsUBO and consumed by
+        // substrate_bsdf.glsl's EvaluateSubstrateGlint. Both default to 1.0 (the authored value
+        // unchanged) -- Release passes 1.0 (no toggle exists there), matching every other Debug-only
+        // tuning knob's Release-always-on convention (see renderer::ClusterRenderPipeline's own
+        // SetDebugGlint* setters); Debug drives them from the Post FX ImGui sliders.
+        // `mixMaskSharpnessScale` (UE5.8 rendering-parity gap G6, Substrate horizontal mixing):
+        // Debug-only tuning multiplier on every horizontally-mixed material's authored mixContrast
+        // (the blend sharpness), threaded into ResolveViewParamsUBO and consumed by
+        // substrate_bsdf.glsl's EvaluateSubstrateMixMask. Defaults to 1.0 (authored value unchanged);
+        // Release passes 1.0 (no toggle exists there), driven in Debug by the Post FX "Mix Sharpness"
+        // slider (renderer::ClusterRenderPipeline's own SetDebugMixMaskSharpnessScale setter).
         void RecordResolve(VkCommandBuffer cmd, const maths::mat4& viewProj, const maths::mat4& prevViewProj,
             const DirectionalLight& sun, const maths::vec3& cameraPositionWorld, float surfaceWetness, float snowCoverage,
+            float glintDensityScale = 1.0f, float glintIntensityScale = 1.0f, float mixMaskSharpnessScale = 1.0f,
             uint32_t debugViewMode = 0);
 
         // --- Phase 1b: binned resolve path (renderer::ClusterShadingBinPass) ---
@@ -184,9 +204,14 @@ namespace renderer {
         // `snowCoverage` -- see RecordResolve()'s own comment (this Release-live path needs the
         // exact same weather modulation the Debug-only full-screen path gets, since this feature
         // must work correctly in Release, not just under a debug view mode).
+        // `glintDensityScale`/`glintIntensityScale` (UE5.8 rendering-parity gap G5) and
+        // `mixMaskSharpnessScale` (UE5.8 rendering-parity gap G6): see RecordResolve's own comment --
+        // this Release-live path needs the same tuning inputs (all 1.0 in Release -> the material's
+        // authored sparkle/mix-sharpness renders unchanged). No defaults here: `shadingBinPass` (a
+        // non-defaulted trailing reference) follows them, so both callers pass them explicitly.
         void RecordResolveBinned(VkCommandBuffer cmd, const maths::mat4& viewProj,
             const DirectionalLight& sun, const maths::vec3& cameraPositionWorld, float surfaceWetness, float snowCoverage,
-            const ClusterShadingBinPass& shadingBinPass);
+            float glintDensityScale, float glintIntensityScale, float mixMaskSharpnessScale, const ClusterShadingBinPass& shadingBinPass);
 
         // Binds Phase 3's renderer::VirtualShadowMapPass resources (physical page atlas + sampler,
         // page table, feedback buffer, sun clipmap levels UBO) into BOTH this pass's descriptor
@@ -300,6 +325,7 @@ namespace renderer {
         VkBuffer m_EntityTransformBuffer = VK_NULL_HANDLE; // Borrowed, same handle Init() received.
         VkBuffer m_EntityDataBuffer = VK_NULL_HANDLE;      // Borrowed, same handle Init() received.
         VkBuffer m_SplineControlPointsBuffer = VK_NULL_HANDLE; // Borrowed, same handle Init() received (Phase 1, Nanite advanced).
+        VkBuffer m_BoneMatricesBuffer = VK_NULL_HANDLE;    // Borrowed, same handle Init() received (skeletal-animation feature).
         std::vector<VkDescriptorImageInfo> m_MaskImageInfos; // Copy of Init()'s own `maskImageInfos` parameter.
 
         VkDescriptorSetLayout m_ResolveBinnedSetLayout = VK_NULL_HANDLE;

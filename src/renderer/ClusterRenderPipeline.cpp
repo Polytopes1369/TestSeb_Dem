@@ -22,6 +22,34 @@
 #include "renderer/vulkan/GpuImage.h" // Phase 0.2: RunPcgInstanceDrawSmokeTest()'s own offscreen color/depth images.
 #include "renderer/vulkan/VulkanUtils.h"
 
+// Phase 4.2 (PCG roadmap, "Spawner-to-DrawPass Glue" capstone): the full sampler -> filter ->
+// spawner -> glue chain RunPcgFullPipelineSmokeTest() below exercises end-to-end. All four are
+// pure-CPU, header-declared algorithm types with no Vulkan dependency of their own (PcgInstanceSpawnManager.h
+// is the sole exception, since it wraps renderer::PcgInstanceDrawPass -- already reachable from this
+// file via ClusterRenderPipeline.h's own Debug-only include) -- safe to include unconditionally here
+// exactly like GpuImage.h just above, even though only the Debug-only smoke test function at the
+// bottom of this file actually uses them.
+#include "pcg/PcgInstanceSpawnManager.h"
+#include "pcg/PcgMeshSpawner.h"
+#include "pcg/PcgSelfPruningFilter.h"
+#include "pcg/PcgVolumeSampler.h"
+
+// PCG roadmap Phase 6.3 ("Runtime Generator Hook"): RunPcgCellLoaderSmokeTest() below builds a real,
+// on-disk PcgGraph asset + PcgVolume .actor file and drives world::PcgCellLoader (the new
+// world::IWorldCellLoader implementation) directly, simulating exactly what world::StreamingManager
+// would trigger from a worker thread -- see that method's own header comment
+// (renderer/ClusterRenderPipeline.h) for exactly what it checks. world::PcgCellLoader.h and
+// WorldPartition/PcgVolumeActor.h are BOTH whole-file Debug-only (see their own header comments for
+// why -- the tools/WorldPartition/ Release-link boundary) so including them here unconditionally is
+// harmless (an empty header in Release) and matches this file's own established convention (see the
+// comment on pcg/PcgInstanceSpawnManager.h just above).
+#include "pcg/PcgGraph.h"
+#include "pcg/PcgNodePlugin.h"
+#include "pcg/PcgPointData.h"
+#include "world/PcgCellLoader.h"
+#include "WorldPartition/PcgVolumeActor.h"
+#include "WorldPartition/Uuid.h"
+
 namespace renderer {
 
     namespace {
@@ -358,6 +386,11 @@ bool ClusterRenderPipeline::Init(
     vmaDestroyBuffer(createInfo.allocator, stagingBuffer, stagingAllocation);
   }
 
+  // Skeletal-animation feature: builds the procedural creature's bone hierarchy and uploads an
+  // initial identity-skinning frame -- must run before m_HardwareRaster/m_SoftwareRaster/m_Resolve
+  // .Init() below, since all three bind GetBoneMatricesBuffer() into their own descriptor sets.
+  m_SkeletalAnimator.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue);
+
   // Procedurally generates the bindless cutout mask array once, before any consumer pass below
   // is initialized (each one binds GetMaskImageInfos() into its own descriptor set).
   m_MaskGenerator.Init(createInfo.device, createInfo.allocator,
@@ -373,7 +406,8 @@ bool ClusterRenderPipeline::Init(
                         createInfo.depthFormat,
                         createInfo.entityTransformBuffer,
                         createInfo.entityDataBuffer,
-                        m_SplineControlPointsBuffer.Handle());
+                        m_SplineControlPointsBuffer.Handle(),
+                        m_SkeletalAnimator.GetBoneMatricesBuffer());
 
   m_SoftwareRaster.Init(createInfo.device, createInfo.allocator,
                         createInfo.commandPool, createInfo.queue,
@@ -386,7 +420,8 @@ bool ClusterRenderPipeline::Init(
                         m_MaskGenerator.GetMaskImageInfos(),
                         createInfo.entityTransformBuffer,
                         createInfo.entityDataBuffer,
-                        m_SplineControlPointsBuffer.Handle());
+                        m_SplineControlPointsBuffer.Handle(),
+                        m_SkeletalAnimator.GetBoneMatricesBuffer());
 
   m_Resolve.Init(
       createInfo.device, createInfo.allocator, createInfo.commandPool,
@@ -400,7 +435,8 @@ bool ClusterRenderPipeline::Init(
       createInfo.entityTransformBuffer,
       createInfo.entityDataBuffer,
       createInfo.materialTable.params,
-      m_SplineControlPointsBuffer.Handle());
+      m_SplineControlPointsBuffer.Handle(),
+      m_SkeletalAnimator.GetBoneMatricesBuffer());
 
   // Phase 1b: the shading-bin sort pass needs m_Resolve's own 5 output image views (its Classify
   // stage writes background pixels directly into them, see ClusterShadingBinPass's own class
@@ -615,7 +651,13 @@ bool ClusterRenderPipeline::Init(
   // Phase A of the MegaLights native-port roadmap: procedurally scatter kMaxMegaLights point
   // lights around the demo's 13-entity grid (see MegaLightsTypes.h's own GenerateProceduralLights
   // comment), then Init the pass -- needs m_Resolve's GBuffer (same as m_Reflection above) and
-  // m_SurfaceCacheRT's TLAS for its own shadow-visibility ray.
+  // m_SurfaceCacheRT's TLAS for its own shadow-visibility ray. Always called, on every tier --
+  // MegaLightsPass::Init() itself internally skips its own expensive GPU setup (raw radiance
+  // image, owned denoiser, both compute pipelines) whenever config::lumen::_MEGALIGHTS_ENABLE is
+  // false, while still creating its (tiny, ~8 KB) light SSBO unconditionally, since m_AtmosFog and
+  // m_TransparentForward below both bind that buffer's handle/size into their OWN descriptor sets
+  // at their own Init() time regardless of this tier's MegaLights setting -- see MegaLightsPass::
+  // Init's own comment for the full reasoning.
   {
     MegaLightsData megaLightsData = GenerateProceduralLights(4242u);
     if (!m_MegaLights.Init(createInfo.device, createInfo.allocator, createInfo.commandPool,
@@ -897,6 +939,14 @@ bool ClusterRenderPipeline::Init(
   // debug::ParticleDebugViewPass's own class comment. Sized to its own fixed 256x256 grid, not
   // m_DisplayExtent (one pixel per particle slot, not per screen pixel).
   m_ParticleDebugView.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue);
+
+  // PCG editor-tooling roadmap, Phase 7.2 ("PCG Point Cloud Debug Visualization"): backs the "PCG
+  // Graph Editor" tab's own point-cloud-visualization toggle -- see debug::PcgPointCloudDebugView's
+  // own class comment. Same colorFormat/depthFormat pair m_VegetationScatter/m_WaterForward/
+  // m_Tessellation already receive at their own Init() call sites (the shared [13c] forward
+  // color/depth target this pass draws onto too).
+  m_PcgPointCloudDebugView.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
+      GICompositePass::kOutputFormat, createInfo.depthFormat);
 #endif
 
 #ifndef NDEBUG
@@ -1271,6 +1321,7 @@ void ClusterRenderPipeline::Shutdown() {
   m_PagePool.Shutdown();
   m_WPOGlobalsBuffer.Destroy();
   m_SplineControlPointsBuffer.Destroy();
+  m_SkeletalAnimator.Shutdown();
 
   m_ClusterCount = 0;
   m_VisBufferClusterIDImage = VK_NULL_HANDLE;
@@ -1533,12 +1584,19 @@ void ClusterRenderPipeline::RecordFrameEarly(VkCommandBuffer cmdEarly,
 
 
   // SWRT/HWRT back-end shared by m_GIInject ([1z] below) and m_WorldProbes' own trace pass ([12c]
-  // in RecordFrameLate) -- debug-only toggle (main.cpp's 'T' key via SetDebugTraceMode), Release
-  // always uses HWRT (no debug toggle to switch back to SWRT).
+  // in RecordFrameLate). Base mode comes from config::lumen::_HARDWARE_RAYTRACING (per-tier: Low
+  // defaults to false/SWRT -- see EngineConfig_Low.h's own HARDWARE_RAYTRACING comment, weaker
+  // hardware trades GI quality for the cheaper sphere-traced Mesh SDF path -- every other tier
+  // defaults to true/HWRT). Debug additionally lets 'T'/'Y' (main.cpp) override this LIVE for A/B
+  // comparison via m_DebugTraceMode -- main.cpp seeds that toggle's own starting value from this
+  // same cvar once at startup (see its own comment there), so a fresh session already reflects
+  // the active tier before either key is ever pressed. Release has no override, so it always
+  // honors the tier's choice exactly (previously hardcoded HWRT unconditionally here, silently
+  // ignoring every tier's own HARDWARE_RAYTRACING setting).
 #ifndef NDEBUG
   uint32_t traceMode = m_DebugTraceMode;
 #else
-  uint32_t traceMode = 1u;
+  uint32_t traceMode = config::lumen::_HARDWARE_RAYTRACING ? 1u : 0u;
 #endif
 
   // Phase 2 (Lumen advanced roadmap): this frame's async-compute routing decision -- read by
@@ -1547,11 +1605,12 @@ void ClusterRenderPipeline::RecordFrameEarly(VkCommandBuffer cmdEarly,
   // this is now stored there instead of an outer-function-scope local. Forced OFF whenever
   // traceMode is SWRT (0): moving GIInject's SWRT path to the async queue would additionally need
   // ownership-transfer barriers for every per-entity Global SDF image it samples
-  // (TraceMeshSDFScene), which only the Debug SWRT toggle ever exercises -- not worth doubling the
-  // barrier surface for a debug-only configuration when Release always uses HWRT anyway (see
-  // SetDebugAsyncComputeEnabled's own header comment). The Debug toggle additionally gates it off
-  // entirely for staged bring-up (false = prove the CPU/struct plumbing alone with everything still
-  // graphics-queue-serialized; true = exercise the real cross-queue barrier design).
+  // (TraceMeshSDFScene) -- not worth doubling the barrier surface for a path only the Low tier's
+  // own config::lumen::_HARDWARE_RAYTRACING default (or the Debug 'T' key, on any tier) ever
+  // exercises, see SetDebugAsyncComputeEnabled's own header comment. The Debug toggle additionally
+  // gates it off entirely for staged bring-up (false = prove the CPU/struct plumbing alone with
+  // everything still graphics-queue-serialized; true = exercise the real cross-queue barrier
+  // design).
   bool useAsyncCompute = (traceMode == 1u);
 #ifndef NDEBUG
   useAsyncCompute = useAsyncCompute && m_DebugAsyncComputeEnabled;
@@ -2096,6 +2155,15 @@ void ClusterRenderPipeline::RecordFrameMid(VkCommandBuffer cmdMid, VkCommandBuff
   }
 
   // =========================================================================================
+  // [1c] Skeletal-animation feature: recompute the procedural creature's bone matrices from this
+  // frame's globalTimeSeconds and re-upload the SkeletalBoneMatricesSSBO, mirroring [1b]'s own
+  // "upload once here, well before either raster pass runs" placement/rationale exactly (its own
+  // internal barrier covers every consumer -- ClusterRaster.vert, cluster_software_raster_core
+  // .glsl's two consumers, and ClusterResolve.comp/ClusterResolveBinned.comp).
+  // =========================================================================================
+  m_SkeletalAnimator.RecordUpdate(cmdMid, globalTimeSeconds);
+
+  // =========================================================================================
   // [2] EARLY cull: every leaf candidate vs frustum/backface + LAST frame's HZB
   // (rebuilt at the end of the previous frame's RecordFrameLate from that frame's complete
   // depth). Its trailing barrier makes the early draw list/count visible to
@@ -2407,14 +2475,24 @@ void ClusterRenderPipeline::RecordFrameMid(VkCommandBuffer cmdMid, VkCommandBuff
 #ifndef NDEBUG
   if (cameraCopy.debugViewMode == DEBUG_VIEW_NORMAL) {
     m_ShadingBin.RecordClassifyAndSort(cmdMid, m_RenderExtent);
-    m_Resolve.RecordResolveBinned(cmdMid, viewProj, m_SceneLights.sun, cameraPositionWorld, surfaceWetness, snowCoverage, m_ShadingBin);
+    // Glint / sparkle (UE5.8 rendering-parity gap G5): Debug-only tuning multipliers (see the
+    // SetDebugGlint* setters) -- 1.0 in Release, so the material's authored sparkle renders unchanged.
+    m_Resolve.RecordResolveBinned(cmdMid, viewProj, m_SceneLights.sun, cameraPositionWorld, surfaceWetness, snowCoverage,
+        m_DebugGlintDensityScale, m_DebugGlintIntensityScale, m_DebugMixMaskSharpnessScale, m_ShadingBin);
   } else {
     maths::mat4 prevViewProjForResolve = m_HasPrevViewProj ? m_PrevViewProj : viewProj;
-    m_Resolve.RecordResolve(cmdMid, viewProj, prevViewProjForResolve, m_SceneLights.sun, cameraPositionWorld, surfaceWetness, snowCoverage, cameraCopy.debugViewMode);
+    m_Resolve.RecordResolve(cmdMid, viewProj, prevViewProjForResolve, m_SceneLights.sun, cameraPositionWorld, surfaceWetness, snowCoverage,
+        m_DebugGlintDensityScale, m_DebugGlintIntensityScale, m_DebugMixMaskSharpnessScale, cameraCopy.debugViewMode);
   }
 #else
   m_ShadingBin.RecordClassifyAndSort(cmdMid, m_RenderExtent);
-  m_Resolve.RecordResolveBinned(cmdMid, viewProj, m_SceneLights.sun, cameraPositionWorld, surfaceWetness, snowCoverage, m_ShadingBin);
+  // Glint / sparkle (UE5.8 rendering-parity gap G5): the m_DebugGlint* tuning members are Debug-only
+  // (#ifndef NDEBUG, see ClusterRenderPipeline.h), so Release passes literal 1.0/1.0 -- the material's
+  // authored glintDensity/glintIntensity renders unmodified (same Debug-only-scale/Release-literal-1.0
+  // pattern the SSS radius scale uses, see this file's own m_DebugSSSRadiusScale usage). No debug
+  // symbols/strings survive into the Release binary, per CLAUDE.md's build-separation rule.
+  m_Resolve.RecordResolveBinned(cmdMid, viewProj, m_SceneLights.sun, cameraPositionWorld, surfaceWetness, snowCoverage,
+      1.0f, 1.0f, 1.0f, m_ShadingBin);
 #endif
 }
 
@@ -2574,9 +2652,18 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
   // ScreenTracePass/GICompositePass were wired up. See MegaLightsPass's own class comment for the
   // full "discovered mid-implementation" explanation.
   //
-  // `megaLightsEnabled` (debug-only toggle, main.cpp's 'X' key) gates the call entirely, same
-  // Release-always-on convention as `reflectionsEnabled` above (a real live consumer from frame
-  // one).
+  // `megaLightsEnabled` is gated by config::lumen::_MEGALIGHTS_ENABLE -- Low/Medium/High profiles
+  // set this false specifically to skip this pass' real per-frame cost (a full-render-resolution
+  // Shade compute dispatch + a 5-iteration A-Trous denoise + a Composite dispatch, every single
+  // frame); only Extrem enables it by default (see EngineConfig_{Low,Medium,High,Extrem}.h's own
+  // MEGALIGHTS_ENABLE). Previously Release hardcoded `true` here unconditionally, never consulting
+  // the config at all -- same bug Debug had too (its own toggle defaulted true independent of the
+  // active tier). Debug additionally ANDs in `m_DebugMegaLightsEnabled` (main.cpp's 'X' key) as a
+  // further manual override for A/B'ing this pass' cost/contribution -- it can only turn MegaLights
+  // OFF on top of the tier default, never force it ON for a tier that disables it, since
+  // MegaLightsPass::Init() itself (see that function's own comment) skips creating the GPU
+  // resources RecordShade needs whenever the tier disables it (RecordShade defends against exactly
+  // this with its own m_ShadePipeline == VK_NULL_HANDLE guard, see that function's own comment).
   //
   // Phase 4 of the "Nanite advanced" roadmap (light BVH for RIS spatial bias, temporal ReSTIR with
   // per-frame revalidated visibility): RecordShade now also takes `prevViewProjForMegaLights` --
@@ -2588,9 +2675,9 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
   // =========================================================================================
   {
 #ifndef NDEBUG
-    bool megaLightsEnabled = m_DebugMegaLightsEnabled;
+    bool megaLightsEnabled = config::lumen::_MEGALIGHTS_ENABLE && m_DebugMegaLightsEnabled;
 #else
-    bool megaLightsEnabled = true;
+    bool megaLightsEnabled = config::lumen::_MEGALIGHTS_ENABLE;
 #endif
     if (megaLightsEnabled) {
       maths::mat4 prevViewProjForMegaLights = m_HasPrevViewProj ? m_PrevViewProj : maths::mat4{};
@@ -2841,6 +2928,20 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
           m_SceneLights, m_WorldProbes.GetGridOriginWorld(),
           config::particles::SOFT_FADE_DISTANCE, particleHeatShimmerStrength, globalTimeSeconds, m_FrameIndex);
     }
+
+#ifndef NDEBUG
+    // PCG editor-tooling roadmap, Phase 7.2 ("PCG Point Cloud Debug Visualization"): recorded LAST
+    // among the [13c] forward passes (right after m_ParticleSystem.RecordDraw) so its wireframe box
+    // gizmos composite on top of everything else drawn this frame -- see
+    // debug::PcgPointCloudDebugView's own class comment for the full barrier/depth-state rationale.
+    // Gated by the "PCG Graph Editor" tab's own checkbox (main.cpp); a no-op call (RecordDraw()
+    // itself also early-outs on GetPointCount() == 0) when either the toggle is off or
+    // RunPcgFullPipelineSmokeTest() has never uploaded a point set.
+    if (config::debugview::PCG_POINT_CLOUD_VIZ) {
+      m_PcgPointCloudDebugView.RecordDraw(cmdLate, transparentTargetImage, transparentTargetView,
+          m_DepthImage, m_DepthImageView, m_RenderExtent, viewProj);
+    }
+#endif
   }
 
   // Phase 2 (Lumen advanced roadmap) fix, 2026-07-17: the old [1z2] hand-off block that used to
@@ -3604,6 +3705,612 @@ bool ClusterRenderPipeline::RunPcgInstanceDrawSmokeTest(
       "[ClusterRenderPipeline] PcgInstanceDrawPass smoke test PASSED: {} instance(s), {} candidate "
       "cluster(s), GPU draw count={}, non-background pixel(s) found in the {}x{} offscreen render.",
       instances.size(), candidateCount, gpuDrawCount, kTestWidth, kTestHeight));
+  return true;
+}
+
+bool ClusterRenderPipeline::RunPcgFullPipelineSmokeTest(
+    const std::vector<PcgFullPipelineSmokeTestMeshDesc>& weightedMeshes, VkCommandPool commandPool, VkQueue queue) {
+  LOG_INFO("[ClusterRenderPipeline] Running PCG full-pipeline (sampler->filter->spawner->glue->draw) smoke test...");
+
+  if (weightedMeshes.empty()) {
+    LOG_ERROR("[ClusterRenderPipeline] PCG full-pipeline smoke test FAILED: no weighted meshes supplied.");
+    return false;
+  }
+  if (m_DebugIndexEntriesCopy.empty() || m_DebugDagEntriesCopy.empty()) {
+    LOG_ERROR("[ClusterRenderPipeline] PCG full-pipeline smoke test FAILED: no cached cluster/DAG "
+              "table (m_DebugIndexEntriesCopy empty -- was this called before Init() succeeded?).");
+    return false;
+  }
+
+  // =========================================================================================
+  // STEP 1 -- Sampler (Phase 2.3): scatter a small grid of points through a test volume centered
+  // at the world origin. Grid mode (not Random) is used so the point count/layout is a pure
+  // function of the parameters below -- fully reproducible run to run, no reliance on how many
+  // points a density-driven Random draw happens to produce. A thin Y half-extent (0.01) keeps
+  // every point essentially on the y=0 plane (countY collapses to 1, see PcgVolumeSampler.cpp's
+  // own ComputeAxisGridPointCount -- always >= 1 even for a near-zero extent), matching this
+  // test's simple ground-plane framing (same convention RunPcgInstanceDrawSmokeTest's own instances
+  // already use, all at position.y == 0).
+  // =========================================================================================
+  pcg::PcgVolumeData testVolume{};
+  testVolume.center = maths::vec3(0.0f, 0.0f, 0.0f);
+  testVolume.halfExtents = maths::vec3(3.0f, 0.01f, 3.0f);
+  // testVolume.orientation left at its default (identity quaternion) -- a plain axis-aligned box.
+
+  pcg::PcgVolumeSamplerParams samplerParams{};
+  samplerParams.mode = pcg::PcgVolumeSamplingMode::Grid;
+  samplerParams.gridSpacing = maths::vec3(1.2f, 1.0f, 1.2f);
+  samplerParams.jitterFraction = 0.25f;
+
+  constexpr uint32_t kSamplerSeed = 1337u;
+  std::vector<pcg::PcgPoint> sampledPoints = pcg::SampleVolume(testVolume, samplerParams, kSamplerSeed);
+  if (sampledPoints.empty()) {
+    LOG_ERROR("[ClusterRenderPipeline] PCG full-pipeline smoke test FAILED: SampleVolume() produced zero points.");
+    return false;
+  }
+
+  // =========================================================================================
+  // STEP 2 -- Filter (Phase 3.2): thin the grid with a minimum-separation prune. minDistance
+  // (1.5) is deliberately larger than the grid's own spacing (1.2) so the filter demonstrably
+  // removes points (not a no-op pass-through) while still leaving a healthy scattered subset,
+  // proving points genuinely survive a real filter step before reaching the spawner.
+  // =========================================================================================
+  constexpr float kPruneMinDistance = 1.5f;
+  std::vector<pcg::PcgPoint> filteredPoints =
+      pcg::PruneByDistance(sampledPoints, kPruneMinDistance, pcg::PcgPruningMode::Uniform);
+  if (filteredPoints.empty()) {
+    LOG_ERROR("[ClusterRenderPipeline] PCG full-pipeline smoke test FAILED: PruneByDistance() removed every point.");
+    return false;
+  }
+  LOG_INFO(std::format(
+      "[ClusterRenderPipeline] PCG full-pipeline smoke test: sampler produced {} point(s), filter kept {} of them.",
+      sampledPoints.size(), filteredPoints.size()));
+
+  // PCG editor-tooling roadmap, Phase 7.2 ("PCG Point Cloud Debug Visualization"): uploads THIS
+  // point set (the real sampler->filter output, not a hand-authored test fixture) into
+  // m_PcgPointCloudDebugView so the "PCG Graph Editor" tab's own toggle (main.cpp) can draw it as
+  // wireframe box gizmos -- see that class' own header comment. Uploaded here, right after the
+  // filter step succeeds, rather than after the whole smoke test finishes, so a point set is still
+  // available to visualize even if a LATER stage (spawner/glue/render) fails below -- exactly the
+  // debugging scenario this visualization exists for.
+  m_PcgPointCloudDebugView.SetPoints(commandPool, queue, filteredPoints);
+
+  // =========================================================================================
+  // STEP 3 -- Spawner (Phase 4.1): resolve each surviving point into one PcgSpawnRequest, picking
+  // a mesh from `weightedMeshes` (the caller-supplied streaming archetypes).
+  // =========================================================================================
+  std::vector<pcg::PcgMeshSpawnEntry> spawnEntries;
+  spawnEntries.reserve(weightedMeshes.size());
+  for (const PcgFullPipelineSmokeTestMeshDesc& mesh : weightedMeshes) {
+    spawnEntries.push_back(pcg::PcgMeshSpawnEntry{ mesh.meshID, mesh.materialID, mesh.weight });
+  }
+
+  constexpr uint32_t kSpawnerSeed = 4242u;
+  std::vector<pcg::PcgSpawnRequest> spawnRequests = pcg::SpawnFromPoints(filteredPoints, spawnEntries, kSpawnerSeed);
+  if (spawnRequests.empty()) {
+    LOG_ERROR("[ClusterRenderPipeline] PCG full-pipeline smoke test FAILED: SpawnFromPoints() produced zero requests.");
+    return false;
+  }
+
+  // =========================================================================================
+  // STEP 4 -- Glue (Phase 4.2, THIS phase): a throwaway PcgInstanceDrawPass (identical setup to
+  // RunPcgInstanceDrawSmokeTest() above -- see that method's own comment for why every field here
+  // is chosen the way it is), sized exactly to `spawnRequests.size()` instances so a mismatch
+  // between requested and acquired slots below is unambiguously a real bug, never a sizing
+  // artifact of this test. maxCandidateClusters is deliberately generous (a fixed 8192, versus
+  // RunPcgInstanceDrawSmokeTest's 256 for its own fixed 3 instances) since this test's instance
+  // count is itself a function of the sampler/filter parameters above, not a fixed literal.
+  // =========================================================================================
+  PcgInstanceDrawPass pcgPass;
+  maths::vec3 sunDir = (m_BaseSunDirection.Length() > 0.0f) ? m_BaseSunDirection.Normalize() : maths::vec3(0.3f, 0.8f, 0.4f).Normalize();
+  pcgPass.Init(m_Device, m_Allocator, commandPool, queue,
+      m_PagePool.GetPhysicalPoolBuffer(), GenerateShowcaseMaterialTable(),
+      sunDir, maths::vec3(1.0f, 0.96f, 0.9f), 3.0f, maths::vec3(0.12f, 0.12f, 0.14f),
+      VK_FORMAT_R16G16B16A16_SFLOAT, VK_FORMAT_D32_SFLOAT,
+      static_cast<uint32_t>(spawnRequests.size()), 8192u);
+
+  pcg::PcgInstanceSpawnManager spawnManager(pcgPass);
+  std::vector<uint32_t> acquiredSlots = spawnManager.SpawnInstances(spawnRequests);
+  if (acquiredSlots.size() != spawnRequests.size()) {
+    LOG_ERROR(std::format(
+        "[ClusterRenderPipeline] PCG full-pipeline smoke test FAILED: PcgInstanceSpawnManager::SpawnInstances() "
+        "only acquired {} of {} request(s) -- the throwaway pool was sized exactly to spawnRequests.size(), so "
+        "this indicates a real bug, not expected pool exhaustion.",
+        acquiredSlots.size(), spawnRequests.size()));
+    pcgPass.Shutdown();
+    return false;
+  }
+
+  maths::vec3 sceneCenter(0.0f, 0.0f, 0.0f);
+  for (const pcg::PcgSpawnRequest& request : spawnRequests) {
+    sceneCenter = sceneCenter + request.position;
+  }
+  sceneCenter = sceneCenter * (1.0f / static_cast<float>(spawnRequests.size()));
+
+  // =========================================================================================
+  // STEP 5 -- Render (Phase 0.2, reused unmodified): the same self-contained offscreen
+  // color+depth pair, GPU cull, and one-shot draw+readback sequence RunPcgInstanceDrawSmokeTest()
+  // above already validates in isolation -- run here against THIS test's own real
+  // sampler/filter/spawner-produced instance set instead of a hand-authored PcgSmokeTestInstanceDesc
+  // list. A wider camera framing (vs. RunPcgInstanceDrawSmokeTest's own) accounts for this test's
+  // scattered grid spanning a ~6x6 area, versus that test's single 6-unit-wide row.
+  // =========================================================================================
+  constexpr uint32_t kTestWidth = 256;
+  constexpr uint32_t kTestHeight = 256;
+  constexpr VkFormat kTestColorFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
+  constexpr VkFormat kTestDepthFormat = VK_FORMAT_D32_SFLOAT;
+
+  GpuImage colorImage;
+  GpuImage depthImage;
+  {
+    VkImageCreateInfo colorInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    colorInfo.imageType = VK_IMAGE_TYPE_2D;
+    colorInfo.format = kTestColorFormat;
+    colorInfo.extent = {kTestWidth, kTestHeight, 1};
+    colorInfo.mipLevels = 1;
+    colorInfo.arrayLayers = 1;
+    colorInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+    colorInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+    colorInfo.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    colorInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    colorImage.Create(m_Allocator, m_Device, colorInfo, VMA_MEMORY_USAGE_GPU_ONLY, VK_IMAGE_ASPECT_COLOR_BIT);
+
+    VkImageCreateInfo depthInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    depthInfo.imageType = VK_IMAGE_TYPE_2D;
+    depthInfo.format = kTestDepthFormat;
+    depthInfo.extent = {kTestWidth, kTestHeight, 1};
+    depthInfo.mipLevels = 1;
+    depthInfo.arrayLayers = 1;
+    depthInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+    depthInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+    depthInfo.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+    depthInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    depthImage.Create(m_Allocator, m_Device, depthInfo, VMA_MEMORY_USAGE_GPU_ONLY, VK_IMAGE_ASPECT_DEPTH_BIT);
+  }
+
+  uint32_t candidateCount = pcgPass.UploadInstances(commandPool, queue, m_DebugIndexEntriesCopy, m_DebugDagEntriesCopy, m_PagePool);
+  if (candidateCount == 0) {
+    LOG_ERROR("[ClusterRenderPipeline] PCG full-pipeline smoke test FAILED: UploadInstances() produced zero "
+              "candidate clusters (no spawned meshID had any matching leaf cluster in the cache tables).");
+    pcgPass.Shutdown();
+    colorImage.Destroy();
+    depthImage.Destroy();
+    return false;
+  }
+
+  // Camera framed wider/further back than RunPcgInstanceDrawSmokeTest's own (this test's points
+  // spread across a ~6x6 area, not a single 6-unit row).
+  maths::vec3 eye = sceneCenter + maths::vec3(0.0f, 10.0f, 20.0f);
+  maths::mat4 view = maths::mat4::LookAt(eye, sceneCenter, maths::vec3(0.0f, 1.0f, 0.0f));
+  maths::mat4 proj = maths::mat4::PerspectiveVulkan(70.0f * (3.14159265f / 180.0f),
+      static_cast<float>(kTestWidth) / static_cast<float>(kTestHeight), 0.1f, 200.0f);
+  CameraPushConstants camera{};
+  camera.view = view;
+  camera.proj = proj;
+
+  maths::mat4 viewProj = proj * view;
+  ClusterCullViewParams cullViewParams{};
+  cullViewParams.frustumPlanes = ExtractFrustumPlanes(viewProj);
+  cullViewParams.cameraPositionWorld = eye;
+
+  GpuBuffer drawCountReadback;
+  drawCountReadback.Create(m_Allocator, sizeof(uint32_t), VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_CPU_ONLY, /*mapped=*/true);
+
+  VkDeviceSize colorBytes = static_cast<VkDeviceSize>(kTestWidth) * kTestHeight * 8; // RGBA16F = 8 bytes/pixel.
+  GpuBuffer colorReadback;
+  colorReadback.Create(m_Allocator, colorBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_CPU_ONLY, /*mapped=*/true);
+
+  VulkanUtils::ExecuteOneShotCommands(m_Device, commandPool, queue, [&](VkCommandBuffer cmd) {
+    VkImageMemoryBarrier2 toAttachment[2]{};
+    toAttachment[0] = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+    toAttachment[0].srcStageMask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
+    toAttachment[0].srcAccessMask = 0;
+    toAttachment[0].dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+    toAttachment[0].dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+    toAttachment[0].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    toAttachment[0].newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    toAttachment[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toAttachment[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toAttachment[0].image = colorImage.Image();
+    toAttachment[0].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+
+    toAttachment[1] = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+    toAttachment[1].srcStageMask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
+    toAttachment[1].srcAccessMask = 0;
+    toAttachment[1].dstStageMask = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
+    toAttachment[1].dstAccessMask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    toAttachment[1].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    toAttachment[1].newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    toAttachment[1].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toAttachment[1].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toAttachment[1].image = depthImage.Image();
+    toAttachment[1].subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+
+    VkDependencyInfo depInfo0{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    depInfo0.imageMemoryBarrierCount = 2;
+    depInfo0.pImageMemoryBarriers = toAttachment;
+    vkCmdPipelineBarrier2(cmd, &depInfo0);
+
+    // GPU frustum/backface cull + atomic compaction, recorded BEFORE vkCmdBeginRendering -- see
+    // RunPcgInstanceDrawSmokeTest()'s own identical comment for why.
+    pcgPass.RecordClear(cmd);
+    pcgPass.RecordCull(cmd, cullViewParams);
+
+    VkRenderingAttachmentInfo colorAttachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    colorAttachment.imageView = colorImage.View();
+    colorAttachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    colorAttachment.clearValue.color = {{0.02f, 0.02f, 0.03f, 1.0f}};
+
+    VkRenderingAttachmentInfo depthAttachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    depthAttachment.imageView = depthImage.View();
+    depthAttachment.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    depthAttachment.clearValue.depthStencil = {0.0f, 0}; // Reversed-Z: far/clear = 0.0.
+
+    VkRenderingInfo renderingInfo{VK_STRUCTURE_TYPE_RENDERING_INFO};
+    renderingInfo.renderArea = {{0, 0}, {kTestWidth, kTestHeight}};
+    renderingInfo.layerCount = 1;
+    renderingInfo.colorAttachmentCount = 1;
+    renderingInfo.pColorAttachments = &colorAttachment;
+    renderingInfo.pDepthAttachment = &depthAttachment;
+
+    vkCmdBeginRendering(cmd, &renderingInfo);
+    pcgPass.RecordDraw(cmd, camera, {kTestWidth, kTestHeight}, m_Decompression.GetDecompressedIndexPoolBuffer());
+    vkCmdEndRendering(cmd);
+
+    VkImageMemoryBarrier2 toTransfer{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+    toTransfer.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+    toTransfer.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+    toTransfer.dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+    toTransfer.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+    toTransfer.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    toTransfer.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    toTransfer.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toTransfer.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toTransfer.image = colorImage.Image();
+    toTransfer.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    VkDependencyInfo depInfo1{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    depInfo1.imageMemoryBarrierCount = 1;
+    depInfo1.pImageMemoryBarriers = &toTransfer;
+    vkCmdPipelineBarrier2(cmd, &depInfo1);
+
+    VkBufferImageCopy copyRegion{};
+    copyRegion.bufferOffset = 0;
+    copyRegion.bufferRowLength = 0;
+    copyRegion.bufferImageHeight = 0;
+    copyRegion.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    copyRegion.imageOffset = {0, 0, 0};
+    copyRegion.imageExtent = {kTestWidth, kTestHeight, 1};
+    vkCmdCopyImageToBuffer(cmd, colorImage.Image(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, colorReadback.Handle(), 1, &copyRegion);
+
+    VkBufferCopy drawCountCopy{0, 0, sizeof(uint32_t)};
+    vkCmdCopyBuffer(cmd, pcgPass.GetDrawCountBuffer(), drawCountReadback.Handle(), 1, &drawCountCopy);
+
+    VkMemoryBarrier2 finalBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    finalBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+    finalBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    finalBarrier.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT;
+    finalBarrier.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT;
+    VkDependencyInfo depInfo2{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    depInfo2.memoryBarrierCount = 1;
+    depInfo2.pMemoryBarriers = &finalBarrier;
+    vkCmdPipelineBarrier2(cmd, &depInfo2);
+  });
+
+  uint32_t gpuDrawCount = 0;
+  std::memcpy(&gpuDrawCount, drawCountReadback.MappedData(), sizeof(uint32_t));
+
+  // Minimal IEEE 754 binary16 -> float decode -- identical helper to RunPcgInstanceDrawSmokeTest's
+  // own (duplicated locally rather than factored out, matching this codebase's general preference
+  // for each Debug-only smoke test staying a fully self-contained, independently-readable block).
+  auto HalfToFloatApprox = [](uint16_t h) -> float {
+    uint32_t sign = static_cast<uint32_t>(h & 0x8000u) << 16;
+    uint32_t exponent = (h >> 10) & 0x1Fu;
+    uint32_t mantissa = h & 0x3FFu;
+    uint32_t bits;
+    if (exponent == 0) {
+      bits = sign;
+    } else if (exponent == 0x1Fu) {
+      bits = sign | 0x7F800000u | (mantissa << 13);
+    } else {
+      bits = sign | ((exponent - 15u + 127u) << 23) | (mantissa << 13);
+    }
+    float f;
+    std::memcpy(&f, &bits, sizeof(f));
+    return f;
+  };
+
+  bool foundNonBackgroundPixel = false;
+  const auto* pixels = static_cast<const uint16_t*>(colorReadback.MappedData()); // RGBA16F, 4x uint16 per pixel.
+  constexpr float kBackgroundThreshold = 0.04f; // Above the clear color's own ~0.02-0.03 channel values.
+  for (uint32_t sample = 0; sample < kTestWidth * kTestHeight && !foundNonBackgroundPixel; ++sample) {
+    float r = HalfToFloatApprox(pixels[sample * 4 + 0]);
+    float g = HalfToFloatApprox(pixels[sample * 4 + 1]);
+    float b = HalfToFloatApprox(pixels[sample * 4 + 2]);
+    if (r > kBackgroundThreshold || g > kBackgroundThreshold || b > kBackgroundThreshold) {
+      foundNonBackgroundPixel = true;
+    }
+  }
+
+  drawCountReadback.Destroy();
+  colorReadback.Destroy();
+  pcgPass.Shutdown();
+  colorImage.Destroy();
+  depthImage.Destroy();
+
+  if (gpuDrawCount == 0) {
+    LOG_ERROR("[ClusterRenderPipeline] PCG full-pipeline smoke test FAILED: GPU-computed draw count "
+              "(renderer::ClusterCullingPass's own atomic counter) is 0 -- every candidate cluster was "
+              "culled (frustum/backface) despite the camera being framed to see them.");
+    return false;
+  }
+  if (!foundNonBackgroundPixel) {
+    LOG_ERROR("[ClusterRenderPipeline] PCG full-pipeline smoke test FAILED: the rendered offscreen "
+              "image contains no pixel above the background threshold -- clusters survived culling "
+              "(draw count > 0) but nothing visibly rasterized.");
+    return false;
+  }
+
+  LOG_INFO(std::format(
+      "[ClusterRenderPipeline] PCG full-pipeline smoke test PASSED: sampler={} point(s), filter kept {}, "
+      "spawner produced {} request(s), glue acquired {} instance(s), {} candidate cluster(s), GPU draw "
+      "count={}, non-background pixel(s) found in the {}x{} offscreen render. Full sampler->filter->"
+      "spawner->glue->render PCG pipeline verified end-to-end.",
+      sampledPoints.size(), filteredPoints.size(), spawnRequests.size(), acquiredSlots.size(),
+      candidateCount, gpuDrawCount, kTestWidth, kTestHeight));
+  return true;
+}
+
+namespace {
+
+    // PCG roadmap Phase 6.3 ("Runtime Generator Hook"): synthetic source node registered once
+    // (namespace-scope self-registration -- see pcg::PCG_REGISTER_NODE_TYPE's own header comment,
+    // PcgNodePlugin.h) purely for RunPcgCellLoaderSmokeTest() below, standing in for a real Phase 2
+    // sampler (none of which are yet wired into the graph-node registry -- see
+    // pcg::PcgCellGenerator.h's own top-of-file comment, point 2). Places a deterministic countX x
+    // countZ grid of points on the Y=0 plane, starting at (originX, 0, originZ) with `spacing`
+    // between consecutive samples -- an exact copy of tests/PcgCellGeneratorTests.cpp's own
+    // "pcg.test.cellgen_grid_points" node (same file-scope self-registration idiom, different
+    // translation unit), deliberately given a DISTINCT "pcg.smoketest." type-id prefix since
+    // PCG_REGISTER_NODE_TYPE's registry is process-global across every linked translation unit (see
+    // that macro's own comment) -- a colliding typeId between this Debug-only smoke test and that
+    // standalone CTest executable would never actually collide at RUNTIME (they never link into the
+    // same binary), but a distinct prefix keeps that invariant obviously true by construction rather
+    // than by accident.
+    PCG_REGISTER_NODE_TYPE("pcg.smoketest.cellloader_grid_points", "CellLoader Smoke Test Grid Points",
+        .Output("Points", pcg::PcgPinDataType::Points),
+        [](const pcg::PcgNodePinDataMap& inputs, const pcg::PcgAttributeSet& params) -> pcg::PcgNodeExecuteResult {
+            (void)inputs; // This node type declares no input pins.
+            const int32_t countX = params.GetOr<int32_t>("countX", 1);
+            const int32_t countZ = params.GetOr<int32_t>("countZ", 1);
+            const float spacing = params.GetOr<float>("spacing", 1.0f);
+            const float originX = params.GetOr<float>("originX", 0.0f);
+            const float originZ = params.GetOr<float>("originZ", 0.0f);
+
+            std::vector<pcg::PcgPoint> points;
+            points.reserve(static_cast<size_t>(std::max(countX, 0)) * static_cast<size_t>(std::max(countZ, 0)));
+            uint32_t index = 0;
+            for (int32_t iz = 0; iz < countZ; ++iz) {
+                for (int32_t ix = 0; ix < countX; ++ix) {
+                    pcg::PcgPoint point;
+                    point.position.x = originX + static_cast<float>(ix) * spacing;
+                    point.position.y = 0.0f;
+                    point.position.z = originZ + static_cast<float>(iz) * spacing;
+                    point.seed = index++;
+                    points.push_back(point);
+                }
+            }
+
+            pcg::PcgNodePinDataMap outputs;
+            outputs.emplace("Points", std::move(points));
+            return pcg::PcgNodeExecuteResult::Ok(std::move(outputs));
+        });
+
+} // namespace
+
+bool ClusterRenderPipeline::RunPcgCellLoaderSmokeTest(
+    const std::vector<PcgFullPipelineSmokeTestMeshDesc>& weightedMeshes, VkCommandPool commandPool, VkQueue queue) {
+  LOG_INFO("[ClusterRenderPipeline] Running PCG Phase 6.3 (Runtime Generator Hook) cell-loader smoke test...");
+
+  if (weightedMeshes.empty()) {
+    LOG_ERROR("[ClusterRenderPipeline] PCG cell-loader smoke test FAILED: no weighted meshes supplied.");
+    return false;
+  }
+
+  // =========================================================================================
+  // STEP 1 -- author a real, on-disk scratch scenario: a PcgGraph JSON asset (grid-points source
+  // above -> the REAL registered "pcg.spawner.weighted_mesh" node, the real expected authoring
+  // pattern -- see pcg::PcgCellGenerator.h's own top-of-file comment) and a PcgVolume .actor file
+  // referencing it, sized/positioned to overlap EXACTLY cell (0,0) at a fixed test cellSize. Mirrors
+  // tests/PcgCellGeneratorTests.cpp's own BuildSpawnerGraph/WriteGraphAssetToDisk pattern.
+  // =========================================================================================
+  const std::filesystem::path scratchDir = std::filesystem::temp_directory_path() / "PcgCellLoaderSmokeTest";
+  const std::filesystem::path actorsDir = scratchDir / "actors";
+  std::error_code dirEc;
+  // Start from a clean slate every run -- a stale volume left over from a previous crashed run must
+  // never silently double the expected instance count below.
+  std::filesystem::remove_all(actorsDir, dirEc);
+  std::filesystem::create_directories(actorsDir, dirEc);
+
+  constexpr float kTestCellSize = 20.0f;
+  constexpr int32_t kGridCountX = 3;
+  constexpr int32_t kGridCountZ = 3; // 3x3 = 9 points, all inside cell (0,0)'s own [0,20)x[0,20) footprint (origin (2,2), spacing 3 -> max coordinate 8 < 20).
+
+  pcg::PcgNodeTypeRegistry registryUnused;
+  pcg::PcgNodeTypeCatalog catalog;
+  pcg::PopulateNativeNodeTypePlugins(registryUnused, catalog);
+
+  pcg::PcgGraph graph;
+  std::string catalogError;
+  pcg::PcgAttributeSet gridParams;
+  gridParams.Set("countX", kGridCountX);
+  gridParams.Set("countZ", kGridCountZ);
+  gridParams.Set("spacing", 3.0f);
+  gridParams.Set("originX", 2.0f);
+  gridParams.Set("originZ", 2.0f);
+  const uint32_t sourceNode = pcg::AddNodeFromCatalog(graph, catalog, "pcg.smoketest.cellloader_grid_points", gridParams, "GridPoints", &catalogError);
+  if (sourceNode == pcg::PcgNode::kInvalidId) {
+    LOG_ERROR(std::format("[ClusterRenderPipeline] PCG cell-loader smoke test FAILED: could not add the synthetic grid-points node ({}).", catalogError));
+    return false;
+  }
+
+  pcg::PcgAttributeSet spawnerParams;
+  std::vector<pcg::PcgMeshSpawnEntry> palette;
+  for (const PcgFullPipelineSmokeTestMeshDesc& mesh : weightedMeshes) {
+    palette.push_back(pcg::PcgMeshSpawnEntry{ mesh.meshID, mesh.materialID, mesh.weight });
+  }
+  pcg::EncodeWeightedMeshList(spawnerParams, palette);
+  spawnerParams.Set(pcg::kSpawnerDensityThresholdParamKey, 0.0f);
+  spawnerParams.Set(pcg::kSpawnerSeedParamKey, 8080);
+
+  const uint32_t spawnerNode = pcg::AddNodeFromCatalog(graph, catalog, "pcg.spawner.weighted_mesh", spawnerParams, "Spawner", &catalogError);
+  if (spawnerNode == pcg::PcgNode::kInvalidId) {
+    LOG_ERROR(std::format("[ClusterRenderPipeline] PCG cell-loader smoke test FAILED: could not add the weighted_mesh spawner node ({}).", catalogError));
+    return false;
+  }
+
+  std::string linkError;
+  if (graph.AddLink(sourceNode, "Points", spawnerNode, "Points", &linkError) != pcg::PcgGraph::AddLinkStatus::Ok) {
+    LOG_ERROR(std::format("[ClusterRenderPipeline] PCG cell-loader smoke test FAILED: GridPoints -> Spawner link failed ({}).", linkError));
+    return false;
+  }
+
+  const std::filesystem::path graphAssetPath = scratchDir / "CellLoaderSmokeTest.pcggraph.json";
+  {
+    std::ofstream graphOut(graphAssetPath, std::ios::binary | std::ios::trunc);
+    if (!graphOut.is_open()) {
+      LOG_ERROR("[ClusterRenderPipeline] PCG cell-loader smoke test FAILED: could not open the scratch graph asset file for writing.");
+      return false;
+    }
+    graphOut << graph.SerializeToJson();
+  }
+
+  worldpartition::PcgVolumeDesc volumeDesc;
+  // [1, 19) on both X/Z -- strictly INSIDE cell (0,0)'s own [0,20) footprint, never touching a cell
+  // boundary. worldpartition::ComputeOverlappingCells uses floor(worldPos / cellSize) on BOTH
+  // boundsMin and boundsMax (inclusive on the resulting cell range) -- an exact [0, kTestCellSize]
+  // bounds would land boundsMax precisely on cell (1,1)'s own floor() threshold (floor(20/20) == 1),
+  // overlapping 4 cells instead of the single cell this test needs (caught by this test's own
+  // GetIndexedCellCount() == 1 check the first time this smoke test ran -- see this codebase's own
+  // "Clean merge != correct merge" precedent for why an off-by-one boundary case like this is worth
+  // spelling out explicitly rather than trusting an eyeballed range).
+  volumeDesc.bounds.boundsMin = { 1.0f, 0.0f, 1.0f };
+  volumeDesc.bounds.boundsMax = { 19.0f, 5.0f, 19.0f };
+  volumeDesc.graphAssetPath = graphAssetPath.string();
+  volumeDesc.seed = 999u;
+
+  // "PCG63SMOK" folded into 64 bits -- deterministic, matching this codebase's own "a demoscene demo
+  // is a fixed procedural performance" convention (see e.g. BakeDemoWorld.cpp's own header comment).
+  worldpartition::UuidGenerator uuidGen(0x5043473633534D4BULL);
+  const worldpartition::Uuid volumeUuid = uuidGen.Generate();
+  const worldpartition::ActorRecord volumeRecord = worldpartition::BuildPcgVolumeActorRecord(volumeUuid, volumeDesc);
+  const std::filesystem::path volumeActorPath = worldpartition::MakeActorFilePath(actorsDir, volumeUuid);
+  if (!worldpartition::WriteActorFile(volumeActorPath, volumeRecord)) {
+    LOG_ERROR("[ClusterRenderPipeline] PCG cell-loader smoke test FAILED: could not write the scratch PcgVolume actor file.");
+    return false;
+  }
+
+  // =========================================================================================
+  // STEP 2 -- throwaway PcgInstanceDrawPass/PcgInstanceSpawnManager pair (identical setup
+  // convention to RunPcgFullPipelineSmokeTest's own STEP 4 above), sized exactly to the grid's own
+  // known point count.
+  // =========================================================================================
+  const uint32_t expectedInstanceCount = static_cast<uint32_t>(kGridCountX * kGridCountZ);
+  PcgInstanceDrawPass pcgPass;
+  maths::vec3 sunDir = (m_BaseSunDirection.Length() > 0.0f) ? m_BaseSunDirection.Normalize() : maths::vec3(0.3f, 0.8f, 0.4f).Normalize();
+  pcgPass.Init(m_Device, m_Allocator, commandPool, queue,
+      m_PagePool.GetPhysicalPoolBuffer(), GenerateShowcaseMaterialTable(),
+      sunDir, maths::vec3(1.0f, 0.96f, 0.9f), 3.0f, maths::vec3(0.12f, 0.12f, 0.14f),
+      VK_FORMAT_R16G16B16A16_SFLOAT, VK_FORMAT_D32_SFLOAT,
+      expectedInstanceCount, 8192u);
+  pcg::PcgInstanceSpawnManager spawnManager(pcgPass);
+
+  // =========================================================================================
+  // STEP 3 -- the actual Phase 6.3 subject under test: world::PcgCellLoader, constructed exactly
+  // the way a future live caller would (scan-at-construction, then IWorldCellLoader calls simulate
+  // whatever world::StreamingManager would have triggered).
+  // =========================================================================================
+  world::PcgCellLoader cellLoader(actorsDir, kTestCellSize, spawnManager);
+
+  if (cellLoader.GetVolumeCount() != 1) {
+    LOG_ERROR(std::format("[ClusterRenderPipeline] PCG cell-loader smoke test FAILED: expected 1 indexed PCG Volume, found {}.", cellLoader.GetVolumeCount()));
+    pcgPass.Shutdown();
+    return false;
+  }
+  if (cellLoader.GetIndexedCellCount() != 1) {
+    LOG_ERROR(std::format("[ClusterRenderPipeline] PCG cell-loader smoke test FAILED: expected the volume to overlap exactly 1 cell, index has {}.", cellLoader.GetIndexedCellCount()));
+    pcgPass.Shutdown();
+    return false;
+  }
+
+  // --- Simulates exactly what world::StreamingManager would trigger from a core::LoadingManager
+  // worker thread when cell (0,0) enters a StreamingSource's detailLoadRadius -- called directly
+  // here (synchronously, on this thread) since this test's whole point is validating
+  // world::PcgCellLoader's own logic, not re-proving core::LoadingManager's own worker-pool dispatch
+  // (already covered elsewhere, and IWorldCellLoader's own threading contract makes a synchronous
+  // direct call from any one thread just as valid as a worker-pool-dispatched one). ---
+  cellLoader.LoadCellFullDetail(world::CellCoord{ 0, 0 });
+  cellLoader.Pump(); // Main-thread pump step -- drives the real SpawnInstances() call.
+
+  const uint32_t liveAfterLoad = pcgPass.GetLiveInstanceCount();
+  if (liveAfterLoad != expectedInstanceCount) {
+    LOG_ERROR(std::format(
+        "[ClusterRenderPipeline] PCG cell-loader smoke test FAILED: expected {} live instance(s) after "
+        "LoadCellFullDetail+Pump, got {}.", expectedInstanceCount, liveAfterLoad));
+    pcgPass.Shutdown();
+    return false;
+  }
+  if (cellLoader.GetLoadedCellCount() != 1) {
+    LOG_ERROR(std::format("[ClusterRenderPipeline] PCG cell-loader smoke test FAILED: expected 1 tracked loaded cell, got {}.", cellLoader.GetLoadedCellCount()));
+    pcgPass.Shutdown();
+    return false;
+  }
+
+  // --- LoadCellHlod is a documented no-op for this phase (see world::PcgCellLoader::LoadCellHlod's
+  // own header comment) -- calling it for a DIFFERENT cell must not change the live instance count
+  // at all, proving the "no fake HLOD behavior" scope decision actually holds at runtime. ---
+  cellLoader.LoadCellHlod(world::CellCoord{ 5, 5 });
+  cellLoader.Pump();
+  const uint32_t liveAfterHlod = pcgPass.GetLiveInstanceCount();
+  if (liveAfterHlod != expectedInstanceCount) {
+    LOG_ERROR(std::format(
+        "[ClusterRenderPipeline] PCG cell-loader smoke test FAILED: LoadCellHlod unexpectedly changed the "
+        "live instance count (expected to stay at {}, got {}) -- it is documented to be a no-op for this phase.",
+        expectedInstanceCount, liveAfterHlod));
+    pcgPass.Shutdown();
+    return false;
+  }
+
+  // --- Unload the real cell -- Pump() must despawn every instance that cell's own generation
+  // acquired. ---
+  cellLoader.UnloadCell(world::CellCoord{ 0, 0 });
+  cellLoader.Pump();
+  const uint32_t liveAfterUnload = pcgPass.GetLiveInstanceCount();
+  const size_t loadedCellsAfterUnload = cellLoader.GetLoadedCellCount();
+  pcgPass.Shutdown();
+
+  if (liveAfterUnload != 0) {
+    LOG_ERROR(std::format(
+        "[ClusterRenderPipeline] PCG cell-loader smoke test FAILED: expected 0 live instances after "
+        "UnloadCell+Pump, got {}.", liveAfterUnload));
+    return false;
+  }
+  if (loadedCellsAfterUnload != 0) {
+    LOG_ERROR(std::format("[ClusterRenderPipeline] PCG cell-loader smoke test FAILED: expected 0 tracked loaded cells after unload, got {}.", loadedCellsAfterUnload));
+    return false;
+  }
+
+  LOG_INFO(std::format(
+      "[ClusterRenderPipeline] PCG cell-loader smoke test PASSED: 1 volume indexed into 1 cell, "
+      "LoadCellFullDetail+Pump acquired {} real instance(s) (matching the grid's own deterministic "
+      "point count), LoadCellHlod verified as a documented no-op, UnloadCell+Pump despawned every "
+      "acquired instance back to 0. world::IWorldCellLoader -> pcg::GeneratePcgContentForCell -> "
+      "world::PcgCellLoader::Pump -> pcg::PcgInstanceSpawnManager -> renderer::PcgInstanceDrawPass "
+      "verified end-to-end.",
+      expectedInstanceCount));
   return true;
 }
 #endif

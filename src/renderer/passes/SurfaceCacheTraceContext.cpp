@@ -31,29 +31,34 @@ namespace renderer {
 
     bool SurfaceCacheTraceContext::InitImpl(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
         const GlobalSDFPass& globalSDF, const SurfaceCachePass& surfaceCache) {
-        kMaxTracedEntities = config::lumen::MAX_TRACED_ENTITIES;
-
         // Self-reinit (see ShadowMapPass's own migration comment for the identical pattern):
         // Shutdown() clears m_Device/m_Allocator, which RenderPass<SurfaceCacheTraceContext>::Init()
         // already set to this call's values just before invoking this function -- restore them.
+        // kMaxTracedEntities is a static constexpr (see header) -- no runtime assignment needed or
+        // possible here; the old per-tier override this branch carried is superseded by main's fix.
         Shutdown();
         m_Device = device;
         m_Allocator = allocator;
 
         // =====================================================================================
-        // STEP 1 -- Gather traced-entity info (CPU side): clamp to kMaxTracedEntities. Persisted
-        // in m_TracedEntityInfos/m_TracedEntities (unlike a plain STEP-1 local) so RefreshCardTable()
-        // can rebuild the per-entity card grouping every frame without re-querying GlobalSDFPass --
-        // see both members' own header comments for why that grouping (not this list itself) is
-        // the part that needs re-deriving.
+        // STEP 1 -- Gather traced-entity info (CPU side): clamp to this quality tier's GI trace
+        // budget (config::lumen::MAX_TRACED_ENTITIES -- a genuine per-tier/live-debug-slider
+        // performance knob, see EngineConfig_Low/Medium/High/Extrem.h and main.cpp's "Max Traced
+        // Entities" DragInt), itself clamped to kMaxTracedEntities (the fixed, shader-matching
+        // descriptor array capacity -- see that constant's own header comment for why the budget
+        // must never exceed it). Persisted in m_TracedEntityInfos/m_TracedEntities (unlike a plain
+        // STEP-1 local) so RefreshCardTable() can rebuild the per-entity card grouping every frame
+        // without re-querying GlobalSDFPass -- see both members' own header comments for why that
+        // grouping (not this list itself) is the part that needs re-deriving.
         // =====================================================================================
         m_TracedEntityInfos = globalSDF.GetTracedEntityInfos();
-        if (m_TracedEntityInfos.size() > kMaxTracedEntities) {
+        const uint32_t traceBudget = std::min(config::lumen::MAX_TRACED_ENTITIES, kMaxTracedEntities);
+        if (m_TracedEntityInfos.size() > traceBudget) {
             LOG_ERROR(std::format(
-                "[SurfaceCacheTraceContext] {} traced entities exceeds kMaxTracedEntities={}; truncating -- "
-                "raise kMaxTracedEntities in both SurfaceCacheTraceContext.h and mesh_sdf_trace.glsl.",
-                m_TracedEntityInfos.size(), kMaxTracedEntities));
-            m_TracedEntityInfos.resize(kMaxTracedEntities);
+                "[SurfaceCacheTraceContext] {} traced entities exceeds this quality tier's trace budget={} "
+                "(min(config::lumen::MAX_TRACED_ENTITIES={}, kMaxTracedEntities={})); truncating.",
+                m_TracedEntityInfos.size(), traceBudget, config::lumen::MAX_TRACED_ENTITIES, kMaxTracedEntities));
+            m_TracedEntityInfos.resize(traceBudget);
         }
         m_EntityCount = static_cast<uint32_t>(m_TracedEntityInfos.size());
 

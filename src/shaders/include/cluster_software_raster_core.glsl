@@ -13,13 +13,14 @@
 // reference, and no per-pixel mask branch at all, mirroring ClusterRasterOpaque.frag's own "no
 // discard, no mask sampling" contract for the hardware path. The includer must also already have
 // declared (before this include): ClusterCullMetadata (cluster_culling_common.glsl),
-// DecodeClusterPosition/DecodeClusterUV (cluster_vertex_decode.glsl), EdgeFunction
-// (half_space_raster.glsl), ApplyWPODeformation (wpo_deformation.glsl), ApplyEnhancedDisplacement
-// (enhanced_displacement.glsl), ApplySplineDeformation (spline_deformation.glsl),
+// DecodeClusterPosition/DecodeClusterUV/DecodeClusterSkin (cluster_vertex_decode.glsl),
+// EdgeFunction (half_space_raster.glsl), ApplyWPODeformation (wpo_deformation.glsl),
+// ApplyEnhancedDisplacement (enhanced_displacement.glsl), ApplySplineDeformation
+// (spline_deformation.glsl), ApplySkeletalSkinning (skeletal_animation.glsl),
 // GetOriginalWPOAmplitude (displacement_bounds.glsl), SampleMaskAlpha
 // (mask_sampling.glsl, only when HAS_MASK_SUPPORT == 1), and the g_ViewParams/g_WPOGlobals/
-// g_VisBufferAtomic/entityData/entityTransforms/splineControlPoints bindings this function
-// reads/writes.
+// g_VisBufferAtomic/entityData/entityTransforms/splineControlPoints/boneMatrices bindings this
+// function reads/writes.
 
 // Packs (clusterSlotIndex, localTriangleOrdinal) into the atomic word's low 32 bits. 7 bits are
 // enough for CLUSTER_MAX_TRIANGLES (128), so the shift never loses triangle-ordinal bits and never
@@ -46,6 +47,21 @@ void RasterizeClusterTriangle(ClusterCullMetadata cluster, uint clusterSlotIndex
     vec3 p0Local = p0World - xform.center;
     vec3 p1Local = p1World - xform.center;
     vec3 p2Local = p2World - xform.center;
+
+    // Skeletal-animation feature: linear-blend vertex skinning, applied in LOCAL space BEFORE the
+    // per-entity rigid rotation (and before spline bend below) -- see skeletal_animation.glsl's own
+    // header comment. Applied identically to all 3 vertices, exactly like ClusterRaster.vert, so
+    // both rasterization paths agree on the same deformed triangle.
+    if (GetFlag(ed.flags, ENTITY_FLAG_IS_SKELETALLY_ANIMATED)) {
+        uvec4 boneIndices0, boneIndices1, boneIndices2;
+        vec4 boneWeights0, boneWeights1, boneWeights2;
+        DecodeClusterSkin(pageByteBase, i0, boneIndices0, boneWeights0);
+        DecodeClusterSkin(pageByteBase, i1, boneIndices1, boneWeights1);
+        DecodeClusterSkin(pageByteBase, i2, boneIndices2, boneWeights2);
+        p0Local = ApplySkeletalSkinning(p0Local, boneIndices0, boneWeights0, boneMatrices);
+        p1Local = ApplySkeletalSkinning(p1Local, boneIndices1, boneWeights1, boneMatrices);
+        p2Local = ApplySkeletalSkinning(p2Local, boneIndices2, boneWeights2, boneMatrices);
+    }
 
     // Phase 1 (Nanite advanced): spline bend, applied in LOCAL space BEFORE the per-entity rigid
     // rotation -- see spline_deformation.glsl's own header comment. Mixed toward the undeformed

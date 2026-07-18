@@ -4,6 +4,7 @@
 #include "include/cluster_entity_transform.glsl"
 #include "include/enhanced_displacement.glsl"
 #include "include/spline_deformation.glsl"
+#include "include/skeletal_animation.glsl"
 #include "include/displacement_bounds.glsl"
 
 // GPU-side DAG LOD cut evaluation for cluster-level screen-space error. The shader consumes a
