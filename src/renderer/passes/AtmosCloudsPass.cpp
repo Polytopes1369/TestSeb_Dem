@@ -31,6 +31,14 @@ namespace renderer {
         static_assert(sizeof(AtmosCloudsPC) == 96,
             "AtmosCloudsPC must match AtmosClouds.comp's own push_constant block exactly");
 
+        // Byte-for-byte mirror of AtmosCloudShadows.comp's AtmosCloudShadowsPC push_constant block.
+        struct AtmosCloudShadowsPC {
+            float sunDirX = 0.0f, sunDirY = 0.0f, sunDirZ = 0.0f;
+            float _pad0 = 0.0f;
+        };
+        static_assert(sizeof(AtmosCloudShadowsPC) == 16,
+            "AtmosCloudShadowsPC must match AtmosCloudShadows.comp's own push_constant block exactly");
+
     } // namespace
 
     bool AtmosCloudsPass::Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
@@ -70,11 +78,18 @@ namespace renderer {
         VulkanUtils::CreateStorageSampledImage2D(allocator, device, kOutputFormat, m_OutputExtent,
             m_CloudOutput.image, m_CloudOutput.allocation, m_CloudOutput.view);
 
+        // Atmos Subtask 5: Cloud Shadow Map, fixed 512x512 regardless of render extent (see class
+        // comment -- this covers a fixed real-world-unit patch, not a screen-space buffer).
+        VkExtent2D shadowExtent{ kCloudShadowMapResolution, kCloudShadowMapResolution };
+        VulkanUtils::CreateStorageSampledImage2D(allocator, device, kShadowFormat, shadowExtent,
+            m_CloudShadowMap.image, m_CloudShadowMap.allocation, m_CloudShadowMap.view);
+
         VkClearColorValue zeroClear{}; zeroClear.float32[0] = zeroClear.float32[1] = zeroClear.float32[2] = 0.0f; zeroClear.float32[3] = 1.0f;
         VulkanUtils::ExecuteOneShotCommands(device, commandPool, queue, [&](VkCommandBuffer cmd) {
             VulkanUtils::ClearComputeImageToGeneral(cmd, m_ShapeNoise.image, zeroClear);
             VulkanUtils::ClearComputeImageToGeneral(cmd, m_DetailNoise.image, zeroClear);
             VulkanUtils::ClearComputeImageToGeneral(cmd, m_CloudOutput.image, zeroClear);
+            VulkanUtils::ClearComputeImageToGeneral(cmd, m_CloudShadowMap.image, zeroClear);
             });
 
         // REPEAT, not CLAMP: the noise textures tile continuously as clouds scroll across many
@@ -159,6 +174,66 @@ namespace renderer {
         m_Pipeline = VulkanPipeline::CreateComputePipeline(m_Device, m_PipelineLayout, shader);
         vkDestroyShaderModule(m_Device, shader, nullptr);
 
+        // =========================================================================================
+        // Atmos Subtask 5: Cloud Shadow Map pipeline -- a SEPARATE descriptor set/pipeline layout/
+        // pipeline (different shader entry point, different bindings) from the noise-gen/raymarch
+        // one above, reusing m_ShapeNoise/m_DetailNoise (bound again here, into this own set) and
+        // m_NoiseSampler. See AtmosCloudShadows.comp's own binding comments.
+        // =========================================================================================
+        {
+            std::array<VkDescriptorSetLayoutBinding, 4> shadowBindings{ {
+                { 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },          // g_ShadowMapStorage
+                { 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // g_ShapeNoiseSampler
+                { 2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // g_DetailNoiseSampler
+                { 3, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },         // AtmosGlobalsUBO
+            } };
+            VkDescriptorSetLayoutCreateInfo shadowLayoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+            shadowLayoutInfo.bindingCount = static_cast<uint32_t>(shadowBindings.size());
+            shadowLayoutInfo.pBindings = shadowBindings.data();
+            VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &shadowLayoutInfo, nullptr, &m_ShadowSetLayout));
+
+            std::array<VkDescriptorPoolSize, 3> shadowPoolSizes{ {
+                { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1 },
+                { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2 },
+                { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 },
+            } };
+            VkDescriptorPoolCreateInfo shadowPoolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
+            shadowPoolInfo.maxSets = 1;
+            shadowPoolInfo.poolSizeCount = static_cast<uint32_t>(shadowPoolSizes.size());
+            shadowPoolInfo.pPoolSizes = shadowPoolSizes.data();
+            VK_CHECK(vkCreateDescriptorPool(m_Device, &shadowPoolInfo, nullptr, &m_ShadowDescriptorPool));
+
+            VkDescriptorSetAllocateInfo shadowAllocSet{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+            shadowAllocSet.descriptorPool = m_ShadowDescriptorPool;
+            shadowAllocSet.descriptorSetCount = 1;
+            shadowAllocSet.pSetLayouts = &m_ShadowSetLayout;
+            VK_CHECK(vkAllocateDescriptorSets(m_Device, &shadowAllocSet, &m_ShadowSet));
+
+            VkDescriptorImageInfo shadowStorageInfo{ VK_NULL_HANDLE, m_CloudShadowMap.view, VK_IMAGE_LAYOUT_GENERAL };
+            VkDescriptorImageInfo shadowShapeSamplerInfo{ m_NoiseSampler, m_ShapeNoise.view, VK_IMAGE_LAYOUT_GENERAL };
+            VkDescriptorImageInfo shadowDetailSamplerInfo{ m_NoiseSampler, m_DetailNoise.view, VK_IMAGE_LAYOUT_GENERAL };
+            VkDescriptorBufferInfo shadowAtmosGlobalsInfo{ atmosClimate.GetGlobalsBufferHandle(), 0, atmosClimate.GetGlobalsBufferSize() };
+            std::array<VkWriteDescriptorSet, 4> shadowWrites{ {
+                { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ShadowSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &shadowStorageInfo, nullptr, nullptr },
+                { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ShadowSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &shadowShapeSamplerInfo, nullptr, nullptr },
+                { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ShadowSet, 2, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &shadowDetailSamplerInfo, nullptr, nullptr },
+                { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ShadowSet, 3, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &shadowAtmosGlobalsInfo, nullptr },
+            } };
+            vkUpdateDescriptorSets(m_Device, static_cast<uint32_t>(shadowWrites.size()), shadowWrites.data(), 0, nullptr);
+
+            VkPushConstantRange shadowPushRange{ VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(AtmosCloudShadowsPC) };
+            VkPipelineLayoutCreateInfo shadowPlInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+            shadowPlInfo.setLayoutCount = 1;
+            shadowPlInfo.pSetLayouts = &m_ShadowSetLayout;
+            shadowPlInfo.pushConstantRangeCount = 1;
+            shadowPlInfo.pPushConstantRanges = &shadowPushRange;
+            VK_CHECK(vkCreatePipelineLayout(m_Device, &shadowPlInfo, nullptr, &m_ShadowPipelineLayout));
+
+            VkShaderModule shadowShader = VulkanPipeline::LoadShaderModule(m_Device, "shaders/AtmosCloudShadows.comp.spv");
+            m_ShadowPipeline = VulkanPipeline::CreateComputePipeline(m_Device, m_ShadowPipelineLayout, shadowShader);
+            vkDestroyShaderModule(m_Device, shadowShader, nullptr);
+        }
+
         // --- One-time noise generation (modes 0/1), dispatched here, never again. ---
         VulkanUtils::ExecuteOneShotCommands(device, commandPool, queue, [&](VkCommandBuffer cmd) {
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_Pipeline);
@@ -188,8 +263,9 @@ namespace renderer {
                 VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
             });
 
-        LOG_INFO(std::format("[AtmosCloudsPass] Initialized (shape {}^3, detail {}^3, cloud output {}x{}).",
-            kShapeNoiseResolution, kDetailNoiseResolution, m_OutputExtent.width, m_OutputExtent.height));
+        LOG_INFO(std::format("[AtmosCloudsPass] Initialized (shape {}^3, detail {}^3, cloud output {}x{}, shadow map {}x{}).",
+            kShapeNoiseResolution, kDetailNoiseResolution, m_OutputExtent.width, m_OutputExtent.height,
+            kCloudShadowMapResolution, kCloudShadowMapResolution));
         return true;
     }
 
@@ -199,26 +275,38 @@ namespace renderer {
             if (m_PipelineLayout != VK_NULL_HANDLE) vkDestroyPipelineLayout(m_Device, m_PipelineLayout, nullptr);
             if (m_SetLayout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(m_Device, m_SetLayout, nullptr);
             if (m_DescriptorPool != VK_NULL_HANDLE) vkDestroyDescriptorPool(m_Device, m_DescriptorPool, nullptr);
+            if (m_ShadowPipeline != VK_NULL_HANDLE) vkDestroyPipeline(m_Device, m_ShadowPipeline, nullptr);
+            if (m_ShadowPipelineLayout != VK_NULL_HANDLE) vkDestroyPipelineLayout(m_Device, m_ShadowPipelineLayout, nullptr);
+            if (m_ShadowSetLayout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(m_Device, m_ShadowSetLayout, nullptr);
+            if (m_ShadowDescriptorPool != VK_NULL_HANDLE) vkDestroyDescriptorPool(m_Device, m_ShadowDescriptorPool, nullptr);
             if (m_NoiseSampler != VK_NULL_HANDLE) vkDestroySampler(m_Device, m_NoiseSampler, nullptr);
             if (m_LinearSampler != VK_NULL_HANDLE) vkDestroySampler(m_Device, m_LinearSampler, nullptr);
             if (m_ShapeNoise.view != VK_NULL_HANDLE) vkDestroyImageView(m_Device, m_ShapeNoise.view, nullptr);
             if (m_DetailNoise.view != VK_NULL_HANDLE) vkDestroyImageView(m_Device, m_DetailNoise.view, nullptr);
             if (m_CloudOutput.view != VK_NULL_HANDLE) vkDestroyImageView(m_Device, m_CloudOutput.view, nullptr);
+            if (m_CloudShadowMap.view != VK_NULL_HANDLE) vkDestroyImageView(m_Device, m_CloudShadowMap.view, nullptr);
         }
         if (m_Allocator != VK_NULL_HANDLE) {
             if (m_ShapeNoise.image != VK_NULL_HANDLE) vmaDestroyImage(m_Allocator, m_ShapeNoise.image, m_ShapeNoise.allocation);
             if (m_DetailNoise.image != VK_NULL_HANDLE) vmaDestroyImage(m_Allocator, m_DetailNoise.image, m_DetailNoise.allocation);
             if (m_CloudOutput.image != VK_NULL_HANDLE) vmaDestroyImage(m_Allocator, m_CloudOutput.image, m_CloudOutput.allocation);
+            if (m_CloudShadowMap.image != VK_NULL_HANDLE) vmaDestroyImage(m_Allocator, m_CloudShadowMap.image, m_CloudShadowMap.allocation);
         }
 
         m_ShapeNoise = {};
         m_DetailNoise = {};
         m_CloudOutput = {};
+        m_CloudShadowMap = {};
         m_Pipeline = VK_NULL_HANDLE;
         m_PipelineLayout = VK_NULL_HANDLE;
         m_SetLayout = VK_NULL_HANDLE;
         m_Set = VK_NULL_HANDLE;
         m_DescriptorPool = VK_NULL_HANDLE;
+        m_ShadowPipeline = VK_NULL_HANDLE;
+        m_ShadowPipelineLayout = VK_NULL_HANDLE;
+        m_ShadowSetLayout = VK_NULL_HANDLE;
+        m_ShadowSet = VK_NULL_HANDLE;
+        m_ShadowDescriptorPool = VK_NULL_HANDLE;
         m_NoiseSampler = VK_NULL_HANDLE;
         m_LinearSampler = VK_NULL_HANDLE;
         m_OutputExtent = { 0, 0 };
@@ -264,6 +352,23 @@ namespace renderer {
 
         DispatchMode(cmd, 2, cameraPosition, forward, right, up, std::tan(fovYRadians * 0.5f), aspectRatio,
             sunDirectionWorld, sunColor, sunIlluminanceLux);
+
+        // Atmos Subtask 5: Cloud Shadow Map, regenerated every frame (tracks the live sun direction
+        // and wind-scrolled cloud position, unlike the noise textures) -- independent pipeline/set,
+        // so this dispatch has no ordering dependency on the raymarch dispatch just above (both only
+        // read m_ShapeNoise/m_DetailNoise, never write them after Init()).
+        {
+            AtmosCloudShadowsPC shadowPC{};
+            shadowPC.sunDirX = sunDirectionWorld.x;
+            shadowPC.sunDirY = sunDirectionWorld.y;
+            shadowPC.sunDirZ = sunDirectionWorld.z;
+
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_ShadowPipeline);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_ShadowPipelineLayout, 0, 1, &m_ShadowSet, 0, nullptr);
+            vkCmdPushConstants(cmd, m_ShadowPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(shadowPC), &shadowPC);
+            uint32_t shadowGroups = (kCloudShadowMapResolution + kShadowWorkgroupSize - 1u) / kShadowWorkgroupSize;
+            vkCmdDispatch(cmd, shadowGroups, shadowGroups, 1);
+        }
 
         VulkanUtils::RecordMemoryBarrier(cmd,
             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,

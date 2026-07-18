@@ -26,6 +26,7 @@
 #include "include/math_utils.glsl"
 #include "include/mesh_sdf_trace.glsl"        // set 1
 #include "include/surface_cache_sampling.glsl" // set 2
+#include "include/atmos_sky_lut_mapping.glsl"
 
 layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
 
@@ -38,6 +39,10 @@ layout(set = 0, binding = 1) uniform accelerationStructureEXT g_TLAS;
 #define FALLBACK_GEOMETRY_SET 0
 #define FALLBACK_GEOMETRY_BASE_BINDING 2
 #include "include/fallback_geometry.glsl"
+
+// Atmos weather system, Subtask 5: renderer::AtmosSkyPass's Sky-View LUT, sampled on a probe-ray
+// miss (see main()'s own comment) instead of contributing 0.
+layout(set = 0, binding = 5) uniform sampler2D g_SkyViewLUT;
 
 // Phase 6 (UE5.8 parity roadmap): one dispatch now covers a single wrap-contiguous PIECE of a
 // dirty slab (renderer::WorldProbeGridPass::RecordSlab), not the whole grid -- `dispatchMinTexel`
@@ -60,6 +65,9 @@ layout(push_constant) uniform WorldProbeInjectPushConstants {
     // WorldProbeGridPass::kGridResolution is runtime-configurable (config::lumen::
     // PROBE_GRID_RESOLUTION) -- the bounds check below needs this value passed explicitly.
     int gridResolution;
+    // Atmos weather system, Subtask 5: sun direction for the Sky-View LUT's sun-relative azimuth
+    // mapping on a miss -- points FROM the light TOWARD the scene.
+    float sunDirX; float sunDirY; float sunDirZ;
 } pc;
 
 const uint kProbeSampleDirections = 14u;
@@ -150,9 +158,13 @@ void main() {
         if (hit) {
             EntityInfo hitEntity = g_Entities[hitEntityIndex];
             accumulated += SampleCardRadiance(hitLocalPos, hitLocalNormal, hitEntity.firstCardIndex, hitEntity.cardCount);
+        } else {
+            // Atmos weather system, Subtask 5: a miss (ray escapes to the sky) now contributes the
+            // physical Sky-View LUT color instead of 0 -- this probe's own ambient irradiance
+            // average now responds to sky color/sun elevation/cloud cover.
+            vec2 skyUV = SkyViewLUTUVFromDirection(dir, vec3(pc.sunDirX, pc.sunDirY, pc.sunDirZ));
+            accumulated += texture(g_SkyViewLUT, skyUV).rgb;
         }
-        // A miss (ray escapes to the sky) contributes 0 -- physically correct for an ambient
-        // average over the full sphere, not an error case to special-case.
     }
 
     vec3 irradiance = accumulated / float(kProbeSampleDirections);

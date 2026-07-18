@@ -210,6 +210,14 @@ namespace renderer {
         void SetVirtualTexture(const VirtualTextureManager& vt, const maths::vec2& worldMinXZ,
             const maths::vec2& worldMaxXZ, VkBuffer feedbackBuffer);
 
+        // Atmos weather system, Subtask 5: binds renderer::AtmosSkyPass's Sky-View LUT (ambient
+        // replacement) and renderer::AtmosCloudsPass's Cloud Shadow Map (sun term modulation) into
+        // BOTH descriptor sets -- mirrors SetVirtualShadowMap()'s own two-set-write pattern exactly.
+        // Must be called after both producer passes' own Init(), before the first RecordResolve()/
+        // RecordResolveBinned() call -- same ordering contract as SetVirtualShadowMap().
+        void SetAtmosCloudLighting(VkSampler skyViewLUTSampler, VkImageView skyViewLUTView,
+            VkSampler cloudShadowSampler, VkImageView cloudShadowView);
+
         VkImage GetOutputColorImage() const { return m_OutputColorImage; }
         VkImageView GetOutputColorView() const { return m_OutputColorView; }
         VkImageView GetOutputNormalView() const { return m_OutputNormalView; }

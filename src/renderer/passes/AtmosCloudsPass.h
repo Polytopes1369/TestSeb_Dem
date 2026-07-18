@@ -19,6 +19,14 @@
 //   cloud buffer visible to whatever the caller's own later consumer (PostProcessComposite.comp)
 //   samples it with next.
 //
+// Atmos weather system, Subtask 5: this pass ALSO owns the Cloud Shadow Map (AtmosCloudShadows.comp,
+// a SEPARATE pipeline/descriptor set from the noise-gen/raymarch one above -- different shader
+// entry point, different bindings) -- a 512x512 R8_UNORM map of sun transmittance through the cloud
+// layer, regenerated every frame (unlike the noise textures) since it tracks the live sun direction
+// and wind-scrolled cloud position. See AtmosCloudShadows.comp's own header comment for the world-
+// space extent convention (deliberately the demo's own real world-unit scale, not the km-scale
+// planet-local frame the rest of this class uses for camera-facing rendering).
+//
 // --- Scope note: half-resolution, no dedicated temporal reprojection ---
 // atmos_integration_plan.md's own Subtask 4 objective #4 suggests pairing the half-res raymarch with
 // a dedicated cloud-specific temporal reconstruction pass. This implementation instead relies on a
@@ -50,6 +58,9 @@ namespace renderer {
         static constexpr VkFormat kNoiseFormat = VK_FORMAT_R8_UNORM;
         static constexpr VkFormat kOutputFormat = VK_FORMAT_R16G16B16A16_SFLOAT; // rgb = in-scattered cloud radiance, a = transmittance.
         static constexpr uint32_t kResolutionDivisor = 2; // Half-resolution -- see class comment's scope note.
+        static constexpr uint32_t kCloudShadowMapResolution = 512;
+        static constexpr VkFormat kShadowFormat = VK_FORMAT_R8_UNORM;
+        static constexpr uint32_t kShadowWorkgroupSize = 8; // Matches AtmosCloudShadows.comp's local_size_x/y.
         // GLSL only allows ONE local_size declaration per shader file -- all 3 modes (2 noise-gen,
         // 1 raymarch) share this 4x4x4 workgroup shape, same convention renderer::
         // AtmosVolumetricFogPass::kWorkgroupSize3D already establishes for the identical constraint.
@@ -81,6 +92,10 @@ namespace renderer {
         VkImageView GetCloudView() const { return m_CloudOutput.view; }
         VkSampler GetCloudSampler() const { return m_LinearSampler; }
 
+        // Atmos weather system, Subtask 5.
+        VkImageView GetCloudShadowMapView() const { return m_CloudShadowMap.view; }
+        VkSampler GetCloudShadowMapSampler() const { return m_LinearSampler; }
+
     private:
         struct Image3D {
             VkImage image = VK_NULL_HANDLE;
@@ -105,15 +120,25 @@ namespace renderer {
         Image3D m_ShapeNoise;
         Image3D m_DetailNoise;
         Image2D m_CloudOutput;
+        Image2D m_CloudShadowMap; // Atmos Subtask 5.
 
         VkSampler m_NoiseSampler = VK_NULL_HANDLE; // Linear, REPEAT (noise tiles) -- see Init()'s own comment.
-        VkSampler m_LinearSampler = VK_NULL_HANDLE; // Linear, CLAMP_TO_EDGE -- for m_CloudOutput's own sampled reads.
+        VkSampler m_LinearSampler = VK_NULL_HANDLE; // Linear, CLAMP_TO_EDGE -- for m_CloudOutput/m_CloudShadowMap's own sampled reads.
 
         VkDescriptorSetLayout m_SetLayout = VK_NULL_HANDLE;
         VkDescriptorPool m_DescriptorPool = VK_NULL_HANDLE;
         VkDescriptorSet m_Set = VK_NULL_HANDLE;
         VkPipelineLayout m_PipelineLayout = VK_NULL_HANDLE;
         VkPipeline m_Pipeline = VK_NULL_HANDLE;
+
+        // Atmos Subtask 5: AtmosCloudShadows.comp -- a separate pipeline (different shader entry
+        // point/bindings from the noise-gen/raymarch one above), reusing m_ShapeNoise/m_DetailNoise
+        // (bound into ITS OWN set, since it's a different VkDescriptorSetLayout) and m_NoiseSampler.
+        VkDescriptorSetLayout m_ShadowSetLayout = VK_NULL_HANDLE;
+        VkDescriptorPool m_ShadowDescriptorPool = VK_NULL_HANDLE;
+        VkDescriptorSet m_ShadowSet = VK_NULL_HANDLE;
+        VkPipelineLayout m_ShadowPipelineLayout = VK_NULL_HANDLE;
+        VkPipeline m_ShadowPipeline = VK_NULL_HANDLE;
     };
 
 }
