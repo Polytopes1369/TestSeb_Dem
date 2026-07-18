@@ -98,6 +98,13 @@ bool ClusterRenderPipeline::Init(
   Shutdown();
 
   m_Device = createInfo.device;
+  m_GraphicsQueueFamilyIndex = createInfo.graphicsQueueFamilyIndex;
+  // Phase 2 (Lumen advanced roadmap): async-compute queue handles -- see this class' own
+  // m_AsyncComputeAvailableThisBuild member comment for exactly what m_AsyncComputeAvailableThisBuild
+  // does and does not gate.
+  m_AsyncComputeQueue = createInfo.asyncComputeQueue;
+  m_AsyncComputeQueueFamilyIndex = createInfo.asyncComputeQueueFamilyIndex;
+  m_AsyncComputeAvailableThisBuild = createInfo.hasDedicatedAsyncComputeQueue;
   m_RenderExtent = createInfo.renderExtent;
   m_DisplayExtent = createInfo.displayExtent;
   m_VisBufferClusterIDImage = createInfo.visBufferClusterIDImage;
@@ -418,7 +425,8 @@ bool ClusterRenderPipeline::Init(
   if (!m_SurfaceCache.Init(createInfo.device, createInfo.allocator,
                            createInfo.commandPool, createInfo.queue,
                            createInfo.cacheFilePath, createInfo.entityDataBuffer,
-                           m_Resolve.GetMaterialParamsBuffer())) {
+                           m_Resolve.GetMaterialParamsBuffer(),
+                           createInfo.entityDataCPU, createInfo.materialTable)) {
     LOG_ERROR("[ClusterRenderPipeline] Failed to initialize SurfaceCachePass.");
     return false;
   }
@@ -1017,8 +1025,89 @@ void ClusterRenderPipeline::BeginVisBufferRendering(
   vkCmdBeginRendering(cmd, &renderingInfo);
 }
 
+void ClusterRenderPipeline::RecordSurfaceCacheOwnershipTransfer(VkCommandBuffer cmd, bool isRelease,
+    uint32_t srcFamily, uint32_t dstFamily, VkPipelineStageFlags2 activeStageMask,
+    VkAccessFlags2 activeImageAccessMask, VkAccessFlags2 activeBufferAccessMask) {
+  if (!m_AsyncComputeAvailableThisBuild) {
+    return; // Same queue family as the graphics/async-compute consumer -- nothing to transfer. See
+             // this method's own header comment.
+  }
+
+  // Per the Vulkan spec, a queue family ownership transfer's RELEASE operation's dstAccessMask/
+  // dstStageMask are ignored (the acquiring queue's own barrier is what actually makes the data
+  // visible to it), and the matching ACQUIRE's srcAccessMask/srcStageMask are likewise ignored --
+  // see GpuGeometryPagePool::ReleasePhysicalPoolOwnership/AcquirePhysicalPoolOwnership's own
+  // comments for the same reasoning applied to a plain buffer. `activeStageMask`/
+  // `activeImageAccessMask`/`activeBufferAccessMask` are therefore routed to src* on the release
+  // side and dst* on the acquire side; the unused triple is left NONE/0 either way.
+  VkPipelineStageFlags2 releaseStage = isRelease ? activeStageMask : VK_PIPELINE_STAGE_2_NONE;
+  VkPipelineStageFlags2 acquireStage = isRelease ? VK_PIPELINE_STAGE_2_NONE : activeStageMask;
+  VkAccessFlags2 releaseImageAccess = isRelease ? activeImageAccessMask : VK_ACCESS_2_NONE;
+  VkAccessFlags2 acquireImageAccess = isRelease ? VK_ACCESS_2_NONE : activeImageAccessMask;
+  VkAccessFlags2 releaseBufferAccess = isRelease ? activeBufferAccessMask : VK_ACCESS_2_NONE;
+  VkAccessFlags2 acquireBufferAccess = isRelease ? VK_ACCESS_2_NONE : activeBufferAccessMask;
+
+  // The 5 atlas images SurfaceCacheGIInjectPass::Init actually binds (confirmed by reading that
+  // method's own descriptor writes) -- Albedo/Normal/Emissive/Radiance/WorldPos. NOT
+  // DirectLighting: GIInject never binds it (only RecordCapture writes it, and only downstream
+  // consumers other than GIInject ever sample it), so it stays on the graphics queue family the
+  // whole time and needs no transfer at all.
+  VkImage images[5] = {
+      m_SurfaceCache.GetAlbedoImage(), m_SurfaceCache.GetNormalImage(), m_SurfaceCache.GetEmissiveImage(),
+      m_SurfaceCache.GetRadianceImage(), m_SurfaceCache.GetWorldPosImage()
+  };
+  VkImageMemoryBarrier2 imageBarriers[5]{};
+  for (uint32_t i = 0; i < 5; ++i) {
+    imageBarriers[i].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+    imageBarriers[i].srcStageMask = releaseStage;
+    imageBarriers[i].srcAccessMask = releaseImageAccess;
+    imageBarriers[i].dstStageMask = acquireStage;
+    imageBarriers[i].dstAccessMask = acquireImageAccess;
+    // Layout unchanged -- these atlas images live permanently in GENERAL for their entire lifetime
+    // (see SurfaceCachePass' own class comment's "Atlas layout convention" section), exactly like
+    // GpuGeometryPagePool's own buffers never change layout across their ownership transfer either.
+    imageBarriers[i].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    imageBarriers[i].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    imageBarriers[i].srcQueueFamilyIndex = srcFamily;
+    imageBarriers[i].dstQueueFamilyIndex = dstFamily;
+    imageBarriers[i].image = images[i];
+    imageBarriers[i].subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+  }
+
+  // The 4 buffers RecordRefreshTLAS (rebuilds the TLAS) / GIInject's own TraceHWRT (reads the
+  // Fallback Mesh vertex/index buffers + the draw-range table to resolve a ray hit) touch every
+  // frame on whichever queue they now run on -- see this method's own header comment for why
+  // SurfaceCacheRayTracingPass::TlasRefitResources' internal scratch/instance buffers are
+  // deliberately excluded.
+  VkBuffer buffers[4] = {
+      m_SurfaceCache.GetVertexBuffer(), m_SurfaceCache.GetIndexBuffer(),
+      m_SurfaceCacheRT.GetDrawRangeBuffer(), m_SurfaceCacheRT.GetTLASBufferHandle()
+  };
+  VkBufferMemoryBarrier2 bufferBarriers[4]{};
+  for (uint32_t i = 0; i < 4; ++i) {
+    bufferBarriers[i].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2;
+    bufferBarriers[i].srcStageMask = releaseStage;
+    bufferBarriers[i].srcAccessMask = releaseBufferAccess;
+    bufferBarriers[i].dstStageMask = acquireStage;
+    bufferBarriers[i].dstAccessMask = acquireBufferAccess;
+    bufferBarriers[i].srcQueueFamilyIndex = srcFamily;
+    bufferBarriers[i].dstQueueFamilyIndex = dstFamily;
+    bufferBarriers[i].buffer = buffers[i];
+    bufferBarriers[i].offset = 0;
+    bufferBarriers[i].size = VK_WHOLE_SIZE;
+  }
+
+  VkDependencyInfo depInfo{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+  depInfo.imageMemoryBarrierCount = 5;
+  depInfo.pImageMemoryBarriers = imageBarriers;
+  depInfo.bufferMemoryBarrierCount = 4;
+  depInfo.pBufferMemoryBarriers = bufferBarriers;
+  vkCmdPipelineBarrier2(cmd, &depInfo);
+}
+
 void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
                                         VkCommandBuffer transferCmd,
+                                        VkCommandBuffer asyncComputeCmd,
                                         const CameraPushConstants &camera,
                                         const maths::vec3 &cameraPositionWorld,
                                         const CameraFrameInfo &cameraFrameInfo,
@@ -1085,6 +1174,32 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
   m_SoftwareRaster.RecordClear(cmd);
   m_LODSelection.RecordClear(cmd);
 
+  // Phase 2 (Lumen advanced roadmap): this frame's async-compute routing decision -- read by both
+  // the [1z] block below (whether to acquire/skip the fallback TLAS-refit+GIInject path) and the
+  // [1z2] hand-off block near the end of this function, hence declared at this outer function scope
+  // rather than local to either. Forced OFF whenever traceMode is SWRT (0): moving GIInject's SWRT
+  // path to the async queue would additionally need ownership-transfer barriers for every per-entity
+  // Global SDF image it samples (TraceMeshSDFScene), which only the Debug SWRT toggle ever exercises
+  // -- not worth doubling the barrier surface for a debug-only configuration when Release always
+  // uses HWRT anyway (see SetDebugAsyncComputeEnabled's own header comment). The Debug toggle
+  // additionally gates it off entirely for staged bring-up (false = prove the CPU/struct plumbing
+  // alone with everything still graphics-queue-serialized; true = exercise the real cross-queue
+  // barrier design).
+  bool useAsyncCompute = (traceMode == 1u);
+#ifndef NDEBUG
+  useAsyncCompute = useAsyncCompute && m_DebugAsyncComputeEnabled;
+#endif
+
+  // Phase 2 (Lumen advanced roadmap): shared with the [1z2] hand-off block near the end of this
+  // function -- see that block's own comment for why the release/async-work happens LATE in the
+  // frame (after every graphics-side consumer of the atlas has read it) rather than immediately
+  // after RecordCapture.
+#ifndef NDEBUG
+  bool radiosityEnabled = m_DebugRadiosityEnabled;
+#else
+  bool radiosityEnabled = true;
+#endif
+
   // =========================================================================================
   // [1z] Lumen-style GI infrastructure: Virtual Shadow Map page requests/renders (Phase 3) ->
   // Surface Cache capture -> Global SDF clipmap streaming -> (Debug-only) SDF ray march debug
@@ -1093,14 +1208,31 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
   // it can run anywhere in the frame; placed early, right after the worklist clears, so it
   // overlaps with the GPU's own internal scheduling of the culling/streaming work that follows
   // rather than sitting at the tail end.
+  //
+  // Phase 2 (Lumen advanced roadmap): when the PREVIOUS frame handed the Surface Cache atlas +
+  // TLAS-refit resources off to the async-compute queue (see [1z2] below, m_AtlasOwnedByAsync),
+  // this frame's very first order of business is acquiring them back -- BEFORE RecordCapture
+  // writes into those same 5 images below, and before anything else this frame samples them.
   // =========================================================================================
   {
-    // 0. Phase 4 integration (UE5.8 parity roadmap, dynamic scenes onto main): per-frame TLAS
-    // refit so ray-traced GI/reflections see this frame's entity rotations -- must run before
-    // anything below traces against m_SurfaceCacheRT's TLAS (radiosity injection, step 4, and any
-    // later HWRT consumer this same frame). A no-op rebuild (identity transforms) whenever
-    // config::ENTITY_SELF_ROTATION_ENABLED is off -- see RecordRefreshTLAS's own comment.
-    m_SurfaceCacheRT.RecordRefreshTLAS(cmd, entityTransformsCPU);
+    if (m_AtlasOwnedByAsync) {
+      // ACQUIRE (by graphics): the async-compute queue's own submission signals
+      // m_AsyncComputeFinishedSemaphore when its release (recorded at the END of last frame's own
+      // [1z2] block) completes; main.cpp's per-frame graphics submission waits on that semaphore
+      // before this command buffer's own execution reaches this barrier's dstStageMask, so by the
+      // time RecordCapture (below) actually runs on the GPU, these resources are genuinely
+      // graphics-owned again. See RecordSurfaceCacheOwnershipTransfer()'s own comment for exactly
+      // which 5 images + 4 buffers this covers.
+      RecordSurfaceCacheOwnershipTransfer(cmd, /*isRelease=*/false,
+          m_AsyncComputeQueueFamilyIndex, m_GraphicsQueueFamilyIndex,
+          VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_2_VERTEX_INPUT_BIT |
+              VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
+          VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_SHADER_SAMPLED_READ_BIT |
+              VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+          VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT |
+              VK_ACCESS_2_INDEX_READ_BIT | VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR);
+      m_AtlasOwnedByAsync = false;
+    }
 
     // Sun direction is fixed for now (m_SceneLights' own default, see LightingTypes.h) -- a
     // future day/night system would rotate it per frame instead.
@@ -1121,7 +1253,11 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
 
     // 2. Surface Cache: feed this frame's light data before the visibility-driven capture draws --
     // shadow lookups now read renderer::VirtualShadowMapPass's own UBOs directly (bound once via
-    // SetVirtualShadowMap()), no per-frame light-view-proj parameter needed here anymore.
+    // SetVirtualShadowMap()), no per-frame light-view-proj parameter needed here anymore. STAYS on
+    // the graphics queue (Feature 1's plan: only TLAS refit + GIInject move) -- this is a render
+    // pass (vkCmdBeginRendering), not a compute dispatch, and async-compute queues on most hardware
+    // cannot execute graphics-pipeline work at all. Safe now regardless of last frame's routing --
+    // the acquire above (if needed) already ran first.
     m_SurfaceCache.UpdateLighting(m_SceneLights);
     m_SurfaceCache.UpdateVisibility(cameraFrameInfo.position, cameraFrameInfo.forward,
                                     maths::vec3{0.0f, 1.0f, 0.0f}, cameraFrameInfo.fovYRadians,
@@ -1129,46 +1265,51 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
                                     cameraFrameInfo.farZ);
     m_SurfaceCache.RecordCapture(cmd, cameraFrameInfo.position, entityTransformsCPU);
 
-    // 3. Global SDF clipmap streaming, from this frame's camera position.
+    // 3. Global SDF clipmap streaming, from this frame's camera position. STAYS on the graphics
+    // queue (Feature 1's plan explicitly excludes it -- GIInject's HWRT path, the only mode ever
+    // moved to async, does not sample the Global SDF at all).
     m_GlobalSDF.RecordUpdate(cmd, cameraFrameInfo.position, entityTransformsCPU);
 
-    // 4. Secondary-bounce injection into m_SurfaceCache's own radiance atlas (budgeted, a handful
-    // of cards per call -- see SurfaceCacheGIInjectPass::kCardsPerFrameBudget) via m_TraceContext's
-    // shared trace-scene sets against m_SurfaceCacheRT's static TLAS or the per-entity mesh SDFs,
-    // depending on `traceMode`. Called kRadiosityBounceCount times in a row, each isolated from the
-    // next by the exact same barrier RecordInject itself doesn't carry (see the comment below) --
-    // this turns the pass's single budgeted round into a genuine INTRA-FRAME multi-bounce chain:
-    // m_GIInject's own round-robin cursor advances across every call in the loop, so bounce N+1's
-    // newly-processed cards sample the atlas including bounce N's own fresh writes wherever their
-    // footprints overlap, on top of (not instead of) the pass's existing cross-frame convergence.
-    // `radiosityEnabled` (debug-only toggle, main.cpp's 'G' key) lets this whole loop be switched
-    // off to isolate its cost/visual contribution from the rest of the GI stack; Release always
-    // runs it.
-#ifndef NDEBUG
-    bool radiosityEnabled = m_DebugRadiosityEnabled;
-#else
-    bool radiosityEnabled = true;
-#endif
-    if (radiosityEnabled) {
-      for (uint32_t bounce = 0; bounce < kRadiosityBounceCount; ++bounce) {
-        m_GIInject.RecordInject(cmd, m_TraceContext, m_SurfaceCache, traceMode);
+    // 4. Secondary-bounce injection into m_SurfaceCache's own radiance atlas + the TLAS refit that
+    // must precede it (Phase 4 integration) -- Phase 2 (Lumen advanced roadmap) moves BOTH onto the
+    // async-compute queue, but only LATE this same frame (see [1z2] below), after every graphics-
+    // side consumer of the atlas/TLAS (Reflection/World Probes/TransparentForward/Water/
+    // HeroTessellation) has already read THIS frame's data -- releasing right here, immediately
+    // after RecordCapture, would strand every one of those later consumers without graphics-side
+    // ownership. `useAsyncCompute` (function-scope, see its own comment above) therefore only picks
+    // the FALLBACK path here: when false, TLAS refit + the radiosity bounce loop run right here,
+    // fully graphics-queue-serialized, exactly as before this phase (the pre-Phase-2 behavior).
+    // When true, both are skipped here entirely and instead recorded once, later, in [1z2].
+    if (!useAsyncCompute) {
+      // Phase 4 integration (UE5.8 parity roadmap, dynamic scenes onto main): per-frame TLAS
+      // refit so ray-traced GI/reflections see this frame's entity rotations -- must run before
+      // anything below traces against m_SurfaceCacheRT's TLAS (radiosity injection right below,
+      // and any later HWRT consumer this same frame). A no-op rebuild (identity transforms)
+      // whenever config::ENTITY_SELF_ROTATION_ENABLED is off -- see RecordRefreshTLAS's own comment.
+      m_SurfaceCacheRT.RecordRefreshTLAS(cmd, entityTransformsCPU);
 
-        // Unlike SurfaceCachePass::RecordCapture/VirtualShadowMapPass::RecordBeginFrame/
-        // GlobalSDFPass::RecordUpdate, SurfaceCacheGIInjectPass::RecordInject does NOT end with its own trailing
-        // barrier -- its read-modify-write of the radiance atlas (imageLoad/imageStore, STORAGE
-        // access) must be made visible here, explicitly, before the NEXT bounce's own RecordInject
-        // call samples that same atlas (surface_cache_sampling.glsl's g_SurfaceCacheRadiance) --
-        // and, after the loop's final iteration, before m_ScreenTrace's own near-field hit samples
-        // and m_WorldProbes' own trace pass do the same later this frame.
-        VkMemoryBarrier2 giInjectBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
-        giInjectBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-        giInjectBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-        giInjectBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
-        giInjectBarrier.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
-        VkDependencyInfo giInjectDepInfo{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
-        giInjectDepInfo.memoryBarrierCount = 1;
-        giInjectDepInfo.pMemoryBarriers = &giInjectBarrier;
-        vkCmdPipelineBarrier2(cmd, &giInjectDepInfo);
+      if (radiosityEnabled) {
+        for (uint32_t bounce = 0; bounce < kRadiosityBounceCount; ++bounce) {
+          m_GIInject.RecordInject(cmd, m_TraceContext, m_SurfaceCache, traceMode);
+
+          // Unlike SurfaceCachePass::RecordCapture/VirtualShadowMapPass::RecordBeginFrame/
+          // GlobalSDFPass::RecordUpdate, SurfaceCacheGIInjectPass::RecordInject does NOT end with
+          // its own trailing barrier -- its read-modify-write of the radiance atlas (imageLoad/
+          // imageStore, STORAGE access) must be made visible here, explicitly, before the NEXT
+          // bounce's own RecordInject call samples that same atlas (surface_cache_sampling.glsl's
+          // g_SurfaceCacheRadiance) -- and, after the loop's final iteration, before m_ScreenTrace's
+          // own near-field hit samples and m_WorldProbes' own trace pass do the same later this
+          // frame.
+          VkMemoryBarrier2 giInjectBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+          giInjectBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+          giInjectBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+          giInjectBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
+          giInjectBarrier.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+          VkDependencyInfo giInjectDepInfo{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+          giInjectDepInfo.memoryBarrierCount = 1;
+          giInjectDepInfo.pMemoryBarriers = &giInjectBarrier;
+          vkCmdPipelineBarrier2(cmd, &giInjectDepInfo);
+        }
       }
     }
 
@@ -1883,6 +2024,97 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
     m_WaterForward.RecordDraw(cmd, viewProj, cameraFrameInfo.position,
         transparentTargetImage, transparentTargetView, m_DepthImage, m_DepthImageView,
         m_RenderExtent, traceMode, m_FrameIndex, globalTimeSeconds, m_TraceContext);
+  }
+
+  // =========================================================================================
+  // [1z2] Phase 2 (Lumen advanced roadmap): hand the Surface Cache atlas (5 images) + TLAS-refit
+  // resources (4 buffers) off to the async-compute queue for THIS frame's TLAS refit + radiosity
+  // injection -- placed here, deliberately LATE (after [13c] above), because [12b2] Reflection,
+  // [12c] World Probes, and [13c]'s own HeroTessellation/TransparentForward/WaterForward (all three
+  // pass `m_TraceContext` and sample the Surface Cache radiance atlas / trace against the TLAS via
+  // it, confirmed by reading their own RecordDraw signatures) are every graphics-side consumer of
+  // these 9 resources THIS frame -- releasing any earlier would strand one of them without
+  // graphics-side ownership. Nothing after this point in RecordFrame touches the Surface Cache
+  // atlas or the TLAS again this frame (TAA/DoF/Bloom/PostProcess/blit are pure post-process, no
+  // GI sampling).
+  //
+  // This means the async work triggered here produces results consumed at the TOP of NEXT frame's
+  // own [1z] acquire (see m_AtlasOwnedByAsync's own comment) -- a deliberate ONE-FRAME PIPELINE
+  // LAG, not a same-frame round trip: GIInject's radiosity injection already has its own existing
+  // CROSS-FRAME convergence model (this pass never claimed same-frame-exact convergence even before
+  // Feature 1 existed), so consuming its output one frame later is a negligible, unnoticeable
+  // perturbation -- and critically, it is what actually lets the async-compute queue's own
+  // submission run genuinely CONCURRENTLY with next frame's [1a]-[11] culling/raster work on the
+  // GPU, rather than a same-frame hand-off that Vulkan's binary-semaphore-at-submission-granularity
+  // semantics cannot express without splitting this codebase's documented single graphics command
+  // buffer per frame (see main.cpp's own per-frame submit-sequence comment for the full reasoning).
+  // =========================================================================================
+  if (useAsyncCompute) {
+    // RELEASE (graphics -> async-compute): makes this frame's now-fully-updated atlas (RecordCapture
+    // + every downstream consumer above have already read/written what they need) + the Fallback
+    // Mesh vertex/index/draw-range buffers + the TLAS's own backing buffer available to the async-
+    // compute queue family. srcStageMask/srcAccessMask cover every stage that touched these 9
+    // resources on the graphics queue this frame: RecordCapture's own COLOR_ATTACHMENT_OUTPUT
+    // writes + VERTEX_INPUT reads, and every COMPUTE_SHADER/RAY_TRACING_SHADER_BIT_KHR sampled/
+    // storage/acceleration-structure read Reflection/World Probes/the forward passes performed
+    // since.
+    RecordSurfaceCacheOwnershipTransfer(cmd, /*isRelease=*/true,
+        m_GraphicsQueueFamilyIndex, m_AsyncComputeQueueFamilyIndex,
+        VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_2_VERTEX_INPUT_BIT |
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
+        VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_SHADER_SAMPLED_READ_BIT |
+            VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+        VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_2_INDEX_READ_BIT |
+            VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR);
+    m_AtlasOwnedByAsync = true;
+
+    // ACQUIRE (by async-compute) + TLAS refit + the radiosity bounce loop + RELEASE back to
+    // graphics -- all recorded into asyncComputeCmd, submitted (main.cpp) to the async-compute
+    // queue AFTER this frame's graphics submission, waiting on m_AsyncComputeCanStartSemaphore
+    // (signaled by that same graphics submission's completion).
+    RecordSurfaceCacheOwnershipTransfer(asyncComputeCmd, /*isRelease=*/false,
+        m_GraphicsQueueFamilyIndex, m_AsyncComputeQueueFamilyIndex,
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+        VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+        VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR |
+            VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR);
+
+    // Phase 4 integration (UE5.8 parity roadmap, dynamic scenes onto main): per-frame TLAS refit,
+    // forced HWRT-only here (traceMode == 1u whenever useAsyncCompute, see this function's own
+    // useAsyncCompute comment) -- must run before the bounce loop below traces against it.
+    m_SurfaceCacheRT.RecordRefreshTLAS(asyncComputeCmd, entityTransformsCPU);
+
+    if (radiosityEnabled) {
+      for (uint32_t bounce = 0; bounce < kRadiosityBounceCount; ++bounce) {
+        m_GIInject.RecordInject(asyncComputeCmd, m_TraceContext, m_SurfaceCache, traceMode);
+
+        // Intra-queue (asyncComputeCmd both sides), so purely the usual execution/memory
+        // dependency -- no queue-family-ownership concern here. Same rationale as the fallback
+        // path's own identical barrier above (see that block's own comment).
+        VkMemoryBarrier2 giInjectBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+        giInjectBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        giInjectBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+        giInjectBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
+        giInjectBarrier.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+        VkDependencyInfo giInjectDepInfo{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        giInjectDepInfo.memoryBarrierCount = 1;
+        giInjectDepInfo.pMemoryBarriers = &giInjectBarrier;
+        vkCmdPipelineBarrier2(asyncComputeCmd, &giInjectDepInfo);
+      }
+    }
+
+    // RELEASE (async-compute -> graphics): makes the bounce loop's Radiance writes + the TLAS
+    // refit's rebuild available back to the graphics queue family -- consumed by NEXT frame's own
+    // [1z] acquire (m_AtlasOwnedByAsync), not this frame's (see this block's own header comment).
+    RecordSurfaceCacheOwnershipTransfer(asyncComputeCmd, /*isRelease=*/true,
+        m_AsyncComputeQueueFamilyIndex, m_GraphicsQueueFamilyIndex,
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+        VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+        VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR |
+            VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR);
+    // Signals m_AsyncComputeFinishedSemaphore as part of asyncComputeCmd's own submission
+    // completing (main.cpp) -- waited on by NEXT frame's graphics submission before ITS OWN [1z]
+    // acquire (above) is allowed to execute.
   }
 
   // =========================================================================================

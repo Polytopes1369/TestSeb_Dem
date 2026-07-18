@@ -675,9 +675,32 @@ void VulkanContext::CreateLogicalDevice() {
     }
   }
 
+  // Dedicated async-compute queue (Phase 2, Lumen advanced roadmap -- UE 5.8 RHI parity): mirrors
+  // the dedicated-transfer-queue search immediately above exactly, just with a different family
+  // predicate -- a family advertising COMPUTE_BIT but NOT GRAPHICS_BIT is this GPU's separate
+  // "async compute" hardware queue (an ACE-style engine on AMD, or a genuinely independent compute
+  // queue on NVIDIA/Intel where one exists) that can execute concurrently with the graphics queue's
+  // own submission instead of merely time-slicing the same combined graphics+compute queue. Cannot
+  // collide with m_TransferQueueFamilyIndex found above: that search explicitly REQUIRES the
+  // family to lack COMPUTE_BIT, while this one explicitly REQUIRES it -- so the two predicates are
+  // mutually exclusive by construction, no distinctness check needed. Not every GPU exposes one
+  // (integrated GPUs / some vendors expose only the combined graphics+compute family), so this is a
+  // graceful runtime fallback exactly like the transfer queue's own -- see
+  // GetAsyncComputeQueue()'s own header comment.
+  m_AsyncComputeQueueFamilyIndex = m_GraphicsQueueFamilyIndex;
+  m_HasDedicatedAsyncComputeQueue = false;
+  for (uint32_t i = 0; i < queueFamilyCount; i++) {
+    if ((queueFamilies[i].queueFlags & VK_QUEUE_COMPUTE_BIT) &&
+        !(queueFamilies[i].queueFlags & VK_QUEUE_GRAPHICS_BIT)) {
+      m_AsyncComputeQueueFamilyIndex = i;
+      m_HasDedicatedAsyncComputeQueue = true;
+      break;
+    }
+  }
+
   float queuePriority = 1.0f;
   std::vector<VkDeviceQueueCreateInfo> queueCreateInfos;
-  queueCreateInfos.reserve(2); // Fixed upfront: emplace_back below must never trigger a reallocation
+  queueCreateInfos.reserve(3); // Fixed upfront: emplace_back below must never trigger a reallocation
                                // while an earlier element's pQueuePriorities (below) still points
                                // at this same-scope `queuePriority` local -- reserving avoids any
                                // risk of that, though pQueuePriorities is re-pointed at &queuePriority
@@ -695,6 +718,14 @@ void VulkanContext::CreateLogicalDevice() {
     transferQueueCreateInfo.queueCount = 1;
     transferQueueCreateInfo.pQueuePriorities = &queuePriority;
     queueCreateInfos.push_back(transferQueueCreateInfo);
+  }
+
+  if (m_HasDedicatedAsyncComputeQueue) {
+    VkDeviceQueueCreateInfo asyncComputeQueueCreateInfo{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
+    asyncComputeQueueCreateInfo.queueFamilyIndex = m_AsyncComputeQueueFamilyIndex;
+    asyncComputeQueueCreateInfo.queueCount = 1;
+    asyncComputeQueueCreateInfo.pQueuePriorities = &queuePriority;
+    queueCreateInfos.push_back(asyncComputeQueueCreateInfo);
   }
 
   VkPhysicalDeviceVulkan13Features features13{
@@ -853,6 +884,16 @@ void VulkanContext::CreateLogicalDevice() {
       m_HasDedicatedTransferQueue ? "dedicated hardware copy queue" : "falling back to the graphics queue",
       m_TransferQueueFamilyIndex));
 
+  // Same fallback-aliasing idiom as the transfer queue above: when no dedicated async-compute
+  // family was found, m_AsyncComputeQueueFamilyIndex already equals m_GraphicsQueueFamilyIndex (set
+  // above), so this just re-fetches the SAME VkQueue handle as m_GraphicsQueue -- harmless, and
+  // keeps every consumer of GetAsyncComputeQueue() ignorant of the fallback (same convention
+  // GetTransferQueue() already establishes).
+  vkGetDeviceQueue(m_Device, m_AsyncComputeQueueFamilyIndex, 0, &m_AsyncComputeQueue);
+  LOG_INFO(std::format("[VulkanContext] Async-compute queue: {} (family {})",
+      m_HasDedicatedAsyncComputeQueue ? "dedicated async-compute queue" : "falling back to the graphics queue",
+      m_AsyncComputeQueueFamilyIndex));
+
   // See RayTracingFunctions.h's own comment: VK_KHR_acceleration_structure /
   // VK_KHR_ray_tracing_pipeline's entry points are not re-exported by this SDK's loader import
   // library, so they must be resolved via vkGetDeviceProcAddr right here, once, immediately after
@@ -881,6 +922,18 @@ void VulkanContext::CreateCommandPool() {
       VK_SUCCESS) {
     throw std::runtime_error("Failed to create Transfer Command Pool!");
   }
+
+  // Own pool for the async-compute queue's per-frame command buffer (Phase 2, Lumen advanced
+  // roadmap -- see GetAsyncComputeCommandBuffer()'s own comment), same "always a distinct pool,
+  // even when the family falls back to the graphics family" reasoning as m_TransferCommandPool
+  // above.
+  VkCommandPoolCreateInfo asyncComputePoolInfo{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+  asyncComputePoolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+  asyncComputePoolInfo.queueFamilyIndex = m_AsyncComputeQueueFamilyIndex;
+  if (vkCreateCommandPool(m_Device, &asyncComputePoolInfo, nullptr, &m_AsyncComputeCommandPool) !=
+      VK_SUCCESS) {
+    throw std::runtime_error("Failed to create Async-Compute Command Pool!");
+  }
 }
 
 void VulkanContext::AllocateCommandBuffer() {
@@ -902,6 +955,16 @@ void VulkanContext::AllocateCommandBuffer() {
   if (vkAllocateCommandBuffers(m_Device, &transferAllocInfo, &m_TransferCommandBuffer) !=
       VK_SUCCESS) {
     throw std::runtime_error("Failed to allocate Transfer Command Buffer!");
+  }
+
+  VkCommandBufferAllocateInfo asyncComputeAllocInfo{
+      VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+  asyncComputeAllocInfo.commandPool = m_AsyncComputeCommandPool;
+  asyncComputeAllocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+  asyncComputeAllocInfo.commandBufferCount = 1;
+  if (vkAllocateCommandBuffers(m_Device, &asyncComputeAllocInfo, &m_AsyncComputeCommandBuffer) !=
+      VK_SUCCESS) {
+    throw std::runtime_error("Failed to allocate Async-Compute Command Buffer!");
   }
 }
 
@@ -1072,6 +1135,25 @@ void VulkanContext::CreateSyncObjects() {
   // retired -- the frameFence wait at the top of main.cpp's loop already guarantees that.
   if (vkCreateSemaphore(m_Device, &semaphoreInfo, nullptr, &m_TransferFinishedSemaphore) != VK_SUCCESS) {
     throw std::runtime_error("Failed to create transfer-finished semaphore!");
+  }
+
+  // Phase 2 (Lumen advanced roadmap): bidirectional async-compute semaphore pair -- unlike
+  // m_TransferFinishedSemaphore's one-way (transfer -> graphics) dependency, the async-compute
+  // queue's work this frame both STARTS after a graphics-queue release (m_AsyncComputeCanStartSemaphore)
+  // AND must FINISH before the graphics queue consumes its results later the same frame
+  // (m_AsyncComputeFinishedSemaphore) -- see GetAsyncComputeCanStartSemaphore()/
+  // GetAsyncComputeFinishedSemaphore()'s own header comments. Both are plain binary semaphores,
+  // safe under the same "signaled/waited within one frame only, never handed to vkQueuePresentKHR,
+  // never reused before the frameFence wait retires both ends" reasoning
+  // m_TransferFinishedSemaphore's own comment above documents -- always created, even when this GPU
+  // exposes no dedicated async-compute family: the fallback path still submits (and waits on) them,
+  // just with both ends on the same graphics queue (see main.cpp's per-frame submit sequence), so
+  // no separate creation branch is needed here.
+  if (vkCreateSemaphore(m_Device, &semaphoreInfo, nullptr, &m_AsyncComputeCanStartSemaphore) != VK_SUCCESS) {
+    throw std::runtime_error("Failed to create async-compute-can-start semaphore!");
+  }
+  if (vkCreateSemaphore(m_Device, &semaphoreInfo, nullptr, &m_AsyncComputeFinishedSemaphore) != VK_SUCCESS) {
+    throw std::runtime_error("Failed to create async-compute-finished semaphore!");
   }
 }
 
@@ -2772,6 +2854,14 @@ void VulkanContext::Shutdown() {
     vkDestroySemaphore(m_Device, m_TransferFinishedSemaphore, nullptr);
     m_TransferFinishedSemaphore = VK_NULL_HANDLE;
   }
+  if (m_AsyncComputeCanStartSemaphore != VK_NULL_HANDLE) {
+    vkDestroySemaphore(m_Device, m_AsyncComputeCanStartSemaphore, nullptr);
+    m_AsyncComputeCanStartSemaphore = VK_NULL_HANDLE;
+  }
+  if (m_AsyncComputeFinishedSemaphore != VK_NULL_HANDLE) {
+    vkDestroySemaphore(m_Device, m_AsyncComputeFinishedSemaphore, nullptr);
+    m_AsyncComputeFinishedSemaphore = VK_NULL_HANDLE;
+  }
 
   for (VkPipeline pipeline :
        {m_ConePipeline, m_IcospherePipeline, m_PlanePipeline, m_SpherePipeline,
@@ -2833,6 +2923,10 @@ void VulkanContext::Shutdown() {
   if (m_TransferCommandPool != VK_NULL_HANDLE) {
     vkDestroyCommandPool(m_Device, m_TransferCommandPool, nullptr);
     m_TransferCommandPool = VK_NULL_HANDLE;
+  }
+  if (m_AsyncComputeCommandPool != VK_NULL_HANDLE) {
+    vkDestroyCommandPool(m_Device, m_AsyncComputeCommandPool, nullptr);
+    m_AsyncComputeCommandPool = VK_NULL_HANDLE;
   }
 
   if (m_Allocator != VK_NULL_HANDLE) {

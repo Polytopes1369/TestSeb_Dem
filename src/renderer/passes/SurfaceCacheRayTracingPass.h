@@ -65,6 +65,14 @@ namespace renderer {
         // second TLAS over the same geometry -- see SurfaceCacheGIInject.comp's own TraceHWRT.
         VkAccelerationStructureKHR GetTLASHandle() const { return m_TLAS.Handle(); }
         VkBuffer GetDrawRangeBuffer() const { return m_DrawRangeBuffer.Handle(); }
+        // Phase 2 (Lumen advanced roadmap): the TLAS's own backing storage buffer (renderer::
+        // AccelerationStructure::m_Buffer) -- needed by renderer::ClusterRenderPipeline::RecordFrame
+        // to record a real VkBufferMemoryBarrier2 queue-family-ownership-transfer pair around it when
+        // RecordRefreshTLAS runs on the async-compute queue. VkAccelerationStructureKHR itself is not
+        // a barrier-typed resource (per the Vulkan spec, ownership-transfer barriers operate on the
+        // underlying VkBuffer memory, not the acceleration structure handle) -- this exposes exactly
+        // that underlying buffer, nothing else.
+        VkBuffer GetTLASBufferHandle() const { return m_TLAS.m_Buffer.Handle(); }
 
     private:
         VkDevice m_Device = VK_NULL_HANDLE;

@@ -11,11 +11,24 @@
 // Fresnel term at this pixel's own view angle (F0 = mix(0.04, albedo, metallic), the standard
 // metallic-workflow reflectance-at-normal-incidence split), and additively read-modify-writes
 // `F * accumulatedRadiance` into renderer::ClusterResolvePass's own output color image -- the exact
-// same direct-RMW compositing convention ScreenProbeGather.comp already uses for diffuse GI, just
-// with a Fresnel-weighted specular term instead of an albedo-weighted diffuse irradiance term. This
-// is a deliberately simplified single-sample "Lumen Performance mode" weighting (Fresnel only, no
-// D/G microfacet terms in the composite -- see include/ggx_brdf.glsl's own header comment), matching
-// this phase's approved plan.
+// same direct-RMW compositing convention ScreenProbeGather.comp already uses for diffuse GI.
+//
+// Phase 2 (Lumen advanced roadmap): the previous Fresnel-only composite weight (a deliberately
+// simplified single-sample "Lumen Performance mode" weighting, no D/G microfacet terms -- see
+// include/ggx_brdf.glsl's own header comment) is now REPLACED by the complete D_GGX *
+// G_SmithGGXCorrelated * F_Schlick specular BRDF product, reconstructed from the half-vector H
+// ReflectionTrace.comp stored (g_ReflectionHalfVector below) at the moment it GGX-VNDF-sampled this
+// pixel's reflection ray. This REPLACES the old `fresnel * reflection.rgb` term, it does not add on
+// top of it: `reflection.rgb` is already the output of an importance-sampled single-ray Monte Carlo
+// estimator (GGX-VNDF sampling already concentrates rays where the BRDF lobe is large), so
+// multiplying it by the FULL D*Vis*F weight on top of the OLD Fresnel-only weight would double-count
+// the NDF's contribution once via the sampling density and once explicitly, biasing results too dark
+// at low roughness / too bright at grazing angles. Note there is deliberately no extra
+// `/(4*NdotV*NdotL)` division here: G_SmithGGXCorrelated in include/ggx_brdf.glsl already returns the
+// VISIBILITY term (V = G/(4*NdotV*NdotL), not the raw geometry term G) -- see that function's own doc
+// comment -- and it is that same `1/(4*NdotV*NdotL)` factor which is what actually compensates for
+// this composite not dividing by the VNDF sampling pdf, making the replacement (not addition) the
+// physically consistent choice.
 
 #include "include/octahedral.glsl"
 #include "include/ggx_brdf.glsl"
@@ -46,6 +59,11 @@ layout(std430, set = 0, binding = 8) readonly buffer MaterialParamsSSBO {
     MaterialParams params[];
 } g_MaterialParams;
 
+// Phase 2 (Lumen advanced roadmap): fixed (non-ping-ponged), read-only -- this pixel's GGX-VNDF
+// half-vector H, octahedral-encoded, written by ReflectionTrace.comp -- see this file's own header
+// comment and renderer::ReflectionPass::m_HalfVectorImage's member comment.
+layout(rg16f, set = 0, binding = 9) uniform readonly image2D g_ReflectionHalfVector;
+
 void main() {
     ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
     if (pixel.x >= int(g_ViewParams.viewportSize.x) || pixel.y >= int(g_ViewParams.viewportSize.y)) {
@@ -69,14 +87,33 @@ void main() {
     vec3 worldPos = worldPos4.xyz / worldPos4.w;
     vec3 viewDir = normalize(g_ViewParams.cameraPositionWorld - worldPos);
 
-    // Substrate integration: real per-pixel Slab Fresnel reflectance weight (base+top vertically
-    // layered) replaces the old plain metallic-workflow Schlick Fresnel (F0 = mix(0.04, albedo,
-    // metallic)) -- see substrate_bsdf.glsl's own EvaluateSubstrateReflectionWeight comment.
+    // Substrate integration: this pixel's real material (base Slab only -- see this file's own
+    // header comment for why the new BRDF composite uses ggx_brdf.glsl's ISOTROPIC, single-Slab
+    // D_GGX/G_SmithGGXCorrelated/F_Schlick rather than substrate_bsdf.glsl's own anisotropic,
+    // base+top-layered EvaluateSubstrateMaterial/EvaluateSubstrateReflectionWeight -- layering the
+    // top coat into this specific term is deliberately out of scope for this phase).
     uint materialSlot = min(imageLoad(g_GBufferMaterialID, pixel).r, MATERIAL_TABLE_SIZE - 1u);
     MaterialParams mat = g_MaterialParams.params[materialSlot];
-    vec3 fresnel = EvaluateSubstrateReflectionWeight(mat, normal, viewDir);
+
+    // Reconstruct H (the half-vector ReflectionTrace.comp GGX-VNDF-sampled) and re-derive
+    // L = reflect(-V, H) -- deterministic, matches exactly what Trace itself computed for its own
+    // ray direction (see ReflectionTrace.comp's own rayDir line), so no separate L storage is needed.
+    vec3 H = OctDecode(imageLoad(g_ReflectionHalfVector, pixel).rg);
+    vec3 L = reflect(-viewDir, H);
+
+    float NdotH = max(dot(normal, H), 0.0);
+    float NdotV = max(dot(normal, viewDir), 1.0e-4);
+    float NdotL = max(dot(normal, L), 0.0);
+    float VdotH = max(dot(viewDir, H), 0.0);
+
+    float D = D_GGX(NdotH, mat.base.roughness);
+    float Vis = G_SmithGGXCorrelated(NdotV, NdotL, mat.base.roughness);
+    vec3 F = F_Schlick(mat.base.f0, VdotH);
+    vec3 specularBRDF = D * Vis * F;
 
     vec4 baseColor = imageLoad(g_OutputColor, pixel);
-    vec3 finalColor = baseColor.rgb + fresnel * reflection.rgb;
+    // REPLACES the old `fresnel * reflection.rgb` term -- see this file's own header comment for the
+    // Monte-Carlo double-counting reasoning for why replace, not add.
+    vec3 finalColor = baseColor.rgb + specularBRDF * reflection.rgb;
     imageStore(g_OutputColor, pixel, vec4(finalColor, baseColor.a));
 }

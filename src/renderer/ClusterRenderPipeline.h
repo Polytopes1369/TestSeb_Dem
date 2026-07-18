@@ -132,6 +132,18 @@ namespace renderer {
         uint32_t graphicsQueueFamilyIndex = 0;
         uint32_t transferQueueFamilyIndex = 0;
 
+        // Phase 2 (Lumen advanced roadmap): dedicated async-compute queue (UE 5.8 RHI parity) --
+        // see VulkanContext::GetAsyncComputeQueue()'s own comment. `asyncComputeQueue` is the
+        // actual queue submissions target (VulkanContext::GetAsyncComputeQueue(), already aliased
+        // to the graphics queue when no dedicated family exists); `asyncComputeQueueFamilyIndex`/
+        // `hasDedicatedAsyncComputeQueue` decide whether the acquire/release barriers this class
+        // records around the Surface Cache atlas images + the TLAS actually need to transfer queue
+        // family ownership (same family == none needed, mirrors m_PagePool's own
+        // transferQueueFamilyIndex convention).
+        VkQueue asyncComputeQueue = VK_NULL_HANDLE;
+        uint32_t asyncComputeQueueFamilyIndex = 0;
+        bool hasDedicatedAsyncComputeQueue = false;
+
         VkExtent2D renderExtent{ 0, 0 };
         VkExtent2D displayExtent{ 0, 0 };
 
@@ -151,6 +163,12 @@ namespace renderer {
         // Entity transform and data buffers for dynamic primitive rotations
         VkBuffer entityTransformBuffer = VK_NULL_HANDLE;
         VkBuffer entityDataBuffer = VK_NULL_HANDLE;
+        // Feature 2 (Lumen advanced roadmap): CPU-side mirror of entityDataBuffer's own contents
+        // (renderer::VulkanContext::GetEntityData(), index == meshID), needed by
+        // SurfaceCachePass::Init() to read each card's owning entity's real materialID BEFORE any
+        // GPU buffer is bound/read -- see that method's own comment for why this must be a CPU-side
+        // array, not a GPU readback, at pass-init time.
+        const core::EntityData* entityDataCPU = nullptr;
 
         // Randomly-generated PBR materials (renderer::VulkanContext::GetMaterialTable(), itself
         // built by renderer::GenerateShowcaseMaterialTable) -- uploaded once into ClusterResolvePass's
@@ -215,7 +233,14 @@ namespace renderer {
         // submitted to the transfer queue by the caller with the ordering main.cpp's per-frame
         // sequence establishes) is where this frame's geometry page uploads are recorded -- see
         // GeometryStreamingCoordinator::ProcessFeedbackAndDrainCompletions's own comment.
-        void RecordFrame(VkCommandBuffer cmd, VkCommandBuffer transferCmd, const CameraPushConstants& camera,
+        // `asyncComputeCmd` (Phase 2, Lumen advanced roadmap -- VulkanContext::
+        // GetAsyncComputeCommandBuffer(), already begun by the caller, mirrors `transferCmd`'s own
+        // contract) is where SurfaceCacheRayTracingPass::RecordRefreshTLAS + the radiosity bounce
+        // loop are recorded when SetDebugAsyncComputeEnabled(true) (Release default / Debug
+        // default): see this method's own [1z] block comment for the full cross-queue barrier/
+        // semaphore sequencing. The caller ends/submits it exactly like `transferCmd`.
+        void RecordFrame(VkCommandBuffer cmd, VkCommandBuffer transferCmd, VkCommandBuffer asyncComputeCmd,
+            const CameraPushConstants& camera,
             const maths::vec3& cameraPositionWorld, const CameraFrameInfo& cameraFrameInfo,
             float globalTimeSeconds, VkImage swapchainImage, VkImageView swapchainImageView,
             const core::EntityTransformCPU* entityTransformsCPU);
@@ -239,6 +264,24 @@ namespace renderer {
         // visual contribution can be A/B'd via the FPS counter and the resolved image -- see
         // main.cpp's 'G' key. Defaults to true (Release has no toggle and always runs the loop).
         void SetDebugRadiosityEnabled(bool enabled) { m_DebugRadiosityEnabled = enabled; }
+
+        // Phase 2 (Lumen advanced roadmap): gates whether RecordFrame()'s [1z] block moves
+        // SurfaceCacheRayTracingPass::RecordRefreshTLAS + the radiosity bounce loop onto the async-
+        // compute queue (true, mirrors SetDebugRadiosityEnabled's own toggle shape) or keeps them
+        // fully graphics-queue-serialized exactly as before this phase (false) -- see main.cpp's
+        // debug key binding. Bringing the feature up with this forced false first validates the CPU/
+        // struct plumbing alone (asyncComputeCmd is still begun/ended/submitted every frame either
+        // way, just left empty); flipping it true then isolates any remaining issue to the actual
+        // cross-queue barrier/semaphore design specifically, per this phase's own approved plan.
+        // Forcing SWRT (traceMode == 0) also falls back to this same fully-serialized path
+        // regardless of this toggle's own value -- see RecordFrame()'s own [1z] comment for why.
+        // Defaults to true (Release has no toggle and always attempts the async-queue path,
+        // matching SetDebugRadiosityEnabled/SetDebugSSRTEnabled's own Release-always-on convention;
+        // when GetAsyncComputeAvailableThisBuild() is false -- no dedicated queue on this GPU -- the
+        // request still "succeeds" from the caller's point of view, just with every barrier
+        // degenerating to a no-op and both queue handles aliased to the same graphics queue, see
+        // m_AsyncComputeAvailableThisBuild's own comment).
+        void SetDebugAsyncComputeEnabled(bool enabled) { m_DebugAsyncComputeEnabled = enabled; }
 
         // Independently gates RecordFrame()'s [12b] m_ScreenTrace.RecordTrace call (Lumen-style
         // Screen Trace: linear screen-space depth march, falling back to m_WorldProbes on a miss --
@@ -321,6 +364,41 @@ namespace renderer {
         // 0xFFFFFFFF, depth 1.0) and the late pass's LOAD (draw on top of the early output).
         void BeginVisBufferRendering(VkCommandBuffer cmd, bool clearAttachments) const;
 
+        // Phase 2 (Lumen advanced roadmap): records ONE HALF (release if `isRelease`, acquire
+        // otherwise) of a queue-family-ownership transfer covering every resource
+        // SurfaceCacheRayTracingPass::RecordRefreshTLAS + SurfaceCacheGIInjectPass::RecordInject
+        // touch when moved onto the async-compute queue this frame -- the 5 Surface Cache atlas
+        // images GIInject reads/writes (Albedo/Normal/Emissive/Radiance/WorldPos -- confirmed by
+        // reading SurfaceCacheGIInjectPass::Init's own descriptor writes; NOT DirectLighting, which
+        // GIInject never binds) plus 4 buffers RecordRefreshTLAS/GIInject's own HWRT trace touch
+        // (m_SurfaceCache's Fallback Mesh vertex/index buffers, m_SurfaceCacheRT's draw-range
+        // buffer, and the TLAS's own backing buffer -- VkAccelerationStructureKHR itself is not a
+        // barrier-typed resource, see SurfaceCacheRayTracingPass::GetTLASBufferHandle()'s own
+        // comment). Mirrors GpuGeometryPagePool::ReleasePhysicalPoolOwnership/
+        // AcquirePhysicalPoolOwnership's existing idiom exactly: per the Vulkan spec, only
+        // srcStageMask/srcAccessMask are meaningful on the release side (the acquiring queue's own
+        // barrier is what actually makes data visible to it) and only dstStageMask/dstAccessMask
+        // are meaningful on the acquire side -- `activeStageMask`/`activeImageAccessMask`/
+        // `activeBufferAccessMask` are therefore applied to src* when `isRelease` and to dst*
+        // otherwise, with the other triple left NONE. Whole-resource scope (not sub-ranged), same
+        // "trades a small amount of granularity for a much simpler, easier-to-verify-correct
+        // synchronization story" reasoning GpuGeometryPagePool's own class comment documents for
+        // its own whole-buffer release/acquire. No-op (records nothing) when
+        // m_AsyncComputeAvailableThisBuild is false (same queue family already, no transfer needed
+        // -- mirrors GpuGeometryPagePool::m_NeedsOwnershipTransfer's own skip pattern).
+        //
+        // KNOWN, DOCUMENTED SIMPLIFICATION: SurfaceCacheRayTracingPass's own internal
+        // TlasRefitResources (instanceBuffer/scratchBuffer -- private scratch state consumed ENTIRELY
+        // within RecordRefreshTLAS's own call, never read by any other pass on either queue) are
+        // deliberately NOT included in this transfer. A CPU-mapped instance buffer's host writes are
+        // not queue-family-scoped, so the only real risk is the GPU-side scratch buffer's ownership
+        // history if SetDebugAsyncComputeEnabled() is toggled mid-session (a rare, Debug-only
+        // scenario) -- accepted here rather than adding a second whole-resource-group transfer for
+        // two purely-internal scratch buffers with no cross-pass consumer.
+        void RecordSurfaceCacheOwnershipTransfer(VkCommandBuffer cmd, bool isRelease,
+            uint32_t srcFamily, uint32_t dstFamily, VkPipelineStageFlags2 activeStageMask,
+            VkAccessFlags2 activeImageAccessMask, VkAccessFlags2 activeBufferAccessMask);
+
 #ifndef NDEBUG
         // Phase 1 (Nanite advanced): C++ port of HermiteEvaluate/BuildBendFrame/ApplySplineDeformation
         // (spline_deformation.glsl), called once at the end of Init() -- densely samples the
@@ -383,6 +461,42 @@ namespace renderer {
         // see Shutdown()'s own comment in the .cpp for why. Only core::LoadingManager's own
         // destructor ever joins its worker threads, exactly once, when this object is destructed.
         core::LoadingManager m_LoadingManager;
+
+        // Phase 2 (Lumen advanced roadmap): the graphics queue family index (createInfo.
+        // graphicsQueueFamilyIndex) -- needed as the src/dstQueueFamilyIndex counterpart in every
+        // RecordSurfaceCacheOwnershipTransfer() call. Not previously stored by this class (every
+        // other pre-Phase-2 consumer only ever needed createInfo.queue itself, not its family
+        // index) -- see m_AsyncComputeQueueFamilyIndex's own sibling comment below.
+        uint32_t m_GraphicsQueueFamilyIndex = 0;
+
+        // Phase 2 (Lumen advanced roadmap): async-compute queue handles, copied from
+        // ClusterRenderPipelineCreateInfo at Init() time (borrowed, owned by VulkanContext, same
+        // convention as every other queue/family field this class stores). `queue`==VK_NULL_HANDLE
+        // until Init() runs.
+        VkQueue m_AsyncComputeQueue = VK_NULL_HANDLE;
+        uint32_t m_AsyncComputeQueueFamilyIndex = 0;
+        // Pure HARDWARE capability, copied once from createInfo.hasDedicatedAsyncComputeQueue at
+        // Init() time (VulkanContext::HasDedicatedAsyncComputeQueue()) -- true only when this GPU
+        // exposed a genuinely distinct async-compute-capable queue family. RecordFrame()'s [1z]
+        // block ALWAYS records SurfaceCacheRayTracingPass::RecordRefreshTLAS + the radiosity bounce
+        // loop into the separate asyncComputeCmd (never into `cmd` itself) whenever the debug toggle
+        // is on and traceMode == HWRT, REGARDLESS of this flag's value -- what this flag actually
+        // gates is whether the acquire/release barriers around that hand-off are real queue-family-
+        // ownership-transfer barriers or degenerate to a no-op (mirrors GpuGeometryPagePool::
+        // m_NeedsOwnershipTransfer's own skip pattern: same-family data needs no ownership transfer,
+        // only the barrier's usual execution/memory dependency, which still fires either way).
+        bool m_AsyncComputeAvailableThisBuild = false;
+
+        // True from the moment RecordFrame()'s own [1z2] block (near the end of the function)
+        // releases the Surface Cache atlas images + TLAS-refit buffers to the async-compute queue,
+        // until the NEXT RecordFrame() call's own [1z] block (near the top) acquires them back --
+        // i.e., true across the frame boundary, false for the rest of any given frame's own
+        // recording. Drives a genuine ONE-FRAME PIPELINE LAG (not a same-frame round trip -- see
+        // [1z2]'s own comment for why): starts false (resources are graphics-owned from Init()'s own
+        // one-shot BLAS/TLAS build and RecordCapture's very first draw, matching EXCLUSIVE sharing
+        // mode's "first use establishes ownership, no transfer needed" rule), and toggles exactly
+        // once per async-compute-active frame thereafter.
+        bool m_AtlasOwnedByAsync = false;
 
         // Owned pipeline stages, in rough execution order.
         GpuGeometryPagePool m_PagePool;
@@ -592,6 +706,11 @@ namespace renderer {
 #ifndef NDEBUG
         uint32_t m_DebugTraceMode = 0;
         bool m_DebugRadiosityEnabled = true;
+        // See SetDebugAsyncComputeEnabled()'s own comment: defaults to true (Release-always-on
+        // equivalent local, no toggle exists there -- matches m_DebugReflectionsEnabled's own
+        // convention), so the async-compute path is attempted by default and must be explicitly
+        // disabled to fall back to the fully-serialized graphics-queue path.
+        bool m_DebugAsyncComputeEnabled = true;
         bool m_DebugSSRTEnabled = true;
         // See SetDebugWorldProbesEnabled()'s own comment for why this defaults to true in Debug
         // while Release hardcodes the equivalent local to false (opposite of the two toggles above).

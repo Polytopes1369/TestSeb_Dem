@@ -122,9 +122,22 @@ namespace debugpipeline {
         TestReport report;
         report.SetHeader(BuildHeader(vkContext));
 
+        // Phase 2 (Lumen advanced roadmap): see main.cpp's own asyncComputeFence declaration-site
+        // comment -- `frameFence` (this function's own parameter) only guards the graphics queue's
+        // submission, not vkContext.GetAsyncComputeCommandBuffer()'s own independent one. Local to
+        // this function (not threaded in from main.cpp) since RunAll owns its whole frame loop.
+        VkFence asyncComputeFence = VK_NULL_HANDLE;
+        VkFenceCreateInfo asyncComputeFenceInfo{ VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+        asyncComputeFenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+        VK_CHECK(vkCreateFence(vkContext.GetDevice(), &asyncComputeFenceInfo, nullptr, &asyncComputeFence));
+
         Camera camera({ 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f });
         float azimuth = 0.0f;
         bool windowClosedEarly = false;
+        // Phase 2 (Lumen advanced roadmap): see main.cpp's own isFirstFrame declaration-site comment
+        // -- persists across every runFrames() call in this whole test run (not just within one
+        // call), matching main.cpp's own single-flag-for-the-whole-process-lifetime scope.
+        bool isFirstFrame = true;
 
         // --- Mirrors main()'s interactive per-frame sequence exactly (same fence/semaphore/
         // command-buffer contract -- see main.cpp's own comments for why each step is ordered the
@@ -158,6 +171,10 @@ namespace debugpipeline {
 
                 VK_CHECK(vkWaitForFences(vkContext.GetDevice(), 1, &frameFence, VK_TRUE, UINT64_MAX));
                 VK_CHECK(vkResetFences(vkContext.GetDevice(), 1, &frameFence));
+                // Phase 2 (Lumen advanced roadmap): see asyncComputeFence's own declaration-site
+                // comment above -- mirrors main.cpp's identical wait/reset.
+                VK_CHECK(vkWaitForFences(vkContext.GetDevice(), 1, &asyncComputeFence, VK_TRUE, UINT64_MAX));
+                VK_CHECK(vkResetFences(vkContext.GetDevice(), 1, &asyncComputeFence));
 
                 clusterPipeline.PumpDebugDAGCutGapsDump();
 
@@ -186,11 +203,18 @@ namespace debugpipeline {
                 VkCommandBufferBeginInfo transferBeginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
                 vkBeginCommandBuffer(transferCmd, &transferBeginInfo);
 
+                // Phase 2 (Lumen advanced roadmap): mirrors main.cpp's own identical sequence -- see
+                // that file's own comments for the full per-frame async-compute submit contract.
+                VkCommandBuffer asyncComputeCmd = vkContext.GetAsyncComputeCommandBuffer();
+                vkResetCommandBuffer(asyncComputeCmd, 0);
+                VkCommandBufferBeginInfo asyncComputeBeginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+                vkBeginCommandBuffer(asyncComputeCmd, &asyncComputeBeginInfo);
+
                 vkResetCommandBuffer(vkContext.GetCommandBuffer(), 0);
                 VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
                 vkBeginCommandBuffer(vkContext.GetCommandBuffer(), &beginInfo);
 
-                clusterPipeline.RecordFrame(vkContext.GetCommandBuffer(), transferCmd, camera.GetPushConstants(),
+                clusterPipeline.RecordFrame(vkContext.GetCommandBuffer(), transferCmd, asyncComputeCmd, camera.GetPushConstants(),
                     camera.GetPosition(), camera.GetFrameInfo(aspect), static_cast<float>(glfwGetTime()),
                     vkContext.GetSwapchainImages()[imageIndex], vkContext.GetSwapchainImageViews()[imageIndex],
                     vkContext.GetEntityTransformsCPU());
@@ -203,6 +227,7 @@ namespace debugpipeline {
                 }
 
                 vkEndCommandBuffer(transferCmd);
+                vkEndCommandBuffer(asyncComputeCmd);
                 vkEndCommandBuffer(vkContext.GetCommandBuffer());
 
                 VkSemaphore transferFinished = vkContext.GetTransferFinishedSemaphore();
@@ -215,16 +240,35 @@ namespace debugpipeline {
 
                 VkCommandBuffer cmd = vkContext.GetCommandBuffer();
                 VkSubmitInfo submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
-                VkSemaphore waitSemaphores[] = { imgAvailable, transferFinished };
-                VkPipelineStageFlags waitStages[] = { VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT };
-                submitInfo.waitSemaphoreCount = 2;
+                VkSemaphore asyncComputeFinished = vkContext.GetAsyncComputeFinishedSemaphore();
+                VkSemaphore waitSemaphores[] = { imgAvailable, transferFinished, asyncComputeFinished };
+                VkPipelineStageFlags waitStages[] = {
+                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
+                };
+                submitInfo.waitSemaphoreCount = isFirstFrame ? 2u : 3u;
                 submitInfo.pWaitSemaphores = waitSemaphores;
                 submitInfo.pWaitDstStageMask = waitStages;
                 submitInfo.commandBufferCount = 1;
                 submitInfo.pCommandBuffers = &cmd;
-                submitInfo.signalSemaphoreCount = 1;
-                submitInfo.pSignalSemaphores = &rndFinished;
+                VkSemaphore asyncComputeCanStart = vkContext.GetAsyncComputeCanStartSemaphore();
+                VkSemaphore signalSemaphores[] = { rndFinished, asyncComputeCanStart };
+                submitInfo.signalSemaphoreCount = 2;
+                submitInfo.pSignalSemaphores = signalSemaphores;
                 VK_CHECK(vkQueueSubmit(vkContext.GetGraphicsQueue(), 1, &submitInfo, frameFence));
+                isFirstFrame = false;
+
+                VkSemaphore asyncComputeFinishedSignal = vkContext.GetAsyncComputeFinishedSemaphore();
+                VkSubmitInfo asyncComputeSubmitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
+                asyncComputeSubmitInfo.waitSemaphoreCount = 1;
+                asyncComputeSubmitInfo.pWaitSemaphores = &asyncComputeCanStart;
+                VkPipelineStageFlags asyncComputeWaitStage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
+                asyncComputeSubmitInfo.pWaitDstStageMask = &asyncComputeWaitStage;
+                asyncComputeSubmitInfo.commandBufferCount = 1;
+                asyncComputeSubmitInfo.pCommandBuffers = &asyncComputeCmd;
+                asyncComputeSubmitInfo.signalSemaphoreCount = 1;
+                asyncComputeSubmitInfo.pSignalSemaphores = &asyncComputeFinishedSignal;
+                VK_CHECK(vkQueueSubmit(vkContext.GetAsyncComputeQueue(), 1, &asyncComputeSubmitInfo, asyncComputeFence));
 
                 VkSwapchainKHR swapchain = vkContext.GetSwapchain();
                 VkPresentInfoKHR presentInfo{ VK_STRUCTURE_TYPE_PRESENT_INFO_KHR };
@@ -238,8 +282,12 @@ namespace debugpipeline {
             // Fully settle the GPU before any post-group readback/screenshot write-out: safe here
             // (this pipeline is a one-shot offline validation run, not the perf-sensitive
             // interactive loop main.cpp's own comments explain the fence-only wait for) and
-            // required before mapping pendingStagingBuffer below.
+            // required before mapping pendingStagingBuffer below. Also waits on the async-compute
+            // queue (Phase 2, Lumen advanced roadmap) -- falls back transparently to a second,
+            // harmless idle-wait on the same queue as the graphics one above when this GPU exposes
+            // no dedicated async-compute family.
             vkQueueWaitIdle(vkContext.GetGraphicsQueue());
+            vkQueueWaitIdle(vkContext.GetAsyncComputeQueue());
 
             if (captureRequested && pendingStagingBuffer != VK_NULL_HANDLE) {
                 std::string relPath = "screenshots/" + screenshotFileName;
@@ -499,6 +547,12 @@ namespace debugpipeline {
         }
 
         vkQueueWaitIdle(vkContext.GetGraphicsQueue());
+        // Phase 2 (Lumen advanced roadmap): also idle the async-compute queue before tearing down
+        // asyncComputeFence below -- falls back transparently to a second, harmless idle-wait on
+        // the same queue as the graphics one above when this GPU exposes no dedicated async-compute
+        // family.
+        vkQueueWaitIdle(vkContext.GetAsyncComputeQueue());
+        vkDestroyFence(vkContext.GetDevice(), asyncComputeFence, nullptr);
         std::string reportPath = report.WriteMarkdown(outputDir);
         uint32_t failCount = report.FailCount();
         LOG_INFO(std::format("[DebugTestPipeline] Done. Report: '{}'. {} test(s) FAILED.", reportPath, failCount));

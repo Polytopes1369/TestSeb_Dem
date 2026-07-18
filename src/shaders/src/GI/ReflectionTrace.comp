@@ -56,6 +56,19 @@ layout(rg16f, set = 0, binding = 10) uniform writeonly image2D g_ReflectionNorma
 // only where this pass found nothing real to reflect.
 layout(r8, set = 0, binding = 11) uniform writeonly image2D g_ReflectionHitMask;
 
+// Phase 2 (Lumen advanced roadmap): fixed (non-ping-ponged) auxiliary outputs, both consumed SAME-
+// FRAME only (like g_ReflectionHitMask above, unlike g_ReflectionRadiance/WorldPos/Normal's own
+// ping-pong reprojection) -- see renderer::ReflectionPass::m_RawRadianceImage/m_HalfVectorImage's
+// own member comments for the full rationale.
+// Raw (pre-temporal-blend) copy of this pixel's traced radiance -- ReflectionTemporal.comp's new 3x3
+// neighborhood variance-clamp box samples THIS image, never the ping-pong g_ReflectionRadiance slot
+// itself, to avoid racing against a neighboring workgroup's own in-place temporal blend write.
+layout(rgba16f, set = 0, binding = 12) uniform writeonly image2D g_ReflectionRawRadiance;
+// This pixel's GGX-VNDF-sampled half-vector (octahedral-encoded, same convention as
+// g_ReflectionNormal above) -- ReflectionGather.comp reconstructs it to evaluate the complete
+// D_GGX * G_SmithGGXCorrelated * F_Schlick specular BRDF product.
+layout(rg16f, set = 0, binding = 13) uniform writeonly image2D g_ReflectionHalfVector;
+
 layout(push_constant) uniform TracePushConstants {
     uint entityCount; // Dynamically uniform -- see mesh_sdf_trace.glsl's own requirement.
     uint traceMode;   // 0 = SWRT (TraceMeshSDFScene), 1 = HWRT (TraceHWRT, inline ray query).
@@ -117,6 +130,8 @@ void main() {
         imageStore(g_ReflectionWorldPos, pixel, vec4(0.0));
         imageStore(g_ReflectionNormal, pixel, vec4(0.5, 0.5, 0.0, 0.0));
         imageStore(g_ReflectionHitMask, pixel, vec4(0.0));
+        imageStore(g_ReflectionRawRadiance, pixel, vec4(0.0));
+        imageStore(g_ReflectionHalfVector, pixel, vec4(0.5, 0.5, 0.0, 0.0));
         return;
     }
 
@@ -152,12 +167,19 @@ void main() {
         tangent * halfVectorTangentSpace.x + bitangent * halfVectorTangentSpace.y + normal * halfVectorTangentSpace.z);
     vec3 rayDir = reflect(-viewDir, halfVectorWorld);
 
+    // Written right after halfVectorWorld is computed (see g_ReflectionHalfVector's own binding
+    // comment) -- valid for every remaining exit path below, including the grazing-angle miss right
+    // after this, since ReflectionGather.comp re-derives L = reflect(-V, H) deterministically from
+    // this SAME stored H rather than needing rayDir itself.
+    imageStore(g_ReflectionHalfVector, pixel, vec4(OctEncode(halfVectorWorld), 0.0, 0.0));
+
     // A grazing-angle reflection whose sampled half-vector points below the macro-surface plane
     // (dot(rayDir, normal) <= 0) is a well-known GGX-VNDF edge case at high roughness -- treat it
     // as an immediate miss (radiance = 0) rather than tracing a physically invalid ray.
     if (dot(rayDir, normal) <= 0.0) {
         imageStore(g_ReflectionRadiance, pixel, vec4(0.0, 0.0, 0.0, 1.0));
         imageStore(g_ReflectionHitMask, pixel, vec4(0.0));
+        imageStore(g_ReflectionRawRadiance, pixel, vec4(0.0, 0.0, 0.0, 1.0));
         return;
     }
 
@@ -180,4 +202,8 @@ void main() {
 
     imageStore(g_ReflectionRadiance, pixel, vec4(radiance, 1.0));
     imageStore(g_ReflectionHitMask, pixel, vec4(hit ? 1.0 : 0.0));
+    // Raw copy for ReflectionTemporal.comp's neighborhood clamp -- see g_ReflectionRawRadiance's own
+    // binding comment. Identical value to g_ReflectionRadiance's own write above, deliberately: this
+    // is a read-race-free COPY, not an independent computation.
+    imageStore(g_ReflectionRawRadiance, pixel, vec4(radiance, 1.0));
 }
