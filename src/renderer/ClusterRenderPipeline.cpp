@@ -1529,6 +1529,27 @@ void ClusterRenderPipeline::RecordFrameEarly(VkCommandBuffer cmdEarly,
         gpu.gravityY = cfg.gravityY; gpu.bounceElasticity = cfg.bounceElasticity;
         gpu.friction = cfg.friction; gpu.dragCoefficient = cfg.dragCoefficient;
         gpu.spawnShape = cfg.spawnShape;
+        // Module stack roadmap (subtask A3): curl-noise turbulence + radial attractor/repulsor force
+        // modules -- same "copy the live ImGui-edited config value into this frame's GPU struct"
+        // pattern as every field above.
+        gpu.curlNoiseEnabled = cfg.curlNoiseEnabled ? 1u : 0u;
+        gpu.curlNoiseStrength = cfg.curlNoiseStrength;
+        gpu.curlNoiseScale = cfg.curlNoiseScale;
+        gpu.attractorEnabled = cfg.attractorEnabled ? 1u : 0u;
+        gpu.attractorOffsetX = cfg.attractorOffsetX; gpu.attractorOffsetY = cfg.attractorOffsetY; gpu.attractorOffsetZ = cfg.attractorOffsetZ;
+        gpu.attractorStrength = cfg.attractorStrength;
+        gpu.attractorRadius = cfg.attractorRadius;
+
+        // Subtask A4 (color-over-life / size-over-life curves): copied wholesale every frame, same
+        // "always re-upload the full live-tunable struct" convention as every other EmitterParams
+        // field above -- see config::particles::EmitterConfig::colorCurve/sizeCurve's own declaration
+        // comment for the full evaluation contract.
+        for (uint32_t key = 0; key < 4; ++key) {
+            for (uint32_t channel = 0; channel < 4; ++channel) {
+                gpu.colorCurve[key][channel] = cfg.colorCurve[key][channel];
+            }
+            gpu.sizeCurve[key] = cfg.sizeCurve[key];
+        }
 
         if (cfg.active) {
           m_ParticleSpawnAccumulator[i] += cfg.spawnRate * particleDeltaTimeSeconds;

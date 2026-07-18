@@ -12,6 +12,7 @@
 #include "world/CellManifest.h"
 #include "world/WorldCellStreamingLoader.h"
 #include "world/LwcOrigin.h"
+#include "audio/AudioEngine.h"
 #include <exception>
 #include <optional>
 #include <unordered_map>
@@ -353,6 +354,18 @@ int main(int argc, char** argv) {
     }
 
 #ifndef NDEBUG
+    // Phase 0.1 (UE5.8-parity PCG roadmap, "Dynamic Instance Registry"): CPU-only Acquire/Release
+    // smoke test for the new core::InstanceRegistry backing VulkanContext's entity storage -- see
+    // VulkanContext::RunInstanceRegistrySmokeTest's own comment for exactly what it checks. Not
+    // fatal on failure (logged only): this validates a mechanism no runtime caller depends on yet
+    // (Phase 0.1 only lays the groundwork later PCG phases build on), so it must not block startup
+    // the way a real content-load failure would.
+    if (!vkContext.RunInstanceRegistrySmokeTest()) {
+        LOG_ERROR("[Main] InstanceRegistry smoke test FAILED -- see log above for the specific check.");
+    }
+#endif
+
+#ifndef NDEBUG
     // Setup Dear ImGui context
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
@@ -660,6 +673,24 @@ int main(int argc, char** argv) {
     // horizon -- enough open sky to read the Sky-View LUT gradient and cloud layer while the
     // showcase gallery still fills the rest of the frame.
     Camera camera({ 12.3613f, 6.5726f, 0.0f }, { 0.0f, 4.0f, 0.0f });
+
+    // Procedural 3D Audio Engine (src/audio/ -- closes the "moteur de son 3D + style FL studio"
+    // gap in this project's own CLAUDE.md design brief): owned directly here, following the same
+    // "plain local variable, Init() once before the loop, Update() once per frame inside it"
+    // pattern `camera`/`lwcOrigin` above and below already establish for per-frame CPU-side state
+    // that isn't itself a Vulkan resource. A real, always-on feature (per CLAUDE.md's build-
+    // separation rule) -- constructed and updated identically in Debug and Release, unlike
+    // g_DebugState above. Deliberately instantiated AFTER the #ifndef NDEBUG --test-pipeline
+    // early-return above (never reached at all during an automated --test-pipeline run, which has
+    // no need to spin up real XAudio2 hardware) but unconditionally in the normal interactive path.
+    // Init() failure (e.g. no audio device present) is logged and non-fatal -- see AudioEngine::
+    // Init()'s own comment: the demo simply runs silent, matching this codebase's own convention
+    // for additive-not-load-bearing subsystems (e.g. World Partition streaming's missing-manifest
+    // fallback just below).
+    audio::AudioEngine audioEngine;
+    if (!audioEngine.Init()) {
+        LOG_WARNING("[Main] AudioEngine::Init failed -- continuing without audio.");
+    }
 
     // Phase 5 (Streaming & Monde roadmap, Part 1): the single LWC origin-tracking instance driving
     // every render-boundary rebase this frame (Camera::UpdateRebased/GetRebasedPosition for the
@@ -1121,6 +1152,48 @@ int main(int argc, char** argv) {
                         ImGui::SliderFloat("Friction", &cfg.friction, 0.0f, 1.0f);
                         ImGui::DragFloat("Wind Drag", &cfg.dragCoefficient, 0.02f, 0.0f, 5.0f);
 
+                        // Module stack roadmap (subtask A3): two independently-toggleable force
+                        // modules layered on top of the fixed physics knobs above -- a small,
+                        // fixed-size, data-driven stand-in for a real Niagara module graph (a full
+                        // visual-scripting node editor is out of scope for this project, see
+                        // renderer::ParticleSystemPass::EmitterParams' own header comment).
+                        ImGui::Separator();
+                        ImGui::TextUnformatted("Force Modules");
+                        ImGui::Checkbox("Curl-Noise Turbulence", &cfg.curlNoiseEnabled);
+                        ImGui::DragFloat("Turbulence Strength (m/s^2)", &cfg.curlNoiseStrength, 0.02f, 0.0f, 10.0f);
+                        ImGui::DragFloat("Turbulence Scale", &cfg.curlNoiseScale, 0.005f, 0.01f, 3.0f);
+                        ImGui::Checkbox("Radial Attractor/Repulsor", &cfg.attractorEnabled);
+                        ImGui::DragFloat3("Attractor Offset (from emitter)", &cfg.attractorOffsetX, 0.05f);
+                        ImGui::DragFloat("Attractor Strength (+attract/-repel)", &cfg.attractorStrength, 0.05f, -20.0f, 20.0f);
+                        ImGui::DragFloat("Attractor Falloff Radius (m)", &cfg.attractorRadius, 0.05f, 0.05f, 50.0f);
+
+                        // Subtask A4 (color-over-life / size-over-life curves): 4 keyframes each,
+                        // evenly spaced across a particle's normalized age -- see config::particles::
+                        // EmitterConfig::colorCurve/sizeCurve's own declaration comment for the full
+                        // evaluation contract (color is DIRECT/authoritative, overriding "Base Color"
+                        // above once edited here; size is a MULTIPLIER on top of "Size Range" above).
+                        // Only meaningful for ember-kind particles -- precipitation (rain/snow) never
+                        // reads these fields at all (see ParticleSimulation.comp's own UpdateParticle
+                        // comment).
+                        ImGui::Separator();
+                        ImGui::TextUnformatted("Color / Size Over Life (subtask A4)");
+                        ImGui::TextDisabled("4 keys at normalized age 0.00 / 0.33 / 0.67 / 1.00, linearly interpolated.");
+                        static const char* kCurveKeyLabels[4] = { "Age 0.00", "Age 0.33", "Age 0.67", "Age 1.00" };
+                        ImGui::PushID("ColorCurve");
+                        for (uint32_t k = 0; k < 4; ++k) {
+                            ImGui::PushID(static_cast<int>(k));
+                            ImGui::ColorEdit4(kCurveKeyLabels[k], cfg.colorCurve[k]);
+                            ImGui::PopID();
+                        }
+                        ImGui::PopID();
+                        ImGui::PushID("SizeCurve");
+                        for (uint32_t k = 0; k < 4; ++k) {
+                            ImGui::PushID(static_cast<int>(k));
+                            ImGui::DragFloat(kCurveKeyLabels[k], &cfg.sizeCurve[k], 0.01f, 0.0f, 5.0f, "%.2fx");
+                            ImGui::PopID();
+                        }
+                        ImGui::PopID();
+
                         // Multi-emitter roadmap (subtask A1) validation/debug instrumentation: proves
                         // this emitter is independently alive/producing particles, not just that the
                         // aggregate total below is nonzero.
@@ -1171,6 +1244,46 @@ int main(int argc, char** argv) {
                 ImGui::TextDisabled("Instances: %u / %u",
                     clusterPipeline.GetVegetationScatter().GetInstanceCount(),
                     renderer::VegetationScatterPass::kMaxInstances);
+
+                ImGui::EndTabItem();
+            }
+
+            // --- Tab Audio (Procedural 3D Audio Engine, src/audio/) ---------------------------
+            // Debug-only per CLAUDE.md's build-separation rule: the sliders below edit the same
+            // live config::audio::* globals audio::AudioEngine reads every Update() call in BOTH
+            // Debug and Release (the engine itself is not gated, only this diagnostic panel is).
+            if (ImGui::BeginTabItem("Audio")) {
+                if (!audioEngine.IsInitialized()) {
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.3f, 0.3f, 1.0f));
+                    ImGui::TextWrapped("AudioEngine failed to initialize (no audio device / XAudio2 unavailable) -- running silent. See demo_log.txt.");
+                    ImGui::PopStyleColor();
+                }
+
+                ImGui::SliderFloat("Master Volume", &config::audio::MASTER_VOLUME, 0.0f, 1.0f);
+
+                ImGui::Separator();
+                ImGui::TextUnformatted("Generative Music (procedural pentatonic-scale ambient pad sequencer)");
+                ImGui::Checkbox("Enabled", &config::audio::GENERATIVE_MUSIC_ENABLED);
+                ImGui::SliderFloat("Volume##Generative", &config::audio::GENERATIVE_MUSIC_VOLUME, 0.0f, 1.0f);
+                ImGui::DragFloat("Tempo (BPM)", &config::audio::GENERATIVE_TEMPO_BPM, 0.5f, 20.0f, 200.0f);
+                ImGui::SliderFloat("Note Density", &config::audio::GENERATIVE_NOTE_DENSITY, 0.0f, 1.0f);
+                ImGui::TextDisabled("Active pad notes: %u / %u", audioEngine.GetGenerativeActiveNoteCount(), audio::GenerativeComposer::kMaxPolyphony);
+                ImGui::TextDisabled("Sequencer: bar chord %u/4, step %u/16", audioEngine.GetGenerativeChordIndex() + 1u, audioEngine.GetGenerativeStepIndex() + 1u);
+
+                ImGui::Separator();
+                ImGui::TextUnformatted("Positional Environmental Sources (3D distance attenuation + stereo pan)");
+                ImGui::Checkbox("Enabled##Positional", &config::audio::POSITIONAL_AUDIO_ENABLED);
+                ImGui::SliderFloat("Embers Volume", &config::audio::EMBERS_VOLUME, 0.0f, 1.0f);
+                ImGui::SliderFloat("Waterfall Volume", &config::audio::WATERFALL_VOLUME, 0.0f, 1.0f);
+                ImGui::SliderFloat("Wind Volume", &config::audio::WIND_VOLUME, 0.0f, 1.0f);
+                ImGui::DragFloat("Attenuation Reference Distance (m)", &config::audio::ATTENUATION_REFERENCE_DISTANCE_METERS, 0.1f, 0.1f, 50.0f);
+                ImGui::DragFloat("Attenuation Rolloff", &config::audio::ATTENUATION_ROLLOFF, 0.05f, 0.0f, 10.0f);
+                ImGui::DragFloat("Attenuation Max Distance (m)", &config::audio::ATTENUATION_MAX_DISTANCE_METERS, 1.0f, 1.0f, 500.0f);
+
+                for (uint32_t i = 0; i < audio::AudioEngine::kPositionalSourceCountDebug; ++i) {
+                    ImGui::TextDisabled("%s: pan %.2f, distance gain %.2f",
+                        audioEngine.GetPositionalSourceName(i), audioEngine.GetPositionalPan(i), audioEngine.GetPositionalDistanceGain(i));
+                }
 
                 ImGui::EndTabItem();
             }
@@ -1357,6 +1470,26 @@ int main(int argc, char** argv) {
         // UpdateRebased's own comment. camera.GetPosition() (true absolute) stays untouched for
         // the streaming-source distance math further below.
         camera.UpdateRebased(aspect, lwcOrigin.GetCurrentOffset());
+
+        // Procedural 3D Audio Engine: fed once per frame with the current camera + this frame's
+        // own dt, entirely decoupled from the Vulkan command-buffer recording that starts further
+        // below (XAudio2 mixes on its own internal thread -- this call only tops up each voice's
+        // streaming ring buffer and updates 3D pan/attenuation, never blocks on audio hardware, see
+        // AudioEngine::Update's own comment). Uses the TRUE absolute camera position/forward (NOT
+        // the LWC-rebased one camera.UpdateRebased() just built the render path's view matrix from
+        // above) -- this demo's world extent is small enough that positional audio never needs
+        // large-world-coordinate rebasing, so camera.GetFrameInfo() is deliberately used here
+        // as-is rather than threading lwcOrigin's offset through a second, audio-only rebase.
+        // Placed after the fly-camera movement block (this frame's camera position is final) and
+        // after camera.UpdateRebased() only because `aspect` is computed alongside it just above --
+        // GetFrameInfo()'s own aspectRatio/fovYRadians/near/far fields are unused by AudioEngine.
+        {
+            static double lastAudioTime = glfwGetTime();
+            double now = glfwGetTime();
+            float audioDt = static_cast<float>(now - lastAudioTime);
+            lastAudioTime = now;
+            audioEngine.Update(audioDt, camera.GetFrameInfo(aspect));
+        }
 
         // --- Runtime World Partition streaming tick: evaluate desired cell representations from
         // the camera's current position, dispatch queued load/unload work onto the shared
@@ -1718,6 +1851,10 @@ int main(int argc, char** argv) {
     }
 
     LOG_INFO("Shutting down engine...");
+
+    // No Vulkan dependency (XAudio2 mixes independently on its own thread) -- safe to shut down
+    // before the GPU drain below. Idempotent/safe even if Init() failed above.
+    audioEngine.Shutdown();
 
     // Drain the GPU before destroying anything the last in-flight frame may still be using --
     // the per-frame loop deliberately never device-idles, so this is the one place that does.
