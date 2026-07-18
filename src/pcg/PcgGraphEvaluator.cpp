@@ -24,6 +24,22 @@ namespace pcg {
         return it != m_Fns.end() ? &it->second : nullptr;
     }
 
+    // Phase 5.3 ("GPU-Resident Node Execution") -- see PcgGraphEvaluator.h's own GPU header comment
+    // block for the full design rationale. Mirrors the CPU Register/IsRegistered/Find trio above
+    // exactly, just against the independent m_GpuFns map.
+    void PcgNodeTypeRegistry::RegisterGpu(PcgNodeTypeId typeId, PcgGpuNodeExecuteFn fn) {
+        m_GpuFns[std::move(typeId)] = std::move(fn);
+    }
+
+    bool PcgNodeTypeRegistry::IsGpuRegistered(const PcgNodeTypeId& typeId) const {
+        return m_GpuFns.find(typeId) != m_GpuFns.end();
+    }
+
+    const PcgGpuNodeExecuteFn* PcgNodeTypeRegistry::FindGpu(const PcgNodeTypeId& typeId) const {
+        const auto it = m_GpuFns.find(typeId);
+        return it != m_GpuFns.end() ? &it->second : nullptr;
+    }
+
     bool PcgGraphEvaluator::TopologicalOrder(const PcgGraph& graph, std::vector<uint32_t>& outOrder, std::string& outError) {
         outOrder.clear();
 
@@ -224,6 +240,43 @@ namespace pcg {
             }
 
             result.nodeOutputs.emplace(nodeId, std::move(outputs));
+        }
+
+        result.success = true;
+        return result;
+    }
+
+    // Phase 5.3 ("GPU-Resident Node Execution") -- see PcgGraphEvaluator.h's own comment on this
+    // method for the full "why single-node, not a graph-walking counterpart to Evaluate()"
+    // rationale. Deliberately as small as the CPU per-node dispatch step inside EvaluateInternal
+    // above (find the node, find its registered callback, invoke it with its own params) -- the
+    // only real difference is which registry map is consulted and that no pin/topological
+    // machinery is involved at all, since a GPU node's input/output are supplied directly.
+    PcgGraphEvaluator::GpuEvalResult PcgGraphEvaluator::EvaluateNodeGpu(const PcgGraph& graph, uint32_t nodeId,
+        VkCommandBuffer cmd, const PcgGpuPointBuffer& input, const PcgGpuPointBuffer& output) const {
+        GpuEvalResult result;
+
+        const PcgNode* node = graph.FindNode(nodeId);
+        if (!node) {
+            result.success = false;
+            result.errorMessage = "EvaluateNodeGpu: unknown nodeId " + std::to_string(nodeId);
+            return result;
+        }
+
+        const PcgGpuNodeExecuteFn* fn = m_Registry.FindGpu(node->typeId);
+        if (!fn) {
+            result.success = false;
+            result.errorMessage = "EvaluateNodeGpu: node " + std::to_string(nodeId) + ": no GPU node type registered for typeId '" +
+                node->typeId + "' (it may still have a CPU registration -- see PcgNodeTypeRegistry::IsRegistered)";
+            return result;
+        }
+
+        const PcgGpuNodeExecuteResult execResult = (*fn)(cmd, input, output, node->params);
+        if (!execResult.success) {
+            result.success = false;
+            result.errorMessage = "EvaluateNodeGpu: node " + std::to_string(nodeId) + " (" + node->typeId +
+                ") GPU execution failed: " + execResult.errorMessage;
+            return result;
         }
 
         result.success = true;
