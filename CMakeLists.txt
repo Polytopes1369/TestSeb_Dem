@@ -283,6 +283,30 @@ add_executable(PcgTerrainSamplerTests
 target_include_directories(PcgTerrainSamplerTests PRIVATE src ${Vulkan_INCLUDE_DIRS})
 add_test(NAME PcgTerrainSamplerTests COMMAND PcgTerrainSamplerTests)
 
+# PCG framework roadmap, Phase 3.4 ("Slope/Height Filter + Projection"): src/pcg/PcgSlopeHeightFilter.cpp
+# depends on Phase 2.2's Terrain Sampler (PcgTerrainSampler.cpp) for its Projection operation's
+# height/normal re-query and its terrain-batch Slope Filter overload's slope semantics, so this
+# target links that source alongside its own filter implementation and test file.
+add_executable(PcgSlopeHeightFilterTests
+    src/pcg/PcgSlopeHeightFilter.cpp
+    src/pcg/PcgTerrainSampler.cpp
+    tests/PcgSlopeHeightFilterTests.cpp
+)
+target_include_directories(PcgSlopeHeightFilterTests PRIVATE src ${Vulkan_INCLUDE_DIRS})
+add_test(NAME PcgSlopeHeightFilterTests COMMAND PcgSlopeHeightFilterTests)
+
+# PCG framework roadmap, Phase 3.2 ("Self-Pruning Filter"): PcgSelfPruningFilter.cpp holds the
+# uniform-hash-grid spatial acceleration structure + PruneByDistance sweep; depends only on the
+# header-only Phase 1 PCG data-model types (PcgPointData.h/PcgSeededRandom.h), so this target
+# links the filter source alongside the test file itself, same pattern as every other
+# tests/*.cpp target above.
+add_executable(PcgSelfPruningFilterTests
+    src/pcg/PcgSelfPruningFilter.cpp
+    tests/PcgSelfPruningFilterTests.cpp
+)
+target_include_directories(PcgSelfPruningFilterTests PRIVATE src ${Vulkan_INCLUDE_DIRS})
+add_test(NAME PcgSelfPruningFilterTests COMMAND PcgSelfPruningFilterTests)
+
 # PCG framework roadmap, Phase 5.1+5.2 ("PCG Graph Engine Core"): the node/link graph data model +
 # JSON serialization (src/pcg/PcgGraph.cpp) and the CPU topological evaluator + subgraph support
 # (src/pcg/PcgGraphEvaluator.cpp), built directly on Phase 1's data model. PcgGraph.cpp reuses
@@ -298,6 +322,30 @@ add_executable(PcgGraphEngineTests
 )
 target_include_directories(PcgGraphEngineTests PRIVATE src ${Vulkan_INCLUDE_DIRS})
 add_test(NAME PcgGraphEngineTests COMMAND PcgGraphEngineTests)
+
+# PCG framework roadmap, Phase 3.3 ("Boolean Set Operations"): Union/Intersect/Difference over
+# point sets (volume-based inclusion/exclusion + spline-distance exclusion). PcgBooleanSetOps.cpp
+# depends on Phase 2.4's arc-length utilities (PcgSplineSampler.cpp's BuildSplineArcLengthTable),
+# so this target links that source file too, alongside its own .cpp and the test file.
+add_executable(PcgBooleanSetOpsTests
+    src/pcg/PcgBooleanSetOps.cpp
+    src/pcg/PcgSplineSampler.cpp
+    tests/PcgBooleanSetOpsTests.cpp
+)
+target_include_directories(PcgBooleanSetOpsTests PRIVATE src ${Vulkan_INCLUDE_DIRS})
+add_test(NAME PcgBooleanSetOpsTests COMMAND PcgBooleanSetOpsTests)
+
+# PCG framework roadmap, Phase 3.1 ("Density Filter, Transform Filter, Attribute Noise/Remap"):
+# src/pcg/PcgDensityTransformFilter.cpp is the real implementation under test (density
+# keep/remap, per-point-seed transform jitter, coherent value-noise density modulation); it
+# depends only on the header-only Phase 1 PCG data-model types (PcgPointData.h/PcgSeededRandom.h),
+# so this target links no other project source beyond that .cpp and the test file itself.
+add_executable(PcgDensityTransformFilterTests
+    src/pcg/PcgDensityTransformFilter.cpp
+    tests/PcgDensityTransformFilterTests.cpp
+)
+target_include_directories(PcgDensityTransformFilterTests PRIVATE src ${Vulkan_INCLUDE_DIRS})
+add_test(NAME PcgDensityTransformFilterTests COMMAND PcgDensityTransformFilterTests)
 
 add_executable(AsyncDecompressingLoaderTests
     src/io/AsyncFileStreamer.cpp
