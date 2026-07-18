@@ -1065,23 +1065,48 @@ int main(int argc, char** argv) {
                 ImGui::EndTabItem();
             }
 
-            // --- Tab Particles (particle_system_integration_plan.md, Subtask 6) ---
-            // Live sliders over config::particles::*, consumed every frame by
+            // --- Tab Particles (particle_system_integration_plan.md, Subtask 6; multi-emitter
+            // roadmap, subtask A1) --- One collapsible section per config::particles::EMITTERS[]
+            // slot, live-edited directly, consumed every frame by
             // renderer::ClusterRenderPipeline::RecordFrame's own RecordSimulate/RecordDraw calls.
+            // Names are a purely local Debug-only UI label array -- never stored in EngineConfig.h
+            // (which is shared with Release builds) to keep CLAUDE.md's "zero verbose strings outside
+            // Debug" rule intact.
             if (ImGui::BeginTabItem("Particles")) {
-                ImGui::TextUnformatted("Emitter");
-                ImGui::DragFloat("Spawn Rate (particles/s)", &config::particles::SPAWN_RATE_PER_SECOND, 5.0f, 0.0f, 5000.0f);
-                ImGui::DragFloat3("Emitter Position", &config::particles::EMITTER_POSITION_X, 0.05f);
+                static const char* kEmitterNames[renderer::ParticleSystemPass::kMaxEmitters] = {
+                    "Emitter 0 (Embers)", "Emitter 1 (Ambient Dust)", "Emitter 2", "Emitter 3" };
+
+                for (uint32_t i = 0; i < renderer::ParticleSystemPass::kMaxEmitters; ++i) {
+                    config::particles::EmitterConfig& cfg = config::particles::EMITTERS[i];
+                    ImGui::PushID(static_cast<int>(i));
+                    if (ImGui::CollapsingHeader(kEmitterNames[i], ImGuiTreeNodeFlags_DefaultOpen)) {
+                        ImGui::Checkbox("Active", &cfg.active);
+                        ImGui::DragFloat("Spawn Rate (particles/s)", &cfg.spawnRate, 5.0f, 0.0f, 5000.0f);
+                        ImGui::DragFloat3("Position", &cfg.positionX, 0.05f);
+                        ImGui::Combo("Spawn Shape", reinterpret_cast<int*>(&cfg.spawnShape), "Cone Burst\0Sphere Volume\0\0");
+                        ImGui::DragFloat("Shape Param (sphere radius)", &cfg.shapeParam0, 0.02f, 0.0f, 20.0f);
+                        ImGui::ColorEdit4("Base Color", &cfg.colorR);
+                        ImGui::DragFloatRange2("Size Range", &cfg.sizeMin, &cfg.sizeMax, 0.005f, 0.001f, 5.0f);
+                        ImGui::DragFloatRange2("Lifetime Range (s)", &cfg.lifetimeMin, &cfg.lifetimeMax, 0.05f, 0.1f, 30.0f);
+
+                        ImGui::Separator();
+                        ImGui::TextUnformatted("Physics");
+                        ImGui::DragFloat("Gravity (Y, m/s^2)", &cfg.gravityY, 0.1f, -30.0f, 30.0f);
+                        ImGui::SliderFloat("Bounce Elasticity", &cfg.bounceElasticity, 0.0f, 1.0f);
+                        ImGui::SliderFloat("Friction", &cfg.friction, 0.0f, 1.0f);
+                        ImGui::DragFloat("Wind Drag", &cfg.dragCoefficient, 0.02f, 0.0f, 5.0f);
+
+                        // Multi-emitter roadmap (subtask A1) validation/debug instrumentation: proves
+                        // this emitter is independently alive/producing particles, not just that the
+                        // aggregate total below is nonzero.
+                        ImGui::TextDisabled("Alive (this emitter): %u",
+                            clusterPipeline.GetParticleSystem().GetLastPerEmitterAliveCountApprox(i));
+                    }
+                    ImGui::PopID();
+                }
 
                 ImGui::Separator();
-                ImGui::TextUnformatted("Physics");
-                ImGui::DragFloat("Gravity (Y, m/s^2)", &config::particles::GRAVITY, 0.1f, -30.0f, 30.0f);
-                ImGui::SliderFloat("Bounce Elasticity", &config::particles::BOUNCE_ELASTICITY, 0.0f, 1.0f);
-                ImGui::SliderFloat("Friction", &config::particles::FRICTION, 0.0f, 1.0f);
-                ImGui::DragFloat("Wind Drag", &config::particles::DRAG_COEFFICIENT, 0.02f, 0.0f, 5.0f);
-
-                ImGui::Separator();
-                ImGui::TextUnformatted("Rendering");
+                ImGui::TextUnformatted("Rendering (shared by every emitter)");
                 ImGui::DragFloat("Soft Fade Distance (m)", &config::particles::SOFT_FADE_DISTANCE, 0.02f, 0.0f, 5.0f);
                 ImGui::Checkbox("Heat Shimmer", &config::particles::HEAT_SHIMMER_ENABLED);
                 ImGui::SliderFloat("Heat Shimmer Strength", &config::particles::HEAT_SHIMMER_STRENGTH, 0.0f, 0.2f);

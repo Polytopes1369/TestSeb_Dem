@@ -1483,12 +1483,32 @@ void ClusterRenderPipeline::RecordFrameEarly(VkCommandBuffer cmdEarly,
       m_LastParticleFrameTimeSeconds = globalTimeSeconds;
       m_HasLastParticleFrameTime = true;
 
-      m_ParticleSpawnAccumulator += config::particles::SPAWN_RATE_PER_SECOND * particleDeltaTimeSeconds;
-      uint32_t particleSpawnCount = static_cast<uint32_t>(m_ParticleSpawnAccumulator);
-      m_ParticleSpawnAccumulator -= static_cast<float>(particleSpawnCount);
+      // Multi-emitter roadmap (subtask A1): build this frame's full EmitterParams array + one
+      // spawn-count per emitter slot from config::particles::EMITTERS[] (live ImGui state) -- each
+      // slot keeps its OWN fractional spawn-rate accumulator (m_ParticleSpawnAccumulator[i]) so an
+      // inactive emitter simply never accumulates (no burst of stale spawns if it is later
+      // reactivated) while every active emitter stays exact over time regardless of framerate.
+      ParticleSystemPass::EmitterParams particleEmitters[ParticleSystemPass::kMaxEmitters]{};
+      uint32_t particleSpawnCounts[ParticleSystemPass::kMaxEmitters]{};
+      for (uint32_t i = 0; i < ParticleSystemPass::kMaxEmitters; ++i) {
+        const config::particles::EmitterConfig& cfg = config::particles::EMITTERS[i];
+        ParticleSystemPass::EmitterParams& gpu = particleEmitters[i];
+        gpu.positionX = cfg.positionX; gpu.positionY = cfg.positionY; gpu.positionZ = cfg.positionZ;
+        gpu.shapeParam0 = cfg.shapeParam0;
+        gpu.colorR = cfg.colorR; gpu.colorG = cfg.colorG; gpu.colorB = cfg.colorB; gpu.colorA = cfg.colorA;
+        gpu.sizeMin = cfg.sizeMin; gpu.sizeMax = cfg.sizeMax;
+        gpu.lifetimeMin = cfg.lifetimeMin; gpu.lifetimeMax = cfg.lifetimeMax;
+        gpu.gravityY = cfg.gravityY; gpu.bounceElasticity = cfg.bounceElasticity;
+        gpu.friction = cfg.friction; gpu.dragCoefficient = cfg.dragCoefficient;
+        gpu.spawnShape = cfg.spawnShape;
 
-      float particleEmitterPosition[3] = {
-          config::particles::EMITTER_POSITION_X, config::particles::EMITTER_POSITION_Y, config::particles::EMITTER_POSITION_Z };
+        if (cfg.active) {
+          m_ParticleSpawnAccumulator[i] += cfg.spawnRate * particleDeltaTimeSeconds;
+        }
+        uint32_t spawnCount = static_cast<uint32_t>(m_ParticleSpawnAccumulator[i]);
+        particleSpawnCounts[i] = spawnCount;
+        m_ParticleSpawnAccumulator[i] -= static_cast<float>(spawnCount);
+      }
 
       // Precipitation feature (Ubisoft "Atmos"-style: rain/snow tied directly to the climate
       // simulation, not a manual toggle) -- spawn rate scales with config::atmos::
@@ -1499,8 +1519,9 @@ void ClusterRenderPipeline::RecordFrameEarly(VkCommandBuffer cmdEarly,
       // slider otherwise, so precipitation kind tracks whichever temperature the simulation is
       // actually driving) -- below PRECIPITATION_SNOW_TEMPERATURE_THRESHOLD_CELSIUS (default 2.0 C,
       // matching real-world sleet/snow transition) spawns snow, otherwise rain. Same
-      // fractional-accumulator idiom as the embers emitter just above (see m_PrecipSpawnAccumulator's
-      // own declaration comment).
+      // fractional-accumulator idiom as each embers emitter above (see m_PrecipSpawnAccumulator's
+      // own declaration comment) -- precipitation is not one of config::particles::EMITTERS[], it
+      // has its own dedicated camera-relative spawn-shell and kind resolution instead.
       m_PrecipSpawnAccumulator += config::atmos::PRECIPITATION_INTENSITY * config::atmos::PRECIPITATION_MAX_SPAWN_RATE_PER_SECOND * particleDeltaTimeSeconds;
       uint32_t precipSpawnCount = static_cast<uint32_t>(m_PrecipSpawnAccumulator);
       m_PrecipSpawnAccumulator -= static_cast<float>(precipSpawnCount);
@@ -1512,7 +1533,7 @@ void ClusterRenderPipeline::RecordFrameEarly(VkCommandBuffer cmdEarly,
       float precipCenterWorld[3] = { cameraFrameInfo.position.x, cameraFrameInfo.position.y, cameraFrameInfo.position.z };
 
       m_ParticleSystem.RecordSimulate(cmdEarly, m_GlobalSDF, particleDeltaTimeSeconds, globalTimeSeconds,
-          particleEmitterPosition, particleSpawnCount,
+          particleEmitters, particleSpawnCounts,
           precipCenterWorld, precipSpawnCount, precipKind,
           config::atmos::PRECIPITATION_SPAWN_RADIUS_METERS, config::atmos::PRECIPITATION_SPAWN_HEIGHT_ABOVE_CAMERA_METERS,
           config::atmos::PRECIPITATION_SPAWN_BAND_THICKNESS_METERS, config::atmos::PRECIPITATION_FLOOR_BELOW_CAMERA_METERS,
