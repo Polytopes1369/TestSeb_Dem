@@ -360,6 +360,14 @@ inline int SELECTED_BUFFER_INDEX = 0;
 // ImGui checkbox and the RecordUpdate read that drives the shader flag are both gated), so this
 // never contributes any GPU work in a Release build -- see AtmosVolumetricFogPass::RecordUpdate.
 inline bool LOCAL_FOG_VOLUME_BOUNDS_VIZ = false;
+// Debug-only (ImGui "PCG Graph Editor" tab, main.cpp) -- when true, renderer::ClusterRenderPipeline
+// draws every point in its own RunPcgFullPipelineSmokeTest()-produced point set (sampler->filter
+// output) as a wireframe box gizmo (renderer::debug::PcgPointCloudDebugView, PCG editor-tooling
+// roadmap Phase 7.2) directly in the live 3D scene. Read ONLY inside #ifndef NDEBUG blocks (its
+// ImGui checkbox and the RecordFrame read that drives the actual draw call are both gated), so
+// this never contributes any GPU work in a Release build -- same convention as
+// LOCAL_FOG_VOLUME_BOUNDS_VIZ just above.
+inline bool PCG_POINT_CLOUD_VIZ = false;
 } // namespace debugview
 
 namespace volumetrics {
