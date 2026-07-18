@@ -551,6 +551,27 @@ inline bool HEAT_SHIMMER_ENABLED = false;
 inline float HEAT_SHIMMER_STRENGTH = 0.02f; // Only applied when HEAT_SHIMMER_ENABLED is true -- see ParticleSystemPass::RecordDraw's own comment on why this is a per-draw-call, not per-particle, toggle.
 } // namespace particles
 
+// GPU-instanced procedural vegetation scatter (UE5.8 rendering-parity gap G2) -- grass tufts,
+// shrubs and small rocks scattered PCG-style across the terrain. Authored scene content read at
+// scatter-generation time (renderer::VegetationScatterPass), same "runtime state, not a hardware-
+// quality tier" convention as config::atmos:: / config::particles:: above (NOT mirrored into
+// EngineConfig_{Low,Medium,High,Extrem}.h). ENABLED / OCCLUSION_CULL_ENABLED take effect live every
+// frame; the density/region/seed knobs are consumed only when the scatter is (re)generated -- the
+// Debug "Vegetation" ImGui tab exposes a Regenerate button that reapplies them at runtime.
+namespace vegetation {
+inline bool ENABLED = true;                  // Master runtime toggle -- skip the per-frame cull+draw entirely.
+inline bool OCCLUSION_CULL_ENABLED = true;   // Per-instance HZB occlusion test (frustum culling always on).
+inline float REGION_HALF_EXTENT = 45.0f;     // World units -- scatter over the square [-H, +H]^2 around the origin (the terrain is 300x300, but foliage is bounded to the showcase area to stay real-time).
+inline float CELL_SIZE = 0.9f;               // Candidate-cell size (== average instance spacing before jitter/pruning).
+inline float GRASS_DENSITY = 0.85f;          // [0,1] placement weight on the grass band.
+inline float BUSH_DENSITY = 0.10f;           // [0,1] placement weight on the grass band (shrubs are sparser than grass).
+inline float ROCK_DENSITY = 0.45f;           // [0,1] placement weight on cliffs/slopes + the beach transition.
+inline uint32_t SEED = 1337u;                // Global determinism seed.
+#ifndef NDEBUG
+inline bool WIREFRAME = false;               // Debug-only wireframe/bounds visualization (gated out of Release per CLAUDE.md rule 8).
+#endif
+} // namespace vegetation
+
 // Active loaded state
 inline bool g_ProfileLoaded = false;
 inline std::string g_ActiveProfileName = "High"; // Default to High properties

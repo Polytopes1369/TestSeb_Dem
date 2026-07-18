@@ -1142,6 +1142,39 @@ int main(int argc, char** argv) {
                 ImGui::EndTabItem();
             }
 
+            // --- Tab Vegetation (UE5.8 rendering-parity gap G2) -- GPU-instanced grass/shrub/rock
+            // scatter. ENABLED / occlusion / wireframe take effect live; the density/region/seed
+            // knobs are consumed on Regenerate (a blocking device-idle re-bake, Debug-only). ---
+            if (ImGui::BeginTabItem("Vegetation")) {
+                ImGui::Checkbox("Enabled", &config::vegetation::ENABLED);
+                ImGui::Checkbox("Occlusion Cull (HZB)", &config::vegetation::OCCLUSION_CULL_ENABLED);
+                ImGui::Checkbox("Wireframe / Bounds", &config::vegetation::WIREFRAME);
+
+                ImGui::Separator();
+                ImGui::TextUnformatted("Scatter parameters (applied on Regenerate)");
+                ImGui::SliderFloat("Region Half-Extent (m)", &config::vegetation::REGION_HALF_EXTENT, 5.0f, 120.0f);
+                ImGui::SliderFloat("Cell Size (m)", &config::vegetation::CELL_SIZE, 0.3f, 4.0f);
+                ImGui::SliderFloat("Grass Density", &config::vegetation::GRASS_DENSITY, 0.0f, 1.0f);
+                ImGui::SliderFloat("Bush Density", &config::vegetation::BUSH_DENSITY, 0.0f, 1.0f);
+                ImGui::SliderFloat("Rock Density", &config::vegetation::ROCK_DENSITY, 0.0f, 1.0f);
+                {
+                    int seed = static_cast<int>(config::vegetation::SEED);
+                    if (ImGui::InputInt("Seed", &seed)) {
+                        config::vegetation::SEED = static_cast<uint32_t>(seed < 0 ? 0 : seed);
+                    }
+                }
+                if (ImGui::Button("Regenerate Scatter")) {
+                    clusterPipeline.RegenerateVegetationScatter();
+                }
+
+                ImGui::Separator();
+                ImGui::TextDisabled("Instances: %u / %u",
+                    clusterPipeline.GetVegetationScatter().GetInstanceCount(),
+                    renderer::VegetationScatterPass::kMaxInstances);
+
+                ImGui::EndTabItem();
+            }
+
             // --- Tab PCG Graph Editor -- Phase 7.1 (PCG editor-tooling roadmap) scaffold: proves
             // the vendored thedmd/imgui-node-editor library is wired end-to-end, nothing more.
             // See renderer::debug::PcgGraphEditorPanel's own header comment for full context. ---

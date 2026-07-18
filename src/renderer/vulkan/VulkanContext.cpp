@@ -919,6 +919,13 @@ void VulkanContext::CreateLogicalDevice() {
   // pipeline). A near-universally-supported core feature on desktop GPUs (same rigor as
   // geometryShader/fragmentStoresAndAtomics/multiDrawIndirect above), enabled unconditionally here.
   deviceFeatures2.features.tessellationShader = VK_TRUE;
+  // fillModeNonSolid (UE5.8 rendering-parity gap G2, vegetation scatter): gates
+  // VK_POLYGON_MODE_LINE, used by renderer::VegetationScatterPass' Debug-only wireframe/bounds
+  // visualization pipeline (that pipeline itself is #ifndef NDEBUG, but the feature bit is a core
+  // Vulkan 1.0 capability with no runtime cost when unused, so it is enabled unconditionally here
+  // -- same near-universally-supported-desktop-feature rigor as tessellationShader/independentBlend
+  // above -- rather than special-casing device creation per build type).
+  deviceFeatures2.features.fillModeNonSolid = VK_TRUE;
 
   VkDeviceCreateInfo createInfo{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
   createInfo.pNext = &deviceFeatures2;

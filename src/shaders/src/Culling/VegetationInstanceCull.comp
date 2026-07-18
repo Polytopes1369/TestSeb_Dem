@@ -1,0 +1,100 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+
+// Vegetation scatter (UE5.8 rendering-parity gap G2), per-instance GPU culling. Runs every frame,
+// one invocation per scattered instance, and compacts the survivors into per-archetype indirect
+// draw commands -- the exact same GPU-driven culling shape the Nanite cluster path uses
+// (ClusterFrustumCull.comp / ClusterHZBOcclusionCull.comp): a per-instance frustum test plus an HZB
+// occlusion test against the same Hierarchical-Z pyramid (renderer::HZBPass) the cluster occlusion
+// cull samples, with the visible count written entirely on the GPU into a VkDrawIndexedIndirectCommand
+// that a later vkCmdDrawIndexedIndirect consumes -- never an unculled brute-force draw of every
+// instance.
+//
+// Output layout: one VkDrawIndexedIndirectCommand per archetype (its indexCount/firstIndex/vertexOffset
+// are pre-filled by the CPU each frame with instanceCount reset to 0; this shader only atomically
+// grows instanceCount). Survivors are appended into a per-archetype segment of the visible-index
+// buffer (segment base = archetype * maxInstances), which renderer::VegetationInstanced.vert then
+// indexes via gl_InstanceIndex to recover the real instance.
+
+#include "include/VegetationCommon.glsl"
+
+#define HZB_TEXTURE_SET 0
+#define HZB_TEXTURE_BINDING 3
+#include "include/hzb_occlusion.glsl"   // g_HZBTexture, IsClusterOccluded
+
+layout(local_size_x = 64) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer InstanceBuffer {
+    VegetationInstance instances[];
+};
+
+layout(std430, set = 0, binding = 1) writeonly buffer VisibleIndexBuffer {
+    uint visibleIndices[];
+};
+
+// Byte-for-byte mirror of VkDrawIndexedIndirectCommand (same convention as ClusterFrustumCull.comp).
+struct DrawIndexedIndirectCommand {
+    uint indexCount;
+    uint instanceCount;
+    uint firstIndex;
+    uint vertexOffset;
+    uint firstInstance;
+};
+layout(std430, set = 0, binding = 2) buffer IndirectCommandBuffer {
+    DrawIndexedIndirectCommand commands[];
+};
+
+// binding 3 == g_HZBTexture (declared by hzb_occlusion.glsl).
+
+layout(std140, set = 0, binding = 4) uniform CullParams {
+    vec4 frustumPlanes[6]; // xyz = outward unit normal, w = signed distance (Gribb-Hartmann); point outside plane i when dot(xyz, p) + w < 0.
+    vec4 cameraPos;
+    mat4 viewProj;         // proj * view -- for the HZB AABB projection.
+    vec2 hzbMip0Size;
+    float hzbMipCount;
+    uint enableOcclusion;  // Debug toggle: 0 disables the HZB test (frustum only).
+    vec4 archetypeRadius;  // Per-archetype bounding radius at scale == 1 (x=grass, y=bush, z=rock).
+    uint maxInstances;     // Visible-index-buffer segment stride.
+    uint _pad0, _pad1, _pad2;
+} g_Cull;
+
+layout(std430, set = 0, binding = 5) readonly buffer CounterBuffer {
+    uint instanceCount;    // Live scattered-instance count (written once by VegetationScatterGen.comp).
+};
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= instanceCount) {
+        return;
+    }
+
+    VegetationInstance inst = instances[idx];
+    uint arch = min(inst.archetype, kVegArchetypeCount - 1u);
+
+    // Conservative bounding sphere: the base mesh grows upward from its local origin, so the sphere
+    // is centered one radius above the ground-anchored instance position.
+    float radius = g_Cull.archetypeRadius[arch] * max(inst.scale, 1.0e-3);
+    vec3 center = inst.position + vec3(0.0, radius, 0.0);
+
+    // Frustum test (sphere vs 6 planes).
+    for (int i = 0; i < 6; ++i) {
+        if (dot(g_Cull.frustumPlanes[i].xyz, center) + g_Cull.frustumPlanes[i].w < -radius) {
+            return;
+        }
+    }
+
+    // HZB occlusion test against the same pyramid the Nanite cluster cull uses.
+    if (g_Cull.enableOcclusion != 0u) {
+        vec3 boundsMin = center - vec3(radius);
+        vec3 boundsMax = center + vec3(radius);
+        if (IsClusterOccluded(boundsMin, boundsMax, g_Cull.viewProj, g_Cull.hzbMip0Size, g_Cull.hzbMipCount)) {
+            return;
+        }
+    }
+
+    // Survivor: append into this archetype's compacted segment + grow its indirect instanceCount.
+    uint slot = atomicAdd(commands[arch].instanceCount, 1u);
+    if (slot < g_Cull.maxInstances) {
+        visibleIndices[arch * g_Cull.maxInstances + slot] = idx;
+    }
+}
