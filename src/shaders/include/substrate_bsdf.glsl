@@ -51,6 +51,7 @@
 #include "include/math_utils.glsl"
 #include "include/ggx_brdf.glsl"
 #include "include/material_params.glsl"
+#include "include/iridescence_bsdf.glsl"
 #include "include/displacement_noise.glsl"
 
 // Generalized Schlick Fresnel with Substrate's F90 edge-tint parameter (F_Schlick in ggx_brdf.glsl
@@ -192,15 +193,22 @@ vec3 EvaluateSubstrateMaterial(MaterialParams mat, vec3 N, vec3 V, vec3 L) {
     vec3 T, B;
     BuildProceduralTangentBasis(N, T, B);
     vec3 baseResponse = EvaluateSlabBSDF(mat.base, N, V, L, T, B);
+    vec3 response;
     if (mat.topWeight <= 0.0) {
-        return baseResponse;
+        response = baseResponse;
+    } else {
+        vec3 topResponse = EvaluateSlabBSDF(mat.top, N, V, L, T, B);
+        float NdotV = max(dot(N, V), 1.0e-4);
+        vec3 topFresnel = F_SchlickF90(mat.top.f0, mat.top.f90Luminance, NdotV);
+        float topFresnelLuma = dot(topFresnel, vec3(0.2126, 0.7152, 0.0722));
+        float baseTransmittance = 1.0 - mat.topWeight * clamp(topFresnelLuma, 0.0, 1.0);
+        response = topResponse * mat.topWeight + baseResponse * baseTransmittance;
     }
-    vec3 topResponse = EvaluateSlabBSDF(mat.top, N, V, L, T, B);
-    float NdotV = max(dot(N, V), 1.0e-4);
-    vec3 topFresnel = F_SchlickF90(mat.top.f0, mat.top.f90Luminance, NdotV);
-    float topFresnelLuma = dot(topFresnel, vec3(0.2126, 0.7152, 0.0722));
-    float baseTransmittance = 1.0 - mat.topWeight * clamp(topFresnelLuma, 0.0, 1.0);
-    return topResponse * mat.topWeight + baseResponse * baseTransmittance;
+    // Wave 2 (UE5.8 Substrate iridescence layer): thin-film shimmer tint applied to the fully
+    // composited BSDF response (post vertical-layering, not per-slab) -- EvaluateIridescence's own
+    // early exit makes this a zero-cost no-op for every material that doesn't opt in
+    // (iridescenceAmount == 0.0, the default -- see MaterialParameters' own comment).
+    return EvaluateIridescence(response, mat.iridescenceAmount, mat.iridescenceThickness, N, V, L);
 }
 
 // Additive emissive term (not a function of any light direction, added once per pixel, not per

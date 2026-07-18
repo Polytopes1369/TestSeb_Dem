@@ -2571,24 +2571,31 @@ void ClusterRenderPipeline::RecordFrameMid(VkCommandBuffer cmdMid, VkCommandBuff
 #ifndef NDEBUG
   if (cameraCopy.debugViewMode == DEBUG_VIEW_NORMAL) {
     m_ShadingBin.RecordClassifyAndSort(cmdMid, m_RenderExtent);
-    // Glint / sparkle (UE5.8 rendering-parity gap G5): Debug-only tuning multipliers (see the
-    // SetDebugGlint* setters) -- 1.0 in Release, so the material's authored sparkle renders unchanged.
+    // Glint / sparkle (UE5.8 rendering-parity gap G5) + Substrate horizontal mixing (gap G6):
+    // Debug-only tuning multipliers (see the SetDebugGlint*/SetDebugMixMaskSharpnessScale setters)
+    // -- 1.0 in Release, so the material's authored sparkle/mix-sharpness renders unchanged. Wave 2
+    // (UE5.8 caustics/light-function parity): m_FrameScratch.globalTimeSeconds is a real feature
+    // input, not a Debug-only toggle, so it is threaded on both this path and the Release #else path
+    // below unconditionally.
     m_Resolve.RecordResolveBinned(cmdMid, viewProj, m_SceneLights.sun, cameraPositionWorld, surfaceWetness, snowCoverage,
-        m_DebugGlintDensityScale, m_DebugGlintIntensityScale, m_DebugMixMaskSharpnessScale, m_ShadingBin);
+        m_DebugGlintDensityScale, m_DebugGlintIntensityScale, m_DebugMixMaskSharpnessScale, m_FrameScratch.globalTimeSeconds, m_ShadingBin);
   } else {
     maths::mat4 prevViewProjForResolve = m_HasPrevViewProj ? m_PrevViewProj : viewProj;
     m_Resolve.RecordResolve(cmdMid, viewProj, prevViewProjForResolve, m_SceneLights.sun, cameraPositionWorld, surfaceWetness, snowCoverage,
-        m_DebugGlintDensityScale, m_DebugGlintIntensityScale, m_DebugMixMaskSharpnessScale, cameraCopy.debugViewMode);
+        m_DebugGlintDensityScale, m_DebugGlintIntensityScale, m_DebugMixMaskSharpnessScale, m_FrameScratch.globalTimeSeconds, cameraCopy.debugViewMode);
   }
 #else
   m_ShadingBin.RecordClassifyAndSort(cmdMid, m_RenderExtent);
-  // Glint / sparkle (UE5.8 rendering-parity gap G5): the m_DebugGlint* tuning members are Debug-only
-  // (#ifndef NDEBUG, see ClusterRenderPipeline.h), so Release passes literal 1.0/1.0 -- the material's
-  // authored glintDensity/glintIntensity renders unmodified (same Debug-only-scale/Release-literal-1.0
-  // pattern the SSS radius scale uses, see this file's own m_DebugSSSRadiusScale usage). No debug
-  // symbols/strings survive into the Release binary, per CLAUDE.md's build-separation rule.
+  // Glint / sparkle (UE5.8 rendering-parity gap G5) + Substrate horizontal mixing (gap G6): the
+  // m_DebugGlint*/m_DebugMixMaskSharpnessScale tuning members are Debug-only (#ifndef NDEBUG, see
+  // ClusterRenderPipeline.h), so Release passes literal 1.0/1.0/1.0 -- the material's authored
+  // glintDensity/glintIntensity/mixContrast renders unmodified (same Debug-only-scale/
+  // Release-literal-1.0 pattern the SSS radius scale uses, see this file's own m_DebugSSSRadiusScale
+  // usage). No debug symbols/strings survive into the Release binary, per CLAUDE.md's
+  // build-separation rule. m_FrameScratch.globalTimeSeconds (Wave 2) is threaded unconditionally --
+  // see the Debug branch's own comment for why it is not part of that Debug-only trio.
   m_Resolve.RecordResolveBinned(cmdMid, viewProj, m_SceneLights.sun, cameraPositionWorld, surfaceWetness, snowCoverage,
-      1.0f, 1.0f, 1.0f, m_ShadingBin);
+      1.0f, 1.0f, 1.0f, m_FrameScratch.globalTimeSeconds, m_ShadingBin);
 #endif
 }
 
