@@ -191,6 +191,16 @@ target_include_directories(PcgDataModelTests PRIVATE src ${Vulkan_INCLUDE_DIRS})
 add_test(NAME PcgDataModelTests COMMAND PcgDataModelTests)
 add_test(NAME BlockCodecTests COMMAND BlockCodecTests)
 
+# PCG framework roadmap, Phase 2.2 ("Landscape / Terrain Sampler"): src/pcg/PcgTerrainSampler.cpp
+# is a real .cpp (unlike Phase 1's header-only types) -- the terrain-noise CPU port + jittered-grid
+# scatter sampler both live there, so this target links it directly alongside the test file.
+add_executable(PcgTerrainSamplerTests
+    src/pcg/PcgTerrainSampler.cpp
+    tests/PcgTerrainSamplerTests.cpp
+)
+target_include_directories(PcgTerrainSamplerTests PRIVATE src ${Vulkan_INCLUDE_DIRS})
+add_test(NAME PcgTerrainSamplerTests COMMAND PcgTerrainSamplerTests)
+
 add_executable(AsyncDecompressingLoaderTests
     src/io/AsyncFileStreamer.cpp
     src/io/BlockCodec.cpp
