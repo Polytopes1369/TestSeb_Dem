@@ -770,6 +770,12 @@ namespace renderer {
         // exercise/verify Phase 3's point-light Virtual Shadow Maps (see Init()'s own comment) --
         // see renderer::LightingTypes.h's own comment for the full field-by-field default.
         SceneLights m_SceneLights;
+        // Dynamic Weather Simulation's seasonal cycle (AtmosClimatePass, see its own
+        // GetSeasonalSunElevationOffsetRadians() comment): the FIXED base sun elevation/azimuth
+        // Init() authors into m_SceneLights.sun.direction, above, kept separately so each frame can
+        // recompute the seasonally-offset direction from this same unchanging base instead of
+        // compounding an offset onto an already-offset value.
+        maths::vec3 m_BaseSunDirection;
 
         // Shared trace-scene descriptor sets (mesh SDF trace + Surface Cache sampling, see
         // SurfaceCacheTraceContext's own class comment) built once from m_GlobalSDF + m_SurfaceCache,
