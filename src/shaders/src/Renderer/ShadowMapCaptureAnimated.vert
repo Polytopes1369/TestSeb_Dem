@@ -35,6 +35,12 @@
 #include "include/wpo_deformation.glsl"
 #include "include/enhanced_displacement.glsl"
 #include "include/spline_deformation.glsl"
+// Skeletal-animation feature: this shader does NOT apply ApplySkeletalSkinning (documented, known
+// scope limitation -- the procedural creature's shadow is cast from its BIND POSE, not its
+// animated pose; see project documentation for this deliberate deviation). Only included for the
+// SKELETAL_MAX_DEVIATION constant displacement_bounds.glsl references unconditionally below (this
+// file has no bone-matrices SSBO binding of its own).
+#include "include/skeletal_animation.glsl"
 
 layout(location = 0) in vec3 inPosition;
 layout(location = 1) in vec2 inUV;

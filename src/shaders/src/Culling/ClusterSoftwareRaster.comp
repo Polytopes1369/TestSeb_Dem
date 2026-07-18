@@ -51,6 +51,7 @@
 #include "include/wpo_deformation.glsl"
 #include "include/enhanced_displacement.glsl"
 #include "include/spline_deformation.glsl"
+#include "include/skeletal_animation.glsl"
 #include "include/displacement_bounds.glsl"
 
 #define MASK_ARRAY_SET 0
@@ -97,6 +98,11 @@ layout(std430, set = 0, binding = 8) readonly buffer EntityDataBuffer {
 // Phase 1 (Nanite advanced): see ClusterRaster.vert's identical binding comment.
 layout(std430, set = 0, binding = 9) readonly buffer SplineControlPointsSSBO {
     SplineControlPoint splineControlPoints[SPLINE_CONTROL_POINT_COUNT];
+};
+
+// Skeletal-animation feature: see ClusterRaster.vert's identical binding comment.
+layout(std430, set = 0, binding = 10) readonly buffer SkeletalBoneMatricesSSBO {
+    mat4 boneMatrices[SKELETAL_MAX_BONES];
 };
 
 layout(push_constant) uniform SoftwareRasterPushConstants {

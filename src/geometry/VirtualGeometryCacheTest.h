@@ -42,6 +42,11 @@ namespace geometry {
     // readback). entityData/entityCount describe the spawned entities exactly as authored by
     // VulkanContext::BuildEntityData() (meshID, materialID, ...).
     //
+    // vertexSkinBuffer (skeletal-animation feature) is VulkanContext::GetVertexSkinBuffer() -- also
+    // VK_BUFFER_USAGE_TRANSFER_SRC_BIT, index-aligned 1:1 with vertexBuffer at the same
+    // totalVertexCount scale. Read back and threaded into BuildClusterDAG for every
+    // core::EntityFlags::IsSkeletallyAnimated entity; ignored (never read) for every other entity.
+    //
     // Returns true iff every entity produced a structurally valid DAG, every cluster encoded
     // within the fixed-size on-disk format's capacity, the consolidated .cache file was written,
     // and reading the header/tables/a sample cluster back from disk reproduces byte-exact the
@@ -53,6 +58,7 @@ namespace geometry {
         VkCommandPool commandPool,
         VkBuffer vertexBuffer,
         VkBuffer indexBuffer,
+        VkBuffer vertexSkinBuffer,
         uint32_t totalVertexCount,
         uint32_t totalIndexCount,
         const core::EntityData* entityData,

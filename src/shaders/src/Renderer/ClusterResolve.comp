@@ -53,6 +53,7 @@
 #include "include/wpo_deformation.glsl"
 #include "include/enhanced_displacement.glsl"
 #include "include/spline_deformation.glsl"
+#include "include/skeletal_animation.glsl"
 #include "include/displacement_bounds.glsl"
 #include "include/material_params.glsl"
 #include "include/substrate_bsdf.glsl"
@@ -225,6 +226,13 @@ layout(std430, set = 0, binding = 26) readonly buffer SplineControlPointsSSBO {
     SplineControlPoint splineControlPoints[SPLINE_CONTROL_POINT_COUNT];
 };
 
+// Skeletal-animation feature: binding 29 -- the first free slot past this shader's full 0-28
+// range (0-26 original + 27/28 Atmos weather's g_SkyViewLUT/g_CloudShadowMap, declared further
+// down this file). See ClusterRaster.vert's identical binding comment.
+layout(std430, set = 0, binding = 29) readonly buffer SkeletalBoneMatricesSSBO {
+    mat4 boneMatrices[SKELETAL_MAX_BONES];
+};
+
 #ifdef _DEBUG
 layout(push_constant) uniform DebugPC {
     uint viewMode;
@@ -330,6 +338,21 @@ void main() {
         vec3 p0Local = p0 - xform.center;
         vec3 p1Local = p1 - xform.center;
         vec3 p2Local = p2 - xform.center;
+
+        // Skeletal-animation feature: linear-blend vertex skinning, applied in LOCAL space BEFORE
+        // the per-entity rigid rotation (and before spline bend below) -- must exactly reproduce
+        // the rasterizer's own transform, same reasoning as the spline bend comment immediately
+        // below.
+        if (GetFlag(ed.flags, ENTITY_FLAG_IS_SKELETALLY_ANIMATED)) {
+            uvec4 boneIndices0, boneIndices1, boneIndices2;
+            vec4 boneWeights0, boneWeights1, boneWeights2;
+            DecodeClusterSkin(pageByteBase, i0, boneIndices0, boneWeights0);
+            DecodeClusterSkin(pageByteBase, i1, boneIndices1, boneWeights1);
+            DecodeClusterSkin(pageByteBase, i2, boneIndices2, boneWeights2);
+            p0Local = ApplySkeletalSkinning(p0Local, boneIndices0, boneWeights0, boneMatrices);
+            p1Local = ApplySkeletalSkinning(p1Local, boneIndices1, boneWeights1, boneMatrices);
+            p2Local = ApplySkeletalSkinning(p2Local, boneIndices2, boneWeights2, boneMatrices);
+        }
 
         // Phase 1 (Nanite advanced): spline bend, applied in LOCAL space BEFORE the per-entity
         // rigid rotation -- see ClusterRaster.vert's identical comment. Must exactly reproduce the

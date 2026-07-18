@@ -94,10 +94,15 @@ namespace renderer {
         // at binding 6 (vertex-stage-only, the first free slot past bindings 0/1/2/4/5 above and the
         // fragment-only binding 3) so ClusterRaster.vert can evaluate ApplySplineDeformation() for
         // entities with core::EntityFlags::HasSplineDeformation set (Phase 1, Nanite advanced).
+        // `boneMatricesBuffer` (skeletal-animation feature) is animation::SkeletalAnimator::
+        // GetBoneMatricesBuffer() -- bound read-only at binding 7 (the next free slot past
+        // splineControlPointsBuffer) so ClusterRaster.vert can evaluate ApplySkeletalSkinning() for
+        // entities with core::EntityFlags::IsSkeletallyAnimated set.
         void Init(VkDevice device, VkBuffer clusterMetadataBuffer, VkBuffer compressedPhysicalPoolBuffer,
             VkBuffer wpoGlobalsBuffer, const std::vector<VkDescriptorImageInfo>& maskImageInfos,
             const std::array<VkFormat, 2>& visBufferColorFormats, VkFormat depthFormat,
-            VkBuffer entityTransformBuffer, VkBuffer entityDataBuffer, VkBuffer splineControlPointsBuffer);
+            VkBuffer entityTransformBuffer, VkBuffer entityDataBuffer, VkBuffer splineControlPointsBuffer,
+            VkBuffer boneMatricesBuffer);
 
         void Shutdown();
 

@@ -457,7 +457,7 @@ int main(int argc, char** argv) {
         try {
             geometryCacheTestPassed = geometry::RunVirtualGeometryCacheTest(
                 vkContext.GetDevice(), vkContext.GetAllocator(), vkContext.GetGraphicsQueue(), vkContext.GetCommandPool(),
-                vkContext.GetVertexBuffer(), vkContext.GetIndexBuffer(),
+                vkContext.GetVertexBuffer(), vkContext.GetIndexBuffer(), vkContext.GetVertexSkinBuffer(),
                 vkContext.GetTotalVertexCount(), vkContext.GetTotalIndexCount(),
                 vkContext.GetEntityData(), vkContext.GetEntityCount());
         }

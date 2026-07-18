@@ -358,6 +358,11 @@ bool ClusterRenderPipeline::Init(
     vmaDestroyBuffer(createInfo.allocator, stagingBuffer, stagingAllocation);
   }
 
+  // Skeletal-animation feature: builds the procedural creature's bone hierarchy and uploads an
+  // initial identity-skinning frame -- must run before m_HardwareRaster/m_SoftwareRaster/m_Resolve
+  // .Init() below, since all three bind GetBoneMatricesBuffer() into their own descriptor sets.
+  m_SkeletalAnimator.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue);
+
   // Procedurally generates the bindless cutout mask array once, before any consumer pass below
   // is initialized (each one binds GetMaskImageInfos() into its own descriptor set).
   m_MaskGenerator.Init(createInfo.device, createInfo.allocator,
@@ -373,7 +378,8 @@ bool ClusterRenderPipeline::Init(
                         createInfo.depthFormat,
                         createInfo.entityTransformBuffer,
                         createInfo.entityDataBuffer,
-                        m_SplineControlPointsBuffer.Handle());
+                        m_SplineControlPointsBuffer.Handle(),
+                        m_SkeletalAnimator.GetBoneMatricesBuffer());
 
   m_SoftwareRaster.Init(createInfo.device, createInfo.allocator,
                         createInfo.commandPool, createInfo.queue,
@@ -386,7 +392,8 @@ bool ClusterRenderPipeline::Init(
                         m_MaskGenerator.GetMaskImageInfos(),
                         createInfo.entityTransformBuffer,
                         createInfo.entityDataBuffer,
-                        m_SplineControlPointsBuffer.Handle());
+                        m_SplineControlPointsBuffer.Handle(),
+                        m_SkeletalAnimator.GetBoneMatricesBuffer());
 
   m_Resolve.Init(
       createInfo.device, createInfo.allocator, createInfo.commandPool,
@@ -400,7 +407,8 @@ bool ClusterRenderPipeline::Init(
       createInfo.entityTransformBuffer,
       createInfo.entityDataBuffer,
       createInfo.materialTable.params,
-      m_SplineControlPointsBuffer.Handle());
+      m_SplineControlPointsBuffer.Handle(),
+      m_SkeletalAnimator.GetBoneMatricesBuffer());
 
   // Phase 1b: the shading-bin sort pass needs m_Resolve's own 5 output image views (its Classify
   // stage writes background pixels directly into them, see ClusterShadingBinPass's own class
@@ -1271,6 +1279,7 @@ void ClusterRenderPipeline::Shutdown() {
   m_PagePool.Shutdown();
   m_WPOGlobalsBuffer.Destroy();
   m_SplineControlPointsBuffer.Destroy();
+  m_SkeletalAnimator.Shutdown();
 
   m_ClusterCount = 0;
   m_VisBufferClusterIDImage = VK_NULL_HANDLE;
@@ -2094,6 +2103,15 @@ void ClusterRenderPipeline::RecordFrameMid(VkCommandBuffer cmdMid, VkCommandBuff
     wpoDepInfo.pMemoryBarriers = &wpoBarrier;
     vkCmdPipelineBarrier2(cmdMid, &wpoDepInfo);
   }
+
+  // =========================================================================================
+  // [1c] Skeletal-animation feature: recompute the procedural creature's bone matrices from this
+  // frame's globalTimeSeconds and re-upload the SkeletalBoneMatricesSSBO, mirroring [1b]'s own
+  // "upload once here, well before either raster pass runs" placement/rationale exactly (its own
+  // internal barrier covers every consumer -- ClusterRaster.vert, cluster_software_raster_core
+  // .glsl's two consumers, and ClusterResolve.comp/ClusterResolveBinned.comp).
+  // =========================================================================================
+  m_SkeletalAnimator.RecordUpdate(cmdMid, globalTimeSeconds);
 
   // =========================================================================================
   // [2] EARLY cull: every leaf candidate vs frustum/backface + LAST frame's HZB
