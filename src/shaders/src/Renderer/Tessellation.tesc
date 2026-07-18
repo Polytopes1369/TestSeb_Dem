@@ -1,7 +1,7 @@
 #version 460
 #extension GL_GOOGLE_include_directive : enable
 
-// Phase 7a (UE5.8 parity roadmap, hero asset tessellation): tessellation control shader --
+// Generalized Nanite Tessellation (renderer::TessellationPass): tessellation control shader --
 // screen-space adaptive tessellation, in the same philosophy as ClusterDAGScreenError.comp's own
 // pixel-error-targeted Nanite LOD cut (project a world-space measure through the camera, compare
 // against a fixed pixel threshold), adapted here to a per-EDGE 2-point screen-space projection
@@ -11,16 +11,18 @@
 // triangles independently compute the IDENTICAL tess level for their shared edge -- this is what
 // keeps the tessellated (and, after .tese's displacement, the DISPLACED) surface crack-free: the
 // Vulkan tessellator's own guarantee for matching per-edge outer levels + shared control points.
+// Runs identically for every tessellated entity's own draw call -- the per-entity identity
+// (entityID/materialID) never affects this stage's own tessellation-level math at all.
 //
 // Tessellation levels are computed from the UNDISPLACED (rest-shape) positions -- a deliberate
 // choice, not an oversight: computing them from the displaced surface would require already
 // knowing the displacement before deciding how finely to sample it (a circular dependency), and
-// this hero asset's displacement amplitude is modest relative to its own silhouette size, so this
-// is not a meaningful source of visible under-tessellation.
+// every tessellated entity's displacement amplitude is modest relative to its own silhouette size,
+// so this is not a meaningful source of visible under-tessellation.
 
 layout(vertices = 3) out;
 
-layout(push_constant) uniform HeroTessellationConstants {
+layout(push_constant) uniform TessellationConstants {
     mat4 viewProj;
     float cameraPositionWorldX, cameraPositionWorldY, cameraPositionWorldZ;
     float _pad0;
@@ -30,14 +32,15 @@ layout(push_constant) uniform HeroTessellationConstants {
     uint entityCount;
     float viewportWidth, viewportHeight;
     float displacementScale;
-    float _pad1;
+    uint materialID;
 } pc;
 
 // Fixed target (this phase's own chosen granularity) -- larger = coarser tessellation for the
-// same screen-space edge length. Comfortably conservative for a single hero object.
+// same screen-space edge length. Comfortably conservative for this codebase's own showcase-sized
+// tessellated entities.
 const float kTargetPixelsPerSegment = 24.0;
 // Comfortably under the Vulkan-guaranteed maxTessellationGenerationLevel minimum of 64 -- see
-// renderer::HeroTessellationPass's own class comment on why no runtime capability query is needed.
+// renderer::TessellationPass's own class comment on why no runtime capability query is needed.
 const float kMaxTessLevel = 16.0;
 
 layout(location = 0) in vec3 inWorldPos[];
@@ -71,7 +74,7 @@ void main() {
         gl_TessLevelOuter[0] = outer0;
         gl_TessLevelOuter[1] = outer1;
         gl_TessLevelOuter[2] = outer2;
-        // Standard average-of-outer inner level -- this is a single isolated hero object, not a
+        // Standard average-of-outer inner level -- each tessellated entity is an isolated object, not a
         // shared-edge terrain grid needing a more elaborate inner-level scheme.
         gl_TessLevelInner[0] = (outer0 + outer1 + outer2) / 3.0;
     }

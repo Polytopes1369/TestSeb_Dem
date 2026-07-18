@@ -33,6 +33,15 @@ layout(std430, set = MEGALIGHTS_LIGHTS_SET, binding = MEGALIGHTS_LIGHTS_BINDING)
 
 const uint kMegaLightsCandidateCount = 16u; // RIS M -- see the approved plan's own justification.
 
+// Phase 4, Feature 2 (temporal ReSTIR) / spatial reuse follow-up: standard ReSTIR-style temporal
+// age-clamp -- how many "effective samples" a single long-lived history reservoir (or, via spatial
+// reuse, a neighbor's already-temporally-combined reservoir) is allowed to represent before it
+// starts dominating a freshly-relit surface's own fresh candidate. Shared here (not left duplicated
+// per-shader) because BOTH MegaLightsShade.comp's own CombineTemporalReservoir (cross-FRAME reuse)
+// and MegaLightsSpatialReuse.comp (cross-PIXEL reuse, same-frame) need the exact same cap for their
+// own streaming-RIS combine's M-weighting term -- see each call site's own comment.
+const float kMegaLightsTemporalHistoryMaxM = 20.0 * float(kMegaLightsCandidateCount);
+
 // Unshadowed contribution-magnitude proxy used both to build reservoir weights AND (implicitly, via
 // SelectLightRIS's outInvPdf) to cancel out of the final unbiased estimator -- see that function's
 // own comment. Clamped to avoid a near-zero-distance sample dominating the reservoir.

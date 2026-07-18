@@ -892,12 +892,12 @@ void VulkanContext::CreateLogicalDevice() {
   // then rejects. A near-universally-supported core Vulkan 1.0 feature bit on desktop GPUs, so
   // enabled unconditionally here, matching multiDrawIndirect's own enablement rigor above.
   deviceFeatures2.features.independentBlend = VK_TRUE;
-  // tessellationShader (Phase 7a, UE5.8 parity roadmap): core Vulkan 1.0 feature bit, no device
-  // extension required -- gates VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT/_EVALUATION_BIT
-  // (renderer::HeroTessellationPass, the hero Icosphere's own screen-space-adaptive
-  // displacement-mapped pipeline). A near-universally-supported core feature on desktop GPUs
-  // (same rigor as geometryShader/fragmentStoresAndAtomics/multiDrawIndirect above), enabled
-  // unconditionally here.
+  // tessellationShader (Phase 7a, UE5.8 parity roadmap; generalized to multiple entities by the
+  // Nanite Tessellation generalization): core Vulkan 1.0 feature bit, no device extension required
+  // -- gates VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT/_EVALUATION_BIT (renderer::TessellationPass,
+  // every core::EntityFlags::IsTessellated entity's own screen-space-adaptive displacement-mapped
+  // pipeline). A near-universally-supported core feature on desktop GPUs (same rigor as
+  // geometryShader/fragmentStoresAndAtomics/multiDrawIndirect above), enabled unconditionally here.
   deviceFeatures2.features.tessellationShader = VK_TRUE;
 
   VkDeviceCreateInfo createInfo{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
@@ -1612,28 +1612,38 @@ void VulkanContext::BuildEntityData() {
       core::SetFlag(entity.flags, core::EntityFlags::IsDynamic, true);
     }
 
-    // Only valid for i in [0, kTreeEntityIndexBase) -- the default `entity.materialID = i` above is
-    // only correct for the 12 showcase primitives (materialID == entity index BY DESIGN, see
-    // GenerateShowcaseMaterialTable()'s own zone-layout comment); every entity from
-    // kTreeEntityIndexBase onward gets its real materialID (and, from it, isTransparent) from an
-    // explicit override below instead.
-    bool isTransparent = (i < kTreeEntityIndexBase) ? m_MaterialTable.isTransparent[i] : false;
-    // Phase 7a (UE5.8 parity roadmap, hero asset tessellation): the Icosphere (kHeroEntityIndex)
-    // is the single tessellated/displaced hero asset, rendered ONLY by
-    // renderer::HeroTessellationPass -- never by the opaque Nanite VisBuffer pipeline (no
-    // representation for runtime-displaced geometry there) nor by TransparentForwardPass.
-    // Overrides its materialID to the reserved renderer::kHeroMaterialID slot (see that
-    // constant's own comment) and forces its entity IsTransparent flag true -- NOT because it's
-    // actually alpha-blended (kHeroMaterialID's own alpha is 1.0, fully opaque), but because
-    // ClusterLODCompact.comp's existing per-entity IsTransparent exclusion (see that shader's own
-    // EntityDataBuffer comment) is the exact "never enters the opaque candidate list" mechanism
-    // this entity also needs. TransparentForwardPass itself stays unaffected: it filters by
-    // materialTable.isTransparent[materialID], which correctly stays false for kHeroMaterialID
-    // (GenerateShowcaseMaterialTable() never sets it true -- see that function's own hero-recipe
-    // comment), so the hero entity's clusters never enter ITS candidate list either.
+    // Default: materialID == entity index for the 12 showcase primitives (BY DESIGN, see
+    // GenerateShowcaseMaterialTable()'s own zone-layout comment); every entity beyond that
+    // (procedural trees, walls, floor, water, ...) gets its real materialID (and, from it,
+    // isTransparent) from an explicit override further below instead -- this default is only ever
+    // actually consumed by the 12 showcase primitives.
+    bool isTransparent = m_MaterialTable.isTransparent[i];
+    // Generalized Nanite Tessellation (renderer::TessellationPass -- see kTessellatedEntityIndices'
+    // own comment for the full generalization rationale and exact entity choices): every entity
+    // index in kTessellatedEntityIndices is rendered ONLY by renderer::TessellationPass -- never by
+    // the opaque Nanite VisBuffer pipeline (no representation for runtime-displaced geometry there)
+    // nor by TransparentForwardPass. Forces the entity's IsTransparent flag true -- NOT because
+    // it's actually alpha-blended, but because ClusterLODCompact.comp's existing per-entity
+    // IsTransparent exclusion (see that shader's own EntityDataBuffer comment) is the exact "never
+    // enters the opaque candidate list" mechanism every tessellated entity also needs.
+    // TransparentForwardPass itself stays unaffected: it filters by
+    // materialTable.isTransparent[materialID], and every tessellated entity's OWN materialID
+    // (unmodified showcase recipe, except the hero -- see below) correctly stays non-transparent
+    // there, so none of these entities' clusters ever enter ITS candidate list either.
+    bool isTessellated = std::find(kTessellatedEntityIndices.begin(), kTessellatedEntityIndices.end(), i)
+        != kTessellatedEntityIndices.end();
+    if (isTessellated) {
+      core::SetFlag(entity.flags, core::EntityFlags::IsTessellated, true);
+      isTransparent = true;
+    }
+    // The original hero entity (kHeroEntityIndex, the Icosphere) keeps its own pre-existing
+    // materialID override to the reserved renderer::kHeroMaterialID slot (see that constant's own
+    // comment) -- every OTHER tessellated entity (slots 3/9 above) keeps its own regular showcase
+    // materialID unmodified, so renderer::TessellationPass shades each with its own distinct
+    // look (see ClusterRenderPipeline's own m_Tessellation Init() call site for how each entity's
+    // materialID is resolved into its GPU draw info).
     if (i == kHeroEntityIndex) {
       entity.materialID = renderer::kHeroMaterialID;
-      isTransparent = true;
     }
     // Procedural tree generator (renderer::ProceduralTreePass): each tree is baked as a bark
     // entity followed immediately by its leaf entity (see VulkanContext.h's own kTreeEntityCount
@@ -1688,7 +1698,7 @@ void VulkanContext::BuildEntityData() {
     //
     // Enhanced procedural displacement was originally authored on entity 2 (Icosphere), but Phase 7a's
     // concurrently-developed hero-asset tessellation independently claimed the same entity
-    // (kHeroEntityIndex == 2) and routes it exclusively through renderer::HeroTessellationPass, which
+    // (kHeroEntityIndex == 2) and routes it exclusively through renderer::TessellationPass, which
     // never reaches ClusterRaster.vert/cluster_software_raster_core.glsl/ClusterResolve*.comp -- the
     // only places ApplyEnhancedDisplacement() is ever called. Rather than ship an EntityFlags bit that
     // is silently a no-op, reassigned to entity 10 (TorusKnot), the zone layout's own "Nanite B" pairing

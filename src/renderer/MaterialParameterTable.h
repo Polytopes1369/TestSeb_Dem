@@ -311,9 +311,9 @@ namespace renderer {
         // Phase 7a (UE5.8 parity roadmap, hero asset tessellation): hero rocky/stone recipe --
         // earthy brown-gray, high roughness (no sharp specular, matching a weathered rock
         // surface), fully opaque, reflections ON (a subtle sheen, showcasing
-        // renderer::HeroTessellationPass's own GGX-VNDF reflection trace the same way the
+        // renderer::TessellationPass's own GGX-VNDF reflection trace the same way the
         // "Transparent/glass" material above showcases it for TransparentForwardPass). Rendered
-        // ONLY by renderer::HeroTessellationPass; never reaches the opaque Nanite resolve shaders
+        // ONLY by renderer::TessellationPass; never reaches the opaque Nanite resolve shaders
         // (its entity is unconditionally excluded from that path via core::EntityFlags::
         // IsTransparent, see VulkanContext::BuildEntityData()'s own comment) nor
         // TransparentForwardPass (table.isTransparent[kHeroMaterialID] stays false).
