@@ -24,7 +24,10 @@ namespace renderer {
         // to a 16-byte boundary (160 bytes) + vec3 sunColor + 1 float sunIntensity (real LUX, see
         // renderer::DirectionalLight's own comment -- physically-based recalibration, 2026-07-17)
         // rounding up to 176 bytes + vec3 cameraPositionWorld (Substrate integration:
-        // EvaluateSubstrateMaterial's view-direction term) + 1 pad float rounding up to 192 bytes
+        // EvaluateSubstrateMaterial's view-direction term) + glintIntensityScale (gap G5, which
+        // reused what had been that trailing pad float) rounding up to 192 bytes. Gap G6 (horizontal
+        // mixing) then appends mixMaskSharpnessScale + 3 explicit pad floats -- the first field to
+        // actually grow this UBO, since no dead padding remained to reuse -- rounding it to 208 bytes
         // total. The 2 floats immediately after viewportWidth/viewportHeight were originally dead
         // std140 padding (still needed to round vec2 up to a 16-byte boundary) -- Atmos weather
         // system's surface response extension repurposes them as real data (surfaceWetness/
@@ -58,8 +61,19 @@ namespace renderer {
             // tuning multiplier, occupying what was the trailing dead pad float -- 1.0 in Release,
             // driven by the Post FX ImGui "Glint Intensity" slider in Debug.
             float glintIntensityScale = 1.0f;
+            // Substrate horizontal mixing (UE5.8 rendering-parity gap G6): Debug-only per-material
+            // blend-sharpness tuning multiplier. The FIRST field to actually GROW this UBO past its
+            // previously-fully-packed 192 bytes -- glintIntensityScale above already consumed the last
+            // dead pad float, so this opens a fresh std140 16-byte block (a lone trailing float rounds
+            // the whole struct up to the next 16-byte boundary), hence the three explicit pad floats
+            // to keep this C++ mirror byte-exact with the GLSL UBO. 1.0 in Release, driven by the Post
+            // FX ImGui "Mix Sharpness" slider in Debug. See ClusterResolve.comp's own field comment.
+            float mixMaskSharpnessScale = 1.0f;
+            float _padMix0 = 0.0f;
+            float _padMix1 = 0.0f;
+            float _padMix2 = 0.0f;
         };
-        static_assert(sizeof(ResolveViewParams) == 192,
+        static_assert(sizeof(ResolveViewParams) == 208,
             "ResolveViewParams must match ResolveViewParamsUBO in ClusterResolve.comp exactly (std140 layout)");
 
         // Step 4: byte-for-byte mirror of VirtualTextureVolumeUBO in ClusterResolve.comp/
@@ -212,7 +226,8 @@ namespace renderer {
             // own doc comment), not a per-frame value -- filled once, here, in the same one-time
             // command buffer as the image transitions above (no ordering dependency between them,
             // so recording order doesn't matter). Well under vkCmdUpdateBuffer's 65536-byte limit
-            // (kMaxMaterials * sizeof(MaterialParameters) = 32 * 48 = 1536 bytes). No intra-
+            // (kMaxMaterials * sizeof(MaterialParameters) = 32 * 320 = 10240 bytes, after gap G6's
+            // horizontal-mix additions grew the struct from 208 to 320 bytes). No intra-
             // command-buffer barrier is needed after this write -- ExecuteOneShotCommands' own
             // vkQueueWaitIdle fully orders it before any later-submitted command buffer's reads,
             // exactly like ClusterRenderPipeline::Init()'s own one-time setup submit.
@@ -509,7 +524,7 @@ namespace renderer {
 
     void ClusterResolvePass::RecordResolve(VkCommandBuffer cmd, const maths::mat4& viewProj, const maths::mat4& prevViewProj,
         const DirectionalLight& sun, const maths::vec3& cameraPositionWorld, float surfaceWetness, float snowCoverage,
-        float glintDensityScale, float glintIntensityScale, uint32_t debugViewMode) {
+        float glintDensityScale, float glintIntensityScale, float mixMaskSharpnessScale, uint32_t debugViewMode) {
         ResolveViewParams viewParams{};
         viewParams.viewProj = viewProj;
         viewParams.prevViewProj = prevViewProj;
@@ -521,6 +536,9 @@ namespace renderer {
         // Release) -- see the ResolveViewParams struct's own field comments above.
         viewParams.glintDensityScale = glintDensityScale;
         viewParams.glintIntensityScale = glintIntensityScale;
+        // Substrate horizontal mixing (UE5.8 rendering-parity gap G6): Debug-only blend-sharpness
+        // multiplier (1.0 in Release) -- see the ResolveViewParams struct's own field comment above.
+        viewParams.mixMaskSharpnessScale = mixMaskSharpnessScale;
         viewParams.sunDirectionX = sun.direction.x;
         viewParams.sunDirectionY = sun.direction.y;
         viewParams.sunDirectionZ = sun.direction.z;
@@ -702,7 +720,7 @@ namespace renderer {
 
     void ClusterResolvePass::RecordResolveBinned(VkCommandBuffer cmd, const maths::mat4& viewProj,
         const DirectionalLight& sun, const maths::vec3& cameraPositionWorld, float surfaceWetness, float snowCoverage,
-        float glintDensityScale, float glintIntensityScale, const ClusterShadingBinPass& shadingBinPass) {
+        float glintDensityScale, float glintIntensityScale, float mixMaskSharpnessScale, const ClusterShadingBinPass& shadingBinPass) {
         // prevViewProj is never read by ClusterResolveBinned.comp (this path never serves
         // DEBUG_VIEW_MOTION_VECTORS) -- `viewProj` itself is reused as a harmless placeholder value
         // rather than introducing a separate identity-matrix concept for an otherwise-dead field.
@@ -717,6 +735,10 @@ namespace renderer {
         // Release, so the material's authored sparkle renders unchanged on this Release path).
         viewParams.glintDensityScale = glintDensityScale;
         viewParams.glintIntensityScale = glintIntensityScale;
+        // Substrate horizontal mixing (UE5.8 rendering-parity gap G6): Debug-only blend-sharpness
+        // multiplier (1.0 in Release, so a horizontally-mixed material blends at its authored
+        // mixContrast on this Release path) -- see the ResolveViewParams struct's own field comment.
+        viewParams.mixMaskSharpnessScale = mixMaskSharpnessScale;
         viewParams.sunDirectionX = sun.direction.x;
         viewParams.sunDirectionY = sun.direction.y;
         viewParams.sunDirectionZ = sun.direction.z;

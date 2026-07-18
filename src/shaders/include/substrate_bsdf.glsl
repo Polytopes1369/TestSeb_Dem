@@ -5,8 +5,9 @@
 // renderer::MaterialParameters/MaterialParams entry (ClusterResolve.comp/ClusterResolveBinned.comp's
 // direct sun term, TransparentForward.frag, ReflectionGather.comp's Lumen reflection composite,
 // MegaLightsShade.comp's local-light term). See the Substrate integration plan's own Context section
-// for what this reproduces (the Slab BSDF's full parameter set + the vertical layering operator) and
-// what is deliberately out of scope (horizontal mixing, Hair/Eye/Water shading models).
+// for what this reproduces (the Slab BSDF's full parameter set + the vertical layering operator +,
+// as of gap G6, the horizontal mixing operator -- see that NOTE below) and what remains deliberately
+// out of scope (Hair/Eye/Water shading models).
 // NOTE (UE5.8 rendering-parity gap G4): full screen-space SSS diffusion was ORIGINALLY out of scope
 // here (this file only ever provided the cheap analytic wrap-diffuse approximation, EvaluateSlabDiffuse's
 // sssAmount/sssRadius blend) -- it is now implemented as a real separable screen-space diffusion pass
@@ -25,14 +26,32 @@
 // response (see ClusterResolve.comp/ClusterResolveBinned.comp's own sun-term call sites). Driven by
 // SubstrateSlab::glintDensity/glintIntensity (material_params.glsl); glintIntensity == 0.0 (default)
 // disables it entirely at zero cost, exactly like every other optional Slab term here.
+// NOTE (UE5.8 rendering-parity gap G6): HORIZONTAL material mixing -- the last of the three
+// deliberately-sequential Substrate BSDF gaps (G4 SSS -> G5 Glint -> G6 mixing) -- is now
+// implemented as EvaluateSubstrateMixMask / MixSlabs / ApplySubstrateHorizontalMix below, closing
+// out what this file's own header (see the line above the #includes) previously listed as its last
+// out-of-scope Substrate feature. It is DISTINCT from the vertical-layering operator
+// (EvaluateSubstrateMaterial): vertical layering stacks a coat Slab ON TOP OF a base (a
+// Fresnel-weighted coat-over-base energy split), whereas horizontal mixing blends two side-by-side
+// base Slabs (A == mat.base, B == mat.mixB) across the SAME surface by a per-pixel procedural mask
+// (rust over metal, moss over rock, dirt over paint). It is a material PRE-PROCESSING operator, not
+// a per-light lobe: ApplySubstrateHorizontalMix resolves A and B into ONE effective base Slab
+// BEFORE any lighting term runs (called once per pixel in ClusterResolve.comp/ClusterResolveBinned.
+// comp, right after the material lookup), so the vertical-layer/SSS/glint/direct-lighting terms all
+// transparently shade the correctly-blended surface with no per-term awareness of mixing.
+// mat.mixAmount == 0.0 (default) disables it entirely at zero cost, exactly like every other
+// optional Slab term here.
 //
 // Reuses include/ggx_brdf.glsl's D_GGX/G_SmithGGXCorrelated/F_Schlick/BuildTangentBasis verbatim --
 // no duplicate BRDF math (that file is this codebase's one and only isotropic-GGX implementation,
-// see its own header comment).
+// see its own header comment) -- and include/displacement_noise.glsl's Fbm3D verbatim for the
+// horizontal-mix mask (this codebase's one established world-space procedural-noise convention, see
+// that file's / ProceduralMaskSampler.h's own headers on never duplicating the noise math).
 
 #include "include/math_utils.glsl"
 #include "include/ggx_brdf.glsl"
 #include "include/material_params.glsl"
+#include "include/displacement_noise.glsl"
 
 // Generalized Schlick Fresnel with Substrate's F90 edge-tint parameter (F_Schlick in ggx_brdf.glsl
 // hardcodes F90 = vec3(1.0); a Slab's f90Luminance can tint the grazing-angle response instead).
@@ -189,6 +208,80 @@ vec3 EvaluateSubstrateMaterial(MaterialParams mat, vec3 N, vec3 V, vec3 L) {
 // above is weighted.
 vec3 EvaluateSubstrateEmissive(MaterialParams mat) {
     return mat.base.emissive + mat.top.emissive * mat.topWeight;
+}
+
+// -----------------------------------------------------------------------------------------------
+// Substrate HORIZONTAL material mixing (UE5.8 rendering-parity gap G6) -- see this file's own G6
+// header NOTE for how it differs from the vertical-layering operator above.
+// -----------------------------------------------------------------------------------------------
+
+// The per-pixel A/B mix weight, in [0, mixAmount]. A world-space procedural mask so the blend varies
+// spatially across the surface (a constant weight would be a visually flat average -- this project's
+// whole ethos is procedural variation), thresholded/sharpened by the material's mixBias/mixContrast.
+float EvaluateSubstrateMixMask(MaterialParams mat, vec3 worldPos, float sharpnessScale) {
+    // World-space fbm value noise (displacement_noise.glsl's Fbm3D, reused verbatim -- the
+    // codebase's one established world-space procedural-noise convention), remapped from Fbm3D's
+    // [-1,1] range to [0,1]. WORLD-anchored (not screen- or UV-space): the mask stays glued to the
+    // surface point, so it is temporally stable under TAA (same reasoning as the glint field's world
+    // anchoring, see EvaluateSlabGlint) and continuous across cluster/LOD boundaries (no per-cluster
+    // UV seam, unlike a decoded-UV sample). mixScale floored so a degenerate 0 still samples a
+    // finite noise domain rather than collapsing every point onto one cell.
+    float n = Fbm3D(worldPos * max(mat.mixScale, 1.0e-4)) * 0.5 + 0.5;
+    // Threshold the noise into the mix weight: mixBias sets the 50% point, mixContrast the transition
+    // width (higher -> narrower band -> crisper A/B patch edges). sharpnessScale is the Debug-only
+    // live tuning multiplier (1.0 in Release, see g_ViewParams.mixMaskSharpnessScale). Both are
+    // floored so a degenerate 0 contrast yields a finite (very soft) band, never a divide-by-zero
+    // hard seam.
+    float sharp = max(mat.mixContrast * sharpnessScale, 1.0e-3);
+    float halfBand = 0.5 / sharp;
+    float t = smoothstep(mat.mixBias - halfBand, mat.mixBias + halfBand, n);
+    return t * clamp(mat.mixAmount, 0.0, 1.0);
+}
+
+// Parameter-space lerp of two Slabs into one. Interpolates the physically meaningful Slab quantities
+// (albedo, roughness, F0/F90, emissive, anisotropy, the second-specular/SSS/fuzz/glint parameters)
+// -- NOT a blend of the two Slabs' final BRDF responses, which is not energy-correct. Lerping the
+// inputs then evaluating ONE BRDF is the standard, energy-sane real-time horizontal-mix
+// simplification (it is exactly what most engines, UE5.8 included for its default "coverage" blend,
+// actually do). No normal term: SubstrateSlab carries no per-material normal (this codebase has no
+// normal maps -- the shading normal comes from the decoded cluster geometry and is shared by both
+// Slabs), so there is nothing to blend there.
+SubstrateSlab MixSlabs(SubstrateSlab a, SubstrateSlab b, float t) {
+    SubstrateSlab r;
+    r.diffuseAlbedo         = mix(a.diffuseAlbedo, b.diffuseAlbedo, t);
+    r.roughness             = mix(a.roughness, b.roughness, t);
+    r.f0                    = mix(a.f0, b.f0, t);
+    r.f90Luminance          = mix(a.f90Luminance, b.f90Luminance, t);
+    r.emissive              = mix(a.emissive, b.emissive, t);
+    r.anisotropy            = mix(a.anisotropy, b.anisotropy, t);
+    r.secondRoughness       = mix(a.secondRoughness, b.secondRoughness, t);
+    r.secondRoughnessWeight = mix(a.secondRoughnessWeight, b.secondRoughnessWeight, t);
+    r.sssAmount             = mix(a.sssAmount, b.sssAmount, t);
+    r.sssRadius             = mix(a.sssRadius, b.sssRadius, t);
+    r.fuzzColor             = mix(a.fuzzColor, b.fuzzColor, t);
+    r.fuzzAmount            = mix(a.fuzzAmount, b.fuzzAmount, t);
+    r.fuzzRoughness         = mix(a.fuzzRoughness, b.fuzzRoughness, t);
+    r.sssProfileScale       = mix(a.sssProfileScale, b.sssProfileScale, t);
+    r.glintDensity          = mix(a.glintDensity, b.glintDensity, t);
+    r.glintIntensity        = mix(a.glintIntensity, b.glintIntensity, t);
+    return r;
+}
+
+// Resolves horizontal mixing IN PLACE: replaces mat.base with the mask-blended lerp of base (A) and
+// mixB (B), leaving mat.top / mat.topWeight untouched (the vertical coat still layers over the mixed
+// result in EvaluateSubstrateMaterial). Returns the raw mask weight via `outMixMask` for the Debug
+// mix-mask visualization (ClusterResolve.comp's DEBUG_VIEW_SUBSTRATE_MIXING). Fast path: mixAmount
+// <= 0.0 (every material but an authored horizontal-mix one) returns mat unchanged at zero cost --
+// mixB is never even read -- exactly the pre-G6 single-base behavior.
+MaterialParams ApplySubstrateHorizontalMix(MaterialParams mat, vec3 worldPos, float sharpnessScale, out float outMixMask) {
+    outMixMask = 0.0;
+    if (mat.mixAmount <= 0.0) {
+        return mat;
+    }
+    float t = EvaluateSubstrateMixMask(mat, worldPos, sharpnessScale);
+    outMixMask = t;
+    mat.base = MixSlabs(mat.base, mat.mixB, t);
+    return mat;
 }
 
 // Substrate Glint / sparkle term for ONE Slab (UE5.8 rendering-parity gap G5) -- the discrete-

@@ -462,6 +462,13 @@ namespace renderer {
         void SetDebugGlintDensityScale(float scale) { m_DebugGlintDensityScale = scale; }
         void SetDebugGlintIntensityScale(float scale) { m_DebugGlintIntensityScale = scale; }
 
+        // UE5.8 rendering-parity gap G6 (Substrate horizontal mixing): live Debug-only tuning
+        // multiplier on every horizontally-mixed material's authored mixContrast (the A/B blend
+        // sharpness) -- 1.0 in Release (always the material's own authored sharpness, no toggle
+        // exists there), matching the Set*Scale setters above. Main.cpp's Post FX ImGui tab drives
+        // it via the "Mix Sharpness" slider; consumed by substrate_bsdf.glsl's EvaluateSubstrateMixMask.
+        void SetDebugMixMaskSharpnessScale(float scale) { m_DebugMixMaskSharpnessScale = scale; }
+
         // Phase 1 (Nanite advanced): gates RecordFrame()'s per-frame WPOGlobalsUBO upload of
         // `enhancedDisplacementDebugMultiplier` -- 1.0 when enabled (full effect, the Release-
         // always-on value, matching SetDebugReflectionsEnabled's own convention -- Release hardcodes
@@ -1118,6 +1125,10 @@ namespace renderer {
         // glint density/intensity unmodified -- the Release-always value, no toggle exists there).
         float m_DebugGlintDensityScale = 1.0f;
         float m_DebugGlintIntensityScale = 1.0f;
+        // UE5.8 rendering-parity gap G6 (Substrate horizontal mixing): see
+        // SetDebugMixMaskSharpnessScale's own comment. Defaults to 1.0 (the material's authored
+        // mixContrast unmodified -- the Release-always value, no toggle exists there).
+        float m_DebugMixMaskSharpnessScale = 1.0f;
         // Phase 1 (Nanite advanced): see SetDebugEnhancedDisplacementEnabled/
         // SetDebugSplineDeformationEnabled's own comments -- both default to true (Release-always-on
         // equivalent, no toggle exists there, matching m_DebugReflectionsEnabled's own convention).
