@@ -362,6 +362,25 @@ add_executable(PcgNodePluginTests
 target_include_directories(PcgNodePluginTests PRIVATE src ${Vulkan_INCLUDE_DIRS})
 add_test(NAME PcgNodePluginTests COMMAND PcgNodePluginTests)
 
+# PCG framework roadmap, Phase 4.1 ("Weighted Mesh Spawner"): UE5.8 Mesh Spawner node parity --
+# src/pcg/PcgMeshSpawner.cpp holds the weighted-selection algorithm (cumulative-weight prefix sum +
+# std::upper_bound, same technique Phase 2.1's PcgSurfaceSampler.cpp already established) plus this
+# node type's own PCG_REGISTER_NODE_TYPE registration ("pcg.spawner.weighted_mesh"), so this target
+# links the same PcgGraph.cpp/PcgGraphEvaluator.cpp/PcgNodePlugin.cpp/CRUDE_JSON_SOURCES set
+# PcgNodePluginTests above links, for the identical reason (the registration macro needs the full
+# Phase 5.1/5.2/5.4 graph-engine core to actually build a graph and evaluate this node type through
+# it in this phase's own registration-round-trip test).
+add_executable(PcgMeshSpawnerTests
+    src/pcg/PcgGraph.cpp
+    src/pcg/PcgGraphEvaluator.cpp
+    src/pcg/PcgNodePlugin.cpp
+    src/pcg/PcgMeshSpawner.cpp
+    ${CRUDE_JSON_SOURCES}
+    tests/PcgMeshSpawnerTests.cpp
+)
+target_include_directories(PcgMeshSpawnerTests PRIVATE src ${Vulkan_INCLUDE_DIRS})
+add_test(NAME PcgMeshSpawnerTests COMMAND PcgMeshSpawnerTests)
+
 # PCG framework roadmap, Phase 5.3 ("GPU-Resident Node Execution"): unlike every Pcg*Tests target
 # above (all pure-CPU logic), this target actually stands up a minimal headless Vulkan compute
 # context (tests/PcgGpuTestUtils.h/.cpp -- deliberately kept under tests/, NOT src/, so it never
