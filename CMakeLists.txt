@@ -249,6 +249,16 @@ add_executable(PcgSplineSamplerTests
 target_include_directories(PcgSplineSamplerTests PRIVATE src ${Vulkan_INCLUDE_DIRS})
 add_test(NAME PcgSplineSamplerTests COMMAND PcgSplineSamplerTests)
 
+# PCG framework roadmap, Phase 2.1 ("Surface Sampler"): unlike Phase 1's header-only data types,
+# this phase's sampling algorithm lives in a real .cpp (src/pcg/PcgSurfaceSampler.cpp), so this
+# target links it explicitly, same pattern as every other tests/*.cpp target above.
+add_executable(PcgSurfaceSamplerTests
+    src/pcg/PcgSurfaceSampler.cpp
+    tests/PcgSurfaceSamplerTests.cpp
+)
+target_include_directories(PcgSurfaceSamplerTests PRIVATE src ${Vulkan_INCLUDE_DIRS})
+add_test(NAME PcgSurfaceSamplerTests COMMAND PcgSurfaceSamplerTests)
+
 add_executable(AsyncDecompressingLoaderTests
     src/io/AsyncFileStreamer.cpp
     src/io/BlockCodec.cpp
