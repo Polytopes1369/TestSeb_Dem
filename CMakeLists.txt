@@ -347,6 +347,21 @@ add_executable(PcgDensityTransformFilterTests
 target_include_directories(PcgDensityTransformFilterTests PRIVATE src ${Vulkan_INCLUDE_DIRS})
 add_test(NAME PcgDensityTransformFilterTests COMMAND PcgDensityTransformFilterTests)
 
+# PCG framework roadmap, Phase 5.4 ("Native C++ Node Plugin API"): the ergonomic authoring layer
+# (PCG_REGISTER_NODE_TYPE self-registration, PcgNodeTypeCatalog introspection,
+# ValidateGraphAgainstCatalog batch validation -- src/pcg/PcgNodePlugin.cpp) built on top of Phase
+# 5.1+5.2's raw PcgNodeTypeRegistry/PcgGraph. Links the same PcgGraph.cpp/PcgGraphEvaluator.cpp/
+# crude_json sources as PcgGraphEngineTests above, for the same reason.
+add_executable(PcgNodePluginTests
+    src/pcg/PcgGraph.cpp
+    src/pcg/PcgGraphEvaluator.cpp
+    src/pcg/PcgNodePlugin.cpp
+    ${CRUDE_JSON_SOURCES}
+    tests/PcgNodePluginTests.cpp
+)
+target_include_directories(PcgNodePluginTests PRIVATE src ${Vulkan_INCLUDE_DIRS})
+add_test(NAME PcgNodePluginTests COMMAND PcgNodePluginTests)
+
 add_executable(AsyncDecompressingLoaderTests
     src/io/AsyncFileStreamer.cpp
     src/io/BlockCodec.cpp
