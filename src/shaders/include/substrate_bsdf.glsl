@@ -6,13 +6,25 @@
 // direct sun term, TransparentForward.frag, ReflectionGather.comp's Lumen reflection composite,
 // MegaLightsShade.comp's local-light term). See the Substrate integration plan's own Context section
 // for what this reproduces (the Slab BSDF's full parameter set + the vertical layering operator) and
-// what is deliberately out of scope (horizontal mixing, Hair/Eye/Water shading models, glint).
+// what is deliberately out of scope (horizontal mixing, Hair/Eye/Water shading models).
 // NOTE (UE5.8 rendering-parity gap G4): full screen-space SSS diffusion was ORIGINALLY out of scope
 // here (this file only ever provided the cheap analytic wrap-diffuse approximation, EvaluateSlabDiffuse's
 // sssAmount/sssRadius blend) -- it is now implemented as a real separable screen-space diffusion pass
 // (renderer::SubsurfaceScatteringPass, driven by SubstrateSlab::sssProfileScale, material_params.glsl),
 // which runs AFTER this BSDF has been fully evaluated and composited, so it needs no term here: SSS is
 // a post-lighting screen-space material response, not a per-light BSDF lobe.
+// NOTE (UE5.8 rendering-parity gap G5): the Glint / sparkle term (the sparkly discrete-microfacet
+// "flake" specular response Substrate supports -- metal-flake paint, glittery snow, sugar/salt-like
+// surfaces) was ALSO originally out of scope here -- it is now implemented as EvaluateSubstrateGlint /
+// EvaluateSlabGlint below, a purely additive high-frequency specular term evaluated per-light ON TOP OF
+// the smooth GGX lobe (it never replaces EvaluateSlabSpecular). Unlike the two SSS terms above it is a
+// genuine per-light BSDF lobe, but it needs two extra inputs the smooth lobes do not (the shading
+// point's world position, to anchor the procedural flake field, and this pixel's world-space footprint,
+// to anti-alias it) -- so rather than widen EvaluateSubstrateMaterial's signature and every call site,
+// it is exposed as a SEPARATE additive function the direct-lighting shaders sum in alongside the smooth
+// response (see ClusterResolve.comp/ClusterResolveBinned.comp's own sun-term call sites). Driven by
+// SubstrateSlab::glintDensity/glintIntensity (material_params.glsl); glintIntensity == 0.0 (default)
+// disables it entirely at zero cost, exactly like every other optional Slab term here.
 //
 // Reuses include/ggx_brdf.glsl's D_GGX/G_SmithGGXCorrelated/F_Schlick/BuildTangentBasis verbatim --
 // no duplicate BRDF math (that file is this codebase's one and only isotropic-GGX implementation,
@@ -177,6 +189,127 @@ vec3 EvaluateSubstrateMaterial(MaterialParams mat, vec3 N, vec3 V, vec3 L) {
 // above is weighted.
 vec3 EvaluateSubstrateEmissive(MaterialParams mat) {
     return mat.base.emissive + mat.top.emissive * mat.topWeight;
+}
+
+// Substrate Glint / sparkle term for ONE Slab (UE5.8 rendering-parity gap G5) -- the discrete-
+// microfacet "flake" specular response (metal-flake paint, glittery snow, sugar/salt-like surfaces).
+// ADDITIVE to and distinct from the smooth GGX lobe (EvaluateSlabSpecular): where that lobe is the
+// STATISTICAL AVERAGE of a surface's microfacets (a single smooth highlight), glint reintroduces the
+// individual, spatially-discrete flakes that average washes out -- so on top of the smooth highlight
+// the surface twinkles with pinpoint sparkles that pop in and out as the view/light angle changes.
+//
+// Technique (a footprint-filtered procedural flake population, in the spirit of the real-time
+// "faceted-normal-jitter + threshold" glint approaches -- Real-Time Rendering 4th ed. sec 9.9.4, the
+// Zirr/Kettunen "stochastic glints" family): a grid of tiny mirror facets is anchored to the surface
+// in WORLD space; each cell carries one flake whose microfacet normal is a hashed random perturbation
+// of the shading normal, and a cell "sparkles" only when that flake normal is near-perfectly aligned
+// with the half-vector H (a high-exponent threshold -> a crisp pinpoint, not a broad blur). It is
+// fully procedural -- no texture/data asset (CLAUDE.md hard rule) -- reusing math_utils.glsl's Hash4.
+//
+// TAA/TSR stability: the flake grid is anchored in WORLD space (surfUV is derived from worldPos, not
+// from screen coordinates), so each flake stays glued to its surface point -- TAATSR.comp reprojects
+// history by that same world position, so a world-anchored flake reprojects to itself frame to frame
+// (it twinkles as the angle changes, which is correct, but it never swims/crawls across the surface,
+// which WOULD alias). `footprint` (this pixel's world-space size) drives the anti-alias: as the
+// surface recedes and many flakes fall inside one pixel, their mean is already captured by the smooth
+// lobe, so the high-frequency sparkle variance is faded out (rather than aliasing into random noise).
+// Fading AMPLITUDE while keeping the world grid FIXED avoids the LOD-re-quantization shimmer a
+// distance-varying cell size would cause.
+vec3 EvaluateSlabGlint(SubstrateSlab slab, vec3 N, vec3 V, vec3 L, vec3 T, vec3 B,
+                       vec3 worldPos, float footprint, float densityScale, float intensityScale) {
+    float intensity = slab.glintIntensity * intensityScale;
+    if (intensity <= 0.0) return vec3(0.0);
+    float NdotL = dot(N, L);
+    if (NdotL <= 0.0) return vec3(0.0);
+    vec3 H = normalize(V + L);
+    float VdotH = max(dot(V, H), 0.0);
+
+    // Flake cell size in world units: denser (higher effective glintDensity) -> smaller cells ->
+    // more, finer flakes. Clamped so a degenerate 0 still yields a finite, non-zero grid.
+    float density = clamp(slab.glintDensity * densityScale, 0.0, 1.0);
+    float cellSize = mix(0.20, 0.015, density);
+
+    // Parametrize the surface plane into a stable 2D grid via the procedural tangent basis. T/B are a
+    // deterministic function of N (BuildTangentBasis), so this UV is continuous wherever N is, and
+    // it is world-anchored (built from worldPos) for the temporal stability described above.
+    vec2 surfUV = vec2(dot(worldPos, T), dot(worldPos, B)) / cellSize;
+    vec2 cellBase = floor(surfUV);
+    vec2 cellFrac = surfUV - cellBase;
+
+    // kFlakeSpread: tangent-plane jitter magnitude of the flake normals about N (a wider cone lets
+    // flakes catch the light over a broader range of view/light angles -> a livelier sparkle spread
+    // across the whole sunlit hemisphere, not just a pinhole around the smooth highlight where H==N).
+    // kSparkExponent: high so only near-mirror-aligned flakes light up (a crisp pinpoint sparkle --
+    // the broad response is already the smooth lobe's job, this term must stay high-frequency).
+    // Values validated numerically against a curved showcase surface: on a lit sphere they light a
+    // sparse ~0.3% of points at a good angle (discrete pinpoints, NOT a broad lobe) at a strong
+    // intensity, and the lit set shifts substantially as the view angle changes (the glint "twinkle").
+    // A tighter cone / higher exponent (e.g. 0.35 / 700) is too narrow -- the perturbed flake normals
+    // can then never reach the half-vector, which typically sits tens of degrees off N, so nothing
+    // sparkles at all on curved geometry.
+    const float kFlakeSpread = 0.7;
+    const float kSparkExponent = 220.0;
+
+    // 2x2 bilinear over the neighboring cells so the sparkle field has no hard cell-boundary popping
+    // as worldPos crosses a cell edge (spatially and, with the world anchoring above, temporally
+    // smooth) -- each cell contributes exactly one discrete flake.
+    float sparkle = 0.0;
+    for (int dy = 0; dy < 2; ++dy) {
+        for (int dx = 0; dx < 2; ++dx) {
+            vec2 cellCoord = cellBase + vec2(float(dx), float(dy));
+            vec4 h = Hash4(cellCoord);
+            // Random tangent-plane jitter -> a perturbed per-flake microfacet normal.
+            vec2 jitter = (h.xy * 2.0 - 1.0) * kFlakeSpread;
+            vec3 flakeN = normalize(N + T * jitter.x + B * jitter.y);
+            float align = max(dot(flakeN, H), 0.0);
+            float flake = pow(align, kSparkExponent);
+            float wx = (dx == 0) ? (1.0 - cellFrac.x) : cellFrac.x;
+            float wy = (dy == 0) ? (1.0 - cellFrac.y) : cellFrac.y;
+            sparkle += flake * wx * wy;
+        }
+    }
+
+    // Footprint anti-alias (see this function's header comment): fade sparkle amplitude toward 0 once
+    // a pixel's footprint spans many flakes, keeping the world grid fixed.
+    float aa = clamp(cellSize / max(footprint, 1.0e-4), 0.0, 1.0);
+    sparkle *= aa;
+
+    // Fresnel-tinted (each flake is a little mirror -> reflects the slab's own specular color) and
+    // NdotL-weighted, exactly like the smooth specular lobe this ADDS to.
+    vec3 F = F_SchlickF90(slab.f0, slab.f90Luminance, VdotH);
+    return F * sparkle * intensity * NdotL;
+}
+
+// Full-material Glint term: the additive sparkle contribution of MaterialParams' base (+ optional
+// top) Slabs to one light direction L. Mirrors EvaluateSubstrateMaterial's own vertical-layering
+// structure (a top coat attenuates the base's glint by how much energy it reflects at this view
+// angle, exactly like the base BSDF response is attenuated there) so a glint-flagged base still reads
+// correctly under a Clear Coat. Returns vec3(0.0) at zero cost when no Slab uses glint. Kept separate
+// from EvaluateSubstrateMaterial (rather than folded into it) so the smooth-lobe call sites that do
+// not want to pay for -- or plumb the worldPos/footprint of -- glint are entirely unaffected.
+vec3 EvaluateSubstrateGlint(MaterialParams mat, vec3 N, vec3 V, vec3 L,
+                            vec3 worldPos, float footprint, float densityScale, float intensityScale) {
+    // Fast path: neither slab uses glint (the common case) -> zero cost, matching every other
+    // Substrate term's "0.0 default disables it entirely" convention.
+    bool baseHasGlint = mat.base.glintIntensity > 0.0;
+    bool topHasGlint = (mat.topWeight > 0.0) && (mat.top.glintIntensity > 0.0);
+    if (!baseHasGlint && !topHasGlint) {
+        return vec3(0.0);
+    }
+    vec3 T, B;
+    BuildProceduralTangentBasis(N, T, B);
+    vec3 baseGlint = EvaluateSlabGlint(mat.base, N, V, L, T, B, worldPos, footprint, densityScale, intensityScale);
+    if (mat.topWeight <= 0.0) {
+        return baseGlint;
+    }
+    vec3 topGlint = EvaluateSlabGlint(mat.top, N, V, L, T, B, worldPos, footprint, densityScale, intensityScale);
+    // Same energy-conserving vertical-layer weighting EvaluateSubstrateMaterial uses (see its own
+    // comment): the top layer's Fresnel reflectance at this view angle sets how much reaches the base.
+    float NdotV = max(dot(N, V), 1.0e-4);
+    vec3 topFresnel = F_SchlickF90(mat.top.f0, mat.top.f90Luminance, NdotV);
+    float topFresnelLuma = dot(topFresnel, vec3(0.2126, 0.7152, 0.0722));
+    float baseTransmittance = 1.0 - mat.topWeight * clamp(topFresnelLuma, 0.0, 1.0);
+    return topGlint * mat.topWeight + baseGlint * baseTransmittance;
 }
 
 // Atmos weather system, surface response extension (UE5.8 Substrate / Ubisoft Atmos parity: dynamic

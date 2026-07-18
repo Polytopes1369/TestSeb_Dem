@@ -446,6 +446,16 @@ namespace renderer {
         void SetDebugSSSEnabled(bool enabled) { m_DebugSSSEnabled = enabled; }
         void SetDebugSSSRadiusScale(float scale) { m_DebugSSSRadiusScale = scale; }
 
+        // UE5.8 rendering-parity gap G5 (Substrate Glint/sparkle): live Debug-only tuning multipliers
+        // on every material's authored SubstrateSlab::glintDensity/glintIntensity, threaded into
+        // ResolveViewParamsUBO by RecordFrame's resolve call and consumed by substrate_bsdf.glsl's
+        // EvaluateSubstrateGlint. Both default to 1.0 (authored value unchanged) -- Release has no
+        // toggle and always renders at 1.0 (the material's own authored sparkle), matching every other
+        // Set*Enabled/Set*Scale setter's Release-always-on convention. Main.cpp's Post FX ImGui tab
+        // drives them (a checkbox that zeroes the intensity scale, plus a density and intensity slider).
+        void SetDebugGlintDensityScale(float scale) { m_DebugGlintDensityScale = scale; }
+        void SetDebugGlintIntensityScale(float scale) { m_DebugGlintIntensityScale = scale; }
+
         // Phase 1 (Nanite advanced): gates RecordFrame()'s per-frame WPOGlobalsUBO upload of
         // `enhancedDisplacementDebugMultiplier` -- 1.0 when enabled (full effect, the Release-
         // always-on value, matching SetDebugReflectionsEnabled's own convention -- Release hardcodes
@@ -1053,6 +1063,11 @@ namespace renderer {
         // equivalent), radius scale 1.0 (the material's authored radius unmodified).
         bool m_DebugSSSEnabled = true;
         float m_DebugSSSRadiusScale = 1.0f;
+        // UE5.8 rendering-parity gap G5 (Substrate Glint/sparkle): see SetDebugGlintDensityScale/
+        // SetDebugGlintIntensityScale's own comments. Both default to 1.0 (the material's authored
+        // glint density/intensity unmodified -- the Release-always value, no toggle exists there).
+        float m_DebugGlintDensityScale = 1.0f;
+        float m_DebugGlintIntensityScale = 1.0f;
         // Phase 1 (Nanite advanced): see SetDebugEnhancedDisplacementEnabled/
         // SetDebugSplineDeformationEnabled's own comments -- both default to true (Release-always-on
         // equivalent, no toggle exists there, matching m_DebugReflectionsEnabled's own convention).

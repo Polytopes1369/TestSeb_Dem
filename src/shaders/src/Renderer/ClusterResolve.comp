@@ -149,7 +149,13 @@ layout(std140, set = 0, binding = 7) uniform ResolveViewParamsUBO {
     // hardcoded, unrelated `vec3(0.5, 1.0, 0.5)` (a light/shadow direction mismatch would have
     // misaligned the lit/unlit transition against the shadow itself).
     vec3 sunDirection;
-    float _pad2;
+    // Glint / sparkle (UE5.8 rendering-parity gap G5) Debug-only tuning multiplier on every material's
+    // authored SubstrateSlab::glintDensity -- repurposes what was dead std140 padding after the vec3
+    // sunDirection (the same "reuse dead padding instead of growing the UBO" pattern surfaceWetness/
+    // snowCoverage above already use). 1.0 in Release (renderer::ClusterRenderPipeline hardcodes it,
+    // no toggle exists there); driven by the Post FX ImGui "Glint Density" slider in Debug. Consumed
+    // by EvaluateSubstrateGlint's call site below.
+    float glintDensityScale;
     // Real photometric sun color/intensity (LUX, matching renderer::DirectionalLight's own
     // comment -- 2026-07-17 recalibration): consumed by the physically-based Lambertian direct
     // lighting term below instead of the old implicit "intensity = 1, no color" hardcode.
@@ -160,7 +166,10 @@ layout(std140, set = 0, binding = 7) uniform ResolveViewParamsUBO {
     // reflection_view_params.glsl) -- not previously threaded into this shader, since the
     // pre-Substrate shading here was pure Lambertian (no view-dependent term at all).
     vec3 cameraPositionWorld;
-    float _pad3;
+    // Glint / sparkle (UE5.8 rendering-parity gap G5) Debug-only tuning multiplier on every material's
+    // authored SubstrateSlab::glintIntensity -- same dead-padding reuse / Release-hardcoded-1.0 /
+    // Debug-ImGui-slider convention as glintDensityScale above (Post FX "Glint Intensity" slider).
+    float glintIntensityScale;
 } g_ViewParams;
 
 // Minimal GBuffer (renderer::ClusterResolvePass -- see its own class comment): written alongside
@@ -527,6 +536,18 @@ void main() {
         vec3 skyAmbient = texture(g_SkyViewLUT, SkyViewLUTUVFromDirection(normal, g_ViewParams.sunDirection)).rgb;
         vec3 sunRadiance = g_ViewParams.sunColor * g_ViewParams.sunIntensity;
         vec3 directResponse = EvaluateSubstrateMaterial(mat, normal, viewDir, lightDir);
+        // Substrate Glint / sparkle (UE5.8 rendering-parity gap G5): additive high-frequency discrete-
+        // flake specular ON TOP OF the smooth GGX lobe already in directResponse (it never replaces it)
+        // -- see substrate_bsdf.glsl's EvaluateSubstrateGlint. Zero cost for the vast majority of
+        // materials (glintIntensity == 0 early-outs to vec3(0)). `perspNorm` IS this pixel's view-space
+        // distance from the camera (see the Step 4 VT-LOD comment above); footprint = that distance /
+        // viewport height approximates this pixel's world-space size, which anti-aliases the sparkle so
+        // it fades (rather than shimmering) with distance -- dFdx/dFdy are unavailable in a compute
+        // shader (same reason the VT sample above uses perspNorm, see that comment). It is a sun-lit
+        // specular term, so it is shadowed and scaled by the sun radiance exactly like directResponse.
+        float glintFootprint = perspNorm / max(g_ViewParams.viewportSize.y, 1.0);
+        vec3 glint = EvaluateSubstrateGlint(mat, normal, viewDir, lightDir, worldPos, glintFootprint,
+            g_ViewParams.glintDensityScale, g_ViewParams.glintIntensityScale);
         // kEmissiveScale converts this codebase's existing artist-authored, unitless emissive
         // multiplier (renderer::MaterialParameters::emissive, authored in a small ~0-3 range across
         // every material -- see renderer::GenerateShowcaseMaterialTable) into the same real
@@ -537,7 +558,7 @@ void main() {
         // "glowing", not just "well lit".
         const float kEmissiveScale = 1500.0;
         finalColor = mat.base.diffuseAlbedo * skyAmbient
-            + directResponse * sunRadiance * sunVisibility
+            + (directResponse + glint) * sunRadiance * sunVisibility
             + EvaluateSubstrateEmissive(mat) * kEmissiveScale;
 
         // GBuffer capture (renderer::ClusterResolvePass's new outputs -- see this file's own

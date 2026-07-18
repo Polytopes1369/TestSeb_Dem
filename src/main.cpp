@@ -112,6 +112,15 @@ struct DebugState {
     // diffusion radius as a live tuning knob. Both driven from the Post FX ImGui tab below.
     bool sssEnabled = true;
     float sssRadiusScale = 1.0f;
+    // UE5.8 rendering-parity gap G5 (Substrate Glint/sparkle): renderer::ClusterRenderPipeline::
+    // SetDebugGlintDensityScale/SetDebugGlintIntensityScale tune every material's authored
+    // SubstrateSlab::glintDensity/glintIntensity live (the discrete-microfacet "flake" specular, see
+    // substrate_bsdf.glsl's EvaluateSubstrateGlint). glintEnabled is an A/B toggle that zeroes the
+    // intensity scale when off. All driven from the Post FX ImGui tab below; Release always renders at
+    // the authored value (scale 1.0, no toggle), matching sssEnabled/sssRadiusScale above.
+    bool glintEnabled = true;
+    float glintDensityScale = 1.0f;
+    float glintIntensityScale = 1.0f;
     // Phase 1 (Nanite advanced): renderer::ClusterRenderPipeline::SetDebugEnhancedDisplacementEnabled
     // -- gates the multi-octave procedural noise displacement on entity 2 (Icosphere, see
     // enhanced_displacement.glsl). Key 'J' -- moved off 'B' (this branch's original key) during the
@@ -1017,6 +1026,12 @@ int main(int argc, char** argv) {
                 // diffusion-radius tuning (the material's authored radius is multiplied by this).
                 ImGui::Checkbox("Subsurface Scattering", &g_DebugState.sssEnabled);
                 ImGui::SliderFloat("SSS Radius Scale", &g_DebugState.sssRadiusScale, 0.0f, 4.0f);
+                // UE5.8 rendering-parity gap G5: Substrate Glint/sparkle A/B toggle + density/intensity
+                // tuning (each multiplies the material's authored glintDensity/glintIntensity live --
+                // see the Metal-flake showcase material, slot 0, in renderer::GenerateShowcaseMaterialTable).
+                ImGui::Checkbox("Glint / Sparkle", &g_DebugState.glintEnabled);
+                ImGui::SliderFloat("Glint Density", &g_DebugState.glintDensityScale, 0.0f, 2.0f);
+                ImGui::SliderFloat("Glint Intensity", &g_DebugState.glintIntensityScale, 0.0f, 4.0f);
                 ImGui::EndTabItem();
             }
 
@@ -1687,6 +1702,10 @@ int main(int argc, char** argv) {
         clusterPipeline.SetDebugTAATSREnabled(g_DebugState.taatsrEnabled);
         clusterPipeline.SetDebugSSSEnabled(g_DebugState.sssEnabled);
         clusterPipeline.SetDebugSSSRadiusScale(g_DebugState.sssRadiusScale);
+        // UE5.8 rendering-parity gap G5 (Substrate Glint/sparkle): the checkbox zeroes the intensity
+        // scale (an A/B off), otherwise the two sliders scale the material-authored glint live.
+        clusterPipeline.SetDebugGlintDensityScale(g_DebugState.glintDensityScale);
+        clusterPipeline.SetDebugGlintIntensityScale(g_DebugState.glintEnabled ? g_DebugState.glintIntensityScale : 0.0f);
         clusterPipeline.SetDebugEnhancedDisplacementEnabled(g_DebugState.enhancedDisplacementEnabled);
         clusterPipeline.SetDebugSplineDeformationEnabled(g_DebugState.splineDeformationEnabled);
         clusterPipeline.SetDebugAsyncComputeEnabled(g_DebugState.asyncComputeEnabled);

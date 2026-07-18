@@ -76,8 +76,16 @@ namespace renderer {
         // would double-count subsurface transport -- see GenerateShowcaseMaterialTable's own waxy SSS
         // showcase recipe, which sets this and leaves sssAmount at 0). Occupies what was _pad0.
         float sssProfileScale = 0.0f;
-        float _pad1 = 0.0f;
-        float _pad2 = 0.0f;
+        // Glint / sparkle (UE5.8 rendering-parity gap G5): the discrete-microfacet "flake" specular
+        // response Substrate supports (metal-flake paint, glittery snow, sugar/salt-like surfaces) --
+        // an ADDITIVE high-frequency term on top of the smooth GGX lobe, see substrate_bsdf.glsl's
+        // EvaluateSlabGlint/EvaluateSubstrateGlint. glintDensity [0,1] tunes how fine/numerous the
+        // flakes are (denser -> smaller world-space flake cells -> more, finer sparkles); glintIntensity
+        // is the sparkle brightness AND its enable flag in one -- 0.0 (default) disables the whole term
+        // at zero cost, exactly like sssProfileScale / fuzzAmount / secondRoughnessWeight above. These
+        // occupy what were _pad1/_pad2 (no struct-size change -- static_assert below still 96 bytes).
+        float glintDensity = 0.0f;
+        float glintIntensity = 0.0f;
     };
     static_assert(sizeof(SubstrateSlab) == 96,
         "SubstrateSlab must match the SubstrateSlab struct in material_params.glsl exactly (std430 layout)");
@@ -257,8 +265,17 @@ namespace renderer {
             p.base = MakeBaseSlab(maths::vec3(0.6f, 0.6f, 0.6f), 0.8f, maths::vec3(0.0f, 0.0f, 0.0f), 0.0f);
         }
 
-        // Metal A "chrome" (Box, slot 0): near-white, low roughness, fully metallic.
-        table.params[0].base = MakeBaseSlab(maths::vec3(0.85f, 0.85f, 0.88f), 0.08f, maths::vec3(0.0f, 0.0f, 0.0f), 1.0f);
+        // Metal-flake (Box, slot 0): UE5.8 rendering-parity gap G5 (Substrate Glint/sparkle) showcase.
+        // A bright metal (still recognizably "Metal A") that additionally sparkles with a high-frequency
+        // discrete-flake specular -- classic metal-flake car paint. Roughness bumped from the old flat
+        // chrome's 0.08 to 0.22 so the body highlight is a broad soft sheen rather than a single hard
+        // hotspot, letting the individual glints read clearly across the whole lit face rather than
+        // being drowned by a mirror highlight. glintDensity/glintIntensity drive substrate_bsdf.glsl's
+        // EvaluateSubstrateGlint (summed into the sun term by ClusterResolve.comp/ClusterResolveBinned.
+        // comp); the effect shifts with view angle, distinct from the smooth GGX highlight beside it.
+        table.params[0].base = MakeBaseSlab(maths::vec3(0.82f, 0.83f, 0.88f), 0.22f, maths::vec3(0.0f, 0.0f, 0.0f), 1.0f);
+        table.params[0].base.glintDensity = 0.6f;
+        table.params[0].base.glintIntensity = 3.0f;
 
         // WPO/displacement (Cone, slot 1): vivid teal dielectric so the WPO sway
         // (geometry::EntityMaterialTable's materialID==1 case) reads clearly against a plain color.

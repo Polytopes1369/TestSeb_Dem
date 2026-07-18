@@ -39,7 +39,12 @@ namespace renderer {
             float sunDirectionX = 0.0f;
             float sunDirectionY = 0.0f;
             float sunDirectionZ = 0.0f;
-            float _pad2 = 0.0f;
+            // Glint / sparkle (UE5.8 rendering-parity gap G5): Debug-only per-material glintDensity
+            // tuning multiplier, occupying what was dead std140 padding after the vec3 sunDirection
+            // (same "reuse dead padding" pattern as surfaceWetness/snowCoverage above) -- 1.0 in
+            // Release, driven by the Post FX ImGui "Glint Density" slider in Debug. See
+            // ClusterResolve.comp's own glintDensityScale field comment.
+            float glintDensityScale = 1.0f;
             float sunColorR = 0.0f;
             float sunColorG = 0.0f;
             float sunColorB = 0.0f;
@@ -49,7 +54,10 @@ namespace renderer {
             float cameraPositionWorldX = 0.0f;
             float cameraPositionWorldY = 0.0f;
             float cameraPositionWorldZ = 0.0f;
-            float _pad3 = 0.0f;
+            // Glint / sparkle (UE5.8 rendering-parity gap G5): Debug-only per-material glintIntensity
+            // tuning multiplier, occupying what was the trailing dead pad float -- 1.0 in Release,
+            // driven by the Post FX ImGui "Glint Intensity" slider in Debug.
+            float glintIntensityScale = 1.0f;
         };
         static_assert(sizeof(ResolveViewParams) == 192,
             "ResolveViewParams must match ResolveViewParamsUBO in ClusterResolve.comp exactly (std140 layout)");
@@ -501,7 +509,7 @@ namespace renderer {
 
     void ClusterResolvePass::RecordResolve(VkCommandBuffer cmd, const maths::mat4& viewProj, const maths::mat4& prevViewProj,
         const DirectionalLight& sun, const maths::vec3& cameraPositionWorld, float surfaceWetness, float snowCoverage,
-        uint32_t debugViewMode) {
+        float glintDensityScale, float glintIntensityScale, uint32_t debugViewMode) {
         ResolveViewParams viewParams{};
         viewParams.viewProj = viewProj;
         viewParams.prevViewProj = prevViewProj;
@@ -509,6 +517,10 @@ namespace renderer {
         viewParams.viewportHeight = static_cast<float>(m_RenderExtent.height);
         viewParams.surfaceWetness = surfaceWetness;
         viewParams.snowCoverage = snowCoverage;
+        // Glint / sparkle (UE5.8 rendering-parity gap G5): Debug-only tuning multipliers (1.0 in
+        // Release) -- see the ResolveViewParams struct's own field comments above.
+        viewParams.glintDensityScale = glintDensityScale;
+        viewParams.glintIntensityScale = glintIntensityScale;
         viewParams.sunDirectionX = sun.direction.x;
         viewParams.sunDirectionY = sun.direction.y;
         viewParams.sunDirectionZ = sun.direction.z;
@@ -690,7 +702,7 @@ namespace renderer {
 
     void ClusterResolvePass::RecordResolveBinned(VkCommandBuffer cmd, const maths::mat4& viewProj,
         const DirectionalLight& sun, const maths::vec3& cameraPositionWorld, float surfaceWetness, float snowCoverage,
-        const ClusterShadingBinPass& shadingBinPass) {
+        float glintDensityScale, float glintIntensityScale, const ClusterShadingBinPass& shadingBinPass) {
         // prevViewProj is never read by ClusterResolveBinned.comp (this path never serves
         // DEBUG_VIEW_MOTION_VECTORS) -- `viewProj` itself is reused as a harmless placeholder value
         // rather than introducing a separate identity-matrix concept for an otherwise-dead field.
@@ -701,6 +713,10 @@ namespace renderer {
         viewParams.viewportHeight = static_cast<float>(m_RenderExtent.height);
         viewParams.surfaceWetness = surfaceWetness;
         viewParams.snowCoverage = snowCoverage;
+        // Glint / sparkle (UE5.8 rendering-parity gap G5): Debug-only tuning multipliers (1.0 in
+        // Release, so the material's authored sparkle renders unchanged on this Release path).
+        viewParams.glintDensityScale = glintDensityScale;
+        viewParams.glintIntensityScale = glintIntensityScale;
         viewParams.sunDirectionX = sun.direction.x;
         viewParams.sunDirectionY = sun.direction.y;
         viewParams.sunDirectionZ = sun.direction.z;

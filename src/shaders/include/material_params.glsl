@@ -37,8 +37,14 @@ struct SubstrateSlab {
     // authors ONE or the other, never both (both together would double-count subsurface transport).
     // Occupies what was _pad0. See renderer::SubstrateSlab::sssProfileScale (MaterialParameterTable.h).
     float sssProfileScale;
-    float _pad1;
-    float _pad2;
+    // Glint / sparkle (UE5.8 rendering-parity gap G5, discrete-microfacet "flake" specular) -- drive
+    // substrate_bsdf.glsl's EvaluateSlabGlint/EvaluateSubstrateGlint. glintDensity [0,1] controls how
+    // fine/numerous the flakes are (denser -> smaller world-space flake cells); glintIntensity is the
+    // sparkle brightness and its "enable" flag in one -- glintIntensity == 0.0 (default) disables the
+    // whole term at zero cost, exactly like sssProfileScale/fuzzAmount/secondRoughnessWeight above.
+    // Occupy what were _pad1/_pad2 (no struct-size change). See renderer::SubstrateSlab::glintDensity.
+    float glintDensity;
+    float glintIntensity;
 };
 
 // GLSL-side, std430-compatible mirror of renderer::MaterialParameters
