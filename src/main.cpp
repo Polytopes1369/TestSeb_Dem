@@ -825,6 +825,28 @@ int main(int argc, char** argv) {
                     config::volumetrics::_VOLUMETRIC_FOG_GRID_PIXEL_SIZE = static_cast<uint32_t>(fogGrid);
                 }
                 ImGui::DragFloat("Cloud Ray Sample Scale", &config::volumetrics::_VOLUMETRIC_CLOUD_VIEW_RAY_SAMPLE_COUNT_SCALE, 0.05f, 0.1f, 10.0f);
+
+                // --- Atmos weather system, Subtask 1: Climatic State Manager & Wind Simulation ---
+                // (atmos_integration_plan.md, project root) -- live sliders over config::atmos::*,
+                // consumed every frame by renderer::AtmosClimatePass::RecordUpdate. Grouped in this
+                // same "Volumetric" tab rather than a new one, since config::volumetrics'
+                // sky/fog/cloud quality knobs above are this same weather system's other half.
+                ImGui::Separator();
+                ImGui::TextUnformatted("Atmos Climate");
+                ImGui::DragFloat("Temperature (C)", &config::atmos::TEMPERATURE_CELSIUS, 0.2f, -20.0f, 45.0f);
+                ImGui::SliderFloat("Relative Humidity", &config::atmos::RELATIVE_HUMIDITY, 0.01f, 1.0f);
+                ImGui::DragFloat("Wind Direction (deg)", &config::atmos::WIND_DIRECTION_DEGREES, 1.0f, 0.0f, 360.0f);
+                ImGui::DragFloat("Wind Speed (m/s)", &config::atmos::WIND_SPEED_MPS, 0.1f, 0.0f, 40.0f);
+                ImGui::DragFloat("Wind Turbulence Frequency", &config::atmos::WIND_TURBULENCE_FREQUENCY, 0.005f, 0.01f, 2.0f);
+                ImGui::DragFloat("Wind Turbulence Octaves", &config::atmos::WIND_TURBULENCE_OCTAVES, 0.05f, 1.0f, 6.0f);
+                ImGui::DragFloat("Wind Turbulence Scale", &config::atmos::WIND_TURBULENCE_SCALE, 0.05f, 0.0f, 10.0f);
+                ImGui::DragFloat("Wind Turbulence Roughness", &config::atmos::WIND_TURBULENCE_ROUGHNESS, 0.01f, 0.0f, 1.0f);
+                ImGui::DragFloat("Cloud Density Target", &config::atmos::CLOUD_DENSITY_TARGET, 0.01f, 0.0f, 1.0f);
+                ImGui::DragFloat("Fog Density Target", &config::atmos::FOG_DENSITY_TARGET, 0.01f, 0.0f, 1.0f);
+                ImGui::DragFloat("Rain Strength", &config::atmos::RAIN_STRENGTH, 0.01f, 0.0f, 1.0f);
+                ImGui::TextDisabled("Dew Point: %.2f C", clusterPipeline.GetAtmosClimate().GetLastDewPointCelsius());
+                ImGui::TextDisabled("LCL Height: %.1f m", clusterPipeline.GetAtmosClimate().GetLastLCLHeightMeters());
+
                 ImGui::EndTabItem();
             }
 

@@ -333,6 +333,25 @@ inline uint32_t _VOLUMETRIC_FOG_GRID_PIXEL_SIZE = 4;
 inline float _VOLUMETRIC_CLOUD_VIEW_RAY_SAMPLE_COUNT_SCALE = 2.0f;
 } // namespace volumetrics
 
+// Atmos weather system (atmos_integration_plan.md, Subtask 1: Climatic State Manager & Wind
+// Simulation) -- live simulation knobs, not a quality-preset tier, so unlike volumetrics:: above
+// these are NOT mirrored into EngineConfig_{Low,Medium,High,Extrem}.h / Apply*Preset(): they are
+// runtime state a user tunes live via the Volumetric ImGui tab, the same way config::temporal::
+// BLEND_ALPHA or config::shadows' non-"_QUALITY" members already are.
+namespace atmos {
+inline float TEMPERATURE_CELSIUS = 22.0f;
+inline float RELATIVE_HUMIDITY = 0.55f; // Fraction [0,1], NOT percent -- see AtmosClimatePass::RecordUpdate's own Magnus-Tetens comment.
+inline float WIND_DIRECTION_DEGREES = 45.0f; // Compass bearing in the XZ plane, 0 = +Z (North), 90 = +X (East).
+inline float WIND_SPEED_MPS = 3.0f;
+inline float WIND_TURBULENCE_FREQUENCY = 0.15f;
+inline float WIND_TURBULENCE_OCTAVES = 3.0f;
+inline float WIND_TURBULENCE_SCALE = 1.0f;
+inline float WIND_TURBULENCE_ROUGHNESS = 0.5f;
+inline float CLOUD_DENSITY_TARGET = 0.5f; // [0,1] -- unconsumed until Subtask 4 (Volumetric Clouds).
+inline float FOG_DENSITY_TARGET = 0.1f; // [0,1] -- unconsumed until Subtask 3 (Froxel Volumetric Fog).
+inline float RAIN_STRENGTH = 0.0f; // [0,1] -- unconsumed until a future precipitation pass.
+} // namespace atmos
+
 // Active loaded state
 inline bool g_ProfileLoaded = false;
 inline std::string g_ActiveProfileName = "High"; // Default to High properties

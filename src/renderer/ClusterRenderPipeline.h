@@ -78,6 +78,7 @@
 #include "renderer/passes/ClusterSoftwareRasterPass.h"
 #include "renderer/passes/GeometryDecompressionPass.h"
 #include "renderer/streaming/GeometryStreamingCoordinator.h"
+#include "renderer/passes/AtmosClimatePass.h"
 #include "renderer/passes/GlobalSDFPass.h"
 #include "renderer/vulkan/GpuBuffer.h"
 #include "renderer/streaming/GpuGeometryPagePool.h"
@@ -225,6 +226,11 @@ namespace renderer {
         // this frame's real candidate count, which only ever exists on the GPU now that
         // m_LODSelection computes a dynamic per-frame cut (see ClusterLODSelectionPass).
         uint32_t GetClusterCount() const { return m_ClusterCount; }
+
+        // Exposes AtmosClimatePass's last computed Dew Point / LCL Height for main.cpp's Volumetric
+        // ImGui tab (atmos_integration_plan.md Subtask 1, objective #4) -- same "borrow a const ref"
+        // convention as e.g. GetTracedEntityInfos() elsewhere in this class.
+        const AtmosClimatePass& GetAtmosClimate() const { return m_AtmosClimate; }
 
 #ifndef NDEBUG
         // SWRT/HWRT back-end toggle shared by m_GIInject and m_WorldProbes' own trace pass (0 = SWRT
@@ -485,6 +491,12 @@ namespace renderer {
         VirtualTextureVolumeBounds m_VTBounds;
         SurfaceCachePass m_SurfaceCache;
         GlobalSDFPass m_GlobalSDF;
+        // Atmos weather system, Subtask 1 (atmos_integration_plan.md): climate/wind state producer
+        // -- see AtmosClimatePass's own class comment. Declared here (not consumed by anything yet)
+        // so its RecordUpdate() call can run right at the top of RecordFrame()'s own [1z] GI-
+        // infrastructure block, ahead of every future consumer (Froxel Fog / Volumetric Clouds,
+        // Subtasks 3-4) that will eventually read its AtmosGlobalsUBO the same frame.
+        AtmosClimatePass m_AtmosClimate;
         // Sun direction is fixed by default; one point light is authored in Init() specifically to
         // exercise/verify Phase 3's point-light Virtual Shadow Maps (see Init()'s own comment) --
         // see renderer::LightingTypes.h's own comment for the full field-by-field default.

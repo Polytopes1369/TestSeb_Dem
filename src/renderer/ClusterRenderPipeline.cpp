@@ -518,6 +518,16 @@ bool ClusterRenderPipeline::Init(
     return false;
   }
 
+  // Atmos weather system, Subtask 1: climate/wind state producer -- no dependency on any pass
+  // above/below (owns a single small UBO, no descriptor set -- see AtmosClimatePass.h's own class
+  // comment), so its Init() placement here is arbitrary; kept next to m_GlobalSDF since both are
+  // "self-contained globals producers" Init'd unconditionally in this same STEP 7 block.
+  if (!m_AtmosClimate.Init(createInfo.device, createInfo.allocator,
+                           createInfo.commandPool, createInfo.queue)) {
+    LOG_ERROR("[ClusterRenderPipeline] Failed to initialize AtmosClimatePass.");
+    return false;
+  }
+
   // Shared trace-scene descriptor sets (mesh SDF trace scene + Surface Cache sampling), built
   // once from m_GlobalSDF's per-entity SDF images and m_SurfaceCache's card table/atlases (both
   // already Init'd above) -- reused unmodified by m_SurfaceCacheRT/m_GIInject/m_WorldProbes.
@@ -928,6 +938,7 @@ void ClusterRenderPipeline::Shutdown() {
   m_SurfaceCacheRT.Shutdown();
   m_TraceContext.Shutdown();
   m_GlobalSDF.Shutdown();
+  m_AtmosClimate.Shutdown();
   // Deliberately NOT calling m_LoadingManager.Shutdown() here: this Shutdown() method runs
   // defensively as the very first line of Init() too (see the top of this function), and
   // core::LoadingManager's worker threads are meant to live for this whole pipeline object's
@@ -1136,6 +1147,14 @@ void ClusterRenderPipeline::RecordFrame(VkCommandBuffer cmd,
   m_OcclusionCulling.RecordClearFrame(cmd);
   m_SoftwareRaster.RecordClear(cmd);
   m_LODSelection.RecordClear(cmd);
+
+  // =========================================================================================
+  // [1y] Atmos weather system, Subtask 1: refresh AtmosGlobalsUBO (wind, Magnus-Tetens dew point /
+  // LCL height) from this frame's config::atmos::* knobs. No consumer yet (Phase 1 -- see
+  // AtmosClimatePass.h's own class comment); placed immediately before [1z] so a future Fog/Cloud
+  // consumer added inside that same block always sees an already-current buffer this frame.
+  // =========================================================================================
+  m_AtmosClimate.RecordUpdate(cmd, globalTimeSeconds);
 
   // =========================================================================================
   // [1z] Lumen-style GI infrastructure: Virtual Shadow Map page requests/renders (Phase 3) ->
