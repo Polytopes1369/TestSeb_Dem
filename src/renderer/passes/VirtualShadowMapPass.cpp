@@ -47,6 +47,13 @@ namespace renderer {
         // value is provably a safe upper bound).
         constexpr float kCpuSplineMaxDeviation = 1.6f;
         constexpr float kCpuEnhancedDisplacementMaxAmplitude = 0.06f;
+        // Skeletal-animation feature (VSM shadow-capture fix): fresh CPU-side copy of
+        // skeletal_animation.glsl's SKELETAL_MAX_DEVIATION -- same convention/rationale as the two
+        // constants above (also mirrored independently in animation::SkeletalAnimator.cpp's own
+        // ValidateSkeletalBounds diagnostic, kSkeletalMaxDeviationMirror -- three independent copies
+        // of the same GLSL source-of-truth constant, all documented, matching this file's own
+        // established "no cross-language include for a small stable constant" idiom).
+        constexpr float kCpuSkeletalMaxDeviation = 1.5f;
 
         constexpr float kHalfPi = 1.57079632679489661923f;
 
@@ -69,7 +76,7 @@ namespace renderer {
     bool VirtualShadowMapPass::Init(VkPhysicalDevice physicalDevice, VkDevice device, VmaAllocator allocator,
         VkCommandPool commandPool, VkQueue queue, const std::filesystem::path& cacheFilePath,
         VkBuffer entityTransformBuffer, VkBuffer entityDataBuffer, VkBuffer wpoGlobalsBuffer,
-        VkBuffer splineControlPointsBuffer, const core::EntityData* entityDataCPU,
+        VkBuffer splineControlPointsBuffer, VkBuffer boneMatricesBuffer, const core::EntityData* entityDataCPU,
         const std::vector<VkDescriptorImageInfo>& maskImageInfos) {
         kSunBaseRadius = config::lumen::VSM_SUN_BASE_RADIUS;
         kPhysicalPageCapacity = config::lumen::VSM_PHYSICAL_PAGE_CAPACITY;
@@ -135,8 +142,17 @@ namespace renderer {
                 range.maskTextureIndex = materialProps.maskTextureIndex;
                 range.hasSplineDeformation = core::GetFlag(ed.flags, core::EntityFlags::HasSplineDeformation);
                 range.hasEnhancedDisplacement = core::GetFlag(ed.flags, core::EntityFlags::HasEnhancedDisplacement);
+                // Skeletal-animation feature (VSM shadow-capture fix): this flag was never folded
+                // into isDynamicCandidate when the skeletal-animation feature was introduced (a real
+                // integration gap between two previously-separate features) -- without it, a page
+                // that had already captured the creature once (e.g. at first visibility) would never
+                // be classified as covering dynamic content again, so it would never be re-rendered,
+                // and ShadowMapCaptureAnimated.vert's own skinning fix (this file's sibling change)
+                // would never actually be observed: the page's cached depth content would stay
+                // frozen at whichever single pose it was last captured at, forever.
+                range.isSkeletallyAnimated = core::GetFlag(ed.flags, core::EntityFlags::IsSkeletallyAnimated);
                 range.isDynamicCandidate = core::GetFlag(ed.flags, core::EntityFlags::IsDynamic) ||
-                    range.hasSplineDeformation || range.hasEnhancedDisplacement;
+                    range.hasSplineDeformation || range.hasEnhancedDisplacement || range.isSkeletallyAnimated;
             }
             m_EntityRanges[entry.entityID] = range;
 
@@ -259,7 +275,7 @@ namespace renderer {
         // =====================================================================================
         uint32_t maskTextureCount = static_cast<uint32_t>(maskImageInfos.size());
 
-        VkDescriptorSetLayoutBinding bindings[5]{};
+        VkDescriptorSetLayoutBinding bindings[6]{};
         bindings[0].binding = 0;
         bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; // EntityTransformBuffer
         bindings[0].descriptorCount = 1;
@@ -285,13 +301,20 @@ namespace renderer {
         bindings[4].descriptorCount = maskTextureCount;
         bindings[4].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
 
+        // Skeletal-animation feature (VSM shadow-capture fix): SkeletalBoneMatricesSSBO, read-only,
+        // vertex-stage-only -- see ShadowMapCaptureAnimated.vert's own binding comment.
+        bindings[5].binding = 5;
+        bindings[5].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        bindings[5].descriptorCount = 1;
+        bindings[5].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+
         VkDescriptorSetLayoutCreateInfo setLayoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-        setLayoutInfo.bindingCount = 5;
+        setLayoutInfo.bindingCount = 6;
         setLayoutInfo.pBindings = bindings;
         VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &setLayoutInfo, nullptr, &m_DescriptorSetLayout));
 
         VkDescriptorPoolSize poolSizes[3]{};
-        poolSizes[0] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3 };
+        poolSizes[0] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4 };
         poolSizes[1] = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 };
         poolSizes[2] = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, maskTextureCount };
         VkDescriptorPoolCreateInfo descPoolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
@@ -310,8 +333,9 @@ namespace renderer {
         VkDescriptorBufferInfo entityDataInfo{ entityDataBuffer, 0, VK_WHOLE_SIZE };
         VkDescriptorBufferInfo wpoGlobalsInfo{ wpoGlobalsBuffer, 0, VK_WHOLE_SIZE };
         VkDescriptorBufferInfo splineControlPointsInfo{ splineControlPointsBuffer, 0, VK_WHOLE_SIZE };
+        VkDescriptorBufferInfo boneMatricesInfo{ boneMatricesBuffer, 0, VK_WHOLE_SIZE };
 
-        VkWriteDescriptorSet writes[5]{};
+        VkWriteDescriptorSet writes[6]{};
         writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[0].dstSet = m_DescriptorSet;
         writes[0].dstBinding = 0;
@@ -347,7 +371,14 @@ namespace renderer {
         writes[4].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         writes[4].pImageInfo = maskImageInfos.data();
 
-        vkUpdateDescriptorSets(m_Device, 5, writes, 0, nullptr);
+        writes[5].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[5].dstSet = m_DescriptorSet;
+        writes[5].dstBinding = 5;
+        writes[5].descriptorCount = 1;
+        writes[5].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[5].pBufferInfo = &boneMatricesInfo;
+
+        vkUpdateDescriptorSets(m_Device, 6, writes, 0, nullptr);
 
         // =====================================================================================
         // STEP 6 -- Two depth-only capture pipelines sharing the descriptor set + layout above:
@@ -859,6 +890,11 @@ namespace renderer {
         }
         if (range.hasEnhancedDisplacement) {
             maths::vec3 dev{ kCpuEnhancedDisplacementMaxAmplitude, kCpuEnhancedDisplacementMaxAmplitude, kCpuEnhancedDisplacementMaxAmplitude };
+            localMin = localMin - dev;
+            localMax = localMax + dev;
+        }
+        if (range.isSkeletallyAnimated) {
+            maths::vec3 dev{ kCpuSkeletalMaxDeviation, kCpuSkeletalMaxDeviation, kCpuSkeletalMaxDeviation };
             localMin = localMin - dev;
             localMax = localMax + dev;
         }

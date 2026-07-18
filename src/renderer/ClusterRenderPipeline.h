@@ -580,6 +580,34 @@ namespace renderer {
             uint32_t srcFamily, uint32_t dstFamily, VkPipelineStageFlags2 activeStageMask,
             VkAccessFlags2 activeImageAccessMask, VkAccessFlags2 activeBufferAccessMask);
 
+        // Skeletal-animation feature (ray-traced GI/reflections fix): a SECOND, dedicated cross-queue
+        // ownership-transfer call -- deliberately kept separate from RecordSurfaceCacheOwnershipTransfer
+        // above (rather than growing that call's own fixed 5-image/4-buffer arrays) because
+        // animation::SkeletalAnimator's bone-matrices buffer has a genuinely different active-access
+        // pattern (TRANSFER_WRITE by SkeletalAnimator::RecordUpdate's own vkCmdUpdateBuffer at
+        // release time; COMPUTE_SHADER/SHADER_STORAGE_READ by SurfaceCacheRayTracingPass::
+        // RecordCreatureBlasUpdate's own skinning dispatch at acquire time -- neither matches the 9
+        // Surface Cache resources' own VERTEX_INPUT/COLOR_ATTACHMENT_OUTPUT/ACCELERATION_STRUCTURE_BUILD
+        // pattern) and a different owning pass entirely.
+        //
+        // UNLIKE RecordSurfaceCacheOwnershipTransfer, this is NOT a "rare, accepted-risk" case: the
+        // bone-matrices buffer is WRITTEN unconditionally in cmdEarly EVERY frame (moved there
+        // specifically to satisfy RecordCreatureBlasUpdate's own ordering requirement -- see
+        // RecordFrameEarly's own call-site comment), but READ by RecordCreatureBlasUpdate's compute
+        // dispatch on THIS frame's actual TLAS-refresh queue, which is the async-compute queue on
+        // EVERY frame useAsyncCompute is true (not just a rare Debug-toggle transition -- traceMode
+        // is hardcoded HWRT in Release, so useAsyncCompute is effectively always true there whenever
+        // a dedicated async-compute queue family exists at all). A missing transfer here would be a
+        // real, every-frame validation-layer/correctness hazard, not a documented edge case --
+        // contrast SurfaceCacheRayTracingPass::HasCreatureBlas()'s own header comment, which explains
+        // why the creature's OWN 2 buffers (skinned-vertex + BLAS backing buffer) do NOT need this
+        // same treatment (both are read-and-written entirely within one same-queue call, unlike this
+        // buffer's cross-call graphics-write/async-compute-read split).
+        //
+        // No-ops (like RecordSurfaceCacheOwnershipTransfer) when !m_AsyncComputeAvailableThisBuild.
+        void RecordBoneMatricesOwnershipTransfer(VkCommandBuffer cmd, bool isRelease,
+            uint32_t srcFamily, uint32_t dstFamily);
+
 #ifndef NDEBUG
         // Phase 1 (Nanite advanced): C++ port of HermiteEvaluate/BuildBendFrame/ApplySplineDeformation
         // (spline_deformation.glsl), called once at the end of Init() -- densely samples the

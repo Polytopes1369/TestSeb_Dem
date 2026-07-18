@@ -3,10 +3,11 @@
 
 // VSM advanced roadmap, Feature 1 (live per-entity transforms): per-entity animated Fallback Mesh
 // capture for renderer::VirtualShadowMapPass -- replicates ClusterRaster.vert's own vertex
-// transform sequence (local-space spline bend -> rigid rotation/translation -> WPO sway ->
-// enhanced displacement) via #include, so a shadow page render always matches THIS frame's actual
-// on-screen deformed silhouette (Tube, entity 6, spline; TorusKnot, entity 10, enhanced
-// displacement) instead of a frozen rest-pose shadow.
+// transform sequence (local-space skeletal skinning -> spline bend -> rigid rotation/translation ->
+// WPO sway -> enhanced displacement) via #include, so a shadow page render always matches THIS
+// frame's actual on-screen deformed silhouette (the procedural creature, skeletal skinning; Tube,
+// entity 6, spline; TorusKnot, entity 10, enhanced displacement) instead of a frozen rest-pose
+// shadow.
 //
 // renderer::VirtualShadowMapPass::RenderPage() now issues one vkCmdDrawIndexed per entity (see
 // EntityDrawRange) instead of one merged draw covering every entity at once, so gl_InstanceIndex
@@ -35,11 +36,12 @@
 #include "include/wpo_deformation.glsl"
 #include "include/enhanced_displacement.glsl"
 #include "include/spline_deformation.glsl"
-// Skeletal-animation feature: this shader does NOT apply ApplySkeletalSkinning (documented, known
-// scope limitation -- the procedural creature's shadow is cast from its BIND POSE, not its
-// animated pose; see project documentation for this deliberate deviation). Only included for the
-// SKELETAL_MAX_DEVIATION constant displacement_bounds.glsl references unconditionally below (this
-// file has no bone-matrices SSBO binding of its own).
+// Skeletal-animation feature (VSM shadow-capture fix): applies ApplySkeletalSkinning, mirroring
+// ClusterRaster.vert's own call site exactly (local space, before the spline bend/rigid rotation
+// below) -- see skeletal_animation.glsl's own header comment for why ComputeChainSkinWeights
+// (rather than a decoded ClusterVertexSkin) is what supplies the bone indices/weights here: this
+// shader reads plain geometry::FallbackVertex (position/normal/uv only, no baked skin data) via
+// ordinary vertex-input attributes, not the compressed cluster pool ClusterRaster.vert decodes.
 #include "include/skeletal_animation.glsl"
 
 layout(location = 0) in vec3 inPosition;
@@ -71,6 +73,17 @@ layout(std430, set = 0, binding = 3) readonly buffer SplineControlPointsSSBO {
     SplineControlPoint splineControlPoints[SPLINE_CONTROL_POINT_COUNT];
 };
 
+// Skeletal-animation feature (VSM shadow-capture fix): this frame's bone-matrices SSBO
+// (animation::SkeletalAnimator::GetBoneMatricesBuffer(), uploaded once per frame by
+// SkeletalAnimator::RecordUpdate) -- bound read-only at binding 5, the first free slot past this
+// pass's own bindings 0-3 (binding 4 is the fragment-only bindless mask array, see
+// renderer::VirtualShadowMapPass::Init's own layout comment). See skeletal_animation.glsl's own
+// header comment for the byte layout and ApplySkeletalSkinning's own header comment for the
+// local-space-before-rotation contract.
+layout(std430, set = 0, binding = 5) readonly buffer SkeletalBoneMatricesSSBO {
+    mat4 boneMatrices[SKELETAL_MAX_BONES];
+};
+
 // entityID indexes EntityDataBuffer/EntityTransformBuffer (one draw == one entity, see this file's
 // own header comment). maxWPOAmplitude/maskTextureIndex are this entity's precomputed, TRUE
 // (non-inflated) values -- see this file's own header comment.
@@ -97,6 +110,20 @@ void main() {
     // subtracting EntityTransform.center.
     vec3 worldPos = inPosition;
     vec3 localPos = worldPos - xform.center;
+
+    // Skeletal-animation feature (VSM shadow-capture fix): linear-blend vertex skinning, applied in
+    // LOCAL space BEFORE the per-entity rigid rotation (and before spline bend below) -- mirrors
+    // ClusterRaster.vert's own call site exactly (same ordering rationale: skinning is an intrinsic
+    // rest-pose mesh-shape property, not a world-space effect). Bone indices/weights are derived
+    // analytically from this vertex's own local-space X coordinate (ComputeChainSkinWeights,
+    // skeletal_animation.glsl) rather than decoded from a baked ClusterVertexSkin buffer -- see that
+    // function's own header comment for why this Fallback Mesh vertex has no such buffer to decode.
+    if (GetFlag(ed.flags, ENTITY_FLAG_IS_SKELETALLY_ANIMATED)) {
+        uvec4 boneIndices;
+        vec4 boneWeights;
+        ComputeChainSkinWeights(localPos.x, boneIndices, boneWeights);
+        localPos = ApplySkeletalSkinning(localPos, boneIndices, boneWeights, boneMatrices);
+    }
 
     // Spline bend, in LOCAL space, BEFORE the rigid rotation -- see spline_deformation.glsl's own
     // header comment, mirrored verbatim from ClusterRaster.vert.
