@@ -759,6 +759,56 @@ int main(int argc, char** argv) {
                 ImGui::EndTabItem();
             }
 
+            // --- Tab Post FX (real-time per-effect enable/disable -- see config::postprocess's
+            // own *_ENABLED block comment for how each toggle actually takes effect) ---
+            if (ImGui::BeginTabItem("Post FX")) {
+                ImGui::Checkbox("Bloom", &config::postprocess::BLOOM_ENABLED);
+                ImGui::Checkbox("Chromatic Aberration", &config::postprocess::CHROMATIC_ABERRATION_ENABLED);
+                ImGui::Checkbox("Vignette", &config::postprocess::VIGNETTE_ENABLED);
+                ImGui::Checkbox("Heat Distortion", &config::postprocess::HEAT_DISTORTION_ENABLED);
+                ImGui::Checkbox("Motion Blur", &config::postprocess::MOTION_BLUR_ENABLED);
+                ImGui::Checkbox("Height Fog", &config::postprocess::HEIGHT_FOG_ENABLED);
+                ImGui::Checkbox("God Rays", &config::postprocess::GOD_RAYS_ENABLED);
+                ImGui::Checkbox("Panini Projection", &config::postprocess::PANINI_ENABLED);
+                ImGui::Checkbox("Sharpen", &config::postprocess::SHARPEN_ENABLED);
+                ImGui::Checkbox("Film Grain", &config::postprocess::FILM_GRAIN_ENABLED);
+                ImGui::Checkbox("White Balance", &config::postprocess::WHITE_BALANCE_ENABLED);
+                ImGui::Checkbox("Color Correction", &config::postprocess::COLOR_CORRECTION_ENABLED);
+                ImGui::Checkbox("Depth of Field", &config::postprocess::DOF_ENABLED);
+                ImGui::Checkbox("Ambient Occlusion (GTAO)", &config::postprocess::AO_ENABLED);
+                ImGui::Checkbox("Contact Shadows", &config::postprocess::CONTACT_SHADOW_ENABLED);
+                ImGui::Checkbox("SSR Fallback", &config::postprocess::SSR_FALLBACK_ENABLED);
+                ImGui::EndTabItem();
+            }
+
+            // --- Tab Buffer Viewer -- index order here MUST match
+            // renderer::ClusterRenderPipeline::RecordDebugBufferView's own switch statement
+            // exactly (see that function's own header comment, the single source of truth both
+            // sides are hand-kept in sync with -- there is no shared enum between the two
+            // translation units). ---
+            if (ImGui::BeginTabItem("Buffer Viewer")) {
+                static const char* kBufferNames[] = {
+                    "Off (Final Composite)",
+                    "Resolve: Direct Color (HDR)",
+                    "Resolve: World Normal",
+                    "Resolve: Depth",
+                    "Resolve: Albedo",
+                    "Resolve: Roughness/Metallic",
+                    "Reflection: Hit Mask",
+                    "Ambient Occlusion (GTAO)",
+                    "Bloom",
+                    "TAA/TSR Output",
+                    "Depth of Field Output",
+                    "Screen Trace GI",
+                    "Denoised GI (A-Trous)",
+                    "GI Composite",
+                    "Final Composite (Post-Process)",
+                };
+                ImGui::Combo("Buffer", &config::debugview::SELECTED_BUFFER_INDEX, kBufferNames, IM_ARRAYSIZE(kBufferNames));
+                ImGui::TextWrapped("Shows the selected buffer instead of the normal final image. Not tied to the Numpad debug-view-mode keys.");
+                ImGui::EndTabItem();
+            }
+
             // --- Tab Volumetric ---
             if (ImGui::BeginTabItem("Volumetric")) {
                 int texQual = static_cast<int>(config::volumetrics::_TEXTURE_QUALITY);
