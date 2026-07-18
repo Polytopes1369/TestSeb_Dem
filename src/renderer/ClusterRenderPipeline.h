@@ -159,6 +159,7 @@
 #include "renderer/passes/ScreenTracePass.h"
 #include "renderer/passes/GICompositePass.h"
 #include "renderer/passes/SubsurfaceScatteringPass.h"
+#include "renderer/passes/DecalProjectionPass.h"
 #ifndef NDEBUG
 #include "renderer/debug/ClusterTriangleStatsPass.h"
 #include "renderer/debug/DebugBufferViewPass.h"
@@ -375,6 +376,12 @@ namespace renderer {
         // (instance-count readout) -- same "borrow a const ref" convention as GetParticleSystem().
         const VegetationScatterPass& GetVegetationScatter() const { return m_VegetationScatter; }
 
+        // UE5.8-parity gap G1 (Decal system): number of projected decals uploaded at Init -- read by
+        // main.cpp's own Debug "Post FX" ImGui tab for a live count readout next to the decal bounds
+        // toggle. Plain accessor (the count itself is not debug-only data), same convention as
+        // GetVegetationScatter().GetInstanceCount() above.
+        uint32_t GetDecalCount() const { return m_Decals.GetDecalCount(); }
+
 #ifndef NDEBUG
         // Debug-only: re-runs the vegetation scatter generator from the current config::vegetation::
         // density/region/seed knobs. Waits for the device to go idle first (the generation is a
@@ -451,6 +458,13 @@ namespace renderer {
         // Post FX ImGui tab.
         void SetDebugSSSEnabled(bool enabled) { m_DebugSSSEnabled = enabled; }
         void SetDebugSSSRadiusScale(float scale) { m_DebugSSSRadiusScale = scale; }
+
+        // UE5.8-parity gap G1 (Decal system): when true, DecalProject.comp outlines every projected
+        // decal's oriented box (bright cyan) over the scene so decal placement/extent is directly
+        // verifiable. Debug-only (Release has no toggle and never draws bounds, the equivalent of a
+        // hardcoded false), matching every other Set*Enabled setter's own Debug-only gating and
+        // CLAUDE.md rule 8's exclusion of visualization tooling from Release. Main.cpp's Post FX tab.
+        void SetDebugShowDecalBounds(bool enabled) { m_DebugShowDecalBounds = enabled; }
 
         // UE5.8 rendering-parity gap G5 (Substrate Glint/sparkle): live Debug-only tuning multipliers
         // on every material's authored SubstrateSlab::glintDensity/glintIntensity, threaded into
@@ -1042,6 +1056,14 @@ namespace renderer {
         // GICompositePass's own class comment.
         GICompositePass m_GIComposite;
 
+        // UE5.8-parity gap G1 (Decal system): deferred projected-decal compositing. Recorded at the
+        // very top of RecordFrameLate (before any deferred lighting pass consumes the GBuffer), it
+        // read-modify-writes the decaled material patch into m_Resolve's GBuffer (albedo/normal/
+        // roughness-metallic) + direct color images -- see DecalProjectionPass's own class comment.
+        // The fixed showcase decal set is authored by renderer::GenerateShowcaseDecals() and uploaded
+        // once at Init().
+        DecalProjectionPass m_Decals;
+
         // Screen-space Subsurface Scattering (UE5.8 rendering-parity gap G4, "Subsurface Profile"
         // shading model): a separable diffusion-profile blur applied IN PLACE to m_GIComposite's
         // fully-lit output image (right after it composites, before the forward passes/TAA), gated
@@ -1120,6 +1142,10 @@ namespace renderer {
         // equivalent), radius scale 1.0 (the material's authored radius unmodified).
         bool m_DebugSSSEnabled = true;
         float m_DebugSSSRadiusScale = 1.0f;
+        // UE5.8-parity gap G1 (Decal system): see SetDebugShowDecalBounds's own comment. Defaults to
+        // false (bounds overlay off) -- Release has no toggle and never compiles the overlay code path
+        // (DecalProject.comp's #ifdef _DEBUG block), the equivalent of a hardcoded false.
+        bool m_DebugShowDecalBounds = false;
         // UE5.8 rendering-parity gap G5 (Substrate Glint/sparkle): see SetDebugGlintDensityScale/
         // SetDebugGlintIntensityScale's own comments. Both default to 1.0 (the material's authored
         // glint density/intensity unmodified -- the Release-always value, no toggle exists there).

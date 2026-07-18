@@ -833,6 +833,17 @@ bool ClusterRenderPipeline::Init(
     return false;
   }
 
+  // UE5.8-parity gap G1 (Decal system): deferred projected-decal compositing over m_Resolve's own
+  // GBuffer (albedo/normal/roughness-metallic) + direct color images. The fixed showcase decal set is
+  // authored here via renderer::GenerateShowcaseDecals() -- this IS where decals are added to the
+  // scene (mirroring how renderer::GenerateShowcaseMaterialTable authors the per-entity materials) --
+  // and uploaded once into this pass (instance SSBO + CPU-built decal BVH). All views borrowed; the
+  // pass owns none of them (see DecalProjectionPass's own class comment).
+  m_Decals.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
+      createInfo.renderExtent, m_Resolve.GetOutputDepthView(), m_Resolve.GetOutputNormalView(),
+      m_Resolve.GetOutputAlbedoView(), m_Resolve.GetOutputRoughnessMetallicView(),
+      m_Resolve.GetOutputColorView(), GenerateShowcaseDecals());
+
   // Screen Trace GI -- linear screen-space depth raymarching falling back to the World Probe grid.
   m_ScreenTrace.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
                      createInfo.renderExtent, m_Resolve.GetOutputDepthView(), m_Resolve.GetOutputNormalView(),
@@ -1239,6 +1250,7 @@ void ClusterRenderPipeline::Shutdown() {
   m_Reflection.Shutdown();
   m_ScreenTrace.Shutdown();
   m_GIComposite.Shutdown();
+  m_Decals.Shutdown();
   m_SubsurfaceScattering.Shutdown();
   m_Denoiser.Shutdown();
   // Phase PP1/PP2 (post-process stack roadmap): reverse Init() order (m_TAATSR -> m_Bloom ->
@@ -2508,6 +2520,22 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
         VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
         VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR);
   }
+
+  // =========================================================================================
+  // [12decal] UE5.8-parity gap G1 (Decal system): project the fully-procedural decals onto the
+  // freshly resolved opaque GBuffer + direct color, BEFORE any deferred lighting pass below consumes
+  // them -- exactly a UE deferred decal's "written into the GBuffer before it is consumed by lighting"
+  // placement (see DecalProjectionPass's own class comment). Recorded as the first real GPU work of
+  // this command buffer (after the async-compute ACQUIRE above, which only touches the Surface Cache
+  // atlas/TLAS, not the GBuffer/color images this reads-and-writes). Everything below ([12a] GTAO/
+  // Contact Shadows, [12b] Screen Trace, [12b2] Reflections, [12b3] MegaLights, [12e] GI Composite)
+  // therefore operates on the decaled GBuffer; the pass's own trailing barrier makes that visible.
+  // =========================================================================================
+  m_Decals.RecordDecals(cmdLate, invViewProj, cameraPositionWorld, globalTimeSeconds
+#ifndef NDEBUG
+      , m_DebugShowDecalBounds
+#endif
+  );
 
   // =========================================================================================
   // [12a] Phase PP4 (post-process stack roadmap): GTAO + Screen-Space Contact Shadows.

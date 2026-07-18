@@ -166,6 +166,10 @@ struct DebugState {
     // Defaults to 0.0f (diagnostic inert, zero cost) -- set via the ImGui slider in the Streaming
     // panel below.
     float simulatedLwcOffsetKm = 0.0f;
+    // UE5.8-parity gap G1 (Decal system): renderer::ClusterRenderPipeline::SetDebugShowDecalBounds --
+    // when on, DecalProject.comp outlines every projected decal's oriented box (bright cyan) so decal
+    // placement/extent is directly verifiable. Off by default; driven from the Post FX ImGui tab below.
+    bool showDecalBounds = false;
 };
 static DebugState g_DebugState;
 
@@ -1187,6 +1191,11 @@ int main(int argc, char** argv) {
                 // GenerateShowcaseMaterialTable); higher = crisper rust-patch edges. The raw A/B mask
                 // itself is inspected via the SUBSTRATE MIXING view mode (keyboard 'N').
                 ImGui::SliderFloat("Mix Sharpness", &g_DebugState.mixSharpnessScale, 0.0f, 4.0f);
+                // UE5.8-parity gap G1 (Decal system): live bounds-overlay toggle + a count readout of
+                // the projected decals uploaded at Init (renderer::GenerateShowcaseDecals()).
+                ImGui::Separator();
+                ImGui::Checkbox("Show Decal Bounds", &g_DebugState.showDecalBounds);
+                ImGui::TextDisabled("Projected Decals: %u", clusterPipeline.GetDecalCount());
                 ImGui::EndTabItem();
             }
 
@@ -1918,6 +1927,8 @@ int main(int argc, char** argv) {
         // UE5.8 rendering-parity gap G6 (Substrate horizontal mixing): live A/B blend-sharpness knob
         // (multiplies every horizontally-mixed material's authored mixContrast; 1.0 = unchanged).
         clusterPipeline.SetDebugMixMaskSharpnessScale(g_DebugState.mixSharpnessScale);
+        // UE5.8-parity gap G1 (Decal system): live decal bounds-overlay toggle (Debug-only).
+        clusterPipeline.SetDebugShowDecalBounds(g_DebugState.showDecalBounds);
         clusterPipeline.SetDebugEnhancedDisplacementEnabled(g_DebugState.enhancedDisplacementEnabled);
         clusterPipeline.SetDebugSplineDeformationEnabled(g_DebugState.splineDeformationEnabled);
         clusterPipeline.SetDebugAsyncComputeEnabled(g_DebugState.asyncComputeEnabled);
