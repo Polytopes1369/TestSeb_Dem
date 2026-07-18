@@ -56,16 +56,6 @@ constexpr float TSR_HISTORY_SCREEN_PERCENTAGE = 150.0f;
 constexpr uint32_t TSR_VELOCITY_HEADING_CONVECTIVE = 1;
 } // namespace temporal
 
-namespace shadows {
-// sg.ShadowQuality=5 (Extreme Cinematic)
-constexpr uint32_t QUALITY = 5;
-constexpr bool VIRTUAL_ENABLE = true;
-// Crisp shadows with high-resolution map cache allocations
-constexpr uint32_t MAX_RESOLUTION = 8192;
-constexpr uint32_t CSM_MAX_CASCADES = 8;
-constexpr float DISTANCE_SCALE = 2.00f;
-} // namespace shadows
-
 namespace lumen {
 constexpr uint32_t CARDS_PER_FRAME_BUDGET = 32u;
 constexpr uint32_t EVICTION_FRAME_DELAY = 1200u;

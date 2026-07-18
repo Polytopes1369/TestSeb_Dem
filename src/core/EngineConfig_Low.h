@@ -62,17 +62,6 @@ constexpr float TSR_HISTORY_SCREEN_PERCENTAGE = 100.0f;
 constexpr uint32_t TSR_VELOCITY_HEADING_CONVECTIVE = 1;
 } // namespace temporal
 
-namespace shadows {
-// UE 5.8 Shadows settings (Classic Cascaded Shadow Maps fallback to save GPU
-// cycles) sg.ShadowQuality=1
-constexpr uint32_t QUALITY = 1;
-// r.Shadow.Virtual.Enable=0 (VSM disabled, too heavy for this architecture)
-constexpr bool VIRTUAL_ENABLE = false;
-constexpr uint32_t MAX_RESOLUTION = 1024;
-constexpr uint32_t CSM_MAX_CASCADES = 2;
-constexpr float DISTANCE_SCALE = 0.85f;
-} // namespace shadows
-
 namespace lumen {
 constexpr uint32_t CARDS_PER_FRAME_BUDGET = 8u; // Reduced for performance
 constexpr uint32_t EVICTION_FRAME_DELAY = 300u;
