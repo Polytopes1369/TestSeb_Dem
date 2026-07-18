@@ -93,6 +93,15 @@ inline uint32_t MAX_TRACED_ENTITIES = 128u;
 inline uint32_t RADIOSITY_BOUNCE_COUNT = 4u;
 inline uint32_t SURFACE_CACHE_GI_SAMPLE_COUNT = 64u;
 
+// Global SDF clipmap quality (renderer::GlobalSDFPass) -- voxels per axis per clipmap level, and
+// per-entity Mesh SDF bake resolution respectively. Tier-scaled exactly like the two members
+// above (see EngineConfig_{Low,Medium,High,Extrem}.h's own config_*::lumen::GLOBAL_SDF_* comment
+// for the full rationale); GlobalSDFPass::Init() reads these at the top of every call, mirroring
+// renderer::WorldProbeGridPass::Init()'s own kGridResolution/kProbeSpacing/
+// kProbeSampleDirections = config::lumen::... assignment convention.
+inline uint32_t GLOBAL_SDF_CLIPMAP_RESOLUTION = 32u;
+inline uint32_t GLOBAL_SDF_ENTITY_RESOLUTION = 24u;
+
 inline uint32_t SCREEN_PROBE_TILE_SIZE = 8u;
 inline uint32_t SCREEN_PROBE_RAY_COUNT = 64u;
 inline float SCREEN_PROBE_TEMPORAL_ALPHA = 0.05f;
@@ -406,6 +415,10 @@ inline void ApplyProfile(std::string_view profileName) {
         config_extrem::lumen::RADIOSITY_BOUNCE_COUNT;
     lumen::SURFACE_CACHE_GI_SAMPLE_COUNT =
         config_extrem::lumen::SURFACE_CACHE_GI_SAMPLE_COUNT;
+    lumen::GLOBAL_SDF_CLIPMAP_RESOLUTION =
+        config_extrem::lumen::GLOBAL_SDF_CLIPMAP_RESOLUTION;
+    lumen::GLOBAL_SDF_ENTITY_RESOLUTION =
+        config_extrem::lumen::GLOBAL_SDF_ENTITY_RESOLUTION;
     lumen::SCREEN_PROBE_TILE_SIZE =
         config_extrem::lumen::SCREEN_PROBE_TILE_SIZE;
     lumen::SCREEN_PROBE_RAY_COUNT =
@@ -495,6 +508,10 @@ inline void ApplyProfile(std::string_view profileName) {
     lumen::RADIOSITY_BOUNCE_COUNT = config_high::lumen::RADIOSITY_BOUNCE_COUNT;
     lumen::SURFACE_CACHE_GI_SAMPLE_COUNT =
         config_high::lumen::SURFACE_CACHE_GI_SAMPLE_COUNT;
+    lumen::GLOBAL_SDF_CLIPMAP_RESOLUTION =
+        config_high::lumen::GLOBAL_SDF_CLIPMAP_RESOLUTION;
+    lumen::GLOBAL_SDF_ENTITY_RESOLUTION =
+        config_high::lumen::GLOBAL_SDF_ENTITY_RESOLUTION;
     lumen::SCREEN_PROBE_TILE_SIZE = config_high::lumen::SCREEN_PROBE_TILE_SIZE;
     lumen::SCREEN_PROBE_RAY_COUNT = config_high::lumen::SCREEN_PROBE_RAY_COUNT;
     lumen::SCREEN_PROBE_TEMPORAL_ALPHA =
@@ -584,6 +601,10 @@ inline void ApplyProfile(std::string_view profileName) {
         config_medium::lumen::RADIOSITY_BOUNCE_COUNT;
     lumen::SURFACE_CACHE_GI_SAMPLE_COUNT =
         config_medium::lumen::SURFACE_CACHE_GI_SAMPLE_COUNT;
+    lumen::GLOBAL_SDF_CLIPMAP_RESOLUTION =
+        config_medium::lumen::GLOBAL_SDF_CLIPMAP_RESOLUTION;
+    lumen::GLOBAL_SDF_ENTITY_RESOLUTION =
+        config_medium::lumen::GLOBAL_SDF_ENTITY_RESOLUTION;
     lumen::SCREEN_PROBE_TILE_SIZE =
         config_medium::lumen::SCREEN_PROBE_TILE_SIZE;
     lumen::SCREEN_PROBE_RAY_COUNT =
@@ -672,6 +693,10 @@ inline void ApplyProfile(std::string_view profileName) {
     lumen::RADIOSITY_BOUNCE_COUNT = config_low::lumen::RADIOSITY_BOUNCE_COUNT;
     lumen::SURFACE_CACHE_GI_SAMPLE_COUNT =
         config_low::lumen::SURFACE_CACHE_GI_SAMPLE_COUNT;
+    lumen::GLOBAL_SDF_CLIPMAP_RESOLUTION =
+        config_low::lumen::GLOBAL_SDF_CLIPMAP_RESOLUTION;
+    lumen::GLOBAL_SDF_ENTITY_RESOLUTION =
+        config_low::lumen::GLOBAL_SDF_ENTITY_RESOLUTION;
     lumen::SCREEN_PROBE_TILE_SIZE = config_low::lumen::SCREEN_PROBE_TILE_SIZE;
     lumen::SCREEN_PROBE_RAY_COUNT = config_low::lumen::SCREEN_PROBE_RAY_COUNT;
     lumen::SCREEN_PROBE_TEMPORAL_ALPHA =

@@ -56,9 +56,12 @@ layout(push_constant) uniform WorldProbeInjectPushConstants {
     uint entityCount;  // Dynamically uniform -- see mesh_sdf_trace.glsl's own requirement.
     uint frameIndex;   // Halton sequence temporal offset, advanced by the caller across calls.
     uint traceMode;    // 0 = SWRT (TraceMeshSDFScene), 1 = HWRT (TraceHWRT, inline ray query).
-    // gridResolution: unlike GlobalSDFComposite.comp's FIXED kClipmapResolution=32, renderer::
-    // WorldProbeGridPass::kGridResolution is runtime-configurable (config::lumen::
-    // PROBE_GRID_RESOLUTION) -- the bounds check below needs this value passed explicitly.
+    // gridResolution: renderer::WorldProbeGridPass::kGridResolution is runtime-configurable
+    // (config::lumen::PROBE_GRID_RESOLUTION) -- the same tier-scaled pattern
+    // GlobalSDFComposite.comp's own clipmapResolution push-constant field now also follows
+    // (config::lumen::GLOBAL_SDF_CLIPMAP_RESOLUTION). Either way the bounds check below needs
+    // this value passed explicitly every dispatch, since a push constant cannot read a C++-side
+    // global directly.
     int gridResolution;
 } pc;
 

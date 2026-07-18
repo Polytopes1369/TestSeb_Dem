@@ -79,6 +79,61 @@ namespace renderer {
         // Mandated by the Vulkan 1.3 core spec to support both SAMPLED_IMAGE and STORAGE_IMAGE
         // optimal-tiling usage, so no format-support query is needed before using it as a storage
         // image here.
+        //
+        // --- Investigated 2026-07-18: KEPT at R32G32_SFLOAT, deliberately NOT narrowed to
+        // R16G16_SFLOAT ---
+        // An earlier audit flagged this as possibly oversized (most engines, UE5 included, often
+        // get away with R16F/R32F single-channel or R16G16F for an HZB) and asked for this to be
+        // profiled before changing, not blindly downsized. Investigated by reading the actual
+        // consumer -- src/shaders/include/hzb_occlusion.glsl's IsClusterOccluded(), sampled by both
+        // the early and late specializations of src/shaders/src/Culling/ClusterHZBOcclusionCull.comp
+        // (see renderer::ClusterOcclusionCullingPass) -- rather than guessing. Conclusion: NOT
+        // confident this is safe without a compensating change, so the format stays R32G32_SFLOAT
+        // pending real GPU profiling data. Reasoning:
+        //   1. IsClusterOccluded()'s final verdict is `return nearestDepth < storedFarthestDepth;`
+        //      -- a bare strict inequality with ZERO epsilon/bias margin anywhere in the function
+        //      (confirmed by reading the whole function, and ClusterHZBOcclusionCull.comp's call
+        //      sites -- the only bounds inflation nearby, InflateBoundsForWPO in
+        //      cluster_culling_tests.glsl, is a spatial AABB slop term for World Position Offset
+        //      animation, a no-op for the common maxWPOAmplitude==0 static-cluster case, and not a
+        //      depth-quantization tolerance). Nothing here would absorb added rounding noise from a
+        //      coarser stored-depth format.
+        //   2. This engine's main depth buffer (which the HZB is built from every frame -- see this
+        //      class' own comment) is reversed-Z: VK_COMPARE_OP_GREATER + clear-to-0.0f (see
+        //      renderer::ClusterRenderPipeline's depth attachment setup) and maths::mat4::
+        //      PerspectiveVulkan's m[10]/m[11]/m[14] terms map the far plane to ndc.z=0 and the near
+        //      plane to ndc.z=1 (verified algebraically: ndc.z(d) = zNear*zFar/((zFar-zNear)*d) -
+        //      zNear/(zFar-zNear) for a point d world units in front of the camera). Floating-point
+        //      reversed-Z is specifically chosen to give roughly CONSTANT RELATIVE depth precision
+        //      across the whole camera range (unlike a fixed-point/non-reversed buffer, which loses
+        //      almost all its precision at far distances) -- fp16 keeps that same relative-precision
+        //      shape but with an ~11-bit mantissa instead of fp32's ~24-bit one (~2^13x coarser), so
+        //      the ABSOLUTE world-space depth gap it can still resolve grows with distance from the
+        //      camera instead of staying sub-millimeter everywhere the way fp32 does here.
+        //   3. Quantified against this project's actual camera (Camera.h: zNear=0.1, zFar=1000.0 --
+        //      see Camera::m_Near/m_Far) via the ndc.z(d) formula above: applying fp16's unit
+        //      roundoff (2^-11) to the stored ndc.z value and mapping back through d(ndc.z)/dd gives
+        //      an analytic (not GPU-measured) estimate of roughly a 5mm blind spot at 10 world units
+        //      from the camera, ~4cm by 100 units, and ~12cm by 500 units -- and past d~=620 units
+        //      (i.e. the outer ~38% of this camera's own 1000-unit zFar) ndc.z drops below fp16's
+        //      normal-float floor (2^-14) entirely into denormal representation, where the step size
+        //      is fixed rather than continuing to scale with distance (worse, not better), and where
+        //      some GPU/driver/shader-compiler combinations flush fp16 subnormals to zero outright.
+        //      Given this project's scene content (procedural terrain, mountains, rivers -- see
+        //      CLAUDE.md) legitimately places clusters at these mid-to-far distances, and the
+        //      comparison above has no tolerance to absorb that error, this reads as a concrete,
+        //      non-hypothetical risk of exactly the "occlusion culling false-positive" failure mode
+        //      (an object incorrectly vanishing) the original audit called out, not just a
+        //      theoretical one -- though this whole point-3 estimate is analytic, derived from the
+        //      projection formula, NOT from an actual GPU capture, which is precisely why this is
+        //      "not confident it's safe" rather than "confirmed broken."
+        // To revisit: either (a) add a small, principled epsilon/bias to IsClusterOccluded()'s
+        // comparison, sized to fp16's worst-case error at this project's zFar, and re-derive whether
+        // the test stays meaningfully conservative with it, or (b) capture an actual GPU profile
+        // (Nsight/PIX) showing this image's bandwidth/cache footprint is a measured bottleneck
+        // before trading away precision for it -- the whole pyramid is tiny in absolute VRAM either
+        // way (a handful of MB at typical resolutions), so this is a pure correctness-risk-vs-
+        // marginal-bandwidth trade, not a memory-pressure one.
         static constexpr VkFormat kFormat = VK_FORMAT_R32G32_SFLOAT;
 
         // Allocates the full HZB mip chain sized from `sourceDepthExtent` (mip 0 is

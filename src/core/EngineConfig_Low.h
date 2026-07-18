@@ -86,6 +86,16 @@ constexpr uint32_t MAX_TRACED_ENTITIES = 64u;
 constexpr uint32_t RADIOSITY_BOUNCE_COUNT = 2u;
 constexpr uint32_t SURFACE_CACHE_GI_SAMPLE_COUNT = 24u;
 
+// Global SDF clipmap quality (renderer::GlobalSDFPass): voxels per axis per clipmap level, and
+// per-entity Mesh SDF bake resolution respectively. Coarser on Low -- shorter/blockier cone-
+// tracing empty-space skipping, matching how every other Lumen quality knob above scales down --
+// even though the resulting volume is tiny in VRAM at every tier (a few hundred KB to ~2MB, see
+// GlobalSDFPass.h's own kClipmapResolution comment), so this is purely a trace-quality knob, not
+// a memory-pressure one. Both must stay multiples of 4 (geometry::kSDFBlockDim, the BC4-style
+// compression block size geometry::BuildMeshSDF requires -- see MeshSDFGenerator.h).
+constexpr uint32_t GLOBAL_SDF_CLIPMAP_RESOLUTION = 24u;
+constexpr uint32_t GLOBAL_SDF_ENTITY_RESOLUTION = 16u;
+
 constexpr uint32_t SCREEN_PROBE_TILE_SIZE =
     16u; // Larger tiles = fewer probes traced
 constexpr uint32_t SCREEN_PROBE_RAY_COUNT = 32u; // Reduced ray budget

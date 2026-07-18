@@ -79,6 +79,13 @@ constexpr uint32_t MAX_TRACED_ENTITIES = 128u;
 constexpr uint32_t RADIOSITY_BOUNCE_COUNT = 4u;
 constexpr uint32_t SURFACE_CACHE_GI_SAMPLE_COUNT = 64u;
 
+// Global SDF clipmap quality (renderer::GlobalSDFPass): voxels per axis per clipmap level, and
+// per-entity Mesh SDF bake resolution respectively -- see config_low's own comment on these two
+// for the full rationale. Both must stay multiples of 4 (geometry::kSDFBlockDim). High keeps the
+// engine's original, pre-tier-scaling defaults (32 / 24) unchanged.
+constexpr uint32_t GLOBAL_SDF_CLIPMAP_RESOLUTION = 32u;
+constexpr uint32_t GLOBAL_SDF_ENTITY_RESOLUTION = 24u;
+
 constexpr uint32_t SCREEN_PROBE_TILE_SIZE = 8u;
 constexpr uint32_t SCREEN_PROBE_RAY_COUNT = 64u;
 constexpr float SCREEN_PROBE_TEMPORAL_ALPHA = 0.05f;

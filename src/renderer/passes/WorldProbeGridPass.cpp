@@ -31,10 +31,12 @@ namespace renderer {
             uint32_t entityCount = 0;
             uint32_t frameIndex = 0;
             uint32_t traceMode = 0;
-            // gridResolution: unlike renderer::GlobalSDFPass (a FIXED kClipmapResolution=32 compile-
-            // time constant), renderer::WorldProbeGridPass::kGridResolution is runtime-configurable
-            // (config::lumen::PROBE_GRID_RESOLUTION) -- the shader's own bounds check needs this
-            // value passed explicitly, it cannot hardcode it.
+            // gridResolution: renderer::WorldProbeGridPass::kGridResolution is runtime-configurable
+            // (config::lumen::PROBE_GRID_RESOLUTION, assigned at the top of Init() -- see that
+            // function) -- the same tier-scaled pattern renderer::GlobalSDFPass::kClipmapResolution
+            // now also follows (config::lumen::GLOBAL_SDF_CLIPMAP_RESOLUTION). Either way the
+            // shader's own bounds check needs this value passed explicitly every dispatch, since a
+            // push constant cannot read a C++-side global directly.
             int32_t gridResolution = 0;
         };
         static_assert(sizeof(WorldProbeInjectPushConstants) == 44,

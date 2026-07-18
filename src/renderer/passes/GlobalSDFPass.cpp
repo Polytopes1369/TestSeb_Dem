@@ -90,12 +90,29 @@ namespace renderer {
         // geometry::kMeshSDFResolution default -- the Global SDF only needs enough resolution to
         // drive cone tracing's coarse empty-space skipping, not fine per-object surface detail
         // (that remains the job of the per-cluster geometry / surface cache, not this clipmap).
-        constexpr uint32_t kEntitySDFResolution = 24u;
+        // Tier-scaled (config::lumen::GLOBAL_SDF_ENTITY_RESOLUTION, see
+        // EngineConfig_{Low,Medium,High,Extrem}.h) exactly like GlobalSDFPass::kClipmapResolution
+        // above -- assigned at the very top of Init() below, before any bake job reads it. No
+        // longer `constexpr` for that reason; every existing reader (the worker-thread lambda's
+        // BuildMeshSDF() call and Init()'s own log message, both further down this file) was
+        // already reading it as an ordinary namespace-scope name, so dropping `constexpr` changes
+        // nothing about how it is used, only that its value can now vary by tier. Must stay a
+        // multiple of geometry::kSDFBlockDim (4) -- geometry::BuildMeshSDF returns an empty
+        // (resolution == 0) MeshSDF otherwise, see that function's own doc comment.
+        uint32_t kEntitySDFResolution = 24u;
 
     } // namespace
 
     bool GlobalSDFPass::Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
         const std::filesystem::path& cacheFilePath, core::LoadingManager& loadingManager) {
+        // Tier-scaled Global SDF quality knobs -- read first, before anything below sizes an
+        // image or bakes an entity SDF from them. Mirrors renderer::WorldProbeGridPass::Init()'s
+        // own kGridResolution/kProbeSpacing/kProbeSampleDirections = config::lumen::... assignment
+        // convention (both classes keep these as ordinary `static inline` / anonymous-namespace
+        // variables rather than `constexpr`, precisely so Init() can overwrite them here).
+        kClipmapResolution = config::lumen::GLOBAL_SDF_CLIPMAP_RESOLUTION;
+        kEntitySDFResolution = config::lumen::GLOBAL_SDF_ENTITY_RESOLUTION;
+
         Shutdown();
 
         m_Device = device;

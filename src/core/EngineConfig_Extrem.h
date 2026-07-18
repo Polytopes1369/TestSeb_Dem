@@ -79,6 +79,14 @@ constexpr uint32_t MAX_TRACED_ENTITIES = 256u;
 constexpr uint32_t RADIOSITY_BOUNCE_COUNT = 6u;
 constexpr uint32_t SURFACE_CACHE_GI_SAMPLE_COUNT = 128u; // Extreme quality bounce GI
 
+// Global SDF clipmap quality (renderer::GlobalSDFPass): voxels per axis per clipmap level, and
+// per-entity Mesh SDF bake resolution respectively -- see config_low's own comment on these two
+// for the full rationale. Both must stay multiples of 4 (geometry::kSDFBlockDim). Entity
+// resolution matches geometry::kMeshSDFResolution (32) at this tier -- Extreme's per-entity
+// Global SDF bake is as fine as the surface-detail mesh SDF itself.
+constexpr uint32_t GLOBAL_SDF_CLIPMAP_RESOLUTION = 48u;
+constexpr uint32_t GLOBAL_SDF_ENTITY_RESOLUTION = 32u;
+
 constexpr uint32_t SCREEN_PROBE_TILE_SIZE = 4u;
 constexpr uint32_t SCREEN_PROBE_RAY_COUNT = 128u;
 constexpr float SCREEN_PROBE_TEMPORAL_ALPHA = 0.02f;

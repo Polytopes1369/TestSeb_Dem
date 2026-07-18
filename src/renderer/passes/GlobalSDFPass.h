@@ -1,5 +1,6 @@
 #pragma once
-// Global SDF: 4 camera-centered 3D clipmap levels (geometry::kMeshSDFResolution^3 voxels each),
+// Global SDF: 4 camera-centered 3D clipmap levels (kClipmapResolution^3 voxels each -- tier-scaled,
+// config::lumen::GLOBAL_SDF_CLIPMAP_RESOLUTION, see kClipmapResolution's own comment below),
 // level L covering 2^L times the world-space extent of level 0, compositing every active entity's
 // per-object Mesh SDF (geometry::BuildMeshSDF, from that entity's Fallback Mesh -- the same coarse
 // proxy renderer::SurfaceCachePass and ray tracing acceleration structures already use) into
@@ -64,10 +65,18 @@ namespace renderer {
         GlobalSDFPass& operator=(const GlobalSDFPass&) = delete;
 
         static constexpr uint32_t kLevelCount = 4;
-        // Voxels per axis, per level (cubic). Matches geometry::kMeshSDFResolution so a level and
-        // a per-object Mesh SDF share the same dispatch-sizing intuition, though the two are
-        // otherwise independent resolutions.
-        static constexpr uint32_t kClipmapResolution = 32;
+        // Voxels per axis, per level (cubic). Tier-scaled (config::lumen::
+        // GLOBAL_SDF_CLIPMAP_RESOLUTION, see EngineConfig_{Low,Medium,High,Extrem}.h), assigned at
+        // the top of Init() -- `static inline`, NOT `static constexpr`, so its value can vary by
+        // tier while staying accessible as GlobalSDFPass::kClipmapResolution the same way it always
+        // was (renderer::SDFRayMarchPass.cpp's own ray-march push constant still reads it that
+        // way, unchanged). Defaults to 32 -- the High-tier value, which also happens to equal
+        // geometry::kMeshSDFResolution, though the two remain otherwise-independent resolutions --
+        // until the first Init() call overwrites it with whatever tier is active. Every consumer
+        // already receives the live value through a push-constant field
+        // (GlobalSDFCompositePC::clipmapResolution / SDFRayMarchPC::clipmapResolution), never a
+        // compile-time literal, so no shader-side change was needed to make this tier-scaled.
+        static inline uint32_t kClipmapResolution = 32u;
         // Level 0's voxel edge length, world units; level L's is kBaseVoxelSize * 2^L, so level L
         // covers 2^L times the world-space extent of level 0 (the "each level doubles" requirement).
         static constexpr float kBaseVoxelSize = 0.5f;
