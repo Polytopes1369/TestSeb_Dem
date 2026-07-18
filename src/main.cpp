@@ -29,6 +29,9 @@
 #include "imgui.h"
 #include "backends/imgui_impl_glfw.h"
 #include "backends/imgui_impl_vulkan.h"
+// Phase 7.1 (PCG editor-tooling roadmap): "PCG Graph Editor" tab scaffold, see that header's own
+// comment for what it does/doesn't do yet.
+#include "renderer/debug/PcgGraphEditorPanel.h"
 #endif
 
 // Unreal-editor style viewport navigation: hold the Right Mouse Button to enable FPS-style
@@ -134,6 +137,12 @@ struct DebugState {
     float simulatedLwcOffsetKm = 0.0f;
 };
 static DebugState g_DebugState;
+
+// Phase 7.1 (PCG editor-tooling roadmap): owns the "PCG Graph Editor" tab's own imgui-node-editor
+// context -- a pure editor scaffold, see renderer::debug::PcgGraphEditorPanel's own header comment
+// for exactly what it does/doesn't do yet. Initialized once right after ImGui_ImplVulkan_Init()
+// below, drawn from inside ConfigTabs, torn down alongside every other ImGui teardown call.
+static renderer::debug::PcgGraphEditorPanel g_PcgGraphEditorPanel;
 
 static void KeyCallback(GLFWwindow* window, int key, int scancode, int action, int mods) {
     if (action != GLFW_PRESS) return;
@@ -345,6 +354,18 @@ int main(int argc, char** argv) {
     }
 
 #ifndef NDEBUG
+    // Phase 0.1 (UE5.8-parity PCG roadmap, "Dynamic Instance Registry"): CPU-only Acquire/Release
+    // smoke test for the new core::InstanceRegistry backing VulkanContext's entity storage -- see
+    // VulkanContext::RunInstanceRegistrySmokeTest's own comment for exactly what it checks. Not
+    // fatal on failure (logged only): this validates a mechanism no runtime caller depends on yet
+    // (Phase 0.1 only lays the groundwork later PCG phases build on), so it must not block startup
+    // the way a real content-load failure would.
+    if (!vkContext.RunInstanceRegistrySmokeTest()) {
+        LOG_ERROR("[Main] InstanceRegistry smoke test FAILED -- see log above for the specific check.");
+    }
+#endif
+
+#ifndef NDEBUG
     // Setup Dear ImGui context
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
@@ -402,6 +423,10 @@ int main(int argc, char** argv) {
     init_info.PipelineInfoMain.PipelineRenderingCreateInfo.depthAttachmentFormat = VK_FORMAT_UNDEFINED;
 
     ImGui_ImplVulkan_Init(&init_info);
+
+    // Phase 7.1 (PCG editor-tooling roadmap): create the node-editor context once ImGui itself is
+    // fully up -- see g_PcgGraphEditorPanel's own declaration-site comment.
+    g_PcgGraphEditorPanel.Init();
 #endif
 
     // Builds the consolidated virtual geometry .cache file (scene.cache): reads back the spawned
@@ -559,6 +584,7 @@ int main(int argc, char** argv) {
 
         // Mirrors the interactive loop's own shutdown order below: ImGui backend/context torn down
         // before the fence/pipeline/context it borrows GPU handles from.
+        g_PcgGraphEditorPanel.Shutdown();
         ImGui_ImplVulkan_Shutdown();
         ImGui_ImplGlfw_Shutdown();
         ImGui::DestroyContext();
@@ -999,6 +1025,17 @@ int main(int argc, char** argv) {
                 }
                 ImGui::DragFloat("Cloud Ray Sample Scale", &config::volumetrics::_VOLUMETRIC_CLOUD_VIEW_RAY_SAMPLE_COUNT_SCALE, 0.05f, 0.1f, 10.0f);
 
+                // --- Local Fog Volumes (UE5.8 rendering-parity gap G8) -- localized box/sphere fog
+                // regions injected additively into the froxel grid (see config::localfog::VOLUMES
+                // and renderer::AtmosVolumetricFogPass). "Enable Local Fog Volumes" is a real runtime
+                // toggle (zeroes the injected count live); "Debug: Local Fog Volume Bounds" is a
+                // Debug-only visualization -- the whole config panel is already #ifndef NDEBUG-gated,
+                // and the config read that drives the shader flag is itself gated in RecordUpdate. ---
+                ImGui::Separator();
+                ImGui::TextUnformatted("Local Fog Volumes");
+                ImGui::Checkbox("Enable Local Fog Volumes", &config::localfog::ENABLE);
+                ImGui::Checkbox("Debug: Local Fog Volume Bounds", &config::debugview::LOCAL_FOG_VOLUME_BOUNDS_VIZ);
+
                 // --- Atmos weather system, Subtask 1: Climatic State Manager & Wind Simulation ---
                 // (atmos_integration_plan.md, project root) -- live sliders over config::atmos::*,
                 // consumed every frame by renderer::AtmosClimatePass::RecordUpdate. Grouped in this
@@ -1115,6 +1152,48 @@ int main(int argc, char** argv) {
                         ImGui::SliderFloat("Friction", &cfg.friction, 0.0f, 1.0f);
                         ImGui::DragFloat("Wind Drag", &cfg.dragCoefficient, 0.02f, 0.0f, 5.0f);
 
+                        // Module stack roadmap (subtask A3): two independently-toggleable force
+                        // modules layered on top of the fixed physics knobs above -- a small,
+                        // fixed-size, data-driven stand-in for a real Niagara module graph (a full
+                        // visual-scripting node editor is out of scope for this project, see
+                        // renderer::ParticleSystemPass::EmitterParams' own header comment).
+                        ImGui::Separator();
+                        ImGui::TextUnformatted("Force Modules");
+                        ImGui::Checkbox("Curl-Noise Turbulence", &cfg.curlNoiseEnabled);
+                        ImGui::DragFloat("Turbulence Strength (m/s^2)", &cfg.curlNoiseStrength, 0.02f, 0.0f, 10.0f);
+                        ImGui::DragFloat("Turbulence Scale", &cfg.curlNoiseScale, 0.005f, 0.01f, 3.0f);
+                        ImGui::Checkbox("Radial Attractor/Repulsor", &cfg.attractorEnabled);
+                        ImGui::DragFloat3("Attractor Offset (from emitter)", &cfg.attractorOffsetX, 0.05f);
+                        ImGui::DragFloat("Attractor Strength (+attract/-repel)", &cfg.attractorStrength, 0.05f, -20.0f, 20.0f);
+                        ImGui::DragFloat("Attractor Falloff Radius (m)", &cfg.attractorRadius, 0.05f, 0.05f, 50.0f);
+
+                        // Subtask A4 (color-over-life / size-over-life curves): 4 keyframes each,
+                        // evenly spaced across a particle's normalized age -- see config::particles::
+                        // EmitterConfig::colorCurve/sizeCurve's own declaration comment for the full
+                        // evaluation contract (color is DIRECT/authoritative, overriding "Base Color"
+                        // above once edited here; size is a MULTIPLIER on top of "Size Range" above).
+                        // Only meaningful for ember-kind particles -- precipitation (rain/snow) never
+                        // reads these fields at all (see ParticleSimulation.comp's own UpdateParticle
+                        // comment).
+                        ImGui::Separator();
+                        ImGui::TextUnformatted("Color / Size Over Life (subtask A4)");
+                        ImGui::TextDisabled("4 keys at normalized age 0.00 / 0.33 / 0.67 / 1.00, linearly interpolated.");
+                        static const char* kCurveKeyLabels[4] = { "Age 0.00", "Age 0.33", "Age 0.67", "Age 1.00" };
+                        ImGui::PushID("ColorCurve");
+                        for (uint32_t k = 0; k < 4; ++k) {
+                            ImGui::PushID(static_cast<int>(k));
+                            ImGui::ColorEdit4(kCurveKeyLabels[k], cfg.colorCurve[k]);
+                            ImGui::PopID();
+                        }
+                        ImGui::PopID();
+                        ImGui::PushID("SizeCurve");
+                        for (uint32_t k = 0; k < 4; ++k) {
+                            ImGui::PushID(static_cast<int>(k));
+                            ImGui::DragFloat(kCurveKeyLabels[k], &cfg.sizeCurve[k], 0.01f, 0.0f, 5.0f, "%.2fx");
+                            ImGui::PopID();
+                        }
+                        ImGui::PopID();
+
                         // Multi-emitter roadmap (subtask A1) validation/debug instrumentation: proves
                         // this emitter is independently alive/producing particles, not just that the
                         // aggregate total below is nonzero.
@@ -1173,6 +1252,14 @@ int main(int argc, char** argv) {
                         audioEngine.GetPositionalSourceName(i), audioEngine.GetPositionalPan(i), audioEngine.GetPositionalDistanceGain(i));
                 }
 
+                ImGui::EndTabItem();
+            }
+
+            // --- Tab PCG Graph Editor -- Phase 7.1 (PCG editor-tooling roadmap) scaffold: proves
+            // the vendored thedmd/imgui-node-editor library is wired end-to-end, nothing more.
+            // See renderer::debug::PcgGraphEditorPanel's own header comment for full context. ---
+            if (ImGui::BeginTabItem("PCG Graph Editor")) {
+                g_PcgGraphEditorPanel.Draw();
                 ImGui::EndTabItem();
             }
 
@@ -1741,6 +1828,7 @@ int main(int argc, char** argv) {
     vkDeviceWaitIdle(vkContext.GetDevice());
 
 #ifndef NDEBUG
+    g_PcgGraphEditorPanel.Shutdown();
     ImGui_ImplVulkan_Shutdown();
     ImGui_ImplGlfw_Shutdown();
     ImGui::DestroyContext();

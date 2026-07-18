@@ -41,23 +41,47 @@ set(IMGUI_SOURCES
     ${IMGUI_DIR}/backends/imgui_impl_vulkan.cpp
 )
 
+# --- Configuration Node Editor (Phase 7.1 -- PCG Graph Editor scaffold, editor-tooling only) ---
+# Vendored from thedmd/imgui-node-editor (MIT license), master branch commit
+# 021aa0ea4da13fed864bafb2a92d4c5205076866 (2026-02-20). That project's own docs/README.md states
+# its only dependency is "Vanilla ImGui 1.72+" and that integration is source-only -- "Node Editor
+# sources are located in root project directory. To use it, simply copy&paste sources into your
+# project" -- exactly the same copy-the-sources-in approach already used for ${IMGUI_SOURCES}
+# above, so it is wired in identically. Builds clean against this project's own vendored ImGui
+# 1.92.9 WIP (docking branch) since it only touches ImGui's public API. Only the library's own 4
+# .cpp translation units are vendored (crude_json/imgui_canvas/imgui_node_editor/
+# imgui_node_editor_api) -- the upstream repo's examples/, external/ (its own private ImGui fork
+# submodule, unused here) and docs/ are deliberately NOT copied in, keeping the vendored footprint
+# to exactly what src/renderer/debug/PcgGraphEditorPanel.cpp needs to link against.
+# This is purely an editor tool (an ImGui node-canvas widget), same exclusion discipline as
+# ${IMGUI_SOURCES}: Debug-only, zero object code and zero string/symbol footprint in Release.
+set(NODE_EDITOR_DIR "${CMAKE_CURRENT_SOURCE_DIR}/vendor/imgui-node-editor")
+set(NODE_EDITOR_SOURCES
+    ${NODE_EDITOR_DIR}/crude_json.cpp
+    ${NODE_EDITOR_DIR}/imgui_canvas.cpp
+    ${NODE_EDITOR_DIR}/imgui_node_editor.cpp
+    ${NODE_EDITOR_DIR}/imgui_node_editor_api.cpp
+)
+
 # --- Création de l'exécutable ---
-add_executable(${PROJECT_NAME} 
-    ${ALL_SOURCES} 
-    ${ALL_HEADERS} 
+add_executable(${PROJECT_NAME}
+    ${ALL_SOURCES}
+    ${ALL_HEADERS}
 )
 
 target_sources(${PROJECT_NAME} PRIVATE
     $<$<CONFIG:Debug>:${IMGUI_SOURCES}>
+    $<$<CONFIG:Debug>:${NODE_EDITOR_SOURCES}>
 )
 
 # --- Includes ---
-target_include_directories(${PROJECT_NAME} PRIVATE 
+target_include_directories(${PROJECT_NAME} PRIVATE
     src
     ${Vulkan_INCLUDE_DIRS}
     vendor/vma
     $<$<CONFIG:Debug>:${IMGUI_DIR}>
     $<$<CONFIG:Debug>:${IMGUI_DIR}/backends>
+    $<$<CONFIG:Debug>:${NODE_EDITOR_DIR}>
 )
 
 # --- Linking ---
@@ -193,6 +217,15 @@ add_executable(BlockCodecTests
     tests/BlockCodecTests.cpp
 )
 target_include_directories(BlockCodecTests PRIVATE src ${Vulkan_INCLUDE_DIRS})
+
+# PCG framework roadmap, Phase 1 ("PCG Data Model"): src/pcg/*.h are header-only data types (no
+# accompanying .cpp yet -- nothing generates/consumes PCG data at runtime until a later phase), so
+# this target links no additional source beyond the test file itself.
+add_executable(PcgDataModelTests
+    tests/PcgDataModelTests.cpp
+)
+target_include_directories(PcgDataModelTests PRIVATE src ${Vulkan_INCLUDE_DIRS})
+add_test(NAME PcgDataModelTests COMMAND PcgDataModelTests)
 add_test(NAME BlockCodecTests COMMAND BlockCodecTests)
 
 add_executable(AsyncDecompressingLoaderTests
