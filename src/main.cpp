@@ -28,6 +28,9 @@
 #include "imgui.h"
 #include "backends/imgui_impl_glfw.h"
 #include "backends/imgui_impl_vulkan.h"
+// Phase 7.1 (PCG editor-tooling roadmap): "PCG Graph Editor" tab scaffold, see that header's own
+// comment for what it does/doesn't do yet.
+#include "renderer/debug/PcgGraphEditorPanel.h"
 #endif
 
 // Unreal-editor style viewport navigation: hold the Right Mouse Button to enable FPS-style
@@ -133,6 +136,12 @@ struct DebugState {
     float simulatedLwcOffsetKm = 0.0f;
 };
 static DebugState g_DebugState;
+
+// Phase 7.1 (PCG editor-tooling roadmap): owns the "PCG Graph Editor" tab's own imgui-node-editor
+// context -- a pure editor scaffold, see renderer::debug::PcgGraphEditorPanel's own header comment
+// for exactly what it does/doesn't do yet. Initialized once right after ImGui_ImplVulkan_Init()
+// below, drawn from inside ConfigTabs, torn down alongside every other ImGui teardown call.
+static renderer::debug::PcgGraphEditorPanel g_PcgGraphEditorPanel;
 
 static void KeyCallback(GLFWwindow* window, int key, int scancode, int action, int mods) {
     if (action != GLFW_PRESS) return;
@@ -401,6 +410,10 @@ int main(int argc, char** argv) {
     init_info.PipelineInfoMain.PipelineRenderingCreateInfo.depthAttachmentFormat = VK_FORMAT_UNDEFINED;
 
     ImGui_ImplVulkan_Init(&init_info);
+
+    // Phase 7.1 (PCG editor-tooling roadmap): create the node-editor context once ImGui itself is
+    // fully up -- see g_PcgGraphEditorPanel's own declaration-site comment.
+    g_PcgGraphEditorPanel.Init();
 #endif
 
     // Builds the consolidated virtual geometry .cache file (scene.cache): reads back the spawned
@@ -558,6 +571,7 @@ int main(int argc, char** argv) {
 
         // Mirrors the interactive loop's own shutdown order below: ImGui backend/context torn down
         // before the fence/pipeline/context it borrows GPU handles from.
+        g_PcgGraphEditorPanel.Shutdown();
         ImGui_ImplVulkan_Shutdown();
         ImGui_ImplGlfw_Shutdown();
         ImGui::DestroyContext();
@@ -1170,6 +1184,14 @@ int main(int argc, char** argv) {
                 ImGui::EndTabItem();
             }
 
+            // --- Tab PCG Graph Editor -- Phase 7.1 (PCG editor-tooling roadmap) scaffold: proves
+            // the vendored thedmd/imgui-node-editor library is wired end-to-end, nothing more.
+            // See renderer::debug::PcgGraphEditorPanel's own header comment for full context. ---
+            if (ImGui::BeginTabItem("PCG Graph Editor")) {
+                g_PcgGraphEditorPanel.Draw();
+                ImGui::EndTabItem();
+            }
+
             ImGui::EndTabBar();
         }
 
@@ -1711,6 +1733,7 @@ int main(int argc, char** argv) {
     vkDeviceWaitIdle(vkContext.GetDevice());
 
 #ifndef NDEBUG
+    g_PcgGraphEditorPanel.Shutdown();
     ImGui_ImplVulkan_Shutdown();
     ImGui_ImplGlfw_Shutdown();
     ImGui::DestroyContext();
