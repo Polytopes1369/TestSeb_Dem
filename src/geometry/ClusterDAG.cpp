@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <execution>
 #include <format>
 #include <limits>
 #include <numeric>
@@ -18,7 +19,7 @@ namespace geometry {
 
     namespace {
 
-        // Shared by UpdateNodeBounds (a node's own bounds) and EmitSimplifiedGroup (a group's
+        // Shared by UpdateNodeBounds (a node's own bounds) and ComputeGroupEmission (a group's
         // shared bounding sphere, computed from its merged+simplified mesh before any re-split --
         // see ClusterDAGGroup's own comment for why that value must be computed once, here, rather
         // than re-derived per output fragment).
@@ -49,7 +50,7 @@ namespace geometry {
         // doc comment for why.
         //
         // `nodeSourceGroupIndex` is likewise parallel to `levelMeshes`: two nodes produced by the
-        // SAME immediately-preceding re-split (EmitSimplifiedGroup, same non-invalid
+        // SAME immediately-preceding re-split (ApplyGroupEmission, same non-invalid
         // sourceGroupIndex) never get a weight entry either, even though they typically share by
         // far the largest number of locked positions of any pair at this level -- the entire split
         // plane SplitSimplifiableMesh cut them along. Without this exclusion, GreedyPairByWeight's
@@ -291,17 +292,37 @@ namespace geometry {
             buildHalf(midCount, triCount, outB);
         }
 
+        // Everything ComputeGroupEmission (below) decides about one group, EXCEPT the parts that
+        // require mutating the shared ClusterDAG -- carried across to ApplyGroupEmission instead,
+        // so that half can run serially afterward. `success == false` mirrors EmitSimplifiedGroup's
+        // old early-return-to-earlyRoots path (locked-vertex saturation: see ComputeGroupEmission's
+        // comment) and leaves every other field default/unused.
+        struct GroupEmitResult {
+            bool success = false;
+            std::vector<SimplifiableMesh> outputMeshes; // 1..kMaxGroupOutputClusters pieces; only
+                                                         // meaningful when success == true.
+            float groupError = 0.0f;
+            maths::vec3 groupSphereCenter{};
+            float groupSphereRadius = 0.0f;
+            // Every member is guaranteed the same isMasked classification (the adjacency-weight
+            // filters that formed this group never let an opaque and a masked node merge together),
+            // so any one member's value is authoritative for every output node -- snapshotted here
+            // (rather than re-read from dag in ApplyGroupEmission) purely so ApplyGroupEmission
+            // never needs read access to a member's node either, keeping its contract to "only
+            // appends / writes this group's own slot(s)" easy to audit.
+            bool outputIsMasked = false;
+        };
 
         // ----------------------------------------------------------------------------------
         // Simplifies `mesh` (merged from up to 4 same-level members, see ClusterGrouping::
-        // GroupItemsIntoQuads) and emits one ClusterDAGGroup into `dag`, producing either a single
-        // output node (the common case: the simplified mesh already fits one cluster's vertex/
-        // triangle cap) or, when it doesn't, exactly kMaxGroupOutputClusters output nodes via one
-        // spatial re-split (SplitSimplifiableMesh) -- both siblings sharing this group's error and
-        // bounding sphere (see ClusterDAGGroup's own comment). This indirection through a group,
-        // rather than simplifying straight into one parent node the way a 2-member merge always
-        // could, is what lets a group of up to 4 members legitimately need more than one coarser
-        // representative without any single member ever needing more than one parent reference.
+        // GroupItemsIntoQuads) and decides how it becomes either a single output node (the common
+        // case: the simplified mesh already fits one cluster's vertex/triangle cap) or, when it
+        // doesn't, exactly kMaxGroupOutputClusters output nodes via one spatial re-split
+        // (SplitSimplifiableMesh) -- both siblings sharing this group's error and bounding sphere
+        // (see ClusterDAGGroup's own comment). This indirection through a group, rather than
+        // simplifying straight into one parent node the way a 2-member merge always could, is what
+        // lets a group of up to 4 members legitimately need more than one coarser representative
+        // without any single member ever needing more than one parent reference.
         //
         // If QEM alone cannot reduce the vertex count to kMaxClusterVertices even after the
         // re-split (locked-vertex saturation -- common on hard-edged, multi-face-seam primitives
@@ -314,31 +335,50 @@ namespace geometry {
         // hole.
         //
         // Fixed by making every one of this group's MEMBERS a ROOT right here instead of forcing
-        // them into a lossy merged/re-split output -- NOT by re-wrapping them in a trivial pass-
-        // through parent and feeding them back into `nextLevel` (a first attempt at this fix that
-        // shipped briefly and was caught before merging: since a pass-through node is byte-for-byte
-        // the same mesh with the same locked vertices, the exact same merge fails again next level,
-        // and the level after that, forever -- observed running past level 300 with no convergence
-        // in testing). Diverting straight to `outEarlyRoots` instead guarantees
-        // `currentLevel.size()` strictly shrinks every time this fires, so BuildClusterDAG's
-        // `while (currentLevel.size() > 1)` loop is still guaranteed to terminate. The re-split
-        // path this function adds does not reopen that risk: SplitSimplifiableMesh strictly
-        // shrinks the triangle count of whichever half still doesn't fit relative to the
-        // already-simplified group mesh it split from, so this function still only ever calls it
-        // once per group (never recursively) -- an oversized half after that one split falls
-        // straight through to the exact same, already-proven-terminating earlyRoots path, never a
-        // second split attempt. Costs strictly less LOD compression for just this one problematic
-        // group (each member becomes its own root one or more levels earlier than it would if it
-        // had been mergeable), never any lost geometry.
+        // them into a lossy merged/re-split output (result.success = false; see
+        // ApplyGroupEmission for where that actually lands them in outEarlyRoots) -- NOT by
+        // re-wrapping them in a trivial pass-through parent and feeding them back into `nextLevel`
+        // (a first attempt at this fix that shipped briefly and was caught before merging: since a
+        // pass-through node is byte-for-byte the same mesh with the same locked vertices, the exact
+        // same merge fails again next level, and the level after that, forever -- observed running
+        // past level 300 with no convergence in testing). Diverting straight to earlyRoots instead
+        // guarantees `currentLevel.size()` strictly shrinks every time this fires, so
+        // BuildClusterDAG's `while (currentLevel.size() > 1)` loop is still guaranteed to
+        // terminate. The re-split path this function adds does not reopen that risk:
+        // SplitSimplifiableMesh strictly shrinks the triangle count of whichever half still
+        // doesn't fit relative to the already-simplified group mesh it split from, so this
+        // function still only ever calls it once per group (never recursively) -- an oversized
+        // half after that one split falls straight through to the exact same, already-proven-
+        // terminating earlyRoots path, never a second split attempt. Costs strictly less LOD
+        // compression for just this one problematic group (each member becomes its own root one
+        // or more levels earlier than it would if it had been mergeable), never any lost geometry.
+        //
+        // --- Why this half is safe to call concurrently across different groups of the same level
+        // (BuildClusterDAG runs it via std::execution::par -- see that loop's own comment for the
+        // full reasoning) ---
+        // Every read/write below touches only: (a) `mesh`, owned exclusively by this call (moved
+        // in from one PendingGroup, never aliased with any other group's mesh); (b) locals
+        // (outputMeshes, groupError, ...), returned by value in `GroupEmitResult`; and (c)
+        // `dag.nodes[memberIdx]` for this group's own members -- a READ-ONLY glance at
+        // clusterError/isMasked, and only at members from a level STRICTLY EARLIER than the one
+        // currently being built (every member index in `memberDagIndices` comes from
+        // `currentLevel`, populated by the PREVIOUS iteration of BuildClusterDAG's while loop, or
+        // level 0's leaf setup before the loop starts). `dag.nodes`/`dag.groups` are never resized
+        // or written to by this function -- that only happens in ApplyGroupEmission, which
+        // BuildClusterDAG only calls afterward, serially, once every ComputeGroupEmission call for
+        // the current level has already returned. So no two concurrent calls -- nor a concurrent
+        // call and the later serial merge -- ever race: the vectors this function reads are never
+        // being mutated while it runs, and the vectors it mutates (`outputMeshes`, all local) are
+        // never shared with any other call.
         // ----------------------------------------------------------------------------------
-        void EmitSimplifiedGroup(
+        GroupEmitResult ComputeGroupEmission(
             SimplifiableMesh mesh,
             const std::vector<uint32_t>& memberDagIndices,
             uint32_t originalTriangleCount,
             uint32_t level,
-            ClusterDAG& dag,
-            std::vector<uint32_t>& nextLevel,
-            std::vector<uint32_t>& outEarlyRoots) {
+            const ClusterDAG& dag) {
+
+            GroupEmitResult result;
 
             uint32_t targetTriangleCount = (originalTriangleCount + 1u) / 2u;
             float simplificationError = 0.0f;
@@ -349,24 +389,23 @@ namespace geometry {
                 membersMaxError = std::max(membersMaxError, dag.nodes[memberIdx].clusterError);
             }
             float errorFloor = std::max(kMinimumErrorStepAbsolute, membersMaxError * kMinimumErrorStepRelative);
-            float groupError = std::max(simplificationError, membersMaxError + errorFloor);
+            result.groupError = std::max(simplificationError, membersMaxError + errorFloor);
 
             // The group's shared bounding sphere: computed from the merged+simplified mesh BEFORE
             // any re-split below, so both potential output siblings project the identical "parent"
             // error/position -- see ClusterDAGGroup's own comment for why that must not depend on
             // which specific sibling a runtime LOD cut ends up actually drawing.
-            maths::vec3 groupBoundsMin, groupBoundsMax, groupSphereCenter;
-            float groupSphereRadius = 0.0f;
-            ComputeMeshBounds(mesh, groupBoundsMin, groupBoundsMax, groupSphereCenter, groupSphereRadius);
+            maths::vec3 groupBoundsMin, groupBoundsMax;
+            ComputeMeshBounds(mesh, groupBoundsMin, groupBoundsMax, result.groupSphereCenter, result.groupSphereRadius);
 
-            std::vector<SimplifiableMesh> outputMeshes;
+            std::vector<SimplifiableMesh>& outputMeshes = result.outputMeshes;
             bool fits = mesh.positions.size() <= kMaxClusterVertices && mesh.triangles.size() <= kMaxClusterIndices;
             if (fits) {
                 outputMeshes.push_back(std::move(mesh));
             }
             else if (mesh.triangles.size() >= 6) { // SplitSimplifiableMesh's own precondition (>= 2 triangles).
                 static_assert(kMaxGroupOutputClusters == 2u,
-                    "EmitSimplifiedGroup performs exactly one SplitSimplifiableMesh call, producing exactly "
+                    "ComputeGroupEmission performs exactly one SplitSimplifiableMesh call, producing exactly "
                     "2 halves -- update this split logic if kMaxGroupOutputClusters ever changes.");
                 SimplifiableMesh half0, half1;
                 SplitSimplifiableMesh(mesh, half0, half1);
@@ -391,30 +430,61 @@ namespace geometry {
                         level, memberDagIndices.size(), piece.positions.size(), piece.triangles.size() / 3,
                         kMaxClusterVertices, kMaxClusterIndices / 3,
                         outputMeshes.size() > 1 ? " and re-splitting" : ""));
-                    for (uint32_t memberIdx : memberDagIndices) {
-                        outEarlyRoots.push_back(memberIdx); // dag.nodes[memberIdx].parentGroupIndex is
-                                                             // already kInvalidDAGGroupIndex (never
-                                                             // touched) -- a genuine root, not a
-                                                             // dangling reference.
-                    }
-                    return;
+                    result.success = false;
+                    result.outputMeshes.clear(); // Nothing downstream should look at partial output.
+                    return result;
                 }
+            }
+
+            result.outputIsMasked = dag.nodes[memberDagIndices[0]].isMasked;
+            result.success = true;
+            return result;
+        }
+
+        // Serial half of the old EmitSimplifiedGroup: takes one group's already-computed
+        // ComputeGroupEmission result and applies it to the shared `dag`/`nextLevel`/
+        // `outEarlyRoots` -- assigning this group's global slot, appending its output node(s), and
+        // stamping parentGroupIndex/parentError back onto its members (or, on a locked-vertex-
+        // saturation bail, promoting every member straight to outEarlyRoots -- see
+        // ComputeGroupEmission's own comment for why that path exists and why it never drops
+        // geometry). Must run strictly serially, one group at a time -- unlike ComputeGroupEmission,
+        // every line here either reads-then-appends dag.nodes.size()/dag.groups.size() (a classic
+        // read-modify-write race if two calls ran concurrently) or writes dag.nodes[memberIdx] for
+        // this group's members (safe only because no OTHER concurrently-running copy of this
+        // specific function could be touching the same member, which is only true as long as calls
+        // are serialized -- concurrent calls would also violate the dag.nodes.size()-based slot
+        // assignment above regardless). BuildClusterDAG enforces this by only ever calling this
+        // function from a plain sequential loop, after every ComputeGroupEmission call for the
+        // level has already returned.
+        void ApplyGroupEmission(
+            GroupEmitResult&& groupResult,
+            const std::vector<uint32_t>& memberDagIndices,
+            uint32_t level,
+            ClusterDAG& dag,
+            std::vector<uint32_t>& nextLevel,
+            std::vector<uint32_t>& outEarlyRoots) {
+
+            if (!groupResult.success) {
+                for (uint32_t memberIdx : memberDagIndices) {
+                    outEarlyRoots.push_back(memberIdx); // dag.nodes[memberIdx].parentGroupIndex is
+                                                         // already kInvalidDAGGroupIndex (never
+                                                         // touched) -- a genuine root, not a
+                                                         // dangling reference.
+                }
+                return;
             }
 
             uint32_t groupIndex = static_cast<uint32_t>(dag.groups.size()); // Slot this group will occupy.
 
             std::vector<uint32_t> outputIndices;
-            outputIndices.reserve(outputMeshes.size());
-            for (SimplifiableMesh& outputMesh : outputMeshes) {
+            outputIndices.reserve(groupResult.outputMeshes.size());
+            for (SimplifiableMesh& outputMesh : groupResult.outputMeshes) {
                 ClusterDAGNode outputNode;
-                outputNode.mesh            = std::move(outputMesh);
+                outputNode.mesh             = std::move(outputMesh);
                 outputNode.sourceGroupIndex = groupIndex;
                 outputNode.level            = level;
-                outputNode.clusterError     = groupError;
-                // Every member is guaranteed the same isMasked classification (the adjacency-
-                // weight filters above never let an opaque and a masked node merge into one
-                // group), so any one member's value is authoritative for every output node.
-                outputNode.isMasked = dag.nodes[memberDagIndices[0]].isMasked;
+                outputNode.clusterError     = groupResult.groupError;
+                outputNode.isMasked         = groupResult.outputIsMasked;
                 UpdateNodeBounds(outputNode);
 
                 uint32_t outputDagIndex = static_cast<uint32_t>(dag.nodes.size());
@@ -426,14 +496,14 @@ namespace geometry {
             ClusterDAGGroup group;
             group.memberClusterIndices = memberDagIndices;
             group.outputClusterIndices = std::move(outputIndices);
-            group.groupError           = groupError;
-            group.groupSphereCenter    = groupSphereCenter;
-            group.groupSphereRadius    = groupSphereRadius;
+            group.groupError           = groupResult.groupError;
+            group.groupSphereCenter    = groupResult.groupSphereCenter;
+            group.groupSphereRadius    = groupResult.groupSphereRadius;
             dag.groups.push_back(std::move(group));
 
             for (uint32_t memberIdx : memberDagIndices) {
                 dag.nodes[memberIdx].parentGroupIndex = groupIndex;
-                dag.nodes[memberIdx].parentError = groupError;
+                dag.nodes[memberIdx].parentError = groupResult.groupError;
             }
         }
 
@@ -479,11 +549,12 @@ namespace geometry {
         uint32_t level = 1;
         bool isFirstPass = true;
 
-        // Nodes EmitSimplifiedGroup diverts straight to root status because their group's merge
-        // never fit within capacity even after simplification and one re-split attempt (see that
-        // function's own comment). Accumulated across every level and appended to dag.rootIndices
-        // at the end, alongside whatever's left in currentLevel once the main loop below
-        // terminates normally.
+        // Nodes ApplyGroupEmission diverts straight to root status because their group's merge
+        // never fit within capacity even after simplification and one re-split attempt (a decision
+        // actually made in ComputeGroupEmission -- see that function's own comment -- and merely
+        // acted on here). Accumulated across every level and appended to dag.rootIndices at the
+        // end, alongside whatever's left in currentLevel once the main loop below terminates
+        // normally.
         std::vector<uint32_t> earlyRoots;
 
         while (currentLevel.size() > 1) {
@@ -508,7 +579,7 @@ namespace geometry {
                     // boundary constraint), producing an identical or near-identical mesh every
                     // time this same singleton keeps failing to find a partner at the next level
                     // too -- an unbounded chain of pass-through nodes, one per level, the same
-                    // non-termination class EmitSimplifiedGroup's own comment describes for its
+                    // non-termination class ComputeGroupEmission's own comment describes for its
                     // reverted 2026-07-16 fix attempt. Promoting it straight to a root instead
                     // costs nothing (it was never going to compress further) and guarantees this
                     // level's node count can only shrink, never idle in place.
@@ -577,19 +648,68 @@ namespace geometry {
             // vertex count below kMaxClusterVertices even after a re-split -- locked-vertex
             // saturation -- zero) coarser DAG node(s), diverting the group's members straight into
             // `earlyRoots` instead of ever dropping geometry to force a fit -- see
-            // EmitSimplifiedGroup's own comment.
+            // ComputeGroupEmission's own comment.
+            //
+            // The per-group simplification work (ComputeGroupEmission) is embarrassingly parallel:
+            // each group reads only its own mesh plus a read-only glance at its own members'
+            // already-finalized prior-level dag.nodes entries, and `dag` itself is never mutated
+            // until the serial ApplyGroupEmission loop below -- see ComputeGroupEmission's own
+            // comment for the full disjointness argument. This is the actual fix for the "one
+            // dense/complex entity's cold DAG rebuild fully serializes on a single thread" issue
+            // (see this file's header): the OUTER per-entity pool
+            // (VirtualGeometryCacheTest.cpp's kMaxConcurrentDagBuilds) only parallelizes ACROSS
+            // entities, never within one entity's own DAG build.
+            //
+            // std::execution::par, not a second hand-sized thread pool: BuildClusterDAG may
+            // already be running on one of that outer pool's worker threads (up to 4 concurrently),
+            // so a fixed-size inner pool here would need manual budgeting against that outer cap to
+            // avoid the exact oversubscription/heap-lock-contention class of regression this
+            // codebase has already hit once from careless DAG-build parallelization (see this
+            // file's header comment). std::execution::par instead shares MSVC's own process-wide,
+            // OS-managed thread pool, which composes safely with concurrent/nested callers without
+            // any manual budgeting, and has been verified to compile and produce correct results
+            // under this project's actual build flags (-std:c++latest, MSVC 19.51, x64-debug
+            // preset).
             std::vector<uint32_t> nextLevel;
             nextLevel.reserve(pendingGroups.size());
 
-            for (PendingGroup& pg : pendingGroups) {
-                EmitSimplifiedGroup(
-                    std::move(pg.mesh),
-                    pg.memberDagIndices,
-                    pg.originalTriangleCount,
-                    level,
-                    dag,
-                    nextLevel,
-                    earlyRoots);
+            // Pre-sized so each parallel task writes only into its own disjoint groupResults[i]
+            // slot -- safe without any extra locking, mirroring VirtualGeometryCacheTest.cpp's own
+            // outer per-entity results vector (see that file's comment on the identical pattern).
+            std::vector<GroupEmitResult> groupResults(pendingGroups.size());
+
+            // Below this many groups, std::execution::par's dispatch overhead isn't worth paying --
+            // levels near the DAG's root routinely shrink to a small handful of groups (or just
+            // one, see the real-sphere test's levels 3-4), where running inline is both simpler and
+            // faster.
+            constexpr size_t kMinGroupsForParallelEmission = 4;
+
+            if (pendingGroups.size() >= kMinGroupsForParallelEmission) {
+                std::vector<size_t> groupOrder(pendingGroups.size());
+                std::iota(groupOrder.begin(), groupOrder.end(), size_t{ 0 });
+                std::for_each(std::execution::par, groupOrder.begin(), groupOrder.end(), [&](size_t i) {
+                    PendingGroup& pg = pendingGroups[i];
+                    groupResults[i] = ComputeGroupEmission(
+                        std::move(pg.mesh), pg.memberDagIndices, pg.originalTriangleCount, level, dag);
+                });
+            }
+            else {
+                for (size_t i = 0; i < pendingGroups.size(); ++i) {
+                    PendingGroup& pg = pendingGroups[i];
+                    groupResults[i] = ComputeGroupEmission(
+                        std::move(pg.mesh), pg.memberDagIndices, pg.originalTriangleCount, level, dag);
+                }
+            }
+
+            // Serial merge, in original group order: applies every group's already-computed result
+            // to dag/nextLevel/earlyRoots one at a time -- see ApplyGroupEmission's own comment for
+            // why this half must never itself run in parallel. Preserving original order here also
+            // keeps dag.nodes/dag.groups layout (level numbering, root ordering, etc.) byte-for-byte
+            // identical to the fully-serial code this replaces, independent of however
+            // std::execution::par above happened to schedule/reorder the compute phase.
+            for (size_t i = 0; i < pendingGroups.size(); ++i) {
+                ApplyGroupEmission(
+                    std::move(groupResults[i]), pendingGroups[i].memberDagIndices, level, dag, nextLevel, earlyRoots);
             }
 
             LOG_INFO(std::format("[ClusterDAG] Level {} completed: {} nodes (total nodes: {}).", level, nextLevel.size(), dag.nodes.size()));
@@ -834,8 +954,8 @@ namespace geometry {
 
         // Group-scoped invariants ValidateReachableFrom's per-node walk doesn't already cover
         // directly: every group must actually have produced at least one output (a group with zero
-        // outputs would mean EmitSimplifiedGroup's earlyRoots bailout path leaked a group entry it
-        // should never have created -- that path returns before ever calling dag.groups.push_back)
+        // outputs would mean ApplyGroupEmission's earlyRoots bailout branch leaked a group entry it
+        // should never have created -- that branch returns before ever calling dag.groups.push_back)
         // and must stay within the documented 1-4 member / 1-kMaxGroupOutputClusters output range.
         void ValidateGroupShapes(const ClusterDAG& dag, std::vector<std::string>& outErrors) {
             for (uint32_t gi = 0; gi < dag.groups.size(); ++gi) {
