@@ -34,11 +34,6 @@ constexpr float BLEND_ALPHA_STATIC = 0.20f;
 constexpr float VARIANCE_CLAMP_FACTOR = 1.5f;
 constexpr uint32_t JITTER_FRAME_COUNT = 16u;
 constexpr bool ENABLED_BY_DEFAULT = true;
-
-constexpr float SCREEN_PERCENTAGE = 150.0f;
-constexpr uint32_t TEMPORAL_AA_UPSCALER = 1;
-constexpr float TSR_HISTORY_SCREEN_PERCENTAGE = 150.0f;
-constexpr uint32_t TSR_VELOCITY_HEADING_CONVECTIVE = 1;
 } // namespace temporal
 
 namespace shadows {
@@ -77,29 +72,12 @@ constexpr uint32_t VSM_PHYSICAL_PAGE_CAPACITY = 8192u;
 constexpr uint32_t VSM_MAX_PAGES_RENDERED_PER_FRAME = 1024u;
 
 constexpr bool HARDWARE_RAYTRACING = true;
-constexpr bool TRACE_MESH_SDF = true;
-constexpr bool SCREEN_SPACE_PROBE_OCCLUSION = true;
-constexpr bool REFLECTIONS_ALLOW = true;
-constexpr uint32_t REFLECTIONS_DOWNSAMPLE_FACTOR = 1;
 
 constexpr bool MEGALIGHTS_ENABLE = true; // Enabled to handle thousands of physics-based dynamic lights
 } // namespace lumen
-
-namespace reflections {
-constexpr bool SCREEN_SPACE_REFLECTIONS = true;
-} // namespace reflections
 
 namespace postprocess {
 constexpr uint32_t EFFECTS_QUALITY = 5;
 constexpr uint32_t TRANSLUCENCY_LIGHTING_VOLUME_DIM = 128;
 } // namespace postprocess
-
-namespace volumetrics {
-// sg.SkyAtmosphereQuality=4 (Extreme scattering)
-constexpr uint32_t SKY_ATMOSPHERE_QUALITY = 4;
-constexpr bool VOLUMETRIC_FOG_ENABLE = true;
-// Ultra-sharp fog boundaries using minimal pixel grid size
-constexpr uint32_t VOLUMETRIC_FOG_GRID_PIXEL_SIZE = 2;
-constexpr float VOLUMETRIC_CLOUD_VIEW_RAY_SAMPLE_COUNT_SCALE = 3.0f;
-} // namespace volumetrics
 } // namespace config_extrem

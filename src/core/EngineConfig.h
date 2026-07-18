@@ -55,11 +55,6 @@ inline float BLEND_ALPHA_STATIC = 0.20f;
 inline float VARIANCE_CLAMP_FACTOR = 1.5f;
 inline uint32_t JITTER_FRAME_COUNT = 16u;
 inline bool ENABLED_BY_DEFAULT = true;
-
-inline float _SCREEN_PERCENTAGE = 100.0f;
-inline uint32_t _TEMPORAL_AA_UPSCALER = 1;
-inline float _TSR_HISTORY_SCREEN_PERCENTAGE = 100.0f;
-inline uint32_t _TSR_VELOCITY_HEADING_CONVECTIVE = 1;
 } // namespace temporal
 
 namespace shadows {
@@ -112,10 +107,6 @@ inline uint32_t VSM_MAX_PAGES_RENDERED_PER_FRAME = 512u;
 inline uint32_t VSM_MAX_DYNAMIC_PAGES_RENDERED_PER_FRAME = 512u;
 
 inline bool _HARDWARE_RAYTRACING = true;
-inline bool _TRACE_MESH_SDF = true;
-inline bool _SCREEN_SPACE_PROBE_OCCLUSION = true;
-inline bool _REFLECTIONS_ALLOW = true;
-inline uint32_t _REFLECTIONS_DOWNSAMPLE_FACTOR = 1;
 inline bool _MEGALIGHTS_ENABLE = true;
 } // namespace lumen
 
@@ -143,10 +134,6 @@ inline float SPATIAL_BIAS_RADIUS = 3.25f;
 inline float SPATIAL_REUSE_RADIUS_PIXELS = 24.0f;
 } // namespace megalights
 
-namespace reflections {
-inline bool _SCREEN_SPACE_REFLECTIONS = true;
-} // namespace reflections
-
 namespace postprocess {
 inline uint32_t _EFFECTS_QUALITY = 4;
 inline uint32_t _TRANSLUCENCY_LIGHTING_VOLUME_DIM = 64;
@@ -162,7 +149,24 @@ inline uint32_t _TRANSLUCENCY_LIGHTING_VOLUME_DIM = 64;
 
 // Physical Camera
 inline float EXPOSURE_APERTURE = 4.0f;             // f-stop.
-inline float EXPOSURE_SHUTTER_SPEED_SECONDS = 1.0f / 60.0f;
+// 1/8000s (was 1/60s) as of the 2026-07-18 exposure re-tuning pass: the 2026-07-17 lighting
+// recalibration (LightingTypes.h's DirectionalLight::intensity) moved the sun to a real 10,000 lux,
+// but this manual EV100 (aperture/shutter/ISO -> log2(N^2/t * 100/ISO), see PostProcessPass.cpp's
+// ComputeManualEV100) was left at its old pre-recalibration value (EV100 ~9.9, MaxLuminance =
+// 1.2*2^EV100 ~= 1152), washing DEBUG_VIEW_NORMAL out toward white independently of Bloom state.
+// A first-pass theoretical correction (1/500s, EV100 ~13.0) accounted only for the direct sun term
+// (ClusterResolve.comp's `directResponse * sunRadiance`) and proved nowhere near enough once
+// measured -- ClusterResolve.comp's `diffuseAlbedo * skyAmbient` sky-view-LUT ambient term plus the
+// multi-bounce GI passes (Surface Cache / Screen Trace / World Probes) stack substantial additional
+// real-lux-scale radiance on top of direct lighting, pushing total scene luminance far past what a
+// direct-only estimate predicts. Retuned empirically instead (rebuild + --test-pipeline +
+// pixel-sampled luminance histogram of the DEBUG_VIEW_NORMAL screenshots, tests #8-10): 1/8000s
+// raises EV100 to ~17.0 (MaxLuminance ~153600), landing mid-scene luminance at ~160/255 (avg,
+// sampled) with zero clipped (255) pixels and real highlight/shadow contrast -- correctly exposed
+// with headroom above for specular highlights. Aperture left untouched (EXPOSURE_APERTURE also
+// drives DepthOfField.comp's circle-of-confusion f-stop, so changing it would shift DoF blur
+// strength as a side effect); 1/8000s is a realistic, if fast, daylight electronic-shutter speed.
+inline float EXPOSURE_SHUTTER_SPEED_SECONDS = 1.0f / 8000.0f;
 inline float EXPOSURE_ISO = 100.0f;
 // Manual (not Auto) for now: renderer::MegaLightsPass (Phase A) has no temporal reservoir reuse
 // yet (per-frame RIS re-samples a different light, spatially but not temporally denoised -- see
@@ -359,14 +363,17 @@ inline bool LOCAL_FOG_VOLUME_BOUNDS_VIZ = false;
 // this never contributes any GPU work in a Release build -- same convention as
 // LOCAL_FOG_VOLUME_BOUNDS_VIZ just above.
 inline bool PCG_POINT_CLOUD_VIZ = false;
+#ifndef NDEBUG
+// UE5.8 rendering-parity gap G10b (ImGui "Path Tracer" tab, main.cpp) -- when true, renderer::
+// ClusterRenderPipeline runs its reference offline Path Tracer (renderer::PathTracerPass) and blits
+// its progressively-accumulated, tonemapped result to the swapchain in place of the real-time
+// Lumen/MegaLights composite, as a ground-truth validation view (exactly what UE5.8's own Path
+// Tracer render mode is for). Wrapped in #ifndef NDEBUG (a "mode de visualisation", CLAUDE.md rule
+// 8 -- same strict Release-exclusion convention as config::vegetation::WIREFRAME): read ONLY inside
+// #ifndef NDEBUG blocks, so it contributes zero code/symbols to a Release build.
+inline bool PATH_TRACER_ENABLED = false;
+#endif
 } // namespace debugview
-
-namespace volumetrics {
-inline uint32_t _SKY_ATMOSPHERE_QUALITY = 3;
-inline bool _VOLUMETRIC_FOG_ENABLE = true;
-inline uint32_t _VOLUMETRIC_FOG_GRID_PIXEL_SIZE = 4;
-inline float _VOLUMETRIC_CLOUD_VIEW_RAY_SAMPLE_COUNT_SCALE = 2.0f;
-} // namespace volumetrics
 
 // Local Fog Volumes (UE5.8 rendering-parity gap G8) -- localized, oriented-box or sphere fog
 // regions, each with its own density/color/vertical-falloff and an optional shadowed sun
@@ -375,8 +382,7 @@ inline float _VOLUMETRIC_CLOUD_VIEW_RAY_SAMPLE_COUNT_SCALE = 2.0f;
 // content (like config::particles::EMITTERS[] and the VulkanContext zone layout), read ONCE at
 // AtmosVolumetricFogPass::Init to build a small std430 SSBO -- so unlike the postprocess::FOG_*
 // analytic knobs above these are NOT live-tunable per-parameter; only the master ENABLE toggle
-// below takes effect at runtime (it zeroes the injected count for one frame). Same live-toggle
-// convention as volumetrics::_VOLUMETRIC_FOG_ENABLE.
+// below takes effect at runtime (it zeroes the injected count for one frame).
 namespace localfog {
 
 // SSBO capacity. Only the first `active` entries of VOLUMES[] below are uploaded/injected.
@@ -675,6 +681,30 @@ inline bool WIREFRAME = false;               // Debug-only wireframe/bounds visu
 #endif
 } // namespace vegetation
 
+// Hair/Fur shading model (UE5.8 rendering-parity gap G10a) -- GPU-instanced procedural fur strands
+// grown off the skinned creature entity's surface (renderer::FurStrandPass). Same "runtime state,
+// not a hardware-quality tier" convention as config::vegetation:: above (NOT mirrored into
+// EngineConfig_{Low,Medium,High,Extrem}.h). ENABLED / OCCLUSION_CULL_ENABLED / the appearance knobs
+// take effect live every frame; the strand-count/length/geometry knobs are consumed only when the
+// strands are (re)generated -- the Debug "Fur / Hair" ImGui tab exposes a Regenerate button that
+// reapplies them at runtime.
+namespace fur {
+inline bool ENABLED = true;                  // Master runtime toggle -- skip the per-frame cull+draw entirely.
+inline bool OCCLUSION_CULL_ENABLED = true;   // Per-strand HZB occlusion test (frustum culling always on).
+inline uint32_t STRAND_COUNT = 14000u;       // Strands baked onto the creature (clamped to FurStrandPass::kMaxStrands). Consumed on (re)generate.
+inline float LENGTH = 0.16f;                 // Base strand length, world units. Consumed on (re)generate (via lengthScale baking) + live at draw.
+inline float LENGTH_JITTER = 0.35f;          // [0,1] per-strand length variation half-range. Consumed on (re)generate.
+inline float WIDTH = 0.020f;                 // Ribbon width, world units (live at draw).
+inline float CURL_AMOUNT = 0.35f;            // Gravity droop + curl strength as a fraction of length (live at draw).
+inline float ROOT_LIFT = 0.008f;             // Outward root offset so a strand's base sits just clear of the skin. Consumed on (re)generate.
+inline float SPEC_INTENSITY = 0.55f;         // Overall hair specular scale (live at draw).
+inline float TRT_INTENSITY = 0.55f;          // Weight of the colored secondary (TRT) highlight (live at draw).
+inline uint32_t SEED = 1337u;                // Global determinism seed. Consumed on (re)generate.
+#ifndef NDEBUG
+inline bool WIREFRAME = false;               // Debug-only wireframe/bounds visualization (gated out of Release per CLAUDE.md rule 8).
+#endif
+} // namespace fur
+
 // Procedural 3D Audio Engine (src/audio/, closes the "moteur de son 3D + style FL studio" gap in
 // this project's own CLAUDE.md design brief -- a fully procedural, real-time-streamed-synthesis
 // audio subsystem, zero .wav/.ogg assets, see audio::AudioEngine's own class comment) -- live-
@@ -739,13 +769,6 @@ inline void ApplyProfile(std::string_view profileName) {
         config_extrem::temporal::VARIANCE_CLAMP_FACTOR;
     temporal::JITTER_FRAME_COUNT = config_extrem::temporal::JITTER_FRAME_COUNT;
     temporal::ENABLED_BY_DEFAULT = config_extrem::temporal::ENABLED_BY_DEFAULT;
-    temporal::_SCREEN_PERCENTAGE = config_extrem::temporal::SCREEN_PERCENTAGE;
-    temporal::_TEMPORAL_AA_UPSCALER =
-        config_extrem::temporal::TEMPORAL_AA_UPSCALER;
-    temporal::_TSR_HISTORY_SCREEN_PERCENTAGE =
-        config_extrem::temporal::TSR_HISTORY_SCREEN_PERCENTAGE;
-    temporal::_TSR_VELOCITY_HEADING_CONVECTIVE =
-        config_extrem::temporal::TSR_VELOCITY_HEADING_CONVECTIVE;
     shadows::_QUALITY = config_extrem::shadows::QUALITY;
     shadows::_VIRTUAL_ENABLE = config_extrem::shadows::VIRTUAL_ENABLE;
     shadows::_MAX_RESOLUTION = config_extrem::shadows::MAX_RESOLUTION;
@@ -776,26 +799,10 @@ inline void ApplyProfile(std::string_view profileName) {
     lumen::VSM_MAX_PAGES_RENDERED_PER_FRAME =
         config_extrem::lumen::VSM_MAX_PAGES_RENDERED_PER_FRAME;
     lumen::_HARDWARE_RAYTRACING = config_extrem::lumen::HARDWARE_RAYTRACING;
-    lumen::_TRACE_MESH_SDF = config_extrem::lumen::TRACE_MESH_SDF;
-    lumen::_SCREEN_SPACE_PROBE_OCCLUSION =
-        config_extrem::lumen::SCREEN_SPACE_PROBE_OCCLUSION;
-    lumen::_REFLECTIONS_ALLOW = config_extrem::lumen::REFLECTIONS_ALLOW;
-    lumen::_REFLECTIONS_DOWNSAMPLE_FACTOR =
-        config_extrem::lumen::REFLECTIONS_DOWNSAMPLE_FACTOR;
     lumen::_MEGALIGHTS_ENABLE = config_extrem::lumen::MEGALIGHTS_ENABLE;
-    reflections::_SCREEN_SPACE_REFLECTIONS =
-        config_extrem::reflections::SCREEN_SPACE_REFLECTIONS;
     postprocess::_EFFECTS_QUALITY = config_extrem::postprocess::EFFECTS_QUALITY;
     postprocess::_TRANSLUCENCY_LIGHTING_VOLUME_DIM =
         config_extrem::postprocess::TRANSLUCENCY_LIGHTING_VOLUME_DIM;
-    volumetrics::_SKY_ATMOSPHERE_QUALITY =
-        config_extrem::volumetrics::SKY_ATMOSPHERE_QUALITY;
-    volumetrics::_VOLUMETRIC_FOG_ENABLE =
-        config_extrem::volumetrics::VOLUMETRIC_FOG_ENABLE;
-    volumetrics::_VOLUMETRIC_FOG_GRID_PIXEL_SIZE =
-        config_extrem::volumetrics::VOLUMETRIC_FOG_GRID_PIXEL_SIZE;
-    volumetrics::_VOLUMETRIC_CLOUD_VIEW_RAY_SAMPLE_COUNT_SCALE = config_extrem::
-        volumetrics::VOLUMETRIC_CLOUD_VIEW_RAY_SAMPLE_COUNT_SCALE;
   } else if (profileName == "High") {
     WINDOW_WIDTH = config_high::WINDOW_WIDTH;
     WINDOW_HEIGHT = config_high::WINDOW_HEIGHT;
@@ -814,13 +821,6 @@ inline void ApplyProfile(std::string_view profileName) {
         config_high::temporal::VARIANCE_CLAMP_FACTOR;
     temporal::JITTER_FRAME_COUNT = config_high::temporal::JITTER_FRAME_COUNT;
     temporal::ENABLED_BY_DEFAULT = config_high::temporal::ENABLED_BY_DEFAULT;
-    temporal::_SCREEN_PERCENTAGE = config_high::temporal::SCREEN_PERCENTAGE;
-    temporal::_TEMPORAL_AA_UPSCALER =
-        config_high::temporal::TEMPORAL_AA_UPSCALER;
-    temporal::_TSR_HISTORY_SCREEN_PERCENTAGE =
-        config_high::temporal::TSR_HISTORY_SCREEN_PERCENTAGE;
-    temporal::_TSR_VELOCITY_HEADING_CONVECTIVE =
-        config_high::temporal::TSR_VELOCITY_HEADING_CONVECTIVE;
     shadows::_QUALITY = config_high::shadows::QUALITY;
     shadows::_VIRTUAL_ENABLE = config_high::shadows::VIRTUAL_ENABLE;
     shadows::_MAX_RESOLUTION = config_high::shadows::MAX_RESOLUTION;
@@ -847,26 +847,10 @@ inline void ApplyProfile(std::string_view profileName) {
     lumen::VSM_MAX_PAGES_RENDERED_PER_FRAME =
         config_high::lumen::VSM_MAX_PAGES_RENDERED_PER_FRAME;
     lumen::_HARDWARE_RAYTRACING = config_high::lumen::HARDWARE_RAYTRACING;
-    lumen::_TRACE_MESH_SDF = config_high::lumen::TRACE_MESH_SDF;
-    lumen::_SCREEN_SPACE_PROBE_OCCLUSION =
-        config_high::lumen::SCREEN_SPACE_PROBE_OCCLUSION;
-    lumen::_REFLECTIONS_ALLOW = config_high::lumen::REFLECTIONS_ALLOW;
-    lumen::_REFLECTIONS_DOWNSAMPLE_FACTOR =
-        config_high::lumen::REFLECTIONS_DOWNSAMPLE_FACTOR;
     lumen::_MEGALIGHTS_ENABLE = config_high::lumen::MEGALIGHTS_ENABLE;
-    reflections::_SCREEN_SPACE_REFLECTIONS =
-        config_high::reflections::SCREEN_SPACE_REFLECTIONS;
     postprocess::_EFFECTS_QUALITY = config_high::postprocess::EFFECTS_QUALITY;
     postprocess::_TRANSLUCENCY_LIGHTING_VOLUME_DIM =
         config_high::postprocess::TRANSLUCENCY_LIGHTING_VOLUME_DIM;
-    volumetrics::_SKY_ATMOSPHERE_QUALITY =
-        config_high::volumetrics::SKY_ATMOSPHERE_QUALITY;
-    volumetrics::_VOLUMETRIC_FOG_ENABLE =
-        config_high::volumetrics::VOLUMETRIC_FOG_ENABLE;
-    volumetrics::_VOLUMETRIC_FOG_GRID_PIXEL_SIZE =
-        config_high::volumetrics::VOLUMETRIC_FOG_GRID_PIXEL_SIZE;
-    volumetrics::_VOLUMETRIC_CLOUD_VIEW_RAY_SAMPLE_COUNT_SCALE =
-        config_high::volumetrics::VOLUMETRIC_CLOUD_VIEW_RAY_SAMPLE_COUNT_SCALE;
   } else if (profileName == "Medium") {
     WINDOW_WIDTH = config_medium::WINDOW_WIDTH;
     WINDOW_HEIGHT = config_medium::WINDOW_HEIGHT;
@@ -885,13 +869,6 @@ inline void ApplyProfile(std::string_view profileName) {
         config_medium::temporal::VARIANCE_CLAMP_FACTOR;
     temporal::JITTER_FRAME_COUNT = config_medium::temporal::JITTER_FRAME_COUNT;
     temporal::ENABLED_BY_DEFAULT = config_medium::temporal::ENABLED_BY_DEFAULT;
-    temporal::_SCREEN_PERCENTAGE = config_medium::temporal::SCREEN_PERCENTAGE;
-    temporal::_TEMPORAL_AA_UPSCALER =
-        config_medium::temporal::TEMPORAL_AA_UPSCALER;
-    temporal::_TSR_HISTORY_SCREEN_PERCENTAGE =
-        config_medium::temporal::TSR_HISTORY_SCREEN_PERCENTAGE;
-    temporal::_TSR_VELOCITY_HEADING_CONVECTIVE =
-        config_medium::temporal::TSR_VELOCITY_HEADING_CONVECTIVE;
     shadows::_QUALITY = config_medium::shadows::QUALITY;
     shadows::_VIRTUAL_ENABLE = config_medium::shadows::VIRTUAL_ENABLE;
     shadows::_MAX_RESOLUTION = config_medium::shadows::MAX_RESOLUTION;
@@ -922,26 +899,10 @@ inline void ApplyProfile(std::string_view profileName) {
     lumen::VSM_MAX_PAGES_RENDERED_PER_FRAME =
         config_medium::lumen::VSM_MAX_PAGES_RENDERED_PER_FRAME;
     lumen::_HARDWARE_RAYTRACING = config_medium::lumen::HARDWARE_RAYTRACING;
-    lumen::_TRACE_MESH_SDF = config_medium::lumen::TRACE_MESH_SDF;
-    lumen::_SCREEN_SPACE_PROBE_OCCLUSION =
-        config_medium::lumen::SCREEN_SPACE_PROBE_OCCLUSION;
-    lumen::_REFLECTIONS_ALLOW = config_medium::lumen::REFLECTIONS_ALLOW;
-    lumen::_REFLECTIONS_DOWNSAMPLE_FACTOR =
-        config_medium::lumen::REFLECTIONS_DOWNSAMPLE_FACTOR;
     lumen::_MEGALIGHTS_ENABLE = config_medium::lumen::MEGALIGHTS_ENABLE;
-    reflections::_SCREEN_SPACE_REFLECTIONS =
-        config_medium::reflections::SCREEN_SPACE_REFLECTIONS;
     postprocess::_EFFECTS_QUALITY = config_medium::postprocess::EFFECTS_QUALITY;
     postprocess::_TRANSLUCENCY_LIGHTING_VOLUME_DIM =
         config_medium::postprocess::TRANSLUCENCY_LIGHTING_VOLUME_DIM;
-    volumetrics::_SKY_ATMOSPHERE_QUALITY =
-        config_medium::volumetrics::SKY_ATMOSPHERE_QUALITY;
-    volumetrics::_VOLUMETRIC_FOG_ENABLE =
-        config_medium::volumetrics::VOLUMETRIC_FOG_ENABLE;
-    volumetrics::_VOLUMETRIC_FOG_GRID_PIXEL_SIZE =
-        config_medium::volumetrics::VOLUMETRIC_FOG_GRID_PIXEL_SIZE;
-    volumetrics::_VOLUMETRIC_CLOUD_VIEW_RAY_SAMPLE_COUNT_SCALE = config_medium::
-        volumetrics::VOLUMETRIC_CLOUD_VIEW_RAY_SAMPLE_COUNT_SCALE;
   } else if (profileName == "Low") {
     WINDOW_WIDTH = config_low::WINDOW_WIDTH;
     WINDOW_HEIGHT = config_low::WINDOW_HEIGHT;
@@ -960,13 +921,6 @@ inline void ApplyProfile(std::string_view profileName) {
         config_low::temporal::VARIANCE_CLAMP_FACTOR;
     temporal::JITTER_FRAME_COUNT = config_low::temporal::JITTER_FRAME_COUNT;
     temporal::ENABLED_BY_DEFAULT = config_low::temporal::ENABLED_BY_DEFAULT;
-    temporal::_SCREEN_PERCENTAGE = config_low::temporal::SCREEN_PERCENTAGE;
-    temporal::_TEMPORAL_AA_UPSCALER =
-        config_low::temporal::TEMPORAL_AA_UPSCALER;
-    temporal::_TSR_HISTORY_SCREEN_PERCENTAGE =
-        config_low::temporal::TSR_HISTORY_SCREEN_PERCENTAGE;
-    temporal::_TSR_VELOCITY_HEADING_CONVECTIVE =
-        config_low::temporal::TSR_VELOCITY_HEADING_CONVECTIVE;
     shadows::_QUALITY = config_low::shadows::QUALITY;
     shadows::_VIRTUAL_ENABLE = config_low::shadows::VIRTUAL_ENABLE;
     shadows::_MAX_RESOLUTION = config_low::shadows::MAX_RESOLUTION;
@@ -992,26 +946,10 @@ inline void ApplyProfile(std::string_view profileName) {
     lumen::VSM_MAX_PAGES_RENDERED_PER_FRAME =
         config_low::lumen::VSM_MAX_PAGES_RENDERED_PER_FRAME;
     lumen::_HARDWARE_RAYTRACING = config_low::lumen::HARDWARE_RAYTRACING;
-    lumen::_TRACE_MESH_SDF = config_low::lumen::TRACE_MESH_SDF;
-    lumen::_SCREEN_SPACE_PROBE_OCCLUSION =
-        config_low::lumen::SCREEN_SPACE_PROBE_OCCLUSION;
-    lumen::_REFLECTIONS_ALLOW = config_low::lumen::REFLECTIONS_ALLOW;
-    lumen::_REFLECTIONS_DOWNSAMPLE_FACTOR =
-        config_low::lumen::REFLECTIONS_DOWNSAMPLE_FACTOR;
     lumen::_MEGALIGHTS_ENABLE = config_low::lumen::MEGALIGHTS_ENABLE;
-    reflections::_SCREEN_SPACE_REFLECTIONS =
-        config_low::reflections::SCREEN_SPACE_REFLECTIONS;
     postprocess::_EFFECTS_QUALITY = config_low::postprocess::EFFECTS_QUALITY;
     postprocess::_TRANSLUCENCY_LIGHTING_VOLUME_DIM =
         config_low::postprocess::TRANSLUCENCY_LIGHTING_VOLUME_DIM;
-    volumetrics::_SKY_ATMOSPHERE_QUALITY =
-        config_low::volumetrics::SKY_ATMOSPHERE_QUALITY;
-    volumetrics::_VOLUMETRIC_FOG_ENABLE =
-        config_low::volumetrics::VOLUMETRIC_FOG_ENABLE;
-    volumetrics::_VOLUMETRIC_FOG_GRID_PIXEL_SIZE =
-        config_low::volumetrics::VOLUMETRIC_FOG_GRID_PIXEL_SIZE;
-    volumetrics::_VOLUMETRIC_CLOUD_VIEW_RAY_SAMPLE_COUNT_SCALE =
-        config_low::volumetrics::VOLUMETRIC_CLOUD_VIEW_RAY_SAMPLE_COUNT_SCALE;
   }
 }
 

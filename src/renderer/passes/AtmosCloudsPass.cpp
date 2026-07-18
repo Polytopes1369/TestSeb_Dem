@@ -41,10 +41,8 @@ namespace renderer {
 
     } // namespace
 
-    bool AtmosCloudsPass::Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
+    bool AtmosCloudsPass::InitImpl(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
         VkExtent2D renderExtent, const AtmosClimatePass& atmosClimate) {
-        m_Device = device;
-        m_Allocator = allocator;
         m_OutputExtent = { std::max(1u, renderExtent.width / kResolutionDivisor), std::max(1u, renderExtent.height / kResolutionDivisor) };
 
         // --- 2 noise textures, generated once below, never rewritten again. ---
@@ -73,16 +71,44 @@ namespace renderer {
             VK_CHECK(vkCreateImageView(device, &viewInfo, nullptr, &outImage.view));
         };
         createNoiseImage(kShapeNoiseResolution, m_ShapeNoise);
+        RegisterResource([this] {
+            vkDestroyImageView(m_Device, m_ShapeNoise.view, nullptr);
+            vmaDestroyImage(m_Allocator, m_ShapeNoise.image, m_ShapeNoise.allocation);
+            m_ShapeNoise.view = VK_NULL_HANDLE;
+            m_ShapeNoise.image = VK_NULL_HANDLE;
+            m_ShapeNoise.allocation = VK_NULL_HANDLE;
+        });
         createNoiseImage(kDetailNoiseResolution, m_DetailNoise);
+        RegisterResource([this] {
+            vkDestroyImageView(m_Device, m_DetailNoise.view, nullptr);
+            vmaDestroyImage(m_Allocator, m_DetailNoise.image, m_DetailNoise.allocation);
+            m_DetailNoise.view = VK_NULL_HANDLE;
+            m_DetailNoise.image = VK_NULL_HANDLE;
+            m_DetailNoise.allocation = VK_NULL_HANDLE;
+        });
 
         VulkanUtils::CreateStorageSampledImage2D(allocator, device, kOutputFormat, m_OutputExtent,
             m_CloudOutput.image, m_CloudOutput.allocation, m_CloudOutput.view);
+        RegisterResource([this] {
+            vkDestroyImageView(m_Device, m_CloudOutput.view, nullptr);
+            vmaDestroyImage(m_Allocator, m_CloudOutput.image, m_CloudOutput.allocation);
+            m_CloudOutput.view = VK_NULL_HANDLE;
+            m_CloudOutput.image = VK_NULL_HANDLE;
+            m_CloudOutput.allocation = VK_NULL_HANDLE;
+        });
 
         // Atmos Subtask 5: Cloud Shadow Map, fixed 512x512 regardless of render extent (see class
         // comment -- this covers a fixed real-world-unit patch, not a screen-space buffer).
         VkExtent2D shadowExtent{ kCloudShadowMapResolution, kCloudShadowMapResolution };
         VulkanUtils::CreateStorageSampledImage2D(allocator, device, kShadowFormat, shadowExtent,
             m_CloudShadowMap.image, m_CloudShadowMap.allocation, m_CloudShadowMap.view);
+        RegisterResource([this] {
+            vkDestroyImageView(m_Device, m_CloudShadowMap.view, nullptr);
+            vmaDestroyImage(m_Allocator, m_CloudShadowMap.image, m_CloudShadowMap.allocation);
+            m_CloudShadowMap.view = VK_NULL_HANDLE;
+            m_CloudShadowMap.image = VK_NULL_HANDLE;
+            m_CloudShadowMap.allocation = VK_NULL_HANDLE;
+        });
 
         VkClearColorValue zeroClear{}; zeroClear.float32[0] = zeroClear.float32[1] = zeroClear.float32[2] = 0.0f; zeroClear.float32[3] = 1.0f;
         VulkanUtils::ExecuteOneShotCommands(device, commandPool, queue, [&](VkCommandBuffer cmd) {
@@ -107,12 +133,14 @@ namespace renderer {
         noiseSamplerInfo.compareEnable = VK_FALSE;
         noiseSamplerInfo.unnormalizedCoordinates = VK_FALSE;
         VK_CHECK(vkCreateSampler(m_Device, &noiseSamplerInfo, nullptr, &m_NoiseSampler));
+        RegisterResource([this] { vkDestroySampler(m_Device, m_NoiseSampler, nullptr); m_NoiseSampler = VK_NULL_HANDLE; });
 
         VkSamplerCreateInfo linearSamplerInfo = noiseSamplerInfo;
         linearSamplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
         linearSamplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
         linearSamplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
         VK_CHECK(vkCreateSampler(m_Device, &linearSamplerInfo, nullptr, &m_LinearSampler));
+        RegisterResource([this] { vkDestroySampler(m_Device, m_LinearSampler, nullptr); m_LinearSampler = VK_NULL_HANDLE; });
 
         // --- Descriptor set: 6 bindings -- see AtmosClouds.comp's own binding comments. ---
         std::array<VkDescriptorSetLayoutBinding, 6> bindings{ {
@@ -123,27 +151,22 @@ namespace renderer {
             { 4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },          // g_CloudOutputStorage
             { 5, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },         // AtmosGlobalsUBO
         } };
-        VkDescriptorSetLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-        layoutInfo.bindingCount = static_cast<uint32_t>(bindings.size());
-        layoutInfo.pBindings = bindings.data();
-        VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &layoutInfo, nullptr, &m_SetLayout));
-
         std::array<VkDescriptorPoolSize, 3> poolSizes{ {
             { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 3 },
             { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2 },
             { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 },
         } };
-        VkDescriptorPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
-        poolInfo.maxSets = 1;
-        poolInfo.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
-        poolInfo.pPoolSizes = poolSizes.data();
-        VK_CHECK(vkCreateDescriptorPool(m_Device, &poolInfo, nullptr, &m_DescriptorPool));
-
-        VkDescriptorSetAllocateInfo allocSet{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-        allocSet.descriptorPool = m_DescriptorPool;
-        allocSet.descriptorSetCount = 1;
-        allocSet.pSetLayouts = &m_SetLayout;
-        VK_CHECK(vkAllocateDescriptorSets(m_Device, &allocSet, &m_Set));
+        auto descSet = VulkanUtils::CreateDescriptorSetLayoutPoolAndSet(m_Device, bindings, poolSizes);
+        m_SetLayout = descSet.layout;
+        m_DescriptorPool = descSet.pool;
+        m_Set = descSet.set;
+        RegisterResource([this] {
+            vkDestroyDescriptorPool(m_Device, m_DescriptorPool, nullptr);
+            vkDestroyDescriptorSetLayout(m_Device, m_SetLayout, nullptr);
+            m_DescriptorPool = VK_NULL_HANDLE;
+            m_SetLayout = VK_NULL_HANDLE;
+            m_Set = VK_NULL_HANDLE;
+        });
 
         VkDescriptorImageInfo shapeStorageInfo{ VK_NULL_HANDLE, m_ShapeNoise.view, VK_IMAGE_LAYOUT_GENERAL };
         VkDescriptorImageInfo shapeSamplerInfo{ m_NoiseSampler, m_ShapeNoise.view, VK_IMAGE_LAYOUT_GENERAL };
@@ -169,10 +192,12 @@ namespace renderer {
         plInfo.pushConstantRangeCount = 1;
         plInfo.pPushConstantRanges = &pushRange;
         VK_CHECK(vkCreatePipelineLayout(m_Device, &plInfo, nullptr, &m_PipelineLayout));
+        RegisterResource([this] { vkDestroyPipelineLayout(m_Device, m_PipelineLayout, nullptr); m_PipelineLayout = VK_NULL_HANDLE; });
 
         VkShaderModule shader = VulkanPipeline::LoadShaderModule(m_Device, "shaders/AtmosClouds.comp.spv");
         m_Pipeline = VulkanPipeline::CreateComputePipeline(m_Device, m_PipelineLayout, shader);
         vkDestroyShaderModule(m_Device, shader, nullptr);
+        RegisterResource([this] { vkDestroyPipeline(m_Device, m_Pipeline, nullptr); m_Pipeline = VK_NULL_HANDLE; });
 
         // =========================================================================================
         // Atmos Subtask 5: Cloud Shadow Map pipeline -- a SEPARATE descriptor set/pipeline layout/
@@ -187,27 +212,22 @@ namespace renderer {
                 { 2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // g_DetailNoiseSampler
                 { 3, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },         // AtmosGlobalsUBO
             } };
-            VkDescriptorSetLayoutCreateInfo shadowLayoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-            shadowLayoutInfo.bindingCount = static_cast<uint32_t>(shadowBindings.size());
-            shadowLayoutInfo.pBindings = shadowBindings.data();
-            VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &shadowLayoutInfo, nullptr, &m_ShadowSetLayout));
-
             std::array<VkDescriptorPoolSize, 3> shadowPoolSizes{ {
                 { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1 },
                 { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2 },
                 { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 },
             } };
-            VkDescriptorPoolCreateInfo shadowPoolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
-            shadowPoolInfo.maxSets = 1;
-            shadowPoolInfo.poolSizeCount = static_cast<uint32_t>(shadowPoolSizes.size());
-            shadowPoolInfo.pPoolSizes = shadowPoolSizes.data();
-            VK_CHECK(vkCreateDescriptorPool(m_Device, &shadowPoolInfo, nullptr, &m_ShadowDescriptorPool));
-
-            VkDescriptorSetAllocateInfo shadowAllocSet{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-            shadowAllocSet.descriptorPool = m_ShadowDescriptorPool;
-            shadowAllocSet.descriptorSetCount = 1;
-            shadowAllocSet.pSetLayouts = &m_ShadowSetLayout;
-            VK_CHECK(vkAllocateDescriptorSets(m_Device, &shadowAllocSet, &m_ShadowSet));
+            auto shadowDescSet = VulkanUtils::CreateDescriptorSetLayoutPoolAndSet(m_Device, shadowBindings, shadowPoolSizes);
+            m_ShadowSetLayout = shadowDescSet.layout;
+            m_ShadowDescriptorPool = shadowDescSet.pool;
+            m_ShadowSet = shadowDescSet.set;
+            RegisterResource([this] {
+                vkDestroyDescriptorPool(m_Device, m_ShadowDescriptorPool, nullptr);
+                vkDestroyDescriptorSetLayout(m_Device, m_ShadowSetLayout, nullptr);
+                m_ShadowDescriptorPool = VK_NULL_HANDLE;
+                m_ShadowSetLayout = VK_NULL_HANDLE;
+                m_ShadowSet = VK_NULL_HANDLE;
+            });
 
             VkDescriptorImageInfo shadowStorageInfo{ VK_NULL_HANDLE, m_CloudShadowMap.view, VK_IMAGE_LAYOUT_GENERAL };
             VkDescriptorImageInfo shadowShapeSamplerInfo{ m_NoiseSampler, m_ShapeNoise.view, VK_IMAGE_LAYOUT_GENERAL };
@@ -228,10 +248,12 @@ namespace renderer {
             shadowPlInfo.pushConstantRangeCount = 1;
             shadowPlInfo.pPushConstantRanges = &shadowPushRange;
             VK_CHECK(vkCreatePipelineLayout(m_Device, &shadowPlInfo, nullptr, &m_ShadowPipelineLayout));
+            RegisterResource([this] { vkDestroyPipelineLayout(m_Device, m_ShadowPipelineLayout, nullptr); m_ShadowPipelineLayout = VK_NULL_HANDLE; });
 
             VkShaderModule shadowShader = VulkanPipeline::LoadShaderModule(m_Device, "shaders/AtmosCloudShadows.comp.spv");
             m_ShadowPipeline = VulkanPipeline::CreateComputePipeline(m_Device, m_ShadowPipelineLayout, shadowShader);
             vkDestroyShaderModule(m_Device, shadowShader, nullptr);
+            RegisterResource([this] { vkDestroyPipeline(m_Device, m_ShadowPipeline, nullptr); m_ShadowPipeline = VK_NULL_HANDLE; });
         }
 
         // --- One-time noise generation (modes 0/1), dispatched here, never again. ---
@@ -269,50 +291,14 @@ namespace renderer {
         return true;
     }
 
-    void AtmosCloudsPass::Shutdown() {
-        if (m_Device != VK_NULL_HANDLE) {
-            if (m_Pipeline != VK_NULL_HANDLE) vkDestroyPipeline(m_Device, m_Pipeline, nullptr);
-            if (m_PipelineLayout != VK_NULL_HANDLE) vkDestroyPipelineLayout(m_Device, m_PipelineLayout, nullptr);
-            if (m_SetLayout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(m_Device, m_SetLayout, nullptr);
-            if (m_DescriptorPool != VK_NULL_HANDLE) vkDestroyDescriptorPool(m_Device, m_DescriptorPool, nullptr);
-            if (m_ShadowPipeline != VK_NULL_HANDLE) vkDestroyPipeline(m_Device, m_ShadowPipeline, nullptr);
-            if (m_ShadowPipelineLayout != VK_NULL_HANDLE) vkDestroyPipelineLayout(m_Device, m_ShadowPipelineLayout, nullptr);
-            if (m_ShadowSetLayout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(m_Device, m_ShadowSetLayout, nullptr);
-            if (m_ShadowDescriptorPool != VK_NULL_HANDLE) vkDestroyDescriptorPool(m_Device, m_ShadowDescriptorPool, nullptr);
-            if (m_NoiseSampler != VK_NULL_HANDLE) vkDestroySampler(m_Device, m_NoiseSampler, nullptr);
-            if (m_LinearSampler != VK_NULL_HANDLE) vkDestroySampler(m_Device, m_LinearSampler, nullptr);
-            if (m_ShapeNoise.view != VK_NULL_HANDLE) vkDestroyImageView(m_Device, m_ShapeNoise.view, nullptr);
-            if (m_DetailNoise.view != VK_NULL_HANDLE) vkDestroyImageView(m_Device, m_DetailNoise.view, nullptr);
-            if (m_CloudOutput.view != VK_NULL_HANDLE) vkDestroyImageView(m_Device, m_CloudOutput.view, nullptr);
-            if (m_CloudShadowMap.view != VK_NULL_HANDLE) vkDestroyImageView(m_Device, m_CloudShadowMap.view, nullptr);
-        }
-        if (m_Allocator != VK_NULL_HANDLE) {
-            if (m_ShapeNoise.image != VK_NULL_HANDLE) vmaDestroyImage(m_Allocator, m_ShapeNoise.image, m_ShapeNoise.allocation);
-            if (m_DetailNoise.image != VK_NULL_HANDLE) vmaDestroyImage(m_Allocator, m_DetailNoise.image, m_DetailNoise.allocation);
-            if (m_CloudOutput.image != VK_NULL_HANDLE) vmaDestroyImage(m_Allocator, m_CloudOutput.image, m_CloudOutput.allocation);
-            if (m_CloudShadowMap.image != VK_NULL_HANDLE) vmaDestroyImage(m_Allocator, m_CloudShadowMap.image, m_CloudShadowMap.allocation);
-        }
-
-        m_ShapeNoise = {};
-        m_DetailNoise = {};
-        m_CloudOutput = {};
-        m_CloudShadowMap = {};
-        m_Pipeline = VK_NULL_HANDLE;
-        m_PipelineLayout = VK_NULL_HANDLE;
-        m_SetLayout = VK_NULL_HANDLE;
-        m_Set = VK_NULL_HANDLE;
-        m_DescriptorPool = VK_NULL_HANDLE;
-        m_ShadowPipeline = VK_NULL_HANDLE;
-        m_ShadowPipelineLayout = VK_NULL_HANDLE;
-        m_ShadowSetLayout = VK_NULL_HANDLE;
-        m_ShadowSet = VK_NULL_HANDLE;
-        m_ShadowDescriptorPool = VK_NULL_HANDLE;
-        m_NoiseSampler = VK_NULL_HANDLE;
-        m_LinearSampler = VK_NULL_HANDLE;
-        m_OutputExtent = { 0, 0 };
-        m_Allocator = VK_NULL_HANDLE;
-        m_Device = VK_NULL_HANDLE;
-    }
+    // Shutdown() is inherited from RenderPass<AtmosCloudsPass>: runs the RegisterResource() cleanups
+    // above in reverse (cloud-shadow pipeline -> cloud-shadow pipeline layout -> cloud-shadow
+    // descriptor pool+layout -> raymarch pipeline -> raymarch pipeline layout -> raymarch descriptor
+    // pool+layout -> linear sampler -> noise sampler -> shadow map image -> cloud output image ->
+    // detail noise image -> shape noise image), the same dependency-safe order the hand-written
+    // Shutdown() used. Note: unlike the original, m_OutputExtent is not reset to {0,0} on Shutdown()
+    // -- it is set unconditionally at the top of InitImpl() on every (re-)Init anyway, and was never
+    // read between a Shutdown() and the next Init() in this codebase's actual call pattern.
 
     void AtmosCloudsPass::DispatchMode(VkCommandBuffer cmd, int32_t mode, const maths::vec3& cameraPosition,
         const maths::vec3& cameraForward, const maths::vec3& cameraRight, const maths::vec3& cameraUp,

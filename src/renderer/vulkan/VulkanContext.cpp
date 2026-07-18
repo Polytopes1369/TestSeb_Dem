@@ -2877,14 +2877,15 @@ void VulkanContext::GenerateGeometry() {
   // vertically, so no further ground clearance is needed).
   // -------------------------------------------------------------------------
   {
-    constexpr float kCreatureClearingX = -10.0f; // Mirrors kTreeClearingX's own offset, opposite side.
-    constexpr float kCreatureGroundY = -0.8f;    // Matches the floor/trees' own ground level.
+    // Placement/radius constants now live as public VulkanContext class constants (kCreatureClearingX
+    // /kCreatureGroundY/kCreatureRadiusMin/kCreatureRadiusMax) -- the single source of truth shared
+    // with renderer::FurStrandPass (UE5.8 rendering-parity gap G10a), which grows fur strands off this
+    // exact bind-pose surface. Only the two mesh-resolution knobs stay local here (the fur system
+    // distributes its roots parametrically, independent of mesh resolution, so it never needs them).
     constexpr uint32_t kCreatureSidesPerRing = 8u;
     constexpr uint32_t kCreatureRingsPerSegment = 2u; // >1 so mid-segment vertices get a genuine 2-bone blend (see geom_creature.comp).
-    constexpr float kCreatureRadiusMin = 0.06f;
-    constexpr float kCreatureRadiusMax = 0.30f;
 
-    maths::vec2 slot = { kCreatureClearingX, 0.0f };
+    maths::vec2 slot = { kCreatureClearingX, kCreatureClearingZ };
     GenerateCreature(m_InstanceRegistry[kCreatureEntityIndex].meshID, slot,
                       kCreatureGroundY + kCreatureRadiusMax,
                       kCreatureSidesPerRing, kCreatureRingsPerSegment,
@@ -3613,6 +3614,19 @@ bool VulkanContext::RunInstanceRegistrySmokeTest() {
   // returns (i.e. after BuildEntityData() has already run). Whole function compiled out of Release.
   LOG_INFO("[VulkanContext] Running core::InstanceRegistry Acquire/Release smoke test...");
 
+  // Phase 9.2 (test-pipeline integration roadmap): default to "ran, failed, generic pointer to the
+  // log" up front -- every early `return false` below (there are several distinct checks) leaves
+  // this default in place, so DebugTestPipeline::RunAll()'s later query always sees SOME real
+  // result rather than a stale/empty struct, without needing per-branch instrumentation of every
+  // individual check (matching this codebase's existing AudioEngine-smoke-test failure-reporting
+  // convention -- see GetInstanceRegistrySmokeTestResult()'s own comment). Overwritten with the
+  // real success details only at the very end, right before the final `return true`.
+  m_InstanceRegistrySmokeTestResult = InstanceRegistrySmokeTestResult{
+      /*ran=*/true, /*passed=*/false,
+      /*details=*/"FAILED -- see demo_log.txt for the specific '[VulkanContext] InstanceRegistry "
+                  "smoke test FAILED: ...' line logged during this run."
+  };
+
   // Snapshot every currently-live entity's data before touching the registry at all, so any
   // corruption of the real showcase/streaming slots is caught by a plain field comparison at the end,
   // regardless of what the Acquire/Release calls below actually did internally.
@@ -3741,10 +3755,13 @@ bool VulkanContext::RunInstanceRegistrySmokeTest() {
     }
   }
 
-  LOG_INFO(std::format(
+  std::string passMsg = std::format(
       "[VulkanContext] InstanceRegistry smoke test PASSED ({} probe slots acquired/released via "
       "LIFO free-list reuse in Debug headroom, all {} live entities unchanged).",
-      kProbeCount, kTotalEntityCount));
+      kProbeCount, kTotalEntityCount);
+  LOG_INFO(passMsg);
+  m_InstanceRegistrySmokeTestResult.passed = true;
+  m_InstanceRegistrySmokeTestResult.details = std::move(passMsg);
   return true;
 }
 #endif // NDEBUG

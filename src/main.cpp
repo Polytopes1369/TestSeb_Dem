@@ -617,6 +617,20 @@ int main(int argc, char** argv) {
     // SurfaceCachePass::Init() to prune translucent-material cards at load time.
     pipelineInfo.entityDataCPU = vkContext.GetEntityData();
 
+    // Hair/Fur shading model (UE5.8 rendering-parity gap G10a): tell renderer::FurStrandPass where the
+    // skinned creature's bind-pose surface lives, sourced from VulkanContext's own single-source-of-
+    // truth creature constants + animation::SkeletalAnimator's skeleton constants, so fur roots land
+    // on exactly the surface geom_creature.comp baked. creatureMeshID indexes the EntityTransform
+    // buffer for the creature (== its meshID) so the pass re-skins each root through the same
+    // transform ClusterRaster.vert uses for the creature's own vertices.
+    pipelineInfo.creatureFurGeometry.worldOffset = vkContext.GetCreatureBakeWorldOffset();
+    pipelineInfo.creatureFurGeometry.radiusMin = vkContext.GetCreatureRadiusMin();
+    pipelineInfo.creatureFurGeometry.radiusMax = vkContext.GetCreatureRadiusMax();
+    pipelineInfo.creatureFurGeometry.segmentLength = animation::SkeletalAnimator::kSegmentLength;
+    pipelineInfo.creatureFurGeometry.boneCount = animation::SkeletalAnimator::kBoneCount;
+    pipelineInfo.creatureFurGeometry.creatureMeshID =
+        vkContext.GetEntityData()[vkContext.GetCreatureEntityIndex()].meshID;
+
     // ClusterRenderPipeline::Init() sequentially creates ~40 render passes' worth of GPU buffers/
     // images/pipelines (many involving first-time driver-side SPIR-V pipeline compilation -- there
     // is no persisted VkPipelineCache anywhere in this codebase, so this cost is paid fresh on
@@ -720,6 +734,32 @@ int main(int argc, char** argv) {
         }
         if (!clusterPipeline.RunPcgFullPipelineSmokeTest(pcgFullPipelineMeshes, vkContext.GetCommandPool(), vkContext.GetGraphicsQueue())) {
             LOG_ERROR("[Main] PCG full-pipeline smoke test FAILED -- see log above for the specific check.");
+        }
+    }
+
+    // PCG roadmap Phase 6.3 ("Runtime Generator Hook", world::PcgCellLoader): proves the LIVE
+    // streaming-triggered generation path -- world::IWorldCellLoader::LoadCellFullDetail()/
+    // UnloadCell() -> pcg::GeneratePcgContentForCell() -> world::PcgCellLoader::Pump() ->
+    // pcg::PcgInstanceSpawnManager -- actually runs end-to-end, simulating exactly what
+    // world::StreamingManager would trigger from a worker thread. See
+    // ClusterRenderPipeline::RunPcgCellLoaderSmokeTest's own comment for exactly what it checks at
+    // each stage. Reuses the SAME 3 already-resident World Partition streaming archetype meshes as
+    // both smoke tests above (this class has no VulkanContext dependency of its own, same reason as
+    // PcgFullPipelineSmokeTestMeshDesc's own comment). Not fatal on failure (logged only), matching
+    // every other smoke test's own convention.
+    {
+        std::vector<renderer::ClusterRenderPipeline::PcgFullPipelineSmokeTestMeshDesc> pcgCellLoaderMeshes;
+        static constexpr uint32_t kCellLoaderUnits[3] = { 0u, 1u, 2u }; // Rock, Bush, Tree (same units as above).
+        for (uint32_t i = 0; i < 3u; ++i) {
+            VulkanContext::StreamingArchetypeMeshInfo meshInfo = vkContext.GetStreamingArchetypeFineMeshInfo(kCellLoaderUnits[i]);
+            renderer::ClusterRenderPipeline::PcgFullPipelineSmokeTestMeshDesc desc{};
+            desc.meshID = meshInfo.meshID;
+            desc.materialID = meshInfo.materialID;
+            desc.weight = 1.0f;
+            pcgCellLoaderMeshes.push_back(desc);
+        }
+        if (!clusterPipeline.RunPcgCellLoaderSmokeTest(pcgCellLoaderMeshes, vkContext.GetCommandPool(), vkContext.GetGraphicsQueue())) {
+            LOG_ERROR("[Main] PCG cell-loader smoke test FAILED -- see log above for the specific check.");
         }
     }
 #endif
@@ -935,7 +975,6 @@ int main(int argc, char** argv) {
             uint32_t PROBE_GRID_RESOLUTION = config::lumen::PROBE_GRID_RESOLUTION;
             uint32_t VSM_PHYSICAL_PAGE_CAPACITY = config::lumen::VSM_PHYSICAL_PAGE_CAPACITY;
             uint32_t TRANSLUCENCY_LIGHTING_VOLUME_DIM = config::postprocess::_TRANSLUCENCY_LIGHTING_VOLUME_DIM;
-            uint32_t VOLUMETRIC_FOG_GRID_PIXEL_SIZE = config::volumetrics::_VOLUMETRIC_FOG_GRID_PIXEL_SIZE;
             // The "Hardware Ray Tracing" checkbox's own value only takes effect at the NEXT session
             // start (see main()'s g_DebugState.traceMode seeding comment, right before the frame
             // loop) -- 'T'/'Y' remain the live, no-reload way to change trace mode mid-session.
@@ -954,7 +993,6 @@ int main(int argc, char** argv) {
                 config::lumen::PROBE_GRID_RESOLUTION,
                 config::lumen::VSM_PHYSICAL_PAGE_CAPACITY,
                 config::postprocess::_TRANSLUCENCY_LIGHTING_VOLUME_DIM,
-                config::volumetrics::_VOLUMETRIC_FOG_GRID_PIXEL_SIZE,
                 config::lumen::_HARDWARE_RAYTRACING,
                 config::g_ActiveProfileName
             };
@@ -972,7 +1010,6 @@ int main(int argc, char** argv) {
         if (config::lumen::PROBE_GRID_RESOLUTION != startup.PROBE_GRID_RESOLUTION) { needsReload = true; reloadReason += "Probe Grid Resolution; "; }
         if (config::lumen::VSM_PHYSICAL_PAGE_CAPACITY != startup.VSM_PHYSICAL_PAGE_CAPACITY) { needsReload = true; reloadReason += "VSM Page Capacity; "; }
         if (config::postprocess::_TRANSLUCENCY_LIGHTING_VOLUME_DIM != startup.TRANSLUCENCY_LIGHTING_VOLUME_DIM) { needsReload = true; reloadReason += "Translucency Volume Dim; "; }
-        if (config::volumetrics::_VOLUMETRIC_FOG_GRID_PIXEL_SIZE != startup.VOLUMETRIC_FOG_GRID_PIXEL_SIZE) { needsReload = true; reloadReason += "Volumetric Fog Grid Pixel Size; "; }
         if (config::lumen::_HARDWARE_RAYTRACING != startup.HARDWARE_RAYTRACING) { needsReload = true; reloadReason += "Hardware Ray Tracing (takes effect next session -- 'T'/'Y' keys change it live without a restart); "; }
         if (config::g_ActiveProfileName != startup.profileName) { needsReload = true; reloadReason += "Profile Preset (changed to " + config::g_ActiveProfileName + "); "; }
 
@@ -1040,11 +1077,6 @@ int main(int argc, char** argv) {
                     config::temporal::JITTER_FRAME_COUNT = static_cast<uint32_t>(jitterCount);
                 }
                 ImGui::Checkbox("Enabled By Default", &config::temporal::ENABLED_BY_DEFAULT);
-                ImGui::DragFloat("Screen Percentage", &config::temporal::_SCREEN_PERCENTAGE, 1.0f, 10.0f, 200.0f);
-                int upscaler = static_cast<int>(config::temporal::_TEMPORAL_AA_UPSCALER);
-                if (ImGui::DragInt("Temporal AA Upscaler", &upscaler, 1, 0, 5)) {
-                    config::temporal::_TEMPORAL_AA_UPSCALER = static_cast<uint32_t>(upscaler);
-                }
                 ImGui::EndTabItem();
             }
 
@@ -1114,16 +1146,7 @@ int main(int argc, char** argv) {
                     config::lumen::VSM_PHYSICAL_PAGE_CAPACITY = static_cast<uint32_t>(pageCap);
                 }
                 ImGui::Checkbox("Hardware Ray Tracing", &config::lumen::_HARDWARE_RAYTRACING);
-                ImGui::Checkbox("Trace Mesh SDF", &config::lumen::_TRACE_MESH_SDF);
-                ImGui::Checkbox("Screen Space Probe Occlusion", &config::lumen::_SCREEN_SPACE_PROBE_OCCLUSION);
-                ImGui::Checkbox("Reflections Allow", &config::lumen::_REFLECTIONS_ALLOW);
                 ImGui::Checkbox("Megalights Enable", &config::lumen::_MEGALIGHTS_ENABLE);
-                ImGui::EndTabItem();
-            }
-
-            // --- Tab Reflection ---
-            if (ImGui::BeginTabItem("Reflection")) {
-                ImGui::Checkbox("Screen Space Reflections", &config::reflections::_SCREEN_SPACE_REFLECTIONS);
                 ImGui::EndTabItem();
             }
 
@@ -1211,19 +1234,27 @@ int main(int argc, char** argv) {
                 ImGui::EndTabItem();
             }
 
+            // --- Tab Path Tracer (UE5.8 rendering-parity gap G10b) -- DEBUG-only reference/ground-
+            // truth offline path tracer, to validate the real-time Lumen view against. The whole
+            // Engine Configuration Panel is already inside #ifndef NDEBUG, so this tab (and the
+            // config::debugview::PATH_TRACER_ENABLED toggle, itself #ifndef NDEBUG) never exists in
+            // a Release build. ---
+            if (ImGui::BeginTabItem("Path Tracer")) {
+                ImGui::Checkbox("Reference Path Tracer (bypass Lumen/MegaLights)", &config::debugview::PATH_TRACER_ENABLED);
+                ImGui::TextWrapped("Unbiased offline reference: full Substrate BSDF + NEE, multi-bounce, "
+                    "progressively accumulated while the camera is stationary (accumulation resets on "
+                    "camera movement). Ground-truth comparison against the real-time Lumen view.");
+                ImGui::Separator();
+                if (config::debugview::PATH_TRACER_ENABLED) {
+                    ImGui::Text("Accumulated samples: %u", clusterPipeline.GetPathTracerSampleCount());
+                } else {
+                    ImGui::TextDisabled("Enable to start accumulating a reference image.");
+                }
+                ImGui::EndTabItem();
+            }
+
             // --- Tab Volumetric ---
             if (ImGui::BeginTabItem("Volumetric")) {
-                int skyQual = static_cast<int>(config::volumetrics::_SKY_ATMOSPHERE_QUALITY);
-                if (ImGui::DragInt("Sky Atmosphere Quality", &skyQual, 1, 1, 5)) {
-                    config::volumetrics::_SKY_ATMOSPHERE_QUALITY = static_cast<uint32_t>(skyQual);
-                }
-                ImGui::Checkbox("Volumetric Fog", &config::volumetrics::_VOLUMETRIC_FOG_ENABLE);
-                int fogGrid = static_cast<int>(config::volumetrics::_VOLUMETRIC_FOG_GRID_PIXEL_SIZE);
-                if (ImGui::DragInt("Fog Grid Pixel Size", &fogGrid, 2, 2, 32)) {
-                    config::volumetrics::_VOLUMETRIC_FOG_GRID_PIXEL_SIZE = static_cast<uint32_t>(fogGrid);
-                }
-                ImGui::DragFloat("Cloud Ray Sample Scale", &config::volumetrics::_VOLUMETRIC_CLOUD_VIEW_RAY_SAMPLE_COUNT_SCALE, 0.05f, 0.1f, 10.0f);
-
                 // --- Local Fog Volumes (UE5.8 rendering-parity gap G8) -- localized box/sphere fog
                 // regions injected additively into the froxel grid (see config::localfog::VOLUMES
                 // and renderer::AtmosVolumetricFogPass). "Enable Local Fog Volumes" is a real runtime
@@ -1518,6 +1549,52 @@ int main(int argc, char** argv) {
                 ImGui::TextDisabled("Instances: %u / %u",
                     clusterPipeline.GetVegetationScatter().GetInstanceCount(),
                     renderer::VegetationScatterPass::kMaxInstances);
+
+                ImGui::EndTabItem();
+            }
+
+            // --- Tab Fur / Hair (UE5.8 rendering-parity gap G10a) -- GPU-instanced procedural fur
+            // strands grown off the skinned creature, shaded with the dedicated hair BSDF. ENABLED /
+            // occlusion / wireframe + appearance (width/curl/spec) take effect live; the strand-count
+            // /length/geometry knobs are consumed on Regenerate (a blocking device-idle re-bake). ---
+            if (ImGui::BeginTabItem("Fur / Hair")) {
+                ImGui::Checkbox("Enabled", &config::fur::ENABLED);
+                ImGui::Checkbox("Occlusion Cull (HZB)", &config::fur::OCCLUSION_CULL_ENABLED);
+                ImGui::Checkbox("Wireframe", &config::fur::WIREFRAME);
+
+                ImGui::Separator();
+                ImGui::TextUnformatted("Appearance (live)");
+                ImGui::SliderFloat("Strand Width (m)", &config::fur::WIDTH, 0.004f, 0.06f);
+                ImGui::SliderFloat("Curl / Droop", &config::fur::CURL_AMOUNT, 0.0f, 1.0f);
+                ImGui::SliderFloat("Specular Intensity", &config::fur::SPEC_INTENSITY, 0.0f, 2.0f);
+                ImGui::SliderFloat("TRT (2nd highlight)", &config::fur::TRT_INTENSITY, 0.0f, 2.0f);
+                ImGui::SliderFloat("Strand Length (m)", &config::fur::LENGTH, 0.02f, 0.5f);
+
+                ImGui::Separator();
+                ImGui::TextUnformatted("Strand parameters (applied on Regenerate)");
+                {
+                    int strands = static_cast<int>(config::fur::STRAND_COUNT);
+                    if (ImGui::SliderInt("Strand Count", &strands, 0,
+                            static_cast<int>(renderer::FurStrandPass::kMaxStrands))) {
+                        config::fur::STRAND_COUNT = static_cast<uint32_t>(strands < 0 ? 0 : strands);
+                    }
+                }
+                ImGui::SliderFloat("Length Jitter", &config::fur::LENGTH_JITTER, 0.0f, 1.0f);
+                ImGui::SliderFloat("Root Lift (m)", &config::fur::ROOT_LIFT, 0.0f, 0.05f);
+                {
+                    int seed = static_cast<int>(config::fur::SEED);
+                    if (ImGui::InputInt("Seed", &seed)) {
+                        config::fur::SEED = static_cast<uint32_t>(seed < 0 ? 0 : seed);
+                    }
+                }
+                if (ImGui::Button("Regenerate Strands")) {
+                    clusterPipeline.RegenerateFur();
+                }
+
+                ImGui::Separator();
+                ImGui::TextDisabled("Strands: %u / %u",
+                    clusterPipeline.GetFurStrand().GetStrandCount(),
+                    renderer::FurStrandPass::kMaxStrands);
 
                 ImGui::EndTabItem();
             }

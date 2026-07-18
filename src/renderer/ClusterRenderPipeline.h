@@ -104,6 +104,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <string>
 #include <vector>
 #include <vulkan/vulkan.h>
 #include <vk_mem_alloc.h>
@@ -135,6 +136,7 @@
 #include "renderer/passes/WaterForwardPass.h"
 #include "renderer/passes/ParticleSystemPass.h"
 #include "renderer/passes/VegetationScatterPass.h"
+#include "renderer/passes/FurStrandPass.h"
 #include "renderer/passes/HZBPass.h"
 #include "renderer/LightingTypes.h"
 #include "renderer/passes/ProceduralMaskGenerator.h"
@@ -171,6 +173,11 @@
 // needed on this class.
 #include "renderer/debug/PcgPointCloudDebugView.h"
 #include "renderer/passes/SDFRayMarchPass.h"
+// UE5.8 rendering-parity gap G10b: DEBUG-only offline/reference Path Tracer -- a ground-truth
+// validation view against the real-time Lumen approximation, so per CLAUDE.md rule 8 ("modes de
+// visualisation") the whole feature (this include, m_PathTracer below, its Init/Shutdown/RecordFrame
+// call sites) lives inside #ifndef NDEBUG and produces zero code/symbols in Release.
+#include "renderer/passes/PathTracerPass.h"
 // Phase 0.2 (UE5.8-parity PCG roadmap, "PCG Instance Draw Path"): only ever instantiated (as a
 // local variable) inside RunPcgInstanceDrawSmokeTest() below -- see that method's own comment.
 // PcgInstanceDrawPass.cpp itself still compiles unconditionally in every build config (it is a
@@ -241,6 +248,14 @@ namespace renderer {
         // built by renderer::GenerateShowcaseMaterialTable) -- uploaded once into ClusterResolvePass's
         // GPU SSBO and TransparentForwardPass's own descriptor set.
         MaterialTable materialTable{};
+
+        // Hair/Fur shading model (UE5.8 rendering-parity gap G10a): the skinned creature's bind-pose
+        // placement/radius geometry (VulkanContext::kCreature* constants) + its EntityTransform slot
+        // index, needed by renderer::FurStrandPass to grow fur strands off the creature's exact
+        // animated surface. Filled by the caller (main.cpp) from VulkanContext. Left at its defaults
+        // if fur is never used -- the pass still Init's harmlessly, just placing roots on a default
+        // creature footprint.
+        CreatureFurGeometry creatureFurGeometry{};
     };
 
     class ClusterRenderPipeline {
@@ -375,15 +390,30 @@ namespace renderer {
         // (instance-count readout) -- same "borrow a const ref" convention as GetParticleSystem().
         const VegetationScatterPass& GetVegetationScatter() const { return m_VegetationScatter; }
 
+        // UE5.8 rendering-parity gap G10a: hair/fur strand pass (strand-count readout) -- same
+        // "borrow a const ref" convention as GetVegetationScatter().
+        const FurStrandPass& GetFurStrand() const { return m_FurStrand; }
+
 #ifndef NDEBUG
         // Debug-only: re-runs the vegetation scatter generator from the current config::vegetation::
         // density/region/seed knobs. Waits for the device to go idle first (the generation is a
         // blocking one-shot submit on the graphics queue, so no in-flight frame may still reference
         // the instance buffer) -- backs the Debug "Vegetation" tab's Regenerate button.
         void RegenerateVegetationScatter();
+
+        // Debug-only: re-runs the fur strand-root generator from the current config::fur:: strand-
+        // count/length/geometry knobs. Same device-idle-then-blocking-one-shot discipline as
+        // RegenerateVegetationScatter above -- backs the Debug "Fur / Hair" tab's Regenerate button.
+        void RegenerateFur();
 #endif
 
 #ifndef NDEBUG
+        // UE5.8 rendering-parity gap G10b: number of samples-per-pixel the reference Path Tracer has
+        // progressively accumulated for the current stationary-camera view (resets to 0 on camera
+        // movement) -- read live by main.cpp's Debug ImGui path-tracer panel. 0 when the mode has
+        // never run this session. Debug-only, exactly like every SetDebug*/Get* member below.
+        uint32_t GetPathTracerSampleCount() const { return m_PathTracer.GetAccumulatedSampleCount(); }
+
         // SWRT/HWRT back-end toggle shared by m_GIInject and m_WorldProbes' own trace pass (0 = SWRT
         // mesh-SDF sphere tracing, 1 = HWRT inline rayQueryEXT against m_SurfaceCacheRT's TLAS) --
         // debug-only (main.cpp's 'T'/'Y' explicit-set keys) so both back-ends stay exercised; Release
@@ -594,6 +624,71 @@ namespace renderer {
         // compiled out of Release, matching RunPcgInstanceDrawSmokeTest's own convention.
         bool RunPcgFullPipelineSmokeTest(const std::vector<PcgFullPipelineSmokeTestMeshDesc>& weightedMeshes,
             VkCommandPool commandPool, VkQueue queue);
+
+        // PCG roadmap Phase 6.3 ("Runtime Generator Hook", world::PcgCellLoader): proves the LIVE
+        // streaming-triggered path -- world::IWorldCellLoader::LoadCellFullDetail()/UnloadCell() ->
+        // pcg::GeneratePcgContentForCell() -> world::PcgCellLoader::Pump() ->
+        // pcg::PcgInstanceSpawnManager::SpawnInstances()/DespawnInstances() -- actually runs
+        // end-to-end, simulating exactly what world::StreamingManager would trigger from a worker
+        // thread, WITHOUT needing a real StreamingManager/CellManifest/camera. Reuses
+        // `weightedMeshes` for the same reason RunPcgFullPipelineSmokeTest() does (real, already-
+        // resident streaming archetype meshes as spawner palette content). Writes a real, throwaway
+        // PcgVolume .actor file + PcgGraph JSON asset to a scratch temp directory (mirrors
+        // tests/PcgCellGeneratorTests.cpp's own WriteGraphAssetToDisk pattern, and
+        // renderer::debug::PcgVolumeInspector::BuildSyntheticDemoVolumes' own "write a real graph
+        // asset to disk" precedent), then constructs a real world::PcgCellLoader against that
+        // directory and a throwaway PcgInstanceDrawPass/PcgInstanceSpawnManager pair (same "borrow
+        // this pipeline's already-resident m_PagePool" convention as RunPcgFullPipelineSmokeTest's
+        // own STEP 4). Verifies, via renderer::PcgInstanceDrawPass::GetLiveInstanceCount() (no pixel
+        // readback needed -- see this phase's own task brief, "log-based PASS/FAIL confirmation is
+        // sufficient"):
+        //   1. The volume index found exactly 1 volume, overlapping exactly the 1 cell it was
+        //      authored to overlap.
+        //   2. LoadCellFullDetail() + Pump() drives a real SpawnInstances() call that acquires
+        //      exactly the expected number of instances (the synthetic grid-points source node's own
+        //      deterministic point count).
+        //   3. LoadCellHlod() + Pump() is a documented no-op (live instance count unchanged) -- see
+        //      world::PcgCellLoader::LoadCellHlod()'s own header comment for why HLOD-tier PCG
+        //      generation is out of scope for this phase.
+        //   4. UnloadCell() + Pump() drives a real DespawnInstances() call that releases every
+        //      instance the cell's own generation had acquired (live instance count back to 0).
+        //   5. PCG roadmap Phase 6.4 ("Generation Caching"): a SECOND LoadCellFullDetail() + Pump()
+        //      for the SAME coord, issued right after step 4's UnloadCell() -- exactly the "camera
+        //      re-crosses a cell boundary" reload scenario Phase 6.4 exists to fix (see
+        //      world::PcgCellLoader.h's own top-of-file "Phase 6.4" comment) -- reproduces the exact
+        //      same instance count as step 2 while world::PcgCellLoader::GetCacheHitCount()/
+        //      GetCacheMissCount() prove pcg::GeneratePcgContentForCell was NOT called again (exactly
+        //      1 total cache hit, 0 additional misses beyond the 1 the first load already produced).
+        // Not fatal on failure (logged only), matching every other smoke test's own convention. Whole
+        // declaration + definition compiled out of Release, matching RunPcgFullPipelineSmokeTest's
+        // own convention -- world::PcgCellLoader itself is ALSO whole-file Debug-only (see that
+        // class' own header comment for why), so this smoke test is its only in-engine validation.
+        bool RunPcgCellLoaderSmokeTest(const std::vector<PcgFullPipelineSmokeTestMeshDesc>& weightedMeshes,
+            VkCommandPool commandPool, VkQueue queue);
+
+        // Phase 9.2 (test-pipeline integration roadmap): captured outcome of the most recent
+        // RunPcgInstanceDrawSmokeTest()/RunPcgFullPipelineSmokeTest()/RunPhase03DynamicLumenSmokeTest()/
+        // RunPcgCellLoaderSmokeTest() run. All four are called exactly once (main.cpp for the first,
+        // second, and fourth, right after this pipeline's own Init() returns; this class's own
+        // Init() itself for the third -- see RunPhase03DynamicLumenSmokeTest's own comment) well
+        // before DebugTestPipeline::RunAll() ever executes, so RunAll() has no way to observe their
+        // results except by querying these getters after the fact -- same "ran, failed generically
+        // until overwritten with real success details" convention as VulkanContext::
+        // GetInstanceRegistrySmokeTestResult() (see that struct's own comment for the full
+        // rationale, including why failure paths only get a generic demo_log.txt pointer rather than
+        // per-check instrumentation). RunPcgCellLoaderSmokeTest() (Phase 6.3, "Runtime Generator
+        // Hook") was not yet merged to main when this result-storage mechanism was first added --
+        // reconciled in here alongside the other three once Phase 6.3 landed, following the exact
+        // same pattern.
+        struct PcgSmokeTestResult {
+            bool ran = false;
+            bool passed = false;
+            std::string details;
+        };
+        const PcgSmokeTestResult& GetPcgInstanceDrawSmokeTestResult() const { return m_PcgInstanceDrawSmokeTestResult; }
+        const PcgSmokeTestResult& GetPcgFullPipelineSmokeTestResult() const { return m_PcgFullPipelineSmokeTestResult; }
+        const PcgSmokeTestResult& GetPhase03DynamicLumenSmokeTestResult() const { return m_Phase03DynamicLumenSmokeTestResult; }
+        const PcgSmokeTestResult& GetPcgCellLoaderSmokeTestResult() const { return m_PcgCellLoaderSmokeTestResult; }
 
         // PCG editor-tooling roadmap, Phase 7.2 ("PCG Point Cloud Debug Visualization"): last
         // point count RunPcgFullPipelineSmokeTest() uploaded into m_PcgPointCloudDebugView (its own
@@ -892,6 +987,16 @@ namespace renderer {
         // the scatter and water snapshots a frame that includes it. Always initialized (not Debug-
         // only), same build-separation rule as m_ParticleSystem above.
         VegetationScatterPass m_VegetationScatter;
+
+        // Hair/Fur shading model (UE5.8 rendering-parity gap G10a): GPU-instanced procedural fur
+        // strands grown off the skinned creature's animated surface -- see renderer::FurStrandPass's
+        // own class comment for the "own buffers + own lightweight forward pass, culled independently
+        // of the Nanite path" structure it shares with m_VegetationScatter, and for why fur gets its
+        // own dedicated hair BSDF (include/hair_bsdf.glsl) outside the Substrate material path.
+        // RecordCull/RecordDraw run in RecordFrameLate's [13c] forward block, right after
+        // m_VegetationScatter (both opaque, depth-writing) and before m_TransparentForward. Always
+        // initialized (not Debug-only), same build-separation rule as m_VegetationScatter above.
+        FurStrandPass m_FurStrand;
         // Subtask 6: this pass' own frame-to-frame delta-time tracking, computed independently from
         // RecordFrameLate's own `deltaTimeSeconds` (that one isn't computed yet by the time
         // RecordFrameEarly reaches m_ParticleSystem.RecordSimulate() -- see that call site's own
@@ -1170,6 +1275,15 @@ namespace renderer {
         // m_PostProcess's output) when config::debugview::SELECTED_BUFFER_INDEX != 0.
         debug::DebugBufferViewPass m_DebugBufferView;
 
+        // UE5.8 rendering-parity gap G10b: offline/reference unbiased Path Tracer -- traces the SAME
+        // scene TLAS m_SurfaceCacheRT built, evaluates the full Substrate BSDF + NEE per hit,
+        // progressively accumulates samples while the camera is stationary, and (when
+        // config::debugview::PATH_TRACER_ENABLED) blits its tonemapped result to the swapchain in
+        // place of the normal composite. A ground-truth reference to validate the real-time Lumen
+        // view against, exactly like UE5.8's own Path Tracer render mode -- Debug-only per CLAUDE.md
+        // rule 8, same build-separation convention as m_SDFRayMarch/m_DebugBufferView above.
+        PathTracerPass m_PathTracer;
+
         // Phase 0.2 (UE5.8-parity PCG roadmap, "PCG Instance Draw Path"): retains Init()'s own
         // local `indexEntries`/`dagEntries` vectors (STEP 1 above; normally discarded once every
         // GPU-resident table is built) purely so RunPcgInstanceDrawSmokeTest() has a full,
@@ -1192,6 +1306,15 @@ namespace renderer {
         // RecordFrame's [13c] forward block, right after m_ParticleSystem.RecordDraw, gated by
         // config::debugview::PCG_POINT_CLOUD_VIZ (the "PCG Graph Editor" tab's own checkbox).
         debug::PcgPointCloudDebugView m_PcgPointCloudDebugView;
+
+        // Backing storage for GetPcgInstanceDrawSmokeTestResult()/GetPcgFullPipelineSmokeTestResult()/
+        // GetPhase03DynamicLumenSmokeTestResult()/GetPcgCellLoaderSmokeTestResult() above -- see
+        // PcgSmokeTestResult's own declaration-site comment. Zero-sized/never referenced in Release
+        // (whole members compiled out).
+        PcgSmokeTestResult m_PcgInstanceDrawSmokeTestResult;
+        PcgSmokeTestResult m_PcgFullPipelineSmokeTestResult;
+        PcgSmokeTestResult m_Phase03DynamicLumenSmokeTestResult;
+        PcgSmokeTestResult m_PcgCellLoaderSmokeTestResult;
 #endif
     };
 
