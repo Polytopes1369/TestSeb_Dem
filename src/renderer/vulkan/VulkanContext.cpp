@@ -3050,14 +3050,88 @@ void VulkanContext::GenerateGeometry() {
     const float savedVertexSpacing = config::VERTEX_SPACING;
     config::VERTEX_SPACING = 0.12f; // See this block's own header comment for why this must be fixed, not profile-dependent.
 
-    for (uint32_t unit = 0; unit < kStreamingUnitCount; ++unit) {
-      std::optional<world::CellPlacement> dedicatedPlacement;
-      if (unit < orderedCells.size()) {
-        dedicatedPlacement = m_CellManifest.GetPlacement(orderedCells[unit]);
-        if (dedicatedPlacement.has_value()) {
-          m_CellToStreamingUnit[orderedCells[unit]] = unit;
+    // Startup-latency fix: BakeHlodProxyIntoSlot() used to be called inline in a single pass below,
+    // each call opening its OWN one-shot command buffer and blocking the CPU on vkQueueWaitIdle
+    // before returning -- up to kStreamingUnitCount (50) sequential blocking GPU round-trips just
+    // for this block. Nothing in BakeHlodProxyIntoSlot()'s own logic actually depends on waiting
+    // between calls: runningVertexOffset/runningIndexOffset are plain CPU-side counters threaded
+    // through by reference (advanced synchronously, no GPU readback involved anywhere in this
+    // function), and every call writes into a disjoint, CPU-computed sub-range of the same
+    // fixed-size m_VertexBuffer/m_IndexBuffer SSBOs -- which sub-range lands where is functionally
+    // irrelevant, since every vertex is tagged with its owning meshID and every downstream consumer
+    // (BuildClusterDAG, the AUTOSMOOTH compute pass) selects/matches by that tag or by world-space
+    // position, never by buffer-layout adjacency or call order. This first pass therefore precomputes
+    // each unit's dedicated-cell lookup (populating m_CellToStreamingUnit exactly once per unit, same
+    // as before) and attempts every qualifying unit's HLOD proxy bake, all recorded into ONE shared
+    // command buffer, submitted and waited on exactly ONCE afterward -- not once per unit.
+    //
+    // The fallback plain-box coarse mesh and every fine-mesh archetype (GenerateBox/GenerateIcosphere/
+    // GenerateSphere/GenerateCapsule/GenerateTorus, all DispatchGeometryCompute-driven) are
+    // deliberately left as a SECOND pass below, each still its own blocking one-shot submit -- out of
+    // scope for this fix (the exact same pattern is shared by every procedural primitive generator in
+    // this entire function, not unique to the streaming pool, so batching it too would be a much
+    // larger change than the specific staging-buffer/wait-idle stall this block targets) -- and that
+    // second pass needs bakedRealCoarseProxy's final per-unit result anyway to decide whether to fall
+    // back to a plain box.
+    std::vector<std::optional<world::CellPlacement>> dedicatedPlacements(kStreamingUnitCount);
+    std::vector<bool> bakedRealCoarseProxy(kStreamingUnitCount, false);
+    {
+      std::vector<std::pair<VkBuffer, VmaAllocation>> pendingStagingBuffers;
+      renderer::VulkanUtils::ExecuteOneShotCommands(m_Device, m_CommandPool, m_GraphicsQueue, [&](VkCommandBuffer cmd) {
+        for (uint32_t unit = 0; unit < kStreamingUnitCount; ++unit) {
+          if (unit < orderedCells.size()) {
+            dedicatedPlacements[unit] = m_CellManifest.GetPlacement(orderedCells[unit]);
+            if (dedicatedPlacements[unit].has_value()) {
+              m_CellToStreamingUnit[orderedCells[unit]] = unit;
+            }
+          }
+
+          const std::optional<world::CellPlacement>& dedicatedPlacement = dedicatedPlacements[unit];
+          if (dedicatedPlacement.has_value() && dedicatedPlacement->hlodVertexCount > 0 && dedicatedPlacement->hlodIndexCount > 0) {
+            uint32_t coarseIdx = StreamingUnitCoarseSlot(unit);
+            maths::vec2 coarseSlot = StreamingSlotParkPosition(coarseIdx);
+            bakedRealCoarseProxy[unit] = BakeHlodProxyIntoSlot(cmd, *dedicatedPlacement, m_InstanceRegistry[coarseIdx].meshID,
+                                                                coarseSlot, runningVertexOffset, runningIndexOffset,
+                                                                pendingStagingBuffers);
+          }
         }
+
+        // One shared transfer-write -> vertex/compute-shader-read visibility barrier for every
+        // vkCmdCopyBuffer recorded by the loop above (both the vertex and index copy of every unit
+        // that got a real HLOD bake this call) -- safe to cover them all with a single barrier since
+        // they share the exact same hazard (transfer write into m_VertexBuffer/m_IndexBuffer vs. a
+        // later vertex/compute-shader read of either), and every one of those writes is already
+        // ordered before this point in submission order within this one command buffer. Matches
+        // BakeHlodProxyIntoSlot()'s own former per-call barrier (same stage/access masks); skipped
+        // entirely when nothing was baked this call (e.g. no manifest loaded), same as before.
+        if (!pendingStagingBuffers.empty()) {
+          VkMemoryBarrier2 memBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+          memBarrier.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+          memBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+          memBarrier.dstStageMask = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+          memBarrier.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
+
+          VkDependencyInfo depInfo{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+          depInfo.memoryBarrierCount = 1;
+          depInfo.pMemoryBarriers = &memBarrier;
+          vkCmdPipelineBarrier2(cmd, &depInfo);
+        }
+      });
+
+      // Safe to destroy every staging buffer now: ExecuteOneShotCommands() above already blocked
+      // until the GPU finished executing every vkCmdCopyBuffer that reads from them.
+      for (auto& [stagingBuffer, stagingAllocation] : pendingStagingBuffers) {
+        vmaDestroyBuffer(m_Allocator, stagingBuffer, stagingAllocation);
       }
+
+      LOG_INFO(std::format("[GenerateGeometry] Streaming pool: baked {} cell(s)' real HLOD proxies "
+                           "via ONE batched GPU submission (previously {} separate blocking "
+                           "one-shot submits).",
+                           pendingStagingBuffers.size() / 2u, pendingStagingBuffers.size() / 2u));
+    }
+
+    for (uint32_t unit = 0; unit < kStreamingUnitCount; ++unit) {
+      const std::optional<world::CellPlacement>& dedicatedPlacement = dedicatedPlacements[unit];
       uint32_t shape = dedicatedPlacement.has_value()
           ? (dedicatedPlacement->archetypeShape % kStreamingArchetypeShapeCount)
           : (unit % kStreamingArchetypeShapeCount);
@@ -3065,12 +3139,7 @@ void VulkanContext::GenerateGeometry() {
       uint32_t coarseIdx = StreamingUnitCoarseSlot(unit);
       maths::vec2 coarseSlot = StreamingSlotParkPosition(coarseIdx);
 
-      bool bakedRealCoarseProxy = false;
-      if (dedicatedPlacement.has_value() && dedicatedPlacement->hlodVertexCount > 0 && dedicatedPlacement->hlodIndexCount > 0) {
-        bakedRealCoarseProxy = BakeHlodProxyIntoSlot(*dedicatedPlacement, m_InstanceRegistry[coarseIdx].meshID,
-                                                      coarseSlot, runningVertexOffset, runningIndexOffset);
-      }
-      if (!bakedRealCoarseProxy) {
+      if (!bakedRealCoarseProxy[unit]) {
         // Fallback: no manifest, this unit exceeds the authored cell count, this cell's HLOD proxy
         // was empty (BuildHlodForCell produced zero triangles -- degrades exactly like "no
         // authored content", see world::CellPlacement's own hlodIndexCount==0 comment), or the
@@ -3173,9 +3242,10 @@ maths::vec2 VulkanContext::StreamingSlotParkPosition(uint32_t slotIndex) {
   return maths::vec2{ kParkBaseX + static_cast<float>(slotIndex) * kParkSpacing, kParkBaseZ };
 }
 
-bool VulkanContext::BakeHlodProxyIntoSlot(const world::CellPlacement &placement, uint32_t meshID,
+bool VulkanContext::BakeHlodProxyIntoSlot(VkCommandBuffer cmd, const world::CellPlacement &placement, uint32_t meshID,
                                           const maths::vec2 &worldOffset,
-                                          uint32_t &runningVertexOffset, uint32_t &runningIndexOffset) {
+                                          uint32_t &runningVertexOffset, uint32_t &runningIndexOffset,
+                                          std::vector<std::pair<VkBuffer, VmaAllocation>> &pendingStagingBuffers) {
   const std::vector<world::CellHlodVertex> &blobVerts = m_CellManifest.GetHlodVertices();
   const std::vector<uint32_t> &blobIndices = m_CellManifest.GetHlodIndices();
 
@@ -3244,14 +3314,15 @@ bool VulkanContext::BakeHlodProxyIntoSlot(const world::CellPlacement &placement,
   const VkDeviceSize vertexBytes = static_cast<VkDeviceSize>(vertices.size()) * sizeof(renderer::Vertex);
   const VkDeviceSize indexBytes = static_cast<VkDeviceSize>(indices.size()) * sizeof(uint32_t);
 
-  // --- Staging + vkCmdCopyBuffer, mirroring UploadEntityData()'s own one-shot pattern exactly
-  // (same VMA_MEMORY_USAGE_CPU_ONLY + VMA_ALLOCATION_CREATE_MAPPED_BIT staging buffer, same
-  // blocking ExecuteOneShotCommands submission -- safe to destroy the staging buffers immediately
-  // after it returns, see VulkanUtils::ExecuteOneShotCommands' own vkQueueWaitIdle -- same trailing
-  // VkMemoryBarrier2 making the transfer-write visible to whatever reads these SSBOs next: both the
-  // vertex/fragment shaders that eventually raster this mesh AND geometry::BuildClusterDAG's own
-  // CPU-side ReadbackFullGeometry() a few statements later in this same Init() call (main.cpp),
-  // hence the COMPUTE + VERTEX stage mask below, wider than UploadEntityData()'s VERTEX-only one). ---
+  // --- Staging + vkCmdCopyBuffer, mirroring UploadEntityData()'s own staging-buffer setup (same
+  // VMA_MEMORY_USAGE_CPU_ONLY + VMA_ALLOCATION_CREATE_MAPPED_BIT staging buffer). UNLIKE
+  // UploadEntityData(), the copy is recorded into the CALLER's own `cmd` instead of a one-shot
+  // command buffer this function opens/submits/waits on itself -- see this function's own header
+  // comment (VulkanContext.h) for why: GenerateGeometry()'s streaming-pool block batches up to
+  // kStreamingUnitCount calls into ONE shared submission instead of one blocking round-trip each.
+  // The staging buffers are therefore NOT destroyed here either -- ownership moves to
+  // `pendingStagingBuffers`; the caller destroys them only after its own shared submission's
+  // vkQueueWaitIdle confirms the GPU has actually finished reading from them. ---
   VkBufferCreateInfo stagingVertexInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
   stagingVertexInfo.size = vertexBytes;
   stagingVertexInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
@@ -3283,35 +3354,28 @@ bool VulkanContext::BakeHlodProxyIntoSlot(const world::CellPlacement &placement,
   }
   std::memcpy(stagingIndexAllocResult.pMappedData, indices.data(), static_cast<size_t>(indexBytes));
 
-  renderer::VulkanUtils::ExecuteOneShotCommands(m_Device, m_CommandPool, m_GraphicsQueue, [&](VkCommandBuffer cmd) {
-    VkBufferCopy vertexCopyRegion{};
-    vertexCopyRegion.srcOffset = 0;
-    vertexCopyRegion.dstOffset = static_cast<VkDeviceSize>(runningVertexOffset) * sizeof(renderer::Vertex);
-    vertexCopyRegion.size = vertexBytes;
-    vkCmdCopyBuffer(cmd, stagingVertexBuffer, m_VertexBuffer, 1, &vertexCopyRegion);
+  // Recorded into the caller's shared `cmd` -- NOT submitted, waited on, barriered, or cleaned up
+  // here. The caller (GenerateGeometry()'s streaming-pool block) records one shared
+  // VkMemoryBarrier2 after every unit's bake has been recorded this way (same transfer-write ->
+  // vertex/compute-shader-read visibility this function used to barrier individually -- see that
+  // block's own comment for why one barrier safely covers every copy: same hazard, same
+  // destination buffers, all ordered before it within this one command buffer), then submits once
+  // and destroys every staging buffer in `pendingStagingBuffers` only after that single
+  // vkQueueWaitIdle confirms completion.
+  VkBufferCopy vertexCopyRegion{};
+  vertexCopyRegion.srcOffset = 0;
+  vertexCopyRegion.dstOffset = static_cast<VkDeviceSize>(runningVertexOffset) * sizeof(renderer::Vertex);
+  vertexCopyRegion.size = vertexBytes;
+  vkCmdCopyBuffer(cmd, stagingVertexBuffer, m_VertexBuffer, 1, &vertexCopyRegion);
 
-    VkBufferCopy indexCopyRegion{};
-    indexCopyRegion.srcOffset = 0;
-    indexCopyRegion.dstOffset = static_cast<VkDeviceSize>(runningIndexOffset) * sizeof(uint32_t);
-    indexCopyRegion.size = indexBytes;
-    vkCmdCopyBuffer(cmd, stagingIndexBuffer, m_IndexBuffer, 1, &indexCopyRegion);
+  VkBufferCopy indexCopyRegion{};
+  indexCopyRegion.srcOffset = 0;
+  indexCopyRegion.dstOffset = static_cast<VkDeviceSize>(runningIndexOffset) * sizeof(uint32_t);
+  indexCopyRegion.size = indexBytes;
+  vkCmdCopyBuffer(cmd, stagingIndexBuffer, m_IndexBuffer, 1, &indexCopyRegion);
 
-    // Explicit transfer-write -> vertex/compute-shader-read visibility barrier -- same pattern as
-    // UploadEntityData()'s own trailing VkMemoryBarrier2.
-    VkMemoryBarrier2 memBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
-    memBarrier.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
-    memBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-    memBarrier.dstStageMask = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-    memBarrier.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
-
-    VkDependencyInfo depInfo{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
-    depInfo.memoryBarrierCount = 1;
-    depInfo.pMemoryBarriers = &memBarrier;
-    vkCmdPipelineBarrier2(cmd, &depInfo);
-  });
-
-  vmaDestroyBuffer(m_Allocator, stagingVertexBuffer, stagingVertexAlloc);
-  vmaDestroyBuffer(m_Allocator, stagingIndexBuffer, stagingIndexAlloc);
+  pendingStagingBuffers.emplace_back(stagingVertexBuffer, stagingVertexAlloc);
+  pendingStagingBuffers.emplace_back(stagingIndexBuffer, stagingIndexAlloc);
 
   runningVertexOffset += placement.hlodVertexCount;
   runningIndexOffset += placement.hlodIndexCount;
@@ -3552,53 +3616,64 @@ void VulkanContext::SetStreamingUnitState(uint32_t unit, bool active, bool useFi
 }
 
 void VulkanContext::PatchStreamingUnitEntityData(uint32_t unit) {
-  uint32_t coarseIdx = StreamingUnitCoarseSlot(unit);
-  // The 2 slots of a unit are always adjacent (see StreamingUnitCoarseSlot/StreamingUnitFineSlot),
-  // so a single 2-element staging buffer + one vkCmdCopyBuffer region covers both.
-  VkDeviceSize patchSize = sizeof(core::EntityData) * kStreamingSlotsPerUnit;
-  VkDeviceSize dstOffset = sizeof(core::EntityData) * coarseIdx;
+  // Purely CPU-side: m_InstanceRegistry[coarseIdx]/[fineIdx] were already updated in place by
+  // SetStreamingUnitState() just above this call, so all that is needed here is to remember that
+  // this unit's slice of m_EntityBuffer is now stale. FlushPendingEntityDataPatches() re-reads
+  // m_InstanceRegistry fresh (never a snapshot) once per frame, so marking the same unit dirty more
+  // than once before the next flush is harmless -- the flush only ever uploads the final, fully
+  // up-to-date state.
+  m_StreamingUnitEntityDataDirty[unit] = true;
+}
 
-  VkBufferCreateInfo stagingInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-  stagingInfo.size = patchSize;
-  stagingInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+void VulkanContext::FlushPendingEntityDataPatches(VkCommandBuffer cmd) {
+  bool anyPatched = false;
+  for (uint32_t unit = 0; unit < kStreamingUnitCount; ++unit) {
+    if (!m_StreamingUnitEntityDataDirty[unit]) {
+      continue;
+    }
+    m_StreamingUnitEntityDataDirty[unit] = false;
+    anyPatched = true;
 
-  VmaAllocationCreateInfo stagingAllocInfo{};
-  stagingAllocInfo.usage = VMA_MEMORY_USAGE_CPU_ONLY;
-  stagingAllocInfo.flags = VMA_ALLOCATION_CREATE_MAPPED_BIT;
+    uint32_t coarseIdx = StreamingUnitCoarseSlot(unit);
+    // The 2 slots of a unit are always adjacent (see StreamingUnitCoarseSlot/StreamingUnitFineSlot),
+    // so a single 32-byte vkCmdUpdateBuffer call covers both -- well under the 65536-byte inline-
+    // update size limit, and both dstOffset and patchSize are always multiples of 4 (core::EntityData
+    // is a flat 16-byte/4-uint32_t struct, see its own comment), satisfying vkCmdUpdateBuffer's
+    // alignment requirement. Data is copied into the command buffer's own storage immediately at
+    // record time -- the same well-established Vulkan semantics renderer::GpuGeometryPagePool::
+    // FinalizeBoundPage() already relies on elsewhere in this codebase (it passes the address of a
+    // local stack variable that goes out of scope right after the call returns) -- so pointing
+    // straight at the live m_InstanceRegistry storage here is safe even though it may be overwritten
+    // again before this command buffer actually executes on the GPU.
+    VkDeviceSize patchSize = sizeof(core::EntityData) * kStreamingSlotsPerUnit;
+    VkDeviceSize dstOffset = sizeof(core::EntityData) * coarseIdx;
+    vkCmdUpdateBuffer(cmd, m_EntityBuffer, dstOffset, patchSize, &m_InstanceRegistry[coarseIdx]);
+  }
 
-  VkBuffer stagingBuffer = VK_NULL_HANDLE;
-  VmaAllocation stagingAllocation = VK_NULL_HANDLE;
-  VmaAllocationInfo stagingAllocResultInfo{};
-  if (vmaCreateBuffer(m_Allocator, &stagingInfo, &stagingAllocInfo,
-                      &stagingBuffer, &stagingAllocation,
-                      &stagingAllocResultInfo) != VK_SUCCESS) {
-    LOG_ERROR("[VulkanContext] Failed to allocate streaming-slot EntityData staging buffer!");
+  if (!anyPatched) {
     return;
   }
-  std::memcpy(stagingAllocResultInfo.pMappedData, &m_InstanceRegistry[coarseIdx],
-              static_cast<size_t>(patchSize));
 
-  renderer::VulkanUtils::ExecuteOneShotCommands(m_Device, m_CommandPool, m_GraphicsQueue, [&](VkCommandBuffer cmd) {
-    VkBufferCopy copyRegion{};
-    copyRegion.srcOffset = 0;
-    copyRegion.dstOffset = dstOffset;
-    copyRegion.size = patchSize;
-    vkCmdCopyBuffer(cmd, stagingBuffer, m_EntityBuffer, 1, &copyRegion);
+  // Same transfer-write -> vertex/compute-shader-read visibility barrier PatchStreamingUnitEntityData()
+  // used to issue per-call (matching UploadEntityData()'s own dstStage/dstAccess for this same
+  // buffer) -- srcStageMask changed from TRANSFER to CLEAR since vkCmdUpdateBuffer, unlike
+  // vkCmdCopyBuffer, is classified under VK_PIPELINE_STAGE_2_CLEAR_BIT by the Vulkan spec's pipeline-
+  // stage table, exactly like renderer::GpuGeometryPagePool's own FinalizeBoundPage()/UnbindPage()
+  // page-table-entry updates (see those functions' own comments for the same CLEAR-not-TRANSFER
+  // classification). One barrier covers every patch applied by the loop above, regardless of how many
+  // units were dirty this frame (at most maxConcurrentLoads, see world::StreamingManager) -- cheaper
+  // and just as correct as one barrier per patch, since they all guard the exact same hazard (transfer
+  // write into m_EntityBuffer vs. a later vertex/compute shader read of it).
+  VkMemoryBarrier2 memBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+  memBarrier.srcStageMask = VK_PIPELINE_STAGE_2_CLEAR_BIT;
+  memBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+  memBarrier.dstStageMask = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+  memBarrier.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
 
-    // Same transfer-write -> vertex/compute-shader-read visibility barrier as UploadEntityData().
-    VkMemoryBarrier2 memBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
-    memBarrier.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
-    memBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-    memBarrier.dstStageMask = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-    memBarrier.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
-
-    VkDependencyInfo depInfo{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
-    depInfo.memoryBarrierCount = 1;
-    depInfo.pMemoryBarriers = &memBarrier;
-    vkCmdPipelineBarrier2(cmd, &depInfo);
-  });
-
-  vmaDestroyBuffer(m_Allocator, stagingBuffer, stagingAllocation);
+  VkDependencyInfo depInfo{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+  depInfo.memoryBarrierCount = 1;
+  depInfo.pMemoryBarriers = &memBarrier;
+  vkCmdPipelineBarrier2(cmd, &depInfo);
 }
 
 #ifndef NDEBUG

@@ -21,6 +21,7 @@
 #include <optional>
 #include <string_view>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 #include <string>
 
@@ -216,7 +217,11 @@ public:
     const renderer::MaterialTable& GetMaterialTable() const { return m_MaterialTable; }
 
     // --- Runtime World Partition streaming pool control (see kStreamingUnitCount's own comment).
-    // Main-thread-only (patches m_EntityBuffer via a one-shot command submission -- see .cpp). ---
+    // Main-thread-only. SetStreamingUnitState() only touches CPU-side state (m_InstanceRegistry +
+    // m_StreamingUnitTranslation) and marks the affected unit dirty; the actual m_EntityBuffer GPU
+    // patch is deferred to FlushPendingEntityDataPatches() -- see that method's own comment for why
+    // (this used to be a per-call one-shot command submission that stalled the whole graphics
+    // queue). ---
     uint32_t GetStreamingUnitCount() const { return kStreamingUnitCount; }
 
     // Activates (or deactivates) one streaming unit: `active` claims the unit for a world cell at
@@ -227,6 +232,28 @@ public:
     // command buffer recording begins (see main.cpp's own call site, right after
     // StreamingManager::Update() and before ClusterRenderPipeline::RecordFrame()).
     void SetStreamingUnitState(uint32_t unit, bool active, bool useFineVariant, const maths::vec3& worldPos, uint32_t cellID);
+
+    // Applies every m_EntityBuffer patch queued by SetStreamingUnitState() calls made earlier this
+    // frame (main.cpp's streaming tick runs before ANY command buffer exists yet -- see
+    // SetStreamingUnitState()'s own comment) via vkCmdUpdateBuffer (2-element/32-byte writes, far
+    // under the 65536-byte inline-update size limit and always 4-byte aligned, since core::EntityData
+    // is a flat 16-byte struct -- see its own comment), recorded directly into `cmd`, followed by ONE
+    // VkMemoryBarrier2 covering every patch applied this call. Replaces the old per-call staging-
+    // buffer + ExecuteOneShotCommands (vkQueueWaitIdle) pattern, which stalled the ENTIRE graphics
+    // queue -- not just this tiny copy -- on every single streaming activation/deactivation, up to
+    // maxConcurrentLoads times per frame, continuously as the camera moves through the world (see
+    // world::StreamingManager), for what is at most a 32-byte write.
+    //
+    // Must be called exactly once per frame, with `cmd` already in the recording state, at a point
+    // strictly before anything this frame reads m_EntityBuffer. main.cpp calls this immediately after
+    // cmdEarly's vkBeginCommandBuffer: cmdEarly is this frame's first GPU submission (see that call
+    // site's own comment -- "nothing before this point in the frame touches the swapchain, the
+    // transfer queue's uploads, or the async-compute queue"), and every later submission this frame
+    // (cmdMid, asyncComputeCmd, cmdLate) is already ordered after it by same-queue submission order or
+    // an explicit semaphore, so recording the patch + barrier here makes it visible to all of them
+    // without any additional wait. A no-op (records nothing, not even the barrier) on any frame where
+    // no streaming unit changed state.
+    void FlushPendingEntityDataPatches(VkCommandBuffer cmd);
 
     // Phase 5 (Streaming & Monde roadmap, Part 2, Gap 3): returns the streaming unit
     // GenerateGeometry() dedicated to `coord` at startup (real, baked HLOD proxy + fine archetype
@@ -587,6 +614,20 @@ private:
     // other memory of where a streaming slot was last placed.
     std::array<maths::vec3, kStreamingSlotCount> m_StreamingUnitTranslation{};
 
+    // Set by PatchStreamingUnitEntityData() (called from SetStreamingUnitState(), main-thread-only,
+    // before this frame's command buffer recording begins -- see that function's own comment),
+    // cleared by FlushPendingEntityDataPatches() once its queued GPU write has actually been
+    // recorded. Indexed per-UNIT (not per-slot like m_StreamingUnitTranslation above): a unit's
+    // coarse+fine EntityData slots are always patched together in one 32-byte vkCmdUpdateBuffer call,
+    // see PatchStreamingUnitEntityData()'s own comment. A plain bitset, not a std::vector of unit
+    // indices: kStreamingUnitCount is small (see its own comment), and a unit can legitimately be
+    // marked dirty more than once in one frame (e.g. a rapid activate/deactivate as the camera
+    // crosses a cell boundary) with no need to de-duplicate, since FlushPendingEntityDataPatches()
+    // always reads CURRENT m_InstanceRegistry state at flush time (never a snapshot taken at
+    // mark-time) -- coalescing multiple same-frame marks into one GPU write is therefore
+    // automatically correct.
+    std::array<bool, kStreamingUnitCount> m_StreamingUnitEntityDataDirty{};
+
     // Phase 5 (Streaming & Monde roadmap, Part 2, Gap 3): the manifest GenerateGeometry() reads once
     // at startup to bake real per-cell HLOD proxies into the streaming pool (see that function's own
     // streaming-pool block) -- kept alive as a member (not a Init()-local) only because
@@ -749,13 +790,13 @@ private:
     // for reading.
     void UploadEntityData();
 
-    // Patches exactly the 2 core::EntityData elements at [kStreamingSlotBase + unit*2, +2) into
-    // m_EntityBuffer via a small one-shot staging-buffer copy (same pattern as UploadEntityData(),
-    // just a 2-element slice instead of the whole array) -- called by SetStreamingUnitState() after
-    // updating m_InstanceRegistry in place. A rare, small, main-thread-only patch (at most
-    // maxConcurrentLoads streaming events per frame, see world::StreamingManager), so the brief
-    // synchronous stall from ExecuteOneShotCommands' vkQueueWaitIdle is an accepted tradeoff over
-    // building a batched per-frame dirty-range upload path for what is not a per-frame-hot path.
+    // Marks this unit's 2 core::EntityData slots ([kStreamingSlotBase + unit*2, +2)) dirty --
+    // called by SetStreamingUnitState() after updating m_InstanceRegistry in place. Purely CPU-side
+    // bookkeeping, no GPU work here: the actual m_EntityBuffer write happens later, batched together
+    // with every other unit dirtied this same frame, in FlushPendingEntityDataPatches(). This used to
+    // be a small one-shot staging-buffer copy + a full vkQueueWaitIdle PER CALL (stalling the entire
+    // graphics queue continuously during gameplay for a 32-byte write) -- see
+    // FlushPendingEntityDataPatches()'s own comment for the fix.
     void PatchStreamingUnitEntityData(uint32_t unit);
 
     // Phase 5 (Streaming & Monde roadmap, Part 2, Gap 3): the deterministic (bake-time AND
@@ -781,9 +822,19 @@ private:
     // blob offsets are out of range for this record, or baking would overflow the fixed-size SSBOs
     // -- defensive; should never trigger against a manifest this same build's WorldPartitionBakeTool
     // produced, but a hand-edited/stale file must never read or write out of bounds.
-    bool BakeHlodProxyIntoSlot(const world::CellPlacement& placement, uint32_t meshID,
+    //
+    // Batched-submission startup-latency fix: records its 2 vkCmdCopyBuffer calls (vertex + index)
+    // into the CALLER-owned `cmd` instead of opening its own one-shot command buffer -- this function
+    // does not itself submit, wait, record a barrier, or destroy its staging buffers. The 2 staging
+    // buffers it creates (vertex, then index) are appended to `pendingStagingBuffers` on success (kept
+    // alive until the caller's own shared submission has been waited on) and left untouched on
+    // failure (nothing was created yet at any early-return point). See GenerateGeometry()'s own
+    // streaming-pool block for why: this lets up to kStreamingUnitCount cells' worth of HLOD proxy
+    // bakes share ONE submit + ONE vkQueueWaitIdle instead of one blocking round-trip each.
+    bool BakeHlodProxyIntoSlot(VkCommandBuffer cmd, const world::CellPlacement& placement, uint32_t meshID,
                                 const maths::vec2& worldOffset,
-                                uint32_t& runningVertexOffset, uint32_t& runningIndexOffset);
+                                uint32_t& runningVertexOffset, uint32_t& runningIndexOffset,
+                                std::vector<std::pair<VkBuffer, VmaAllocation>>& pendingStagingBuffers);
 
     // Single source of truth for the feature-gallery layout (also used by
     // UpdateEntityRotations() to recover each entity's rotation pivot, and duplicated by
