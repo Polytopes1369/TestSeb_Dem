@@ -23,6 +23,8 @@
 #include "SceneIndex.h"
 #include "SpatialHashGrid.h"
 #include "RuntimeCellManifest.h"
+#include "HlodPipeline.h"
+#include "ArchetypeMeshLibrary.h"
 
 namespace {
 
@@ -121,15 +123,48 @@ int main() {
         return true;
     };
 
-    std::vector<worldpartition::RuntimeCellManifestRecord> manifest =
-        worldpartition::BuildRuntimeCellManifest(grid, fetchActor, ClassNameToArchetypeShape);
+    // Phase 5 (Streaming & Monde roadmap, Part 2, Gap 1/3): real HLOD proxy baking -- gathers each
+    // cell's (single, by this tool's own authoring convention) actor's mesh via ArchetypeMeshLibrary
+    // (the offline, zero-Vulkan-dependency CPU re-implementation of the same 4 archetype silhouettes
+    // the shipping executable's GPU compute generators bake), then simplifies it down to
+    // kHlodTriangleBudget triangles via HlodPipeline::BuildHlodForCell -- a genuinely simplified,
+    // real proxy mesh per cell, not a placeholder.
+    constexpr uint32_t kHlodTriangleBudget = 64u; // Small, coarse-viewed-from-far proxy -- see HlodLevel's own comment.
+    worldpartition::HlodLevel hlodLevel;
+    hlodLevel.levelIndex = 0;
+    hlodLevel.cellSize = kDemoWorldCellSize;
+    hlodLevel.triangleBudget = kHlodTriangleBudget;
 
-    if (!worldpartition::WriteRuntimeCellManifest(manifestPath, kDemoWorldCellSize, manifest)) {
+    worldpartition::NativeQEMSimplificationBackend hlodSimplificationBackend;
+
+    auto fetchActorMesh = [&actorsRoot](const worldpartition::Uuid& uuid, geometry::SimplifiableMesh& outMesh) -> bool {
+        worldpartition::ActorRecord record;
+        if (!worldpartition::ReadActorFile(worldpartition::MakeActorFilePath(actorsRoot, uuid), record)) return false;
+        outMesh = worldpartition::BuildArchetypeMesh(ClassNameToArchetypeShape(record.className));
+        return true;
+    };
+
+    auto fetchHlodProxy = [&](const worldpartition::SpatialHashCell& cell, geometry::SimplifiableMesh& outProxyMesh) -> bool {
+        worldpartition::HlodProxyMesh proxy = worldpartition::BuildHlodForCell(
+            cell, fetchActorMesh, hlodLevel, hlodSimplificationBackend);
+        if (proxy.mesh.triangles.empty()) return false;
+        outProxyMesh = std::move(proxy.mesh);
+        return true;
+    };
+
+    std::vector<worldpartition::RuntimeCellManifestHlodVertex> hlodVertexBlob;
+    std::vector<uint32_t> hlodIndexBlob;
+    std::vector<worldpartition::RuntimeCellManifestRecord> manifest =
+        worldpartition::BuildRuntimeCellManifest(grid, fetchActor, ClassNameToArchetypeShape,
+                                                  fetchHlodProxy, hlodVertexBlob, hlodIndexBlob);
+
+    if (!worldpartition::WriteRuntimeCellManifest(manifestPath, kDemoWorldCellSize, manifest, hlodVertexBlob, hlodIndexBlob)) {
         std::cerr << "[BakeDemoWorld] Failed to write runtime cell manifest: " << manifestPath << "\n";
         return 1;
     }
-    std::cout << "[BakeDemoWorld] Exported runtime cell manifest (" << manifest.size() << " records) to "
-              << manifestPath << "\n";
+    std::cout << "[BakeDemoWorld] Exported runtime cell manifest (" << manifest.size() << " records, "
+              << hlodVertexBlob.size() << " HLOD proxy vertices / " << (hlodIndexBlob.size() / 3)
+              << " HLOD proxy triangles total) to " << manifestPath << "\n";
     std::cout << "[BakeDemoWorld] Done. Copy/keep world_data/ next to DemoSceneVK.exe for streaming to activate.\n";
 
     return 0;

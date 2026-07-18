@@ -8,8 +8,17 @@
 #include "core/EntityData.h"
 #include "core/IDManager.h"
 #include "renderer/MaterialParameterTable.h"
+// Phase 5 (Streaming & Monde roadmap, Part 2, Gap 3): world::CellManifest/world::CellCoord --
+// VulkanContext::GenerateGeometry() reads the same offline-baked world_data/cellmanifest.bin
+// main.cpp's own world::CellManifest instance loads, to bake each authored cell's real HLOD proxy
+// into a dedicated streaming unit at startup (see kStreamingUnitCount's own comment). Both headers
+// are Vulkan-free and have zero dependency back onto renderer::, so this is a one-directional,
+// acyclic addition.
+#include "world/CellManifest.h"
 #include <array>
+#include <optional>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 #include <string>
 
@@ -147,7 +156,21 @@ public:
     // Recomputes every entity's self-rotation (tumbling on all 3 axes) from elapsed scene
     // time and re-uploads the whole EntityTransform array to the GPU. Must be called once per
     // frame, before recording the draw, so the vertex shader picks up this frame's rotation.
-    void UpdateEntityRotations(float timeSeconds);
+    //
+    // Phase 5 (Streaming & Monde roadmap, Part 1): `originOffset` is the current LWC origin cell's
+    // world-space center (world::LwcOrigin::GetCurrentOffset(), computed by main.cpp earlier this
+    // same frame, after the fly-camera movement block so this call sees this frame's fresh origin,
+    // never a stale one -- see main.cpp's own per-frame ordering comment). Subtracted from every
+    // entity's `translation` channel ONLY, not `center` -- see this method's .cpp definition for the
+    // exact worked-out reason `center` must stay untouched (it is also the rotation pivot inside
+    // struct_custo.glsl's `rotation*(restPos-center)` term, baked against the immutable, always-
+    // absolute GPU vertex buffer; rebasing it there would introduce a spurious rotation*offset error
+    // term on every rotating entity, growing with the offset's own magnitude -- exactly the kind of
+    // "close enough" approximation CLAUDE.md's zero-approximation rule forbids). `translation` is
+    // already the pure world-space-additive-after-rotation channel struct_custo.glsl's own
+    // composition comment documents, so subtracting there alone rebases the FINAL composed world
+    // position by exactly `-originOffset`, correct regardless of any entity's current rotation.
+    void UpdateEntityRotations(float timeSeconds, const maths::vec3& originOffset);
 
     // --- Accessors exposing the raw GPU handles needed by geometry::RunVirtualGeometryCacheTest
     // to read back the live procedural Vertex/Index SSBOs for the virtual geometry cache test.
@@ -188,6 +211,25 @@ public:
     // command buffer recording begins (see main.cpp's own call site, right after
     // StreamingManager::Update() and before ClusterRenderPipeline::RecordFrame()).
     void SetStreamingUnitState(uint32_t unit, bool active, bool useFineVariant, const maths::vec3& worldPos, uint32_t cellID);
+
+    // Phase 5 (Streaming & Monde roadmap, Part 2, Gap 3): returns the streaming unit
+    // GenerateGeometry() dedicated to `coord` at startup (real, baked HLOD proxy + fine archetype
+    // mesh -- see that function's own streaming-pool bake-in block), or std::nullopt if this cell
+    // has no dedicated unit (world_data/cellmanifest.bin was missing/unreadable at startup, this
+    // cell is unauthored, or the manifest's authored-cell count exceeded kStreamingUnitCount's fixed
+    // capacity). Callers (main.cpp's own streaming-activation loop) must fall back to the shared
+    // free-list pool over the remaining spare units in that case -- see
+    // GetDedicatedStreamingUnitCount()'s own comment for the exact fallback contract.
+    std::optional<uint32_t> GetDedicatedStreamingUnitForCell(const world::CellCoord& coord) const;
+
+    // Number of units GenerateGeometry() dedicated to a real authored cell at startup -- ALWAYS the
+    // contiguous range [0, GetDedicatedStreamingUnitCount()) (unit index == that cell's index in
+    // world::CellManifest::GetOrderedCells(), see that function's own bake-in loop), so a caller
+    // building its own free-list over the REMAINING spare units (main.cpp's own
+    // freeStreamingUnits) can simply start iterating at this value instead of at 0. Returns 0 if
+    // world_data/cellmanifest.bin was missing/unreadable at startup (every unit then falls back to
+    // the pre-Phase-5 shared 4-archetype rotation, exactly as before this feature).
+    uint32_t GetDedicatedStreamingUnitCount() const { return static_cast<uint32_t>(m_CellToStreamingUnit.size()); }
 
 private:
     VkInstance m_Instance = VK_NULL_HANDLE;
@@ -365,12 +407,18 @@ private:
     // (see ClusterLODCompact.comp's own boundsMin/boundsMax comment) -- live re-baking of resident
     // Nanite geometry is not a supported operation in this pipeline.
     static constexpr uint32_t kStreamingArchetypeShapeCount = 4; // Rock, Bush, Tree, Debris -- see BuildEntityData()'s archetype block.
-    // Deliberately small: 16 base + 12 streaming == 28 total entities -- comfortably under
-    // mesh_sdf_trace.glsl's/SurfaceCacheTraceContext's kMaxTracedEntities (128, config::lumen::
-    // MAX_TRACED_ENTITIES), and each streaming slot's SDF bake is cheap (small pre-baked archetype
-    // props, not the scene's large primitives). Kept small mainly to bound GPU memory/Init cost,
-    // not to dodge any known capacity limit.
-    static constexpr uint32_t kStreamingUnitCount = 6;
+    // Phase 5 (Streaming & Monde roadmap, Part 2, Gap 3): grown from 6 (a small shared-archetype
+    // rotation pool) to 50, so GenerateGeometry() can dedicate one real, individually-baked unit to
+    // every one of BakeDemoWorld.cpp's 49 authored demo-grid cells (7x7, see that tool's own
+    // kGridRadiusCells) with one spare unit left over for the shared-archetype fallback pool (see
+    // main.cpp's own freeStreamingUnits comment). Ceiling verified, not guessed: kEntityCount (16) +
+    // kStreamingUnitCount*kStreamingSlotsPerUnit must stay <= SurfaceCacheTraceContext::
+    // kMaxTracedEntities (128, mesh_sdf_trace.glsl's own compile-time array size -- exceeding it
+    // doesn't crash, GlobalSDFPass/SurfaceCacheTraceContext just silently truncate the overflow
+    // entities out of GI/SDF tracing, see that constant's own comment) -- 16 + 50*2 = 116, leaving
+    // 12 of headroom. A prior attempt at 64 units (16 + 64*2 = 144) confirmed this ceiling by
+    // exceeding it by exactly 16 entities.
+    static constexpr uint32_t kStreamingUnitCount = 50;
     static constexpr uint32_t kStreamingSlotsPerUnit = 2; // 0 = coarse (HLOD), 1 = fine (FullDetail).
     static constexpr uint32_t kStreamingSlotCount = kStreamingUnitCount * kStreamingSlotsPerUnit;
     static constexpr uint32_t kStreamingSlotBase = kEntityCount;
@@ -390,12 +438,42 @@ private:
     // comment.
     std::array<core::EntityTransformCPU, kTotalEntityCount> m_EntityTransformsCPU{};
 
-    // Per-streaming-UNIT (not per-slot: both the coarse and fine slot of a unit always share the
-    // same world position, see the pool comment above) desired world translation, set by
-    // SetStreamingUnitState() and consumed every frame by UpdateEntityRotations() -- persists
-    // across frames since UpdateEntityRotations() rebuilds the whole upload array from scratch
-    // every call and has no other memory of where a streaming unit was last placed.
-    std::array<maths::vec3, kStreamingUnitCount> m_StreamingUnitTranslation{};
+    // Phase 5 (Streaming & Monde roadmap, Part 2, Gap 3) BUG FIX: per-SLOT (not per-unit as before
+    // this fix), indexed by physical slot (StreamingUnitCoarseSlot(unit)/StreamingUnitFineSlot(unit)
+    // minus kStreamingSlotBase). struct_custo.glsl's EntityTransform composition is
+    // `worldPos = translation + center + rotation*(restPos - center)`; with center == 0 and
+    // rotation == identity for every streaming slot (see UpdateEntityRotations()'s own streaming-
+    // pool loop), this collapses to `worldPos = translation + restPos`, and restPos already bakes in
+    // this slot's own unique park offset (StreamingSlotParkPosition() -- GenerateGeometry()'s
+    // streaming block bakes every slot at its own parking position, never the origin, see that
+    // block's own header comment on why coarse/fine must never share one). A single shared
+    // per-UNIT translation set to the raw desired world position (the pre-fix behavior) therefore
+    // silently double-counted that park offset, rendering an active streaming slot ~560 units away
+    // from its intended cell -- SetStreamingUnitState() now subtracts EACH slot's own
+    // StreamingSlotParkPosition() before storing here, and coarse/fine need independent storage
+    // because their park positions differ (by kParkSpacing, see that function's own local
+    // constants) even though they represent the same unit/cell. Set by SetStreamingUnitState() and
+    // consumed every frame by UpdateEntityRotations() -- persists across frames since
+    // UpdateEntityRotations() rebuilds the whole upload array from scratch every call and has no
+    // other memory of where a streaming slot was last placed.
+    std::array<maths::vec3, kStreamingSlotCount> m_StreamingUnitTranslation{};
+
+    // Phase 5 (Streaming & Monde roadmap, Part 2, Gap 3): the manifest GenerateGeometry() reads once
+    // at startup to bake real per-cell HLOD proxies into the streaming pool (see that function's own
+    // streaming-pool block) -- kept alive as a member (not a Init()-local) only because
+    // BuildEntityData() ALSO needs it (to assign each dedicated unit's materialID/shape consistently
+    // with what GenerateGeometry() later bakes for that SAME unit) and runs before GenerateGeometry()
+    // in Init()'s own call order. Small enough to keep resident for the process's whole lifetime
+    // without concern (see world::CellManifest's own header comment on why reading it wholesale up
+    // front is fine at this demo's scale).
+    world::CellManifest m_CellManifest;
+
+    // Phase 5 (Streaming & Monde roadmap, Part 2, Gap 3): built once by GenerateGeometry()'s
+    // streaming-pool block, ALWAYS mapping to the contiguous range [0, GetDedicatedStreamingUnitCount())
+    // (unit index == that cell's index in m_CellManifest.GetOrderedCells()) -- backs
+    // GetDedicatedStreamingUnitForCell()/GetDedicatedStreamingUnitCount() above. Empty if
+    // world_data/cellmanifest.bin was missing/unreadable at startup.
+    std::unordered_map<world::CellCoord, uint32_t, world::CellCoordHash> m_CellToStreamingUnit;
 
     // Hand-authored PBR showcase materials (renderer::GenerateShowcaseMaterialTable), one slot per
     // entity -- built once by BuildEntityData(), uploaded to the GPU by ClusterResolvePass::Init()
@@ -513,6 +591,33 @@ private:
     // synchronous stall from ExecuteOneShotCommands' vkQueueWaitIdle is an accepted tradeoff over
     // building a batched per-frame dirty-range upload path for what is not a per-frame-hot path.
     void PatchStreamingUnitEntityData(uint32_t unit);
+
+    // Phase 5 (Streaming & Monde roadmap, Part 2, Gap 3): the deterministic (bake-time AND
+    // runtime-time both call this SAME function) parking position for ONE physical streaming slot,
+    // unique per slot (never per unit) so autosmooth's post-pass (GenerateGeometry()'s own
+    // AUTOSMOOTH POST-PASS block) never welds normals across two different archetype shapes baked
+    // in the same run -- see kStreamingUnitCount's own header comment on why this pool exists.
+    // Called by GenerateGeometry() (to bake each slot's mesh AT this offset) and by
+    // SetStreamingUnitState() (to CANCEL this same offset back out of the desired world position --
+    // see m_StreamingUnitTranslation's own comment for the exact bug this shared function fixes).
+    static maths::vec2 StreamingSlotParkPosition(uint32_t slotIndex);
+
+    // Phase 5 (Streaming & Monde roadmap, Part 2, Gap 3): CPU memcpy-into-staging + vkCmdCopyBuffer
+    // bake-in of one authored cell's already-simplified HLOD proxy mesh (`placement`, sliced out of
+    // m_CellManifest's own shared blob arrays) directly into the vertex/index SSBOs at
+    // [runningVertexOffset, +placement.hlodVertexCount) / [runningIndexOffset, +placement.hlodIndexCount)
+    // -- no compute shader dispatch, unlike every other GenerateXxx() primitive, because this
+    // geometry is already finalized on disk (see kStreamingUnitCount's own header comment on why
+    // live per-cell Nanite DAG builds are infeasible and proxies must instead be baked once at
+    // startup like this). Advances runningVertexOffset/runningIndexOffset by the ACTUAL proxy size
+    // (varies per cell, unlike the fixed-size archetype generators) on success. Returns false (both
+    // offsets left untouched, caller must fall back to a plain generated mesh) if the manifest's
+    // blob offsets are out of range for this record, or baking would overflow the fixed-size SSBOs
+    // -- defensive; should never trigger against a manifest this same build's WorldPartitionBakeTool
+    // produced, but a hand-edited/stale file must never read or write out of bounds.
+    bool BakeHlodProxyIntoSlot(const world::CellPlacement& placement, uint32_t meshID,
+                                const maths::vec2& worldOffset,
+                                uint32_t& runningVertexOffset, uint32_t& runningIndexOffset);
 
     // Single source of truth for the feature-gallery layout (also used by
     // UpdateEntityRotations() to recover each entity's rotation pivot, and duplicated by

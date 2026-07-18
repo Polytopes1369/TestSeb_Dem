@@ -43,11 +43,27 @@ struct Vertex {
 // pivot (its baked grid slot position, or (0,0,0) for a streaming slot baked at local origin --
 // see VulkanContext::kStreamingSlotBase); "rotation" is a pure rotation matrix with no scale.
 // "translation" is an ADDITIONAL world-space offset applied on top of the rotate-about-center
-// result -- zero for every original showcase/wall/floor/water entity (their world position is
-// fully determined by the bake-time slot + rotation pivot, exactly as before this field existed),
-// non-zero only for a streaming slot repositioned by world::WorldCellStreamingLoader at runtime
-// (see that class's own header comment for why a genuine translation channel, not just re-baked
-// vertex data, is required). Composition: worldPos = translation + center + rotation*(restPos - center).
+// result -- BEFORE Phase 5 (Streaming & Monde roadmap, Part 1) this was zero for every original
+// showcase/wall/floor/water entity and non-zero only for a streaming slot repositioned by
+// world::WorldCellStreamingLoader at runtime (see that class's own header comment for why a genuine
+// translation channel, not just re-baked vertex data, is required). Composition: worldPos =
+// translation + center + rotation*(restPos - center).
+//
+// Phase 5 (Streaming & Monde roadmap, Part 1) -- LWC camera-relative rendering: the composed
+// worldPos above is now RELATIVE TO THE CURRENT LWC ORIGIN CELL, not absolute world space.
+// VulkanContext::UpdateEntityRotations() subtracts the current world::LwcOrigin::GetCurrentOffset()
+// from "translation" every frame, for EVERY entity (never from "center" -- center also doubles as
+// the rotation pivot against the immutable, always-absolute baked "restPos" vertex data, so
+// rebasing it there would introduce a spurious rotation*offset error term on any rotating entity;
+// see UpdateEntityRotations' own .cpp comment for the full derivation). "translation" is therefore
+// never exactly zero anymore (it is "-originOffset" for every entity that used to read zero here) --
+// this struct's byte layout and the composition formula above are BOTH unchanged, only which
+// absolute-vs-relative reference frame the result lands in. The camera's own view/proj
+// (CameraPushConstants) is rebased by the exact same offset every frame (Camera::UpdateRebased), so
+// this composed worldPos and the camera's eye point always stay in the SAME small-magnitude
+// reference frame -- the entire point of camera-relative rendering: no vertex shader ever multiplies
+// a huge absolute-world-space position against a huge-translation view matrix, regardless of how far
+// the camera has actually travelled from the true (0,0,0) world origin.
 struct EntityTransform {
     mat4 rotation;
     vec3 center;

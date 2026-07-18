@@ -58,9 +58,19 @@ namespace core {
     // VulkanContext class, only on plain data/handles it exposes).
     struct EntityTransformCPU {
         maths::mat4 rotation;
+        // Rest-pose world-space rotation pivot -- Phase 5 (Streaming & Monde roadmap, Part 1) never
+        // rebases this field (see struct_custo.glsl's EntityTransform comment for why: it also
+        // doubles as the rotation pivot against the immutable, always-absolute baked vertex data).
         maths::vec3 center;
         // Additional world-space offset on top of the rotate-about-center result -- see
-        // struct_custo.glsl's EntityTransform comment. Zero for every non-streaming entity.
+        // struct_custo.glsl's EntityTransform comment. Phase 5 (Streaming & Monde roadmap, Part 1):
+        // this is now "-world::LwcOrigin::GetCurrentOffset()" for every entity (no longer literally
+        // zero for non-streaming entities), so the composed transform this struct describes is
+        // relative to the CURRENT LWC origin cell, not absolute world space -- consumers of this CPU
+        // mirror (SurfaceCacheRayTracingPass's per-frame TLAS refit, GlobalSDFPass's object-space
+        // compositing) therefore operate in the SAME per-frame rebased reference frame as the
+        // rasterized VisBuffer pipeline, matching renderer::ClusterRenderPipeline::m_FrameScratch's
+        // own single-choke-point rebased camera value -- one "world space" notion per frame.
         maths::vec3 translation{};
     };
 }

@@ -71,6 +71,22 @@ void Camera::Update(float aspectRatio) {
     m_PushConstants.proj = maths::mat4::PerspectiveVulkan(fovRadians, aspectRatio, m_Near, m_Far);
 }
 
+void Camera::UpdateRebased(float aspectRatio, const maths::vec3& originOffset) {
+    // Same LookAt/PerspectiveVulkan construction as Update() above, except the eye/target pair is
+    // built from the REBASED position (m_Position - originOffset) -- see this method's own header
+    // comment in Camera.h for why m_Position itself is never mutated (SetPosition/GetPosition stay
+    // the true absolute position for streaming distance math elsewhere).
+    maths::vec3 rebasedPosition = m_Position - originOffset;
+    maths::vec3 worldUp{ 0.0f, 1.0f, 0.0f };
+    maths::vec3 forward = GetForwardVector();
+    maths::vec3 targetDestination = rebasedPosition + forward;
+
+    m_PushConstants.view = maths::mat4::LookAt(rebasedPosition, targetDestination, worldUp);
+
+    float fovRadians = maths::ToRadians(m_FovDegrees);
+    m_PushConstants.proj = maths::mat4::PerspectiveVulkan(fovRadians, aspectRatio, m_Near, m_Far);
+}
+
 void Camera::CameraPan(maths::vec3 start, maths::vec3 end, float t) {
     t = std::clamp(t, 0.0f, 1.0f);
     m_Position = start + (end - start) * t;
