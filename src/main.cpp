@@ -100,8 +100,12 @@ struct DebugState {
     bool reflectionsEnabled = true;
     // renderer::ClusterRenderPipeline::SetDebugMegaLightsEnabled -- Phase A of the MegaLights
     // native-port roadmap: gates the RIS-weighted stochastic multi-point-light direct lighting +
-    // shadow-ray pass ([12b3] in RecordFrame), same Release-always-on convention as
-    // reflectionsEnabled above (a real live consumer from its first frame).
+    // shadow-ray pass ([12b3] in RecordFrame). Manual A/B override only -- ANDed with
+    // config::lumen::_MEGALIGHTS_ENABLE at the [12b3] call site, so this key can disable MegaLights
+    // on a tier that enables it (e.g. Extrem) but can't re-enable it on a tier that disables it
+    // (Low/Medium/High default to off -- see EngineConfig_{Low,Medium,High}.h's own
+    // MEGALIGHTS_ENABLE, and MegaLightsPass::Init's own comment for why the GPU resources needed
+    // to shade don't even exist on those tiers).
     bool megaLightsEnabled = true;
     // Set by the 'K' key, consumed (and reset) once per frame by the main loop, which calls
     // renderer::ClusterRenderPipeline::RequestDebugDAGCutGapsDump() -- see that method's own
