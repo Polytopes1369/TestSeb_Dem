@@ -1458,6 +1458,20 @@ int main(int argc, char** argv) {
             // See renderer::debug::PcgGraphEditorPanel's own header comment for full context. ---
             if (ImGui::BeginTabItem("PCG Graph Editor")) {
                 g_PcgGraphEditorPanel.Draw();
+
+                // Phase 7.2 (PCG editor-tooling roadmap): "PCG Point Cloud Debug Visualization" --
+                // draws renderer::ClusterRenderPipeline::RunPcgFullPipelineSmokeTest()'s own real
+                // sampler->filter point set as wireframe box gizmos in the live 3D scene (see
+                // renderer::debug::PcgPointCloudDebugView's own class comment). This tab only ever
+                // flips the config toggle + shows the live count -- the actual draw call is fully
+                // owned by ClusterRenderPipeline::RecordFrame, this UI never touches a raw
+                // pcg::PcgPoint itself.
+                ImGui::Separator();
+                ImGui::TextUnformatted("Point Cloud Debug Visualization (Phase 7.2)");
+                ImGui::Checkbox("Show Point Cloud Gizmos", &config::debugview::PCG_POINT_CLOUD_VIZ);
+                ImGui::TextDisabled("Points visualized: %u (from RunPcgFullPipelineSmokeTest's sampler->filter output)",
+                    clusterPipeline.GetDebugPcgPointCloudCount());
+
                 ImGui::EndTabItem();
             }
 
