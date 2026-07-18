@@ -1095,6 +1095,15 @@ void ClusterRenderPipeline::ValidateSplineBounds() const {
 void ClusterRenderPipeline::RunPhase03DynamicLumenSmokeTest(VkCommandPool commandPool, VkQueue queue) {
     LOG_INFO("[ClusterRenderPipeline] Phase 0.3 dynamic Lumen registration smoke test: starting...");
 
+    // Phase 9.2 (test-pipeline integration roadmap): reset to the "not run yet" default up front --
+    // stays at ran=false (correctly surfaced as a Skip, not a Fail, by DebugTestPipeline::RunAll())
+    // if the traced.empty() early-return just below is taken, exactly mirroring this function's own
+    // existing LOG_WARNING("...skipping...")/return convention. Overwritten with the real
+    // ran=true/passed=allOk/details result only at the very end of this function, once `allOk` is
+    // actually known. See VulkanContext::GetInstanceRegistrySmokeTestResult()'s own comment for the
+    // general rationale behind this result-capture pattern.
+    m_Phase03DynamicLumenSmokeTestResult = PcgSmokeTestResult{};
+
     // Borrow a few already-known entityIDs' baked geometry to register under FRESH synthetic
     // identities -- see GlobalSDFPass::RegisterEntity/SurfaceCachePass::RegisterEntity's own
     // comments for why a brand-new entityID is required here: every entityID this engine's current
@@ -1213,6 +1222,24 @@ void ClusterRenderPipeline::RunPhase03DynamicLumenSmokeTest(VkCommandPool comman
     } else {
         LOG_ERROR("[ClusterRenderPipeline] Phase 0.3 dynamic Lumen registration smoke test: FAILED.");
     }
+
+    // Phase 9.2 (test-pipeline integration roadmap): capture the real evidence this run already
+    // computed above (registration/cleanup counts at every stage) into `details`, mirroring the
+    // LOG_INFO summary lines already logged, so DebugTestPipeline::RunAll()'s later query has real
+    // numbers to put in test_reports/<timestamp>/report.md's `actual` field.
+    m_Phase03DynamicLumenSmokeTestResult = PcgSmokeTestResult{
+        /*ran=*/true, /*passed=*/allOk,
+        /*details=*/std::format(
+            "{} of {} test entities registered OK in both Global SDF ({} succeeded) and Surface Cache "
+            "({} succeeded). Global SDF composite entities: {} -> {} (registered) -> {} (after "
+            "unregister, baseline {}, {}). Surface Cache active cards: {} -> {} (registered) -> {} "
+            "(after unregister, baseline {}, {}).",
+            testCount, testCount, sdfRegisteredOk, cardsRegisteredOk,
+            sdfCountBefore, sdfCountAfterRegister, sdfCountAfterUnregister, sdfCountBefore,
+            sdfCleanupOk ? "OK" : "MISMATCH",
+            cardCountBefore, cardCountAfterRegister, cardCountAfterUnregister, cardCountBefore,
+            cardCleanupOk ? "OK" : "MISMATCH")
+    };
 }
 #endif
 
@@ -3400,6 +3427,16 @@ bool ClusterRenderPipeline::RunPcgInstanceDrawSmokeTest(
     const std::vector<PcgSmokeTestInstanceDesc>& instances, VkCommandPool commandPool, VkQueue queue) {
   LOG_INFO("[ClusterRenderPipeline] Running PcgInstanceDrawPass smoke test...");
 
+  // Phase 9.2 (test-pipeline integration roadmap): default to "ran, failed, generic pointer to the
+  // log" up front -- every early `return false` below leaves this default in place, overwritten
+  // with the real PASSED details only right before the final `return true`. See
+  // VulkanContext::GetInstanceRegistrySmokeTestResult()'s own comment for the full rationale.
+  m_PcgInstanceDrawSmokeTestResult = PcgSmokeTestResult{
+      /*ran=*/true, /*passed=*/false,
+      /*details=*/"FAILED -- see demo_log.txt for the specific '[ClusterRenderPipeline] "
+                  "PcgInstanceDrawPass smoke test FAILED: ...' line logged during this run."
+  };
+
   if (instances.empty()) {
     LOG_ERROR("[ClusterRenderPipeline] PcgInstanceDrawPass smoke test FAILED: no instances supplied.");
     return false;
@@ -3662,16 +3699,30 @@ bool ClusterRenderPipeline::RunPcgInstanceDrawSmokeTest(
     return false;
   }
 
-  LOG_INFO(std::format(
+  std::string passMsg = std::format(
       "[ClusterRenderPipeline] PcgInstanceDrawPass smoke test PASSED: {} instance(s), {} candidate "
       "cluster(s), GPU draw count={}, non-background pixel(s) found in the {}x{} offscreen render.",
-      instances.size(), candidateCount, gpuDrawCount, kTestWidth, kTestHeight));
+      instances.size(), candidateCount, gpuDrawCount, kTestWidth, kTestHeight);
+  LOG_INFO(passMsg);
+  m_PcgInstanceDrawSmokeTestResult.passed = true;
+  m_PcgInstanceDrawSmokeTestResult.details = std::move(passMsg);
   return true;
 }
 
 bool ClusterRenderPipeline::RunPcgFullPipelineSmokeTest(
     const std::vector<PcgFullPipelineSmokeTestMeshDesc>& weightedMeshes, VkCommandPool commandPool, VkQueue queue) {
   LOG_INFO("[ClusterRenderPipeline] Running PCG full-pipeline (sampler->filter->spawner->glue->draw) smoke test...");
+
+  // Phase 9.2 (test-pipeline integration roadmap): default to "ran, failed, generic pointer to the
+  // log" up front -- every early `return false` below (at ANY of the 5 pipeline stages: sampler,
+  // filter, spawner, glue, render) leaves this default in place, overwritten with the real PASSED
+  // details only right before the final `return true`. See
+  // VulkanContext::GetInstanceRegistrySmokeTestResult()'s own comment for the full rationale.
+  m_PcgFullPipelineSmokeTestResult = PcgSmokeTestResult{
+      /*ran=*/true, /*passed=*/false,
+      /*details=*/"FAILED -- see demo_log.txt for the specific '[ClusterRenderPipeline] PCG "
+                  "full-pipeline smoke test FAILED: ...' line logged during this run."
+  };
 
   if (weightedMeshes.empty()) {
     LOG_ERROR("[ClusterRenderPipeline] PCG full-pipeline smoke test FAILED: no weighted meshes supplied.");
@@ -4015,13 +4066,16 @@ bool ClusterRenderPipeline::RunPcgFullPipelineSmokeTest(
     return false;
   }
 
-  LOG_INFO(std::format(
+  std::string passMsg = std::format(
       "[ClusterRenderPipeline] PCG full-pipeline smoke test PASSED: sampler={} point(s), filter kept {}, "
       "spawner produced {} request(s), glue acquired {} instance(s), {} candidate cluster(s), GPU draw "
       "count={}, non-background pixel(s) found in the {}x{} offscreen render. Full sampler->filter->"
       "spawner->glue->render PCG pipeline verified end-to-end.",
       sampledPoints.size(), filteredPoints.size(), spawnRequests.size(), acquiredSlots.size(),
-      candidateCount, gpuDrawCount, kTestWidth, kTestHeight));
+      candidateCount, gpuDrawCount, kTestWidth, kTestHeight);
+  LOG_INFO(passMsg);
+  m_PcgFullPipelineSmokeTestResult.passed = true;
+  m_PcgFullPipelineSmokeTestResult.details = std::move(passMsg);
   return true;
 }
 #endif

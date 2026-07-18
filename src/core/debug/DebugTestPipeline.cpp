@@ -36,6 +36,29 @@
 //      moving camera neither crashes nor leaves the engine uninitialized, then Shutdown() tears
 //      down cleanly. Does NOT (cannot, headless) verify audio is actually audible/correctly
 //      panned -- see this feature's own delivery notes for how that was verified instead.
+//
+// Phase 9.2 (PCG roadmap, test-pipeline integration) additionally surfaces 4 pre-existing PCG smoke
+// tests (Phases 0.1/0.2/0.3/4.2 of the UE5.8-parity PCG roadmap) that already ran once,
+// unconditionally, at VulkanContext::Init()/ClusterRenderPipeline::Init() time -- well before this
+// function is ever reached -- but previously only ever logged PASS/FAIL via LOG_INFO/LOG_ERROR, with
+// no queryable result and no report entry. Rather than re-running GPU/CPU work that already happened
+// (tests 13/14/16 are one-shot offscreen renders with no live state left to re-exercise; test 15's
+// own registration probe already unregistered everything it added), each smoke test function gained
+// a small Debug-only `..SmokeTestResult { bool ran; bool passed; std::string details; }` member +
+// getter (VulkanContext::GetInstanceRegistrySmokeTestResult(),
+// ClusterRenderPipeline::GetPcgInstanceDrawSmokeTestResult()/GetPcgFullPipelineSmokeTestResult()/
+// GetPhase03DynamicLumenSmokeTestResult()) that its own existing Init()-time call site populates
+// unmodified in control flow -- this design was chosen over moving the calls themselves into RunAll()
+// because their real test content (specific streaming-archetype meshIDs, m_DebugIndexEntriesCopy/
+// m_DebugDagEntriesCopy cache tables, m_GlobalSDF/m_SurfaceCache's Init()-time-fixed roster) is only
+// resolved/valid at those exact existing call sites, and Phase 0.3's own smoke test runs from deep
+// inside ClusterRenderPipeline::Init() itself (ordering-dependent on internal state), not from
+// main.cpp, making a move far riskier than a few generically-additive getters. Tests 13/14/16 below
+// query their result and convert it straight into a FeatureTestResult; test 15 is genuinely
+// Skip-able (not just Fail-able) if GlobalSDFPass::GetTracedEntityInfos() had nothing to borrow from
+// at Init() time. A would-be 5th entry (Phase 6.3, a runtime generator hook into live World Partition
+// cell streaming) was checked for and NOT present in this worktree's merged history -- skipped
+// entirely, not stubbed, per this task's own scope.
 #ifndef NDEBUG
 
 #include "core/debug/DebugTestPipeline.h"
@@ -715,6 +738,146 @@ namespace debugpipeline {
                     "Confirms real-time streaming synthesis code paths execute without crashing across "
                     "many frames/camera positions; does not (cannot, headless) verify audible "
                     "correctness -- see this test's own header comment."
+                };
+            });
+
+        // === 13. PCG Phase 0.1: core::InstanceRegistry Acquire/Release smoke test =============
+        // Ground-truth smoke test itself already ran once, unconditionally, in main.cpp right after
+        // VulkanContext::Init() returned -- long before this RunAll() call is ever reached (see
+        // main.cpp's own call ordering). This block does not re-run it (it is a pure CPU-only
+        // registry bookkeeping check with no live GPU state left to re-exercise); it only surfaces
+        // that already-completed run's result as a proper report entry instead of a log-only
+        // PASS/FAIL line -- see the top of this file's own Phase 9.2 design note for why (Debug-only
+        // result-storage getter added to VulkanContext, existing Init()-time call site untouched).
+        runTest("PCG Phase 0.1: core::InstanceRegistry Acquire/Release", "src/renderer/vulkan/VulkanContext.cpp",
+            [&]() -> TestOutcome {
+                const VulkanContext::InstanceRegistrySmokeTestResult& result = vkContext.GetInstanceRegistrySmokeTestResult();
+                if (!result.ran) {
+                    return TestOutcome{
+                        TestStatus::Skip, 0,
+                        "VulkanContext::RunInstanceRegistrySmokeTest() (called once from main.cpp right "
+                        "after VulkanContext::Init() returns) has already run and recorded a result by "
+                        "the time this pipeline starts.",
+                        "GetInstanceRegistrySmokeTestResult().ran == false -- the smoke test's call site "
+                        "in main.cpp was never reached (unexpected in a normal --test-pipeline run).",
+                        "This entry surfaces an Init()-time smoke test's already-completed result; it is "
+                        "not re-run here."
+                    };
+                }
+                return TestOutcome{
+                    result.passed ? TestStatus::Pass : TestStatus::Fail, 0,
+                    "core::InstanceRegistry's AcquireSlot()/ReleaseSlot() LIFO free-list bookkeeping (3 "
+                    "probe slots acquired/released in Debug-only registry headroom) never aliases a live "
+                    "showcase/streaming entity, and leaves the live count/high-water mark exactly restored "
+                    "afterward -- see VulkanContext::RunInstanceRegistrySmokeTest's own comment for the "
+                    "full check sequence.",
+                    result.details,
+                    "Ran once at startup (main.cpp, right after VulkanContext::Init()), not re-run inside "
+                    "this pipeline -- see this test's own sourceFile for the real check sequence."
+                };
+            });
+
+        // === 14. PCG Phase 0.2: PcgInstanceDrawPass GPU-driven instanced draw path =============
+        runTest("PCG Phase 0.2: PcgInstanceDrawPass Instance Draw",
+            "src/renderer/passes/PcgInstanceDrawPass.h, src/renderer/ClusterRenderPipeline.cpp",
+            [&]() -> TestOutcome {
+                const renderer::ClusterRenderPipeline::PcgSmokeTestResult& result = clusterPipeline.GetPcgInstanceDrawSmokeTestResult();
+                if (!result.ran) {
+                    return TestOutcome{
+                        TestStatus::Skip, 0,
+                        "ClusterRenderPipeline::RunPcgInstanceDrawSmokeTest() (called once from main.cpp "
+                        "right after this pipeline's own Init() returns) has already run and recorded a "
+                        "result by the time this pipeline starts.",
+                        "GetPcgInstanceDrawSmokeTestResult().ran == false -- the smoke test's call site in "
+                        "main.cpp was never reached (unexpected in a normal --test-pipeline run).",
+                        "This entry surfaces an Init()-time smoke test's already-completed result; it is "
+                        "not re-run here."
+                    };
+                }
+                return TestOutcome{
+                    result.passed ? TestStatus::Pass : TestStatus::Fail, 0,
+                    "3 test instances (Rock/Bush/Tree fine-variant streaming archetypes) acquired into a "
+                    "throwaway PcgInstanceDrawPass render with a GPU-computed draw count "
+                    "(ClusterCullingPass's own atomic counter) > 0, and the offscreen render contains at "
+                    "least one non-background pixel -- proves real Nanite cluster geometry actually "
+                    "rasterizes through this draw path end-to-end, not just a compile/link check.",
+                    result.details,
+                    "Ran once at startup (main.cpp, right after ClusterRenderPipeline::Init()), against a "
+                    "self-contained offscreen 256x256 render target -- never touches the live scene "
+                    "attachment or RecordFrame*() sequence. Not re-run inside this pipeline."
+                };
+            });
+
+        // === 15. PCG Phase 0.3: dynamic Lumen registration (Global SDF + Surface Cache) ========
+        runTest("PCG Phase 0.3: Dynamic Lumen Registration (Global SDF + Surface Cache)",
+            "src/renderer/ClusterRenderPipeline.cpp",
+            [&]() -> TestOutcome {
+                const renderer::ClusterRenderPipeline::PcgSmokeTestResult& result = clusterPipeline.GetPhase03DynamicLumenSmokeTestResult();
+                if (!result.ran) {
+                    return TestOutcome{
+                        TestStatus::Skip, 0,
+                        "ClusterRenderPipeline::RunPhase03DynamicLumenSmokeTest() (called once at the very "
+                        "end of this pipeline's own Init(), after m_GlobalSDF/m_SurfaceCache's fixed "
+                        "Init()-time roster is fully built) has already run and recorded a result by the "
+                        "time this pipeline starts.",
+                        "GetPhase03DynamicLumenSmokeTestResult().ran == false -- either the smoke test's "
+                        "call site inside Init() was never reached, or (its own graceful-degradation path) "
+                        "GlobalSDFPass::GetTracedEntityInfos() returned empty (nothing loaded to borrow "
+                        "Fallback Mesh geometry from) -- see that method's own LOG_WARNING for which.",
+                        "A false `ran` here is gracefully Skipped, not Failed, matching this codebase's "
+                        "\"streaming is additive, not load-bearing\" convention for an unmet precondition."
+                    };
+                }
+                return TestOutcome{
+                    result.passed ? TestStatus::Pass : TestStatus::Fail, 0,
+                    "3 synthetic-entityID test entities register successfully into BOTH GlobalSDFPass "
+                    "(RegisterEntity) and SurfaceCachePass (RegisterEntity), a real Global SDF composite "
+                    "dispatch runs against the new entries, then every entity is unregistered and every "
+                    "composite-entity/active-card count returns exactly to its pre-test baseline -- proves "
+                    "dynamic (runtime, not Init()-time-fixed) Lumen registration works end-to-end.",
+                    result.details,
+                    "Ran once at startup (end of ClusterRenderPipeline::Init()), reusing already-baked "
+                    "Fallback Mesh geometry borrowed from a few already-resident entityIDs under fresh "
+                    "synthetic identities. Not re-run inside this pipeline."
+                };
+            });
+
+        // === 16. PCG Phase 4.2: full pipeline capstone (Sampler -> Filter -> Spawner -> Render) =
+        runTest("PCG Phase 4.2: Full Pipeline (Sampler->Filter->Spawner->Render)",
+            "src/renderer/ClusterRenderPipeline.cpp, src/pcg/PcgVolumeSampler.h, src/pcg/PcgSelfPruningFilter.h, src/pcg/PcgMeshSpawner.h",
+            [&]() -> TestOutcome {
+                const renderer::ClusterRenderPipeline::PcgSmokeTestResult& result = clusterPipeline.GetPcgFullPipelineSmokeTestResult();
+                if (!result.ran) {
+                    return TestOutcome{
+                        TestStatus::Skip, 0,
+                        "ClusterRenderPipeline::RunPcgFullPipelineSmokeTest() (called once from main.cpp "
+                        "right after RunPcgInstanceDrawSmokeTest(), reusing the same 3 streaming archetype "
+                        "meshes as a weighted palette) has already run and recorded a result by the time "
+                        "this pipeline starts.",
+                        "GetPcgFullPipelineSmokeTestResult().ran == false -- the smoke test's call site in "
+                        "main.cpp was never reached (unexpected in a normal --test-pipeline run).",
+                        "This entry surfaces an Init()-time smoke test's already-completed result; it is "
+                        "not re-run here."
+                    };
+                }
+                return TestOutcome{
+                    result.passed ? TestStatus::Pass : TestStatus::Fail, 0,
+                    "The full sampler (pcg::SampleVolume, grid mode) -> filter (pcg::PruneByDistance) -> "
+                    "spawner (pcg::SpawnFromPoints) -> glue (pcg::PcgInstanceSpawnManager) -> render chain "
+                    "produces a non-zero point count at every stage, a GPU-computed draw count > 0, and at "
+                    "least one non-background pixel in the offscreen render -- proves every PCG phase from "
+                    "0 through 4 composes end-to-end, not just each phase in isolation.",
+                    result.details,
+                    "Ran once at startup (main.cpp, right after ClusterRenderPipeline::Init()), against its "
+                    "own self-contained offscreen 256x256 render target. This same run's filtered point set "
+                    "is what main.cpp's \"PCG Graph Editor\" tab visualizes via "
+                    "GetDebugPcgPointCloudCount()/PCG_POINT_CLOUD_VIZ. Not re-run inside this pipeline. "
+                    "NOTE: Phase 6.3 (runtime PCG generator hook into live World Partition cell streaming) "
+                    "has no smoke test of its own to surface here -- that class/subtask was not present in "
+                    "this worktree's merged history at the time Phase 9.2 landed (checked via `git log "
+                    "main --oneline | grep -i pcg` and a source-tree search for PcgCellLoader-shaped "
+                    "names); out of scope for this task per its own instructions, add a 17th entry here "
+                    "once that subtask lands."
                 };
             });
 
