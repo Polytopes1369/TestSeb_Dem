@@ -228,6 +228,16 @@ target_include_directories(PcgDataModelTests PRIVATE src ${Vulkan_INCLUDE_DIRS})
 add_test(NAME PcgDataModelTests COMMAND PcgDataModelTests)
 add_test(NAME BlockCodecTests COMMAND BlockCodecTests)
 
+# PCG framework roadmap, Phase 2.4 ("Spline Sampler"): unlike Phase 1's header-only data model,
+# PcgSplineSampler.h has a real accompanying PcgSplineSampler.cpp (the arc-length lookup table
+# build/resolve + the sampler itself), so this test target links that source file too.
+add_executable(PcgSplineSamplerTests
+    src/pcg/PcgSplineSampler.cpp
+    tests/PcgSplineSamplerTests.cpp
+)
+target_include_directories(PcgSplineSamplerTests PRIVATE src ${Vulkan_INCLUDE_DIRS})
+add_test(NAME PcgSplineSamplerTests COMMAND PcgSplineSamplerTests)
+
 add_executable(AsyncDecompressingLoaderTests
     src/io/AsyncFileStreamer.cpp
     src/io/BlockCodec.cpp
