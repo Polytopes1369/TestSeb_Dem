@@ -2407,14 +2407,24 @@ void ClusterRenderPipeline::RecordFrameMid(VkCommandBuffer cmdMid, VkCommandBuff
 #ifndef NDEBUG
   if (cameraCopy.debugViewMode == DEBUG_VIEW_NORMAL) {
     m_ShadingBin.RecordClassifyAndSort(cmdMid, m_RenderExtent);
-    m_Resolve.RecordResolveBinned(cmdMid, viewProj, m_SceneLights.sun, cameraPositionWorld, surfaceWetness, snowCoverage, m_ShadingBin);
+    // Glint / sparkle (UE5.8 rendering-parity gap G5): Debug-only tuning multipliers (see the
+    // SetDebugGlint* setters) -- 1.0 in Release, so the material's authored sparkle renders unchanged.
+    m_Resolve.RecordResolveBinned(cmdMid, viewProj, m_SceneLights.sun, cameraPositionWorld, surfaceWetness, snowCoverage,
+        m_DebugGlintDensityScale, m_DebugGlintIntensityScale, m_ShadingBin);
   } else {
     maths::mat4 prevViewProjForResolve = m_HasPrevViewProj ? m_PrevViewProj : viewProj;
-    m_Resolve.RecordResolve(cmdMid, viewProj, prevViewProjForResolve, m_SceneLights.sun, cameraPositionWorld, surfaceWetness, snowCoverage, cameraCopy.debugViewMode);
+    m_Resolve.RecordResolve(cmdMid, viewProj, prevViewProjForResolve, m_SceneLights.sun, cameraPositionWorld, surfaceWetness, snowCoverage,
+        m_DebugGlintDensityScale, m_DebugGlintIntensityScale, cameraCopy.debugViewMode);
   }
 #else
   m_ShadingBin.RecordClassifyAndSort(cmdMid, m_RenderExtent);
-  m_Resolve.RecordResolveBinned(cmdMid, viewProj, m_SceneLights.sun, cameraPositionWorld, surfaceWetness, snowCoverage, m_ShadingBin);
+  // Glint / sparkle (UE5.8 rendering-parity gap G5): the m_DebugGlint* tuning members are Debug-only
+  // (#ifndef NDEBUG, see ClusterRenderPipeline.h), so Release passes literal 1.0/1.0 -- the material's
+  // authored glintDensity/glintIntensity renders unmodified (same Debug-only-scale/Release-literal-1.0
+  // pattern the SSS radius scale uses, see this file's own m_DebugSSSRadiusScale usage). No debug
+  // symbols/strings survive into the Release binary, per CLAUDE.md's build-separation rule.
+  m_Resolve.RecordResolveBinned(cmdMid, viewProj, m_SceneLights.sun, cameraPositionWorld, surfaceWetness, snowCoverage,
+      1.0f, 1.0f, m_ShadingBin);
 #endif
 }
 
