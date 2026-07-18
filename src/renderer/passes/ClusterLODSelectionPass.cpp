@@ -757,10 +757,33 @@ namespace renderer {
         // three off) -- this checks whether the DAG DATA ITSELF already contains out-of-place
         // positions for the floor, which would point at cache-build/simplification corruption
         // rather than a runtime rendering/streaming bug.
-        constexpr uint32_t kFloorEntityID = 12;
+        // kFloorY/kYTolerance below predate Phase 7b (UE5.8 parity roadmap): a genuinely undulating
+        // 300x300m procedural terrain heightfield (VulkanContext.cpp's GenerateTerrain call,
+        // terrain_noise.glsl's SampleTerrainHeight) now occupies this same entity slot/footprint,
+        // replacing the literal flat plane this check was originally written against -- see that
+        // call site's own comment. kYTolerance is widened from the original flat-plane 0.05 to
+        // generously cover both real height contributors: ambient terrain noise (kTerrainAmplitude,
+        // terrain_noise.glsl, +/-0.4) and the river spline's authored control-point heights
+        // (river_spline.glsl's kRiverControlHeight, -1.05 to 2.2) under either an absolute-world-Y
+        // or base-relative reading of those control points -- comfortably wider than the true
+        // combined range so this check still catches genuine corruption (e.g. NaN or a
+        // wildly-wrong position), just not legitimate terrain/river undulation.
+        // kFloorEntityID below was hardcoded to 12 when this scan was first written (2026-07-16,
+        // when the scene had exactly 13 entities: the 12 showcase primitives at 0-11, floor at 12).
+        // It was NEVER updated when VulkanContext.h's kTreeEntityIndexBase claimed index 12 for the
+        // first of kTreeEntityCount (8) tree bark/leaves entities (Phase: procedural trees), pushing
+        // the real floor down to VulkanContext::kFloorEntityIndex (== kEntityCount - 2, where
+        // kEntityCount == 17 + kTreeVisualCount*2 == 25 today, i.e. 23) -- this scan had silently
+        // been checking the first tree's bark entity instead of the floor/terrain ever since trees
+        // were added, which happened to still mostly "pass" only because a tree trunk's base also
+        // sits near Y=0/small-radius, masking the mismatch. Recomputed here to match
+        // VulkanContext::kFloorEntityIndex's own formula; if kTreeVisualCount or the base-17 entity
+        // count ever changes again, update both sides together (no shared header exports this
+        // constant across the two translation units today).
+        constexpr uint32_t kFloorEntityID = 23;
         constexpr float kFloorY = -0.8f;
         constexpr float kFloorHalfExtent = 150.0f;
-        constexpr float kYTolerance = 0.05f;
+        constexpr float kYTolerance = 4.0f;
         constexpr float kXZTolerance = 1.0f; // A cluster's own sphereRadius can push its center slightly past the exact edge.
 
         uint32_t floorNodesChecked = 0;
@@ -788,40 +811,48 @@ namespace renderer {
 
         if (floorOutliers > 0) {
             LOG_WARNING(std::format(
-                "[ClusterLODSelectionPass][DebugFloorPositionScan] {}/{} floor DAG nodes have a sphereCenter outside the expected flat Y={:.1f} / [-{:.0f},{:.0f}] XZ footprint -- the cache-build data itself is corrupt for these, not just a runtime culling/streaming symptom. Examples:\n{}",
-                floorOutliers, floorNodesChecked, kFloorY, kFloorHalfExtent, kFloorHalfExtent, outlierExamples));
+                "[ClusterLODSelectionPass][DebugFloorPositionScan] {}/{} floor/terrain DAG nodes have a sphereCenter outside the expected undulating-terrain envelope (Y={:.1f}+/-{:.1f} / [-{:.0f},{:.0f}] XZ footprint) -- the cache-build data itself is corrupt for these, not just a runtime culling/streaming symptom. Examples:\n{}",
+                floorOutliers, floorNodesChecked, kFloorY, kYTolerance, kFloorHalfExtent, kFloorHalfExtent, outlierExamples));
         } else {
             LOG_INFO(std::format(
-                "[ClusterLODSelectionPass][DebugFloorPositionScan] Checked {} floor DAG nodes: all sphereCenters are within the expected flat Y={:.1f} / [-{:.0f},{:.0f}] XZ footprint. Floor cache data is NOT corrupt -- the floating fragments must come from elsewhere (rendering/decode/vis-buffer, not the DAG itself).",
-                floorNodesChecked, kFloorY, kFloorHalfExtent, kFloorHalfExtent));
+                "[ClusterLODSelectionPass][DebugFloorPositionScan] Checked {} floor/terrain DAG nodes: all sphereCenters are within the expected undulating-terrain envelope (Y={:.1f}+/-{:.1f} / [-{:.0f},{:.0f}] XZ footprint). Floor/terrain cache data is NOT corrupt.",
+                floorNodesChecked, kFloorY, kYTolerance, kFloorHalfExtent, kFloorHalfExtent));
         }
 
         // ---------------------------------------------------------------------------------------
         // Same sanity idea for the 12 non-floor (sculpted, grid-arranged) SHOWCASE primitives only
-        // (entityID < kFloorEntityID, i.e. 0-11): each entity's whole grid slot + own half-extent
-        // puts every one of its clusters, at every DAG level, well within a generous +/-10m box on
-        // X/Z and +/-3m on Y (see VulkanContext::GridSlot's 3m spacing / 3-wide grid and each
-        // primitive's own ~1-2m size). A node outside that would mean THAT entity's own cache data
-        // is corrupt -- independent of the floor investigation above, e.g. relevant to the box
-        // primitive's own persistent crack.
+        // (entityID < kShowcasePrimitiveCount, i.e. 0-11): each entity's whole grid slot + own
+        // half-extent puts every one of its clusters, at every DAG level, well within a generous
+        // +/-10m box on X/Z and +/-3m on Y (see VulkanContext::GridSlot's 3m spacing / 3-wide grid
+        // and each primitive's own ~1-2m size). A node outside that would mean THAT entity's own
+        // cache data is corrupt -- independent of the floor investigation above, e.g. relevant to
+        // the box primitive's own persistent crack.
         //
-        // entityID > kFloorEntityID (PCG-scattered trees/vegetation/rocks, world::PcgCellLoader /
-        // pcg::GeneratePcgContentForCell) is deliberately OUT of scope here: those clusters' own
-        // sphereCenter is legitimately baked at their real, spread-out world-space position (e.g.
-        // a tree planted 400 units from the origin), not relative to a shared local origin the way
-        // the 12 tightly grid-arranged showcase primitives are -- confirmed by inspecting real
-        // flagged samples, which were tiny-radius (~0.3-0.7) leaf/twig clusters sitting at
-        // Y~=0 (ground level, well inside the Y bound) with only X/Z far outside it, consistent
-        // with an ordinary planted tree and not corrupt data. Checking them against this box was
-        // always a scope bug, not a real corruption signal.
+        // Deliberately its OWN constant, not kFloorEntityID: the two boundaries are unrelated facts
+        // that happened to share the value 12 by coincidence before kFloorEntityID's bug (above) was
+        // fixed -- entityID 12 is now correctly understood to be the first tree entity, not the
+        // floor, so reusing kFloorEntityID here would silently let entities 12-22 (trees, and
+        // whatever occupies 20-22) leak into this tight showcase-grid box.
+        //
+        // entityID >= kShowcasePrimitiveCount (PCG-scattered trees/vegetation/rocks,
+        // world::PcgCellLoader / pcg::GeneratePcgContentForCell, plus the 8 hand-placed tree
+        // entities and the wall/floor/water block) is deliberately OUT of scope here: those
+        // clusters' own sphereCenter is legitimately baked at their real, spread-out world-space
+        // position (e.g. a tree planted 400 units from the origin), not relative to a shared local
+        // origin the way the 12 tightly grid-arranged showcase primitives are -- confirmed by
+        // inspecting real flagged samples, which were tiny-radius (~0.3-0.7) leaf/twig clusters
+        // sitting at Y~=0 (ground level, well inside the Y bound) with only X/Z far outside it,
+        // consistent with an ordinary planted tree and not corrupt data. Checking them against this
+        // box was always a scope bug, not a real corruption signal.
         // ---------------------------------------------------------------------------------------
+        constexpr uint32_t kShowcasePrimitiveCount = 12;
         constexpr float kPrimitiveXZBound = 10.0f;
         constexpr float kPrimitiveYBound = 3.0f;
         std::unordered_map<uint32_t, uint32_t> primitiveOutlierCountByEntity;
         std::unordered_map<uint32_t, std::string> primitiveOutlierExamplesByEntity;
         for (uint32_t i = 0; i < m_TotalNodeCount; ++i) {
             const DAGNodePayload& node = m_DebugDagNodesCopy[i];
-            if (node.entityID >= kFloorEntityID) {
+            if (node.entityID >= kShowcasePrimitiveCount) {
                 continue;
             }
             bool outOfBounds = std::abs(node.sphereCenter.x) > kPrimitiveXZBound
