@@ -92,6 +92,12 @@ layout(location = 1) in vec2 inUV;
 layout(location = 2) in vec4 inColor;
 layout(location = 3) in float inNormalizedAge;
 layout(location = 4) flat in uint inKind; // kParticleKindEmber/Rain/Snow (ParticleCommon.glsl) -- see this file's own shapeMask comment below.
+// Niagara-parity roadmap, subtask B3 (procedural sub-variation) -- see ParticleRender.vert's own
+// comment on why these are per-particle constants (outSubVariationStrength is already forced to 0.0
+// there for anything other than a kKindEmber particle, so this shader does not need to re-check
+// inKind before using it).
+layout(location = 5) flat in uint inSubVariationSeed;
+layout(location = 6) in float inSubVariationStrength;
 
 layout(location = 0) out vec4 outColor;
 // renderer::TransparentForwardPass's own shared heat-distortion target -- see this file's own
@@ -114,7 +120,29 @@ void main() {
         // Embers and snow: the original plain analytic soft-circle mask (this project has zero on-disk
         // texture assets, see this file's own header comment) -- snow reuses it unmodified, a soft
         // round flake needs no kind-specific change here.
-        shapeMask = smoothstep(1.0, 0.0, length(centered));
+        //
+        // Niagara-parity roadmap, subtask B3 (procedural sub-variation): when inSubVariationStrength
+        // > 0 (embers only -- see ParticleRender.vert's own comment, snow/rain always get exactly
+        // 0.0 here), perturbs the circle's own radius by an angle-dependent wobble derived from this
+        // particle's own random seed, so a sprite emitter renders a population of subtly irregular
+        // blob shapes instead of every particle being a visually IDENTICAL perfect circle -- the
+        // closest procedural equivalent of "a texture atlas with several sprite variants" this
+        // project's zero-on-disk-texture-assets constraint allows (see this file's own header
+        // comment). `lobes`/`phase` are derived from disjoint bit ranges of the same seed so they
+        // vary independently from each other and from `p.rotation` (already used for the quad's own
+        // spin, ParticleRender.vert) without needing an extra dedicated seed field. At
+        // inSubVariationStrength == 0.0 (this roadmap step's own default, see EmitterParams::
+        // subVariationStrength's own declaration comment), radiusScale is identically 1.0 for every
+        // angle and this reduces exactly to the original unmodified soft-circle mask above --
+        // pixel-identical to every emitter's pre-B3 look unless explicitly opted in.
+        float angle = atan(centered.y, centered.x);
+        float lobes = 3.0 + float(inSubVariationSeed % 4u); // 3..6 lobes, stable per particle.
+        float phase = float((inSubVariationSeed >> 8u) & 0xFFu) * (6.28318530718 / 256.0);
+        // Capped well below 1.0 so even at maximum authored strength the silhouette stays a
+        // recognizably round, still fully-closed blob rather than growing self-intersecting spikes.
+        float amplitude = inSubVariationStrength * 0.35;
+        float radiusScale = 1.0 + amplitude * sin(lobes * angle + phase);
+        shapeMask = smoothstep(1.0, 0.0, length(centered) / max(radiusScale, 0.2));
     }
     if (shapeMask <= 0.0) {
         discard; // Outside the sprite's soft shape -- skip the (otherwise wasted) work below.
