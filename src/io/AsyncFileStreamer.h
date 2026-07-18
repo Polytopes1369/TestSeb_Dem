@@ -64,6 +64,9 @@ namespace geometry {
         // Stops the worker threads and closes the file/completion port. Any request submitted
         // before this call but not yet completed will still have its callback invoked (from a
         // worker thread) before the threads are joined -- Close() does not abandon in-flight I/O.
+        // Implemented by calling WaitForAllPending() before any worker is told to exit (see the
+        // .cpp): callers do not need to call WaitForAllPending() themselves first, Close() already
+        // guarantees the drain.
         void Close();
 
         bool IsOpen() const { return m_FileHandle != INVALID_HANDLE_VALUE; }
@@ -80,7 +83,10 @@ namespace geometry {
         // Blocks the calling thread until every request submitted so far has had its callback
         // invoked. Safe to call even while other threads (e.g. a completion callback) are still
         // submitting further reads -- it only observes the pending count, so as long as callbacks
-        // eventually stop re-submitting, this returns once the queue truly drains.
+        // eventually stop re-submitting, this returns once the queue truly drains. Also usable
+        // directly by a caller that wants an explicit drain point before doing its own cleanup
+        // (e.g. a benchmark/test driving SubmitRead in a tight loop) -- Close() itself calls this
+        // internally, so most production callers never need to call it themselves.
         void WaitForAllPending();
 
         uint32_t PendingRequestCount() const { return m_PendingRequests.load(std::memory_order_acquire); }

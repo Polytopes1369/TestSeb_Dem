@@ -69,18 +69,20 @@ namespace renderer {
         // storage buffer, create the VkAccelerationStructureKHR handle, allocate an aligned
         // scratch buffer, record + submit the build, fetch the resulting device address. The only
         // difference between a BLAS and a TLAS build is `type` and the contents of `geometry` /
-        // `rangeInfo` -- both fully prepared by the caller (BuildBLAS/BuildTLAS below).
+        // `rangeInfo` -- both fully prepared by the caller (BuildBLAS/BuildTLAS below). `flags`
+        // defaults to PREFER_FAST_TRACE (every acceleration structure in this codebase except the
+        // skeletally-animated creature's BLAS is built exactly once at Init() and never refit -- see
+        // this file's own header comment); BuildBLAS's `allowUpdate` path is the one caller that
+        // overrides it to ALLOW_UPDATE_BIT_KHR | PREFER_FAST_BUILD_BIT_KHR instead.
         AccelerationStructure BuildAccelerationStructure(
             VkPhysicalDevice physicalDevice, VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
             VkAccelerationStructureTypeKHR type, const VkAccelerationStructureGeometryKHR& geometry,
-            const VkAccelerationStructureBuildRangeInfoKHR& rangeInfo, uint32_t primitiveCount) {
+            const VkAccelerationStructureBuildRangeInfoKHR& rangeInfo, uint32_t primitiveCount,
+            VkBuildAccelerationStructureFlagsKHR flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR) {
 
             VkAccelerationStructureBuildGeometryInfoKHR buildInfo{ VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR };
             buildInfo.type = type;
-            // PREFER_FAST_TRACE, never ALLOW_UPDATE: every acceleration structure in this codebase
-            // is built exactly once at Init() and never refit -- see this file's own header
-            // comment on why entities are treated as static.
-            buildInfo.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
+            buildInfo.flags = flags;
             buildInfo.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
             buildInfo.geometryCount = 1;
             buildInfo.pGeometries = &geometry;
@@ -190,7 +192,7 @@ namespace renderer {
 
     AccelerationStructure BuildBLAS(VkPhysicalDevice physicalDevice, VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
         VkBuffer vertexBuffer, VkDeviceSize vertexStride, uint32_t maxVertex, VkDeviceSize vertexOffsetBytes,
-        VkBuffer indexBuffer, VkDeviceSize indexOffsetBytes, uint32_t triangleCount) {
+        VkBuffer indexBuffer, VkDeviceSize indexOffsetBytes, uint32_t triangleCount, bool allowUpdate) {
 
         VkAccelerationStructureGeometryTrianglesDataKHR triangles{ VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR };
         triangles.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT; // Matches geometry::FallbackVertex::position's layout exactly.
@@ -215,8 +217,18 @@ namespace renderer {
         rangeInfo.firstVertex = 0;
         rangeInfo.transformOffset = 0;
 
+        // Skeletal-animation feature: ALLOW_UPDATE_BIT_KHR | PREFER_FAST_BUILD_BIT_KHR for the one
+        // BLAS that will later be refit every frame via RecordUpdateBLAS (the skeletally-animated
+        // creature's) -- the standard flag pairing for frequently-updated dynamic geometry (fast
+        // per-frame UPDATE cost matters far more than peak trace quality for a coarse Fallback Mesh
+        // BVH proxy). Every other entity keeps this file's default PREFER_FAST_TRACE_BIT_KHR (see
+        // this file's own header comment) via BuildAccelerationStructure's own default argument.
+        VkBuildAccelerationStructureFlagsKHR flags = allowUpdate
+            ? (VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR | VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR)
+            : VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
+
         return BuildAccelerationStructure(physicalDevice, device, allocator, commandPool, queue,
-            VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR, geometry, rangeInfo, triangleCount);
+            VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR, geometry, rangeInfo, triangleCount, flags);
     }
 
     AccelerationStructure BuildTLAS(VkPhysicalDevice physicalDevice, VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
@@ -366,6 +378,157 @@ namespace renderer {
         postBarrier.srcStageMask = VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
         postBarrier.srcAccessMask = VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
         postBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
+        postBarrier.dstAccessMask = VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR;
+        VkDependencyInfo postDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+        postDep.memoryBarrierCount = 1;
+        postDep.pMemoryBarriers = &postBarrier;
+        vkCmdPipelineBarrier2(cmd, &postDep);
+    }
+
+    BlasUpdateResources CreateBlasUpdateResources(VkPhysicalDevice physicalDevice, VkDevice device, VmaAllocator allocator,
+        VkDeviceSize vertexStride, uint32_t maxVertex, uint32_t triangleCount) {
+        BlasUpdateResources result;
+
+        // Sizing-only geometry description: per the VK_KHR_acceleration_structure spec,
+        // vkGetAccelerationStructureBuildSizesKHR reads only the geometry's SHAPE (format/stride/
+        // maxVertex/indexType/triangleCount) from pBuildInfo, never the actual buffer device
+        // addresses -- so a placeholder (0) deviceAddress here is legal and does not need to
+        // resolve to any real buffer. Must otherwise match RecordUpdateBLAS's own per-frame
+        // geometry description byte-for-byte (same rationale as CreateTlasRefitResources' own
+        // MakeTlasInstancesGeometry reuse: a size query built from a mismatched geometry
+        // description risks under-sizing the scratch buffer, a real correctness hazard).
+        VkAccelerationStructureGeometryTrianglesDataKHR triangles{ VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR };
+        triangles.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
+        triangles.vertexData.deviceAddress = 0;
+        triangles.vertexStride = vertexStride;
+        triangles.maxVertex = maxVertex;
+        triangles.indexType = VK_INDEX_TYPE_UINT32;
+        triangles.indexData.deviceAddress = 0;
+
+        VkAccelerationStructureGeometryKHR geometry{ VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR };
+        geometry.geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
+        geometry.geometry.triangles = triangles;
+        geometry.flags = VK_GEOMETRY_OPAQUE_BIT_KHR;
+
+        VkAccelerationStructureBuildGeometryInfoKHR buildInfo{ VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR };
+        buildInfo.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
+        // Must match BuildBLAS's own allowUpdate=true flags exactly -- the flags describe the
+        // acceleration structure's build/update CAPABILITY, and an inconsistent flags value here
+        // could under-size updateScratchSize relative to what an actual UPDATE build (RecordUpdateBLAS,
+        // using the SAME flags) will really require.
+        buildInfo.flags = VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR | VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR;
+        // MODE_UPDATE here (unlike CreateTlasRefitResources' own MODE_BUILD size query): this call
+        // exists specifically to size the UPDATE path's scratch requirement (updateScratchSize),
+        // which the spec allows to differ from buildScratchSize -- querying with MODE_BUILD would
+        // return the wrong (BUILD-path) scratch size instead.
+        buildInfo.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR;
+        buildInfo.geometryCount = 1;
+        buildInfo.pGeometries = &geometry;
+
+        VkAccelerationStructureBuildSizesInfoKHR sizeInfo{ VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR };
+        g_RTFunctions.vkGetAccelerationStructureBuildSizesKHR(device, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,
+            &buildInfo, &triangleCount, &sizeInfo);
+
+        const VkDeviceSize scratchAlignment = QueryMinScratchOffsetAlignment(physicalDevice);
+        // updateScratchSize (NOT buildScratchSize) -- see this function's own header comment
+        // (AccelerationStructure.h) for why an UPDATE-mode refit needs its own, separately-sized
+        // scratch allocation rather than reusing BuildBLAS's one-shot (already-destroyed) scratch.
+        AlignedScratchBuffer scratch = AllocateAlignedScratchBuffer(allocator, device, sizeInfo.updateScratchSize, scratchAlignment);
+        result.scratchBuffer = std::move(scratch.buffer);
+        result.scratchAddress = scratch.alignedAddress;
+
+        return result;
+    }
+
+    void RecordUpdateBLAS(VkCommandBuffer cmd, VkDevice device, VkAccelerationStructureKHR blas, BlasUpdateResources& resources,
+        VkBuffer vertexBuffer, VkDeviceSize vertexStride, uint32_t maxVertex, VkDeviceSize vertexOffsetBytes,
+        VkBuffer indexBuffer, VkDeviceSize indexOffsetBytes, uint32_t triangleCount) {
+
+        VkAccelerationStructureGeometryTrianglesDataKHR triangles{ VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR };
+        triangles.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
+        // May legitimately point at a DIFFERENT buffer than the original BuildBLAS() call used --
+        // see this function's own declaration comment (AccelerationStructure.h).
+        triangles.vertexData.deviceAddress = GetBufferDeviceAddress(device, vertexBuffer) + vertexOffsetBytes;
+        triangles.vertexStride = vertexStride;
+        triangles.maxVertex = maxVertex;
+        triangles.indexType = VK_INDEX_TYPE_UINT32;
+        triangles.indexData.deviceAddress = GetBufferDeviceAddress(device, indexBuffer) + indexOffsetBytes;
+
+        VkAccelerationStructureGeometryKHR geometry{ VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR };
+        geometry.geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
+        geometry.geometry.triangles = triangles;
+        geometry.flags = VK_GEOMETRY_OPAQUE_BIT_KHR;
+
+        VkAccelerationStructureBuildGeometryInfoKHR buildInfo{ VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR };
+        buildInfo.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
+        // Must match the flags BuildBLAS(..., /*allowUpdate=*/true, ...) originally built `blas`
+        // with -- see CreateBlasUpdateResources's own comment on why an inconsistent flags value
+        // here is a correctness hazard, not just a style nit.
+        buildInfo.flags = VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR | VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR;
+        // MODE_UPDATE, src==dst: an in-place refit reusing `blas`'s own existing backing buffer/
+        // internal BVH topology, recomputing leaf/node bounds from this frame's (skinned) vertex
+        // positions -- see this function's own declaration comment (AccelerationStructure.h) for
+        // why src==dst is the correct, standard choice here.
+        buildInfo.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR;
+        buildInfo.srcAccelerationStructure = blas;
+        buildInfo.dstAccelerationStructure = blas;
+        buildInfo.geometryCount = 1;
+        buildInfo.pGeometries = &geometry;
+        buildInfo.scratchData.deviceAddress = resources.scratchAddress;
+
+        VkAccelerationStructureBuildRangeInfoKHR rangeInfo{};
+        rangeInfo.primitiveCount = triangleCount;
+        rangeInfo.primitiveOffset = 0;
+        rangeInfo.firstVertex = 0;
+        rangeInfo.transformOffset = 0;
+        const VkAccelerationStructureBuildRangeInfoKHR* pRangeInfo = &rangeInfo;
+
+        // --- Pre-update barrier (WAR): the previous frame's HWRT consumers of this exact BLAS must
+        // have finished reading before this frame's update starts overwriting it. Three distinct
+        // stages can have read it: (1) ACCELERATION_STRUCTURE_BUILD_BIT_KHR -- last frame's TLAS
+        // refit (RecordRefitTLAS), which reads this BLAS's device address/bounds as ITS OWN build
+        // input; (2) RAY_TRACING_SHADER_BIT_KHR -- SurfaceCacheHWRT's traceRayEXT traversal
+        // descending into it through the TLAS; (3) COMPUTE_SHADER_BIT -- every OTHER HWRT consumer
+        // in this codebase uses INLINE ray query (GL_EXT_ray_query) from an ordinary compute shader
+        // instead of the dedicated ray-tracing pipeline (SurfaceCacheGIInject.comp, ScreenProbeTrace
+        // .comp, WorldProbeInject.comp, ReflectionTrace.comp, MegaLightsShade.comp, etc. -- see
+        // CMakeLists.txt's own SPIR-V-1.4 shader list for the full roster), which is a DIFFERENT
+        // pipeline stage from RAY_TRACING_SHADER_BIT_KHR despite tracing through the same TLAS/BLAS
+        // -- mirrors BuildAccelerationStructure's own post-build barrier just above (which already
+        // combines all 3 for the identical "later AS read" reason) and RecordRefitTLAS's own
+        // pre-build barrier (COMPUTE_SHADER_BIT | RAY_TRACING_SHADER_BIT_KHR -- that one omits
+        // ACCELERATION_STRUCTURE_BUILD_BIT_KHR because nothing in this codebase ever builds another
+        // acceleration structure FROM a TLAS the way the TLAS build reads FROM a BLAS). Same
+        // "previous frame's read is unconditionally already retired by the time this call is
+        // reached" reasoning as RecordRefitTLAS's own pre-build barrier (this codebase's per-frame
+        // fence-wait-before-recording discipline, see that function's own comment) -- not re-derived
+        // here to avoid duplicating that reasoning verbatim.
+        // --- Post-update barrier (RAW): makes the freshly-updated BLAS visible to the TLAS refit
+        // that reads it next THIS frame (the caller's own responsibility to sequence immediately
+        // after this call -- see RecordUpdateBLAS's own declaration comment) and, transitively via
+        // that TLAS refit's OWN post-build barrier, to every ray trace/query consumer after it --
+        // narrowed to ACCELERATION_STRUCTURE_BUILD_BIT_KHR alone (unlike the pre-barrier's 3-stage
+        // src, and unlike BuildAccelerationStructure's own broader post-build barrier) specifically
+        // BECAUSE that strict "TLAS refit always runs next, same queue" sequencing contract is
+        // guaranteed here (RecordCreatureBlasUpdate's own caller contract), so nothing else ever
+        // reads this BLAS directly without going through that TLAS refit first. ---
+        VkMemoryBarrier2 preBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+        preBarrier.srcStageMask = VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR |
+            VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        preBarrier.srcAccessMask = VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR;
+        preBarrier.dstStageMask = VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
+        preBarrier.dstAccessMask = VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
+        VkDependencyInfo preDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+        preDep.memoryBarrierCount = 1;
+        preDep.pMemoryBarriers = &preBarrier;
+        vkCmdPipelineBarrier2(cmd, &preDep);
+
+        g_RTFunctions.vkCmdBuildAccelerationStructuresKHR(cmd, 1, &buildInfo, &pRangeInfo);
+
+        VkMemoryBarrier2 postBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+        postBarrier.srcStageMask = VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
+        postBarrier.srcAccessMask = VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
+        postBarrier.dstStageMask = VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
         postBarrier.dstAccessMask = VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR;
         VkDependencyInfo postDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
         postDep.memoryBarrierCount = 1;

@@ -232,8 +232,9 @@ namespace renderer {
             // own doc comment), not a per-frame value -- filled once, here, in the same one-time
             // command buffer as the image transitions above (no ordering dependency between them,
             // so recording order doesn't matter). Well under vkCmdUpdateBuffer's 65536-byte limit
-            // (kMaxMaterials * sizeof(MaterialParameters) = 32 * 320 = 10240 bytes, after gap G6's
-            // horizontal-mix additions grew the struct from 208 to 320 bytes). No intra-
+            // (kMaxMaterials * sizeof(MaterialParameters) = 32 * 336 = 10752 bytes, after gap G6's
+            // horizontal-mix additions and the later Substrate iridescence layer grew the struct from
+            // 208 to 336 bytes total -- see MaterialParameterTable.h's own static_assert). No intra-
             // command-buffer barrier is needed after this write -- ExecuteOneShotCommands' own
             // vkQueueWaitIdle fully orders it before any later-submitted command buffer's reads,
             // exactly like ClusterRenderPipeline::Init()'s own one-time setup submit.

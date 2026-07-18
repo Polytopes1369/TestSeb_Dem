@@ -61,4 +61,45 @@ vec3 ApplySkeletalSkinning(vec3 localPos, uvec4 boneIndices, vec4 boneWeights, m
     return skinned;
 }
 
+// --- Analytic chain bone-weight derivation (BLAS refit / VSM shadow-capture feature) ---
+// Byte-for-byte parameter mirror of animation::SkeletalAnimator::kBoneCount / kSegmentLength
+// (src/animation/SkeletalAnimator.h) -- MUST match exactly, same contract as SKELETAL_MAX_BONES
+// above.
+#define SKELETAL_CHAIN_BONE_COUNT 16u
+#define SKELETAL_CHAIN_SEGMENT_LENGTH 0.32
+
+// geom_creature.comp bakes each CLUSTER vertex's boneIndices/boneWeights explicitly at bake time
+// (see that shader's own "Linear-blend-skinning weight authoring" comment) into
+// geometry::ClusterVertexSkin, decoded per-vertex by DecodeClusterSkin (cluster_vertex_decode.glsl)
+// -- the ONLY per-vertex skin data this codebase persists anywhere. Two consumers have no such
+// baked buffer of their own and therefore cannot decode a skin the normal way:
+//   - The coarse Fallback Mesh (geometry::FallbackMeshBuilder -- QEM-simplified, welds/collapses
+//     the cluster geometry into a much smaller proxy) that renderer::SurfaceCacheRayTracingPass's
+//     creature BLAS is refit from (see CreatureBlasSkinning.comp) -- QEM simplification does not
+//     carry the source ClusterVertexSkin buffer through its edge collapses.
+//   - src/shaders/src/Renderer/ShadowMapCaptureAnimated.vert, which reads plain
+//     geometry::FallbackVertex (position/normal/uv only) via ordinary vertex-input attributes --
+//     renderer::VirtualShadowMapPass keeps its own separate, position/uv-only copy of the Fallback
+//     Mesh (see that class's own comment), with no skin buffer either.
+// Both cases are salvageable because this creature's bind-pose shape is ITSELF a closed-form
+// function of chain parameter t (geom_creature.comp's `v.position = vec3(globalT * segmentLength,
+// ...)`, mirrored on the CPU by animation::SkeletalAnimator::BindPoseBoneLocalPosition()) -- so the
+// INVERSE (recovering t, and therefore the influencing bone pair + blend weight, from a vertex's
+// own bind-pose-local X coordinate) is equally closed-form, and reproduces geom_creature.comp's own
+// per-vertex boneLow/boneHigh/blend derivation exactly, without needing to carry a separate skin
+// buffer through either consumer's own geometry pipeline.
+// `localX` must be the vertex's bind-pose LOCAL-space X coordinate (i.e. `localPos.x`, the SAME
+// local space ApplySkeletalSkinning's own `localPos` parameter expects). Clamps into
+// [0, boneCount-1] exactly like geom_creature.comp's own boneLow/blend derivation, so a
+// QEM-simplified Fallback Mesh vertex sitting slightly outside the analytic ring range (e.g. near a
+// pole) still resolves to a valid, fully-in-range bone pair instead of an out-of-bounds index.
+void ComputeChainSkinWeights(float localX, out uvec4 boneIndices, out vec4 boneWeights) {
+    float globalT = clamp(localX / SKELETAL_CHAIN_SEGMENT_LENGTH, 0.0, float(SKELETAL_CHAIN_BONE_COUNT - 1u));
+    uint boneLow = min(uint(floor(globalT)), SKELETAL_CHAIN_BONE_COUNT - 2u);
+    uint boneHigh = boneLow + 1u;
+    float blend = clamp(globalT - float(boneLow), 0.0, 1.0);
+    boneIndices = uvec4(boneLow, boneHigh, 0u, 0u);
+    boneWeights = vec4(1.0 - blend, blend, 0.0, 0.0);
+}
+
 #endif // SKELETAL_ANIMATION_GLSL

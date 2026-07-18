@@ -695,8 +695,10 @@ namespace renderer {
         // gates this call on that same flag, but the flag is ALSO a live Debug-only ImGui checkbox
         // ("Megalights Enable", main.cpp Lumen tab) a developer can flip mid-session with no matching
         // re-Init -- without this guard that would dispatch into null pipeline/descriptor-set handles
-        // the instant the checkbox flips true on a tier that skipped setup. Checked before the
-        // reservoir-slot flip below since neither ping-pong buffer exists yet on a skipped tier.
+        // the instant the checkbox flips true on a tier that skipped setup. Returning here before the
+        // reservoir-slot flip below is deliberate too: neither ping-pong buffer exists yet on a
+        // skipped tier, and skipping the flip along with everything else means a disabled frame never
+        // desyncs history/current from what the next enabled frame expects.
         if (m_ShadePipeline == VK_NULL_HANDLE) {
             return;
         }

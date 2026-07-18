@@ -1,0 +1,131 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+
+// Skeletal-animation feature (ray-traced GI/reflections fix): produces this frame's SKINNED
+// Fallback Mesh vertex positions for the engine's one skeletally-animated entity (the procedural
+// creature, core::EntityFlags::IsSkeletallyAnimated) into a DEDICATED per-entity buffer
+// (renderer::SurfaceCacheRayTracingPass's own m_CreatureSkinnedVertexBuffer), which
+// RecordUpdateBLAS (renderer/vulkan/AccelerationStructure.h) then reads as this entity's BLAS
+// UPDATE-mode geometry input -- see that pass' own RecordCreatureBlasUpdate comment for the full
+// per-frame sequencing (this dispatch -> compute-write/AS-build-read barrier -> BLAS UPDATE -> TLAS
+// refit).
+//
+// Reuses ApplySkeletalSkinning (skeletal_animation.glsl) verbatim -- the SAME function
+// ClusterRaster.vert/cluster_software_raster_core.glsl/ClusterResolve(Binned).comp already use for
+// the rasterized path, so the ray-traced/shadow paths this feature fixes never disagree with the
+// on-screen rasterized silhouette about how skinning is defined. The one piece this dispatch cannot
+// just decode from a buffer (unlike those raster-path consumers, which read geometry::
+// ClusterVertexSkin straight from the compressed cluster pool) is WHICH bones influence a given
+// vertex: the Fallback Mesh is a QEM-simplified proxy (geometry::FallbackMeshBuilder) with no such
+// per-vertex skin buffer of its own -- ComputeChainSkinWeights (skeletal_animation.glsl) derives the
+// same bone pair/blend weight analytically instead, from the vertex's own bind-pose local-space X
+// coordinate. See that function's own header comment for the full derivation.
+
+#include "include/skeletal_animation.glsl"
+
+// std430-exact mirror of geometry::FallbackVertex (32 bytes: 3+3+2 floats, no padding -- see
+// ClusterFormat.h's own static_assert) using flat scalars instead of vec3 fields, to avoid
+// std430's vec3-alignment padding diverging from the tightly-packed C++ layout -- the SAME
+// convention include/fallback_geometry.glsl's own FallbackVertexGpu already established. Kept as
+// an independent local copy (not a #include of that file) because this shader needs a
+// DIFFERENTLY-shaped pair of bindings -- one READ-ONLY source, one WRITE-ONLY dest, both using this
+// same 3-field shape -- not fallback_geometry.glsl's single fixed read-only vertex+index+draw-range
+// triple.
+struct FallbackVertexSkin {
+    float posX, posY, posZ;
+    float normX, normY, normZ;
+    float u, v;
+};
+
+layout(local_size_x = 64) in;
+
+// renderer::SurfaceCachePass's own combined Fallback Mesh vertex buffer (GetVertexBuffer()) -- the
+// SAME buffer every entity's one-shot BLAS was originally built directly against (see
+// renderer::AccelerationStructure::BuildBLAS's own comment); read-only here, this dispatch never
+// mutates the shared buffer other entities/passes (SurfaceCachePass::RecordCapture, every other
+// entity's static BLAS) still read directly.
+layout(std430, set = 0, binding = 0) readonly buffer SourceVertexBuffer {
+    FallbackVertexSkin srcVertices[];
+};
+
+// This frame's bone-matrices SSBO (animation::SkeletalAnimator::GetBoneMatricesBuffer(), uploaded
+// once per frame by SkeletalAnimator::RecordUpdate) -- the SAME buffer ClusterRaster.vert/
+// ShadowMapCaptureAnimated.vert both bind. See skeletal_animation.glsl's own header comment for the
+// byte layout.
+layout(std430, set = 0, binding = 1) readonly buffer SkeletalBoneMatricesSSBO {
+    mat4 boneMatrices[SKELETAL_MAX_BONES];
+};
+
+// renderer::SurfaceCacheRayTracingPass's own dedicated, per-entity, GPU_ONLY buffer -- sized for
+// exactly this entity's own Fallback Mesh vertex count (see that pass' own Init() comment), never
+// shared with any other entity/pass. Written here every frame, then read as BLAS UPDATE geometry
+// input by RecordUpdateBLAS immediately afterward (same command buffer, with an explicit
+// compute-write -> AS-build-read barrier in between -- see RecordCreatureBlasUpdate's own comment).
+layout(std430, set = 0, binding = 2) writeonly buffer DestVertexBuffer {
+    FallbackVertexSkin dstVertices[];
+};
+
+layout(push_constant) uniform CreatureSkinningConstants {
+    // Element offset (NOT bytes) into srcVertices[] where this entity's own Fallback Mesh vertex
+    // span begins -- renderer::SurfaceCachePass::EntityDrawRange::vertexOffset.
+    uint srcVertexOffset;
+    // How many vertices this dispatch skins -- dstVertices[] is indexed [0, vertexCount) (its own
+    // dedicated buffer, no offset), srcVertices[] is read at [srcVertexOffset, srcVertexOffset +
+    // vertexCount).
+    uint vertexCount;
+    // This entity's EntityTransform::center THIS FRAME (renderer::ClusterRenderPipeline's own
+    // m_FrameScratch.entityTransformsCPU) -- see main()'s own comment for why skinning needs it.
+    float centerX;
+    float centerY;
+    float centerZ;
+} pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.vertexCount) {
+        return;
+    }
+
+    FallbackVertexSkin src = srcVertices[pc.srcVertexOffset + i];
+    vec3 worldPos = vec3(src.posX, src.posY, src.posZ);
+    vec3 center = vec3(pc.centerX, pc.centerY, pc.centerZ);
+
+    // Same local-space convention ClusterRaster.vert/ShadowMapCaptureAnimated.vert both use:
+    // ApplySkeletalSkinning operates on the REST-POSE LOCAL-space position (worldPos - center),
+    // i.e. BEFORE the entity's rigid rotation/translation -- see skeletal_animation.glsl's own
+    // header comment. This creature entity carries no rigid rotation/translation of its own (see
+    // VulkanContext.cpp's own kCreatureEntityIndex branch comment: "ALL of its visible motion comes
+    // from GPU-side skinning"), so `center` is the only piece of its EntityTransform this shader
+    // needs at all -- unlike ClusterRaster.vert, this BLAS geometry is consumed directly as the
+    // TLAS instance's OWN local space (see renderer::SurfaceCacheRayTracingPass::RecordRefreshTLAS's
+    // own comment: "the BLAS stores geometry already positioned at its rest-pose world location"),
+    // so the skinned result is re-added to `center` below, NOT further rotated/translated -- the
+    // TLAS instance transform (identity rotation/translation for every entity in this codebase's
+    // fixed Init()-time instance list, refreshed per-frame only for RIGID entities) applies on top
+    // of this at trace time, exactly like it already does for this same entity's un-skinned bind
+    // pose today.
+    vec3 localPos = worldPos - center;
+
+    uvec4 boneIndices;
+    vec4 boneWeights;
+    ComputeChainSkinWeights(localPos.x, boneIndices, boneWeights);
+    vec3 skinnedLocal = ApplySkeletalSkinning(localPos, boneIndices, boneWeights, boneMatrices);
+
+    vec3 skinnedWorld = skinnedLocal + center;
+
+    FallbackVertexSkin dst;
+    dst.posX = skinnedWorld.x;
+    dst.posY = skinnedWorld.y;
+    dst.posZ = skinnedWorld.z;
+    // normal/uv pass through unchanged -- SurfaceCacheHWRT.rchit recomputes a geometric (flat) face
+    // normal from the hit triangle's 3 POSITIONS directly (see that shader's own FetchPosition/
+    // faceNormal comment), never reads a per-vertex normal from BLAS geometry, so re-skinning the
+    // normal here would be dead work; uv is a pure material-space coordinate, unaffected by
+    // skinning.
+    dst.normX = src.normX;
+    dst.normY = src.normY;
+    dst.normZ = src.normZ;
+    dst.u = src.u;
+    dst.v = src.v;
+    dstVertices[i] = dst;
+}

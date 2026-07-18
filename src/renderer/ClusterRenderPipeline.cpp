@@ -480,6 +480,7 @@ bool ClusterRenderPipeline::Init(
                                createInfo.cacheFilePath,
                                createInfo.entityTransformBuffer, createInfo.entityDataBuffer,
                                m_WPOGlobalsBuffer.Handle(), m_SplineControlPointsBuffer.Handle(),
+                               m_SkeletalAnimator.GetBoneMatricesBuffer(),
                                createInfo.entityDataCPU, m_MaskGenerator.GetMaskImageInfos())) {
     LOG_ERROR("[ClusterRenderPipeline] Failed to initialize VirtualShadowMapPass.");
     return false;
@@ -504,11 +505,27 @@ bool ClusterRenderPipeline::Init(
   // (RGBA8_UNORM, matching ClusterResolvePass::kOutputAlbedoFormat's own choice of format for the
   // exact same "simplest, most broadly supported color-attachment-and-storage-capable format"
   // reason) -- see renderer::VirtualTextureConfig's own struct defaults for the virtual space/tile/
-  // border/physical-capacity sizing this demo uses unmodified. Always Init()'d and always wired into
-  // m_Resolve's descriptor sets below regardless of config::lumen::BUILD_VIRTUAL_TEXTURES (that flag
-  // only gates the expensive per-frame disk-streaming work, see VirtualTextureStreamingCoordinator::
-  // RecordBeginFrame's own comment) -- exactly like m_VirtualShadowMap's own unconditional Init()
-  // above, gated the same way by config::lumen::BUILD_SHADOWS instead.
+  // border/physical-capacity sizing this demo uses unmodified. m_VTManager.Init() below (and the
+  // m_Resolve descriptor wiring further down) run UNCONDITIONALLY regardless of
+  // config::lumen::BUILD_VIRTUAL_TEXTURES -- NOT an oversight: ClusterResolvePass's set-0 layout is
+  // fixed at ITS OWN Init() time with bindings 21-24 (g_PageTable/g_PhysicalPools[]/g_VTFeedback/
+  // VirtualTextureVolumeUBO) always present and statically referenced by ClusterResolve.comp /
+  // ClusterResolveBinned.comp, and this engine does not enable
+  // VkPhysicalDeviceVulkan12Features::descriptorBindingPartiallyBound (see
+  // ClusterResolvePass::SetVirtualTexture's own comment) -- so every one of those bindings MUST hold
+  // a valid descriptor before the first RecordResolve()/RecordResolveBinned() call, and both of those
+  // run every frame unconditionally too (not gated by this flag either). Skipping m_VTManager's own
+  // Init() when the flag is off would leave those bindings unwritten -- a validation error (and
+  // undefined behavior on drivers that don't catch it) on the very first frame. Only m_VTRenderPass
+  // further below (the on-demand PAGE RENDERING half -- see its own class comment) is actually gated:
+  // SetVirtualTexture()'s signature (below) never takes a VirtualTextureRenderPass reference, so its
+  // Init() is not part of this mandatory descriptor contract, and (today) it is also never driven by
+  // any real per-frame caller even when the flag is on (RequestPage() has zero production call sites
+  // -- see m_VTBounds' own comment below) -- so gating it is free, both in the "feature off" case and,
+  // right now, in the "feature on" case too. Matches m_VirtualShadowMap's own unconditional Init()
+  // above under config::lumen::BUILD_SHADOWS for the identical descriptor-validity reason (see
+  // VirtualShadowMapPass's own class comment) -- only the gated HALF differs (there, per-frame
+  // capture work; here, m_VTRenderPass's Init()) because the two systems' consumers differ.
   VirtualTextureConfig vtConfig{};
   std::vector<VkFormat> vtPoolFormats{ VK_FORMAT_R8G8B8A8_UNORM };
   if (!m_VTManager.Init(createInfo.physicalDevice, createInfo.device, createInfo.allocator,
@@ -520,11 +537,20 @@ bool ClusterRenderPipeline::Init(
   // Default volume bounds (see VirtualTextureVolumeBounds' own struct defaults, [-8,8]^2 XZ / [-4,4]
   // Y) already cover this demo's scene bounding sphere (~6.4m radius, see VirtualShadowMapPass's own
   // scene-bounds read) with generous margin -- kept as-is rather than re-deriving from the geometry
-  // cache file's own bounds.
+  // cache file's own bounds. Computed unconditionally: m_Resolve.SetVirtualTexture() further below
+  // reads it regardless of config::lumen::BUILD_VIRTUAL_TEXTURES (see this scope's opening comment).
   m_VTBounds = VirtualTextureVolumeBounds{};
-  if (!m_VTRenderPass.Init(createInfo.device, &m_VTManager, m_VTBounds)) {
-    LOG_ERROR("[ClusterRenderPipeline] Failed to initialize VirtualTextureRenderPass.");
-    return false;
+  // config::lumen::BUILD_VIRTUAL_TEXTURES gate: see this scope's opening comment for why ONLY
+  // m_VTRenderPass's Init() (not m_VTManager's/m_VTStreaming's, both above/below) can safely skip
+  // its setup when the feature is off. VirtualTextureRenderPass::Init() itself is pure CPU work (one
+  // view-projection matrix, no Vulkan resources -- see that method's own body), so today this mainly
+  // documents intent/saves a log line; it still future-proofs this call site against that class
+  // growing real GPU setup later without anyone having to remember to gate it retroactively.
+  if (config::lumen::BUILD_VIRTUAL_TEXTURES) {
+    if (!m_VTRenderPass.Init(createInfo.device, &m_VTManager, m_VTBounds)) {
+      LOG_ERROR("[ClusterRenderPipeline] Failed to initialize VirtualTextureRenderPass.");
+      return false;
+    }
   }
 
   // Streams previously-baked tiles back from disk (.vtcache, sibling to the geometry .cache file at
@@ -533,7 +559,8 @@ bool ClusterRenderPipeline::Init(
   // on a from-scratch run -- this demo has no offline VT bake step wired up yet, matching this
   // phase's own scope: the streaming PLUMBING is real and complete, the content SOURCE is future
   // work, exactly like VirtualTextureRenderPass itself is not yet driven by any real page-visibility
-  // system either).
+  // system either). Init()'d unconditionally, same descriptor-validity reason as m_VTManager above --
+  // GetFeedbackDeviceBuffer() below feeds binding 23, which SetVirtualTexture() must always populate.
   std::filesystem::path vtCacheFilePath = createInfo.cacheFilePath;
   vtCacheFilePath.replace_extension(".vtcache");
   if (!m_VTStreaming.Init(createInfo.device, createInfo.allocator, createInfo.commandPool,
@@ -625,7 +652,8 @@ bool ClusterRenderPipeline::Init(
   // Fallback Mesh vertex/index buffers (the scene is static -- see this class' own "Entity self-
   // rotation" scope note -- so no per-frame rebuild is needed).
   if (!m_SurfaceCacheRT.Init(createInfo.physicalDevice, createInfo.device, createInfo.allocator,
-                             createInfo.commandPool, createInfo.queue, m_TraceContext, m_SurfaceCache)) {
+                             createInfo.commandPool, createInfo.queue, m_TraceContext, m_SurfaceCache,
+                             m_SkeletalAnimator.GetBoneMatricesBuffer(), createInfo.entityDataCPU)) {
     LOG_ERROR("[ClusterRenderPipeline] Failed to initialize SurfaceCacheRayTracingPass.");
     return false;
   }
@@ -1633,6 +1661,41 @@ void ClusterRenderPipeline::RecordSurfaceCacheOwnershipTransfer(VkCommandBuffer 
   vkCmdPipelineBarrier2(cmd, &depInfo);
 }
 
+void ClusterRenderPipeline::RecordBoneMatricesOwnershipTransfer(VkCommandBuffer cmd, bool isRelease,
+    uint32_t srcFamily, uint32_t dstFamily) {
+  if (!m_AsyncComputeAvailableThisBuild) {
+    return; // Same queue family as the graphics/async-compute consumer -- nothing to transfer. See
+             // this method's own header comment (ClusterRenderPipeline.h).
+  }
+
+  // Release: describes SkeletalAnimator::RecordUpdate's own vkCmdUpdateBuffer write (already made
+  // available to VERTEX_SHADER/COMPUTE_SHADER READERS ON THE GRAPHICS QUEUE by that method's own
+  // internal barrier -- see its own header comment -- but that barrier does not, and cannot, cover
+  // a DIFFERENT queue family, which is exactly this transfer's own job). Acquire: describes
+  // RecordCreatureBlasUpdate's own skinning compute dispatch, the sole consumer on the acquiring
+  // side.
+  VkPipelineStageFlags2 releaseStage = isRelease ? VK_PIPELINE_STAGE_2_COPY_BIT : VK_PIPELINE_STAGE_2_NONE;
+  VkPipelineStageFlags2 acquireStage = isRelease ? VK_PIPELINE_STAGE_2_NONE : VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+  VkAccessFlags2 releaseAccess = isRelease ? VK_ACCESS_2_TRANSFER_WRITE_BIT : VK_ACCESS_2_NONE;
+  VkAccessFlags2 acquireAccess = isRelease ? VK_ACCESS_2_NONE : VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+
+  VkBufferMemoryBarrier2 bufferBarrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2};
+  bufferBarrier.srcStageMask = releaseStage;
+  bufferBarrier.srcAccessMask = releaseAccess;
+  bufferBarrier.dstStageMask = acquireStage;
+  bufferBarrier.dstAccessMask = acquireAccess;
+  bufferBarrier.srcQueueFamilyIndex = srcFamily;
+  bufferBarrier.dstQueueFamilyIndex = dstFamily;
+  bufferBarrier.buffer = m_SkeletalAnimator.GetBoneMatricesBuffer();
+  bufferBarrier.offset = 0;
+  bufferBarrier.size = VK_WHOLE_SIZE;
+
+  VkDependencyInfo depInfo{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+  depInfo.bufferMemoryBarrierCount = 1;
+  depInfo.pBufferMemoryBarriers = &bufferBarrier;
+  vkCmdPipelineBarrier2(cmd, &depInfo);
+}
+
 void ClusterRenderPipeline::RecordFrameEarly(VkCommandBuffer cmdEarly,
                                               const CameraPushConstants &camera,
                                               const maths::vec3 &cameraPositionWorld,
@@ -1737,6 +1800,22 @@ void ClusterRenderPipeline::RecordFrameEarly(VkCommandBuffer cmdEarly,
   m_FrameScratch.traceMode = traceMode;
   m_FrameScratch.useAsyncCompute = useAsyncCompute;
   m_FrameScratch.radiosityEnabled = radiosityEnabled;
+
+  // =========================================================================================
+  // [1a-skel] Skeletal-animation feature: recompute the procedural creature's bone matrices from
+  // this frame's globalTimeSeconds and re-upload the SkeletalBoneMatricesSSBO. MOVED here (used to
+  // run in RecordFrameMid(), see that call site's own remaining comment) so this frame's fresh bone
+  // matrices are available before EITHER (a) the raster-path consumers later this same frame
+  // (ClusterRaster.vert etc., in cmdMid, still correctly ordered after cmdEarly -- same-queue
+  // submission order) AND (b), the whole reason for the move, the [1z] block below's
+  // RecordCreatureBlasUpdate call -- reached from either right here in cmdEarly (fallback path) or
+  // from RecordAsyncCompute()'s own asyncComputeCmd (async-compute path), in BOTH cases strictly
+  // after this upload. Own internal VkMemoryBarrier2 already covers every consumer stage this
+  // upload needs WITHIN the graphics queue (VERTEX_SHADER/COMPUTE_SHADER, see SkeletalAnimator::
+  // RecordUpdate's own header comment) -- RecordBoneMatricesOwnershipTransfer below additionally
+  // covers the async-compute-queue case specifically, which that barrier cannot reach on its own.
+  // =========================================================================================
+  m_SkeletalAnimator.RecordUpdate(cmdEarly, globalTimeSeconds);
 
   // =========================================================================================
   // [1y] Atmos weather system, Subtask 1: refresh AtmosGlobalsUBO (wind, Magnus-Tetens dew point /
@@ -1986,6 +2065,14 @@ void ClusterRenderPipeline::RecordFrameEarly(VkCommandBuffer cmdEarly,
     //     asyncComputeCmd -- see this class' own header comment for the full redesign. The RELEASE
     //     immediately below (this same `if`'s `else` branch) hands the atlas off for that.
     if (!useAsyncCompute) {
+      // Skeletal-animation feature (ray-traced GI/reflections fix): refresh the creature's BLAS
+      // with THIS frame's animated (skinned) pose before the TLAS refit below reads its device
+      // address/bounds -- a no-op if Init() found no skeletally-animated entity. Fallback path:
+      // everything (skinning compute write -> BLAS UPDATE -> TLAS refit read) stays on the SAME
+      // cmdEarly/graphics-queue command buffer, so no cross-queue hazard to manage here (contrast
+      // the useAsyncCompute branch below, and RecordAsyncCompute()'s own mirrored call).
+      m_SurfaceCacheRT.RecordCreatureBlasUpdate(cmdEarly, entityTransformsCPU);
+
       // Phase 4 integration (UE5.8 parity roadmap, dynamic scenes onto main): per-frame TLAS
       // refit so ray-traced GI/reflections see this frame's entity rotations -- must run before
       // anything below traces against m_SurfaceCacheRT's TLAS (radiosity injection right below,
@@ -2033,6 +2120,14 @@ void ClusterRenderPipeline::RecordFrameEarly(VkCommandBuffer cmdEarly,
           VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_2_VERTEX_INPUT_BIT,
           VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
           VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_2_INDEX_READ_BIT);
+
+      // Skeletal-animation feature: RELEASE the bone-matrices buffer alongside the 9 Surface Cache
+      // resources above -- [1a-skel]'s upload (earlier this same cmdEarly) is the "active access"
+      // being released; RecordAsyncCompute()'s own skinning dispatch is the acquiring consumer. See
+      // RecordBoneMatricesOwnershipTransfer's own header comment (ClusterRenderPipeline.h) for why
+      // this is a separate call, not folded into RecordSurfaceCacheOwnershipTransfer above.
+      RecordBoneMatricesOwnershipTransfer(cmdEarly, /*isRelease=*/true,
+          m_GraphicsQueueFamilyIndex, m_AsyncComputeQueueFamilyIndex);
     }
 
 #ifndef NDEBUG
@@ -2097,6 +2192,21 @@ void ClusterRenderPipeline::RecordAsyncCompute(VkCommandBuffer asyncComputeCmd) 
       VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR |
           VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR);
 
+  // Skeletal-animation feature: ACQUIRE (by async-compute) the bone-matrices buffer RecordFrameEarly()
+  // already released -- see RecordBoneMatricesOwnershipTransfer's own header comment
+  // (ClusterRenderPipeline.h) for why this is separate from the 9-resource acquire just above. Must
+  // land before RecordCreatureBlasUpdate's own skinning dispatch immediately below reads it.
+  RecordBoneMatricesOwnershipTransfer(asyncComputeCmd, /*isRelease=*/false,
+      m_GraphicsQueueFamilyIndex, m_AsyncComputeQueueFamilyIndex);
+
+  // Skeletal-animation feature (ray-traced GI/reflections fix): refresh the creature's BLAS with
+  // THIS frame's animated (skinned) pose on THIS queue (asyncComputeCmd) -- must run before the
+  // TLAS refit immediately below, which reads this BLAS's device address/bounds -- see
+  // RecordCreatureBlasUpdate's own comment (SurfaceCacheRayTracingPass.h) for the full ordering
+  // contract. A no-op if Init() found no skeletally-animated entity. Mirrors the fallback path's
+  // own identical call in RecordFrameEarly()'s cmdEarly branch.
+  m_SurfaceCacheRT.RecordCreatureBlasUpdate(asyncComputeCmd, entityTransformsCPU);
+
   // Phase 4 integration (UE5.8 parity roadmap, dynamic scenes onto main): per-frame TLAS refit,
   // forced HWRT-only here (traceMode == 1u whenever useAsyncCompute, see RecordFrameEarly()'s own
   // useAsyncCompute derivation) -- must run before the bounce loop below traces against it.
@@ -2131,6 +2241,16 @@ void ClusterRenderPipeline::RecordAsyncCompute(VkCommandBuffer asyncComputeCmd) 
       VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
       VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR |
           VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR);
+
+  // Skeletal-animation feature: RELEASE the bone-matrices buffer back to the graphics queue family
+  // -- leaves it in a consistent, always-graphics-owned state at the end of every async-enabled
+  // frame, mirroring the 9-resource release just above (see RecordBoneMatricesOwnershipTransfer's
+  // own header comment for why this full round-trip discipline matters even though nothing later
+  // this same frame reads it on the graphics queue -- it is what keeps a LATER frame's
+  // [1a-skel] upload, which always targets the graphics queue unconditionally, valid regardless of
+  // this frame's own routing).
+  RecordBoneMatricesOwnershipTransfer(asyncComputeCmd, /*isRelease=*/true,
+      m_AsyncComputeQueueFamilyIndex, m_GraphicsQueueFamilyIndex);
   // Signals m_AsyncComputeFinishedSemaphore as part of asyncComputeCmd's own submission completing
   // (main.cpp) -- waited on by THIS SAME frame's cmdLate submission before RecordFrameLate()'s own
   // ACQUIRE (above, mirrored) is allowed to execute.
@@ -2251,14 +2371,16 @@ void ClusterRenderPipeline::RecordFrameMid(VkCommandBuffer cmdMid, VkCommandBuff
     vkCmdPipelineBarrier2(cmdMid, &wpoDepInfo);
   }
 
-  // =========================================================================================
-  // [1c] Skeletal-animation feature: recompute the procedural creature's bone matrices from this
-  // frame's globalTimeSeconds and re-upload the SkeletalBoneMatricesSSBO, mirroring [1b]'s own
-  // "upload once here, well before either raster pass runs" placement/rationale exactly (its own
-  // internal barrier covers every consumer -- ClusterRaster.vert, cluster_software_raster_core
-  // .glsl's two consumers, and ClusterResolve.comp/ClusterResolveBinned.comp).
-  // =========================================================================================
-  m_SkeletalAnimator.RecordUpdate(cmdMid, globalTimeSeconds);
+  // [1c] Skeletal-animation feature: m_SkeletalAnimator.RecordUpdate() used to run here (cmdMid) --
+  // MOVED to the top of RecordFrameEarly() (cmdEarly), see that call site's own comment for why the
+  // ray-traced GI/reflections BLAS-refit fix (RecordCreatureBlasUpdate) needs this frame's bone
+  // matrices ready earlier than cmdMid can offer on the async-compute-routed frames. Moving it
+  // strictly EARLIER only tightens (never breaks) the ordering every raster-path consumer below
+  // (ClusterRaster.vert, cluster_software_raster_core.glsl's two consumers, ClusterResolve.comp/
+  // ClusterResolveBinned.comp) already required -- cmdEarly always precedes cmdMid (same-queue
+  // submission order, see this class' own header comment) -- and globalTimeSeconds is the SAME
+  // m_FrameScratch-cached value regardless of which command buffer reads it, so the animated pose
+  // computed is bit-identical either way; no behavior change for the raster path.
 
   // =========================================================================================
   // [2] EARLY cull: every leaf candidate vs frustum/backface + LAST frame's HZB
@@ -2641,6 +2763,13 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
         VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
         VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR);
+
+    // Skeletal-animation feature: ACQUIRE the bone-matrices buffer back to the graphics queue family
+    // -- completes the round trip RecordFrameEarly()/RecordAsyncCompute() started (see
+    // RecordBoneMatricesOwnershipTransfer's own header comment for why this unconditional
+    // every-async-frame round trip, not just a toggle-transition fix-up, is required).
+    RecordBoneMatricesOwnershipTransfer(cmdLate, /*isRelease=*/false,
+        m_AsyncComputeQueueFamilyIndex, m_GraphicsQueueFamilyIndex);
   }
 
   // =========================================================================================
@@ -2786,7 +2915,7 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
   // this with its own m_ShadePipeline == VK_NULL_HANDLE guard, see that function's own comment).
   //
   // Phase 4 of the "Nanite advanced" roadmap (light BVH for RIS spatial bias, temporal ReSTIR with
-  // per-frame revalidated visibility): RecordShade now also takes `prevViewProjForMegaLights` --
+  // per-frame revalidated visibility): RecordShade also takes `prevViewProjForMegaLights` --
   // its own reservoir reprojection needs the previous frame's combined view-projection matrix, same
   // `m_HasPrevViewProj` frame-0-safety ternary already used for [12b2]'s own
   // prevViewProjForReflection above (identity matrix on the very first frame ever recorded; see

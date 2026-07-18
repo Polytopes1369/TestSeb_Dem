@@ -976,13 +976,14 @@ int main(int argc, char** argv) {
             uint64_t VERTEX_BUFFER_BYTES = config::nanite::VERTEX_BUFFER_BYTES;
             uint64_t INDEX_BUFFER_BYTES = config::nanite::INDEX_BUFFER_BYTES;
             float RENDER_SCALE = config::temporal::RENDER_SCALE;
-            uint32_t SHADOW_MAX_RESOLUTION = config::shadows::_MAX_RESOLUTION;
             uint32_t PROBE_GRID_RESOLUTION = config::lumen::PROBE_GRID_RESOLUTION;
             uint32_t VSM_PHYSICAL_PAGE_CAPACITY = config::lumen::VSM_PHYSICAL_PAGE_CAPACITY;
-            uint32_t TRANSLUCENCY_LIGHTING_VOLUME_DIM = config::postprocess::_TRANSLUCENCY_LIGHTING_VOLUME_DIM;
             // The "Hardware Ray Tracing" checkbox's own value only takes effect at the NEXT session
             // start (see main()'s g_DebugState.traceMode seeding comment, right before the frame
             // loop) -- 'T'/'Y' remain the live, no-reload way to change trace mode mid-session.
+            // NOTE: _TRANSLUCENCY_LIGHTING_VOLUME_DIM was dropped from this struct (2026-07-18 merge
+            // reconciliation) along with its EngineConfig.h declaration -- verified zero real
+            // consumers (see EngineConfig.h's own postprocess::_EFFECTS_QUALITY comment).
             bool HARDWARE_RAYTRACING = config::lumen::_HARDWARE_RAYTRACING;
             std::string profileName = config::g_ActiveProfileName;
         };
@@ -994,10 +995,8 @@ int main(int argc, char** argv) {
                 config::nanite::VERTEX_BUFFER_BYTES,
                 config::nanite::INDEX_BUFFER_BYTES,
                 config::temporal::RENDER_SCALE,
-                config::shadows::_MAX_RESOLUTION,
                 config::lumen::PROBE_GRID_RESOLUTION,
                 config::lumen::VSM_PHYSICAL_PAGE_CAPACITY,
-                config::postprocess::_TRANSLUCENCY_LIGHTING_VOLUME_DIM,
                 config::lumen::_HARDWARE_RAYTRACING,
                 config::g_ActiveProfileName
             };
@@ -1011,10 +1010,8 @@ int main(int argc, char** argv) {
         if (config::nanite::VERTEX_BUFFER_BYTES != startup.VERTEX_BUFFER_BYTES) { needsReload = true; reloadReason += "Vertex Buffer Size; "; }
         if (config::nanite::INDEX_BUFFER_BYTES != startup.INDEX_BUFFER_BYTES) { needsReload = true; reloadReason += "Index Buffer Size; "; }
         if (config::temporal::RENDER_SCALE != startup.RENDER_SCALE) { needsReload = true; reloadReason += "Render Scale; "; }
-        if (config::shadows::_MAX_RESOLUTION != startup.SHADOW_MAX_RESOLUTION) { needsReload = true; reloadReason += "VSM Max Resolution; "; }
         if (config::lumen::PROBE_GRID_RESOLUTION != startup.PROBE_GRID_RESOLUTION) { needsReload = true; reloadReason += "Probe Grid Resolution; "; }
         if (config::lumen::VSM_PHYSICAL_PAGE_CAPACITY != startup.VSM_PHYSICAL_PAGE_CAPACITY) { needsReload = true; reloadReason += "VSM Page Capacity; "; }
-        if (config::postprocess::_TRANSLUCENCY_LIGHTING_VOLUME_DIM != startup.TRANSLUCENCY_LIGHTING_VOLUME_DIM) { needsReload = true; reloadReason += "Translucency Volume Dim; "; }
         if (config::lumen::_HARDWARE_RAYTRACING != startup.HARDWARE_RAYTRACING) { needsReload = true; reloadReason += "Hardware Ray Tracing (takes effect next session -- 'T'/'Y' keys change it live without a restart); "; }
         if (config::g_ActiveProfileName != startup.profileName) { needsReload = true; reloadReason += "Profile Preset (changed to " + config::g_ActiveProfileName + "); "; }
 
@@ -1082,25 +1079,6 @@ int main(int argc, char** argv) {
                     config::temporal::JITTER_FRAME_COUNT = static_cast<uint32_t>(jitterCount);
                 }
                 ImGui::Checkbox("Enabled By Default", &config::temporal::ENABLED_BY_DEFAULT);
-                ImGui::EndTabItem();
-            }
-
-            // --- Tab Shadow ---
-            if (ImGui::BeginTabItem("Shadow")) {
-                int shadQual = static_cast<int>(config::shadows::_QUALITY);
-                if (ImGui::DragInt("Shadow Quality", &shadQual, 1, 1, 5)) {
-                    config::shadows::_QUALITY = static_cast<uint32_t>(shadQual);
-                }
-                ImGui::Checkbox("Virtual Shadow Maps", &config::shadows::_VIRTUAL_ENABLE);
-                int maxRes = static_cast<int>(config::shadows::_MAX_RESOLUTION);
-                if (ImGui::DragInt("VSM Max Resolution", &maxRes, 512, 512, 16384)) {
-                    config::shadows::_MAX_RESOLUTION = static_cast<uint32_t>(maxRes);
-                }
-                int cascades = static_cast<int>(config::shadows::_CSM_MAX_CASCADES);
-                if (ImGui::DragInt("CSM Max Cascades", &cascades, 1, 1, 8)) {
-                    config::shadows::_CSM_MAX_CASCADES = static_cast<uint32_t>(cascades);
-                }
-                ImGui::DragFloat("CSM Distance Scale", &config::shadows::_DISTANCE_SCALE, 0.05f, 0.1f, 10.0f);
                 ImGui::EndTabItem();
             }
 
@@ -1180,10 +1158,6 @@ int main(int argc, char** argv) {
                 int fxQual = static_cast<int>(config::postprocess::_EFFECTS_QUALITY);
                 if (ImGui::DragInt("Effects Quality", &fxQual, 1, 1, 5)) {
                     config::postprocess::_EFFECTS_QUALITY = static_cast<uint32_t>(fxQual);
-                }
-                int dim = static_cast<int>(config::postprocess::_TRANSLUCENCY_LIGHTING_VOLUME_DIM);
-                if (ImGui::DragInt("Translucency Volume Dim", &dim, 8, 8, 256)) {
-                    config::postprocess::_TRANSLUCENCY_LIGHTING_VOLUME_DIM = static_cast<uint32_t>(dim);
                 }
                 ImGui::EndTabItem();
             }
@@ -2109,6 +2083,18 @@ int main(int argc, char** argv) {
         vkResetCommandBuffer(cmdEarly, 0);
         VkCommandBufferBeginInfo cmdEarlyBeginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
         vkBeginCommandBuffer(cmdEarly, &cmdEarlyBeginInfo);
+
+        // Applies every m_EntityBuffer patch queued by this frame's streaming tick above
+        // (SetStreamingUnitState() calls -- no command buffer existed yet at that point in the loop,
+        // see that function's own comment) via vkCmdUpdateBuffer, right at the start of cmdEarly --
+        // this frame's first GPU submission (see this block's own comment just above: "nothing before
+        // this point in the frame touches the swapchain, the transfer queue's uploads, or the
+        // async-compute queue"), so the patch + its trailing barrier are visible to every later pass
+        // this frame that reads m_EntityBuffer (RecordFrameEarly below, cmdMid's culling/LOD compute
+        // via same-queue submission order, and asyncComputeCmd via its own semaphore wait on this very
+        // submission) with no separate wait of any kind. See VulkanContext::
+        // FlushPendingEntityDataPatches()'s own comment for the full rationale.
+        vkContext.FlushPendingEntityDataPatches(cmdEarly);
 
         // Phase 5 (Streaming & Monde roadmap, Part 1): pass the REBASED camera position (both to
         // `cameraPositionWorld` and CameraFrameInfo::position), never the raw absolute one --

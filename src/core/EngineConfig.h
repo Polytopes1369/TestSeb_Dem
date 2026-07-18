@@ -58,17 +58,13 @@ inline uint32_t JITTER_FRAME_COUNT = 16u;
 inline bool ENABLED_BY_DEFAULT = true;
 } // namespace temporal
 
-namespace shadows {
-inline uint32_t _QUALITY = 4;
-inline bool _VIRTUAL_ENABLE = true;
-inline uint32_t _MAX_RESOLUTION = 4096;
-inline uint32_t _CSM_MAX_CASCADES = 6;
-inline float _DISTANCE_SCALE = 1.50f;
-} // namespace shadows
-
 namespace lumen {
 inline uint32_t CARDS_PER_FRAME_BUDGET = 16u;
 inline uint32_t EVICTION_FRAME_DELAY = 600u;
+// Surface Cache atlas resolution (square, texels) -- see EngineConfig_Low.h's own comment on this
+// value for the full rationale. Wired into renderer::SurfaceCachePass::Init(), replacing what used
+// to be a hardcoded geometry::kSurfaceCacheAtlasSize regardless of tier.
+inline uint32_t SURFACE_CACHE_ATLAS_SIZE = 2048u;
 
 inline uint32_t PROBE_GRID_RESOLUTION = 64u;
 inline float PROBE_SPACING = 1.0f;
@@ -77,6 +73,15 @@ inline uint32_t PROBE_SAMPLE_DIRECTIONS = 14u;
 inline uint32_t MAX_TRACED_ENTITIES = 128u;
 inline uint32_t RADIOSITY_BOUNCE_COUNT = 4u;
 inline uint32_t SURFACE_CACHE_GI_SAMPLE_COUNT = 64u;
+
+// Global SDF clipmap quality (renderer::GlobalSDFPass) -- voxels per axis per clipmap level, and
+// per-entity Mesh SDF bake resolution respectively. Tier-scaled exactly like the two members
+// above (see EngineConfig_{Low,Medium,High,Extrem}.h's own config_*::lumen::GLOBAL_SDF_* comment
+// for the full rationale); GlobalSDFPass::Init() reads these at the top of every call, mirroring
+// renderer::WorldProbeGridPass::Init()'s own kGridResolution/kProbeSpacing/
+// kProbeSampleDirections = config::lumen::... assignment convention.
+inline uint32_t GLOBAL_SDF_CLIPMAP_RESOLUTION = 32u;
+inline uint32_t GLOBAL_SDF_ENTITY_RESOLUTION = 24u;
 
 inline uint32_t SCREEN_PROBE_TILE_SIZE = 8u;
 inline uint32_t SCREEN_PROBE_RAY_COUNT = 64u;
@@ -108,6 +113,11 @@ inline uint32_t VSM_MAX_PAGES_RENDERED_PER_FRAME = 512u;
 inline uint32_t VSM_MAX_DYNAMIC_PAGES_RENDERED_PER_FRAME = 512u;
 
 inline bool _HARDWARE_RAYTRACING = true;
+// _TRACE_MESH_SDF/_REFLECTIONS_ALLOW/_REFLECTIONS_DOWNSAMPLE_FACTOR/_HARDWARE_RAYTRACING_NANITE_MODE
+// removed (2026-07-18 merge reconciliation): verified zero real consumers anywhere in the codebase
+// (only self-referential ApplyProfile() assignment + a decorative ImGui checkbox in main.cpp that
+// wrote them but nothing downstream ever read them) -- same "disconnected cvar" pattern as the
+// broader main-branch cvar cleanup sweep (feedback_wire_in_vs_remove_heuristic).
 inline bool _MEGALIGHTS_ENABLE = true;
 } // namespace lumen
 
@@ -150,7 +160,10 @@ inline float TYPED_LIGHT_INTENSITY_SCALE = 1.0f;
 
 namespace postprocess {
 inline uint32_t _EFFECTS_QUALITY = 4;
-inline uint32_t _TRANSLUCENCY_LIGHTING_VOLUME_DIM = 64;
+// _REFRACTION_QUALITY (this branch) and _TRANSLUCENCY_LIGHTING_VOLUME_DIM (main) both removed
+// (2026-07-18 merge reconciliation): verified neither has a real downstream consumer -- each was
+// only round-tripped through ApplyProfile()/a main.cpp startup-reload-detection struct/an ImGui
+// slider, with nothing in any renderer:: pass or shader ever reading either value.
 
 // --- Phase PP1 (post-process stack roadmap): Physical Camera / Auto Exposure / White Balance /
 // Color Correction / Tone Mapping / Gamma Correction -- renderer::PostProcessPass's own tunable
@@ -236,6 +249,12 @@ inline float BLOOM_SOFT_KNEE = 0.5f;
 // was verified safe: with the fix, toggling bloom fully off vs. on at 1.0 produces an identical final
 // image in --test-pipeline, i.e. bloom no longer introduces any non-finite value (the pre-existing
 // overexposure of that fixed test camera's framing is a separate, bloom-independent matter).
+//
+// Independently re-discovered and re-fixed by a concurrent branch (code-audit-optimization) via a
+// read-side-only SanitizeHDR guard in PostProcessComposite.comp -- that fix is a strict subset of
+// this one (it stops the NaN from propagating past the read but does not stop the store-time +Inf
+// itself); this more complete store-clamp + read-guard combination is kept. See EXPOSURE_APERTURE's
+// own comment for a separate, still-open overexposure follow-up unrelated to this bug.
 inline float BLOOM_INTENSITY = 1.0f;
 inline float BLOOM_UPSAMPLE_RADIUS = 1.0f;
 
@@ -389,6 +408,9 @@ inline bool PATH_TRACER_ENABLED = false;
 #endif
 } // namespace debugview
 
+// namespace volumetrics { _TEXTURE_QUALITY/_SKY_ATMOSPHERE_QUALITY/_VOLUMETRIC_FOG_ENABLE } removed
+// (2026-07-18 merge reconciliation): verified zero real consumers -- same disconnected-cvar pattern
+// as the main-branch cvar cleanup sweep; only a decorative ImGui "Volumetric" tab wrote them.
 // Local Fog Volumes (UE5.8 rendering-parity gap G8) -- localized, oriented-box or sphere fog
 // regions, each with its own density/color/vertical-falloff and an optional shadowed sun
 // contribution, injected ADDITIVELY into renderer::AtmosVolumetricFogPass's froxel grid on top of
@@ -448,7 +470,7 @@ inline LocalFogVolumeConfig VOLUMES[kMaxLocalFogVolumes] = {
 // Simulation) -- live simulation knobs, not a quality-preset tier, so unlike volumetrics:: above
 // these are NOT mirrored into EngineConfig_{Low,Medium,High,Extrem}.h / Apply*Preset(): they are
 // runtime state a user tunes live via the Volumetric ImGui tab, the same way config::temporal::
-// BLEND_ALPHA or config::shadows' non-"_QUALITY" members already are.
+// BLEND_ALPHA already is.
 namespace atmos {
 inline float TEMPERATURE_CELSIUS = 22.0f;
 inline float RELATIVE_HUMIDITY = 0.55f; // Fraction [0,1], NOT percent -- see AtmosClimatePass::RecordUpdate's own Magnus-Tetens comment.
@@ -783,14 +805,15 @@ inline void ApplyProfile(std::string_view profileName) {
         config_extrem::temporal::VARIANCE_CLAMP_FACTOR;
     temporal::JITTER_FRAME_COUNT = config_extrem::temporal::JITTER_FRAME_COUNT;
     temporal::ENABLED_BY_DEFAULT = config_extrem::temporal::ENABLED_BY_DEFAULT;
-    shadows::_QUALITY = config_extrem::shadows::QUALITY;
-    shadows::_VIRTUAL_ENABLE = config_extrem::shadows::VIRTUAL_ENABLE;
-    shadows::_MAX_RESOLUTION = config_extrem::shadows::MAX_RESOLUTION;
-    shadows::_CSM_MAX_CASCADES = config_extrem::shadows::CSM_MAX_CASCADES;
-    shadows::_DISTANCE_SCALE = config_extrem::shadows::DISTANCE_SCALE;
+    // temporal::_ANTI_ALIASING_* (this branch) and shadows::_* (main) both removed (2026-07-18
+    // merge reconciliation): their config_extrem:: source fields were independently removed by
+    // both branches' own dead-cvar sweeps (see EngineConfig_Extrem.h), and neither destination
+    // field has a real consumer anywhere outside this now-deleted round trip.
     lumen::CARDS_PER_FRAME_BUDGET =
         config_extrem::lumen::CARDS_PER_FRAME_BUDGET;
     lumen::EVICTION_FRAME_DELAY = config_extrem::lumen::EVICTION_FRAME_DELAY;
+    lumen::SURFACE_CACHE_ATLAS_SIZE =
+        config_extrem::lumen::SURFACE_CACHE_ATLAS_SIZE;
     lumen::PROBE_GRID_RESOLUTION = config_extrem::lumen::PROBE_GRID_RESOLUTION;
     lumen::PROBE_SPACING = config_extrem::lumen::PROBE_SPACING;
     lumen::PROBE_SAMPLE_DIRECTIONS =
@@ -800,6 +823,10 @@ inline void ApplyProfile(std::string_view profileName) {
         config_extrem::lumen::RADIOSITY_BOUNCE_COUNT;
     lumen::SURFACE_CACHE_GI_SAMPLE_COUNT =
         config_extrem::lumen::SURFACE_CACHE_GI_SAMPLE_COUNT;
+    lumen::GLOBAL_SDF_CLIPMAP_RESOLUTION =
+        config_extrem::lumen::GLOBAL_SDF_CLIPMAP_RESOLUTION;
+    lumen::GLOBAL_SDF_ENTITY_RESOLUTION =
+        config_extrem::lumen::GLOBAL_SDF_ENTITY_RESOLUTION;
     lumen::SCREEN_PROBE_TILE_SIZE =
         config_extrem::lumen::SCREEN_PROBE_TILE_SIZE;
     lumen::SCREEN_PROBE_RAY_COUNT =
@@ -815,8 +842,6 @@ inline void ApplyProfile(std::string_view profileName) {
     lumen::_HARDWARE_RAYTRACING = config_extrem::lumen::HARDWARE_RAYTRACING;
     lumen::_MEGALIGHTS_ENABLE = config_extrem::lumen::MEGALIGHTS_ENABLE;
     postprocess::_EFFECTS_QUALITY = config_extrem::postprocess::EFFECTS_QUALITY;
-    postprocess::_TRANSLUCENCY_LIGHTING_VOLUME_DIM =
-        config_extrem::postprocess::TRANSLUCENCY_LIGHTING_VOLUME_DIM;
   } else if (profileName == "High") {
     WINDOW_WIDTH = config_high::WINDOW_WIDTH;
     WINDOW_HEIGHT = config_high::WINDOW_HEIGHT;
@@ -835,13 +860,11 @@ inline void ApplyProfile(std::string_view profileName) {
         config_high::temporal::VARIANCE_CLAMP_FACTOR;
     temporal::JITTER_FRAME_COUNT = config_high::temporal::JITTER_FRAME_COUNT;
     temporal::ENABLED_BY_DEFAULT = config_high::temporal::ENABLED_BY_DEFAULT;
-    shadows::_QUALITY = config_high::shadows::QUALITY;
-    shadows::_VIRTUAL_ENABLE = config_high::shadows::VIRTUAL_ENABLE;
-    shadows::_MAX_RESOLUTION = config_high::shadows::MAX_RESOLUTION;
-    shadows::_CSM_MAX_CASCADES = config_high::shadows::CSM_MAX_CASCADES;
-    shadows::_DISTANCE_SCALE = config_high::shadows::DISTANCE_SCALE;
+    // temporal::_ANTI_ALIASING_* / shadows::_* removed -- see the "Extrem" branch above's own
+    // comment for the full rationale (identical reasoning applies at every tier).
     lumen::CARDS_PER_FRAME_BUDGET = config_high::lumen::CARDS_PER_FRAME_BUDGET;
     lumen::EVICTION_FRAME_DELAY = config_high::lumen::EVICTION_FRAME_DELAY;
+    lumen::SURFACE_CACHE_ATLAS_SIZE = config_high::lumen::SURFACE_CACHE_ATLAS_SIZE;
     lumen::PROBE_GRID_RESOLUTION = config_high::lumen::PROBE_GRID_RESOLUTION;
     lumen::PROBE_SPACING = config_high::lumen::PROBE_SPACING;
     lumen::PROBE_SAMPLE_DIRECTIONS =
@@ -850,6 +873,10 @@ inline void ApplyProfile(std::string_view profileName) {
     lumen::RADIOSITY_BOUNCE_COUNT = config_high::lumen::RADIOSITY_BOUNCE_COUNT;
     lumen::SURFACE_CACHE_GI_SAMPLE_COUNT =
         config_high::lumen::SURFACE_CACHE_GI_SAMPLE_COUNT;
+    lumen::GLOBAL_SDF_CLIPMAP_RESOLUTION =
+        config_high::lumen::GLOBAL_SDF_CLIPMAP_RESOLUTION;
+    lumen::GLOBAL_SDF_ENTITY_RESOLUTION =
+        config_high::lumen::GLOBAL_SDF_ENTITY_RESOLUTION;
     lumen::SCREEN_PROBE_TILE_SIZE = config_high::lumen::SCREEN_PROBE_TILE_SIZE;
     lumen::SCREEN_PROBE_RAY_COUNT = config_high::lumen::SCREEN_PROBE_RAY_COUNT;
     lumen::SCREEN_PROBE_TEMPORAL_ALPHA =
@@ -863,8 +890,6 @@ inline void ApplyProfile(std::string_view profileName) {
     lumen::_HARDWARE_RAYTRACING = config_high::lumen::HARDWARE_RAYTRACING;
     lumen::_MEGALIGHTS_ENABLE = config_high::lumen::MEGALIGHTS_ENABLE;
     postprocess::_EFFECTS_QUALITY = config_high::postprocess::EFFECTS_QUALITY;
-    postprocess::_TRANSLUCENCY_LIGHTING_VOLUME_DIM =
-        config_high::postprocess::TRANSLUCENCY_LIGHTING_VOLUME_DIM;
   } else if (profileName == "Medium") {
     WINDOW_WIDTH = config_medium::WINDOW_WIDTH;
     WINDOW_HEIGHT = config_medium::WINDOW_HEIGHT;
@@ -883,14 +908,13 @@ inline void ApplyProfile(std::string_view profileName) {
         config_medium::temporal::VARIANCE_CLAMP_FACTOR;
     temporal::JITTER_FRAME_COUNT = config_medium::temporal::JITTER_FRAME_COUNT;
     temporal::ENABLED_BY_DEFAULT = config_medium::temporal::ENABLED_BY_DEFAULT;
-    shadows::_QUALITY = config_medium::shadows::QUALITY;
-    shadows::_VIRTUAL_ENABLE = config_medium::shadows::VIRTUAL_ENABLE;
-    shadows::_MAX_RESOLUTION = config_medium::shadows::MAX_RESOLUTION;
-    shadows::_CSM_MAX_CASCADES = config_medium::shadows::CSM_MAX_CASCADES;
-    shadows::_DISTANCE_SCALE = config_medium::shadows::DISTANCE_SCALE;
+    // temporal::_ANTI_ALIASING_* / shadows::_* removed -- see the "Extrem" branch above's own
+    // comment for the full rationale (identical reasoning applies at every tier).
     lumen::CARDS_PER_FRAME_BUDGET =
         config_medium::lumen::CARDS_PER_FRAME_BUDGET;
     lumen::EVICTION_FRAME_DELAY = config_medium::lumen::EVICTION_FRAME_DELAY;
+    lumen::SURFACE_CACHE_ATLAS_SIZE =
+        config_medium::lumen::SURFACE_CACHE_ATLAS_SIZE;
     lumen::PROBE_GRID_RESOLUTION = config_medium::lumen::PROBE_GRID_RESOLUTION;
     lumen::PROBE_SPACING = config_medium::lumen::PROBE_SPACING;
     lumen::PROBE_SAMPLE_DIRECTIONS =
@@ -900,6 +924,10 @@ inline void ApplyProfile(std::string_view profileName) {
         config_medium::lumen::RADIOSITY_BOUNCE_COUNT;
     lumen::SURFACE_CACHE_GI_SAMPLE_COUNT =
         config_medium::lumen::SURFACE_CACHE_GI_SAMPLE_COUNT;
+    lumen::GLOBAL_SDF_CLIPMAP_RESOLUTION =
+        config_medium::lumen::GLOBAL_SDF_CLIPMAP_RESOLUTION;
+    lumen::GLOBAL_SDF_ENTITY_RESOLUTION =
+        config_medium::lumen::GLOBAL_SDF_ENTITY_RESOLUTION;
     lumen::SCREEN_PROBE_TILE_SIZE =
         config_medium::lumen::SCREEN_PROBE_TILE_SIZE;
     lumen::SCREEN_PROBE_RAY_COUNT =
@@ -915,8 +943,6 @@ inline void ApplyProfile(std::string_view profileName) {
     lumen::_HARDWARE_RAYTRACING = config_medium::lumen::HARDWARE_RAYTRACING;
     lumen::_MEGALIGHTS_ENABLE = config_medium::lumen::MEGALIGHTS_ENABLE;
     postprocess::_EFFECTS_QUALITY = config_medium::postprocess::EFFECTS_QUALITY;
-    postprocess::_TRANSLUCENCY_LIGHTING_VOLUME_DIM =
-        config_medium::postprocess::TRANSLUCENCY_LIGHTING_VOLUME_DIM;
   } else if (profileName == "Low") {
     WINDOW_WIDTH = config_low::WINDOW_WIDTH;
     WINDOW_HEIGHT = config_low::WINDOW_HEIGHT;
@@ -935,13 +961,11 @@ inline void ApplyProfile(std::string_view profileName) {
         config_low::temporal::VARIANCE_CLAMP_FACTOR;
     temporal::JITTER_FRAME_COUNT = config_low::temporal::JITTER_FRAME_COUNT;
     temporal::ENABLED_BY_DEFAULT = config_low::temporal::ENABLED_BY_DEFAULT;
-    shadows::_QUALITY = config_low::shadows::QUALITY;
-    shadows::_VIRTUAL_ENABLE = config_low::shadows::VIRTUAL_ENABLE;
-    shadows::_MAX_RESOLUTION = config_low::shadows::MAX_RESOLUTION;
-    shadows::_CSM_MAX_CASCADES = config_low::shadows::CSM_MAX_CASCADES;
-    shadows::_DISTANCE_SCALE = config_low::shadows::DISTANCE_SCALE;
+    // temporal::_ANTI_ALIASING_* / shadows::_* removed -- see the "Extrem" branch above's own
+    // comment for the full rationale (identical reasoning applies at every tier).
     lumen::CARDS_PER_FRAME_BUDGET = config_low::lumen::CARDS_PER_FRAME_BUDGET;
     lumen::EVICTION_FRAME_DELAY = config_low::lumen::EVICTION_FRAME_DELAY;
+    lumen::SURFACE_CACHE_ATLAS_SIZE = config_low::lumen::SURFACE_CACHE_ATLAS_SIZE;
     lumen::PROBE_GRID_RESOLUTION = config_low::lumen::PROBE_GRID_RESOLUTION;
     lumen::PROBE_SPACING = config_low::lumen::PROBE_SPACING;
     lumen::PROBE_SAMPLE_DIRECTIONS = config_low::lumen::PROBE_SAMPLE_DIRECTIONS;
@@ -949,6 +973,10 @@ inline void ApplyProfile(std::string_view profileName) {
     lumen::RADIOSITY_BOUNCE_COUNT = config_low::lumen::RADIOSITY_BOUNCE_COUNT;
     lumen::SURFACE_CACHE_GI_SAMPLE_COUNT =
         config_low::lumen::SURFACE_CACHE_GI_SAMPLE_COUNT;
+    lumen::GLOBAL_SDF_CLIPMAP_RESOLUTION =
+        config_low::lumen::GLOBAL_SDF_CLIPMAP_RESOLUTION;
+    lumen::GLOBAL_SDF_ENTITY_RESOLUTION =
+        config_low::lumen::GLOBAL_SDF_ENTITY_RESOLUTION;
     lumen::SCREEN_PROBE_TILE_SIZE = config_low::lumen::SCREEN_PROBE_TILE_SIZE;
     lumen::SCREEN_PROBE_RAY_COUNT = config_low::lumen::SCREEN_PROBE_RAY_COUNT;
     lumen::SCREEN_PROBE_TEMPORAL_ALPHA =
@@ -962,8 +990,6 @@ inline void ApplyProfile(std::string_view profileName) {
     lumen::_HARDWARE_RAYTRACING = config_low::lumen::HARDWARE_RAYTRACING;
     lumen::_MEGALIGHTS_ENABLE = config_low::lumen::MEGALIGHTS_ENABLE;
     postprocess::_EFFECTS_QUALITY = config_low::postprocess::EFFECTS_QUALITY;
-    postprocess::_TRANSLUCENCY_LIGHTING_VOLUME_DIM =
-        config_low::postprocess::TRANSLUCENCY_LIGHTING_VOLUME_DIM;
   }
 }
 

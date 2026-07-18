@@ -122,6 +122,19 @@ namespace renderer {
         // pass needs to originate its hemisphere rays from -- the capture pass's own depth buffer
         // is a same-lifetime scratch image (see class comment) with no sampled-read usage, so it
         // cannot serve that purpose.
+        //
+        // Re-verified during the 2026-07-18 VRAM-reduction audit (an RGBA16F downgrade here was
+        // in scope, then deliberately reverted): VulkanContext::GenerateTerrain(300.0f, 300.0f, ...)
+        // bakes the floor/terrain entity's vertices across roughly [-150, +150] on X/Z (geom_terrain
+        // .comp's xPos/zPos), and SurfaceCacheCapture.vert/.frag write that raw, un-rebased position
+        // straight through (outWorldPos = inPosition) -- NOT the ~14m camera-orbit scale
+        // ScreenProbeTemporal.comp's own kDisocclusionDistanceThreshold comment assumes. fp16's ULP
+        // at |150| is ~0.125 world units, and SurfaceCacheGIInject.comp uses this exact value,
+        // unmodified, as a hemisphere-ray origin with only a 1.0e-2 unit surface bias
+        // (biasedOrigin = origin + normal * 1.0e-2) -- quantization error an order of magnitude
+        // larger than that bias risks visible GI self-intersection/light-leak artifacts on the
+        // terrain specifically. Kept at fp32; see renderer::ReflectionPass::kWorldPosFormat's own
+        // comment for the same finding applied to its own (also-un-rebased) world-position slots.
         static constexpr VkFormat kWorldPosFormat = VK_FORMAT_R32G32B32A32_SFLOAT;
         static constexpr VkFormat kDepthFormat = VK_FORMAT_D32_SFLOAT;
 
@@ -150,7 +163,8 @@ namespace renderer {
         // Reads the surface-cache card table + every fallback mesh's geometry from
         // `cacheFilePath` (written by geometry::CacheFileManager::WriteCacheFile), uploads one
         // combined vertex/index GPU buffer covering every entity's Fallback Mesh, allocates the 6
-        // atlas images + 1 shared depth image (all geometry::kSurfaceCacheAtlasSize^2), clears the
+        // atlas images + 1 shared depth image (all m_AtlasSize^2, tier-scaled from
+        // config::lumen::SURFACE_CACHE_ATLAS_SIZE -- see that member's own comment), clears the
         // atlas images to a neutral default (so a card not yet captured samples something sane
         // rather than undefined memory), and builds the capture graphics pipeline. A scene with
         // zero cards is valid (Init() succeeds, RecordCapture() is then a no-op) -- only an actual
@@ -440,7 +454,21 @@ namespace renderer {
         std::vector<geometry::SurfaceCacheCardEntry> m_Cards;
         std::vector<CardRuntimeState> m_CardStates; // Parallel to m_Cards.
         std::unordered_map<uint32_t, EntityDrawRange> m_EntityRanges; // Keyed by entityID.
-        geometry::SurfaceCacheAtlasAllocator m_AtlasAllocator{ geometry::kSurfaceCacheAtlasSize };
+
+        // Tier-scaled runtime atlas resolution (config::lumen::SURFACE_CACHE_ATLAS_SIZE, re-read at
+        // the top of Init() -- see that method's own comment), replacing what used to be a single
+        // hardcoded geometry::kSurfaceCacheAtlasSize for every profile. geometry::
+        // kSurfaceCacheAtlasSize itself is NOT repurposed here: it remains the offline/cook-time
+        // ceiling geometry::PackCardsIntoAtlas validates against when CacheFileManager bakes the
+        // .cache file (a build step with no notion of "which GPU tier will load this later"), always
+        // the largest possible tier size (2048) regardless of which tier actually runs the result --
+        // the runtime SurfaceCacheAtlasAllocator below is explicitly designed to hold only a SUBSET
+        // of cards resident at once (see its own class comment), so a smaller runtime atlas on
+        // Low/Medium is a supported degradation (more eviction pressure), never a correctness issue.
+        // Default-initialized to the same 2048 ceiling purely as a pre-Init() placeholder; Init()
+        // always overwrites both this and m_AtlasAllocator together so they never disagree.
+        uint32_t m_AtlasSize = geometry::kSurfaceCacheAtlasSize;
+        geometry::SurfaceCacheAtlasAllocator m_AtlasAllocator{ m_AtlasSize };
         std::deque<uint32_t> m_DirtyCardQueue; // Card indices queued for capture by UpdateVisibility(), drained by RecordCapture().
 
         // Phase 0.3 (PCG roadmap, dynamic Lumen registration):

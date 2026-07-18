@@ -134,6 +134,14 @@ namespace renderer {
         const core::EntityData* entityDataCPU, const renderer::MaterialTable& materialTable) {
         kCardsPerFrameBudget = config::lumen::CARDS_PER_FRAME_BUDGET;
         kEvictionFrameDelay = config::lumen::EVICTION_FRAME_DELAY;
+        // VRAM-reduction (2026-07-18): tier-scaled atlas resolution, replacing the formerly-hardcoded
+        // geometry::kSurfaceCacheAtlasSize (2048 on every profile) -- see m_AtlasSize's own member
+        // comment. Logged explicitly since this directly drives the 6 atlas images' allocation size
+        // just below (STEP 2) and is otherwise easy to lose track of across profiles.
+        m_AtlasSize = config::lumen::SURFACE_CACHE_ATLAS_SIZE;
+        LOG_INFO(std::format(
+            "[SurfaceCachePass] Surface Cache atlas resolution for profile '{}': {}x{} texels.",
+            config::g_ActiveProfileName, m_AtlasSize, m_AtlasSize));
 
         Shutdown();
 
@@ -189,7 +197,13 @@ namespace renderer {
         // Every card starts non-resident (see CardRuntimeState's own comment) -- UpdateVisibility()
         // is what grants a card its first atlas page, the first time it is actually on screen.
         m_CardStates.assign(m_Cards.size(), CardRuntimeState{});
-        m_AtlasAllocator.Reset();
+        // Full reconstruction (not just Reset()): Reset() alone only clears the free-rect list back
+        // to a single rect covering the EXISTING m_AtlasSize (geometry::SurfaceCacheAtlasAllocator
+        // has no setter for it), so re-profiling to a different tier across two Init() calls (e.g.
+        // gpu_profile.cfg changing between runs) would otherwise leave the allocator sized for the
+        // PREVIOUS profile. Re-constructing here guarantees the allocator always matches this call's
+        // freshly-resolved m_AtlasSize above.
+        m_AtlasAllocator = geometry::SurfaceCacheAtlasAllocator(m_AtlasSize);
         m_DirtyCardQueue.clear();
 
         std::vector<geometry::FallbackMeshIndexEntry> fallbackTable;
@@ -256,7 +270,9 @@ namespace renderer {
 
         VkImageCreateInfo atlasImageInfo{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
         atlasImageInfo.imageType = VK_IMAGE_TYPE_2D;
-        atlasImageInfo.extent = { geometry::kSurfaceCacheAtlasSize, geometry::kSurfaceCacheAtlasSize, 1 };
+        // Tier-scaled (m_AtlasSize), NOT the cook-time geometry::kSurfaceCacheAtlasSize ceiling --
+        // see m_AtlasSize's own member comment in SurfaceCachePass.h.
+        atlasImageInfo.extent = { m_AtlasSize, m_AtlasSize, 1 };
         atlasImageInfo.mipLevels = 1;
         atlasImageInfo.arrayLayers = 1;
         atlasImageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
@@ -748,7 +764,13 @@ namespace renderer {
         geometry::SurfaceCacheCardEntry& card = m_Cards[cardIndex];
         card.atlasOffset[0] = paddedRect.x;
         card.atlasOffset[1] = paddedRect.y;
-        const float invAtlasSize = 1.0f / static_cast<float>(geometry::kSurfaceCacheAtlasSize);
+        // Must divide by the ACTUAL runtime atlas size (m_AtlasSize == m_AtlasAllocator's own size,
+        // kept in sync -- see that member's comment), not the cook-time geometry::
+        // kSurfaceCacheAtlasSize ceiling: paddedRect's x/y/width/height come from m_AtlasAllocator,
+        // whose logical space IS m_AtlasSize, so normalizing against a different (larger) constant
+        // would silently produce wrong uvMin/uvMax on any tier below the 2048 ceiling (every sampled
+        // GI/reflection read would land in the wrong quadrant of the atlas).
+        const float invAtlasSize = 1.0f / static_cast<float>(m_AtlasSize);
         card.uvMin[0] = static_cast<float>(card.atlasOffset[0]) * invAtlasSize;
         card.uvMin[1] = static_cast<float>(card.atlasOffset[1]) * invAtlasSize;
         card.uvMax[0] = static_cast<float>(card.atlasOffset[0] + card.atlasSize[0]) * invAtlasSize;

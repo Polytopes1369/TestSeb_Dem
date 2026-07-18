@@ -35,20 +35,13 @@ constexpr uint32_t JITTER_FRAME_COUNT = 16u;
 constexpr bool ENABLED_BY_DEFAULT = true;
 } // namespace temporal
 
-namespace shadows {
-// UE 5.8 Shadows settings (Virtual Shadow Maps enabled on High profile)
-// sg.ShadowQuality=2 (High)
-constexpr uint32_t QUALITY = 2;
-// r.Shadow.Virtual.Enable=1 (Highly optimized shadow performance on RTX 4060)
-constexpr bool VIRTUAL_ENABLE = true;
-constexpr uint32_t MAX_RESOLUTION = 2048;
-constexpr uint32_t CSM_MAX_CASCADES = 4;
-constexpr float DISTANCE_SCALE = 1.00f;
-} // namespace shadows
-
 namespace lumen {
 constexpr uint32_t CARDS_PER_FRAME_BUDGET = 12u;
 constexpr uint32_t EVICTION_FRAME_DELAY = 450u;
+
+// Surface Cache atlas resolution -- see EngineConfig_Low.h's own comment on this value. Midway
+// between Low's 1024 and High/Extrem's 2048.
+constexpr uint32_t SURFACE_CACHE_ATLAS_SIZE = 1536u;
 
 // Standard 48^3 probe grid for precise GI calculations.
 constexpr uint32_t PROBE_GRID_RESOLUTION = 48u;
@@ -58,6 +51,12 @@ constexpr uint32_t PROBE_SAMPLE_DIRECTIONS = 14u;
 constexpr uint32_t MAX_TRACED_ENTITIES = 96u;
 constexpr uint32_t RADIOSITY_BOUNCE_COUNT = 3u;
 constexpr uint32_t SURFACE_CACHE_GI_SAMPLE_COUNT = 48u;
+
+// Global SDF clipmap quality (renderer::GlobalSDFPass): voxels per axis per clipmap level, and
+// per-entity Mesh SDF bake resolution respectively -- see config_low's own comment on these two
+// for the full rationale. Both must stay multiples of 4 (geometry::kSDFBlockDim).
+constexpr uint32_t GLOBAL_SDF_CLIPMAP_RESOLUTION = 28u;
+constexpr uint32_t GLOBAL_SDF_ENTITY_RESOLUTION = 20u;
 
 constexpr uint32_t SCREEN_PROBE_TILE_SIZE = 8u;
 constexpr uint32_t SCREEN_PROBE_RAY_COUNT = 48u;
@@ -81,6 +80,5 @@ constexpr bool MEGALIGHTS_ENABLE = false;
 namespace postprocess {
 // UE 5.8 Post-processing & Effects settings
 constexpr uint32_t EFFECTS_QUALITY = 2;
-constexpr uint32_t TRANSLUCENCY_LIGHTING_VOLUME_DIM = 64;
 } // namespace postprocess
 } // namespace config_medium

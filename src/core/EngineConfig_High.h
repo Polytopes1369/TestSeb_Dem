@@ -22,8 +22,12 @@ constexpr uint32_t MAX_CLUSTER_VERTICES = 64u;
 constexpr uint32_t MAX_CLUSTER_TRIANGLES = 128u;
 constexpr uint32_t PAGE_SIZE_BYTES = 4096u;
 
-constexpr uint64_t VERTEX_BUFFER_BYTES = 1024 * 1024 * 1024;
-constexpr uint64_t INDEX_BUFFER_BYTES = 512 * 1024 * 1024;
+// 1.5GB vertex buffer / 768MB index buffer -- strictly between Medium (1GB/512MB) and Extrem
+// (2GB/1GB). Previously byte-for-byte identical to Medium's own values (an unintentional bug: the
+// single biggest VRAM knob in the engine did not differentiate these two tiers at all), fixed here
+// as the arithmetic midpoint, preserving the same 2:1 vertex:index ratio every other tier uses.
+constexpr uint64_t VERTEX_BUFFER_BYTES = 1536 * 1024 * 1024;
+constexpr uint64_t INDEX_BUFFER_BYTES = 768 * 1024 * 1024;
 } // namespace nanite
 
 namespace temporal {
@@ -35,19 +39,13 @@ constexpr uint32_t JITTER_FRAME_COUNT = 16u;
 constexpr bool ENABLED_BY_DEFAULT = true;
 } // namespace temporal
 
-namespace shadows {
-// UE 5.8 Shadows settings (Epic Virtual Shadow Maps)
-// sg.ShadowQuality=3 (Epic)
-constexpr uint32_t QUALITY = 3;
-constexpr bool VIRTUAL_ENABLE = true;
-constexpr uint32_t MAX_RESOLUTION = 4096;
-constexpr uint32_t CSM_MAX_CASCADES = 4;
-constexpr float DISTANCE_SCALE = 1.20f;
-} // namespace shadows
-
 namespace lumen {
 constexpr uint32_t CARDS_PER_FRAME_BUDGET = 16u;
 constexpr uint32_t EVICTION_FRAME_DELAY = 600u;
+
+// Surface Cache atlas resolution -- see EngineConfig_Low.h's own comment on this value. Full
+// resolution: matches the original fixed 2048 footprint this engine always ran at pre-tiering.
+constexpr uint32_t SURFACE_CACHE_ATLAS_SIZE = 2048u;
 
 // High-quality 64^3 probe grid (262k probes) for flawless global illumination.
 constexpr uint32_t PROBE_GRID_RESOLUTION = 64u;
@@ -57,6 +55,13 @@ constexpr uint32_t PROBE_SAMPLE_DIRECTIONS = 14u;
 constexpr uint32_t MAX_TRACED_ENTITIES = 128u;
 constexpr uint32_t RADIOSITY_BOUNCE_COUNT = 4u;
 constexpr uint32_t SURFACE_CACHE_GI_SAMPLE_COUNT = 64u;
+
+// Global SDF clipmap quality (renderer::GlobalSDFPass): voxels per axis per clipmap level, and
+// per-entity Mesh SDF bake resolution respectively -- see config_low's own comment on these two
+// for the full rationale. Both must stay multiples of 4 (geometry::kSDFBlockDim). High keeps the
+// engine's original, pre-tier-scaling defaults (32 / 24) unchanged.
+constexpr uint32_t GLOBAL_SDF_CLIPMAP_RESOLUTION = 32u;
+constexpr uint32_t GLOBAL_SDF_ENTITY_RESOLUTION = 24u;
 
 constexpr uint32_t SCREEN_PROBE_TILE_SIZE = 8u;
 constexpr uint32_t SCREEN_PROBE_RAY_COUNT = 64u;
@@ -80,6 +85,5 @@ constexpr bool MEGALIGHTS_ENABLE = false;
 namespace postprocess {
 // UE 5.8 Post-processing & Effects settings
 constexpr uint32_t EFFECTS_QUALITY = 3;
-constexpr uint32_t TRANSLUCENCY_LIGHTING_VOLUME_DIM = 64;
 } // namespace postprocess
 } // namespace config_high
