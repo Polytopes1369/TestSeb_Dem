@@ -33,7 +33,41 @@ public:
     VkImageView GetDepthImageView() const { return m_DepthImageView; }
     VkImage GetDepthImage() const { return m_DepthImage; }
     VkFormat GetDepthFormat() const { return m_DepthFormat; }
-    VkCommandBuffer GetCommandBuffer() const { return m_CommandBuffer; }
+    // Phase 2 (Lumen advanced roadmap) fix: this frame's Nanite/GI work is now split across THREE
+    // separate graphics-queue command buffers/submissions (previously one) so the async-compute
+    // queue's Surface Cache TLAS-refit + radiosity injection can run genuinely CONCURRENTLY with
+    // this queue's own Nanite VisBuffer culling/raster work, instead of only ever starting after
+    // the entire graphics frame had already finished (a single vkQueueSubmit's signal semaphores
+    // only fire once every command buffer in that submission completes -- see
+    // renderer::ClusterRenderPipeline::RecordFrameEarly's own class-comment addendum for the full
+    // root-cause explanation). All three are allocated from the SAME m_CommandPool (same graphics
+    // queue family) -- same-queue submission order alone (no semaphore) is what makes cmdEarly's
+    // trailing barriers visible to cmdMid, and cmdMid's to cmdLate, exactly like this codebase's
+    // existing single-command-buffer intra-frame barriers already relied on same-queue ordering
+    // across the [13] HZB rebuild -> next frame boundary.
+    //   - GetCommandBufferEarly(): Virtual Shadow Map/Virtual Texture "begin frame", Surface Cache
+    //     capture, Global SDF update, and (only when async compute is active this frame) the
+    //     RELEASE half of the Surface Cache atlas/TLAS ownership transfer to the async-compute
+    //     queue family. Submitted first, signals GetAsyncComputeCanStartSemaphore(), waits on
+    //     nothing.
+    //   - GetCommandBufferMid(): the Nanite VisBuffer pipeline (LOD selection/culling, HW+SW
+    //     raster, resolve) plus this frame's geometry-streaming triage -- none of this samples the
+    //     Surface Cache atlas/TLAS, so it needs no wait on the async-compute queue at all. It DOES
+    //     wait on GetTransferFinishedSemaphore() (the geometry page pool's own queue-family-
+    //     ownership acquire + decompression + raster reads run here, not in cmdEarly/cmdLate).
+    //     Submitted second (same queue as cmdEarly, so implicitly ordered after it).
+    //   - GetCommandBufferLate(): (only when async compute is active this frame) the ACQUIRE half
+    //     of the Surface Cache ownership transfer back from the async-compute queue family, then
+    //     every GI/reflection/forward pass that reads the Surface Cache atlas/TLAS this same frame
+    //     (Reflection, World Probes, MegaLights' shadow rays, the 3 forward passes), post-process,
+    //     and the final swapchain blit + present transition. Submitted third (same queue,
+    //     implicitly ordered after cmdMid), additionally waits on GetImageAvailableSemaphore() and
+    //     GetAsyncComputeFinishedSemaphore(), and is the ONE submission guarded by the per-frame
+    //     frameFence (main.cpp) -- see that fence's own declaration-site comment for why cmdEarly/
+    //     cmdMid need no fence of their own.
+    VkCommandBuffer GetCommandBufferEarly() const { return m_CommandBuffer; }
+    VkCommandBuffer GetCommandBufferMid() const { return m_CommandBufferMid; }
+    VkCommandBuffer GetCommandBufferLate() const { return m_CommandBufferLate; }
 
     // Visibility Buffer attachments (replaces the classic lit-color G-Buffer target): two
     // single-channel R32_UINT images, index-aligned per-pixel -- ClusterID and local TriangleID
@@ -148,7 +182,12 @@ private:
     VkQueue m_GraphicsQueue = VK_NULL_HANDLE;
     uint32_t m_GraphicsQueueFamilyIndex = 0;
     VkCommandPool m_CommandPool = VK_NULL_HANDLE;
-    VkCommandBuffer m_CommandBuffer = VK_NULL_HANDLE;
+    VkCommandBuffer m_CommandBuffer = VK_NULL_HANDLE; // "cmdEarly" -- see GetCommandBufferEarly()'s own comment.
+    // "cmdMid"/"cmdLate" -- see GetCommandBufferMid()/GetCommandBufferLate()'s own comment. Same
+    // pool as m_CommandBuffer above (same graphics queue family), just 2 more primary command
+    // buffers allocated out of it.
+    VkCommandBuffer m_CommandBufferMid = VK_NULL_HANDLE;
+    VkCommandBuffer m_CommandBufferLate = VK_NULL_HANDLE;
 
     // Dedicated transfer queue (or a fallback alias of m_GraphicsQueue/m_GraphicsQueueFamilyIndex)
     // -- see GetTransferQueue()'s own comment.

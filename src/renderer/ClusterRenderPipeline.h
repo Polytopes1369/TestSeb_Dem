@@ -38,25 +38,69 @@
 // into the ray-traced/GI side of this pipeline (TLAS refit, Surface Cache re-capture, Global SDF
 // object-space compositing -- see m_SurfaceCacheRT/m_SurfaceCache/m_GlobalSDF's own comments below).
 //
-// --- Per-frame GPU work (all recorded by RecordFrame() into ONE command buffer, submitted once:
-// no mid-frame vkQueueSubmit/vkQueueWaitIdle anywhere, the other half of the anti-stutter
-// guarantee) ---
+// --- Per-frame GPU work ---
+// Phase 2 (Lumen advanced roadmap) fix, 2026-07-17: this class used to record the ENTIRE frame
+// into ONE graphics command buffer, submitted once. That single-submission design turned out to
+// make the async-compute queue's Surface Cache work (TLAS refit + radiosity injection) NOT
+// actually concurrent with anything: per the Vulkan spec, a submission's signal semaphores only
+// fire once EVERY command buffer in that submission has finished executing on the GPU, so the
+// async-compute queue could never start before the entire graphics frame (including post-process
+// and the final blit) had already finished -- and the next frame's own top-of-loop fence wait for
+// that async work then serialized everything AGAIN. Net effect: graphics(N) -> async(N) ->
+// graphics(N+1) -> async(N+1) -> ..., zero real overlap, despite the barrier infrastructure being
+// otherwise correct. Fixed by splitting the frame into THREE graphics command buffers/submissions
+// (still zero mid-frame vkQueueWaitIdle/vkDeviceWaitIdle -- the anti-stutter guarantee is
+// preserved, "one submit per phase" replaces "one submit per frame"), letting the async-compute
+// queue's work run genuinely concurrently with the middle one:
+//   - RecordFrameEarly() -> cmdEarly: Virtual Shadow Map/Virtual Texture "begin frame", Surface
+//     Cache capture, Global SDF update, and (async compute active) the RELEASE half of the Surface
+//     Cache atlas/TLAS ownership transfer to the async-compute queue family. Signals
+//     VulkanContext::GetAsyncComputeCanStartSemaphore().
+//   - RecordAsyncCompute() -> asyncComputeCmd (separate queue): ACQUIRE + SurfaceCacheRayTracingPass
+//     ::RecordRefreshTLAS + the radiosity bounce loop + RELEASE back to graphics. Waits on
+//     can-start, signals VulkanContext::GetAsyncComputeFinishedSemaphore(). Runs CONCURRENTLY with
+//     cmdMid below on the GPU (different queue, no wait between them).
+//   - RecordFrameMid() -> cmdMid: everything from this section's old steps 1-7 below (worklist
+//      clears -> two-phase cull/raster -> resolve) PLUS this frame's geometry-streaming triage --
+//      confirmed (by reading every pass' own descriptor bindings, not assumed) to never sample the
+//      Surface Cache atlas, the TLAS, or GI-related Global SDF state, so it needs no wait on the
+//      async-compute queue at all. Same-queue submission order (not a semaphore) is what orders it
+//      after cmdEarly.
+//   - RecordFrameLate() -> cmdLate: (async compute active) the ACQUIRE half of the ownership
+//     transfer back from the async-compute queue family, then every pass that DOES read the
+//     Surface Cache atlas/TLAS this same frame (Screen Trace/World Probe fallback, Reflection,
+//     MegaLights' shadow-visibility rays, World Probe grid rebuild, the 3 forward passes), the
+//     final [8]/[9] HZB rebuild + blit below, and post-process. Waits on
+//     GetAsyncComputeFinishedSemaphore() (plus the swapchain-image-acquire and transfer-queue
+//     semaphores) since this is the submission that actually needs the async work's THIS-FRAME
+//     output -- a genuine same-frame hand-off now, not the old design's one-frame pipeline lag.
+// See main.cpp's own per-frame submit-sequence comment for the exact semaphore/fence graph, and
+// VulkanContext::GetCommandBufferEarly()'s own comment for why 3 command buffers from the SAME
+// pool need no semaphore between themselves (same-queue submission order suffices, exactly like
+// this class' existing intra-frame barriers already relied on for e.g. the [8] HZB rebuild feeding
+// next frame's [2] early cull).
+//
+// The steps below (now split across cmdMid/cmdLate as described above) are otherwise unchanged:
 //   1. Clear the frame's atomic worklists (pending/early/late/software counts) + the software
-//      rasterizer's atomic VisBuffer.
+//      rasterizer's atomic VisBuffer.                                                    [cmdMid]
 //   2. EARLY cull: every leaf cluster vs frustum/backface + last frame's HZB; survivors routed to
-//      the early hardware draw list or the software cluster list; uncertain ones to the pending list.
-//   3. Early hardware raster into the VisBuffer (2x R32_UINT) + depth.
+//      the early hardware draw list or the software cluster list; uncertain ones to the pending
+//      list.                                                                              [cmdMid]
+//   3. Early hardware raster into the VisBuffer (2x R32_UINT) + depth.                    [cmdMid]
 //   4. HZB rebuild from the early depth; LATE cull re-tests exactly the pending list against it.
-//   5. Late hardware raster (loadOp = LOAD on top of the early pass's output).
+//                                                                                          [cmdMid]
+//   5. Late hardware raster (loadOp = LOAD on top of the early pass's output).            [cmdMid]
 //   6. Software raster of every micro-triangle cluster listed this frame (early + late routed).
+//                                                                                          [cmdMid]
 //   7. Resolve: per-pixel hardware-vs-software depth arbitration, barycentric reconstruction,
-//      material evaluation into the output color image.
+//      material evaluation into the output color image.                                  [cmdMid]
 //   8. Second HZB rebuild from the now-complete depth, so next frame's EARLY pass tests against
-//      the full previous-frame occlusion state (the standard two-phase scheme).
+//      the full previous-frame occlusion state (the standard two-phase scheme).          [cmdLate]
 //   9. Blit the resolved image to the swapchain image and transition it to PRESENT_SRC_KHR.
+//                                                                                         [cmdLate]
 // Every inter-pass hazard is covered by an explicit VkMemoryBarrier2/VkImageMemoryBarrier2 inside
-// RecordFrame() or inside the passes' own Record*() functions -- see the .cpp for the exact
-// stage/access/layout reasoning at each step.
+// the Record*() methods above or inside the passes' own Record*() functions -- see the .cpp for
+// the exact stage/access/layout reasoning at each step.
 
 #include <cstdint>
 #include <filesystem>
@@ -215,35 +259,72 @@ namespace renderer {
 
         void Shutdown();
 
-        // Records the entire frame's GPU work (culling -> hybrid raster -> resolve -> blit +
-        // present transition of `swapchainImage`) into `cmd` -- see the class comment's step list.
-        // `camera` supplies view/proj (must be the frame's final matrices: every stage this frame
-        // uses the same viewProj, which is what makes the resolve pass's barycentric
-        // reconstruction exact) and `cameraPositionWorld` the eye point for the backface cone
-        // test. `globalTimeSeconds` (main.cpp's glfwGetTime(), monotonically increasing) drives the
-        // World Position Offset sway function (wpo_deformation.glsl's ApplyWPODeformation, called
-        // identically from ClusterRaster.vert and ClusterSoftwareRaster.comp) -- uploaded once per
-        // frame into m_WPOGlobalsBuffer before either raster pass runs. The caller only
-        // begins/ends/submits the command buffer and presents. `entityTransformsCPU` (Phase 4
-        // integration, UE5.8 parity roadmap, dynamic scenes onto main -- renderer::VulkanContext::
-        // GetEntityTransformsCPU(), index == meshID) drives this frame's TLAS refit
-        // (m_SurfaceCacheRT.RecordRefreshTLAS) and Global SDF object-space compositing
-        // (m_GlobalSDF.RecordUpdate) -- see those two call sites' own comments.
-        // `transferCmd` (VulkanContext::GetTransferCommandBuffer(), already begun/ended and
-        // submitted to the transfer queue by the caller with the ordering main.cpp's per-frame
-        // sequence establishes) is where this frame's geometry page uploads are recorded -- see
-        // GeometryStreamingCoordinator::ProcessFeedbackAndDrainCompletions's own comment.
-        // `asyncComputeCmd` (Phase 2, Lumen advanced roadmap -- VulkanContext::
-        // GetAsyncComputeCommandBuffer(), already begun by the caller, mirrors `transferCmd`'s own
-        // contract) is where SurfaceCacheRayTracingPass::RecordRefreshTLAS + the radiosity bounce
-        // loop are recorded when SetDebugAsyncComputeEnabled(true) (Release default / Debug
-        // default): see this method's own [1z] block comment for the full cross-queue barrier/
-        // semaphore sequencing. The caller ends/submits it exactly like `transferCmd`.
-        void RecordFrame(VkCommandBuffer cmd, VkCommandBuffer transferCmd, VkCommandBuffer asyncComputeCmd,
-            const CameraPushConstants& camera,
+        // Phase 2 (Lumen advanced roadmap) fix: the frame is now recorded across 4 calls instead of
+        // one RecordFrame() -- see this class' own header comment ("Per-frame GPU work") for the
+        // full root-cause/redesign explanation and main.cpp for the exact submit sequence each call
+        // sits between. Every call must happen in this order, every frame:
+        //   RecordFrameEarly() -> [main.cpp ends/submits cmdEarly] ->
+        //   RecordAsyncCompute() -> [main.cpp ends/submits asyncComputeCmd] ->
+        //   RecordFrameMid() -> [main.cpp ends/submits transferCmd, then cmdMid] ->
+        //   RecordFrameLate() -> [main.cpp ends/submits cmdLate, then presents]
+        // `camera`/`cameraPositionWorld`/`cameraFrameInfo`/`globalTimeSeconds`/`entityTransformsCPU`
+        // are only ever passed to RecordFrameEarly() (the first call each frame) -- every later call
+        // reads the same values back from this frame's own scratch state (m_FrameScratch),
+        // populated once by RecordFrameEarly() and valid for the rest of that same frame's 4 calls,
+        // exactly as if this were still one function with function-scope locals.
+
+        // [cmdEarly] Virtual Shadow Map/Virtual Texture "begin frame", Surface Cache capture,
+        // Global SDF update, and -- only when this frame routes through the async-compute queue --
+        // the RELEASE half of the Surface Cache atlas/TLAS ownership transfer to the async-compute
+        // queue family (see RecordSurfaceCacheOwnershipTransfer's own comment for exactly which 5
+        // images + 4 buffers). `camera` supplies view/proj (must be the frame's final matrices:
+        // every later stage this frame uses the same viewProj, which is what makes the resolve
+        // pass's barycentric reconstruction exact) and `cameraPositionWorld` the eye point for the
+        // backface cone test. `globalTimeSeconds` (main.cpp's glfwGetTime(), monotonically
+        // increasing) drives the World Position Offset sway function (wpo_deformation.glsl's
+        // ApplyWPODeformation) -- computed here, actually uploaded in RecordFrameMid() before either
+        // raster pass runs. `entityTransformsCPU` (Phase 4 integration, UE5.8 parity roadmap --
+        // renderer::VulkanContext::GetEntityTransformsCPU(), index == meshID) drives this frame's
+        // TLAS refit (m_SurfaceCacheRT.RecordRefreshTLAS, in RecordAsyncCompute()/here depending on
+        // routing) and Global SDF object-space compositing (m_GlobalSDF.RecordUpdate, here).
+        void RecordFrameEarly(VkCommandBuffer cmdEarly, const CameraPushConstants& camera,
             const maths::vec3& cameraPositionWorld, const CameraFrameInfo& cameraFrameInfo,
-            float globalTimeSeconds, VkImage swapchainImage, VkImageView swapchainImageView,
-            const core::EntityTransformCPU* entityTransformsCPU);
+            float globalTimeSeconds, const core::EntityTransformCPU* entityTransformsCPU);
+
+        // [asyncComputeCmd] ACQUIRE (from graphics) + SurfaceCacheRayTracingPass::RecordRefreshTLAS
+        // + the radiosity bounce loop + RELEASE (back to graphics) -- a no-op (records nothing) if
+        // this frame's routing decision (computed by RecordFrameEarly(), stored in m_FrameScratch)
+        // was the fully-graphics-queue-serialized fallback path instead. `asyncComputeCmd`
+        // (VulkanContext::GetAsyncComputeCommandBuffer(), already begun by the caller AFTER cmdEarly
+        // has been submitted -- see main.cpp's own comment on why the async-compute fence wait is
+        // deliberately deferred to right before this) is ended/submitted by the caller exactly like
+        // cmdEarly.
+        void RecordAsyncCompute(VkCommandBuffer asyncComputeCmd);
+
+        // [cmdMid] The Nanite VisBuffer pipeline (worklist clears -> two-phase cull/raster -> HZB ->
+        // resolve) plus this frame's geometry-streaming triage -- confirmed by reading every pass'
+        // own descriptor bindings (not assumed) to never sample the Surface Cache atlas, the TLAS,
+        // or GI-related Global SDF state, so this command buffer needs no wait on the async-compute
+        // queue's own submission at all (only on the transfer queue's, for the geometry page pool's
+        // own ownership-transfer acquire + decompression this method records). `transferCmd`
+        // (VulkanContext::GetTransferCommandBuffer(), already begun by the caller) is where this
+        // frame's geometry page uploads are recorded -- see
+        // GeometryStreamingCoordinator::ProcessFeedbackAndDrainCompletions's own comment. The caller
+        // ends/submits both `transferCmd` (first) and `cmdMid` (waiting on the former).
+        void RecordFrameMid(VkCommandBuffer cmdMid, VkCommandBuffer transferCmd);
+
+        // [cmdLate] -- only when this frame routed through the async-compute queue -- the ACQUIRE
+        // half of the Surface Cache ownership transfer back from the async-compute queue family
+        // (this command buffer's very first GPU work, since every pass below reads what it
+        // acquires), then every pass that samples the Surface Cache atlas/TLAS THIS SAME FRAME
+        // (Screen Trace's World Probe fallback, Reflection, MegaLights' shadow-visibility rays,
+        // World Probe grid rebuild, the 3 forward passes), the second HZB rebuild, post-process, and
+        // finally the blit of the resolved/post-processed image into `swapchainImage`
+        // (`swapchainImageView` for the Debug-only ImGui overlay) + the PRESENT_SRC_KHR transition.
+        // The caller ends/submits `cmdLate` (waiting on the swapchain-acquire semaphore and
+        // VulkanContext::GetAsyncComputeFinishedSemaphore(), guarded by this frame's frameFence) and
+        // presents.
+        void RecordFrameLate(VkCommandBuffer cmdLate, VkImage swapchainImage, VkImageView swapchainImageView);
 
         // Upper bound on this frame's actual candidate count (the DAG's total leaf count) -- NOT
         // this frame's real candidate count, which only ever exists on the GPU now that
@@ -487,16 +568,48 @@ namespace renderer {
         // only the barrier's usual execution/memory dependency, which still fires either way).
         bool m_AsyncComputeAvailableThisBuild = false;
 
-        // True from the moment RecordFrame()'s own [1z2] block (near the end of the function)
-        // releases the Surface Cache atlas images + TLAS-refit buffers to the async-compute queue,
-        // until the NEXT RecordFrame() call's own [1z] block (near the top) acquires them back --
-        // i.e., true across the frame boundary, false for the rest of any given frame's own
-        // recording. Drives a genuine ONE-FRAME PIPELINE LAG (not a same-frame round trip -- see
-        // [1z2]'s own comment for why): starts false (resources are graphics-owned from Init()'s own
-        // one-shot BLAS/TLAS build and RecordCapture's very first draw, matching EXCLUSIVE sharing
-        // mode's "first use establishes ownership, no transfer needed" rule), and toggles exactly
-        // once per async-compute-active frame thereafter.
-        bool m_AtlasOwnedByAsync = false;
+        // Phase 2 (Lumen advanced roadmap) fix, 2026-07-17: this class used to own a persistent
+        // `m_AtlasOwnedByAsync` bool tracking Surface Cache atlas/TLAS ownership ACROSS the frame
+        // boundary (release late in frame N, matching acquire at the top of frame N+1) -- a
+        // deliberate one-frame pipeline lag, forced by the old single-submission design (see this
+        // class' own header comment for the full root-cause explanation). Now that RecordFrameEarly
+        // releases and RecordFrameLate re-acquires WITHIN THE SAME FRAME (the async-compute queue's
+        // work runs concurrently with RecordFrameMid's own GPU work in between, so the hand-off no
+        // longer needs to span a frame boundary to get real overlap), the release/acquire pair is
+        // fully determined by that SAME frame's own m_FrameScratch.useAsyncCompute -- there is
+        // nothing left to track across frames, so that member was removed entirely.
+        //
+        // Per-frame scratch state, written ONCE by RecordFrameEarly() and read-only for the rest of
+        // that same frame's RecordAsyncCompute()/RecordFrameMid()/RecordFrameLate() calls -- exists
+        // only because splitting one function into 4 calls (see this class' own header comment) lost
+        // the ability to share function-scope locals directly; every field here is exactly a local
+        // variable the old single RecordFrame() would have declared at its own top. Never read
+        // before RecordFrameEarly() has run this frame (asserted there).
+        struct FrameScratch {
+            CameraPushConstants camera{};              // Original, UNjittered (RecordFrameMid's own HW raster draws use this one, not cameraCopy).
+            CameraPushConstants cameraCopy{};           // Jittered (TAA/TSR) -- every other consumer.
+            maths::vec3 cameraPositionWorld{};
+            CameraFrameInfo cameraFrameInfo{};
+            float globalTimeSeconds = 0.0f;
+            const core::EntityTransformCPU* entityTransformsCPU = nullptr;
+
+            maths::mat4 viewProj{};
+            maths::mat4 invViewProj{};
+            ClusterCullViewParams viewParams{};
+            float projScaleY = 0.0f;
+            float jitterX = 0.0f;
+            float jitterY = 0.0f;
+            bool taatsrEnabled = true;
+
+            uint32_t traceMode = 1u;
+            // This frame's async-compute routing decision -- see the old RecordFrame()'s own
+            // `useAsyncCompute` local for the full derivation (traceMode==HWRT AND the debug toggle).
+            // Read by RecordAsyncCompute() (skip everything if false) and RecordFrameLate() (skip the
+            // ACQUIRE if false, since RecordFrameEarly never RELEASEd in that case either).
+            bool useAsyncCompute = false;
+            bool radiosityEnabled = true;
+        };
+        FrameScratch m_FrameScratch;
 
         // Owned pipeline stages, in rough execution order.
         GpuGeometryPagePool m_PagePool;

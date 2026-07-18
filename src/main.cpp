@@ -479,41 +479,46 @@ int main(int argc, char** argv) {
     // Frame-pacing fence, created signaled so the first frame's wait passes immediately. Replaces
     // the old per-frame vkDeviceWaitIdle: the CPU now only waits for the previous frame's own
     // submission (never for a full device drain) and there are zero mid-frame CPU waits -- the
-    // two properties that keep the frame loop stutter-free. Since the dedicated transfer queue
-    // was added (UE 5.8 RHI parity, VulkanContext::GetTransferQueue()), the frame now records
-    // exactly TWO vkQueueSubmit calls (transfer, then graphics) instead of one, linked by a
-    // semaphore the graphics submission waits on -- but this is a second, independent, non-
-    // blocking GPU-side submission, not a second CPU wait, so it does not reintroduce the stall
-    // this fence itself eliminates.
+    // two properties that keep the frame loop stutter-free.
+    //
+    // Phase 2 (Lumen advanced roadmap) fix, 2026-07-17: this frame's graphics-queue work is now
+    // split across THREE command buffers/submissions (cmdEarly/cmdMid/cmdLate -- see
+    // renderer::ClusterRenderPipeline.h's own "Per-frame GPU work" class comment for the full
+    // redesign and root-cause this fixed), submitted in that order to the SAME queue. This fence is
+    // now the argument to ONLY cmdLate's own vkQueueSubmit call -- cmdEarly/cmdMid pass
+    // VK_NULL_HANDLE. This is safe (not merely convenient): the Vulkan spec's queue-submission-
+    // order guarantee means cmdLate's commands cannot retire before cmdEarly's/cmdMid's own
+    // (submitted earlier to the identical queue) have already retired, so frameFence signaling
+    // transitively proves all three have completed -- safe to reset all three command buffers for
+    // the next frame once this ONE fence signals. (This is the same "trailing barrier orders
+    // against a later command buffer on the same queue with no semaphore needed" guarantee this
+    // codebase's own HZB-rebuild-across-frames barrier already relies on, see
+    // ClusterRenderPipeline.cpp's own [13]/[6] comments.)
     VkFence frameFence = VK_NULL_HANDLE;
     VkFenceCreateInfo fenceInfo{ VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
     fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
     VK_CHECK(vkCreateFence(vkContext.GetDevice(), &fenceInfo, nullptr, &frameFence));
 
     // Phase 2 (Lumen advanced roadmap): a SEPARATE fence for the async-compute queue's own per-
-    // frame submission. frameFence above only guards the GRAPHICS queue's submission (it is the
-    // fence argument to that vkQueueSubmit call only) -- it says nothing about whether
-    // vkContext.GetAsyncComputeCommandBuffer()'s OWN, independent submission (to a genuinely
-    // different queue, possibly still executing concurrently with next frame's graphics work by
-    // design, see ClusterRenderPipeline::RecordFrame's own [1z2] one-frame-pipelined comment) has
-    // retired. Without this, this loop's next iteration could vkResetCommandBuffer()/
-    // vkBeginCommandBuffer() that SAME command buffer object while the GPU is still executing its
-    // previous contents -- a real VUID violation (command buffer must not be reset/re-recorded while
-    // still in use), not merely a hazard. Created signaled for the same "frame 0 passes straight
-    // through" reason as frameFence.
+    // frame submission (asyncComputeCmd) -- frameFence above only guards cmdLate's own
+    // vkQueueSubmit call, so it says nothing about whether the async-compute queue's genuinely
+    // independent submission has retired. Without this, this loop's next iteration could
+    // vkResetCommandBuffer()/vkBeginCommandBuffer() that SAME command buffer object while the GPU
+    // is still executing its previous contents -- a real VUID violation (command buffer must not
+    // be reset/re-recorded while still in use), not merely a hazard. Created signaled for the same
+    // "frame 0 passes straight through" reason as frameFence.
+    //
+    // Phase 2 fix, 2026-07-17: the CPU-side wait on this fence is now DEFERRED to right before
+    // asyncComputeCmd is actually reset (see this loop's own per-frame comment below), rather than
+    // waited-on upfront alongside frameFence the way it used to be -- now that cmdEarly/cmdMid's
+    // own CPU-side recording takes real wall-clock time (several Record*() calls' worth) before
+    // asyncComputeCmd needs touching, deferring the wait gives the PREVIOUS frame's async-compute
+    // submission strictly more real time to have already finished on the GPU by the time this wait
+    // is actually evaluated, reducing/eliminating the common-case stall. Still always waited on
+    // before the reset/re-record, never skipped -- never safe to reset a command buffer whose
+    // previous submission hasn't retired.
     VkFence asyncComputeFence = VK_NULL_HANDLE;
     VK_CHECK(vkCreateFence(vkContext.GetDevice(), &fenceInfo, nullptr, &asyncComputeFence));
-
-    // Phase 2 (Lumen advanced roadmap): unlike frameFence above (created signaled, so frame 0's
-    // fence wait passes immediately), a semaphore has no "start signaled" option -- the graphics
-    // submission's own wait on vkContext.GetAsyncComputeFinishedSemaphore() must be skipped
-    // entirely on the very first frame ever recorded, since nothing has signaled it yet (no async-
-    // compute submission has happened before frame 0's graphics submission is built). From frame 1
-    // onward, frame (N-1)'s own async-compute submission (issued right after frame (N-1)'s graphics
-    // submission, see this loop's own per-frame comment below) has always signaled it exactly once
-    // by the time this wait is evaluated -- see renderer::ClusterRenderPipeline::RecordFrame's own
-    // [1z2] block for the one-frame-pipelined async-compute design this mirrors.
-    bool isFirstFrame = true;
 
     LOG_INFO("Entering main loop.");
 
@@ -972,19 +977,13 @@ int main(int argc, char** argv) {
 
         VkSemaphore imgAvailable = vkContext.GetImageAvailableSemaphore();
 
-        // 1. Wait for the PREVIOUS frame's submission only (never a full device drain): the fence
-        // guards the shared command buffer and the pipeline's per-frame buffers against being
-        // re-recorded while the GPU still consumes them. Signaled at creation, so frame 0 passes
-        // straight through.
+        // 1. Wait for the PREVIOUS frame's cmdLate submission only (never a full device drain):
+        // see frameFence's own declaration-site comment for why this transitively also guarantees
+        // the previous frame's cmdEarly/cmdMid have retired. Signaled at creation, so frame 0
+        // passes straight through. NOTE: the async-compute fence wait is deliberately NOT here --
+        // see asyncComputeFence's own declaration-site comment for why it's deferred further down.
         VK_CHECK(vkWaitForFences(vkContext.GetDevice(), 1, &frameFence, VK_TRUE, UINT64_MAX));
         VK_CHECK(vkResetFences(vkContext.GetDevice(), 1, &frameFence));
-
-        // Phase 2 (Lumen advanced roadmap): wait for the PREVIOUS frame's async-compute submission
-        // too, before this frame resets/re-records vkContext.GetAsyncComputeCommandBuffer() below --
-        // see asyncComputeFence's own declaration-site comment. Signaled at creation, so frame 0
-        // passes straight through, same as frameFence above.
-        VK_CHECK(vkWaitForFences(vkContext.GetDevice(), 1, &asyncComputeFence, VK_TRUE, UINT64_MAX));
-        VK_CHECK(vkResetFences(vkContext.GetDevice(), 1, &asyncComputeFence));
 
 #ifndef NDEBUG
         // Must run right after the fence wait above: guarantees the previous frame's
@@ -1002,56 +1001,112 @@ int main(int argc, char** argv) {
         // of it, now that the per-frame vkDeviceWaitIdle is gone.
         VkSemaphore rndFinished = vkContext.GetRenderFinishedSemaphore(imageIndex);
 
-        // 3a. Record this frame's geometry page uploads into the transfer queue's OWN command
-        // buffer first (UE 5.8 RHI parity -- dedicated hardware copy queue, see VulkanContext::
-        // GetTransferQueue()'s own comment; falls back to the graphics queue/family transparently
-        // when the GPU exposes none). Safe to re-record without waiting again here: the fence wait
-        // above already guarantees the PREVIOUS frame's transfer submission (which the previous
-        // frame's graphics submission itself waited on, see step 4 below) has completed.
-        VkCommandBuffer transferCmd = vkContext.GetTransferCommandBuffer();
-        vkResetCommandBuffer(transferCmd, 0);
-        VkCommandBufferBeginInfo transferBeginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-        vkBeginCommandBuffer(transferCmd, &transferBeginInfo);
+        // ====================================================================================
+        // Phase 2 (Lumen advanced roadmap) fix, 2026-07-17: this frame's graphics-queue work is
+        // now recorded/submitted in 3 phases (cmdEarly -> cmdMid -> cmdLate) instead of one, so
+        // the async-compute queue's Surface Cache TLAS-refit + radiosity injection can run
+        // genuinely concurrently with cmdMid's own Nanite VisBuffer work on the GPU -- see
+        // renderer::ClusterRenderPipeline.h's own "Per-frame GPU work" class comment for the full
+        // root-cause/redesign explanation this fixes (the old single-submission design could never
+        // achieve real overlap: a submission's signal semaphores only fire once every command
+        // buffer in it has finished executing).
+        // ====================================================================================
 
-        // 3a2. Phase 2 (Lumen advanced roadmap): the async-compute queue's own per-frame command
-        // buffer (VulkanContext::GetAsyncComputeCommandBuffer(), same "always begin/end/submit,
-        // falls back transparently to the graphics queue/family" contract as transferCmd above --
-        // see GetAsyncComputeQueue()'s own comment). Reset/begun every frame regardless of whether
-        // renderer::ClusterRenderPipeline::RecordFrame actually records anything into it this frame
-        // (SetDebugAsyncComputeEnabled(false) or the Debug SWRT toggle leave it empty -- a valid,
-        // trivially-fast no-op command buffer).
+        // 2a. cmdEarly: Virtual Shadow Map/Virtual Texture "begin frame", Surface Cache capture,
+        // Global SDF update, and (async compute active) the Surface Cache ownership RELEASE to the
+        // async-compute queue family. No wait semaphores -- nothing before this point in the frame
+        // touches the swapchain, the transfer queue's uploads, or the async-compute queue.
+        VkCommandBuffer cmdEarly = vkContext.GetCommandBufferEarly();
+        vkResetCommandBuffer(cmdEarly, 0);
+        VkCommandBufferBeginInfo cmdEarlyBeginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+        vkBeginCommandBuffer(cmdEarly, &cmdEarlyBeginInfo);
+
+        clusterPipeline.RecordFrameEarly(cmdEarly, camera.GetPushConstants(),
+            camera.GetPosition(), camera.GetFrameInfo(aspect), static_cast<float>(glfwGetTime()),
+            vkContext.GetEntityTransformsCPU());
+
+        vkEndCommandBuffer(cmdEarly);
+
+        VkSemaphore asyncComputeCanStart = vkContext.GetAsyncComputeCanStartSemaphore();
+        VkSubmitInfo cmdEarlySubmitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
+        cmdEarlySubmitInfo.commandBufferCount = 1;
+        cmdEarlySubmitInfo.pCommandBuffers = &cmdEarly;
+        cmdEarlySubmitInfo.signalSemaphoreCount = 1;
+        cmdEarlySubmitInfo.pSignalSemaphores = &asyncComputeCanStart;
+        // fence = VK_NULL_HANDLE: frameFence (on cmdLate, submitted last this same frame) covers
+        // this command buffer transitively -- see frameFence's own declaration-site comment.
+        VK_CHECK(vkQueueSubmit(vkContext.GetGraphicsQueue(), 1, &cmdEarlySubmitInfo, VK_NULL_HANDLE));
+
+        // 2b. Wait for the PREVIOUS frame's async-compute submission (asyncComputeCmd) to retire
+        // before this frame resets/re-records it -- deliberately deferred to HERE (after cmdEarly's
+        // own CPU-side recording + vkQueueSubmit call above, not upfront alongside frameFence) --
+        // see asyncComputeFence's own declaration-site comment for why.
+        VK_CHECK(vkWaitForFences(vkContext.GetDevice(), 1, &asyncComputeFence, VK_TRUE, UINT64_MAX));
+        VK_CHECK(vkResetFences(vkContext.GetDevice(), 1, &asyncComputeFence));
+
+        // 2c. asyncComputeCmd: ACQUIRE + TLAS refit + radiosity bounce loop + RELEASE -- a no-op
+        // (empty, trivially-fast) command buffer whenever this frame's routing decision was the
+        // fully-graphics-queue-serialized fallback path instead (RecordAsyncCompute() itself
+        // checks). Waits on the can-start signal cmdEarly's own submission just queued (2a above);
+        // non-blocking on the CPU (no vkQueueWaitIdle) -- this is a second, independent GPU
+        // submission, not a second CPU stall.
         VkCommandBuffer asyncComputeCmd = vkContext.GetAsyncComputeCommandBuffer();
         vkResetCommandBuffer(asyncComputeCmd, 0);
         VkCommandBufferBeginInfo asyncComputeBeginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
         vkBeginCommandBuffer(asyncComputeCmd, &asyncComputeBeginInfo);
 
-        // 3b. Record the entire frame (culling -> hybrid raster -> resolve -> blit + present
-        // transition) into ONE graphics command buffer -- every inter-pass barrier lives inside
-        // ClusterRenderPipeline::RecordFrame and the passes it drives. RecordFrame() records into
-        // ALL THREE command buffers (transferCmd for page uploads, asyncComputeCmd for TLAS refit +
-        // radiosity injection when Feature 1 is active, cmd for everything else) in the correct
-        // internal order before any of them is ended below.
-        vkResetCommandBuffer(vkContext.GetCommandBuffer(), 0);
-        VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-        vkBeginCommandBuffer(vkContext.GetCommandBuffer(), &beginInfo);
+        clusterPipeline.RecordAsyncCompute(asyncComputeCmd);
 
-        clusterPipeline.RecordFrame(vkContext.GetCommandBuffer(), transferCmd, asyncComputeCmd, camera.GetPushConstants(),
-            camera.GetPosition(), camera.GetFrameInfo(aspect), static_cast<float>(glfwGetTime()),
-            vkContext.GetSwapchainImages()[imageIndex],
-            vkContext.GetSwapchainImageViews()[imageIndex],
-            vkContext.GetEntityTransformsCPU());
+        vkEndCommandBuffer(asyncComputeCmd);
+
+        VkSemaphore asyncComputeFinished = vkContext.GetAsyncComputeFinishedSemaphore();
+        VkSubmitInfo asyncComputeSubmitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
+        asyncComputeSubmitInfo.waitSemaphoreCount = 1;
+        asyncComputeSubmitInfo.pWaitSemaphores = &asyncComputeCanStart;
+        // asyncComputeCmd's own first real work (when not a no-op) is the ACQUIRE barrier +
+        // RecordRefreshTLAS's vkCmdBuildAccelerationStructuresKHR, so gate on those two stages
+        // specifically rather than an ALL_COMMANDS shortcut.
+        VkPipelineStageFlags asyncComputeWaitStage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
+        asyncComputeSubmitInfo.pWaitDstStageMask = &asyncComputeWaitStage;
+        asyncComputeSubmitInfo.commandBufferCount = 1;
+        asyncComputeSubmitInfo.pCommandBuffers = &asyncComputeCmd;
+        asyncComputeSubmitInfo.signalSemaphoreCount = 1;
+        asyncComputeSubmitInfo.pSignalSemaphores = &asyncComputeFinished;
+        // asyncComputeFence (not VK_NULL_HANDLE): step 2b above, NEXT frame, is what actually
+        // retires it.
+        VK_CHECK(vkQueueSubmit(vkContext.GetAsyncComputeQueue(), 1, &asyncComputeSubmitInfo, asyncComputeFence));
+
+        // 2d. Record this frame's geometry page uploads into the transfer queue's OWN command
+        // buffer (UE 5.8 RHI parity -- dedicated hardware copy queue, see VulkanContext::
+        // GetTransferQueue()'s own comment; falls back to the graphics queue/family transparently
+        // when the GPU exposes none). Content is recorded by RecordFrameMid() below (the geometry-
+        // streaming triage call records into BOTH transferCmd and cmdMid), so this is begun here
+        // but only ended/submitted after that call returns.
+        VkCommandBuffer transferCmd = vkContext.GetTransferCommandBuffer();
+        vkResetCommandBuffer(transferCmd, 0);
+        VkCommandBufferBeginInfo transferBeginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+        vkBeginCommandBuffer(transferCmd, &transferBeginInfo);
+
+        // 2e. cmdMid: the Nanite VisBuffer pipeline (worklist clears -> two-phase cull/raster ->
+        // HZB -> resolve) plus this frame's geometry-streaming triage -- confirmed (by reading
+        // every pass' own descriptor bindings, see RecordFrameMid()'s own comment) to never sample
+        // the Surface Cache atlas/TLAS/GI-related Global SDF state, so no wait on the async-compute
+        // queue here. Same graphics queue as cmdEarly (submitted right above), so same-queue
+        // submission order alone (no semaphore) is what orders this after cmdEarly's own GPU work.
+        VkCommandBuffer cmdMid = vkContext.GetCommandBufferMid();
+        vkResetCommandBuffer(cmdMid, 0);
+        VkCommandBufferBeginInfo cmdMidBeginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+        vkBeginCommandBuffer(cmdMid, &cmdMidBeginInfo);
+
+        clusterPipeline.RecordFrameMid(cmdMid, transferCmd);
 
         vkEndCommandBuffer(transferCmd);
-        vkEndCommandBuffer(asyncComputeCmd);
-        vkEndCommandBuffer(vkContext.GetCommandBuffer());
+        vkEndCommandBuffer(cmdMid);
 
-        // 3c. Submit the transfer queue's work FIRST, signaling a semaphore the graphics
-        // submission (step 4) waits on before touching anything it uploaded -- an additional,
-        // non-blocking vkQueueSubmit alongside the graphics one below. This does not reintroduce
-        // the CPU-GPU stall the frame-pacing fence comment above was written to eliminate (no CPU
-        // wait is added here, only a GPU-side semaphore dependency between two queues that would
-        // otherwise race), it just means "one vkQueueSubmit" no longer literally describes the
-        // frame now that a second, independent queue is genuinely in play.
+        // Submit the transfer queue's work FIRST, signaling a semaphore cmdMid waits on before
+        // touching anything it uploaded (GpuGeometryPagePool's own ownership-transfer ACQUIRE +
+        // decompression + raster reads -- see RecordFrameMid()'s own comment for why THIS command
+        // buffer, not cmdEarly, is the one with the real dependency on the transfer queue).
         VkSemaphore transferFinished = vkContext.GetTransferFinishedSemaphore();
         VkSubmitInfo transferSubmitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
         transferSubmitInfo.commandBufferCount = 1;
@@ -1060,79 +1115,62 @@ int main(int argc, char** argv) {
         transferSubmitInfo.pSignalSemaphores = &transferFinished;
         VK_CHECK(vkQueueSubmit(vkContext.GetTransferQueue(), 1, &transferSubmitInfo, VK_NULL_HANDLE));
 
-        // 4. Submit to Graphics Queue -- the acquire semaphore gates the frame's first use of the
-        // swapchain image, which is the blit at the very end of RecordFrame (TRANSFER stage). The
         // transfer-finished wait uses ALL_COMMANDS (not a narrower stage like COMPUTE_SHADER_BIT):
         // GpuGeometryPagePool::FinalizeBoundPage's vkCmdUpdateBuffer is classified under the
         // Vulkan spec's "Clear" pseudo-stage, which an earlier pipeline stage than
         // VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT could otherwise let race ahead of this wait.
-        //
-        // Phase 2 (Lumen advanced roadmap): this submission ALSO waits on
-        // vkContext.GetAsyncComputeFinishedSemaphore() (skipped only on isFirstFrame, see that
-        // semaphore's own declaration-site comment above) and ALSO signals
-        // vkContext.GetAsyncComputeCanStartSemaphore() -- both added to this SAME single graphics
-        // submission (this codebase's documented "one command buffer, one submit per frame"
-        // invariant, see renderer::ClusterRenderPipeline.h's own class comment, is preserved: no
-        // second graphics submission is introduced). This is a deliberate ONE-FRAME-PIPELINED
-        // design (see ClusterRenderPipeline::RecordFrame's own [1z]/[1z2] block comments): the
-        // asyncFinished wait consumes THIS frame's graphics command buffer's own [1z] acquire of
-        // LAST frame's async-compute results (already-completed by now in the overwhelming common
-        // case, since that submission was issued nearly a full frame ago -- see step 5 below), and
-        // the asyncCanStart signal unblocks step 5's own submission of THIS frame's async-compute
-        // work once this ENTIRE graphics submission (including this frame's own [1z2] release,
-        // recorded near the end of `cmd`) has completed.
-        VkCommandBuffer cmd = vkContext.GetCommandBuffer();
-        VkSubmitInfo submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
+        VkSubmitInfo cmdMidSubmitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
+        cmdMidSubmitInfo.waitSemaphoreCount = 1;
+        cmdMidSubmitInfo.pWaitSemaphores = &transferFinished;
+        VkPipelineStageFlags cmdMidWaitStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+        cmdMidSubmitInfo.pWaitDstStageMask = &cmdMidWaitStage;
+        cmdMidSubmitInfo.commandBufferCount = 1;
+        cmdMidSubmitInfo.pCommandBuffers = &cmdMid;
+        // fence = VK_NULL_HANDLE: frameFence (on cmdLate, submitted next) covers this command
+        // buffer transitively -- see frameFence's own declaration-site comment.
+        VK_CHECK(vkQueueSubmit(vkContext.GetGraphicsQueue(), 1, &cmdMidSubmitInfo, VK_NULL_HANDLE));
 
-        VkSemaphore asyncComputeFinished = vkContext.GetAsyncComputeFinishedSemaphore();
-        VkSemaphore waitSemaphores[3] = { imgAvailable, transferFinished, asyncComputeFinished };
-        VkPipelineStageFlags waitStages[3] = {
-            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-            // Matches ClusterRenderPipeline::RecordFrame's own [1z] acquire barrier's dstStageMask
-            // (VkPipelineStageFlags2 there; this is the legacy VkSubmitInfo's non-2 equivalent,
-            // still union-of-stages precise rather than an ALL_COMMANDS shortcut): the stages that
-            // actually touch the 5 Surface Cache atlas images / 4 TLAS-refit buffers this frame --
-            // COLOR_ATTACHMENT_OUTPUT/VERTEX_INPUT for RecordCapture's own render pass, COMPUTE_SHADER
-            // for GIInject/Reflection/World Probes' sampled/storage reads.
-            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
+        // 2f. cmdLate: the ACQUIRE of the Surface Cache atlas/TLAS back from the async-compute
+        // queue family (THIS frame's own hand-off, not a one-frame-lagged one -- see
+        // RecordFrameLate()'s own comment), every pass that reads it (Reflection/World Probes/
+        // MegaLights/the 3 forward passes), post-process, and the final swapchain blit + present
+        // transition. Waits on imgAvailable (first touch of the swapchain image is this command
+        // buffer's own blit) and asyncComputeFinished (this frame's own async-compute submission,
+        // 2c above, already queued to this same queue's sibling before this wait is even recorded
+        // -- safe on frame 0 too, unlike the old design, since asyncComputeCmd is unconditionally
+        // submitted every frame regardless of routing).
+        VkCommandBuffer cmdLate = vkContext.GetCommandBufferLate();
+        vkResetCommandBuffer(cmdLate, 0);
+        VkCommandBufferBeginInfo cmdLateBeginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+        vkBeginCommandBuffer(cmdLate, &cmdLateBeginInfo);
+
+        clusterPipeline.RecordFrameLate(cmdLate, vkContext.GetSwapchainImages()[imageIndex],
+            vkContext.GetSwapchainImageViews()[imageIndex]);
+
+        vkEndCommandBuffer(cmdLate);
+
+        VkSubmitInfo cmdLateSubmitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
+        VkSemaphore cmdLateWaitSemaphores[2] = { imgAvailable, asyncComputeFinished };
+        VkPipelineStageFlags cmdLateWaitStages[2] = {
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            // Matches RecordFrameLate()'s own ACQUIRE barrier's dstStageMask (VkPipelineStageFlags2
+            // there; this is the legacy VkSubmitInfo's non-2 equivalent, still union-of-stages
+            // precise rather than an ALL_COMMANDS shortcut): the stages that actually sample the
+            // Surface Cache atlas/TLAS this frame -- COMPUTE_SHADER for Reflection/World Probes/
+            // MegaLights' shading (this codebase's HWRT back-end is inline rayQueryEXT inside
+            // compute shaders, not the separate ray-tracing-pipeline stage vkCmdTraceRaysKHR would
+            // need -- same reasoning the ORIGINAL single-submission design's own identical
+            // COMPUTE_SHADER-only legacy waitStages entry already established, kept identical here).
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
         };
-        submitInfo.waitSemaphoreCount = isFirstFrame ? 2u : 3u;
-        submitInfo.pWaitSemaphores = waitSemaphores;
-        submitInfo.pWaitDstStageMask = waitStages;
-        submitInfo.commandBufferCount = 1;
-        submitInfo.pCommandBuffers = &cmd;
-
-        VkSemaphore asyncComputeCanStart = vkContext.GetAsyncComputeCanStartSemaphore();
-        VkSemaphore signalSemaphores[2] = { rndFinished, asyncComputeCanStart };
-        submitInfo.signalSemaphoreCount = 2;
-        submitInfo.pSignalSemaphores = signalSemaphores;
-
-        VK_CHECK(vkQueueSubmit(vkContext.GetGraphicsQueue(), 1, &submitInfo, frameFence));
-        isFirstFrame = false;
-
-        // 5. Submit the async-compute queue's own per-frame work LAST, waiting on the can-start
-        // signal step 4 just queued -- see VulkanContext::GetAsyncComputeCanStartSemaphore()'s own
-        // comment and ClusterRenderPipeline::RecordFrame's [1z2] block for the full contract. Falls
-        // back transparently to the SAME queue as step 4 when this GPU exposes no dedicated async-
-        // compute family (VulkanContext::HasDedicatedAsyncComputeQueue()) -- two submissions to the
-        // same VkQueue execute in submission order regardless, so this remains correct (if not
-        // concurrent) even then.
-        VkSemaphore asyncComputeFinishedSignal = vkContext.GetAsyncComputeFinishedSemaphore();
-        VkSubmitInfo asyncComputeSubmitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
-        asyncComputeSubmitInfo.waitSemaphoreCount = 1;
-        asyncComputeSubmitInfo.pWaitSemaphores = &asyncComputeCanStart;
-        // asyncComputeCmd's own first real work is the [1z2] acquire barrier + RecordRefreshTLAS's
-        // vkCmdBuildAccelerationStructuresKHR, so gate on those two stages specifically rather than
-        // an ALL_COMMANDS shortcut.
-        VkPipelineStageFlags asyncComputeWaitStage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
-        asyncComputeSubmitInfo.pWaitDstStageMask = &asyncComputeWaitStage;
-        asyncComputeSubmitInfo.commandBufferCount = 1;
-        asyncComputeSubmitInfo.pCommandBuffers = &asyncComputeCmd;
-        asyncComputeSubmitInfo.signalSemaphoreCount = 1;
-        asyncComputeSubmitInfo.pSignalSemaphores = &asyncComputeFinishedSignal;
-        // asyncComputeFence (not VK_NULL_HANDLE): this frame's own wait/reset at the top of the
-        // loop (see that fence's own declaration-site comment) is what actually retires it.
-        VK_CHECK(vkQueueSubmit(vkContext.GetAsyncComputeQueue(), 1, &asyncComputeSubmitInfo, asyncComputeFence));
+        cmdLateSubmitInfo.waitSemaphoreCount = 2u;
+        cmdLateSubmitInfo.pWaitSemaphores = cmdLateWaitSemaphores;
+        cmdLateSubmitInfo.pWaitDstStageMask = cmdLateWaitStages;
+        cmdLateSubmitInfo.commandBufferCount = 1;
+        cmdLateSubmitInfo.pCommandBuffers = &cmdLate;
+        cmdLateSubmitInfo.signalSemaphoreCount = 1;
+        cmdLateSubmitInfo.pSignalSemaphores = &rndFinished;
+        VK_CHECK(vkQueueSubmit(vkContext.GetGraphicsQueue(), 1, &cmdLateSubmitInfo, frameFence));
 
         VkSwapchainKHR swapchain = vkContext.GetSwapchain();
         VkPresentInfoKHR presentInfo{ VK_STRUCTURE_TYPE_PRESENT_INFO_KHR };

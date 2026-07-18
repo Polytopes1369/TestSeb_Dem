@@ -944,7 +944,30 @@ void VulkanContext::AllocateCommandBuffer() {
   allocInfo.commandBufferCount = 1;
   if (vkAllocateCommandBuffers(m_Device, &allocInfo, &m_CommandBuffer) !=
       VK_SUCCESS) {
-    throw std::runtime_error("Failed to allocate principal Command Buffer!");
+    throw std::runtime_error("Failed to allocate principal (cmdEarly) Command Buffer!");
+  }
+
+  // Phase 2 (Lumen advanced roadmap) fix: 2 more graphics-queue command buffers ("cmdMid"/
+  // "cmdLate", same pool/family as m_CommandBuffer above) -- see GetCommandBufferMid()/
+  // GetCommandBufferLate()'s own comment for why this frame's graphics work is now split 3 ways.
+  VkCommandBufferAllocateInfo midAllocInfo{
+      VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+  midAllocInfo.commandPool = m_CommandPool;
+  midAllocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+  midAllocInfo.commandBufferCount = 1;
+  if (vkAllocateCommandBuffers(m_Device, &midAllocInfo, &m_CommandBufferMid) !=
+      VK_SUCCESS) {
+    throw std::runtime_error("Failed to allocate cmdMid Command Buffer!");
+  }
+
+  VkCommandBufferAllocateInfo lateAllocInfo{
+      VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+  lateAllocInfo.commandPool = m_CommandPool;
+  lateAllocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+  lateAllocInfo.commandBufferCount = 1;
+  if (vkAllocateCommandBuffers(m_Device, &lateAllocInfo, &m_CommandBufferLate) !=
+      VK_SUCCESS) {
+    throw std::runtime_error("Failed to allocate cmdLate Command Buffer!");
   }
 
   VkCommandBufferAllocateInfo transferAllocInfo{
