@@ -35,6 +35,10 @@
 // Phase 7.3 (PCG editor-tooling roadmap): "Node Data Inspector" panel drawn alongside the canvas
 // above, plus its own self-contained demo PcgGraph (see that header's DemoGraphState comment).
 #include "renderer/debug/PcgNodeDataInspector.h"
+// Phase 7.4 (PCG editor-tooling roadmap, closes out Phase 7): "PCG Volume Inspector" -- browses
+// authored (or synthetic-demo fallback) PCG Volumes and edits seed/bounds/graph-asset-path in
+// memory. See that header's own comment for the full scope rationale.
+#include "renderer/debug/PcgVolumeInspector.h"
 #endif
 
 // Unreal-editor style viewport navigation: hold the Right Mouse Button to enable FPS-style
@@ -180,6 +184,13 @@ static renderer::debug::PcgGraphEditorPanel g_PcgGraphEditorPanel;
 // in this roadmap).
 static renderer::debug::PcgNodeDataInspector g_PcgNodeDataInspector;
 static renderer::debug::DemoGraphState g_PcgInspectorDemoGraph;
+
+// Phase 7.4 (PCG editor-tooling roadmap): the "PCG Volume Inspector" section drawn right below
+// g_PcgNodeDataInspector's own child region above, inside the same "PCG Graph Editor" tab -- the
+// 4th and final section of Phase 7 (see renderer::debug::PcgVolumeInspector's own header comment
+// for the full scope rationale: browses/edits authored-or-synthetic-demo PCG Volumes' top-level
+// fields, in memory only). Initialized once right after g_PcgInspectorDemoGraph above.
+static renderer::debug::PcgVolumeInspector g_PcgVolumeInspector;
 
 static void KeyCallback(GLFWwindow* window, int key, int scancode, int action, int mods) {
     if (action != GLFW_PRESS) return;
@@ -476,6 +487,11 @@ int main(int argc, char** argv) {
     // Phase 7.3 (PCG editor-tooling roadmap): build + evaluate the Node Data Inspector's own
     // self-contained demo graph once -- see g_PcgInspectorDemoGraph's own declaration-site comment.
     g_PcgInspectorDemoGraph = renderer::debug::BuildDemoInspectorGraph();
+
+    // Phase 7.4 (PCG editor-tooling roadmap): scan world_data/actors/ for real PcgVolume actors
+    // (falling back to 3 synthetic in-memory demo volumes if none exist yet) -- see
+    // g_PcgVolumeInspector's own declaration-site comment.
+    g_PcgVolumeInspector.Init();
 #endif
 
     // Builds the consolidated virtual geometry .cache file (scene.cache): reads back the spawned
@@ -1526,6 +1542,22 @@ int main(int argc, char** argv) {
                 if (ImGui::BeginChild("PcgNodeDataInspector_Child", ImVec2(0.0f, 320.0f), ImGuiChildFlags_Borders)) {
                     g_PcgNodeDataInspector.Draw(g_PcgInspectorDemoGraph.graph, g_PcgInspectorDemoGraph.evalResult,
                         &g_PcgInspectorDemoGraph.catalog);
+                }
+                ImGui::EndChild();
+
+                // Phase 7.4 (PCG editor-tooling roadmap, closes out Phase 7): "PCG Volume
+                // Inspector" -- browses PcgVolume actors discovered under world_data/actors/ (or,
+                // absent any today, 3 synthetic in-memory demo volumes -- see
+                // renderer::debug::PcgVolumeInspector's own header comment) and edits each one's
+                // seed/bounds/graph-asset-path IN MEMORY ONLY (no write-back in this phase).
+                ImGui::Separator();
+                ImGui::TextWrapped(
+                    "Phase 7.4: PCG Volume Inspector -- browse authored (or, absent any today, "
+                    "SYNTHETIC in-memory demo) PCG Volumes and edit each one's seed/bounds/graph "
+                    "asset path IN MEMORY. Write-back to disk is out of scope for this phase -- see "
+                    "PcgVolumeInspector.h's own header comment for the full scope rationale.");
+                if (ImGui::BeginChild("PcgVolumeInspector_Child", ImVec2(0.0f, 420.0f), ImGuiChildFlags_Borders)) {
+                    g_PcgVolumeInspector.Draw();
                 }
                 ImGui::EndChild();
 
