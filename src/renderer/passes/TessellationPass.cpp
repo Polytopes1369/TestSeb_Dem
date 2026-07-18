@@ -3,6 +3,7 @@
 #include <array>
 #include <cstring>
 #include <format>
+#include <span>
 #include <stdexcept>
 
 #include "core/Logger.h"
@@ -64,7 +65,7 @@ namespace renderer {
 
     } // namespace
 
-    bool TessellationPass::Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
+    bool TessellationPass::InitImpl(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
         VkFormat colorFormat, VkFormat depthFormat,
         VkBuffer entityTransformBuffer,
         const std::array<MaterialParameters, kMaxMaterials>& materialTable,
@@ -74,8 +75,10 @@ namespace renderer {
         VkBuffer lightBuffer, VkDeviceSize lightBufferSize,
         const VirtualShadowMapPass& vsm, const WorldProbeGridPass& worldProbes,
         const SurfaceCacheTraceContext& traceContext) {
+        // Self-reinit (see ShadowMapPass's own migration comment for the identical pattern):
+        // Shutdown() clears m_Device, which RenderPass<TessellationPass>::Init() already set to
+        // this call's value just before invoking this function -- restore it.
         Shutdown();
-
         m_Device = device;
         m_Entities = entities;
         m_FallbackVertexBuffer = fallbackVertexBuffer;
@@ -108,27 +111,23 @@ namespace renderer {
         bindings[12] = { 12, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr };       // FallbackIndexBuffer (HWRT)
         bindings[13] = { 13, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr };       // EntityDrawRangeBuffer (HWRT)
 
-        VkDescriptorSetLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-        layoutInfo.bindingCount = 14;
-        layoutInfo.pBindings = bindings;
-        VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &layoutInfo, nullptr, &m_SetLayout));
-
         VkDescriptorPoolSize poolSizes[4]{};
         poolSizes[0] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8 };             // bindings 2,3,7,8,10,11,12,13
         poolSizes[1] = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 3 };             // bindings 0,4,6
         poolSizes[2] = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2 };     // bindings 1,5
         poolSizes[3] = { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1 }; // binding 9
-        VkDescriptorPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
-        poolInfo.maxSets = 1;
-        poolInfo.poolSizeCount = 4;
-        poolInfo.pPoolSizes = poolSizes;
-        VK_CHECK(vkCreateDescriptorPool(m_Device, &poolInfo, nullptr, &m_DescriptorPool));
-
-        VkDescriptorSetAllocateInfo setAlloc{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-        setAlloc.descriptorPool = m_DescriptorPool;
-        setAlloc.descriptorSetCount = 1;
-        setAlloc.pSetLayouts = &m_SetLayout;
-        VK_CHECK(vkAllocateDescriptorSets(m_Device, &setAlloc, &m_Set));
+        auto descSet = VulkanUtils::CreateDescriptorSetLayoutPoolAndSet(m_Device,
+            std::span{ bindings, 14 }, std::span{ poolSizes, 4 });
+        m_SetLayout = descSet.layout;
+        m_DescriptorPool = descSet.pool;
+        m_Set = descSet.set;
+        RegisterResource([this] {
+            vkDestroyDescriptorPool(m_Device, m_DescriptorPool, nullptr);
+            vkDestroyDescriptorSetLayout(m_Device, m_SetLayout, nullptr);
+            m_DescriptorPool = VK_NULL_HANDLE;
+            m_SetLayout = VK_NULL_HANDLE;
+            m_Set = VK_NULL_HANDLE;
+        });
 
         // =====================================================================================
         // STEP 2 -- writes. Every resource is already fully built by the time this Init() runs
@@ -138,6 +137,7 @@ namespace renderer {
         // =====================================================================================
         m_ViewParamsBuffer.Create(allocator, sizeof(TessellationLightingUBO),
             VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
+        RegisterResource([this] { m_ViewParamsBuffer.Destroy(); });
         VkDescriptorBufferInfo lightingInfo{ m_ViewParamsBuffer.Handle(), 0, m_ViewParamsBuffer.Size() };
 
         VkDescriptorImageInfo shadowAtlasInfo{};
@@ -160,6 +160,7 @@ namespace renderer {
         // RecordDraw() call.
         m_WorldProbeGridParamsBuffer.Create(allocator, sizeof(WorldProbeGridParamsUBO),
             VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, VMA_MEMORY_USAGE_CPU_TO_GPU, /*mapped=*/true);
+        RegisterResource([this] { m_WorldProbeGridParamsBuffer.Destroy(); });
         VkDescriptorBufferInfo worldProbeGridParamsInfo{ m_WorldProbeGridParamsBuffer.Handle(), 0, m_WorldProbeGridParamsBuffer.Size() };
 
         // Full MaterialParameters[kMaxMaterials] buffer -- generalized from the original single-
@@ -168,6 +169,7 @@ namespace renderer {
         // exactly mirroring renderer::TransparentForwardPass::Init's own identical upload.
         m_MaterialParamsBuffer.Create(allocator, sizeof(MaterialParameters) * kMaxMaterials,
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
+        RegisterResource([this] { m_MaterialParamsBuffer.Destroy(); });
         VulkanUtils::ExecuteOneShotCommands(m_Device, commandPool, queue, [&](VkCommandBuffer cmd) {
             vkCmdUpdateBuffer(cmd, m_MaterialParamsBuffer.Handle(), 0, sizeof(MaterialParameters) * kMaxMaterials, materialTable.data());
             VulkanUtils::RecordMemoryBarrier(cmd,
@@ -226,6 +228,7 @@ namespace renderer {
         pipelineLayoutInfo.pushConstantRangeCount = 1;
         pipelineLayoutInfo.pPushConstantRanges = &pushConstantRange;
         VK_CHECK(vkCreatePipelineLayout(m_Device, &pipelineLayoutInfo, nullptr, &m_PipelineLayout));
+        RegisterResource([this] { vkDestroyPipelineLayout(m_Device, m_PipelineLayout, nullptr); m_PipelineLayout = VK_NULL_HANDLE; });
 
         // =====================================================================================
         // STEP 4 -- graphics pipeline, built manually (hardcoded for the 4-stage vertex/
@@ -357,6 +360,7 @@ namespace renderer {
         pipelineInfo.pNext = &pipelineRendering;
 
         VK_CHECK(vkCreateGraphicsPipelines(m_Device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_Pipeline));
+        RegisterResource([this] { vkDestroyPipeline(m_Device, m_Pipeline, nullptr); m_Pipeline = VK_NULL_HANDLE; });
 
         vkDestroyShaderModule(m_Device, vertModule, nullptr);
         vkDestroyShaderModule(m_Device, tescModule, nullptr);
@@ -367,30 +371,12 @@ namespace renderer {
         return true;
     }
 
-    void TessellationPass::Shutdown() {
-        if (m_Device != VK_NULL_HANDLE) {
-            if (m_Pipeline != VK_NULL_HANDLE) vkDestroyPipeline(m_Device, m_Pipeline, nullptr);
-            if (m_PipelineLayout != VK_NULL_HANDLE) vkDestroyPipelineLayout(m_Device, m_PipelineLayout, nullptr);
-            if (m_DescriptorPool != VK_NULL_HANDLE) {
-                // Destroying the pool implicitly frees m_Set.
-                vkDestroyDescriptorPool(m_Device, m_DescriptorPool, nullptr);
-            }
-            if (m_SetLayout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(m_Device, m_SetLayout, nullptr);
-        }
-        m_ViewParamsBuffer.Destroy();
-        m_MaterialParamsBuffer.Destroy();
-        m_WorldProbeGridParamsBuffer.Destroy();
-
-        m_Pipeline = VK_NULL_HANDLE;
-        m_PipelineLayout = VK_NULL_HANDLE;
-        m_DescriptorPool = VK_NULL_HANDLE;
-        m_SetLayout = VK_NULL_HANDLE;
-        m_Set = VK_NULL_HANDLE;
-        m_FallbackVertexBuffer = VK_NULL_HANDLE;
-        m_FallbackIndexBuffer = VK_NULL_HANDLE;
-        m_Entities.clear();
-        m_Device = VK_NULL_HANDLE;
-    }
+    // Shutdown() is inherited from RenderPass<TessellationPass>: runs the RegisterResource()
+    // cleanups above in reverse (pipeline -> pipeline layout -> descriptor pool+layout ->
+    // material-params buffer -> world-probe-grid-params buffer -> view-params buffer), the same
+    // dependency-safe order the hand-written Shutdown() used. m_FallbackVertexBuffer/
+    // m_FallbackIndexBuffer/m_Entities left un-reset (same reasoning as AtmosCloudsPass's
+    // m_OutputExtent: private, no getters, unconditionally re-set at the top of every InitImpl()).
 
     void TessellationPass::RecordDraw(VkCommandBuffer cmd, const maths::mat4& viewProj, const maths::vec3& cameraPositionWorld,
         VkImage colorImage, VkImageView colorView, VkImage depthImage, VkImageView depthView,

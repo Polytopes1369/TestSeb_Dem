@@ -27,10 +27,13 @@ namespace renderer {
 
     } // namespace
 
-    bool ShadowMapPass::Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
+    bool ShadowMapPass::InitImpl(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
         const std::filesystem::path& cacheFilePath) {
+        // Self-reinit: releases any previously-registered resources (a no-op on the very first call,
+        // since m_Cleanups starts empty) before rebuilding below. Shutdown() also clears
+        // m_Device/m_Allocator, which RenderPass<ShadowMapPass>::Init() already set to this call's
+        // values just before invoking this function -- re-assign them here to restore that.
         Shutdown();
-
         m_Device = device;
         m_Allocator = allocator;
 
@@ -108,6 +111,13 @@ namespace renderer {
             m_IndexBuffer.Create(allocator, indexBytes,
                 VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
         }
+        // Registered unconditionally (matching the original Shutdown()'s unconditional
+        // m_VertexBuffer.Destroy()/m_IndexBuffer.Destroy() calls): GpuBuffer::Destroy() is a safe
+        // no-op on a buffer that was never Create()'d (empty-scene case above).
+        RegisterResource([this] {
+            m_VertexBuffer.Destroy();
+            m_IndexBuffer.Destroy();
+        });
 
         VkImageCreateInfo shadowImageInfo{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
         shadowImageInfo.imageType = VK_IMAGE_TYPE_2D;
@@ -131,6 +141,13 @@ namespace renderer {
         viewInfo.format = kShadowFormat;
         viewInfo.subresourceRange = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1 };
         VK_CHECK(vkCreateImageView(m_Device, &viewInfo, nullptr, &m_ShadowView));
+        RegisterResource([this] {
+            vkDestroyImageView(m_Device, m_ShadowView, nullptr);
+            vmaDestroyImage(m_Allocator, m_ShadowImage, m_ShadowAllocation);
+            m_ShadowView = VK_NULL_HANDLE;
+            m_ShadowImage = VK_NULL_HANDLE;
+            m_ShadowAllocation = VK_NULL_HANDLE;
+        });
 
         VkSamplerCreateInfo samplerInfo{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
         samplerInfo.magFilter = VK_FILTER_LINEAR;
@@ -150,6 +167,7 @@ namespace renderer {
         samplerInfo.maxLod = 0.0f;
         samplerInfo.unnormalizedCoordinates = VK_FALSE;
         VK_CHECK(vkCreateSampler(m_Device, &samplerInfo, nullptr, &m_ShadowSampler));
+        RegisterResource([this] { vkDestroySampler(m_Device, m_ShadowSampler, nullptr); m_ShadowSampler = VK_NULL_HANDLE; });
 
         // =====================================================================================
         // STEP 3 -- One-time setup command buffer: upload the combined geometry (if any) and
@@ -226,6 +244,7 @@ namespace renderer {
         layoutInfo.pushConstantRangeCount = 1;
         layoutInfo.pPushConstantRanges = &pushConstantRange;
         VK_CHECK(vkCreatePipelineLayout(m_Device, &layoutInfo, nullptr, &m_PipelineLayout));
+        RegisterResource([this] { vkDestroyPipelineLayout(m_Device, m_PipelineLayout, nullptr); m_PipelineLayout = VK_NULL_HANDLE; });
 
         VkShaderModule vertModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/ShadowMapCapture.vert.spv");
 
@@ -300,34 +319,23 @@ namespace renderer {
         pipelineInfo.layout = m_PipelineLayout;
         pipelineInfo.pNext = &pipelineRendering;
         VK_CHECK(vkCreateGraphicsPipelines(m_Device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_Pipeline));
+        RegisterResource([this] { vkDestroyPipeline(m_Device, m_Pipeline, nullptr); m_Pipeline = VK_NULL_HANDLE; });
 
         vkDestroyShaderModule(m_Device, vertModule, nullptr);
+
+        // Not Vulkan handles -- but the original hand-written Shutdown() reset these two too (NOT
+        // m_SceneBoundsCenter, which it left untouched; preserved exactly as-is here).
+        RegisterResource([this] {
+            m_TotalIndexCount = 0;
+            m_SceneBoundsRadius = 0.0f;
+        });
 
         return true;
     }
 
-    void ShadowMapPass::Shutdown() {
-        if (m_Device != VK_NULL_HANDLE) {
-            if (m_Pipeline != VK_NULL_HANDLE) vkDestroyPipeline(m_Device, m_Pipeline, nullptr);
-            if (m_PipelineLayout != VK_NULL_HANDLE) vkDestroyPipelineLayout(m_Device, m_PipelineLayout, nullptr);
-            if (m_ShadowSampler != VK_NULL_HANDLE) vkDestroySampler(m_Device, m_ShadowSampler, nullptr);
-            if (m_ShadowView != VK_NULL_HANDLE) vkDestroyImageView(m_Device, m_ShadowView, nullptr);
-        }
-        if (m_Allocator != VK_NULL_HANDLE) {
-            if (m_ShadowImage != VK_NULL_HANDLE) vmaDestroyImage(m_Allocator, m_ShadowImage, m_ShadowAllocation);
-        }
-        m_VertexBuffer.Destroy();
-        m_IndexBuffer.Destroy();
-
-        m_Pipeline = VK_NULL_HANDLE;
-        m_PipelineLayout = VK_NULL_HANDLE;
-        m_ShadowSampler = VK_NULL_HANDLE;
-        m_ShadowImage = VK_NULL_HANDLE; m_ShadowAllocation = VK_NULL_HANDLE; m_ShadowView = VK_NULL_HANDLE;
-        m_TotalIndexCount = 0;
-        m_SceneBoundsRadius = 0.0f;
-        m_Allocator = VK_NULL_HANDLE;
-        m_Device = VK_NULL_HANDLE;
-    }
+    // Shutdown() is inherited from RenderPass<ShadowMapPass>: runs the RegisterResource() cleanups
+    // above in reverse (state reset -> pipeline -> pipeline layout -> sampler -> view+image ->
+    // vertex/index buffers), the same dependency-safe order the hand-written Shutdown() used.
 
     void ShadowMapPass::RecordCapture(VkCommandBuffer cmd, const maths::vec3& sunDirection) {
         // Fit an orthographic projection to the scene's bounding sphere from this direction: place

@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstring>
 #include <format>
+#include <span>
 #include <vector>
 
 #include "core/EngineConfig.h"
@@ -81,14 +82,32 @@ namespace renderer {
         VK_CHECK(vkCreateImageView(device, &viewInfo, nullptr, &outImage.view));
     }
 
-    bool AtmosVolumetricFogPass::Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
+    bool AtmosVolumetricFogPass::InitImpl(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
         const AtmosClimatePass& atmosClimate, const MegaLightsPass& megaLights, const VirtualShadowMapPass& vsm) {
-        m_Device = device;
-        m_Allocator = allocator;
-
         CreateFroxelImage(allocator, device, kMediaFormat, m_MediaProps);
+        RegisterResource([this] {
+            vkDestroyImageView(m_Device, m_MediaProps.view, nullptr);
+            vmaDestroyImage(m_Allocator, m_MediaProps.image, m_MediaProps.allocation);
+            m_MediaProps.view = VK_NULL_HANDLE;
+            m_MediaProps.image = VK_NULL_HANDLE;
+            m_MediaProps.allocation = VK_NULL_HANDLE;
+        });
         CreateFroxelImage(allocator, device, kRadianceFormat, m_RawLight);
+        RegisterResource([this] {
+            vkDestroyImageView(m_Device, m_RawLight.view, nullptr);
+            vmaDestroyImage(m_Allocator, m_RawLight.image, m_RawLight.allocation);
+            m_RawLight.view = VK_NULL_HANDLE;
+            m_RawLight.image = VK_NULL_HANDLE;
+            m_RawLight.allocation = VK_NULL_HANDLE;
+        });
         CreateFroxelImage(allocator, device, kRadianceFormat, m_IntegratedFog);
+        RegisterResource([this] {
+            vkDestroyImageView(m_Device, m_IntegratedFog.view, nullptr);
+            vmaDestroyImage(m_Allocator, m_IntegratedFog.image, m_IntegratedFog.allocation);
+            m_IntegratedFog.view = VK_NULL_HANDLE;
+            m_IntegratedFog.image = VK_NULL_HANDLE;
+            m_IntegratedFog.allocation = VK_NULL_HANDLE;
+        });
 
         VkClearColorValue zeroClear{}; zeroClear.float32[0] = zeroClear.float32[1] = zeroClear.float32[2] = 0.0f; zeroClear.float32[3] = 1.0f;
         VulkanUtils::ExecuteOneShotCommands(device, commandPool, queue, [&](VkCommandBuffer cmd) {
@@ -109,6 +128,7 @@ namespace renderer {
         samplerInfo.compareEnable = VK_FALSE;
         samplerInfo.unnormalizedCoordinates = VK_FALSE;
         VK_CHECK(vkCreateSampler(m_Device, &samplerInfo, nullptr, &m_FogSampler));
+        RegisterResource([this] { vkDestroySampler(m_Device, m_FogSampler, nullptr); m_FogSampler = VK_NULL_HANDLE; });
 
         // --- Local Fog Volumes (G8): build the binding-11 std430 SSBO ONCE from config. ---
         // These are static authored scene content (like the VulkanContext zone layout), so they are
@@ -156,6 +176,10 @@ namespace renderer {
                 static_cast<VkDeviceSize>(std::max<uint32_t>(1u, m_LocalFogVolumeCount)) * sizeof(LocalFogVolumeGPU);
             m_LocalFogVolumes.Create(allocator, volumesBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                 VMA_MEMORY_USAGE_CPU_TO_GPU, /*mapped=*/true);
+            RegisterResource([this] {
+                m_LocalFogVolumes.Destroy();
+                m_LocalFogVolumeCount = 0u;
+            });
             if (m_LocalFogVolumeCount > 0u) {
                 std::memcpy(m_LocalFogVolumes.MappedData(), gpuVolumes.data(),
                     gpuVolumes.size() * sizeof(LocalFogVolumeGPU));
@@ -182,28 +206,23 @@ namespace renderer {
             { 10, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },        // Shadow sun levels
             { 11, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },        // Local Fog Volumes SSBO (G8)
         } };
-        VkDescriptorSetLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-        layoutInfo.bindingCount = static_cast<uint32_t>(bindings.size());
-        layoutInfo.pBindings = bindings.data();
-        VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &layoutInfo, nullptr, &m_SetLayout));
-
         std::array<VkDescriptorPoolSize, 4> poolSizes{ {
             { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 3 },
             { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3 },
             { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4 }, // MegaLights + shadow page table + shadow feedback + local fog volumes.
             { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2 }, // AtmosGlobalsUBO + shadow sun levels.
         } };
-        VkDescriptorPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
-        poolInfo.maxSets = 1;
-        poolInfo.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
-        poolInfo.pPoolSizes = poolSizes.data();
-        VK_CHECK(vkCreateDescriptorPool(m_Device, &poolInfo, nullptr, &m_DescriptorPool));
-
-        VkDescriptorSetAllocateInfo allocSet{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-        allocSet.descriptorPool = m_DescriptorPool;
-        allocSet.descriptorSetCount = 1;
-        allocSet.pSetLayouts = &m_SetLayout;
-        VK_CHECK(vkAllocateDescriptorSets(m_Device, &allocSet, &m_Set));
+        auto descSet = VulkanUtils::CreateDescriptorSetLayoutPoolAndSet(m_Device, bindings, poolSizes);
+        m_SetLayout = descSet.layout;
+        m_DescriptorPool = descSet.pool;
+        m_Set = descSet.set;
+        RegisterResource([this] {
+            vkDestroyDescriptorPool(m_Device, m_DescriptorPool, nullptr);
+            vkDestroyDescriptorSetLayout(m_Device, m_SetLayout, nullptr);
+            m_DescriptorPool = VK_NULL_HANDLE;
+            m_SetLayout = VK_NULL_HANDLE;
+            m_Set = VK_NULL_HANDLE;
+        });
 
         VkDescriptorImageInfo mediaStorageInfo{ VK_NULL_HANDLE, m_MediaProps.view, VK_IMAGE_LAYOUT_GENERAL };
         VkDescriptorImageInfo mediaSamplerInfo{ m_FogSampler, m_MediaProps.view, VK_IMAGE_LAYOUT_GENERAL };
@@ -241,49 +260,21 @@ namespace renderer {
         plInfo.pushConstantRangeCount = 1;
         plInfo.pPushConstantRanges = &pushRange;
         VK_CHECK(vkCreatePipelineLayout(m_Device, &plInfo, nullptr, &m_PipelineLayout));
+        RegisterResource([this] { vkDestroyPipelineLayout(m_Device, m_PipelineLayout, nullptr); m_PipelineLayout = VK_NULL_HANDLE; });
 
         VkShaderModule shader = VulkanPipeline::LoadShaderModule(m_Device, "shaders/AtmosVolumetricFog.comp.spv");
         m_Pipeline = VulkanPipeline::CreateComputePipeline(m_Device, m_PipelineLayout, shader);
         vkDestroyShaderModule(m_Device, shader, nullptr);
+        RegisterResource([this] { vkDestroyPipeline(m_Device, m_Pipeline, nullptr); m_Pipeline = VK_NULL_HANDLE; });
 
         LOG_INFO(std::format("[AtmosVolumetricFogPass] Initialized ({}x{}x{} froxel grid).", kGridWidth, kGridHeight, kGridDepth));
         return true;
     }
 
-    void AtmosVolumetricFogPass::Shutdown() {
-        // Local Fog Volumes (G8): release the SSBO while the VMA allocator is still alive (GpuBuffer
-        // captured it at Create()). Safe to call even if Init never ran (no-op on an empty buffer).
-        m_LocalFogVolumes.Destroy();
-        m_LocalFogVolumeCount = 0u;
-
-        if (m_Device != VK_NULL_HANDLE) {
-            if (m_Pipeline != VK_NULL_HANDLE) vkDestroyPipeline(m_Device, m_Pipeline, nullptr);
-            if (m_PipelineLayout != VK_NULL_HANDLE) vkDestroyPipelineLayout(m_Device, m_PipelineLayout, nullptr);
-            if (m_SetLayout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(m_Device, m_SetLayout, nullptr);
-            if (m_DescriptorPool != VK_NULL_HANDLE) vkDestroyDescriptorPool(m_Device, m_DescriptorPool, nullptr);
-            if (m_FogSampler != VK_NULL_HANDLE) vkDestroySampler(m_Device, m_FogSampler, nullptr);
-            if (m_MediaProps.view != VK_NULL_HANDLE) vkDestroyImageView(m_Device, m_MediaProps.view, nullptr);
-            if (m_RawLight.view != VK_NULL_HANDLE) vkDestroyImageView(m_Device, m_RawLight.view, nullptr);
-            if (m_IntegratedFog.view != VK_NULL_HANDLE) vkDestroyImageView(m_Device, m_IntegratedFog.view, nullptr);
-        }
-        if (m_Allocator != VK_NULL_HANDLE) {
-            if (m_MediaProps.image != VK_NULL_HANDLE) vmaDestroyImage(m_Allocator, m_MediaProps.image, m_MediaProps.allocation);
-            if (m_RawLight.image != VK_NULL_HANDLE) vmaDestroyImage(m_Allocator, m_RawLight.image, m_RawLight.allocation);
-            if (m_IntegratedFog.image != VK_NULL_HANDLE) vmaDestroyImage(m_Allocator, m_IntegratedFog.image, m_IntegratedFog.allocation);
-        }
-
-        m_MediaProps = {};
-        m_RawLight = {};
-        m_IntegratedFog = {};
-        m_Pipeline = VK_NULL_HANDLE;
-        m_PipelineLayout = VK_NULL_HANDLE;
-        m_SetLayout = VK_NULL_HANDLE;
-        m_Set = VK_NULL_HANDLE;
-        m_DescriptorPool = VK_NULL_HANDLE;
-        m_FogSampler = VK_NULL_HANDLE;
-        m_Allocator = VK_NULL_HANDLE;
-        m_Device = VK_NULL_HANDLE;
-    }
+    // Shutdown() is inherited from RenderPass<AtmosVolumetricFogPass>: runs the RegisterResource()
+    // cleanups above in reverse (pipeline -> pipeline layout -> descriptor pool+layout -> local fog
+    // volumes SSBO -> sampler -> integrated-fog image -> raw-light image -> media-props image), the
+    // same dependency-safe order the hand-written Shutdown() used.
 
     void AtmosVolumetricFogPass::RecordUpdate(VkCommandBuffer cmd, const maths::vec3& cameraPosition,
         const maths::vec3& cameraForward, const maths::vec3& upHint,

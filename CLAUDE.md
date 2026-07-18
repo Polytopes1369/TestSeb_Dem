@@ -43,3 +43,111 @@ Tout est 100% procedural GPU driven.
 4. Enfin, bascule à nouveau sur la branche d'origine (la branche courante actuelle) et fusionne (merge) ta branche locale temporaire dedans afin que le résultat final se retrouve directement dans mon espace de travail actif. Supprime ensuite la branche temporaire locale que tu as créée.
 
 Confirme que tu as créé la branche locale avant de formuler ta première proposition technique.
+
+---
+
+## État Actuel du Projet (2026-07-18)
+
+### Vue d'ensemble rapide
+**DemoScene Vulkan 2026** est un moteur GPU-driven 100% procédural pour Windows/Vulkan 1.3, conçu pour créer une démoscene haute performance. Le projet contient **238 fichiers sources**, **50+ passes de rendu**, et **multiple roadmaps en cours**.
+
+### Roadmaps Complétées ✓
+- **Nanite-Parity** (9 phases) : Cluster LOD, hardware/software rasterization, tessellation WPO
+- **Lumen-Parity** (6+ phases) : Global SDF, Surface Cache, World Probe Grid, Screen-space GI, Reflections
+- **Atmos Weather** (5 phases) : Climate model, PBR sky, volumetric clouds, froxel fog, cloud shadows
+- **Particle System** (Niagara-parity, 6 subtasks) : Multi-emitter, mesh/ribbon/sprite rendering, collision, data interfaces
+
+### Roadmaps En Cours 🔄
+- **PCG Framework** (10 phases, 70% done)
+  - ✓ Phases 0-3 (Data model, sampler, filters)
+  - ✓ Phases 5.1-5.2 (Graph engine CPU)
+  - ⏳ Phases 4, 6+ (GPU spawner, GPU vertex gen)
+  - ⏳ Phase 7-10 (Editor, material binding, mesh ops)
+
+- **UE5.8 Render Parity** (G1-G10, 70% done)
+  - ✓ G2 (MegaLights), G8 (Post-process)
+  - 🔄 G1, G3-G4, G5-G7, G10 (Various render features)
+
+### Statistiques Clés
+| Métrique | Valeur |
+|----------|--------|
+| Fichiers sources | 238 (.cpp/.h/.hpp) |
+| Shaders GLSL | ~40+ (.comp/.glsl → SPIR-V) |
+| Passes de rendu | 50+ |
+| Tests (`--test-pipeline`) | 10/10 ✓ |
+| Build (clean) | ~45s |
+| Commits | 200+ |
+| Feature branches actives | 15+ |
+
+### Architecture Majeure
+```
+Main Rendering Pipeline:
+  HZBPass → ClusterCullingPass → ClusterOcclusionCullingPass
+    ↓
+  ClusterHardwareRasterPass / ClusterSoftwareRasterPass
+    ↓
+  ClusterResolvePass (Visibility Buffer)
+    ↓
+  [Parallel] MegaLightsPass, GlobalSDFPass, SurfaceCachePass
+    ↓
+  [GI] ScreenTracePass → GICompositePass → WorldProbeGridPass
+    ↓
+  [Effects] AtmosClimatePass, AtmosCloudsPass, ParticleSystemPass
+    ↓
+  [Forward] TransparentForwardPass, WaterForwardPass
+    ↓
+  [Post] PostProcessPass → BloomPass → TAATSRPass → Present
+```
+
+### Structure des Sources
+```
+src/
+  ├── main.cpp (1914 lignes, entry point)
+  ├── core/ (Camera, Config, Logging, LoadingManager, ECS)
+  ├── renderer/ (ClusterRenderPipeline + 50+ passes)
+  │   ├── vulkan/ (VMA, command buffers, synchronization)
+  │   ├── passes/ (Culling, Rasterization, Lighting, GI, FX)
+  │   ├── streaming/ (LOD, residency, virtual textures)
+  │   └── debug/ (ImGui overlays, Debug-only)
+  ├── pcg/ (~25 fichiers, graph evaluation engine)
+  ├── shaders/ (~40+ .comp/.glsl → SPIR-V)
+  ├── audio/ (Procedural sound generator)
+  ├── world/ (Scene graph, world partition streaming)
+  ├── geometry/ (Mesh structures, compression)
+  └── io/ (Asset loading, cache, async decompression)
+```
+
+### Prochaines Étapes Critiques (Ordre priorité)
+
+**Immédiat (cette semaine)**
+1. **PCG Phase 4** - GPU Spawner System
+   - Compute shader spawner
+   - Instance data generation
+   - Collision awareness
+2. **UE5.8 Gap G1** - Material Parameter Updates
+   - Paramètres de matériau dynamiques
+   - Bindless material table expansion
+
+**Court-terme (2 semaines)**
+3. **PCG Phase 6** - GPU Vertex Generation
+4. **UE5.8 Gaps G3-G4** - Decals + Substrate SSS (en parallèle)
+5. **Feature Branch Backlog** - Cluster DAG, Decals, Skeletal Animation
+
+**Moyen-terme (1 mois)**
+6. **PCG Phase 7** - Editor Tools (Node canvas complet)
+7. **UE5.8 Gaps G5-G10** - Closure complète
+8. **Performance Optimization Pass** - GPU memory, cache coherency
+
+### Points d'attention connus
+- **DAG-build hang** → Mitigé via LoadingManager throttle (4 workers)
+- **Shader stale deploy** → Vérifier timestamps shaders_gen vs shaders/
+- **Incremental build corruption** → Fresh dir + full rebuild si device-lost
+- **TAA flicker** → Mitigation via TAATSR alpha cap (attend Phase B temporal)
+- **Cluster bounds rotation** → Never in persisted SSBO, only local copy
+
+### Documentation Complète
+Voir [PROJECT_ANALYSIS.md](PROJECT_ANALYSIS.md) pour l'analyse détaillée complète du projet.
+
+---
+
+## Directives de Codage (Détaillé)
