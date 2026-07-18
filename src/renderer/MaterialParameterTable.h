@@ -64,7 +64,18 @@ namespace renderer {
         maths::vec3 fuzzColor;
         float fuzzAmount = 0.0f;
         float fuzzRoughness = 0.3f;
-        float _pad0 = 0.0f;
+        // Screen-space Subsurface Scattering (UE5.8 rendering-parity gap G4, "Subsurface Profile"
+        // shading model): the world-space diffusion radius fed to renderer::SubsurfaceScatteringPass'
+        // separable screen-space blur (the Jimenez/Burley "Separable SSS" technique). 0.0 (default) =
+        // disabled (the pixel is never touched by that pass -- exactly the pre-G4 behavior, at zero
+        // extra cost). DISTINCT from sssAmount/sssRadius above: those drive the cheap analytic
+        // wrap-diffuse baked directly into EvaluateSlabDiffuse (substrate_bsdf.glsl), whereas this
+        // drives a real post-lighting separable screen-space diffusion pass -- exactly Substrate's
+        // own distinction between its "Subsurface" (wrap) and "Subsurface Profile" (screen-space
+        // diffusion) shading models. A material authors ONE or the other, not both (setting both
+        // would double-count subsurface transport -- see GenerateShowcaseMaterialTable's own waxy SSS
+        // showcase recipe, which sets this and leaves sssAmount at 0). Occupies what was _pad0.
+        float sssProfileScale = 0.0f;
         float _pad1 = 0.0f;
         float _pad2 = 0.0f;
     };
@@ -291,8 +302,22 @@ namespace renderer {
         // Dielectric B (Pyramid, slot 9): matte deep green, fully opaque non-metal.
         table.params[9].base = MakeBaseSlab(maths::vec3(0.15f, 0.55f, 0.25f), 0.75f, maths::vec3(0.0f, 0.0f, 0.0f), 0.0f);
 
-        // Nanite B (TorusKnot, slot 10): neutral gray, distinct tint from slot 2 but same intent.
-        table.params[10].base = MakeBaseSlab(maths::vec3(0.6f, 0.6f, 0.7f), 0.5f, maths::vec3(0.0f, 0.0f, 0.0f), 0.0f);
+        // Screen-space Subsurface Scattering showcase (TorusKnot, slot 10) -- UE5.8 rendering-parity
+        // gap G4, "Subsurface Profile" shading model. Repurposes what was the "Nanite B neutral"
+        // slot: a torus knot's many thin, self-shadowing tubes are the ideal shape to show light
+        // visibly bleeding THROUGH thin geometry and softly wrapping past the sun terminator, exactly
+        // the effect renderer::SubsurfaceScatteringPass produces (vs. the sharp Lambertian falloff
+        // every other opaque material here has). It is still fully-opaque neutral Nanite geometry, so
+        // it keeps serving the "Nanite B" role too -- and every per-cluster debug view (Numpad '*')
+        // hash-colors it regardless of this base color, so those visualizations are unaffected.
+        // A warm ivory/wax base color (not pure white) so the diffusion profile's characteristic
+        // reddish edge-bleed reads clearly; moderate-high roughness (soft, low specular -- an organic
+        // waxy surface, not glossy); dielectric; reflections OFF (default). sssProfileScale drives the
+        // world-space diffusion radius (see renderer::SubstrateSlab::sssProfileScale); sssAmount is
+        // deliberately left at 0 -- this recipe uses the real screen-space diffusion, NOT the cheap
+        // analytic wrap-diffuse, and using both would double-count subsurface transport.
+        table.params[10].base = MakeBaseSlab(maths::vec3(0.86f, 0.72f, 0.60f), 0.45f, maths::vec3(0.0f, 0.0f, 0.0f), 0.0f);
+        table.params[10].base.sssProfileScale = 0.30f;
 
         // Lumen/GI hero (ChamferBox, slot 11): near-white neutral so it best picks up the red/green
         // bounce light from the 2 corner walls, with no tint of its own to muddy the result.

@@ -1,0 +1,97 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+
+// Debug-only (subtask E3, Niagara-parity particle system roadmap -- Debug Buffer Viewer extension,
+// see renderer::debug::ParticleDebugViewPass's own class comment): bakes renderer::
+// ParticleSystemPass's own raw GpuParticle buffer into a kGridWidth x kGridHeight RGBA8 image, one
+// pixel per particle SLOT (renderer::ParticleSystemPass::kMaxParticles == kGridWidth * kGridHeight
+// exactly, statically asserted on the C++ side) -- fuses an "alive-list occupancy heatmap" (a dead
+// slot, life <= 0, renders as a faint uniform gray so the grid's own structure stays visible even
+// when almost nothing is alive) with a per-emitter color-coded overlay (an alive slot's hue keys
+// off its own stored Particle.emitterIndex, brightness off its normalized remaining life) into a
+// single view. Feeds straight into the existing renderer::debug::DebugBufferViewPass (kPassthrough
+// mode) -- this shader's own output is already display-ready RGB, no further tonemap/grayscale/
+// octahedral remap needed.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+// Byte-for-byte mirror of ParticleCommon.glsl's own `Particle` struct (also mirrored by renderer::
+// GpuParticle, ParticleSystemPass.h) -- only the 2 fields this view actually needs (life,
+// emitterIndex) are meaningfully named; every other field is skipped via explicitly-named padding
+// so the std430 offsets still land exactly where the real struct puts them (this shader binds the
+// SAME physical buffer every other particle shader writes, so the layouts must agree exactly, even
+// though this shader itself only ever READS 2 of its 12 fields).
+struct ParticleDebugEntry {
+    vec3 _padPosition;
+    float life;         // Seconds remaining before this particle dies -- <= 0 means the slot is dead.
+    vec3 _padVelocity;
+    float maxLife;       // Seconds this particle was spawned with -- used below for age-based brightness.
+    vec4 _padColor;
+    vec2 _padSize;
+    float _padRotation;
+    uint _padRandomSeed;
+    uint emitterIndex;    // Which EmitterParamsBuffer slot spawned this particle -- keys the color palette below.
+    float _padBaseSize;
+    float _pad1, _pad2;
+};
+
+layout(std430, set = 0, binding = 0) readonly buffer ParticleBuffer {
+    ParticleDebugEntry particles[];
+};
+
+layout(rgba8, set = 0, binding = 1) uniform writeonly image2D g_Output;
+
+layout(push_constant) uniform ParticleDebugViewPC {
+    uint particleCount; // renderer::ParticleSystemPass::kMaxParticles -- must equal gridWidth*gridHeight exactly.
+    uint maxEmitters;   // renderer::ParticleSystemPass::kMaxEmitters -- bounds the emitter color palette lookup below.
+} pc;
+
+// Fixed small hue palette, one entry per emitter slot -- deliberately simple/high-contrast (not a
+// continuous HSV wheel) so a developer can visually separate "which emitter" at a glance. Indexed
+// modulo 4 below, so this stays safe even if renderer::ParticleSystemPass::kMaxEmitters ever grows
+// past 4 (colors would repeat, not overflow).
+const vec3 kEmitterColors[4] = vec3[4](
+    vec3(1.00, 0.25, 0.25), // Emitter 0 -- red.
+    vec3(0.25, 1.00, 0.35), // Emitter 1 -- green.
+    vec3(0.35, 0.55, 1.00), // Emitter 2 -- blue.
+    vec3(1.00, 0.85, 0.25)  // Emitter 3 -- yellow.
+);
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 res = imageSize(g_Output);
+    if (pixel.x >= res.x || pixel.y >= res.y) {
+        return;
+    }
+
+    uint slotIndex = uint(pixel.y) * uint(res.x) + uint(pixel.x);
+    if (slotIndex >= pc.particleCount) {
+        // Should never trigger given kMaxParticles == gridWidth*gridHeight exactly (see this
+        // shader's own header comment), but defensive regardless -- render as a distinct dark blue
+        // so a future capacity/grid-size mismatch is immediately visually obvious rather than
+        // silently sampling past the end of ParticleBuffer.
+        imageStore(g_Output, pixel, vec4(0.0, 0.0, 0.15, 1.0));
+        return;
+    }
+
+    float life = particles[slotIndex].life;
+    if (life <= 0.0) {
+        // Dead slot -- faint gray, not pure black, so the grid's own structure stays visible even
+        // when almost nothing is alive (confirms this view is actually updating, not just stuck on
+        // a cleared image).
+        imageStore(g_Output, pixel, vec4(0.05, 0.05, 0.05, 1.0));
+        return;
+    }
+
+    uint emitterIndex = particles[slotIndex].emitterIndex % max(pc.maxEmitters, 1u);
+    vec3 baseColor = kEmitterColors[emitterIndex % 4u];
+
+    // Age-based brightness: freshly-spawned particles (age near 0) render at full brightness,
+    // particles near death (age near 1) render dimmer but never as dim as a dead slot's flat gray
+    // above -- keeps "alive" visually unambiguous from "dead" at a glance regardless of age.
+    float maxLife = max(particles[slotIndex].maxLife, 0.0001);
+    float age = clamp((maxLife - life) / maxLife, 0.0, 1.0);
+    float brightness = mix(1.0, 0.35, age);
+
+    imageStore(g_Output, pixel, vec4(baseColor * brightness, 1.0));
+}

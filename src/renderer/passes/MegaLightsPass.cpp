@@ -4,6 +4,7 @@
 #include <cfloat>
 #include <cstring>
 #include <format>
+#include <vector>
 
 #include "core/EngineConfig.h"
 #include "core/Logger.h"
@@ -72,15 +73,38 @@ namespace renderer {
         // STEP 1 -- Light SSBO: host-visible, persistently mapped, filled once here (static
         // procedural population -- never re-uploaded per frame, same convention as renderer::
         // SurfaceCacheTraceContext's own host-visible entity/card buffers).
+        //
+        // Niagara-parity render-integration roadmap, D4 (particles as light emitters): the buffer is
+        // sized for kMaxMegaLights + kMaxParticleDerivedLights (MegaLightsTypes.h) entries, not just
+        // kMaxMegaLights -- the extra kMaxParticleDerivedLights slots are zero-filled here (an
+        // "inert" MegaLight -- zero radius/intensity, see MegaLightTargetWeight's own comment in
+        // megalights_ris.glsl for why that provably scores zero weight regardless of position/
+        // normal) and left for renderer::ParticleSystemPass::RecordExtractLights to overwrite every
+        // frame with real {position, radius, color, intensity} entries derived from currently-alive
+        // emissive particles. `header.lightCount` covers the FULL total (static + reserved) so every
+        // existing RIS consumer's own full-population fallback draw (TransparentForward.frag/
+        // TessellationPass/ParticleRender.frag, whenever poolCount == 0) already reaches these slots
+        // with zero code change on their end -- an inert slot picked by that draw contributes exactly
+        // 0 (see above), so this is a strictly additive, backward-compatible change for every
+        // existing consumer. `m_LightCount` itself is left at the STATIC population's own count
+        // (unchanged meaning, still used below for BVH-build bookkeeping/logging).
         // =====================================================================================
         constexpr VkDeviceSize kHeaderBytes = 16; // uint lightCount + 3 reserved uint (16-byte-aligns the trailing array, matches megalights_ris.glsl's own MegaLightsSSBO layout).
-        VkDeviceSize lightBufferBytes = kHeaderBytes + static_cast<VkDeviceSize>(kMaxMegaLights) * sizeof(MegaLight);
+        constexpr uint32_t kTotalLightCapacity = kMaxMegaLights + kMaxParticleDerivedLights;
+        VkDeviceSize lightBufferBytes = kHeaderBytes + static_cast<VkDeviceSize>(kTotalLightCapacity) * sizeof(MegaLight);
         m_LightBuffer.Create(allocator, lightBufferBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VMA_MEMORY_USAGE_CPU_TO_GPU, /*mapped=*/true);
         {
             uint8_t* dst = static_cast<uint8_t*>(m_LightBuffer.MappedData());
-            uint32_t header[4] = { m_LightCount, 0u, 0u, 0u };
+            uint32_t header[4] = { kTotalLightCapacity, 0u, 0u, 0u };
             std::memcpy(dst, header, sizeof(header));
             std::memcpy(dst + kHeaderBytes, lightsData.lights.data(), kMaxMegaLights * sizeof(MegaLight));
+            MegaLight inertLight{}; // MegaLight's own default field values are non-zero (radius=1, color=white, intensity=1) -- overridden below to be truly inert.
+            inertLight.radius = 0.0f;
+            inertLight.color = maths::vec3(0.0f, 0.0f, 0.0f);
+            inertLight.intensity = 0.0f;
+            for (uint32_t i = 0; i < kMaxParticleDerivedLights; ++i) {
+                std::memcpy(dst + kHeaderBytes + static_cast<VkDeviceSize>(kMaxMegaLights + i) * sizeof(MegaLight), &inertLight, sizeof(inertLight));
+            }
         }
 
         // =====================================================================================
@@ -88,9 +112,34 @@ namespace renderer {
         // light SSBO upload above (lights are confirmed static for this pass' entire lifetime --
         // see this class' own m_LightBVHNodesBuffer member comment). Host-visible/mapped SSBOs,
         // same "tiny data, no staging needed" convention as m_LightBuffer above.
+        //
+        // D4: the BVH is built over kTotalLightCapacity entries (not just m_LightCount) -- the
+        // kMaxParticleDerivedLights reserved slots get a PLACEHOLDER entry here (position at the
+        // showcase grid's own center, a generously large radius covering the whole ~12x12-unit
+        // layout -- see EntityGridPosition's own column/row pitch in MegaLightsTypes.cpp) purely so
+        // their AABB is indexed as an ALWAYS-CANDIDATE leaf by GatherSpatialLightCandidates
+        // (megalights_bvh.glsl) for MegaLightsShade.comp's own BVH-biased opaque-shading path --
+        // without this, a real per-frame particle light written into the SSBO tail by
+        // RecordExtractLights would be numerically correct but INVISIBLE to that path (the BVH
+        // traversal would simply never visit a node it was never told exists), silently defeating
+        // D4's entire purpose for opaque geometry specifically (the fallback full-population draw
+        // paths -- TransparentForward.frag et al. -- would still see it, but MegaLightsShade.comp's
+        // own opaque path is the one D4 exists for). The placeholder's OWN radius/color/intensity
+        // are irrelevant (BuildLightBVH only reads position+radius, to build an AABB) and are never
+        // read again after this call -- the ACTUAL per-frame light data
+        // GatherSpatialLightCandidates' caller evaluates always comes fresh from g_Lights.lights[i]
+        // in the SSBO (RecordExtractLights' own write target), so this placeholder never goes stale.
         // =====================================================================================
         {
-            geometry::LightBVH lightBVH = geometry::BuildLightBVH(lightsData.lights.data(), m_LightCount);
+            std::vector<MegaLight> lightsForBVH(lightsData.lights.begin(), lightsData.lights.begin() + kMaxMegaLights);
+            MegaLight placeholder{};
+            placeholder.position = maths::vec3(0.0f, 0.0f, 0.0f); // Showcase grid center (kZonePitch * {-1,0,1} columns/rows, MegaLightsTypes.cpp).
+            placeholder.radius = 20.0f; // Comfortably covers the whole grid + every zone's own jitter disk.
+            placeholder.color = maths::vec3(0.0f, 0.0f, 0.0f);
+            placeholder.intensity = 0.0f;
+            lightsForBVH.resize(kTotalLightCapacity, placeholder);
+
+            geometry::LightBVH lightBVH = geometry::BuildLightBVH(lightsForBVH.data(), kTotalLightCapacity);
             m_LightBVHNodeCount = static_cast<uint32_t>(lightBVH.nodes.size());
             m_LightBVHIndexCount = static_cast<uint32_t>(lightBVH.lightIndices.size());
 

@@ -106,6 +106,12 @@ struct DebugState {
     bool dumpDAGCutGapsRequested = false;
     // Toggles TAA + TSR on / off (Key 'A')
     bool taatsrEnabled = config::temporal::ENABLED_BY_DEFAULT;
+    // UE5.8 rendering-parity gap G4 (screen-space Subsurface Scattering): renderer::
+    // ClusterRenderPipeline::SetDebugSSSEnabled gates the [12f] SubsurfaceScatteringPass so its
+    // cost/contribution can be A/B'd, and SetDebugSSSRadiusScale scales the material-authored
+    // diffusion radius as a live tuning knob. Both driven from the Post FX ImGui tab below.
+    bool sssEnabled = true;
+    float sssRadiusScale = 1.0f;
     // Phase 1 (Nanite advanced): renderer::ClusterRenderPipeline::SetDebugEnhancedDisplacementEnabled
     // -- gates the multi-octave procedural noise displacement on entity 2 (Icosphere, see
     // enhanced_displacement.glsl). Key 'J' -- moved off 'B' (this branch's original key) during the
@@ -1007,6 +1013,10 @@ int main(int argc, char** argv) {
                 ImGui::Checkbox("Ambient Occlusion (GTAO)", &config::postprocess::AO_ENABLED);
                 ImGui::Checkbox("Contact Shadows", &config::postprocess::CONTACT_SHADOW_ENABLED);
                 ImGui::Checkbox("SSR Fallback", &config::postprocess::SSR_FALLBACK_ENABLED);
+                // UE5.8 rendering-parity gap G4: screen-space Subsurface Scattering A/B toggle +
+                // diffusion-radius tuning (the material's authored radius is multiplied by this).
+                ImGui::Checkbox("Subsurface Scattering", &g_DebugState.sssEnabled);
+                ImGui::SliderFloat("SSS Radius Scale", &g_DebugState.sssRadiusScale, 0.0f, 4.0f);
                 ImGui::EndTabItem();
             }
 
@@ -1032,6 +1042,12 @@ int main(int argc, char** argv) {
                     "Denoised GI (A-Trous)",
                     "GI Composite",
                     "Final Composite (Post-Process)",
+                    // Subtask E3 (Debug Buffer Viewer extension): one pixel per particle SLOT (a
+                    // 256x256 grid, renderer::ParticleSystemPass::kMaxParticles exactly) -- dead
+                    // slots render as a faint gray, alive slots are color-coded by which emitter
+                    // spawned them and brightness-faded by remaining life. See
+                    // renderer::debug::ParticleDebugViewPass's own class comment.
+                    "Particles: Alive/Emitter Heatmap",
                 };
                 ImGui::Combo("Buffer", &config::debugview::SELECTED_BUFFER_INDEX, kBufferNames, IM_ARRAYSIZE(kBufferNames));
                 ImGui::TextWrapped("Shows the selected buffer instead of the normal final image. Not tied to the Numpad debug-view-mode keys.");
@@ -1169,8 +1185,22 @@ int main(int argc, char** argv) {
                         ImGui::Checkbox("Active", &cfg.active);
                         ImGui::DragFloat("Spawn Rate (particles/s)", &cfg.spawnRate, 5.0f, 0.0f, 5000.0f);
                         ImGui::DragFloat3("Position", &cfg.positionX, 0.05f);
-                        ImGui::Combo("Spawn Shape", reinterpret_cast<int*>(&cfg.spawnShape), "Cone Burst\0Sphere Volume\0\0");
+                        ImGui::Combo("Spawn Shape", reinterpret_cast<int*>(&cfg.spawnShape), "Cone Burst\0Sphere Volume\0Mesh Surface\0\0");
                         ImGui::DragFloat("Shape Param (sphere radius)", &cfg.shapeParam0, 0.02f, 0.0f, 20.0f);
+                        // Subtask C3 (spawn-on-mesh-surface): only consulted when Spawn Shape above is
+                        // "Mesh Surface" -- matches ClusterCullMetadata::entityID / geometry::
+                        // ClusterIndexEntry::entityID (the showcase scene's own entity indices, see
+                        // VulkanContext::BuildEntityData()'s call sites for which meshID each showcase
+                        // zone uses). An entity with no currently-resident clusters (streamed out, or an
+                        // out-of-range ID) simply falls back to a small sphere spawn around this
+                        // emitter's own Position above -- see ParticleSimulation.comp's own
+                        // SpawnParticleCore comment.
+                        if (cfg.spawnShape == 2u) {
+                            int targetEntityId = static_cast<int>(cfg.spawnTargetEntityId);
+                            if (ImGui::DragInt("Target Entity ID (mesh surface)", &targetEntityId, 1.0f, 0, 63)) {
+                                cfg.spawnTargetEntityId = static_cast<uint32_t>(std::max(0, targetEntityId));
+                            }
+                        }
                         ImGui::ColorEdit4("Base Color", &cfg.colorR);
                         ImGui::DragFloatRange2("Size Range", &cfg.sizeMin, &cfg.sizeMax, 0.005f, 0.001f, 5.0f);
                         ImGui::DragFloatRange2("Lifetime Range (s)", &cfg.lifetimeMin, &cfg.lifetimeMax, 0.05f, 0.1f, 30.0f);
@@ -1181,6 +1211,11 @@ int main(int argc, char** argv) {
                         ImGui::SliderFloat("Bounce Elasticity", &cfg.bounceElasticity, 0.0f, 1.0f);
                         ImGui::SliderFloat("Friction", &cfg.friction, 0.0f, 1.0f);
                         ImGui::DragFloat("Wind Drag", &cfg.dragCoefficient, 0.02f, 0.0f, 5.0f);
+                        // Subtask C2 (screen-space depth-buffer collision) -- a fallback/supplement to
+                        // the Global SDF collision above, for camera-relative dynamic geometry the SDF
+                        // clipmap has not (re)captured yet. See config::particles::EmitterConfig::
+                        // depthCollisionEnabled's own declaration comment.
+                        ImGui::Checkbox("Depth-Buffer Collision (fallback)", &cfg.depthCollisionEnabled);
 
                         // Module stack roadmap (subtask A3): two independently-toggleable force
                         // modules layered on top of the fixed physics knobs above -- a small,
@@ -1224,6 +1259,48 @@ int main(int argc, char** argv) {
                         }
                         ImGui::PopID();
 
+                        // Subtask C4 (Niagara-parity roadmap: sub-emitters / event-driven spawn
+                        // chains) -- this emitter triggers spawning INTO a different emitter slot's
+                        // own style when one of its own particles dies or first hits Global SDF
+                        // geometry. See config::particles::EmitterConfig's own trailing fields'
+                        // declaration comment and ParticleSimulation.comp's own TriggerSubEmitter
+                        // comment for the full one-level-deep-capped contract -- a sub-emitter-spawned
+                        // particle can never itself trigger a further chain, regardless of what the
+                        // target slot's own fields below say.
+                        ImGui::Separator();
+                        ImGui::TextUnformatted("Sub-Emitters (subtask C4)");
+                        ImGui::Checkbox("Enable Sub-Emitter", &cfg.subEmitterEnabled);
+                        {
+                            int targetSlot = static_cast<int>(cfg.subEmitterTargetSlot);
+                            if (ImGui::Combo("Target Emitter Slot", &targetSlot, kEmitterNames, static_cast<int>(renderer::ParticleSystemPass::kMaxEmitters))) {
+                                cfg.subEmitterTargetSlot = static_cast<uint32_t>(targetSlot);
+                            }
+                        }
+                        ImGui::Combo("Trigger Condition", reinterpret_cast<int*>(&cfg.subEmitterTriggerMode), "On Death\0On Collision\0\0");
+                        {
+                            int spawnCount = static_cast<int>(cfg.subEmitterSpawnCount);
+                            if (ImGui::DragInt("Spawn Count Per Trigger", &spawnCount, 0.2f, 0, 32)) {
+                                cfg.subEmitterSpawnCount = static_cast<uint32_t>(std::max(0, spawnCount));
+                            }
+                        }
+
+                        // Niagara-parity roadmap (bundled B1 "Mesh Particle" + B2 "Ribbon/Trail" +
+                        // B3 "sprite orientation/sub-variation" workstream) -- one shared render-mode
+                        // selector per emitter, plus each mode's own knobs (only the ones relevant to
+                        // the currently-selected mode are shown, to keep this panel from becoming
+                        // cluttered with fields that do nothing for the other 2 modes).
+                        ImGui::Separator();
+                        ImGui::TextUnformatted("Render Mode (Niagara-parity roadmap B1/B2/B3)");
+                        ImGui::Combo("Render Mode", reinterpret_cast<int*>(&cfg.renderMode), "Billboard\0Mesh Particle\0Ribbon / Trail\0\0");
+                        if (cfg.renderMode == 1u) {
+                            ImGui::Combo("Mesh Archetype", reinterpret_cast<int*>(&cfg.meshArchetype), "Box\0Icosphere\0\0");
+                        } else if (cfg.renderMode == 2u) {
+                            ImGui::DragFloat("Ribbon Width (m)", &cfg.ribbonWidth, 0.005f, 0.005f, 2.0f);
+                        } else {
+                            ImGui::Combo("Sprite Orientation", reinterpret_cast<int*>(&cfg.spriteOrientationMode), "Camera-Facing\0Velocity-Aligned\0\0");
+                            ImGui::SliderFloat("Shape Sub-Variation", &cfg.subVariationStrength, 0.0f, 1.0f);
+                        }
+
                         // Multi-emitter roadmap (subtask A1) validation/debug instrumentation: proves
                         // this emitter is independently alive/producing particles, not just that the
                         // aggregate total below is nonzero.
@@ -1241,6 +1318,20 @@ int main(int argc, char** argv) {
 
                 ImGui::Separator();
                 ImGui::TextDisabled("Alive: %u / %u", clusterPipeline.GetParticleSystem().GetLastAliveCountApprox(), renderer::ParticleSystemPass::kMaxParticles);
+
+                // Subtask E2 (GPU timestamp query profiling): per-pass GPU time for last frame's
+                // RecordSimulate()/RecordSort()/RecordDraw() calls -- exactly one frame stale (see
+                // renderer::ParticleSystemPass::GetLastSimMs()'s own comment for why this is
+                // deterministic, not racy, unlike the alive-count readback above). Reads as 0.00 ms
+                // across the board on a GPU/driver that doesn't support timestamp queries on this
+                // pass' own combined graphics+compute queue (see ParticleSystemPass::Init()'s own
+                // comment) -- not distinguished from "genuinely instant" in this readout, since a
+                // real 0.00 ms pass and an unsupported query both mean "nothing meaningful to show
+                // here" from a developer's point of view.
+                ImGui::TextDisabled("GPU: Sim %.2f ms / Sort %.2f ms / Draw %.2f ms",
+                    clusterPipeline.GetParticleSystem().GetLastSimMs(),
+                    clusterPipeline.GetParticleSystem().GetLastSortMs(),
+                    clusterPipeline.GetParticleSystem().GetLastDrawMs());
 
                 ImGui::EndTabItem();
             }
@@ -1594,6 +1685,8 @@ int main(int argc, char** argv) {
         clusterPipeline.SetDebugReflectionsEnabled(g_DebugState.reflectionsEnabled);
         clusterPipeline.SetDebugMegaLightsEnabled(g_DebugState.megaLightsEnabled);
         clusterPipeline.SetDebugTAATSREnabled(g_DebugState.taatsrEnabled);
+        clusterPipeline.SetDebugSSSEnabled(g_DebugState.sssEnabled);
+        clusterPipeline.SetDebugSSSRadiusScale(g_DebugState.sssRadiusScale);
         clusterPipeline.SetDebugEnhancedDisplacementEnabled(g_DebugState.enhancedDisplacementEnabled);
         clusterPipeline.SetDebugSplineDeformationEnabled(g_DebugState.splineDeformationEnabled);
         clusterPipeline.SetDebugAsyncComputeEnabled(g_DebugState.asyncComputeEnabled);

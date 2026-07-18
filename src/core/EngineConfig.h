@@ -546,6 +546,42 @@ struct EmitterConfig {
         { 1.0f, 1.0f, 1.0f, 1.0f }, { 1.0f, 1.0f, 1.0f, 1.0f }
     };
     float sizeCurve[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+
+    // Subtask C2 (Niagara-parity roadmap: screen-space depth-buffer collision) -- deliberately added
+    // at the END of this struct (same convention module-stack roadmap subtask A3's own trailing
+    // fields already established, see that comment above) so every existing positional
+    // EmitterConfig{...} aggregate initializer below keeps relying on this new field's own default
+    // member initializer rather than needing to be rewritten. See renderer::ParticleSystemPass::
+    // EmitterParams::depthCollisionEnabled's own declaration comment for the full contract.
+    bool depthCollisionEnabled = false;
+    // Subtask C3 (spawn-on-mesh-surface) -- same trailing-field convention as depthCollisionEnabled
+    // just above. Only meaningful when spawnShape == 2 -- see renderer::ParticleSystemPass::
+    // EmitterParams::spawnTargetEntityId's own declaration comment for the full contract.
+    uint32_t spawnTargetEntityId = 0;
+
+    // Subtask C4 (Niagara-parity roadmap: sub-emitters / event-driven spawn chains) -- same trailing-
+    // field convention as every field above. See renderer::ParticleSystemPass::EmitterParams' own
+    // declaration comment for the full contract (this emitter triggers spawning into
+    // EMITTERS[subEmitterTargetSlot] when one of its own particles dies or first hits Global SDF
+    // geometry).
+    bool subEmitterEnabled = false;
+    uint32_t subEmitterTargetSlot = 0;
+    uint32_t subEmitterTriggerMode = 0; // 0 = on-death, 1 = on-collision.
+    uint32_t subEmitterSpawnCount = 8;  // A modest default burst size -- harmless while subEmitterEnabled is false.
+
+    // Niagara-parity roadmap (bundled B1 "Mesh Particle" + B2 "Ribbon/Trail" + B3 "sprite
+    // orientation/sub-variation" workstream) -- mirrors renderer::ParticleSystemPass::EmitterParams::
+    // renderMode/meshArchetype/ribbonWidth/spriteOrientationMode/subVariationStrength
+    // (src/renderer/passes/ParticleSystemPass.h) field-for-field; see that struct's own declaration
+    // comment for the full contract. Appended at the END of this struct for the same reason as
+    // colorCurve/sizeCurve above -- every existing positional EmitterConfig{...} aggregate
+    // initializer below keeps relying on these new fields' own in-class defaults (renderMode == 0 ==
+    // Billboard), so this roadmap step changes NOTHING about any existing emitter's look by default.
+    uint32_t renderMode = 0;
+    uint32_t meshArchetype = 0;
+    float ribbonWidth = 0.05f;
+    uint32_t spriteOrientationMode = 0;
+    float subVariationStrength = 0.0f;
 };
 
 // Slot 0 preserves the ORIGINAL single-emitter defaults exactly (same position/spawn rate/physics

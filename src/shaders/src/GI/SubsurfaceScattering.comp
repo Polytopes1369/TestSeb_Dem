@@ -1,0 +1,219 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+
+// Screen-space Subsurface Scattering (UE5.8 rendering-parity gap G4, "Subsurface Profile" shading
+// model) -- one direction of a SEPARABLE diffusion-profile blur (the Jimenez/Burley "Separable
+// Subsurface Scattering" technique UE5.8's own Subsurface Profile is built on). Dispatched twice by
+// renderer::SubsurfaceScatteringPass: pass 0 (pc.direction == 0) blurs horizontally, pass 1
+// (pc.direction == 1) blurs vertically, so the two 1D passes together approximate a 2D isotropic
+// diffusion kernel at O(2N) cost instead of a dense O(N*N) 2D gather.
+//
+// --- What this does, and where it runs in the frame ---
+// It runs AFTER the opaque scene is fully lit and composited (renderer::GICompositePass's own output:
+// direct sun + MegaLights + reflections + denoised indirect GI), and BEFORE the forward-transparent
+// passes / TAA. Only pixels whose material has SubstrateSlab::sssProfileScale > 0 (material_params
+// .glsl) are diffused; every other pixel is passed through untouched, so opaque non-organic surfaces
+// (metal, rock, glass, terrain) are never softened. The characteristic reddish "light bleeds through
+// thin geometry / softly wraps past the terminator" look comes from the per-channel diffusion profile
+// below: red light penetrates the surface deepest and so spreads widest, exactly like real skin/wax.
+//
+// --- Why a bilateral (edge-stopping) gather, exactly like ATrousDenoise.comp ---
+// A naive blur would smear lit subsurface color ACROSS a silhouette onto whatever geometry sits
+// behind it. This gather rejects a tap unless (a) it belongs to an SSS-enabled material too (the
+// materialID gate -- this alone fully prevents bleeding onto any non-SSS neighbor), (b) its scene
+// depth is close to the center's (the depth bilateral -- stops bleed across a silhouette/depth
+// discontinuity even between two SSS surfaces), and (c) its shading normal is not wildly opposed to
+// the center's (a GENTLE normal weight -- unlike ATrousDenoise.comp's sharp kSigmaNormal=32, SSS is
+// SUPPOSED to diffuse across gentle surface curvature, so this only rejects hard creases/backfaces,
+// it must not fight the very curvature-wrapping the effect exists to produce).
+//
+// --- Specular preservation, and the one documented simplification ---
+// Physically only DIFFUSE subsurface transport should blur; a mirror-like specular highlight should
+// stay sharp. This engine composites direct+indirect+specular+reflections into ONE HDR image (there
+// is no separate diffuse-only scene-color target anywhere in the pipeline -- see renderer::
+// GICompositePass), so a strict diffuse/specular split would mean threading a dedicated specular
+// GBuffer through the Release-critical dual-path resolve shaders (ClusterResolve.comp /
+// ClusterResolveBinned.comp) and both their descriptor sets. That cost is deliberately not paid here:
+// the pass instead diffuses the full composited radiance of SSS-flagged pixels only, and the showcase
+// SSS material (renderer::GenerateShowcaseMaterialTable slot 10) is authored moderate-high roughness
+// with reflections off, so its specular is a broad, low-peak lobe whose slight softening is
+// imperceptible -- and the effect's most visible region (the diffuse falloff past the sun terminator)
+// carries essentially zero specular anyway. This is a bounded, standard real-time simplification, in
+// the same spirit as this codebase's other documented ones (e.g. substrate_bsdf.glsl's single-
+// averaged-roughness anisotropic visibility, or its own analytic wrap-diffuse "Subsurface" model).
+
+#include "include/math_utils.glsl"
+#include "include/octahedral.glsl"
+#include "include/material_params.glsl"
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+// Input scene color: pass 0 reads renderer::GICompositePass's fully-composited HDR output; pass 1
+// reads pass 0's horizontally-blurred scratch image. Both are rgba16f in VK_IMAGE_LAYOUT_GENERAL,
+// sampled via texelFetch (nearest, no filtering) exactly like ATrousDenoise.comp reads its own input.
+layout(set = 0, binding = 0) uniform sampler2D g_SceneColor;
+// Output: pass 0 writes the scratch image; pass 1 writes BACK into GICompositePass's own output image
+// in place (see renderer::SubsurfaceScatteringPass for the ping-pong + write-back-in-place rationale).
+layout(rgba16f, set = 0, binding = 1) uniform writeonly image2D g_Output;
+// The winning (hw-vs-sw arbitrated) NDC depth GBuffer (r32f, reversed-Z: LARGER is nearer) and the
+// octahedral-encoded world-space normal GBuffer (rg16f), both from renderer::ClusterResolvePass.
+layout(set = 0, binding = 2) uniform sampler2D g_Depth;
+layout(set = 0, binding = 3) uniform sampler2D g_Normal;
+// Per-pixel clamped materialID GBuffer (r16ui, 0xFFFF = background/no geometry) -- see
+// renderer::ClusterResolvePass::GetOutputMaterialIDView(). Bound as a plain storage image + imageLoad
+// (an integer format, so no sampler filtering is meaningful), kept permanently GENERAL like every
+// other ClusterResolvePass GBuffer image.
+layout(r16ui, set = 0, binding = 4) uniform readonly uimage2D g_MaterialID;
+// renderer::GenerateShowcaseMaterialTable()'s result -- this pass needs each pixel's own
+// sssProfileScale (the SSS gate + world-space diffusion radius). Same SSBO renderer::
+// ClusterResolvePass already owns/uploads (bound read-only here, not a second copy).
+layout(std430, set = 0, binding = 5) readonly buffer MaterialParamsSSBO {
+    MaterialParams params[];
+} g_MaterialParams;
+
+layout(push_constant) uniform SSSPushConstants {
+    // Reconstructs a pixel's world position from its NDC + depth (to derive its camera distance, so
+    // the screen-space blur radius shrinks correctly with distance) -- the SAME inverse combined
+    // view-projection renderer::ClusterRenderPipeline already computes each frame (m_FrameScratch
+    // .invViewProj), passed straight through.
+    mat4 invViewProj;
+    // xyz = camera world position; w = a global radius multiplier (Debug-only A/B tuning slider,
+    // hardcoded to 1.0 in Release -- see renderer::SubsurfaceScatteringPass::RecordUpdate).
+    vec4 cameraPosAndRadiusScale;
+    vec2 viewportSize;
+    // proj[1][1] == 1/tan(fovY/2): converts a world-space radius at a given camera distance into a
+    // vertical screen-space radius in pixels (radiusPixels = worldRadius * 0.5*viewportH*projScaleY /
+    // cameraDist), so a 3cm scattering radius covers many pixels up close and sub-pixel far away.
+    float projScaleY;
+    // 0 = horizontal pass (blur along +X), 1 = vertical pass (blur along +Y).
+    uint direction;
+} pc;
+
+// --- Analytic sum-of-Gaussians diffusion profile (per RGB channel) ---
+// Evaluated per tap as a function of the normalized offset u = |offsetPixels| / radiusPixels in
+// [0,1]. Three lobes approximate a stylized skin/wax profile: a sharp near-white core, a warm mid
+// lobe, and a wide red-dominant tail. Only the RELATIVE shape matters -- the gather renormalizes by
+// the accumulated per-channel weight sum (like ATrousDenoise.comp's weightSum), so absolute
+// magnitudes and any missing (rejected) taps are handled automatically and stay energy-conserving.
+// No texture-based profile lookup (CLAUDE.md's no-data-asset rule) -- a few analytic Gaussians are
+// both the correct "Separable SSS" technique and rule-compliant.
+const float kGaussVariance[3] = float[3](0.020, 0.10, 0.40);
+const vec3 kGaussWeight[3] = vec3[3](
+    vec3(1.00, 1.00, 1.00),  // Sharp core: all channels -> a near-white, barely-spread center.
+    vec3(0.55, 0.38, 0.28),  // Warm mid lobe.
+    vec3(0.45, 0.12, 0.05)); // Wide tail: red-dominant -> the characteristic reddish edge/terminator bleed.
+
+vec3 DiffusionProfile(float u) {
+    float u2 = u * u;
+    vec3 w = vec3(0.0);
+    for (int g = 0; g < 3; ++g) {
+        w += kGaussWeight[g] * exp(-u2 / (2.0 * kGaussVariance[g]));
+    }
+    return w;
+}
+
+// Fixed tap count per side -- 21 taps total (center + 10 each direction) spread uniformly across
+// [-radiusPixels, +radiusPixels]. A fixed loop keeps the dispatch GPU-friendly; the radius clamp
+// below bounds the worst-case spacing so this stays well-sampled even for a close-up SSS surface.
+const int kHalfSamples = 10;
+// Edge-stopping sensitivities. kSigmaDepth matches ATrousDenoise.comp's own NDC-depth convention.
+// kSigmaNormal is DELIBERATELY much gentler than that pass's 32.0 -- see this shader's header comment
+// (SSS must diffuse across surface curvature, not reject it).
+const float kSigmaDepth = 0.002;
+const float kSigmaNormal = 6.0;
+// Upper bound on the screen-space blur half-width (pixels) -- bounds the fixed-tap spacing so a very
+// close-up SSS surface never under-samples into visible banding.
+const float kMaxRadiusPixels = 48.0;
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 res = ivec2(pc.viewportSize);
+    if (pixel.x >= res.x || pixel.y >= res.y) {
+        return;
+    }
+
+    vec4 centerColor = texelFetch(g_SceneColor, pixel, 0);
+
+    // SSS gate: only diffuse pixels whose material opted in (sssProfileScale > 0). Background
+    // (materialID == 0xFFFF, i.e. >= MATERIAL_TABLE_SIZE after the resolve pass's own clamp) and any
+    // non-SSS material are passed through byte-for-byte -- the pass is a strict no-op for them.
+    uint matID = imageLoad(g_MaterialID, pixel).r;
+    if (matID >= MATERIAL_TABLE_SIZE) {
+        imageStore(g_Output, pixel, centerColor);
+        return;
+    }
+    float profileScale = g_MaterialParams.params[matID].base.sssProfileScale;
+    if (profileScale <= 0.0) {
+        imageStore(g_Output, pixel, centerColor);
+        return;
+    }
+
+    float centerDepth = texelFetch(g_Depth, pixel, 0).r;
+    // A background/never-written depth is 0.0 (the far plane in this engine's reversed-Z convention,
+    // see ClusterResolve.comp) -- guard against dividing the radius by a degenerate camera distance.
+    if (centerDepth <= 0.0) {
+        imageStore(g_Output, pixel, centerColor);
+        return;
+    }
+    vec3 centerNormal = OctDecode(texelFetch(g_Normal, pixel, 0).rg);
+
+    // Reconstruct this pixel's world position from NDC + depth, then its distance from the camera, to
+    // size the blur in screen space (kernel shrinks with distance -- a fixed world-space radius).
+    vec2 pixelCenter = vec2(pixel) + 0.5;
+    vec2 ndcXY = (pixelCenter / pc.viewportSize) * 2.0 - 1.0;
+    vec4 worldH = pc.invViewProj * vec4(ndcXY, centerDepth, 1.0);
+    vec3 worldPos = worldH.xyz / worldH.w;
+    float cameraDist = max(length(worldPos - pc.cameraPosAndRadiusScale.xyz), 1.0e-3);
+
+    float radiusScale = pc.cameraPosAndRadiusScale.w;
+    float radiusPixels = profileScale * radiusScale * (0.5 * pc.viewportSize.y * pc.projScaleY) / cameraDist;
+    radiusPixels = min(radiusPixels, kMaxRadiusPixels);
+    // Sub-pixel radius: no meaningful diffusion possible, pass through (also the far-distance case).
+    if (radiusPixels < 0.5) {
+        imageStore(g_Output, pixel, centerColor);
+        return;
+    }
+
+    ivec2 stepDir = (pc.direction == 0u) ? ivec2(1, 0) : ivec2(0, 1);
+
+    // Center tap: full profile weight at u == 0.
+    vec3 weightSum = DiffusionProfile(0.0);
+    vec3 colorSum = centerColor.rgb * weightSum;
+
+    for (int i = 1; i <= kHalfSamples; ++i) {
+        float offsetPixels = (float(i) / float(kHalfSamples)) * radiusPixels;
+        float u = offsetPixels / radiusPixels; // == i / kHalfSamples, precomputed for clarity.
+        vec3 profile = DiffusionProfile(u);
+
+        // Symmetric pair (+offset and -offset along the pass direction).
+        for (int s = -1; s <= 1; s += 2) {
+            ivec2 tapPixel = pixel + stepDir * int(round(offsetPixels)) * s;
+            if (tapPixel.x < 0 || tapPixel.y < 0 || tapPixel.x >= res.x || tapPixel.y >= res.y) {
+                continue;
+            }
+            // materialID gate: the tap must be an SSS-enabled material too. This alone fully prevents
+            // bleeding onto any non-SSS neighbor (background, metal, rock, glass, terrain, ...).
+            uint tapMat = imageLoad(g_MaterialID, tapPixel).r;
+            if (tapMat >= MATERIAL_TABLE_SIZE) continue;
+            if (g_MaterialParams.params[tapMat].base.sssProfileScale <= 0.0) continue;
+
+            float tapDepth = texelFetch(g_Depth, tapPixel, 0).r;
+            vec3 tapNormal = OctDecode(texelFetch(g_Normal, tapPixel, 0).rg);
+
+            // Bilateral edge stops: depth (stop at a silhouette/depth discontinuity, even between two
+            // SSS surfaces) + a gentle normal term (only rejects hard creases/backfaces).
+            float depthWeight = exp(-abs(centerDepth - tapDepth) / kSigmaDepth);
+            float normalWeight = pow(max(dot(centerNormal, tapNormal), 0.0), kSigmaNormal);
+            vec3 w = profile * depthWeight * normalWeight;
+
+            colorSum += texelFetch(g_SceneColor, tapPixel, 0).rgb * w;
+            weightSum += w;
+        }
+    }
+
+    // Per-channel renormalization (weightSum is a vec3 -- red, having the widest profile, accumulates
+    // the most, which is exactly what produces the reddish spread). Guard the rare all-rejected case.
+    vec3 result = colorSum / max(weightSum, vec3(1.0e-6));
+    // Preserve the input alpha unchanged (the composited image carries alpha == 1.0 for geometry).
+    imageStore(g_Output, pixel, vec4(result, centerColor.a));
+}
