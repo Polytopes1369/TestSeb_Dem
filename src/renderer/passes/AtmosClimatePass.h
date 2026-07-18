@@ -26,7 +26,7 @@
 // a private simulation-time accumulator (m_SimulationTime, advanced by each frame's own dt -- NEVER
 // by wall-clock/glfwGetTime() directly, so pausing/slow frames don't desync the simulation from what
 // the demo visually shows). config::atmos::TEMPERATURE_CELSIUS/RELATIVE_HUMIDITY/WIND_SPEED_MPS/
-// CLOUD_DENSITY_TARGET/FOG_DENSITY_TARGET/RAIN_STRENGTH are REINTERPRETED as baseline "centers" the
+// CLOUD_DENSITY_TARGET/FOG_DENSITY_TARGET/PRECIPITATION_INTENSITY are REINTERPRETED as baseline "centers" the
 // simulation drifts around (not disabled outright -- still live ImGui sliders, still visibly shift
 // the simulated weather) rather than being read as literal per-frame state; when the toggle is OFF,
 // behavior is byte-for-byte the original Subtask 1 static-read path.
@@ -35,6 +35,7 @@
 #include <vulkan/vulkan.h>
 #include <vk_mem_alloc.h>
 
+#include "core/EngineConfig.h"
 #include "renderer/vulkan/GpuBuffer.h"
 
 namespace renderer {
@@ -129,6 +130,14 @@ namespace renderer {
         // after this RecordUpdate() call, before any consumer (AtmosSkyPass, VSM, ...) reads
         // m_SceneLights.sun.direction this same frame. Always 0 when DYNAMIC_WEATHER_ENABLED is OFF.
         float GetSeasonalSunElevationOffsetRadians() const { return m_SeasonalSunElevationOffsetRad; }
+
+        // Effective temperature this frame's AtmosGlobalsUBO was built from: the simulation's
+        // smoothed/seasonally-offset value when config::atmos::DYNAMIC_WEATHER_ENABLED, or the raw
+        // config::atmos::TEMPERATURE_CELSIUS slider otherwise -- see RecordUpdate()'s own
+        // effectiveTemperature local. Exposed so consumers deciding rain-vs-snow (e.g.
+        // ClusterRenderPipeline's precipitation-kind selection) follow the same temperature the
+        // simulation is actually driving, not just the manual baseline slider.
+        float GetEffectiveTemperatureCelsius() const { return m_HasLastFrameTime ? (config::atmos::DYNAMIC_WEATHER_ENABLED ? m_CurrentTemperatureCelsius : config::atmos::TEMPERATURE_CELSIUS) : config::atmos::TEMPERATURE_CELSIUS; }
 
     private:
         VkDevice m_Device = VK_NULL_HANDLE;

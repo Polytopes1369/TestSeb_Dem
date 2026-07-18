@@ -147,7 +147,7 @@ namespace renderer {
         float effectiveWindSpeed = config::atmos::WIND_SPEED_MPS;
         float effectiveCloudDensity = config::atmos::CLOUD_DENSITY_TARGET;
         float effectiveFogDensity = config::atmos::FOG_DENSITY_TARGET;
-        float effectiveRainStrength = config::atmos::RAIN_STRENGTH;
+        float effectiveRainStrength = config::atmos::PRECIPITATION_INTENSITY;
 
         if (config::atmos::DYNAMIC_WEATHER_ENABLED) {
             // Seed the smoothed "current" state from wherever the manual sliders currently sit, the
@@ -159,7 +159,7 @@ namespace renderer {
                 m_CurrentWindSpeedMPS = config::atmos::WIND_SPEED_MPS;
                 m_CurrentCloudDensity = config::atmos::CLOUD_DENSITY_TARGET;
                 m_CurrentFogDensity = config::atmos::FOG_DENSITY_TARGET;
-                m_CurrentRainStrength = config::atmos::RAIN_STRENGTH;
+                m_CurrentRainStrength = config::atmos::PRECIPITATION_INTENSITY;
                 m_CurrentInitialized = true;
             }
 
@@ -243,7 +243,7 @@ namespace renderer {
             const float targetWindSpeed = std::fmax(config::atmos::WIND_SPEED_MPS * blendedWindMultiplier, 0.0f);
             const float targetCloudDensity = std::clamp(config::atmos::CLOUD_DENSITY_TARGET + blendedDeltaCloud, 0.0f, 1.0f);
             const float targetFogDensity = std::clamp(config::atmos::FOG_DENSITY_TARGET + blendedDeltaFog, 0.0f, 1.0f);
-            const float targetRainStrength = std::clamp(config::atmos::RAIN_STRENGTH + seasonalPrecipOffset + blendedDeltaRain, 0.0f, 1.0f);
+            const float targetRainStrength = std::clamp(config::atmos::PRECIPITATION_INTENSITY + seasonalPrecipOffset + blendedDeltaRain, 0.0f, 1.0f);
 
             // Exponential-approach smoothing (task-specified form: current += (target-current) *
             // (1 - exp(-dt/tau))) -- gradual, frame-rate-independent transitions instead of an
@@ -364,6 +364,12 @@ namespace renderer {
         ubo.condensationLCL = lclHeight;
         ubo.cloudDensityTarget = effectiveCloudDensity;
         ubo.fogDensityTarget = effectiveFogDensity;
+        // GPU field name kept as `rainStrength` (byte-for-byte mirrored across
+        // AtmosVolumetricFog.comp/AtmosCloudShadows.comp/AtmosClouds.comp/ParticleSimulation.comp)
+        // -- only the CPU-side config knob was renamed to PRECIPITATION_INTENSITY (see that
+        // variable's own comment). effectiveRainStrength is PRECIPITATION_INTENSITY itself when
+        // Dynamic Weather is off, or the simulation's smoothed/seasonal-adjusted derivative of it
+        // when on -- see the DYNAMIC_WEATHER_ENABLED branch above.
         ubo.rainStrength = effectiveRainStrength;
         ubo.time = globalTimeSeconds;
         ubo.windTurbulenceFrequency = config::atmos::WIND_TURBULENCE_FREQUENCY;
