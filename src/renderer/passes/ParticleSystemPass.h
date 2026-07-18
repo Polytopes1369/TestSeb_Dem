@@ -126,6 +126,31 @@ namespace renderer {
         void RecordSimulate(VkCommandBuffer cmd, const GlobalSDFPass& globalSDF, float dt, float time,
             const float emitterPositionWorld[3], uint32_t spawnCount);
 
+        // Sorted {particleIndex, depthKey} pairs, back-to-front (farthest first) among the first
+        // GetCounterBufferHandle()-reported aliveCount entries -- see ParticleSort.comp's own header
+        // comment for why the buffer is always kMaxParticles long (a power of two, required for
+        // bitonic sort) rather than sized to the frame's actual (non-power-of-two) aliveCount.
+        // Exposed so Subtask 4's render pass can bind it directly, same "borrow a raw handle"
+        // convention as GetIndirectDrawBufferHandle().
+        VkBuffer GetSortedPairsBufferHandle() const { return m_SortedPairsBuffer.Handle(); }
+
+        // Dispatches ParticleSort.comp (see that shader's own header comment for the full InitKeys/
+        // CompareExchange contract) against GetCurrentSet()'s particle state: one InitKeys pass,
+        // then the full O(log2(kMaxParticles)^2) bitonic compare-exchange network (136 dispatches
+        // for kMaxParticles == 65536), each followed by its own VkMemoryBarrier2 (global-memory
+        // bitonic sort has a genuine read-after-write dependency between every single step -- no
+        // shared-memory local-merge optimization exists yet, see ParticleSort.comp's own comment).
+        // Finishes by copying CounterBuffer.aliveCount into the indirect-draw buffer's own
+        // `instanceCount` field (a GPU-side vkCmdCopyBuffer, no CPU readback) so a future indirect
+        // draw call (Subtask 4) always reflects this frame's real alive count with no extra work at
+        // that call site. `cameraPositionWorld`/`cameraForwardWorld` feed InitKeys' own depth-key
+        // projection. Caller owns the barrier before this call (particle/alive-list state visible to
+        // COMPUTE_SHADER, e.g. RecordSimulate()'s own trailing barrier already covers this) and
+        // after it (this call's own trailing barrier only covers COMPUTE_SHADER/TRANSFER-stage
+        // consumers -- a render-stage consumer, Subtask 4, will need its own additional barrier,
+        // including one for INDIRECT_COMMAND_READ on the indirect-draw buffer specifically).
+        void RecordSort(VkCommandBuffer cmd, const float cameraPositionWorld[3], const float cameraForwardWorld[3]);
+
     private:
         VkDevice m_Device = VK_NULL_HANDLE;
         VmaAllocator m_Allocator = VK_NULL_HANDLE;
@@ -166,6 +191,18 @@ namespace renderer {
 
         VkPipelineLayout m_SimPipelineLayout = VK_NULL_HANDLE;
         VkPipeline m_SimPipeline = VK_NULL_HANDLE;
+
+        // Subtask 3 -- ParticleSort.comp's own set 1 (a single SortedPairsBuffer binding, unrelated
+        // to Subtask 2's environment set 1 above -- each compute pipeline has its OWN independent
+        // set 1, they are never bound together in the same dispatch). kMaxParticles * 8 bytes
+        // (uint index + float key per entry), GPU_ONLY, never host-written (ParticleSort.comp's own
+        // InitKeys pass is this buffer's only writer, every single frame it runs).
+        GpuBuffer m_SortedPairsBuffer;
+        VkDescriptorSetLayout m_SortSetLayout = VK_NULL_HANDLE;
+        VkDescriptorPool m_SortDescriptorPool = VK_NULL_HANDLE;
+        VkDescriptorSet m_SortSet = VK_NULL_HANDLE;
+        VkPipelineLayout m_SortPipelineLayout = VK_NULL_HANDLE;
+        VkPipeline m_SortPipeline = VK_NULL_HANDLE;
     };
 
 }
