@@ -187,16 +187,48 @@ inline float DISPLAY_GAMMA = 2.2f;
 // Bloom
 inline float BLOOM_THRESHOLD = 1.0f;        // Bright-pass threshold, linear HDR luminance.
 inline float BLOOM_SOFT_KNEE = 0.5f;
-// Disabled (was 1.0f) as of the 2026-07-17 light-unit recalibration: renderer::BloomPass produces
-// a corrupted (not simply NaN -- see project_light_units_ue58_recalibration memory for the full
-// investigation, including the SanitizeHDR guards added to BloomDownsample.comp/
-// BloomUpsampleComposite.comp/PostProcessComposite.comp, which did NOT fix this) result once the
-// scene's real HDR brightness increased to real UE5.8-parity lux/candela levels, crushing
-// PostProcessComposite.comp's entire final output to black via clamp()'s implementation-defined
-// handling of a non-finite input. Root cause not yet found (BloomPass's own per-mip barriers
-// inspected and appear structurally correct) -- disabling this is the confirmed, working interim
-// fix; re-enable once BloomPass's real bug is found and fixed.
-inline float BLOOM_INTENSITY = 0.0f;
+// Re-enabled (2026-07-18) at its original 1.0f, following the light-unit recalibration black-
+// screen bug (see project_light_units_ue58_recalibration memory for the original investigation).
+// Root cause: PostProcessComposite.comp read g_Bloom (BloomPass's own output) with NO SanitizeHDR
+// guard, unlike its g_HDRColor read a few hundred lines earlier in the same file. The prior
+// session's SanitizeHDR guards on BloomDownsample.comp/BloomUpsampleComposite.comp clamp every
+// individual texture TAP to a max of 50000, but BloomUpsampleComposite.comp's own
+// `result = detail + blurred` sums TWO independently-clamped-to-50000 terms, which can reach up to
+// 100000 in the float32 compute intermediate -- silently overflowing to +Infinity when written
+// into that pass' rgba16f output image (fp16's finite max is 65504). That store-time truncation
+// was never visible to any read-side tap clamp upstream, so the resulting Inf texel reached
+// PostProcessComposite.comp unguarded and crushed the whole frame to black via
+// clamp(Inf, 0, 1)'s implementation-defined result. Fixed by wrapping the g_Bloom read in
+// SanitizeHDR() too (PostProcessComposite.comp), mirroring the g_HDRColor pattern.
+//
+// Verified via two Debug --test-pipeline runs (BLOOM_INTENSITY=1.0 and, as an isolation check,
+// =0.0) plus manual screenshot inspection of DEBUG_VIEW_NORMAL captures (08_reflections_on.bmp/
+// 09_radiosity_ssrt_on.bmp/10_taatsr.bmp): the scene no longer goes black with Bloom active, and
+// both runs report zero new Vulkan Validation Layer messages (9/10 --test-pipeline features pass
+// in both runs; the one pre-existing failure, "Global SDF Bake + Ray March View", is an unrelated
+// VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT image-creation bug in SDFRayMarchPass/GlobalSDFPass -- that
+// debug view swaps to a completely different, non-post-processed blitSourceImage and never touches
+// BloomPass/PostProcessComposite.comp at all, and the failure is byte-for-byte identical at both
+// BLOOM_INTENSITY values, so it cannot be this change; flagged separately, left untouched here as
+// out of this scoped bug-fix's scope).
+//
+// IMPORTANT CAVEAT found during verification, NOT fixed here (separate, pre-existing, and
+// independent of Bloom -- confirmed by the =0.0 isolation run above still showing the same
+// washed-out result): at this "Extrem" profile's fixed manual exposure (EXPOSURE_APERTURE=4.0,
+// EXPOSURE_SHUTTER_SPEED_SECONDS=1/60, EXPOSURE_ISO=100, EXPOSURE_USE_AUTO=false -- see those
+// fields' own declarations above), DEBUG_VIEW_NORMAL now renders visibly overexposed/washed
+// toward white (NOT black -- ACESFilmicTonemap correctly compresses large-but-finite HDR input
+// toward 1.0, which is the expected, non-buggy behavior of a saturating tonemap curve) with Bloom
+// re-enabled, and is ALREADY visibly overexposed (just less severely) even with BLOOM_INTENSITY
+// pinned to 0.0. This points at the fixed exposure triplet never having been re-tuned for the
+// same 2026-07-17 real-lux/candela recalibration that prompted this whole investigation (see
+// commit 6669234's own message) -- real sun-level illuminance through this aperture/shutter/ISO
+// combo is plausibly still over a physically-"bright indoor" EV100, not a sunlit-exterior one.
+// Needs its own follow-up pass (re-tune EXPOSURE_APERTURE/SHUTTER/ISO or EXPOSURE_COMPENSATION_EV
+// for the recalibrated lighting scale, or revisit EXPOSURE_USE_AUTO now that the MegaLights
+// auto-exposure flicker that motivated disabling it -- project_taa_megalights_flicker_fix memory
+// -- may interact differently); out of scope for this task.
+inline float BLOOM_INTENSITY = 1.0f;
 inline float BLOOM_UPSAMPLE_RADIUS = 1.0f;
 
 // Lens Flare (procedural radial ghosts, no texture asset)
