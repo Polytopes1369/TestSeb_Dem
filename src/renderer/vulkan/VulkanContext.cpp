@@ -1546,6 +1546,17 @@ void VulkanContext::BuildEntityData() {
     entity.flags = 0u;
     core::SetFlag(entity.flags, core::EntityFlags::CastShadows, true);
 
+    // VSM advanced roadmap, Feature 2 (real static-vs-dynamic page invalidation): activates the
+    // previously-dead IsDynamic bit on the 12 continuously-rotating showcase entities (indices
+    // [0, kWallEntityIndexA) == [0, 12) -- see UpdateEntityRotations(), which leaves exactly the
+    // last 4 showcase entities (the 2 Lumen-corner walls, the floor, the water plane --
+    // kWallEntityIndexA..kWaterEntityIndex) permanently static). Gives renderer::
+    // VirtualShadowMapPass's own per-page dynamic-content classification a real, meaningful flag
+    // to test instead of the dead default of always-0.
+    if (i < kWallEntityIndexA) {
+      core::SetFlag(entity.flags, core::EntityFlags::IsDynamic, true);
+    }
+
     bool isTransparent = m_MaterialTable.isTransparent[i];
     // Phase 7a (UE5.8 parity roadmap, hero asset tessellation): the Icosphere (kHeroEntityIndex)
     // is the single tessellated/displaced hero asset, rendered ONLY by

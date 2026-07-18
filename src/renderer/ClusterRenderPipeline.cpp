@@ -416,9 +416,17 @@ bool ClusterRenderPipeline::Init(
   // established "self-contained pass" convention -- see e.g. renderer::VirtualShadowMapPass's own
   // class comment).
   // =========================================================================================
+  // VSM advanced roadmap, Feature 1/3: the 4 buffers below are the SAME ones
+  // m_HardwareRaster.Init()/m_SoftwareRaster.Init()/m_Resolve.Init() already received above (all
+  // already created/uploaded at this point in Init()), plus createInfo.entityDataCPU (Feature 1's
+  // per-entity material lookup) and m_MaskGenerator.GetMaskImageInfos() (Feature 3, initialized
+  // earlier at STEP 6 above, before any consumer pass that binds it).
   if (!m_VirtualShadowMap.Init(createInfo.physicalDevice, createInfo.device, createInfo.allocator,
                                createInfo.commandPool, createInfo.queue,
-                               createInfo.cacheFilePath)) {
+                               createInfo.cacheFilePath,
+                               createInfo.entityTransformBuffer, createInfo.entityDataBuffer,
+                               m_WPOGlobalsBuffer.Handle(), m_SplineControlPointsBuffer.Handle(),
+                               createInfo.entityDataCPU, m_MaskGenerator.GetMaskImageInfos())) {
     LOG_ERROR("[ClusterRenderPipeline] Failed to initialize VirtualShadowMapPass.");
     return false;
   }
@@ -1358,7 +1366,7 @@ void ClusterRenderPipeline::RecordFrameEarly(VkCommandBuffer cmdEarly,
     // [12]) need THIS frame's VSM view-projection matrices + any pages rendered this frame already
     // visible -- RecordBeginFrame()'s own trailing barrier (when it renders any page) covers that.
     // See VirtualShadowMapPass's own class comment for the full one-frame-lag feedback contract.
-    m_VirtualShadowMap.RecordBeginFrame(cmdEarly, sunDirection, m_SceneLights, cameraFrameInfo.position);
+    m_VirtualShadowMap.RecordBeginFrame(cmdEarly, sunDirection, m_SceneLights, cameraFrameInfo.position, entityTransformsCPU);
 
     // 1b. Virtual Texture streaming: reads back LAST frame's page-miss feedback (m_Resolve's own
     // ClusterResolve.comp/ClusterResolveBinned.comp VT sampling call, see SetVirtualTexture()'s own

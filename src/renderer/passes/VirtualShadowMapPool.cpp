@@ -131,6 +131,10 @@ namespace renderer {
         // STEP 4 -- CPU-side allocator state.
         // =====================================================================================
         m_LogicalToPhysical.assign(static_cast<size_t>(totalVSMCount) * kShadowPagesPerVSM, kInvalidShadowPhysicalPage);
+        // VSM advanced roadmap, Feature 2: every logical page starts classified "static" -- the
+        // first ClassifyDynamicPages() call after this page is ever actually rendered reclassifies
+        // it for real, exactly like m_LogicalToPhysical's own "everything starts unmapped" contract.
+        m_LogicalPageCoversDynamic.assign(static_cast<size_t>(totalVSMCount) * kShadowPagesPerVSM, false);
         m_LRUNodes.assign(physicalPageCapacity, LRUNode{});
         m_FreePhysicalSlots.clear();
         m_NextUnusedPhysicalSlot = 0;
@@ -164,6 +168,7 @@ namespace renderer {
         m_Sampler = VK_NULL_HANDLE;
 
         m_LogicalToPhysical.clear();
+        m_LogicalPageCoversDynamic.clear();
         m_LRUNodes.clear();
         m_FreePhysicalSlots.clear();
         m_NextUnusedPhysicalSlot = 0;
@@ -254,6 +259,9 @@ namespace renderer {
 
         UnlinkFromLRUList(physicalLayer);
         m_LogicalToPhysical[logicalPageID] = kInvalidShadowPhysicalPage;
+        // VSM advanced roadmap, Feature 2: a page's dynamic/static classification never survives a
+        // residency gap -- see SetPageCoversDynamicContent's own comment.
+        m_LogicalPageCoversDynamic[logicalPageID] = false;
         m_FreePhysicalSlots.push_back(physicalLayer);
         --m_ResidentCount;
 
@@ -305,6 +313,38 @@ namespace renderer {
     uint32_t VirtualShadowMapPool::GetPhysicalLayer(uint32_t logicalPageID) const {
         assert(logicalPageID < m_LogicalToPhysical.size());
         return m_LogicalToPhysical[logicalPageID];
+    }
+
+    void VirtualShadowMapPool::SetPageCoversDynamicContent(uint32_t logicalPageID, bool coversDynamic) {
+        assert(logicalPageID < m_LogicalPageCoversDynamic.size());
+        m_LogicalPageCoversDynamic[logicalPageID] = coversDynamic;
+    }
+
+    bool VirtualShadowMapPool::GetPageCoversDynamicContent(uint32_t logicalPageID) const {
+        assert(logicalPageID < m_LogicalPageCoversDynamic.size());
+        return m_LogicalPageCoversDynamic[logicalPageID];
+    }
+
+    std::vector<uint32_t> VirtualShadowMapPool::GetResidentPageIDs() const {
+        std::vector<uint32_t> result;
+        result.reserve(m_ResidentCount);
+        for (uint32_t physicalLayer = m_LRUMostRecentPage; physicalLayer != kInvalidShadowPhysicalPage;
+            physicalLayer = m_LRUNodes[physicalLayer].next) {
+            result.push_back(m_LRUNodes[physicalLayer].logicalPageID);
+        }
+        return result;
+    }
+
+    std::vector<uint32_t> VirtualShadowMapPool::GetResidentDynamicPageIDs() const {
+        std::vector<uint32_t> result;
+        for (uint32_t physicalLayer = m_LRUMostRecentPage; physicalLayer != kInvalidShadowPhysicalPage;
+            physicalLayer = m_LRUNodes[physicalLayer].next) {
+            uint32_t logicalPageID = m_LRUNodes[physicalLayer].logicalPageID;
+            if (m_LogicalPageCoversDynamic[logicalPageID]) {
+                result.push_back(logicalPageID);
+            }
+        }
+        return result;
     }
 
 }
