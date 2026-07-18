@@ -124,6 +124,9 @@ namespace renderer {
         RegisterResource([this] {
             vkDestroyDescriptorPool(m_Device, m_DescriptorPool, nullptr);
             vkDestroyDescriptorSetLayout(m_Device, m_SetLayout, nullptr);
+            m_DescriptorPool = VK_NULL_HANDLE;
+            m_SetLayout = VK_NULL_HANDLE;
+            m_Set = VK_NULL_HANDLE;
         });
 
         // =====================================================================================
@@ -225,7 +228,7 @@ namespace renderer {
         pipelineLayoutInfo.pushConstantRangeCount = 1;
         pipelineLayoutInfo.pPushConstantRanges = &pushConstantRange;
         VK_CHECK(vkCreatePipelineLayout(m_Device, &pipelineLayoutInfo, nullptr, &m_PipelineLayout));
-        RegisterResource([this] { vkDestroyPipelineLayout(m_Device, m_PipelineLayout, nullptr); });
+        RegisterResource([this] { vkDestroyPipelineLayout(m_Device, m_PipelineLayout, nullptr); m_PipelineLayout = VK_NULL_HANDLE; });
 
         // =====================================================================================
         // STEP 4 -- graphics pipeline, built manually (hardcoded for the 4-stage vertex/
@@ -357,7 +360,7 @@ namespace renderer {
         pipelineInfo.pNext = &pipelineRendering;
 
         VK_CHECK(vkCreateGraphicsPipelines(m_Device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_Pipeline));
-        RegisterResource([this] { vkDestroyPipeline(m_Device, m_Pipeline, nullptr); });
+        RegisterResource([this] { vkDestroyPipeline(m_Device, m_Pipeline, nullptr); m_Pipeline = VK_NULL_HANDLE; });
 
         vkDestroyShaderModule(m_Device, vertModule, nullptr);
         vkDestroyShaderModule(m_Device, tescModule, nullptr);

@@ -65,6 +65,9 @@ namespace renderer {
                 vmaDestroyImage(m_Allocator, slot.radianceImage, slot.radianceAllocation);
                 vmaDestroyImage(m_Allocator, slot.worldPosImage, slot.worldPosAllocation);
                 vmaDestroyImage(m_Allocator, slot.normalImage, slot.normalAllocation);
+                slot.radianceView = VK_NULL_HANDLE; slot.worldPosView = VK_NULL_HANDLE; slot.normalView = VK_NULL_HANDLE;
+                slot.radianceImage = VK_NULL_HANDLE; slot.worldPosImage = VK_NULL_HANDLE; slot.normalImage = VK_NULL_HANDLE;
+                slot.radianceAllocation = VK_NULL_HANDLE; slot.worldPosAllocation = VK_NULL_HANDLE; slot.normalAllocation = VK_NULL_HANDLE;
             }
         });
 
@@ -74,6 +77,9 @@ namespace renderer {
         RegisterResource([this] {
             vkDestroyImageView(m_Device, m_HitMaskView, nullptr);
             vmaDestroyImage(m_Allocator, m_HitMaskImage, m_HitMaskAllocation);
+            m_HitMaskView = VK_NULL_HANDLE;
+            m_HitMaskImage = VK_NULL_HANDLE;
+            m_HitMaskAllocation = VK_NULL_HANDLE;
         });
 
         // Phase 2 (Lumen advanced roadmap): raw radiance + half-vector -- both single fixed images,
@@ -84,11 +90,17 @@ namespace renderer {
         RegisterResource([this] {
             vkDestroyImageView(m_Device, m_RawRadianceView, nullptr);
             vmaDestroyImage(m_Allocator, m_RawRadianceImage, m_RawRadianceAllocation);
+            m_RawRadianceView = VK_NULL_HANDLE;
+            m_RawRadianceImage = VK_NULL_HANDLE;
+            m_RawRadianceAllocation = VK_NULL_HANDLE;
         });
         VulkanUtils::CreateStorageSampledImage2D(allocator, device, kHalfVectorFormat, renderExtent, m_HalfVectorImage, m_HalfVectorAllocation, m_HalfVectorView);
         RegisterResource([this] {
             vkDestroyImageView(m_Device, m_HalfVectorView, nullptr);
             vmaDestroyImage(m_Allocator, m_HalfVectorImage, m_HalfVectorAllocation);
+            m_HalfVectorView = VK_NULL_HANDLE;
+            m_HalfVectorImage = VK_NULL_HANDLE;
+            m_HalfVectorAllocation = VK_NULL_HANDLE;
         });
 
         VkSamplerCreateInfo samplerInfo{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
@@ -102,7 +114,7 @@ namespace renderer {
         samplerInfo.maxLod = 0.0f;
         samplerInfo.unnormalizedCoordinates = VK_FALSE;
         VK_CHECK(vkCreateSampler(m_Device, &samplerInfo, nullptr, &m_ReflectionSampler));
-        RegisterResource([this] { vkDestroySampler(m_Device, m_ReflectionSampler, nullptr); });
+        RegisterResource([this] { vkDestroySampler(m_Device, m_ReflectionSampler, nullptr); m_ReflectionSampler = VK_NULL_HANDLE; });
 
         m_ViewParamsBuffer.Create(allocator, sizeof(ReflectionViewParamsUBO),
             VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
@@ -173,6 +185,10 @@ namespace renderer {
             RegisterResource([this] {
                 vkDestroyDescriptorPool(m_Device, m_TraceDescriptorPool, nullptr);
                 vkDestroyDescriptorSetLayout(m_Device, m_TraceSetLayout, nullptr);
+                m_TraceDescriptorPool = VK_NULL_HANDLE;
+                m_TraceSetLayout = VK_NULL_HANDLE;
+                m_TraceSet[0] = VK_NULL_HANDLE;
+                m_TraceSet[1] = VK_NULL_HANDLE;
             });
 
             VkAccelerationStructureKHR tlasHandle = rtPass.GetTLASHandle();
@@ -217,7 +233,7 @@ namespace renderer {
             pipelineLayoutInfo.pushConstantRangeCount = 1;
             pipelineLayoutInfo.pPushConstantRanges = &pushRange;
             VK_CHECK(vkCreatePipelineLayout(m_Device, &pipelineLayoutInfo, nullptr, &m_TracePipelineLayout));
-            RegisterResource([this] { vkDestroyPipelineLayout(m_Device, m_TracePipelineLayout, nullptr); });
+            RegisterResource([this] { vkDestroyPipelineLayout(m_Device, m_TracePipelineLayout, nullptr); m_TracePipelineLayout = VK_NULL_HANDLE; });
 
             VkShaderModule shaderModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/ReflectionTrace.comp.spv");
             VkComputePipelineCreateInfo pipelineInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
@@ -228,7 +244,7 @@ namespace renderer {
             pipelineInfo.stage.pName = "main";
             VK_CHECK(vkCreateComputePipelines(m_Device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_TracePipeline));
             vkDestroyShaderModule(m_Device, shaderModule, nullptr);
-            RegisterResource([this] { vkDestroyPipeline(m_Device, m_TracePipeline, nullptr); });
+            RegisterResource([this] { vkDestroyPipeline(m_Device, m_TracePipeline, nullptr); m_TracePipeline = VK_NULL_HANDLE; });
         }
 
         // =====================================================================================
@@ -276,6 +292,10 @@ namespace renderer {
             RegisterResource([this] {
                 vkDestroyDescriptorPool(m_Device, m_TemporalDescriptorPool, nullptr);
                 vkDestroyDescriptorSetLayout(m_Device, m_TemporalSetLayout, nullptr);
+                m_TemporalDescriptorPool = VK_NULL_HANDLE;
+                m_TemporalSetLayout = VK_NULL_HANDLE;
+                m_TemporalSet[0] = VK_NULL_HANDLE;
+                m_TemporalSet[1] = VK_NULL_HANDLE;
             });
 
             VkDescriptorBufferInfo viewParamsInfo{ m_ViewParamsBuffer.Handle(), 0, m_ViewParamsBuffer.Size() };
@@ -314,7 +334,7 @@ namespace renderer {
             pipelineLayoutInfo.pushConstantRangeCount = 0;
             pipelineLayoutInfo.pPushConstantRanges = nullptr;
             VK_CHECK(vkCreatePipelineLayout(m_Device, &pipelineLayoutInfo, nullptr, &m_TemporalPipelineLayout));
-            RegisterResource([this] { vkDestroyPipelineLayout(m_Device, m_TemporalPipelineLayout, nullptr); });
+            RegisterResource([this] { vkDestroyPipelineLayout(m_Device, m_TemporalPipelineLayout, nullptr); m_TemporalPipelineLayout = VK_NULL_HANDLE; });
 
             VkShaderModule shaderModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/ReflectionTemporal.comp.spv");
             VkComputePipelineCreateInfo pipelineInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
@@ -325,7 +345,7 @@ namespace renderer {
             pipelineInfo.stage.pName = "main";
             VK_CHECK(vkCreateComputePipelines(m_Device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_TemporalPipeline));
             vkDestroyShaderModule(m_Device, shaderModule, nullptr);
-            RegisterResource([this] { vkDestroyPipeline(m_Device, m_TemporalPipeline, nullptr); });
+            RegisterResource([this] { vkDestroyPipeline(m_Device, m_TemporalPipeline, nullptr); m_TemporalPipeline = VK_NULL_HANDLE; });
         }
 
         // =====================================================================================
@@ -374,6 +394,10 @@ namespace renderer {
             RegisterResource([this] {
                 vkDestroyDescriptorPool(m_Device, m_GatherDescriptorPool, nullptr);
                 vkDestroyDescriptorSetLayout(m_Device, m_GatherSetLayout, nullptr);
+                m_GatherDescriptorPool = VK_NULL_HANDLE;
+                m_GatherSetLayout = VK_NULL_HANDLE;
+                m_GatherSet[0] = VK_NULL_HANDLE;
+                m_GatherSet[1] = VK_NULL_HANDLE;
             });
 
             VkDescriptorImageInfo gbufferNormalInfo{ VK_NULL_HANDLE, resolvePass.GetOutputNormalView(), VK_IMAGE_LAYOUT_GENERAL };
@@ -411,7 +435,7 @@ namespace renderer {
             pipelineLayoutInfo.pushConstantRangeCount = 0;
             pipelineLayoutInfo.pPushConstantRanges = nullptr;
             VK_CHECK(vkCreatePipelineLayout(m_Device, &pipelineLayoutInfo, nullptr, &m_GatherPipelineLayout));
-            RegisterResource([this] { vkDestroyPipelineLayout(m_Device, m_GatherPipelineLayout, nullptr); });
+            RegisterResource([this] { vkDestroyPipelineLayout(m_Device, m_GatherPipelineLayout, nullptr); m_GatherPipelineLayout = VK_NULL_HANDLE; });
 
             VkShaderModule shaderModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/ReflectionGather.comp.spv");
             VkComputePipelineCreateInfo pipelineInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
@@ -422,7 +446,7 @@ namespace renderer {
             pipelineInfo.stage.pName = "main";
             VK_CHECK(vkCreateComputePipelines(m_Device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_GatherPipeline));
             vkDestroyShaderModule(m_Device, shaderModule, nullptr);
-            RegisterResource([this] { vkDestroyPipeline(m_Device, m_GatherPipeline, nullptr); });
+            RegisterResource([this] { vkDestroyPipeline(m_Device, m_GatherPipeline, nullptr); m_GatherPipeline = VK_NULL_HANDLE; });
         }
 
         // Not a Vulkan handle -- always unconditionally re-set here, so (unlike the ping-pong

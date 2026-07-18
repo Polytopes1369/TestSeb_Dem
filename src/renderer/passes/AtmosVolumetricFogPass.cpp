@@ -88,16 +88,25 @@ namespace renderer {
         RegisterResource([this] {
             vkDestroyImageView(m_Device, m_MediaProps.view, nullptr);
             vmaDestroyImage(m_Allocator, m_MediaProps.image, m_MediaProps.allocation);
+            m_MediaProps.view = VK_NULL_HANDLE;
+            m_MediaProps.image = VK_NULL_HANDLE;
+            m_MediaProps.allocation = VK_NULL_HANDLE;
         });
         CreateFroxelImage(allocator, device, kRadianceFormat, m_RawLight);
         RegisterResource([this] {
             vkDestroyImageView(m_Device, m_RawLight.view, nullptr);
             vmaDestroyImage(m_Allocator, m_RawLight.image, m_RawLight.allocation);
+            m_RawLight.view = VK_NULL_HANDLE;
+            m_RawLight.image = VK_NULL_HANDLE;
+            m_RawLight.allocation = VK_NULL_HANDLE;
         });
         CreateFroxelImage(allocator, device, kRadianceFormat, m_IntegratedFog);
         RegisterResource([this] {
             vkDestroyImageView(m_Device, m_IntegratedFog.view, nullptr);
             vmaDestroyImage(m_Allocator, m_IntegratedFog.image, m_IntegratedFog.allocation);
+            m_IntegratedFog.view = VK_NULL_HANDLE;
+            m_IntegratedFog.image = VK_NULL_HANDLE;
+            m_IntegratedFog.allocation = VK_NULL_HANDLE;
         });
 
         VkClearColorValue zeroClear{}; zeroClear.float32[0] = zeroClear.float32[1] = zeroClear.float32[2] = 0.0f; zeroClear.float32[3] = 1.0f;
@@ -119,7 +128,7 @@ namespace renderer {
         samplerInfo.compareEnable = VK_FALSE;
         samplerInfo.unnormalizedCoordinates = VK_FALSE;
         VK_CHECK(vkCreateSampler(m_Device, &samplerInfo, nullptr, &m_FogSampler));
-        RegisterResource([this] { vkDestroySampler(m_Device, m_FogSampler, nullptr); });
+        RegisterResource([this] { vkDestroySampler(m_Device, m_FogSampler, nullptr); m_FogSampler = VK_NULL_HANDLE; });
 
         // --- Local Fog Volumes (G8): build the binding-11 std430 SSBO ONCE from config. ---
         // These are static authored scene content (like the VulkanContext zone layout), so they are
@@ -210,6 +219,9 @@ namespace renderer {
         RegisterResource([this] {
             vkDestroyDescriptorPool(m_Device, m_DescriptorPool, nullptr);
             vkDestroyDescriptorSetLayout(m_Device, m_SetLayout, nullptr);
+            m_DescriptorPool = VK_NULL_HANDLE;
+            m_SetLayout = VK_NULL_HANDLE;
+            m_Set = VK_NULL_HANDLE;
         });
 
         VkDescriptorImageInfo mediaStorageInfo{ VK_NULL_HANDLE, m_MediaProps.view, VK_IMAGE_LAYOUT_GENERAL };
@@ -248,12 +260,12 @@ namespace renderer {
         plInfo.pushConstantRangeCount = 1;
         plInfo.pPushConstantRanges = &pushRange;
         VK_CHECK(vkCreatePipelineLayout(m_Device, &plInfo, nullptr, &m_PipelineLayout));
-        RegisterResource([this] { vkDestroyPipelineLayout(m_Device, m_PipelineLayout, nullptr); });
+        RegisterResource([this] { vkDestroyPipelineLayout(m_Device, m_PipelineLayout, nullptr); m_PipelineLayout = VK_NULL_HANDLE; });
 
         VkShaderModule shader = VulkanPipeline::LoadShaderModule(m_Device, "shaders/AtmosVolumetricFog.comp.spv");
         m_Pipeline = VulkanPipeline::CreateComputePipeline(m_Device, m_PipelineLayout, shader);
         vkDestroyShaderModule(m_Device, shader, nullptr);
-        RegisterResource([this] { vkDestroyPipeline(m_Device, m_Pipeline, nullptr); });
+        RegisterResource([this] { vkDestroyPipeline(m_Device, m_Pipeline, nullptr); m_Pipeline = VK_NULL_HANDLE; });
 
         LOG_INFO(std::format("[AtmosVolumetricFogPass] Initialized ({}x{}x{} froxel grid).", kGridWidth, kGridHeight, kGridDepth));
         return true;

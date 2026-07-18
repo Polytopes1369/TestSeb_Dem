@@ -130,6 +130,9 @@ namespace renderer {
             RegisterResource([this] {
                 vkDestroyImageView(m_Device, m_DummySdfView, nullptr);
                 vmaDestroyImage(m_Allocator, m_DummySdfImage, m_DummySdfAllocation);
+                m_DummySdfView = VK_NULL_HANDLE;
+                m_DummySdfImage = VK_NULL_HANDLE;
+                m_DummySdfAllocation = VK_NULL_HANDLE;
             });
 
             VkSamplerCreateInfo samplerInfo{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
@@ -143,7 +146,7 @@ namespace renderer {
             samplerInfo.maxLod = 0.0f;
             samplerInfo.unnormalizedCoordinates = VK_FALSE;
             VK_CHECK(vkCreateSampler(m_Device, &samplerInfo, nullptr, &m_EntitySdfSampler));
-            RegisterResource([this] { vkDestroySampler(m_Device, m_EntitySdfSampler, nullptr); });
+            RegisterResource([this] { vkDestroySampler(m_Device, m_EntitySdfSampler, nullptr); m_EntitySdfSampler = VK_NULL_HANDLE; });
 
             VkBuffer stagingBuffer = VK_NULL_HANDLE;
             VmaAllocation stagingAllocation = VK_NULL_HANDLE;
@@ -228,7 +231,7 @@ namespace renderer {
         meshSdfLayoutInfo.bindingCount = 2;
         meshSdfLayoutInfo.pBindings = meshSdfBindings;
         VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &meshSdfLayoutInfo, nullptr, &m_MeshSdfTraceSetLayout));
-        RegisterResource([this] { vkDestroyDescriptorSetLayout(m_Device, m_MeshSdfTraceSetLayout, nullptr); });
+        RegisterResource([this] { vkDestroyDescriptorSetLayout(m_Device, m_MeshSdfTraceSetLayout, nullptr); m_MeshSdfTraceSetLayout = VK_NULL_HANDLE; });
 
         VkDescriptorSetLayoutBinding samplingBindings[3]{};
         samplingBindings[0].binding = 0;
@@ -248,7 +251,7 @@ namespace renderer {
         samplingLayoutInfo.bindingCount = 3;
         samplingLayoutInfo.pBindings = samplingBindings;
         VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &samplingLayoutInfo, nullptr, &m_SurfaceCacheSamplingSetLayout));
-        RegisterResource([this] { vkDestroyDescriptorSetLayout(m_Device, m_SurfaceCacheSamplingSetLayout, nullptr); });
+        RegisterResource([this] { vkDestroyDescriptorSetLayout(m_Device, m_SurfaceCacheSamplingSetLayout, nullptr); m_SurfaceCacheSamplingSetLayout = VK_NULL_HANDLE; });
 
         VkDescriptorPoolSize poolSizes[2] = {
             { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3 },
@@ -259,7 +262,12 @@ namespace renderer {
         poolInfo.poolSizeCount = 2;
         poolInfo.pPoolSizes = poolSizes;
         VK_CHECK(vkCreateDescriptorPool(m_Device, &poolInfo, nullptr, &m_DescriptorPool));
-        RegisterResource([this] { vkDestroyDescriptorPool(m_Device, m_DescriptorPool, nullptr); });
+        RegisterResource([this] {
+            vkDestroyDescriptorPool(m_Device, m_DescriptorPool, nullptr);
+            m_DescriptorPool = VK_NULL_HANDLE;
+            m_MeshSdfTraceSet = VK_NULL_HANDLE;
+            m_SurfaceCacheSamplingSet = VK_NULL_HANDLE;
+        });
 
         VkDescriptorSetLayout layoutsToAllocate[2] = { m_MeshSdfTraceSetLayout, m_SurfaceCacheSamplingSetLayout };
         VkDescriptorSet allocatedSets[2] = {};

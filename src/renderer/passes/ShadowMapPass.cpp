@@ -144,6 +144,9 @@ namespace renderer {
         RegisterResource([this] {
             vkDestroyImageView(m_Device, m_ShadowView, nullptr);
             vmaDestroyImage(m_Allocator, m_ShadowImage, m_ShadowAllocation);
+            m_ShadowView = VK_NULL_HANDLE;
+            m_ShadowImage = VK_NULL_HANDLE;
+            m_ShadowAllocation = VK_NULL_HANDLE;
         });
 
         VkSamplerCreateInfo samplerInfo{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
@@ -164,7 +167,7 @@ namespace renderer {
         samplerInfo.maxLod = 0.0f;
         samplerInfo.unnormalizedCoordinates = VK_FALSE;
         VK_CHECK(vkCreateSampler(m_Device, &samplerInfo, nullptr, &m_ShadowSampler));
-        RegisterResource([this] { vkDestroySampler(m_Device, m_ShadowSampler, nullptr); });
+        RegisterResource([this] { vkDestroySampler(m_Device, m_ShadowSampler, nullptr); m_ShadowSampler = VK_NULL_HANDLE; });
 
         // =====================================================================================
         // STEP 3 -- One-time setup command buffer: upload the combined geometry (if any) and
@@ -241,7 +244,7 @@ namespace renderer {
         layoutInfo.pushConstantRangeCount = 1;
         layoutInfo.pPushConstantRanges = &pushConstantRange;
         VK_CHECK(vkCreatePipelineLayout(m_Device, &layoutInfo, nullptr, &m_PipelineLayout));
-        RegisterResource([this] { vkDestroyPipelineLayout(m_Device, m_PipelineLayout, nullptr); });
+        RegisterResource([this] { vkDestroyPipelineLayout(m_Device, m_PipelineLayout, nullptr); m_PipelineLayout = VK_NULL_HANDLE; });
 
         VkShaderModule vertModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/ShadowMapCapture.vert.spv");
 
@@ -316,7 +319,7 @@ namespace renderer {
         pipelineInfo.layout = m_PipelineLayout;
         pipelineInfo.pNext = &pipelineRendering;
         VK_CHECK(vkCreateGraphicsPipelines(m_Device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_Pipeline));
-        RegisterResource([this] { vkDestroyPipeline(m_Device, m_Pipeline, nullptr); });
+        RegisterResource([this] { vkDestroyPipeline(m_Device, m_Pipeline, nullptr); m_Pipeline = VK_NULL_HANDLE; });
 
         vkDestroyShaderModule(m_Device, vertModule, nullptr);
 

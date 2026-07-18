@@ -41,6 +41,9 @@ namespace renderer {
         RegisterResource([this] {
             vkDestroyImageView(m_Device, m_Transmittance.view, nullptr);
             vmaDestroyImage(m_Allocator, m_Transmittance.image, m_Transmittance.allocation);
+            m_Transmittance.view = VK_NULL_HANDLE;
+            m_Transmittance.image = VK_NULL_HANDLE;
+            m_Transmittance.allocation = VK_NULL_HANDLE;
         });
 
         VulkanUtils::CreateStorageSampledImage2D(allocator, device, kLUTFormat, kMultiScatteringExtent,
@@ -48,6 +51,9 @@ namespace renderer {
         RegisterResource([this] {
             vkDestroyImageView(m_Device, m_MultiScattering.view, nullptr);
             vmaDestroyImage(m_Allocator, m_MultiScattering.image, m_MultiScattering.allocation);
+            m_MultiScattering.view = VK_NULL_HANDLE;
+            m_MultiScattering.image = VK_NULL_HANDLE;
+            m_MultiScattering.allocation = VK_NULL_HANDLE;
         });
 
         VulkanUtils::CreateStorageSampledImage2D(allocator, device, kLUTFormat, kSkyViewExtent,
@@ -55,6 +61,9 @@ namespace renderer {
         RegisterResource([this] {
             vkDestroyImageView(m_Device, m_SkyView.view, nullptr);
             vmaDestroyImage(m_Allocator, m_SkyView.image, m_SkyView.allocation);
+            m_SkyView.view = VK_NULL_HANDLE;
+            m_SkyView.image = VK_NULL_HANDLE;
+            m_SkyView.allocation = VK_NULL_HANDLE;
         });
 
         VkClearColorValue zeroClear{}; zeroClear.float32[0] = zeroClear.float32[1] = zeroClear.float32[2] = 0.0f; zeroClear.float32[3] = 1.0f;
@@ -76,7 +85,7 @@ namespace renderer {
         samplerInfo.compareEnable = VK_FALSE;
         samplerInfo.unnormalizedCoordinates = VK_FALSE;
         VK_CHECK(vkCreateSampler(m_Device, &samplerInfo, nullptr, &m_LUTSampler));
-        RegisterResource([this] { vkDestroySampler(m_Device, m_LUTSampler, nullptr); });
+        RegisterResource([this] { vkDestroySampler(m_Device, m_LUTSampler, nullptr); m_LUTSampler = VK_NULL_HANDLE; });
 
         // --- Descriptor set: 5 bindings -- see AtmosSkyLUTs.comp's own binding comments. Storage +
         // sampler pairs on the SAME underlying view are safe here because mode is uniform across an
@@ -103,6 +112,9 @@ namespace renderer {
         RegisterResource([this] {
             vkDestroyDescriptorPool(m_Device, m_DescriptorPool, nullptr);
             vkDestroyDescriptorSetLayout(m_Device, m_SetLayout, nullptr);
+            m_DescriptorPool = VK_NULL_HANDLE;
+            m_SetLayout = VK_NULL_HANDLE;
+            m_Set = VK_NULL_HANDLE;
         });
 
         VkDescriptorImageInfo transStorageInfo{ VK_NULL_HANDLE, m_Transmittance.view, VK_IMAGE_LAYOUT_GENERAL };
@@ -126,12 +138,12 @@ namespace renderer {
         plInfo.pushConstantRangeCount = 1;
         plInfo.pPushConstantRanges = &pushRange;
         VK_CHECK(vkCreatePipelineLayout(m_Device, &plInfo, nullptr, &m_PipelineLayout));
-        RegisterResource([this] { vkDestroyPipelineLayout(m_Device, m_PipelineLayout, nullptr); });
+        RegisterResource([this] { vkDestroyPipelineLayout(m_Device, m_PipelineLayout, nullptr); m_PipelineLayout = VK_NULL_HANDLE; });
 
         VkShaderModule shader = VulkanPipeline::LoadShaderModule(m_Device, "shaders/AtmosSkyLUTs.comp.spv");
         m_Pipeline = VulkanPipeline::CreateComputePipeline(m_Device, m_PipelineLayout, shader);
         vkDestroyShaderModule(m_Device, shader, nullptr);
-        RegisterResource([this] { vkDestroyPipeline(m_Device, m_Pipeline, nullptr); });
+        RegisterResource([this] { vkDestroyPipeline(m_Device, m_Pipeline, nullptr); m_Pipeline = VK_NULL_HANDLE; });
 
         // Not a Vulkan handle -- but the original hand-written Shutdown() reset this cache state too,
         // so a Shutdown() followed by a fresh Init() on the same instance doesn't start out believing

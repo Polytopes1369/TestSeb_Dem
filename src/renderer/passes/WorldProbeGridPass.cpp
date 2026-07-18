@@ -120,6 +120,9 @@ namespace renderer {
         RegisterResource([this] {
             vkDestroyImageView(m_Device, m_GridView, nullptr);
             vmaDestroyImage(m_Allocator, m_GridImage, m_GridAllocation);
+            m_GridView = VK_NULL_HANDLE;
+            m_GridImage = VK_NULL_HANDLE;
+            m_GridAllocation = VK_NULL_HANDLE;
         });
 
         // Phase 6 (UE5.8 parity roadmap): NEAREST, not LINEAR -- now that the grid is addressed
@@ -143,7 +146,7 @@ namespace renderer {
         samplerInfo.compareEnable = VK_FALSE;
         samplerInfo.unnormalizedCoordinates = VK_FALSE;
         VK_CHECK(vkCreateSampler(m_Device, &samplerInfo, nullptr, &m_GridSampler));
-        RegisterResource([this] { vkDestroySampler(m_Device, m_GridSampler, nullptr); });
+        RegisterResource([this] { vkDestroySampler(m_Device, m_GridSampler, nullptr); m_GridSampler = VK_NULL_HANDLE; });
 
         // One-time UNDEFINED -> GENERAL transition (mirrors ClusterResolvePass::Init's own one-shot
         // pattern) -- stays GENERAL for this image's entire lifetime.
@@ -180,6 +183,9 @@ namespace renderer {
         RegisterResource([this] {
             vkDestroyDescriptorPool(m_Device, m_DescriptorPool, nullptr);
             vkDestroyDescriptorSetLayout(m_Device, m_SetLayout, nullptr);
+            m_DescriptorPool = VK_NULL_HANDLE;
+            m_SetLayout = VK_NULL_HANDLE;
+            m_Set = VK_NULL_HANDLE;
         });
 
         VkDescriptorImageInfo gridStorageInfo{ VK_NULL_HANDLE, m_GridView, VK_IMAGE_LAYOUT_GENERAL };
@@ -216,7 +222,7 @@ namespace renderer {
         layoutInfo.pushConstantRangeCount = 1;
         layoutInfo.pPushConstantRanges = &pushConstantRange;
         VK_CHECK(vkCreatePipelineLayout(m_Device, &layoutInfo, nullptr, &m_PipelineLayout));
-        RegisterResource([this] { vkDestroyPipelineLayout(m_Device, m_PipelineLayout, nullptr); });
+        RegisterResource([this] { vkDestroyPipelineLayout(m_Device, m_PipelineLayout, nullptr); m_PipelineLayout = VK_NULL_HANDLE; });
 
         VkShaderModule shaderModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/WorldProbeInject.comp.spv");
         VkComputePipelineCreateInfo pipelineInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
@@ -227,7 +233,7 @@ namespace renderer {
         pipelineInfo.stage.pName = "main";
         VK_CHECK(vkCreateComputePipelines(m_Device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_Pipeline));
         vkDestroyShaderModule(m_Device, shaderModule, nullptr);
-        RegisterResource([this] { vkDestroyPipeline(m_Device, m_Pipeline, nullptr); });
+        RegisterResource([this] { vkDestroyPipeline(m_Device, m_Pipeline, nullptr); m_Pipeline = VK_NULL_HANDLE; });
 
         m_GridOriginWorld = maths::vec3{ 0.0f, 0.0f, 0.0f };
         m_FrameIndex = 0;

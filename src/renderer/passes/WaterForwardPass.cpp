@@ -91,6 +91,9 @@ namespace renderer {
         RegisterResource([this] {
             vkDestroyImageView(m_Device, m_BackgroundSnapshotView, nullptr);
             vmaDestroyImage(m_Allocator, m_BackgroundSnapshotImage, m_BackgroundSnapshotAllocation);
+            m_BackgroundSnapshotView = VK_NULL_HANDLE;
+            m_BackgroundSnapshotImage = VK_NULL_HANDLE;
+            m_BackgroundSnapshotAllocation = VK_NULL_HANDLE;
         });
 
         // One-shot UNDEFINED -> SHADER_READ_ONLY_OPTIMAL transition -- so RecordDraw() never needs
@@ -134,7 +137,7 @@ namespace renderer {
         if (vkCreateSampler(m_Device, &samplerInfo, nullptr, &m_BackgroundSnapshotSampler) != VK_SUCCESS) {
             throw std::runtime_error("Failed to create WaterForwardPass background snapshot sampler!");
         }
-        RegisterResource([this] { vkDestroySampler(m_Device, m_BackgroundSnapshotSampler, nullptr); });
+        RegisterResource([this] { vkDestroySampler(m_Device, m_BackgroundSnapshotSampler, nullptr); m_BackgroundSnapshotSampler = VK_NULL_HANDLE; });
 
         // =====================================================================================
         // STEP 1 -- set 0 layout: 7 bindings (no shadow/World-Probe-Grid/MegaLights resources --
@@ -161,6 +164,9 @@ namespace renderer {
         RegisterResource([this] {
             vkDestroyDescriptorPool(m_Device, m_DescriptorPool, nullptr);
             vkDestroyDescriptorSetLayout(m_Device, m_SetLayout, nullptr);
+            m_DescriptorPool = VK_NULL_HANDLE;
+            m_SetLayout = VK_NULL_HANDLE;
+            m_Set = VK_NULL_HANDLE;
         });
 
         // =====================================================================================
@@ -228,7 +234,7 @@ namespace renderer {
         if (vkCreatePipelineLayout(m_Device, &pipelineLayoutInfo, nullptr, &m_PipelineLayout) != VK_SUCCESS) {
             throw std::runtime_error("Failed to create WaterForwardPass pipeline layout!");
         }
-        RegisterResource([this] { vkDestroyPipelineLayout(m_Device, m_PipelineLayout, nullptr); });
+        RegisterResource([this] { vkDestroyPipelineLayout(m_Device, m_PipelineLayout, nullptr); m_PipelineLayout = VK_NULL_HANDLE; });
 
         // =====================================================================================
         // STEP 4 -- graphics pipeline, built manually (same reasoning as TessellationPass'
@@ -334,7 +340,7 @@ namespace renderer {
         if (vkCreateGraphicsPipelines(m_Device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_Pipeline) != VK_SUCCESS) {
             throw std::runtime_error("Failed to create WaterForwardPass graphics pipeline!");
         }
-        RegisterResource([this] { vkDestroyPipeline(m_Device, m_Pipeline, nullptr); });
+        RegisterResource([this] { vkDestroyPipeline(m_Device, m_Pipeline, nullptr); m_Pipeline = VK_NULL_HANDLE; });
 
         vkDestroyShaderModule(m_Device, vertModule, nullptr);
         vkDestroyShaderModule(m_Device, fragModule, nullptr);
