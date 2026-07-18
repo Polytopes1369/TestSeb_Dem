@@ -114,6 +114,13 @@ constexpr uint32_t VSM_SUN_LEVEL_COUNT = 3u;
 inline float VSM_SUN_BASE_RADIUS = 2.0f;
 inline uint32_t VSM_PHYSICAL_PAGE_CAPACITY = 4096u;
 inline uint32_t VSM_MAX_PAGES_RENDERED_PER_FRAME = 512u;
+// VSM advanced roadmap, Feature 2 (real static-vs-dynamic page invalidation): own frame budget for
+// re-rendering resident pages classified "covers dynamic content" every frame -- see
+// renderer::VirtualShadowMapPass::kMaxDynamicPagesRenderedPerFrame's own comment (mirrors
+// VSM_MAX_PAGES_RENDERED_PER_FRAME's exact convention above). Not per-quality-profile-tiered (like
+// BUILD_VIRTUAL_TEXTURES above, unlike VSM_MAX_PAGES_RENDERED_PER_FRAME) -- this demo's whole
+// resident page count is small enough that a single generous default covers every profile.
+inline uint32_t VSM_MAX_DYNAMIC_PAGES_RENDERED_PER_FRAME = 512u;
 
 inline uint32_t _GI_QUALITY = 4;
 inline bool _HARDWARE_RAYTRACING = true;
