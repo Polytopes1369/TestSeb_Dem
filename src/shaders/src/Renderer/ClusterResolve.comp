@@ -315,9 +315,9 @@ void main() {
             p2Local = mix(p2Local, ApplySplineDeformation(p2Local, splineControlPoints), g_WPOGlobals.splineDeformationDebugMultiplier);
         }
 
-        p0 = xform.center + rotation * p0Local;
-        p1 = xform.center + rotation * p1Local;
-        p2 = xform.center + rotation * p2Local;
+        p0 = xform.translation + xform.center + rotation * p0Local;
+        p1 = xform.translation + xform.center + rotation * p1Local;
+        p2 = xform.translation + xform.center + rotation * p2Local;
 
 #ifdef _DEBUG
         // Pre-deformation copies, kept ONLY in Debug builds -- DEBUG_VIEW_NANITE_WPO (below) needs

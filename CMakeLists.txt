@@ -286,6 +286,18 @@ if(WORLDPARTITION_MESHOPT_DEFINE)
 endif()
 add_test(NAME HlodPipelineTests COMMAND HlodPipelineTests)
 
+# WorldPartitionBakeTool: standalone dev-time content-authoring executable (see
+# tools/WorldPartition/BakeDemoWorld.cpp's own header comment) -- NOT a test, not registered via
+# add_test, run manually once to populate world_data/ for the runtime streaming demo. Links the
+# same OFPA sources as OfpaSerializationTests plus RuntimeCellManifest.cpp.
+add_executable(WorldPartitionBakeTool
+    ${WORLDPARTITION_OFPA_SOURCES}
+    tools/WorldPartition/SpatialHashGrid.cpp
+    tools/WorldPartition/RuntimeCellManifest.cpp
+    tools/WorldPartition/BakeDemoWorld.cpp
+)
+target_include_directories(WorldPartitionBakeTool PRIVATE src tools ${Vulkan_INCLUDE_DIRS})
+
 # ==============================================================================
 # AUTOMATIZED SHADER COMPILATION & POST-BUILD COPY
 # ==============================================================================

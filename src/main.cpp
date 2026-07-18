@@ -8,7 +8,12 @@
 #include "core/EntityData.h"
 #include "core/EngineConfig.h"
 #include "geometry/VirtualGeometryCacheTest.h"
+#include "world/StreamingManager.h"
+#include "world/CellManifest.h"
+#include "world/WorldCellStreamingLoader.h"
 #include <exception>
+#include <unordered_map>
+#include <vector>
 #include <format>
 #include <cstring>
 #include <thread>
@@ -34,6 +39,13 @@ struct CameraControlState {
     float moveSpeed = 5.0f; // meters/second, adjustable via mouse wheel while flying
 };
 static CameraControlState g_CameraControl;
+
+// Runtime World Partition streaming radii (world::StreamingSource) -- always-compiled runtime
+// state (streaming itself is a shipping feature, not a debug tool), only their ImGui sliders are
+// Debug-only per CLAUDE.md's build-separation rule. Tuned against BakeDemoWorld.cpp's own
+// kDemoWorldCellSize (20.0f) so a few cells fit within each radius at typical fly speed.
+static float g_StreamingDetailRadius = 30.0f;
+static float g_StreamingHlodRadius = 70.0f;
 
 // Mouse wheel while flying (RMB held) adjusts fly speed, matching UE5's own viewport scroll
 // behavior. GLFW only exposes wheel deltas via callback (no polling equivalent), so this is the
@@ -497,6 +509,43 @@ int main(int argc, char** argv) {
     }
 #endif
 
+    // --- Runtime World Partition streaming (world::StreamingManager, finalizing the previously
+    // offline-only OFPA/HLOD tooling -- see world/StreamingTypes.h and tools/WorldPartition/
+    // BakeDemoWorld.cpp for the full authoring -> runtime chain). world_data/cellmanifest.bin is
+    // produced by the offline WorldPartitionBakeTool (tools/WorldPartition/ never links into this
+    // executable, see that CMakeLists.txt section's own comment) -- if it is missing, streaming is
+    // gracefully disabled (the fixed showcase gallery still renders normally) rather than treated
+    // as a fatal error, unlike scene.cache above: streaming is additive, not load-bearing. ---
+    world::CellManifest cellManifest;
+    bool streamingEnabled = cellManifest.Load("world_data/cellmanifest.bin");
+    if (streamingEnabled) {
+        LOG_INFO(std::format("[Main] World Partition streaming ENABLED: {} authored cells (cellSize={:.1f}).",
+                              cellManifest.RecordCount(), cellManifest.CellSize()));
+    } else {
+        LOG_WARNING("[Main] world_data/cellmanifest.bin not found or unreadable -- World Partition "
+                    "streaming disabled. Run WorldPartitionBakeTool.exe once (see tools/WorldPartition/"
+                    "BakeDemoWorld.cpp) to author the demo world and enable it.");
+    }
+
+    world::WorldCellStreamingLoader worldCellLoader(cellManifest);
+    // Constructed unconditionally (cheap, inert if streamingEnabled is false -- UpdateStreamingSources/
+    // Update() are simply never called below) so its lifetime doesn't need its own conditional scope.
+    world::StreamingManager streamingManager(cellManifest.CellSize(), worldCellLoader,
+                                              clusterPipeline.GetLoadingManager(), /*maxConcurrentLoads=*/4);
+
+    // Bounded free-list over VulkanContext's kStreamingUnitCount physical GPU slots (see that
+    // class's own header comment on why the pool is small and fixed) -- maps a claimed cell to the
+    // unit currently rendering it. If more cells fall within g_StreamingHlodRadius simultaneously
+    // than there are free units, the newest ones are silently skipped (logged) until an older cell
+    // streams back out -- an explicit, accepted degradation of the bounded pool, not a crash.
+    std::unordered_map<world::CellCoord, uint32_t, world::CellCoordHash> cellToStreamingUnit;
+    std::vector<uint32_t> freeStreamingUnits;
+    for (uint32_t u = 0; u < vkContext.GetStreamingUnitCount(); ++u) freeStreamingUnits.push_back(u);
+
+    auto hashCellCoord = [](const world::CellCoord& c) -> uint32_t {
+        return static_cast<uint32_t>(c.x) * 73856093u ^ static_cast<uint32_t>(c.z) * 19349663u;
+    };
+
     // Instantiate the camera at the same vantage point the old auto-orbit used to start from
     // (distance 14, azimuth 0, elevation 28 around the origin). The feature-gallery base scene
     // (VulkanContext::GridSlot's 9 zones, kZonePitch = 4) keeps roughly the same ~7-unit max
@@ -854,6 +903,27 @@ int main(int argc, char** argv) {
         }
 
         ImGui::End();
+
+        // World Partition streaming overlay: its own separate window, built here (within this
+        // frame's already-open ImGui::NewFrame()/Render() bracket, see the top of this loop) rather
+        // than after streamingManager.Update() runs below -- ImGui::Begin() after ImGui::Render()
+        // is invalid. Necessarily shows the PREVIOUS frame's tracked-cell/in-flight/pool numbers
+        // (this frame's own streamingManager.Update() hasn't run yet at this point in the loop) --
+        // a one-frame-stale debug readout, not a correctness issue for what is purely an
+        // observability overlay. The sliders themselves take effect immediately: they write into
+        // g_StreamingDetailRadius/g_StreamingHlodRadius, plain floats read later this same frame by
+        // the streaming tick below.
+        if (streamingEnabled) {
+            ImGui::Begin("World Partition Streaming");
+            ImGui::SliderFloat("Detail load radius", &g_StreamingDetailRadius, 5.0f, 150.0f);
+            ImGui::SliderFloat("HLOD load radius", &g_StreamingHlodRadius, g_StreamingDetailRadius, 250.0f);
+            ImGui::Text("Tracked cells: %zu", streamingManager.GetTrackedCellCount());
+            ImGui::Text("In-flight loads: %u", streamingManager.GetInFlightCount());
+            ImGui::Text("Pending queue: %zu", streamingManager.GetPendingQueueLength());
+            ImGui::Text("Streaming units free: %zu / %u", freeStreamingUnits.size(), vkContext.GetStreamingUnitCount());
+            ImGui::End();
+        }
+
         ImGui::Render();
 #endif
 
@@ -928,6 +998,51 @@ int main(int argc, char** argv) {
         float aspect = static_cast<float>(vkContext.GetSwapchainExtent().width) /
             static_cast<float>(vkContext.GetSwapchainExtent().height);
         camera.Update(aspect);
+
+        // --- Runtime World Partition streaming tick: evaluate desired cell representations from
+        // the camera's current position, dispatch queued load/unload work onto the shared
+        // LoadingManager worker pool, then drain both its main-thread completions AND
+        // WorldCellStreamingLoader's own staged GPU-slot events -- see this block's construction
+        // site above for the full rationale. Placed after camera.Update() (this frame's position is
+        // final) and before RecordFrame() (no command buffer for this frame is being recorded yet),
+        // matching StreamingManager::Update()/PumpCompletions()'s own "main-thread-only, once per
+        // frame" contracts. ---
+        if (streamingEnabled) {
+            std::vector<world::StreamingSource> sources{
+                world::StreamingSource{ camera.GetPosition(), g_StreamingDetailRadius, g_StreamingHlodRadius, 0u }
+            };
+            streamingManager.UpdateStreamingSources(sources);
+            streamingManager.Update();
+            clusterPipeline.GetLoadingManager().PumpCompletions(8u);
+
+            for (const world::StreamingPlacementEvent& event : worldCellLoader.DrainEvents()) {
+                if (event.activate) {
+                    uint32_t unit;
+                    auto it = cellToStreamingUnit.find(event.coord);
+                    if (it != cellToStreamingUnit.end()) {
+                        unit = it->second;
+                    } else if (!freeStreamingUnits.empty()) {
+                        unit = freeStreamingUnits.back();
+                        freeStreamingUnits.pop_back();
+                        cellToStreamingUnit[event.coord] = unit;
+                    } else {
+                        LOG_WARNING(std::format(
+                            "[Streaming] Pool exhausted ({} units) -- cannot claim a slot for cell ({}, {}).",
+                            vkContext.GetStreamingUnitCount(), event.coord.x, event.coord.z));
+                        continue;
+                    }
+                    vkContext.SetStreamingUnitState(unit, true, event.useFineVariant,
+                                                     event.worldPosition, hashCellCoord(event.coord));
+                } else {
+                    auto it = cellToStreamingUnit.find(event.coord);
+                    if (it != cellToStreamingUnit.end()) {
+                        vkContext.SetStreamingUnitState(it->second, false, false, {}, 0u);
+                        freeStreamingUnits.push_back(it->second);
+                        cellToStreamingUnit.erase(it);
+                    }
+                }
+            }
+        }
 
 #ifndef NDEBUG
         camera.SetDebugViewMode(g_DebugState.viewMode);

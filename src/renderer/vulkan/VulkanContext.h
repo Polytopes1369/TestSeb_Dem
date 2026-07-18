@@ -97,7 +97,13 @@ public:
     VkBuffer GetVertexBuffer() const { return m_VertexBuffer; }
     VkBuffer GetIndexBuffer() const { return m_IndexBuffer; }
     const core::EntityData* GetEntityData() const { return m_EntityData.data(); }
-    uint32_t GetEntityCount() const { return kEntityCount; }
+    // Returns the TOTAL entity count including the streaming pool (kTotalEntityCount), not just
+    // the fixed showcase gallery -- every existing "iterate every entity" consumer (GlobalSDFPass's
+    // per-entity SDF bake, EntityBVH, TLAS build, shadow maps) picks up the streaming slots
+    // automatically and for free this way, each slot getting a small, cheap, always-valid bake
+    // (they are small pre-baked archetype props, not the scene's large primitives) rather than
+    // needing special-casing in every one of those passes.
+    uint32_t GetEntityCount() const { return kTotalEntityCount; }
     VkBuffer GetEntityTransformBuffer() const { return m_EntityTransformBuffer; }
     // Phase 4 integration (UE5.8 parity roadmap, dynamic scenes onto main): CPU-readable mirror of
     // this frame's per-entity rotation, refreshed every UpdateEntityRotations() call alongside its
@@ -108,6 +114,19 @@ public:
     const core::EntityTransformCPU* GetEntityTransformsCPU() const { return m_EntityTransformsCPU.data(); }
     VkBuffer GetEntityBuffer() const { return m_EntityBuffer; }
     const renderer::MaterialTable& GetMaterialTable() const { return m_MaterialTable; }
+
+    // --- Runtime World Partition streaming pool control (see kStreamingUnitCount's own comment).
+    // Main-thread-only (patches m_EntityBuffer via a one-shot command submission -- see .cpp). ---
+    uint32_t GetStreamingUnitCount() const { return kStreamingUnitCount; }
+
+    // Activates (or deactivates) one streaming unit: `active` claims the unit for a world cell at
+    // `worldPos`, showing its coarse mesh if `useFineVariant` is false or its fine mesh if true,
+    // and stamping `cellID` into both slots' core::EntityData::cellID; `!active` parks the unit
+    // (both slots marked core::EntityFlags::StreamingInactive, never drawn) for later reuse by a
+    // different cell. Safe to call from the main thread only, at any point before this frame's
+    // command buffer recording begins (see main.cpp's own call site, right after
+    // StreamingManager::Update() and before ClusterRenderPipeline::RecordFrame()).
+    void SetStreamingUnitState(uint32_t unit, bool active, bool useFineVariant, const maths::vec3& worldPos, uint32_t cellID);
 
 private:
     VkInstance m_Instance = VK_NULL_HANDLE;
@@ -256,15 +275,51 @@ private:
     // own kHeroMaterialID override.
     static constexpr uint32_t kHeroEntityIndex = 2;
 
+    // --- Runtime World Partition streaming pool (world::StreamingManager / world::WorldCellStreamingLoader) ---
+    // Bounded pool of extra entity slots appended AFTER the fixed showcase gallery (indices
+    // [kEntityCount, kTotalEntityCount)) -- every constant above (kWallEntityIndexA/B,
+    // kFloorEntityIndex, kWaterEntityIndex, kHeroEntityIndex) stays keyed off kEntityCount (16)
+    // unchanged, so this pool can never collide with or shift any existing showcase entity index.
+    //
+    // Each "streaming unit" is 2 physical slots (a coarse + a fine pre-baked mesh variant of the
+    // same archetype shape, both baked at local origin -- see GenerateGeometry()'s streaming block)
+    // sharing one world position: HLOD <-> FullDetail transitions are a flag swap between the two,
+    // never a geometry re-bake, because re-writing baked vertex data after the Nanite cluster DAG
+    // has been built from it would desync the DAG's cluster bounds from the raw vertices it indexes
+    // (see ClusterLODCompact.comp's own boundsMin/boundsMax comment) -- live re-baking of resident
+    // Nanite geometry is not a supported operation in this pipeline.
+    static constexpr uint32_t kStreamingArchetypeShapeCount = 4; // Rock, Bush, Tree, Debris -- see BuildEntityData()'s archetype block.
+    // Deliberately small: 16 base + 12 streaming == 28 total entities -- comfortably under
+    // mesh_sdf_trace.glsl's/SurfaceCacheTraceContext's kMaxTracedEntities (128, config::lumen::
+    // MAX_TRACED_ENTITIES), and each streaming slot's SDF bake is cheap (small pre-baked archetype
+    // props, not the scene's large primitives). Kept small mainly to bound GPU memory/Init cost,
+    // not to dodge any known capacity limit.
+    static constexpr uint32_t kStreamingUnitCount = 6;
+    static constexpr uint32_t kStreamingSlotsPerUnit = 2; // 0 = coarse (HLOD), 1 = fine (FullDetail).
+    static constexpr uint32_t kStreamingSlotCount = kStreamingUnitCount * kStreamingSlotsPerUnit;
+    static constexpr uint32_t kStreamingSlotBase = kEntityCount;
+    static constexpr uint32_t kTotalEntityCount = kEntityCount + kStreamingSlotCount;
+
+    static constexpr uint32_t StreamingUnitCoarseSlot(uint32_t unit) { return kStreamingSlotBase + unit * kStreamingSlotsPerUnit; }
+    static constexpr uint32_t StreamingUnitFineSlot(uint32_t unit) { return kStreamingSlotBase + unit * kStreamingSlotsPerUnit + 1u; }
+
     // CPU-authoritative entity records: built once by BuildEntityData() (meshID assigned via
     // core::IDManager) before GenerateGeometry() runs, then copied to m_EntityBuffer by
-    // UploadEntityData(). One entry per entity (box=0 .. floor=14), see struct_custo.glsl.
-    std::array<core::EntityData, kEntityCount> m_EntityData{};
+    // UploadEntityData(). Indices [0, kEntityCount) are the fixed showcase gallery; indices
+    // [kStreamingSlotBase, kTotalEntityCount) are the streaming pool above.
+    std::array<core::EntityData, kTotalEntityCount> m_EntityData{};
 
     // Phase 4 integration (UE5.8 parity roadmap, dynamic scenes onto main): CPU-readable mirror of
     // m_EntityTransformBuffer's own per-frame contents -- see GetEntityTransformsCPU()'s own
     // comment.
-    std::array<core::EntityTransformCPU, kEntityCount> m_EntityTransformsCPU{};
+    std::array<core::EntityTransformCPU, kTotalEntityCount> m_EntityTransformsCPU{};
+
+    // Per-streaming-UNIT (not per-slot: both the coarse and fine slot of a unit always share the
+    // same world position, see the pool comment above) desired world translation, set by
+    // SetStreamingUnitState() and consumed every frame by UpdateEntityRotations() -- persists
+    // across frames since UpdateEntityRotations() rebuilds the whole upload array from scratch
+    // every call and has no other memory of where a streaming unit was last placed.
+    std::array<maths::vec3, kStreamingUnitCount> m_StreamingUnitTranslation{};
 
     // Hand-authored PBR showcase materials (renderer::GenerateShowcaseMaterialTable), one slot per
     // entity -- built once by BuildEntityData(), uploaded to the GPU by ClusterResolvePass::Init()
@@ -373,6 +428,15 @@ private:
     // buffer + vkCmdCopyBuffer, matching DispatchGeometryCompute's blocking one-time-submit
     // pattern. Must run after m_EntityBuffer is allocated and before it is bound for reading.
     void UploadEntityData();
+
+    // Patches exactly the 2 core::EntityData elements at [kStreamingSlotBase + unit*2, +2) into
+    // m_EntityBuffer via a small one-shot staging-buffer copy (same pattern as UploadEntityData(),
+    // just a 2-element slice instead of the whole array) -- called by SetStreamingUnitState() after
+    // updating m_EntityData in place. A rare, small, main-thread-only patch (at most
+    // maxConcurrentLoads streaming events per frame, see world::StreamingManager), so the brief
+    // synchronous stall from ExecuteOneShotCommands' vkQueueWaitIdle is an accepted tradeoff over
+    // building a batched per-frame dirty-range upload path for what is not a per-frame-hot path.
+    void PatchStreamingUnitEntityData(uint32_t unit);
 
     // Single source of truth for the feature-gallery layout (also used by
     // UpdateEntityRotations() to recover each entity's rotation pivot, and duplicated by

@@ -147,6 +147,14 @@ namespace renderer {
     // composes manually against a background snapshot, see that pass's own header comment).
     inline constexpr uint32_t kWaterMaterialID = 17u;
 
+    // Runtime World Partition streaming pool (VulkanContext::kStreamingUnitCount): one opaque
+    // material per archetype shape (Rock/Bush/Tree/Debris, see VulkanContext::
+    // kStreamingArchetypeShapeCount), reserved one past kWaterMaterialID, same "never collides with
+    // a real entity's showcase material" convention. Both the coarse and fine mesh variant of a
+    // streaming unit share their shape's single material -- only the geometry detail differs
+    // between them, not the look.
+    inline constexpr uint32_t kStreamingArchetypeMaterialIDBase = 18u; // Occupies 18..21 (4 shapes).
+
     // One generated table: the PBR parameters themselves, plus a parallel convenience flag so
     // callers (VulkanContext::BuildEntityData, deciding each entity's core::EntityFlags::
     // IsTransparent bit) don't need to re-derive "alpha < 1.0" themselves.
@@ -328,6 +336,18 @@ namespace renderer {
         // that pass' own class comment).
         table.params[kWaterMaterialID].base = MakeBaseSlab(maths::vec3(0.02f, 0.10f, 0.18f), 0.04f, maths::vec3(0.0f, 0.0f, 0.0f), 0.0f);
         table.params[kWaterMaterialID].alpha = 0.85f;
+
+        // Runtime World Partition streaming pool: 4 opaque archetype recipes, indices
+        // kStreamingArchetypeMaterialIDBase..+3 (18..21) -- likewise past every hand-authored slot
+        // above, untouched by the isTransparent loop (all stay fully opaque).
+        table.params[kStreamingArchetypeMaterialIDBase + 0].base =
+            MakeBaseSlab(maths::vec3(0.45f, 0.42f, 0.40f), 0.85f, maths::vec3(0.0f, 0.0f, 0.0f), 0.0f); // Rock: matte gray-brown.
+        table.params[kStreamingArchetypeMaterialIDBase + 1].base =
+            MakeBaseSlab(maths::vec3(0.18f, 0.45f, 0.15f), 0.75f, maths::vec3(0.0f, 0.0f, 0.0f), 0.0f); // Bush: matte green.
+        table.params[kStreamingArchetypeMaterialIDBase + 2].base =
+            MakeBaseSlab(maths::vec3(0.28f, 0.20f, 0.12f), 0.80f, maths::vec3(0.0f, 0.0f, 0.0f), 0.0f); // Tree: matte dark brown.
+        table.params[kStreamingArchetypeMaterialIDBase + 3].base =
+            MakeBaseSlab(maths::vec3(0.55f, 0.30f, 0.18f), 0.70f, maths::vec3(0.0f, 0.0f, 0.0f), 0.0f); // Debris: rusty orange-brown.
 
         return table;
     }

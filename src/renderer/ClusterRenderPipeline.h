@@ -199,6 +199,13 @@ namespace renderer {
 
         void Shutdown();
 
+        // Exposes the pipeline-wide worker pool (see m_LoadingManager's own comment: owned here,
+        // not per-pass, specifically so future CPU-bound systems can share it) to runtime World
+        // Partition streaming (world::StreamingManager, io::AsyncDecompressingLoader) constructed
+        // in main.cpp -- previously only used internally by GlobalSDFPass::Init(). Must outlive
+        // anything handed this reference, exactly as m_LoadingManager's own comment already states.
+        core::LoadingManager& GetLoadingManager() { return m_LoadingManager; }
+
         // Records the entire frame's GPU work (culling -> hybrid raster -> resolve -> blit +
         // present transition of `swapchainImage`) into `cmd` -- see the class comment's step list.
         // `camera` supplies view/proj (must be the frame's final matrices: every stage this frame
