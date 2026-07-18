@@ -22,9 +22,13 @@
 // pre-existing alive particle AND every particle mode == 1/2 just spawned this same RecordSimulate()
 // call, uniformly, since both look identical here (a slot with life > 0). A dead slot (life <= 0)
 // costs one branch and returns. A live slot's physics branches on its own stored kind (see
-// ParticleCommon.glsl's UnpackParticleKind): kKindEmber integrates gravity + wind + drag and resolves
-// Global SDF collisions with a bounce (elastic-normal/frictional-tangential split), exactly as
-// before this feature existed; kKindRain/kKindSnow (this file's own precipitation feature, see mode
+// ParticleCommon.glsl's UnpackParticleKind): kKindEmber integrates gravity + wind + drag, then (module
+// stack roadmap, subtask A3) additively layers its own emitter's curl-noise turbulence and/or radial
+// attractor/repulsor force -- EACH independently toggleable per emitter and a no-op branch when
+// disabled (see EmitterParams' own curlNoiseEnabled/attractorEnabled fields and UpdateParticle's own
+// call site) -- before resolving Global SDF collisions with a bounce (elastic-normal/
+// frictional-tangential split), exactly as before this feature existed; kKindRain/kKindSnow (this
+// file's own precipitation feature, see mode
 // == 2 below) instead relax velocity toward a fixed downward fall speed (blended with the local wind
 // for horizontal drift, plus a sine-noise wobble for snow) and are simply ABSORBED (life forced to 0,
 // no bounce) on any Global SDF collision or once they sink below g_Precip.floorBelowCenter under the
@@ -176,6 +180,22 @@ vec3 RandomInUnitSphere(inout uint seed) {
 // that array's own comment) rides this SAME per-emitter path as any other emitter, authored with
 // spawnShape == 1 (Sphere volume drift) below for a soft, near-weightless billow rather than a
 // bespoke recipe -- no special-casing needed here.
+
+// Module stack roadmap (subtask A3): curl-noise turbulence module's own force sample -- reuses
+// AtmosNoiseCommon.glsl's existing AtmosFractalCurlNoise3D (the same divergence-free noise helper
+// Atmos wind turbulence already uses, see that file's own header comment) rather than introducing a
+// second noise implementation, keeping this module consistent with the established
+// procedural-noise style. `scale` (per-emitter, EmitterParams.curlNoiseScale) is a frequency
+// multiplier on world position; the domain is additionally scrolled slowly along a fixed diagonal by
+// `time` so the field visibly evolves rather than looking frozen in world space for a particle that
+// lingers in one place (e.g. this file's own Sphere volume drift spawn shape) -- independent of
+// wind's own scroll direction/speed, since this module is explicitly NOT tied to wind, only layered
+// additively on top of it (see UpdateParticle's own call site).
+vec3 SampleCurlTurbulence(vec3 worldPos, float time, float scale) {
+    vec3 scrolledPos = worldPos * scale + vec3(time * 0.15, -time * 0.1, time * 0.05);
+    return AtmosFractalCurlNoise3D(scrolledPos, 1.0, 3.0, 0.5);
+}
+
 void SpawnParticle(uint slotIndex, uint spawnRequestIndex, uint emitterIndex) {
     uint seed = HashUint(pc.randomSeedBase ^ (slotIndex * 2654435761u) ^ (spawnRequestIndex * 40503u) ^ (emitterIndex * 2246822519u));
     EmitterParams e = emitters[emitterIndex];
@@ -328,6 +348,29 @@ void UpdateParticle(uint slotIndex) {
         EmitterParams e = emitters[p.emitterIndex];
         p.velocity.y += e.gravityY * pc.dt;
         p.velocity += (wind - p.velocity) * clamp(e.dragCoefficient * pc.dt, 0.0, 1.0);
+
+        // --- Module stack roadmap (subtask A3): curl-noise turbulence force ---
+        // Additive, independent of the base wind above (a per-emitter tunable layered ON TOP of it,
+        // not a replacement) -- gated by its own enable flag so a disabled module costs exactly one
+        // branch beyond this point (no noise evaluation at all when off).
+        if (e.curlNoiseEnabled != 0u) {
+            p.velocity += SampleCurlTurbulence(p.position, pc.time, e.curlNoiseScale) * e.curlNoiseStrength * pc.dt;
+        }
+
+        // --- Module stack roadmap (subtask A3): radial attractor/repulsor force ---
+        // Additive force toward (positive strength) or away from (negative strength) a point that is
+        // an offset from this emitter's own live position -- smoothstep falloff to zero at
+        // attractorRadius avoids both a harsh cutoff and an inverse-square singularity as a particle
+        // approaches the point itself. Gated the same way as the turbulence module above.
+        if (e.attractorEnabled != 0u) {
+            vec3 toAttractor = (e.position + e.attractorOffset) - p.position;
+            float distToAttractor = length(toAttractor);
+            if (distToAttractor > 1.0e-4) {
+                float falloff = 1.0 - smoothstep(0.0, e.attractorRadius, distToAttractor);
+                p.velocity += (toAttractor / distToAttractor) * e.attractorStrength * falloff * pc.dt;
+            }
+        }
+
         newPosition = p.position + p.velocity * pc.dt;
 
         // --- Global SDF collision (central-difference normal, reflect() split into elastic-normal /

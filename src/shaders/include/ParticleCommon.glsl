@@ -50,9 +50,16 @@ struct Particle {
 // renderer::ParticleSystemPass::kMaxEmitters), re-uploaded in full every RecordSimulate() call since
 // every field is directly editable via main.cpp's Particles ImGui tab
 // (config::particles::EMITTERS[]). Mirrors renderer::ParticleSystemPass::EmitterParams byte-for-byte
-// -- 80 bytes, std430, same "flat floats, vec3 packs with trailing scalar" layout as Particle above.
+// -- 112 bytes, std430, same "flat floats, vec3 packs with trailing scalar" layout as Particle above.
 // Only consumed for kKindEmber particles -- precipitation (rain/snow) has its own dedicated
 // PrecipitationParamsUBO (this file's own binding declarations further down) instead.
+//
+// Module stack roadmap (subtask A3): adds two independently-toggleable force modules on top of the
+// existing gravity/wind-drag/SDF-bounce physics below (which are unchanged) -- see
+// ParticleSimulation.comp's UpdateParticle for where these are applied, additively, in the ember
+// (non-precipitation) branch only. A full visual-scripting module graph is out of scope for this
+// project (see renderer::ParticleSystemPass::EmitterParams' own header comment); this is instead a
+// small fixed-size data-driven set, matching this codebase's "no data in the .exe" discipline.
 struct EmitterParams {
     vec3 position;
     float shapeParam0;      // Spawn-shape parameter: Sphere (spawnShape==1) = radius in world units; Cone (spawnShape==0) = unused.
@@ -64,7 +71,19 @@ struct EmitterParams {
     float friction;          // [0,1] -- fraction of tangential-relative speed kept after a Global SDF collision.
     float dragCoefficient;   // How strongly velocity relaxes toward the local Atmos wind vector each second.
     uint spawnShape;         // 0 = Cone burst (legacy "embers" launch direction/jitter), 1 = Sphere volume drift spawn.
-    float _pad0, _pad1, _pad2;
+    // Module stack roadmap (subtask A3): curl-noise turbulence module -- replaces the 3 previously
+    // unused trailing pad floats that used to close spawnShape's own 16-byte slot (no size change).
+    uint curlNoiseEnabled;    // Nonzero = apply a divergence-free curl-noise force to velocity every UpdateParticle() call.
+    float curlNoiseStrength;  // Force magnitude, m/s^2 applied to velocity per second at full strength.
+    float curlNoiseScale;     // World-space frequency multiplier fed into the curl-noise field (bigger = finer swirls).
+    // Module stack roadmap (subtask A3): radial attractor/repulsor module -- its own point is an
+    // OFFSET from this emitter's own live `position` (tags along with a moving emitter), not a fixed
+    // world point -- own new 16+16-byte slot pair, same vec3+trailing-scalar convention as above.
+    vec3 attractorOffset;
+    float attractorStrength; // Positive = attract toward the point, negative = repel away from it, m/s^2 at zero distance (before falloff below).
+    float attractorRadius;   // World units -- force falls off smoothly (smoothstep) to zero at this distance.
+    uint attractorEnabled;
+    float _pad0, _pad1;
 };
 
 // Particle "kind" tag, packed into Particle.randomSeed's top 2 bits (see that field's own comment).

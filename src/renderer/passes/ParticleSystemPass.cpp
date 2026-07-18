@@ -722,7 +722,9 @@ namespace renderer {
         float precipRainFallSpeedMps, float precipSnowFallSpeedMps, float precipSnowWobbleStrength) {
         // Multi-emitter roadmap (subtask A1): this frame's (possibly ImGui-edited) per-emitter
         // parameters, uploaded wholesale -- every field is live-tunable, so a full re-upload every
-        // call is simplest and cheap (kMaxEmitters * 80 bytes == 320 bytes today). The waterfall mist
+        // call is simplest and cheap (kMaxEmitters * 112 bytes == 448 bytes today -- grew from 80
+        // bytes/emitter when the module stack roadmap's subtask A3 added its two new force modules,
+        // still comfortably under vkCmdUpdateBuffer's 65536-byte limit). The waterfall mist
         // (rivers/waterfalls feature) rides this same array as EMITTERS[3], see RecordSimulate's own
         // header comment.
         vkCmdUpdateBuffer(cmd, m_EmitterParamsBuffer.Handle(), 0, sizeof(EmitterParams) * kMaxEmitters, emitters);
