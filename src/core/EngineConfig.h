@@ -117,7 +117,6 @@ inline uint32_t VSM_MAX_DYNAMIC_PAGES_RENDERED_PER_FRAME = 512u;
 inline uint32_t _GI_QUALITY = 4;
 inline bool _HARDWARE_RAYTRACING = true;
 inline bool _TRACE_MESH_SDF = true;
-inline bool _SCREEN_SPACE_PROBE_OCCLUSION = true;
 inline bool _REFLECTIONS_ALLOW = true;
 inline uint32_t _REFLECTIONS_DOWNSAMPLE_FACTOR = 1;
 inline bool _HARDWARE_RAYTRACING_NANITE_MODE = true;
@@ -157,7 +156,6 @@ inline bool _SCREEN_SPACE_REFLECTIONS = true;
 namespace postprocess {
 inline uint32_t _QUALITY = 4;
 inline uint32_t _EFFECTS_QUALITY = 4;
-inline uint32_t _TRANSLUCENCY_LIGHTING_VOLUME_DIM = 64;
 inline uint32_t _REFRACTION_QUALITY = 3;
 
 // --- Phase PP1 (post-process stack roadmap): Physical Camera / Auto Exposure / White Balance /
@@ -390,8 +388,6 @@ namespace volumetrics {
 inline uint32_t _TEXTURE_QUALITY = 4;
 inline uint32_t _SKY_ATMOSPHERE_QUALITY = 3;
 inline bool _VOLUMETRIC_FOG_ENABLE = true;
-inline uint32_t _VOLUMETRIC_FOG_GRID_PIXEL_SIZE = 4;
-inline float _VOLUMETRIC_CLOUD_VIEW_RAY_SAMPLE_COUNT_SCALE = 2.0f;
 } // namespace volumetrics
 
 // Local Fog Volumes (UE5.8 rendering-parity gap G8) -- localized, oriented-box or sphere fog
@@ -806,8 +802,6 @@ inline void ApplyProfile(std::string_view profileName) {
     lumen::_GI_QUALITY = config_extrem::lumen::GI_QUALITY;
     lumen::_HARDWARE_RAYTRACING = config_extrem::lumen::HARDWARE_RAYTRACING;
     lumen::_TRACE_MESH_SDF = config_extrem::lumen::TRACE_MESH_SDF;
-    lumen::_SCREEN_SPACE_PROBE_OCCLUSION =
-        config_extrem::lumen::SCREEN_SPACE_PROBE_OCCLUSION;
     lumen::_REFLECTIONS_ALLOW = config_extrem::lumen::REFLECTIONS_ALLOW;
     lumen::_REFLECTIONS_DOWNSAMPLE_FACTOR =
         config_extrem::lumen::REFLECTIONS_DOWNSAMPLE_FACTOR;
@@ -820,8 +814,6 @@ inline void ApplyProfile(std::string_view profileName) {
         config_extrem::reflections::SCREEN_SPACE_REFLECTIONS;
     postprocess::_QUALITY = config_extrem::postprocess::QUALITY;
     postprocess::_EFFECTS_QUALITY = config_extrem::postprocess::EFFECTS_QUALITY;
-    postprocess::_TRANSLUCENCY_LIGHTING_VOLUME_DIM =
-        config_extrem::postprocess::TRANSLUCENCY_LIGHTING_VOLUME_DIM;
     postprocess::_REFRACTION_QUALITY =
         config_extrem::postprocess::REFRACTION_QUALITY;
     volumetrics::_TEXTURE_QUALITY = config_extrem::volumetrics::TEXTURE_QUALITY;
@@ -829,10 +821,6 @@ inline void ApplyProfile(std::string_view profileName) {
         config_extrem::volumetrics::SKY_ATMOSPHERE_QUALITY;
     volumetrics::_VOLUMETRIC_FOG_ENABLE =
         config_extrem::volumetrics::VOLUMETRIC_FOG_ENABLE;
-    volumetrics::_VOLUMETRIC_FOG_GRID_PIXEL_SIZE =
-        config_extrem::volumetrics::VOLUMETRIC_FOG_GRID_PIXEL_SIZE;
-    volumetrics::_VOLUMETRIC_CLOUD_VIEW_RAY_SAMPLE_COUNT_SCALE = config_extrem::
-        volumetrics::VOLUMETRIC_CLOUD_VIEW_RAY_SAMPLE_COUNT_SCALE;
   } else if (profileName == "High") {
     WINDOW_WIDTH = config_high::WINDOW_WIDTH;
     WINDOW_HEIGHT = config_high::WINDOW_HEIGHT;
@@ -888,8 +876,6 @@ inline void ApplyProfile(std::string_view profileName) {
     lumen::_GI_QUALITY = config_high::lumen::GI_QUALITY;
     lumen::_HARDWARE_RAYTRACING = config_high::lumen::HARDWARE_RAYTRACING;
     lumen::_TRACE_MESH_SDF = config_high::lumen::TRACE_MESH_SDF;
-    lumen::_SCREEN_SPACE_PROBE_OCCLUSION =
-        config_high::lumen::SCREEN_SPACE_PROBE_OCCLUSION;
     lumen::_REFLECTIONS_ALLOW = config_high::lumen::REFLECTIONS_ALLOW;
     lumen::_REFLECTIONS_DOWNSAMPLE_FACTOR =
         config_high::lumen::REFLECTIONS_DOWNSAMPLE_FACTOR;
@@ -902,8 +888,6 @@ inline void ApplyProfile(std::string_view profileName) {
         config_high::reflections::SCREEN_SPACE_REFLECTIONS;
     postprocess::_QUALITY = config_high::postprocess::QUALITY;
     postprocess::_EFFECTS_QUALITY = config_high::postprocess::EFFECTS_QUALITY;
-    postprocess::_TRANSLUCENCY_LIGHTING_VOLUME_DIM =
-        config_high::postprocess::TRANSLUCENCY_LIGHTING_VOLUME_DIM;
     postprocess::_REFRACTION_QUALITY =
         config_high::postprocess::REFRACTION_QUALITY;
     volumetrics::_TEXTURE_QUALITY = config_high::volumetrics::TEXTURE_QUALITY;
@@ -911,10 +895,6 @@ inline void ApplyProfile(std::string_view profileName) {
         config_high::volumetrics::SKY_ATMOSPHERE_QUALITY;
     volumetrics::_VOLUMETRIC_FOG_ENABLE =
         config_high::volumetrics::VOLUMETRIC_FOG_ENABLE;
-    volumetrics::_VOLUMETRIC_FOG_GRID_PIXEL_SIZE =
-        config_high::volumetrics::VOLUMETRIC_FOG_GRID_PIXEL_SIZE;
-    volumetrics::_VOLUMETRIC_CLOUD_VIEW_RAY_SAMPLE_COUNT_SCALE =
-        config_high::volumetrics::VOLUMETRIC_CLOUD_VIEW_RAY_SAMPLE_COUNT_SCALE;
   } else if (profileName == "Medium") {
     WINDOW_WIDTH = config_medium::WINDOW_WIDTH;
     WINDOW_HEIGHT = config_medium::WINDOW_HEIGHT;
@@ -974,8 +954,6 @@ inline void ApplyProfile(std::string_view profileName) {
     lumen::_GI_QUALITY = config_medium::lumen::GI_QUALITY;
     lumen::_HARDWARE_RAYTRACING = config_medium::lumen::HARDWARE_RAYTRACING;
     lumen::_TRACE_MESH_SDF = config_medium::lumen::TRACE_MESH_SDF;
-    lumen::_SCREEN_SPACE_PROBE_OCCLUSION =
-        config_medium::lumen::SCREEN_SPACE_PROBE_OCCLUSION;
     lumen::_REFLECTIONS_ALLOW = config_medium::lumen::REFLECTIONS_ALLOW;
     lumen::_REFLECTIONS_DOWNSAMPLE_FACTOR =
         config_medium::lumen::REFLECTIONS_DOWNSAMPLE_FACTOR;
@@ -988,8 +966,6 @@ inline void ApplyProfile(std::string_view profileName) {
         config_medium::reflections::SCREEN_SPACE_REFLECTIONS;
     postprocess::_QUALITY = config_medium::postprocess::QUALITY;
     postprocess::_EFFECTS_QUALITY = config_medium::postprocess::EFFECTS_QUALITY;
-    postprocess::_TRANSLUCENCY_LIGHTING_VOLUME_DIM =
-        config_medium::postprocess::TRANSLUCENCY_LIGHTING_VOLUME_DIM;
     postprocess::_REFRACTION_QUALITY =
         config_medium::postprocess::REFRACTION_QUALITY;
     volumetrics::_TEXTURE_QUALITY = config_medium::volumetrics::TEXTURE_QUALITY;
@@ -997,10 +973,6 @@ inline void ApplyProfile(std::string_view profileName) {
         config_medium::volumetrics::SKY_ATMOSPHERE_QUALITY;
     volumetrics::_VOLUMETRIC_FOG_ENABLE =
         config_medium::volumetrics::VOLUMETRIC_FOG_ENABLE;
-    volumetrics::_VOLUMETRIC_FOG_GRID_PIXEL_SIZE =
-        config_medium::volumetrics::VOLUMETRIC_FOG_GRID_PIXEL_SIZE;
-    volumetrics::_VOLUMETRIC_CLOUD_VIEW_RAY_SAMPLE_COUNT_SCALE = config_medium::
-        volumetrics::VOLUMETRIC_CLOUD_VIEW_RAY_SAMPLE_COUNT_SCALE;
   } else if (profileName == "Low") {
     WINDOW_WIDTH = config_low::WINDOW_WIDTH;
     WINDOW_HEIGHT = config_low::WINDOW_HEIGHT;
@@ -1055,8 +1027,6 @@ inline void ApplyProfile(std::string_view profileName) {
     lumen::_GI_QUALITY = config_low::lumen::GI_QUALITY;
     lumen::_HARDWARE_RAYTRACING = config_low::lumen::HARDWARE_RAYTRACING;
     lumen::_TRACE_MESH_SDF = config_low::lumen::TRACE_MESH_SDF;
-    lumen::_SCREEN_SPACE_PROBE_OCCLUSION =
-        config_low::lumen::SCREEN_SPACE_PROBE_OCCLUSION;
     lumen::_REFLECTIONS_ALLOW = config_low::lumen::REFLECTIONS_ALLOW;
     lumen::_REFLECTIONS_DOWNSAMPLE_FACTOR =
         config_low::lumen::REFLECTIONS_DOWNSAMPLE_FACTOR;
@@ -1069,8 +1039,6 @@ inline void ApplyProfile(std::string_view profileName) {
         config_low::reflections::SCREEN_SPACE_REFLECTIONS;
     postprocess::_QUALITY = config_low::postprocess::QUALITY;
     postprocess::_EFFECTS_QUALITY = config_low::postprocess::EFFECTS_QUALITY;
-    postprocess::_TRANSLUCENCY_LIGHTING_VOLUME_DIM =
-        config_low::postprocess::TRANSLUCENCY_LIGHTING_VOLUME_DIM;
     postprocess::_REFRACTION_QUALITY =
         config_low::postprocess::REFRACTION_QUALITY;
     volumetrics::_TEXTURE_QUALITY = config_low::volumetrics::TEXTURE_QUALITY;
@@ -1078,10 +1046,6 @@ inline void ApplyProfile(std::string_view profileName) {
         config_low::volumetrics::SKY_ATMOSPHERE_QUALITY;
     volumetrics::_VOLUMETRIC_FOG_ENABLE =
         config_low::volumetrics::VOLUMETRIC_FOG_ENABLE;
-    volumetrics::_VOLUMETRIC_FOG_GRID_PIXEL_SIZE =
-        config_low::volumetrics::VOLUMETRIC_FOG_GRID_PIXEL_SIZE;
-    volumetrics::_VOLUMETRIC_CLOUD_VIEW_RAY_SAMPLE_COUNT_SCALE =
-        config_low::volumetrics::VOLUMETRIC_CLOUD_VIEW_RAY_SAMPLE_COUNT_SCALE;
   }
 }
 

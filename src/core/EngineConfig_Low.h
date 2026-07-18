@@ -94,7 +94,6 @@ constexpr uint32_t GI_QUALITY = 1;
 // r.Lumen.HardwareRayTracing=0 (Software Ray Tracing only on the 3060)
 constexpr bool HARDWARE_RAYTRACING = false;
 constexpr bool TRACE_MESH_SDF = true;
-constexpr bool SCREEN_SPACE_PROBE_OCCLUSION = true;
 constexpr bool REFLECTIONS_ALLOW = true;
 // Downsampled reflections to protect framerate
 constexpr uint32_t REFLECTIONS_DOWNSAMPLE_FACTOR = 2;
@@ -119,7 +118,6 @@ namespace postprocess {
 constexpr uint32_t QUALITY = 2;
 // sg.EffectsQuality=1
 constexpr uint32_t EFFECTS_QUALITY = 1;
-constexpr uint32_t TRANSLUCENCY_LIGHTING_VOLUME_DIM = 32;
 constexpr uint32_t REFRACTION_QUALITY = 1;
 } // namespace postprocess
 
@@ -130,8 +128,5 @@ constexpr uint32_t TEXTURE_QUALITY = 2;
 // sg.SkyAtmosphereQuality=1
 constexpr uint32_t SKY_ATMOSPHERE_QUALITY = 1;
 constexpr bool VOLUMETRIC_FOG_ENABLE = true;
-// Larger grid size to minimize pixel shader cost
-constexpr uint32_t VOLUMETRIC_FOG_GRID_PIXEL_SIZE = 16;
-constexpr float VOLUMETRIC_CLOUD_VIEW_RAY_SAMPLE_COUNT_SCALE = 0.5f;
 } // namespace volumetrics
 } // namespace config_low

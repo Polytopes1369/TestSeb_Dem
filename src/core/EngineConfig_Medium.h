@@ -87,7 +87,6 @@ constexpr uint32_t GI_QUALITY = 2;
 // r.Lumen.HardwareRayTracing=1 (RTX 4060 hardware RT enabled)
 constexpr bool HARDWARE_RAYTRACING = true;
 constexpr bool TRACE_MESH_SDF = true;
-constexpr bool SCREEN_SPACE_PROBE_OCCLUSION = true;
 constexpr bool REFLECTIONS_ALLOW = true;
 // No downsampling for cleaner hardware reflection tracing
 constexpr uint32_t REFLECTIONS_DOWNSAMPLE_FACTOR = 1;
@@ -109,7 +108,6 @@ namespace postprocess {
 // sg.PostProcessQuality=3 (High)
 constexpr uint32_t QUALITY = 3;
 constexpr uint32_t EFFECTS_QUALITY = 2;
-constexpr uint32_t TRANSLUCENCY_LIGHTING_VOLUME_DIM = 64;
 constexpr uint32_t REFRACTION_QUALITY = 2;
 } // namespace postprocess
 
@@ -120,8 +118,5 @@ constexpr uint32_t TEXTURE_QUALITY = 3;
 // sg.SkyAtmosphereQuality=2
 constexpr uint32_t SKY_ATMOSPHERE_QUALITY = 2;
 constexpr bool VOLUMETRIC_FOG_ENABLE = true;
-// Sharper fog with smaller pixel grid size
-constexpr uint32_t VOLUMETRIC_FOG_GRID_PIXEL_SIZE = 8;
-constexpr float VOLUMETRIC_CLOUD_VIEW_RAY_SAMPLE_COUNT_SCALE = 1.0f;
 } // namespace volumetrics
 } // namespace config_medium

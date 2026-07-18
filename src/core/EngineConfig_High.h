@@ -86,7 +86,6 @@ constexpr uint32_t VSM_MAX_PAGES_RENDERED_PER_FRAME = 512u;
 constexpr uint32_t GI_QUALITY = 3;
 constexpr bool HARDWARE_RAYTRACING = true;
 constexpr bool TRACE_MESH_SDF = true;
-constexpr bool SCREEN_SPACE_PROBE_OCCLUSION = true;
 constexpr bool REFLECTIONS_ALLOW = true;
 constexpr uint32_t REFLECTIONS_DOWNSAMPLE_FACTOR = 1;
 
@@ -109,7 +108,6 @@ namespace postprocess {
 // sg.PostProcessQuality=4 (Epic)
 constexpr uint32_t QUALITY = 4;
 constexpr uint32_t EFFECTS_QUALITY = 3;
-constexpr uint32_t TRANSLUCENCY_LIGHTING_VOLUME_DIM = 64;
 constexpr uint32_t REFRACTION_QUALITY = 3;
 } // namespace postprocess
 
@@ -120,8 +118,5 @@ constexpr uint32_t TEXTURE_QUALITY = 3;
 // sg.SkyAtmosphereQuality=3 (Epic atmosphere scattering)
 constexpr uint32_t SKY_ATMOSPHERE_QUALITY = 3;
 constexpr bool VOLUMETRIC_FOG_ENABLE = true;
-// Sharp volumetric light shafts
-constexpr uint32_t VOLUMETRIC_FOG_GRID_PIXEL_SIZE = 8;
-constexpr float VOLUMETRIC_CLOUD_VIEW_RAY_SAMPLE_COUNT_SCALE = 1.5f;
 } // namespace volumetrics
 } // namespace config_high

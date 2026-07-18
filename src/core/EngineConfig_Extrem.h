@@ -85,7 +85,6 @@ constexpr uint32_t VSM_MAX_PAGES_RENDERED_PER_FRAME = 1024u;
 constexpr uint32_t GI_QUALITY = 5;
 constexpr bool HARDWARE_RAYTRACING = true;
 constexpr bool TRACE_MESH_SDF = true;
-constexpr bool SCREEN_SPACE_PROBE_OCCLUSION = true;
 constexpr bool REFLECTIONS_ALLOW = true;
 constexpr uint32_t REFLECTIONS_DOWNSAMPLE_FACTOR = 1;
 
@@ -104,7 +103,6 @@ namespace postprocess {
 // sg.PostProcessQuality=5 (Extreme Cinematic)
 constexpr uint32_t QUALITY = 5;
 constexpr uint32_t EFFECTS_QUALITY = 5;
-constexpr uint32_t TRANSLUCENCY_LIGHTING_VOLUME_DIM = 128;
 constexpr uint32_t REFRACTION_QUALITY = 4;
 } // namespace postprocess
 
@@ -114,8 +112,5 @@ constexpr uint32_t TEXTURE_QUALITY = 5;
 // sg.SkyAtmosphereQuality=4 (Extreme scattering)
 constexpr uint32_t SKY_ATMOSPHERE_QUALITY = 4;
 constexpr bool VOLUMETRIC_FOG_ENABLE = true;
-// Ultra-sharp fog boundaries using minimal pixel grid size
-constexpr uint32_t VOLUMETRIC_FOG_GRID_PIXEL_SIZE = 2;
-constexpr float VOLUMETRIC_CLOUD_VIEW_RAY_SAMPLE_COUNT_SCALE = 3.0f;
 } // namespace volumetrics
 } // namespace config_extrem
