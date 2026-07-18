@@ -29,10 +29,13 @@ namespace renderer {
 
     } // namespace
 
-    bool SurfaceCacheTraceContext::Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
+    bool SurfaceCacheTraceContext::InitImpl(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
         const GlobalSDFPass& globalSDF, const SurfaceCachePass& surfaceCache) {
         kMaxTracedEntities = config::lumen::MAX_TRACED_ENTITIES;
 
+        // Self-reinit (see ShadowMapPass's own migration comment for the identical pattern):
+        // Shutdown() clears m_Device/m_Allocator, which RenderPass<SurfaceCacheTraceContext>::Init()
+        // already set to this call's values just before invoking this function -- restore them.
         Shutdown();
         m_Device = device;
         m_Allocator = allocator;
@@ -87,6 +90,11 @@ namespace renderer {
         m_CardBuffer.Create(allocator, cardCapacityBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VMA_MEMORY_USAGE_CPU_TO_GPU, /*mapped=*/true);
         m_EntityCardIndexBuffer.Create(allocator, cardIndexCapacityBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VMA_MEMORY_USAGE_CPU_TO_GPU, /*mapped=*/true);
         m_EntityInfoBuffer.Create(allocator, entityInfoBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VMA_MEMORY_USAGE_CPU_TO_GPU, /*mapped=*/true);
+        RegisterResource([this] {
+            m_EntityInfoBuffer.Destroy();
+            m_CardBuffer.Destroy();
+            m_EntityCardIndexBuffer.Destroy();
+        });
         std::memset(m_CardBuffer.MappedData(), 0, static_cast<size_t>(cardCapacityBytes));
         std::memset(m_EntityCardIndexBuffer.MappedData(), 0, static_cast<size_t>(cardIndexCapacityBytes));
         std::memset(m_EntityInfoBuffer.MappedData(), 0, static_cast<size_t>(entityInfoBytes));
@@ -119,6 +127,10 @@ namespace renderer {
             viewInfo.format = VK_FORMAT_R32_SFLOAT;
             viewInfo.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
             VK_CHECK(vkCreateImageView(m_Device, &viewInfo, nullptr, &m_DummySdfView));
+            RegisterResource([this] {
+                vkDestroyImageView(m_Device, m_DummySdfView, nullptr);
+                vmaDestroyImage(m_Allocator, m_DummySdfImage, m_DummySdfAllocation);
+            });
 
             VkSamplerCreateInfo samplerInfo{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
             samplerInfo.magFilter = VK_FILTER_LINEAR;
@@ -131,6 +143,7 @@ namespace renderer {
             samplerInfo.maxLod = 0.0f;
             samplerInfo.unnormalizedCoordinates = VK_FALSE;
             VK_CHECK(vkCreateSampler(m_Device, &samplerInfo, nullptr, &m_EntitySdfSampler));
+            RegisterResource([this] { vkDestroySampler(m_Device, m_EntitySdfSampler, nullptr); });
 
             VkBuffer stagingBuffer = VK_NULL_HANDLE;
             VmaAllocation stagingAllocation = VK_NULL_HANDLE;
@@ -215,6 +228,7 @@ namespace renderer {
         meshSdfLayoutInfo.bindingCount = 2;
         meshSdfLayoutInfo.pBindings = meshSdfBindings;
         VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &meshSdfLayoutInfo, nullptr, &m_MeshSdfTraceSetLayout));
+        RegisterResource([this] { vkDestroyDescriptorSetLayout(m_Device, m_MeshSdfTraceSetLayout, nullptr); });
 
         VkDescriptorSetLayoutBinding samplingBindings[3]{};
         samplingBindings[0].binding = 0;
@@ -234,6 +248,7 @@ namespace renderer {
         samplingLayoutInfo.bindingCount = 3;
         samplingLayoutInfo.pBindings = samplingBindings;
         VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &samplingLayoutInfo, nullptr, &m_SurfaceCacheSamplingSetLayout));
+        RegisterResource([this] { vkDestroyDescriptorSetLayout(m_Device, m_SurfaceCacheSamplingSetLayout, nullptr); });
 
         VkDescriptorPoolSize poolSizes[2] = {
             { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3 },
@@ -244,6 +259,7 @@ namespace renderer {
         poolInfo.poolSizeCount = 2;
         poolInfo.pPoolSizes = poolSizes;
         VK_CHECK(vkCreateDescriptorPool(m_Device, &poolInfo, nullptr, &m_DescriptorPool));
+        RegisterResource([this] { vkDestroyDescriptorPool(m_Device, m_DescriptorPool, nullptr); });
 
         VkDescriptorSetLayout layoutsToAllocate[2] = { m_MeshSdfTraceSetLayout, m_SurfaceCacheSamplingSetLayout };
         VkDescriptorSet allocatedSets[2] = {};
@@ -307,6 +323,15 @@ namespace renderer {
 
         vkUpdateDescriptorSets(m_Device, 5, writes, 0, nullptr);
 
+        // Not Vulkan handles, but publicly exposed via GetEntityCount()/GetTracedEntities() (unlike
+        // e.g. AtmosCloudsPass's private-only m_OutputExtent) -- a caller could observe these on a
+        // freshly-Shutdown() instance, so preserve the original Shutdown()'s reset of them.
+        RegisterResource([this] {
+            m_EntityCount = 0;
+            m_TracedEntities.clear();
+            m_TracedEntityInfos.clear();
+        });
+
         // Populate the card table/indices for whatever residency state exists right now (every
         // card non-resident, in practice, this early -- see this function's own STEP 2 comment).
         RefreshCardTable(surfaceCache);
@@ -365,33 +390,9 @@ namespace renderer {
         }
     }
 
-    void SurfaceCacheTraceContext::Shutdown() {
-        if (m_Device != VK_NULL_HANDLE) {
-            if (m_DescriptorPool != VK_NULL_HANDLE) vkDestroyDescriptorPool(m_Device, m_DescriptorPool, nullptr);
-            if (m_MeshSdfTraceSetLayout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(m_Device, m_MeshSdfTraceSetLayout, nullptr);
-            if (m_SurfaceCacheSamplingSetLayout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(m_Device, m_SurfaceCacheSamplingSetLayout, nullptr);
-            if (m_EntitySdfSampler != VK_NULL_HANDLE) vkDestroySampler(m_Device, m_EntitySdfSampler, nullptr);
-            if (m_DummySdfView != VK_NULL_HANDLE) vkDestroyImageView(m_Device, m_DummySdfView, nullptr);
-        }
-        if (m_Allocator != VK_NULL_HANDLE) {
-            if (m_DummySdfImage != VK_NULL_HANDLE) vmaDestroyImage(m_Allocator, m_DummySdfImage, m_DummySdfAllocation);
-        }
-        m_EntityInfoBuffer.Destroy();
-        m_CardBuffer.Destroy();
-        m_EntityCardIndexBuffer.Destroy();
-
-        m_DescriptorPool = VK_NULL_HANDLE;
-        m_MeshSdfTraceSetLayout = VK_NULL_HANDLE;
-        m_SurfaceCacheSamplingSetLayout = VK_NULL_HANDLE;
-        m_MeshSdfTraceSet = VK_NULL_HANDLE;
-        m_SurfaceCacheSamplingSet = VK_NULL_HANDLE;
-        m_EntitySdfSampler = VK_NULL_HANDLE;
-        m_DummySdfImage = VK_NULL_HANDLE; m_DummySdfAllocation = VK_NULL_HANDLE; m_DummySdfView = VK_NULL_HANDLE;
-        m_EntityCount = 0;
-        m_TracedEntities.clear();
-        m_TracedEntityInfos.clear();
-        m_Allocator = VK_NULL_HANDLE;
-        m_Device = VK_NULL_HANDLE;
-    }
+    // Shutdown() is inherited from RenderPass<SurfaceCacheTraceContext>: runs the RegisterResource()
+    // cleanups above in reverse (traced-entity state reset -> descriptor pool -> sampling set
+    // layout -> mesh SDF set layout -> sampler -> dummy SDF image+view -> the 3 SSBOs), the same
+    // dependency-safe order the hand-written Shutdown() used.
 
 }
