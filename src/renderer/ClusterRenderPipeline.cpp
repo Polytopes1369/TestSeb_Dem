@@ -596,6 +596,16 @@ bool ClusterRenderPipeline::Init(
       return false;
     }
   }
+
+  // Atmos weather system, Subtask 3: Froxel Volumetric Fog -- needs m_AtmosClimate (AtmosGlobalsUBO),
+  // m_MegaLights (light SSBO), and m_VirtualShadowMap (shadow atlas/page-table/feedback/sun-levels),
+  // all already Init'd above.
+  if (!m_AtmosFog.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
+                       m_AtmosClimate, m_MegaLights, m_VirtualShadowMap)) {
+    LOG_ERROR("[ClusterRenderPipeline] Failed to initialize AtmosVolumetricFogPass.");
+    return false;
+  }
+
   // World Probe grid (Lumen "Translucency Volume") -- reuses the same shared trace-scene sets and
   // HWRT/BLAS/TLAS as every other GI consumer above; see ClusterRenderPipeline.h's own comment on
   // its live consumers (m_ScreenTrace's fallback, GICompositePass's debug visualization). Must be
@@ -738,7 +748,7 @@ bool ClusterRenderPipeline::Init(
   m_PostProcess.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
       m_DisplayExtent, m_DepthOfField.GetOutputView(), m_Bloom.GetOutputView(),
       m_Resolve.GetOutputDepthView(), m_TransparentForward.GetRefractionOffsetView(),
-      m_AtmosSky.GetSkyViewLUTView());
+      m_AtmosSky.GetSkyViewLUTView(), m_AtmosFog.GetIntegratedFogView());
 
 #ifndef NDEBUG
   // Two-tier SDF ray march DEBUG VISUALIZATION (see ClusterRenderPipeline.h's own comment on
@@ -940,6 +950,7 @@ void ClusterRenderPipeline::Shutdown() {
   m_SDFRayMarch.Shutdown();
   m_DebugBufferView.Shutdown();
 #endif
+  m_AtmosFog.Shutdown();
   m_MegaLights.Shutdown();
   m_ScreenSpaceEffects.Shutdown();
   m_Reflection.Shutdown();
@@ -2431,8 +2442,18 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
       // resolved into its own block-scoped prevViewProjForTAA (out of scope here) -- Motion Blur's
       // own per-pixel reprojection needs the identical semantics, recomputed inline.
       maths::mat4 prevViewProjForPostProcess = m_HasPrevViewProj ? m_PrevViewProj : viewProj;
+
+      // Atmos weather system, Subtask 3: refresh the froxel volumetric fog grid immediately before
+      // its only consumer (m_PostProcess.RecordComposite below) -- keeps producer and consumer
+      // adjacent in the frame graph, and guarantees renderer::VirtualShadowMapPass's shadow pages
+      // (captured earlier, in [1z]) are this frame's freshest state by the time InjectLight samples
+      // them.
+      m_AtmosFog.RecordUpdate(cmdLate, cameraPositionWorld, cameraFrameInfo.forward, maths::vec3{0.0f, 1.0f, 0.0f},
+          cameraFrameInfo.fovYRadians, cameraFrameInfo.aspectRatio,
+          m_SceneLights.sun.direction, m_SceneLights.sun.color, m_SceneLights.sun.intensity, m_FrameIndex);
+
       m_PostProcess.RecordComposite(cmdLate, deltaTimeSeconds, ppSettings, invViewProj, prevViewProjForPostProcess, cameraPositionWorld,
-          viewProj, m_SceneLights.sun.direction,
+          viewProj, m_SceneLights.sun.direction, cameraFrameInfo.forward,
           cameraFrameInfo.fovYRadians, cameraFrameInfo.aspectRatio, m_FrameIndex);
   }
 

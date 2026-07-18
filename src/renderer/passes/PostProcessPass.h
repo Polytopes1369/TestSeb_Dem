@@ -147,12 +147,15 @@ namespace renderer {
         // LINEAR sampler for their own implicit bilinear upsample to display resolution (this
         // pipeline has no display-resolution depth anywhere -- see DepthOfField.comp's own comment).
         // `skyViewLUTView` (Atmos weather system, Subtask 2): renderer::AtmosSkyPass's own Sky-View
-        // LUT view, sampled read-only through this pass' own m_LinearSampler -- fixed identity for
-        // this pipeline's entire lifetime (that pass never recreates its own images after Init()),
-        // same convention as `depthView`/`refractionOffsetView` below.
+        // LUT view. `volumetricFogView` (Atmos Subtask 3): renderer::AtmosVolumetricFogPass's own
+        // integrated fog 3D texture. Both sampled read-only through this pass' own m_LinearSampler
+        // -- fixed identity for this pipeline's entire lifetime (neither producer pass ever
+        // recreates its own images after Init()), same convention as `depthView`/
+        // `refractionOffsetView` below.
         void Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
             VkExtent2D displayExtent, VkImageView hdrColorView, VkImageView bloomView,
-            VkImageView depthView, VkImageView refractionOffsetView, VkImageView skyViewLUTView);
+            VkImageView depthView, VkImageView refractionOffsetView, VkImageView skyViewLUTView,
+            VkImageView volumetricFogView);
 
         void Shutdown();
 
@@ -184,9 +187,10 @@ namespace renderer {
         // `halfFovTanX`/`halfFovTanY`). `frameIndex` (Phase PP5): seeds Film Grain's own per-frame
         // animated noise hash (same pixel+frame hashing convention as ReflectionTrace.comp's own
         // GGX-VNDF sample decorrelation).
+        // `cameraForward` (Atmos Subtask 3): see PostProcessParamsUBO's own cameraForwardX/Y/Z comment.
         void RecordComposite(VkCommandBuffer cmd, float deltaTimeSeconds, const Settings& settings,
             const maths::mat4& invViewProj, const maths::mat4& prevViewProj, const maths::vec3& cameraPositionWorld,
-            const maths::mat4& viewProj, const maths::vec3& sunDirection,
+            const maths::mat4& viewProj, const maths::vec3& sunDirection, const maths::vec3& cameraForward,
             float fovYRadians, float aspectRatio, uint32_t frameIndex);
 
         VkImage GetOutputImage() const { return m_OutputImage; }
@@ -275,8 +279,14 @@ namespace renderer {
             // the scene, same convention as `sunDirection` in RecordComposite's own parameter list),
             // fed to PostProcessComposite.comp's SkyViewLUTUVFromDirection() on a miss.
             float sunDirWorldX = 0.0f, sunDirWorldY = 0.0f, sunDirWorldZ = 0.0f, _padSky = 0.0f;
+
+            // Atmos weather system, Subtask 3: camera forward axis (unit vector) -- lets
+            // PostProcessComposite.comp recover each pixel's view-space depth (distance along this
+            // axis, NOT Euclidean ray length) to look up renderer::AtmosVolumetricFogPass's own
+            // froxel grid via atmos_volumetric_fog_mapping.glsl's ViewZToFroxelW().
+            float cameraForwardX = 0.0f, cameraForwardY = 0.0f, cameraForwardZ = 0.0f, _padFog = 0.0f;
         };
-        static_assert(sizeof(PostProcessParamsUBO) == 432,
+        static_assert(sizeof(PostProcessParamsUBO) == 448,
             "PostProcessParamsUBO must match PostProcessComposite.comp's PostProcessParamsUBO exactly (std140 layout)");
 
         // Byte-for-byte mirror of AutoExposureAdapt.comp's push_constant block.
