@@ -558,6 +558,16 @@ struct EmitterConfig {
     // just above. Only meaningful when spawnShape == 2 -- see renderer::ParticleSystemPass::
     // EmitterParams::spawnTargetEntityId's own declaration comment for the full contract.
     uint32_t spawnTargetEntityId = 0;
+
+    // Subtask C4 (Niagara-parity roadmap: sub-emitters / event-driven spawn chains) -- same trailing-
+    // field convention as every field above. See renderer::ParticleSystemPass::EmitterParams' own
+    // declaration comment for the full contract (this emitter triggers spawning into
+    // EMITTERS[subEmitterTargetSlot] when one of its own particles dies or first hits Global SDF
+    // geometry).
+    bool subEmitterEnabled = false;
+    uint32_t subEmitterTargetSlot = 0;
+    uint32_t subEmitterTriggerMode = 0; // 0 = on-death, 1 = on-collision.
+    uint32_t subEmitterSpawnCount = 8;  // A modest default burst size -- harmless while subEmitterEnabled is false.
 };
 
 // Slot 0 preserves the ORIGINAL single-emitter defaults exactly (same position/spawn rate/physics

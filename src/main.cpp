@@ -1194,6 +1194,31 @@ int main(int argc, char** argv) {
                         }
                         ImGui::PopID();
 
+                        // Subtask C4 (Niagara-parity roadmap: sub-emitters / event-driven spawn
+                        // chains) -- this emitter triggers spawning INTO a different emitter slot's
+                        // own style when one of its own particles dies or first hits Global SDF
+                        // geometry. See config::particles::EmitterConfig's own trailing fields'
+                        // declaration comment and ParticleSimulation.comp's own TriggerSubEmitter
+                        // comment for the full one-level-deep-capped contract -- a sub-emitter-spawned
+                        // particle can never itself trigger a further chain, regardless of what the
+                        // target slot's own fields below say.
+                        ImGui::Separator();
+                        ImGui::TextUnformatted("Sub-Emitters (subtask C4)");
+                        ImGui::Checkbox("Enable Sub-Emitter", &cfg.subEmitterEnabled);
+                        {
+                            int targetSlot = static_cast<int>(cfg.subEmitterTargetSlot);
+                            if (ImGui::Combo("Target Emitter Slot", &targetSlot, kEmitterNames, static_cast<int>(renderer::ParticleSystemPass::kMaxEmitters))) {
+                                cfg.subEmitterTargetSlot = static_cast<uint32_t>(targetSlot);
+                            }
+                        }
+                        ImGui::Combo("Trigger Condition", reinterpret_cast<int*>(&cfg.subEmitterTriggerMode), "On Death\0On Collision\0\0");
+                        {
+                            int spawnCount = static_cast<int>(cfg.subEmitterSpawnCount);
+                            if (ImGui::DragInt("Spawn Count Per Trigger", &spawnCount, 0.2f, 0, 32)) {
+                                cfg.subEmitterSpawnCount = static_cast<uint32_t>(std::max(0, spawnCount));
+                            }
+                        }
+
                         // Multi-emitter roadmap (subtask A1) validation/debug instrumentation: proves
                         // this emitter is independently alive/producing particles, not just that the
                         // aggregate total below is nonzero.

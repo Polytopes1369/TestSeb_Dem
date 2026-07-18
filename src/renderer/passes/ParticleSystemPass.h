@@ -75,7 +75,26 @@ namespace renderer {
         // comment) and never reach the curve-evaluation code path at all (see UpdateParticle's own
         // comment on why that branch is ember-only).
         float baseSize = 0.0f;
-        float _pad1 = 0.0f, _pad2 = 0.0f;
+        // Subtask C4 (Niagara-parity roadmap: sub-emitters / event-driven spawn chains) -- repurposes
+        // what were `_pad1`/`_pad2` (this struct's total size does not change, same "reuse a trailing
+        // pad slot" convention as baseSize's own declaration comment above). Both are set exactly once
+        // at spawn (ParticleSimulation.comp's SpawnParticleCore) and read/latched every
+        // UpdateParticle() call thereafter -- never touched by the render pass or any CPU code.
+        //
+        // subEmitterChildFlag: 0.0 for every normally-spawned particle; forced to 1.0 for a particle
+        // that was itself created BY a sub-emitter trigger (TriggerSubEmitter). This is the ENTIRE
+        // mechanism that caps sub-emitter chains at exactly one level deep -- UpdateParticle only ever
+        // calls TriggerSubEmitter for a particle whose OWN subEmitterChildFlag is still 0.0, so a child
+        // particle can never itself spawn a third generation, regardless of what its own (inherited)
+        // emitter slot's EmitterParams::subEmitterEnabled says. See TriggerSubEmitter's own header
+        // comment (ParticleSimulation.comp) for the full safety argument.
+        float subEmitterChildFlag = 0.0f;
+        // subEmitterCollisionFired: 0.0 until this particle's first Global SDF collision contact (for
+        // an emitter with subEmitterTriggerMode == 1, on-collision) fires its one allowed trigger, then
+        // latched to 1.0 for the rest of this particle's life -- without this latch, a particle resting/
+        // repeatedly bouncing against geometry would re-fire (and flood the dead-list) every single
+        // frame it stays in contact, instead of exactly once per particle lifetime.
+        float subEmitterCollisionFired = 0.0f;
     };
     static_assert(sizeof(GpuParticle) == 80, "GpuParticle must match ParticleCommon.glsl's Particle struct exactly (std430 layout)");
 
@@ -186,13 +205,27 @@ namespace renderer {
             // entityID exactly (the same index renderer::ClusterHardwareRasterPass's own vertex shader
             // uses to look up EntityDataBuffer/EntityTransformBuffer, see ParticleSimulation.comp's own
             // SpawnParticleCore comment for the full sampling contract). Unused by any other
-            // spawnShape. `_padC2b`/`_padC2c` reserve the rest of this 16-byte slot for subtask C4
-            // (Niagara-parity roadmap), landing immediately after this one in the same contiguous
-            // block.
+            // spawnShape.
             uint32_t spawnTargetEntityId = 0;
-            float _padC2b = 0.0f, _padC2c = 0.0f;
+
+            // Subtask C4 (Niagara-parity roadmap: sub-emitters / event-driven spawn chains) -- lets an
+            // emitter trigger spawning INTO a different emitter slot when one of its own particles dies
+            // or on its first Global SDF collision contact (e.g. an ember that, on death, spawns a
+            // small burst of dust in EMITTERS[1]'s style at the death location). See ParticleSimulation.
+            // comp's own TriggerSubEmitter comment for the full GPU-side mechanism (a fully in-shader,
+            // same-dispatch immediate re-spawn -- chosen over a CPU-readback queue specifically to
+            // preserve exact per-event world position, see that function's own comment) and Particle::
+            // subEmitterChildFlag's own declaration comment (this file, above) for why chains are
+            // provably capped at exactly one level deep.
+            uint32_t subEmitterEnabled = 0;
+            uint32_t subEmitterTargetSlot = 0; // Which EmitterParamsBuffer slot the spawned particles are styled/tagged as (bounds-checked via emitters.length() in-shader, not this field itself).
+            uint32_t subEmitterTriggerMode = 0; // 0 = on this particle's own death, 1 = on its first Global SDF collision contact.
+            uint32_t subEmitterSpawnCount = 0; // Particles spawned per trigger EVENT (not per frame) -- also hard-capped in-shader (see TriggerSubEmitter's own comment) independent of however large this is configured.
+            // Closes out this block's trailing 16-byte slot -- same "always end a subtask's growth on
+            // a clean std430 boundary" convention as every earlier block in this struct.
+            uint32_t _padC4a = 0, _padC4b = 0;
         };
-        static_assert(sizeof(EmitterParams) == 208, "EmitterParams must match ParticleCommon.glsl's EmitterParams struct exactly (std430 layout)");
+        static_assert(sizeof(EmitterParams) == 224, "EmitterParams must match ParticleCommon.glsl's EmitterParams struct exactly (std430 layout)");
 
         // Maximum simultaneous emitter slots (multi-emitter roadmap, subtask A1) -- small and fixed
         // (unlike kMaxParticles, no sort/perf pressure motivates a larger number yet; a future

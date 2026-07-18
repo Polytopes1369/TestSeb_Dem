@@ -1536,6 +1536,11 @@ void ClusterRenderPipeline::RecordFrameEarly(VkCommandBuffer cmdEarly,
         // Subtask C3 (spawn-on-mesh-surface): only meaningful when spawnShape == 2, copied
         // unconditionally like every other field regardless (harmless when unused).
         gpu.spawnTargetEntityId = cfg.spawnTargetEntityId;
+        // Subtask C4 (sub-emitters): same "copy the live ImGui-edited config value" pattern.
+        gpu.subEmitterEnabled = cfg.subEmitterEnabled ? 1u : 0u;
+        gpu.subEmitterTargetSlot = cfg.subEmitterTargetSlot;
+        gpu.subEmitterTriggerMode = cfg.subEmitterTriggerMode;
+        gpu.subEmitterSpawnCount = cfg.subEmitterSpawnCount;
 
         if (cfg.active) {
           m_ParticleSpawnAccumulator[i] += cfg.spawnRate * particleDeltaTimeSeconds;

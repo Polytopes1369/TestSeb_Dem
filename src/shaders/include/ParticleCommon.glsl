@@ -55,7 +55,12 @@ struct Particle {
     // SpawnPrecipitationParticle comment in ParticleSimulation.comp) and never reach the curve-
     // evaluation code path at all (see UpdateParticle's own comment on why that branch is ember-only).
     float baseSize;
-    float _pad1, _pad2;
+    // Subtask C4 (Niagara-parity roadmap: sub-emitters / event-driven spawn chains) -- mirrors
+    // renderer::GpuParticle::subEmitterChildFlag/subEmitterCollisionFired (src/renderer/passes/
+    // ParticleSystemPass.h) byte-for-byte, repurposing what were `_pad1`/`_pad2` -- see those fields'
+    // own declaration comment for the full contract (one-level-deep sub-emitter recursion cap /
+    // once-per-lifetime collision-trigger latch).
+    float subEmitterChildFlag, subEmitterCollisionFired;
 };
 
 // Per-emitter, live-tunable spawn/physics parameters -- one instance per active emitter slot (see
@@ -117,11 +122,17 @@ struct EmitterParams {
     // contract and ParticleSimulation.comp's own ResolveDepthBufferCollision for the consuming logic.
     uint depthCollisionEnabled;
     // Subtask C3 (spawn-on-mesh-surface): mirrors renderer::ParticleSystemPass::EmitterParams::
-    // spawnTargetEntityId byte-for-byte -- see that field's own declaration comment. `_padC2b`/
-    // `_padC2c` reserve the rest of this 16-byte slot for subtask C4, landing immediately after this
-    // one in the same contiguous block.
+    // spawnTargetEntityId byte-for-byte -- see that field's own declaration comment.
     uint spawnTargetEntityId;
-    float _padC2b, _padC2c;
+
+    // Subtask C4 (Niagara-parity roadmap: sub-emitters / event-driven spawn chains) -- mirrors
+    // renderer::ParticleSystemPass::EmitterParams' own trailing block byte-for-byte, see that
+    // struct's own declaration comment for the full contract.
+    uint subEmitterEnabled;
+    uint subEmitterTargetSlot;
+    uint subEmitterTriggerMode;
+    uint subEmitterSpawnCount;
+    uint _padC4a, _padC4b;
 };
 
 // Particle "kind" tag, packed into Particle.randomSeed's top 2 bits (see that field's own comment).

@@ -442,6 +442,32 @@ bool SampleEntityMeshSurface(uint targetEntityId, inout uint seed, out vec3 outP
     return true;
 }
 
+// Pops one index off the tail of the dead-list, atomically -- shared by every spawn path in this file
+// (mode == 1 embers, mode == 2 precipitation, AND subtask C4's own in-line TriggerSubEmitter below)
+// since the free-list itself is not per-kind/per-caller (see ParticleCommon.glsl's own DeadListBuffer
+// comment: it is a single shared pool, exactly the "share the pool, back off gracefully under
+// pressure" contract every spawn path in this file already relies on -- an over-subscribed request
+// simply stops finding free slots here and gives up on the remainder). Calling this from WITHIN
+// mode == 0's UpdateParticle (TriggerSubEmitter's own case) is exactly as safe as calling it from a
+// dedicated mode == 1/2 spawn dispatch: every caller only ever performs atomic increments/decrements
+// on the shared counter plus an index-protected array read, so two threads (regardless of which mode
+// dispatched them) can never claim the same slot index. Returns false (and leaves deadCount untouched
+// -- see the underflow-undo below) when the pool is fully alive.
+bool TryPopDeadListSlot(out uint slotIndex) {
+    // atomicAdd(deadCount, -1) returns the PRE-decrement value, so the slot this thread claims is at
+    // deadIndices[oldValue - 1]. uint wraps on underflow, so oldValue == 0 (nothing left to pop) is
+    // diagnosed via the explicit guard below rather than trusting an unsigned-wraparound comparison.
+    uint oldDeadCount = atomicAdd(deadCount, -1u);
+    if (oldDeadCount == 0u) {
+        // No dead slots left -- undo the decrement (it wrapped to UINT_MAX) and give up; the caller's
+        // spawnQueue was simply optimistic this frame (kMaxParticles is already fully alive).
+        atomicAdd(deadCount, 1u);
+        return false;
+    }
+    slotIndex = deadIndices[oldDeadCount - 1u];
+    return true;
+}
+
 // `centerPosition` is the spawn-volume center for shapes 0/1 (the emitter's own live position for a
 // normal spawn, mode == 1; a DEATH/COLLISION location for a subtask C4 sub-emitter trigger instead,
 // see TriggerSubEmitter's own comment) -- ignored by shape 2 (mesh surface), which always samples
@@ -514,12 +540,76 @@ void SpawnParticleCore(uint slotIndex, uint seed, uint emitterIndex, vec3 center
     // comment) immediately re-evaluates both from the curves at age ~= 0, so this is purely a sane
     // one-frame-safe default, not the value that actually reaches the render pass.
     p.baseSize = size;
+    // Subtask C4: see Particle::subEmitterChildFlag's own declaration comment (ParticleSystemPass.h)
+    // for the full one-level-deep recursion-cap argument this single assignment is responsible for.
+    p.subEmitterChildFlag = isSubEmitterChild ? 1.0 : 0.0;
+    p.subEmitterCollisionFired = 0.0;
     particles[slotIndex] = p;
 }
 
 void SpawnParticle(uint slotIndex, uint spawnRequestIndex, uint emitterIndex) {
     uint seed = HashUint(pc.randomSeedBase ^ (slotIndex * 2654435761u) ^ (spawnRequestIndex * 40503u) ^ (emitterIndex * 2246822519u));
     SpawnParticleCore(slotIndex, seed, emitterIndex, emitters[emitterIndex].position, false);
+}
+
+// Subtask C4 (Niagara-parity roadmap: sub-emitters / event-driven spawn chains) -- called from inside
+// UpdateParticle (one thread per particle) at exactly two possible moments: the frame a particle's own
+// life crosses to <= 0 (subEmitterTriggerMode == 0, "on death"), or the frame it first contacts Global
+// SDF geometry (subEmitterTriggerMode == 1, "on collision", latched via Particle::
+// subEmitterCollisionFired so it can only ever fire once per particle lifetime -- see that field's own
+// declaration comment). Both call sites already guard `p.subEmitterChildFlag == 0.0` before calling
+// this at all, so `seed`/`atPosition` here always belong to an ELIGIBLE (non-child) particle.
+//
+// --- Why an immediate, same-dispatch, in-shader re-spawn (rather than a CPU-readback queue) ---
+// The plan doc explicitly allows either mechanism. A CPU-readback queue (GPU writes "please spawn N at
+// P for slot K" requests into a small buffer, ClusterRenderPipeline reads them back NEXT frame and
+// folds them into that frame's ordinary spawnCounts) was considered, but it has a real fidelity cost:
+// the ordinary per-emitter spawn path always jitters new particles around EmitterParams.position, not
+// an arbitrary caller-supplied point -- so a CPU-readback round trip would spawn dust somewhere near
+// EMITTERS[targetSlot]'s own configured position, NOT at the actual death/collision location the
+// feature description calls for ("...spawns a small burst of dust... AT THE DEATH LOCATION"). Directly
+// popping the dead-list and initializing new particles HERE, inside this same mode == 0 dispatch,
+// costs zero extra latency and preserves exact per-event position fidelity instead.
+//
+// --- Why this is safe within a single dispatch (no barrier between "spawn" and "this frame's update") ---
+// mode == 0 covers every slot with ONE thread each, and TryPopDeadListSlot's atomics guarantee no two
+// threads (regardless of call site) ever claim the same slot index -- see that function's own comment.
+// The only subtlety: a child particle spawned HERE, into some OTHER slot X, might be processed by slot
+// X's own UpdateParticle thread either before or after this write completes (workgroup dispatch order
+// is not sequential) -- if slot X's own thread already read `particles[X]` as dead (life <= 0) BEFORE
+// this write lands, that thread simply returns early and does nothing further; it does NOT re-read
+// afterward (a one-shot invocation), so the freshly-spawned child is invisible to THIS frame's
+// alive-list rebuild. It is NOT lost, however: next frame's mode == 0 dispatch iterates every slot
+// unconditionally and will find life > 0 there, correctly rebuilding it into the alive list and
+// resuming its normal countdown -- the only consequence of this race is the new particle rendering one
+// frame later than it was created, imperceptible for a demoscene dust-puff/spark-burst effect, and
+// nothing here can double-free a slot, corrupt the dead-list, or leak an index.
+//
+// --- Why chains are capped at exactly one level deep ---
+// Every particle spawned by this function has its OWN subEmitterChildFlag forced to 1.0 (see
+// SpawnParticleCore's own call site below) regardless of subEmitterTargetSlot's configured
+// EmitterParams -- so even if a user configures EMITTERS[targetSlot] to ALSO have subEmitterEnabled
+// set (pointing at a third slot), UpdateParticle's own two call sites below never invoke this function
+// for a particle whose subEmitterChildFlag is already 1.0, so a third generation can never spawn. This
+// is enforced structurally (a per-particle flag propagated at spawn time), not by convention alone.
+void TriggerSubEmitter(EmitterParams e, vec3 atPosition, uint baseSeedSalt) {
+    uint targetSlot = e.subEmitterTargetSlot;
+    if (e.subEmitterEnabled == 0u || e.subEmitterSpawnCount == 0u || targetSlot >= uint(emitters.length())) {
+        return;
+    }
+    // Defensive hard cap independent of however large subEmitterSpawnCount is configured -- bounds the
+    // worst-case dead-list drain from a single trigger EVENT to a small, fixed number regardless of
+    // user (ImGui) misconfiguration, on top of (not instead of) the one-level-deep structural cap above.
+    const uint kMaxSubEmitterSpawnPerTrigger = 32u;
+    uint spawnN = min(e.subEmitterSpawnCount, kMaxSubEmitterSpawnPerTrigger);
+    for (uint i = 0u; i < spawnN; ++i) {
+        uint slotIndex;
+        if (!TryPopDeadListSlot(slotIndex)) {
+            break; // Dead-list exhausted this frame -- back off gracefully, same convention as every other spawn path in this file.
+        }
+        uint seed = HashUint(baseSeedSalt ^ (slotIndex * 2654435761u) ^ (i * 40503u) ^ 0x2545F491u);
+        SpawnParticleCore(slotIndex, seed, targetSlot, atPosition, /*isSubEmitterChild=*/true);
+    }
 }
 
 // Precipitation feature -- spawns one rain or snow particle inside a horizontal box "shell" centered
@@ -592,6 +682,11 @@ void UpdateParticle(uint slotIndex) {
 
     vec3 wind = SampleWindVelocity(p.position, pc.time, g_AtmosGlobals.windDirection, g_AtmosGlobals.windSpeed, g_AtmosGlobals.windTurbulenceParams);
     vec3 newPosition;
+    // Subtask C4: hoisted out of the ember branch below (which used to declare this locally) so the
+    // shared on-death trigger check further down can also read it -- left unassigned (never read) on
+    // the precipitation path, matching that path's own existing "precipitation never touches
+    // EmitterParams" convention (see the ember branch's own comment on `e` below).
+    EmitterParams e;
 
     if (isPrecipitation) {
         // --- Precipitation fall: relax toward a fixed terminal fall speed instead of accelerating
@@ -634,7 +729,7 @@ void UpdateParticle(uint slotIndex) {
         // the top of UpdateParticle) since precipitation particles never touch EmitterParams at all
         // -- their own kind-branch above uses PrecipitationParamsUBO instead, and their spawn path
         // sets emitterIndex to an unused default (see SpawnPrecipitationParticle's own comment).
-        EmitterParams e = emitters[p.emitterIndex];
+        e = emitters[p.emitterIndex];
         p.velocity.y += e.gravityY * pc.dt;
         p.velocity += (wind - p.velocity) * clamp(e.dragCoefficient * pc.dt, 0.0, 1.0);
 
@@ -682,6 +777,17 @@ void UpdateParticle(uint slotIndex) {
             float normalSpeed = dot(reflected, n);
             vec3 tangentVelocity = reflected - n * normalSpeed;
             p.velocity = n * normalSpeed * e.bounceElasticity + tangentVelocity * e.friction;
+
+            // --- Subtask C4: on-collision sub-emitter trigger ---
+            // Fires at most once per particle lifetime (the subEmitterCollisionFired latch below),
+            // right at this particle's FIRST Global SDF contact -- see TriggerSubEmitter's own header
+            // comment for the full mechanism and one-level-deep recursion-cap argument.
+            // p.subEmitterChildFlag == 0.0 excludes a particle that is ITSELF a sub-emitter spawn.
+            if (e.subEmitterEnabled != 0u && e.subEmitterTriggerMode == 1u &&
+                p.subEmitterChildFlag == 0.0 && p.subEmitterCollisionFired == 0.0) {
+                TriggerSubEmitter(e, newPosition, pc.randomSeedBase ^ (slotIndex * 3571643827u));
+                p.subEmitterCollisionFired = 1.0;
+            }
         }
 
         // --- Subtask C2: screen-space depth-buffer collision (secondary/fallback mode) ---
@@ -721,6 +827,17 @@ void UpdateParticle(uint slotIndex) {
     if (p.life <= 0.0) {
         uint deadSlot = atomicAdd(deadCount, 1u);
         deadIndices[deadSlot] = slotIndex;
+
+        // --- Subtask C4: on-death sub-emitter trigger ---
+        // Fires exactly once, the frame this particle's own life crosses to <= 0 (natural expiry OR an
+        // SDF-absorb kill for a kind that has one -- embers never force-absorb, so this is always
+        // natural expiry for kKindEmber) -- never re-checked again since the slot is now dead. Excluded
+        // for precipitation (isPrecipitation) since only ember particles have a meaningful `e` fetched
+        // above, and excluded for a particle that is itself a sub-emitter spawn (subEmitterChildFlag),
+        // same one-level-deep cap as the on-collision trigger above.
+        if (!isPrecipitation && e.subEmitterEnabled != 0u && e.subEmitterTriggerMode == 0u && p.subEmitterChildFlag == 0.0) {
+            TriggerSubEmitter(e, p.position, pc.randomSeedBase ^ (slotIndex * 668265263u));
+        }
     } else {
         uint aliveSlot = atomicAdd(aliveCount, 1u);
         aliveIndices[aliveSlot] = slotIndex;
@@ -732,28 +849,6 @@ void UpdateParticle(uint slotIndex) {
         atomicAdd(perEmitterAliveCount[p.emitterIndex], 1u);
 #endif
     }
-}
-
-// Pops one index off the tail of the dead-list, atomically -- shared by both spawn modes (mode == 1
-// embers, mode == 2 precipitation) since the free-list itself is not per-kind (see ParticleCommon.
-// glsl's own DeadListBuffer comment: it is a single shared pool, exactly the "precipitation shares
-// the pool with any other emitter, backs off gracefully under pressure" contract the integration plan
-// asks for -- an over-subscribed spawnQueue simply stops finding free slots here and gives up on the
-// remaining requests, same as this codebase's own pre-existing embers path already did). Returns
-// false (and leaves deadCount untouched -- see the underflow-undo below) when the pool is fully alive.
-bool TryPopDeadListSlot(out uint slotIndex) {
-    // atomicAdd(deadCount, -1) returns the PRE-decrement value, so the slot this thread claims is at
-    // deadIndices[oldValue - 1]. uint wraps on underflow, so oldValue == 0 (nothing left to pop) is
-    // diagnosed via the explicit guard below rather than trusting an unsigned-wraparound comparison.
-    uint oldDeadCount = atomicAdd(deadCount, -1u);
-    if (oldDeadCount == 0u) {
-        // No dead slots left -- undo the decrement (it wrapped to UINT_MAX) and give up; the caller's
-        // spawnQueue was simply optimistic this frame (kMaxParticles is already fully alive).
-        atomicAdd(deadCount, 1u);
-        return false;
-    }
-    slotIndex = deadIndices[oldDeadCount - 1u];
-    return true;
 }
 
 void main() {
