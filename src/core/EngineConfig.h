@@ -546,6 +546,20 @@ struct EmitterConfig {
         { 1.0f, 1.0f, 1.0f, 1.0f }, { 1.0f, 1.0f, 1.0f, 1.0f }
     };
     float sizeCurve[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+
+    // Niagara-parity roadmap (bundled B1 "Mesh Particle" + B2 "Ribbon/Trail" + B3 "sprite
+    // orientation/sub-variation" workstream) -- mirrors renderer::ParticleSystemPass::EmitterParams::
+    // renderMode/meshArchetype/ribbonWidth/spriteOrientationMode/subVariationStrength
+    // (src/renderer/passes/ParticleSystemPass.h) field-for-field; see that struct's own declaration
+    // comment for the full contract. Appended at the END of this struct for the same reason as
+    // colorCurve/sizeCurve above -- every existing positional EmitterConfig{...} aggregate
+    // initializer below keeps relying on these new fields' own in-class defaults (renderMode == 0 ==
+    // Billboard), so this roadmap step changes NOTHING about any existing emitter's look by default.
+    uint32_t renderMode = 0;
+    uint32_t meshArchetype = 0;
+    float ribbonWidth = 0.05f;
+    uint32_t spriteOrientationMode = 0;
+    float subVariationStrength = 0.0f;
 };
 
 // Slot 0 preserves the ORIGINAL single-emitter defaults exactly (same position/spawn rate/physics

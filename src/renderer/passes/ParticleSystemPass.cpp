@@ -112,6 +112,88 @@ namespace renderer {
         };
         static_assert(sizeof(WorldProbeGridParamsUBO) == 32, "WorldProbeGridParamsUBO must match world_probe_sampling.glsl's own UBO exactly (std140 layout)");
 
+        // =========================================================================================
+        // B1 (Mesh Particle render mode) -- one-shot generation of the two small procedural mesh
+        // archetypes (box, icosphere), reusing geom_box.comp/geom_icosphere.comp UNMODIFIED (see
+        // Init()'s own STEP 7 comment for why this is deliberately plain hardware instancing, not
+        // the virtualized cluster/DAG pipeline). Everything below mirrors renderer::VulkanContext.
+        // cpp's own identically-named structs/constants byte-for-byte (that file's copy is the
+        // source of truth this must stay in sync with) -- duplicated here rather than shared across
+        // translation units since VulkanContext.cpp keeps these in its own anonymous namespace, and
+        // this pass' one-shot generation is a fully independent, throwaway-pipeline use of the same
+        // shaders, not a caller of VulkanContext's own persistent geometry-generation machinery.
+        // =========================================================================================
+
+        // Byte-for-byte mirror of struct_custo.glsl's own Vertex struct (48 bytes) -- this pass never
+        // constructs an instance on the CPU (generation happens entirely on the GPU via the one-shot
+        // compute dispatches below), this struct exists purely to size m_MeshVertexBuffer/the vertex
+        // input stride correctly via sizeof().
+        struct PrimitiveVertex {
+            float positionX = 0.0f, positionY = 0.0f, positionZ = 0.0f, materialID = 0.0f;
+            float normalX = 0.0f, normalY = 0.0f, normalZ = 0.0f; uint32_t meshID = 0;
+            float u = 0.0f, v = 0.0f, u2 = 0.0f, v2 = 0.0f;
+        };
+        static_assert(sizeof(PrimitiveVertex) == 48, "PrimitiveVertex must match struct_custo.glsl's own Vertex struct exactly (std430 layout)");
+
+        // Byte-for-byte mirror of geom_box.comp's own push-constant block (renderer::VulkanContext.
+        // cpp's own BoxPushConstants).
+        struct BoxGenPushConstants {
+            float width = 0.0f, length = 0.0f, height = 0.0f;
+            uint32_t widthSegments = 0, lengthSegments = 0, heightSegments = 0;
+            uint32_t meshID = 0;
+            float materialID = 0.0f;
+            uint32_t vertexOffset = 0, indexOffset = 0;
+            float worldOffsetX = 0.0f, worldOffsetY = 0.0f, worldOffsetZ = 0.0f;
+        };
+
+        // Byte-for-byte mirror of geom_box.comp's own 6-face specialization-constant table
+        // (renderer::VulkanContext.cpp's own BoxFaceSpecConstants/kBoxFaceSpecs) -- see that file's
+        // own comment for the full winding-consistency derivation these 6 rows satisfy.
+        struct BoxFaceSpecConstants {
+            int32_t uAxis = 0, vAxis = 1, wAxis = 2, faceMode = 0;
+            float udir = 1.0f, vdir = 1.0f, wSign = 1.0f;
+        };
+        constexpr BoxFaceSpecConstants kBoxFaceSpecs[6] = {
+            {0, 1, 2, 0, -1.0f, 1.0f, 1.0f},  // +Z
+            {0, 1, 2, 0, 1.0f,  1.0f, -1.0f}, // -Z
+            {0, 2, 1, 1, 1.0f,  1.0f, 1.0f},  // +Y
+            {0, 2, 1, 1, -1.0f, 1.0f, -1.0f}, // -Y
+            {1, 2, 0, 2, -1.0f, 1.0f, 1.0f},  // +X
+            {1, 2, 0, 2, 1.0f,  1.0f, -1.0f}, // -X
+        };
+
+        // Byte-for-byte mirror of geom_icosphere.comp's own std140 Params UBO.
+        struct IcosphereGenParamsUBO {
+            float radius = 0.0f;
+            uint32_t segments = 0, tetra = 0, octa = 0, icosa = 0;
+            uint32_t meshID = 0;
+            float materialID = 0.0f;
+            uint32_t vertexOffset = 0, indexOffset = 0;
+            float worldOffsetX = 0.0f, worldOffsetY = 0.0f, worldOffsetZ = 0.0f;
+        };
+
+        // Both meshes' known, fixed vertex/index sub-ranges within the ONE shared buffer pair (see
+        // m_MeshVertexBuffer/m_MeshIndexBuffer's own declaration comments) -- box first
+        // (widthSegments=lengthSegments=heightSegments=1: 4 verts/6 indices per face * 6 faces),
+        // icosphere immediately after (segments=1, icosa base: 3 verts/3 indices per face * 20
+        // faces, i.e. a plain 20-triangle icosahedron with no subdivision -- a deliberately coarse
+        // "rock/debris" silhouette, appropriate at the small on-screen sizes a particle instance
+        // actually renders at).
+        constexpr uint32_t kBoxMeshVertexCount = 24;
+        constexpr uint32_t kBoxMeshIndexCount = 36;
+        constexpr uint32_t kIcosphereMeshVertexBase = kBoxMeshVertexCount;
+        constexpr uint32_t kIcosphereMeshIndexBase = kBoxMeshIndexCount;
+        constexpr uint32_t kIcosphereMeshVertexCount = 60;
+        constexpr uint32_t kIcosphereMeshIndexCount = 60;
+        constexpr uint32_t kTotalMeshVertexCount = kIcosphereMeshVertexBase + kIcosphereMeshVertexCount; // 84
+        constexpr uint32_t kTotalMeshIndexCount = kIcosphereMeshIndexBase + kIcosphereMeshIndexCount;     // 96
+
+        // Byte-for-byte mirror of ParticleMeshRender.vert's own push-constant block.
+        struct ParticleMeshRenderPC {
+            uint32_t expectedArchetype = 0;
+        };
+        static_assert(sizeof(ParticleMeshRenderPC) == 4, "ParticleMeshRenderPC must match ParticleMeshRender.vert's own push-constant block exactly");
+
     } // namespace
 
     bool ParticleSystemPass::Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
@@ -602,6 +684,15 @@ namespace renderer {
             VkPipelineLayoutCreateInfo renderPipelineLayoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
             renderPipelineLayoutInfo.setLayoutCount = 4;
             renderPipelineLayoutInfo.pSetLayouts = renderPipelineSetLayouts;
+            // B1 (Mesh Particle render mode): a small push-constant range m_MeshPipeline (built
+            // further below, in STEP 7) uses to know which of the 2 generated archetypes a given
+            // draw call represents -- ParticleRender.vert/.frag (this SAME pipeline layout's other,
+            // original consumer) simply never declares/reads a push constant, which is legal (a
+            // pipeline layout only needs to be a superset of what each pipeline built against it
+            // actually uses).
+            VkPushConstantRange meshArchetypePushRange{ VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(ParticleMeshRenderPC) };
+            renderPipelineLayoutInfo.pushConstantRangeCount = 1;
+            renderPipelineLayoutInfo.pPushConstantRanges = &meshArchetypePushRange;
             VK_CHECK(vkCreatePipelineLayout(m_Device, &renderPipelineLayoutInfo, nullptr, &m_RenderPipelineLayout));
 
             VkShaderModule vertModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/ParticleRender.vert.spv");
@@ -709,6 +800,331 @@ namespace renderer {
             vkDestroyShaderModule(m_Device, fragModule, nullptr);
         }
 
+        // =====================================================================================
+        // STEP 7 (B1 -- Niagara-parity roadmap, Mesh Particle render mode) -- generates the two
+        // small, fixed procedural mesh archetypes (box, icosphere) an emitter can instance in place
+        // of a billboard (EmitterParams::renderMode == 1, meshArchetype selects which) by reusing
+        // the SAME GPU generation shaders (geom_box.comp / geom_icosphere.comp) the main cluster/
+        // Nanite pipeline already builds its own procedural entity meshes from (see this
+        // translation unit's own BoxGenPushConstants/BoxFaceSpecConstants/IcosphereGenParamsUBO,
+        // mirroring renderer::VulkanContext.cpp's identically-named machinery byte-for-byte) --
+        // NOT a hand-authored vertex array and NOT a new file-based mesh format, matching this
+        // project's "100% procedural GPU-driven, zero data in the .exe" discipline exactly.
+        //
+        // Deliberately NOT plumbed through GpuGeometryPagePool/ClusterDAG (the virtualized-geometry
+        // streaming system every OTHER procedurally-generated entity mesh in this codebase
+        // eventually lands in): that system exists to page/stream/LOD potentially enormous UNIQUE
+        // meshes across a whole scene -- a mismatch for "draw the exact SAME ~24-60 vertex mesh
+        // several thousand times a frame with a live per-instance transform," which is precisely
+        // what plain hardware instancing (vkCmdDrawIndexedIndirect with instanceCount == aliveCount,
+        // mirroring the billboard pass' own instanceCount == aliveCount indirect-draw idiom) already
+        // solves directly with no virtualization needed at all.
+        //
+        // Both meshes are generated ONCE, here, into one small shared VertexBuffer/IndexBuffer pair
+        // (both STORAGE_BUFFER, for the one-shot compute writes below, AND {VERTEX,INDEX}_BUFFER,
+        // for RecordDraw's later vkCmdBindVertexBuffers/vkCmdBindIndexBuffer) -- never touched again
+        // after this block, since neither mesh's geometry is parametrized at runtime.
+        // =====================================================================================
+        {
+            m_MeshVertexBuffer.Create(allocator, static_cast<VkDeviceSize>(kTotalMeshVertexCount) * sizeof(PrimitiveVertex),
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
+            m_MeshIndexBuffer.Create(allocator, static_cast<VkDeviceSize>(kTotalMeshIndexCount) * sizeof(uint32_t),
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
+
+            // Per-archetype indirect-draw args -- indexCount/firstIndex/vertexOffset are the fixed
+            // sub-range each archetype occupies in the shared buffers above; instanceCount starts at
+            // 0 here and is refreshed every RecordDraw() call from CounterBuffer.aliveCount (see that
+            // method's own comment for why this happens in RecordDraw(), not RecordSort()).
+            VkDrawIndexedIndirectCommand boxIndirectInitial{ kBoxMeshIndexCount, 0u, 0u, 0, 0u };
+            VkDrawIndexedIndirectCommand icosphereIndirectInitial{ kIcosphereMeshIndexCount, 0u, kIcosphereMeshIndexBase, static_cast<int32_t>(kIcosphereMeshVertexBase), 0u };
+            m_MeshIndirectDrawBuffer[kMeshArchetypeBox].Create(allocator, sizeof(VkDrawIndexedIndirectCommand),
+                VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
+            m_MeshIndirectDrawBuffer[kMeshArchetypeIcosphere].Create(allocator, sizeof(VkDrawIndexedIndirectCommand),
+                VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
+
+            // --- Temporary (this block only) descriptor set layout/pool/set + pipelines for the
+            // one-shot generation dispatches below -- discarded at the end of this scope, since
+            // neither mesh is ever regenerated after Init(). Binding 0/1 (Vertex/Index SSBOs) are
+            // shared by both the box and icosphere generation shaders; binding 2 (Params UBO) is
+            // icosphere-only (box reads its own Params via push constants instead, see
+            // BoxGenPushConstants' own comment) -- declaring it unconditionally in one shared layout
+            // is harmless (box's own shader module simply never references binding 2). ---
+            VkDescriptorSetLayoutBinding genBindings[3]{};
+            genBindings[0] = { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+            genBindings[1] = { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+            genBindings[2] = { 2, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+
+            VkDescriptorSetLayout genSetLayout = VK_NULL_HANDLE;
+            VkDescriptorSetLayoutCreateInfo genLayoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+            genLayoutInfo.bindingCount = 3;
+            genLayoutInfo.pBindings = genBindings;
+            VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &genLayoutInfo, nullptr, &genSetLayout));
+
+            VkDescriptorPool genPool = VK_NULL_HANDLE;
+            VkDescriptorPoolSize genPoolSizes[2] = {
+                { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 },
+                { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 }
+            };
+            VkDescriptorPoolCreateInfo genPoolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
+            genPoolInfo.maxSets = 1;
+            genPoolInfo.poolSizeCount = 2;
+            genPoolInfo.pPoolSizes = genPoolSizes;
+            VK_CHECK(vkCreateDescriptorPool(m_Device, &genPoolInfo, nullptr, &genPool));
+
+            VkDescriptorSet genSet = VK_NULL_HANDLE;
+            VkDescriptorSetAllocateInfo genSetAllocInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+            genSetAllocInfo.descriptorPool = genPool;
+            genSetAllocInfo.descriptorSetCount = 1;
+            genSetAllocInfo.pSetLayouts = &genSetLayout;
+            VK_CHECK(vkAllocateDescriptorSets(m_Device, &genSetAllocInfo, &genSet));
+
+            // Icosphere's own Params UBO -- CPU_TO_GPU mapped, filled directly (no staging copy
+            // needed: this one-shot command buffer's compute dispatch reads it after the same host
+            // write below, and VMA's CPU_TO_GPU memory type is HOST_COHERENT on every platform this
+            // project targets, matching this codebase's own other directly-mapped-and-written UBOs,
+            // e.g. GpuBuffer's own persistently-mapped Debug readback buffers).
+            GpuBuffer icosphereParamsBuffer;
+            icosphereParamsBuffer.Create(allocator, sizeof(IcosphereGenParamsUBO),
+                VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, VMA_MEMORY_USAGE_CPU_TO_GPU, /*mapped=*/true);
+            IcosphereGenParamsUBO icosphereParams{};
+            icosphereParams.radius = 0.5f; // Matches the box's own [-0.5, 0.5] half-extent -- see kBoxGenPushConstants.width/length/height below.
+            icosphereParams.segments = 1;  // No subdivision -- a plain 20-triangle icosahedron, see kIcosphereMeshVertexCount's own comment.
+            icosphereParams.icosa = 1;
+            icosphereParams.vertexOffset = kIcosphereMeshVertexBase;
+            icosphereParams.indexOffset = kIcosphereMeshIndexBase;
+            std::memcpy(icosphereParamsBuffer.MappedData(), &icosphereParams, sizeof(icosphereParams));
+
+            VkDescriptorBufferInfo genVertexInfo{ m_MeshVertexBuffer.Handle(), 0, m_MeshVertexBuffer.Size() };
+            VkDescriptorBufferInfo genIndexInfo{ m_MeshIndexBuffer.Handle(), 0, m_MeshIndexBuffer.Size() };
+            VkDescriptorBufferInfo genParamsInfo{ icosphereParamsBuffer.Handle(), 0, icosphereParamsBuffer.Size() };
+            VkWriteDescriptorSet genWrites[3]{};
+            genWrites[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, genSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &genVertexInfo, nullptr };
+            genWrites[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, genSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &genIndexInfo, nullptr };
+            genWrites[2] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, genSet, 2, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &genParamsInfo, nullptr };
+            vkUpdateDescriptorSets(m_Device, 3, genWrites, 0, nullptr);
+
+            // Box: 6 throwaway compute pipelines (one per face, differentiated by specialization
+            // constants only -- see BoxFaceSpecConstants' own comment), sharing one pipeline layout
+            // with a BoxGenPushConstants-sized push-constant range.
+            VkPushConstantRange boxPushRange{ VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(BoxGenPushConstants) };
+            VkPipelineLayout boxPipelineLayout = VK_NULL_HANDLE;
+            VkPipelineLayoutCreateInfo boxPipelineLayoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+            boxPipelineLayoutInfo.setLayoutCount = 1;
+            boxPipelineLayoutInfo.pSetLayouts = &genSetLayout;
+            boxPipelineLayoutInfo.pushConstantRangeCount = 1;
+            boxPipelineLayoutInfo.pPushConstantRanges = &boxPushRange;
+            VK_CHECK(vkCreatePipelineLayout(m_Device, &boxPipelineLayoutInfo, nullptr, &boxPipelineLayout));
+
+            VkShaderModule boxModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/geom_box.comp.spv");
+            VkPipeline boxFacePipelines[6]{};
+            VkSpecializationMapEntry boxSpecMapEntries[7] = {
+                { 0, offsetof(BoxFaceSpecConstants, uAxis), sizeof(int32_t) },
+                { 1, offsetof(BoxFaceSpecConstants, vAxis), sizeof(int32_t) },
+                { 2, offsetof(BoxFaceSpecConstants, wAxis), sizeof(int32_t) },
+                { 3, offsetof(BoxFaceSpecConstants, faceMode), sizeof(int32_t) },
+                { 4, offsetof(BoxFaceSpecConstants, udir), sizeof(float) },
+                { 5, offsetof(BoxFaceSpecConstants, vdir), sizeof(float) },
+                { 6, offsetof(BoxFaceSpecConstants, wSign), sizeof(float) },
+            };
+            for (uint32_t face = 0; face < 6u; ++face) {
+                VkSpecializationInfo specInfo{};
+                specInfo.mapEntryCount = 7;
+                specInfo.pMapEntries = boxSpecMapEntries;
+                specInfo.dataSize = sizeof(BoxFaceSpecConstants);
+                specInfo.pData = &kBoxFaceSpecs[face];
+
+                VkComputePipelineCreateInfo boxPipelineInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
+                boxPipelineInfo.layout = boxPipelineLayout;
+                boxPipelineInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+                boxPipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+                boxPipelineInfo.stage.module = boxModule;
+                boxPipelineInfo.stage.pName = "main";
+                boxPipelineInfo.stage.pSpecializationInfo = &specInfo;
+                VK_CHECK(vkCreateComputePipelines(m_Device, VK_NULL_HANDLE, 1, &boxPipelineInfo, nullptr, &boxFacePipelines[face]));
+            }
+            vkDestroyShaderModule(m_Device, boxModule, nullptr);
+
+            // Icosphere: one throwaway compute pipeline, no push constants (its own Params come from
+            // the UBO written above).
+            VkPipelineLayout icospherePipelineLayout = VK_NULL_HANDLE;
+            VkPipelineLayoutCreateInfo icospherePipelineLayoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+            icospherePipelineLayoutInfo.setLayoutCount = 1;
+            icospherePipelineLayoutInfo.pSetLayouts = &genSetLayout;
+            VK_CHECK(vkCreatePipelineLayout(m_Device, &icospherePipelineLayoutInfo, nullptr, &icospherePipelineLayout));
+
+            VkShaderModule icosphereModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/geom_icosphere.comp.spv");
+            VkComputePipelineCreateInfo icospherePipelineInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
+            icospherePipelineInfo.layout = icospherePipelineLayout;
+            icospherePipelineInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+            icospherePipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+            icospherePipelineInfo.stage.module = icosphereModule;
+            icospherePipelineInfo.stage.pName = "main";
+            VkPipeline icospherePipeline = VK_NULL_HANDLE;
+            VK_CHECK(vkCreateComputePipelines(m_Device, VK_NULL_HANDLE, 1, &icospherePipelineInfo, nullptr, &icospherePipeline));
+            vkDestroyShaderModule(m_Device, icosphereModule, nullptr);
+
+            // --- Record + submit every generation dispatch in one one-shot command buffer, seed
+            // both archetypes' indirect-draw commands, then a single trailing barrier before this
+            // command buffer's own completion (ExecuteOneShotCommands blocks until done -- see
+            // Init()'s own STEP 2 comment for why no further barrier is needed after that point). ---
+            VulkanUtils::ExecuteOneShotCommands(m_Device, commandPool, queue, [&](VkCommandBuffer cmd) {
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, boxPipelineLayout, 0, 1, &genSet, 0, nullptr);
+                uint32_t runningVertexOffset = 0;
+                uint32_t runningIndexOffset = 0;
+                for (uint32_t face = 0; face < 6u; ++face) {
+                    BoxGenPushConstants boxPc{};
+                    boxPc.width = 1.0f; boxPc.length = 1.0f; boxPc.height = 1.0f; // Unit cube -- spans [-0.5, 0.5] per axis, matching every render mode's own "size == full extent" convention.
+                    boxPc.widthSegments = 1; boxPc.lengthSegments = 1; boxPc.heightSegments = 1; // One quad per face -- the coarsest possible box, appropriate for a small particle instance.
+                    boxPc.vertexOffset = runningVertexOffset;
+                    boxPc.indexOffset = runningIndexOffset;
+                    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, boxFacePipelines[face]);
+                    vkCmdPushConstants(cmd, boxPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(boxPc), &boxPc);
+                    // geom_box.comp's local_size = (8, 8, 1); with widthSegments=lengthSegments=heightSegments=1, every face's own uSegsCount == vSegsCount == 2, so one workgroup covers it fully.
+                    vkCmdDispatch(cmd, 1, 1, 1);
+                    runningVertexOffset += 4u; // 2x2 grid of vertices per face.
+                    runningIndexOffset += 6u;  // 2 triangles per face.
+                }
+
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, icospherePipeline);
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, icospherePipelineLayout, 0, 1, &genSet, 0, nullptr);
+                // geom_icosphere.comp's local_size = (8, 8, 1); segments=1 means i,j each only need
+                // 2 values (0,1), well within one workgroup's own 8x8 (i,j) coverage -- one
+                // workgroup per base face (20 for the icosahedron), dispatched along Z.
+                vkCmdDispatch(cmd, 1, 1, 20);
+
+                // Seed both archetypes' indirect-draw commands now, inside the SAME one-shot buffer,
+                // right after the generation dispatches above (their instanceCount stays 0 -- see
+                // this buffer's own declaration comment -- until RecordDraw()'s first real call).
+                vkCmdUpdateBuffer(cmd, m_MeshIndirectDrawBuffer[kMeshArchetypeBox].Handle(), 0, sizeof(boxIndirectInitial), &boxIndirectInitial);
+                vkCmdUpdateBuffer(cmd, m_MeshIndirectDrawBuffer[kMeshArchetypeIcosphere].Handle(), 0, sizeof(icosphereIndirectInitial), &icosphereIndirectInitial);
+
+                // Make every compute-shader write above (vertex/index buffers) visible to this
+                // pass' later VERTEX_INPUT reads (vkCmdBindVertexBuffers/vkCmdBindIndexBuffer,
+                // RecordDraw()) -- ExecuteOneShotCommands' own blocking completion already covers
+                // the vkCmdUpdateBuffer writes just above with no further barrier needed for those.
+                VulkanUtils::RecordMemoryBarrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                    VK_PIPELINE_STAGE_2_VERTEX_INPUT_BIT, VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_2_INDEX_READ_BIT);
+                });
+
+            // Tear down every temporary object from this scope -- neither mesh is ever regenerated.
+            vkDestroyPipeline(m_Device, icospherePipeline, nullptr);
+            vkDestroyPipelineLayout(m_Device, icospherePipelineLayout, nullptr);
+            for (uint32_t face = 0; face < 6u; ++face) {
+                vkDestroyPipeline(m_Device, boxFacePipelines[face], nullptr);
+            }
+            vkDestroyPipelineLayout(m_Device, boxPipelineLayout, nullptr);
+            icosphereParamsBuffer.Destroy();
+            vkDestroyDescriptorPool(m_Device, genPool, nullptr);
+            vkDestroyDescriptorSetLayout(m_Device, genSetLayout, nullptr);
+
+            // The mesh-particle graphics pipeline itself -- reuses m_RenderPipelineLayout (STEP 6c,
+            // now carrying the ParticleMeshRenderPC push-constant range) UNMODIFIED: sets 0/1/2/3
+            // (particle state / SortedPairsBuffer / ParticleRenderParamsUBO / lighting) are exactly
+            // what ParticleMeshRender.vert/.frag also need, see this class' own m_MeshPipeline
+            // declaration comment.
+            VkShaderModule meshVertModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/ParticleMeshRender.vert.spv");
+            VkShaderModule meshFragModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/ParticleMeshRender.frag.spv");
+            VkPipelineShaderStageCreateInfo meshStages[2]{};
+            meshStages[0] = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_VERTEX_BIT, meshVertModule, "main", nullptr };
+            meshStages[1] = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT, meshFragModule, "main", nullptr };
+
+            // Real vertex input -- struct_custo.glsl's Vertex layout: position at byte 0, normal at
+            // byte 16, stride 48 (see PrimitiveVertex's own declaration comment).
+            VkVertexInputBindingDescription meshBinding{ 0, sizeof(PrimitiveVertex), VK_VERTEX_INPUT_RATE_VERTEX };
+            VkVertexInputAttributeDescription meshAttributes[2]{};
+            meshAttributes[0] = { 0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0 };
+            meshAttributes[1] = { 1, 0, VK_FORMAT_R32G32B32_SFLOAT, 16 };
+            VkPipelineVertexInputStateCreateInfo meshVertexInputInfo{ VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
+            meshVertexInputInfo.vertexBindingDescriptionCount = 1;
+            meshVertexInputInfo.pVertexBindingDescriptions = &meshBinding;
+            meshVertexInputInfo.vertexAttributeDescriptionCount = 2;
+            meshVertexInputInfo.pVertexAttributeDescriptions = meshAttributes;
+
+            VkPipelineInputAssemblyStateCreateInfo meshInputAssembly{ VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
+            meshInputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+            meshInputAssembly.primitiveRestartEnable = VK_FALSE;
+
+            VkPipelineViewportStateCreateInfo meshViewportState{ VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
+            meshViewportState.viewportCount = 1;
+            meshViewportState.scissorCount = 1;
+
+            // Real opaque 3D geometry -- back-face culled, CCW front face, matching
+            // renderer::VulkanPipeline::CreateGraphicsPipeline's own established convention for
+            // every OTHER consumer of these same procedurally-generated meshes (unlike the
+            // never-culled billboard pipeline just above, which has no meaningful winding).
+            VkPipelineRasterizationStateCreateInfo meshRasterizer{ VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
+            meshRasterizer.polygonMode = VK_POLYGON_MODE_FILL;
+            meshRasterizer.lineWidth = 1.0f;
+            meshRasterizer.cullMode = VK_CULL_MODE_BACK_BIT;
+            meshRasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+
+            VkPipelineMultisampleStateCreateInfo meshMultisampling{ VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
+            meshMultisampling.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+            // Fully opaque (blendEnable = FALSE) -- see ParticleMeshRender.frag's own header comment
+            // for why. Attachment 1 (refraction offset) is a plain overwrite, same convention as the
+            // billboard pipeline's own identical second attachment.
+            VkPipelineColorBlendAttachmentState meshColorBlendAttachment{};
+            meshColorBlendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+            meshColorBlendAttachment.blendEnable = VK_FALSE;
+            VkPipelineColorBlendAttachmentState meshRefractionBlendAttachment{};
+            meshRefractionBlendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT;
+            meshRefractionBlendAttachment.blendEnable = VK_FALSE;
+            VkPipelineColorBlendAttachmentState meshColorBlendAttachments[2] = { meshColorBlendAttachment, meshRefractionBlendAttachment };
+            VkPipelineColorBlendStateCreateInfo meshColorBlending{ VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
+            meshColorBlending.attachmentCount = 2;
+            meshColorBlending.pAttachments = meshColorBlendAttachments;
+
+            VkDynamicState meshDynamicStates[2] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+            VkPipelineDynamicStateCreateInfo meshDynamicState{ VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
+            meshDynamicState.dynamicStateCount = 2;
+            meshDynamicState.pDynamicStates = meshDynamicStates;
+
+            VkFormat meshColorFormats[2] = { colorFormat, VK_FORMAT_R16G16_SFLOAT };
+            VkPipelineRenderingCreateInfo meshPipelineRendering{ VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO };
+            meshPipelineRendering.colorAttachmentCount = 2;
+            meshPipelineRendering.pColorAttachmentFormats = meshColorFormats;
+            meshPipelineRendering.depthAttachmentFormat = depthFormat;
+
+            // Depth-tested but NOT written -- same constraint as the billboard pipeline just above,
+            // and for the same structural reason, not merely the same style choice: this entire
+            // rendering scope's depth attachment is bound at VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_
+            // OPTIMAL (see RecordDraw's own depthAttachment declaration), which makes
+            // depthWriteEnable = VK_TRUE a hard Vulkan validation error (VUID-vkCmdDrawIndexedIndirect-
+            // None-06886) for ANY pipeline drawn within it, not an optional quality trade-off this
+            // pipeline could opt out of. A mesh particle is therefore still correctly hidden behind
+            // real opaque scene geometry (the depth TEST still runs against the already-populated
+            // depth buffer), but two overlapping mesh particles rely on back-to-front draw order
+            // (SortedPairsBuffer, same as billboards) for correct relative occlusion via the
+            // fixed-function color write instead -- exactly the billboard pipeline's own established
+            // "sort provides the ordering, not the depth buffer" contract, just with an opaque
+            // (blendEnable = FALSE) overwrite instead of an alpha blend.
+            VkPipelineDepthStencilStateCreateInfo meshDepthStencil{ VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
+            meshDepthStencil.depthTestEnable = VK_TRUE;
+            meshDepthStencil.depthWriteEnable = VK_FALSE;
+            meshDepthStencil.depthCompareOp = VK_COMPARE_OP_GREATER;
+            meshDepthStencil.depthBoundsTestEnable = VK_FALSE;
+            meshDepthStencil.stencilTestEnable = VK_FALSE;
+
+            VkGraphicsPipelineCreateInfo meshPipelineInfo{ VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
+            meshPipelineInfo.pNext = &meshPipelineRendering;
+            meshPipelineInfo.stageCount = 2;
+            meshPipelineInfo.pStages = meshStages;
+            meshPipelineInfo.pVertexInputState = &meshVertexInputInfo;
+            meshPipelineInfo.pInputAssemblyState = &meshInputAssembly;
+            meshPipelineInfo.pViewportState = &meshViewportState;
+            meshPipelineInfo.pRasterizationState = &meshRasterizer;
+            meshPipelineInfo.pMultisampleState = &meshMultisampling;
+            meshPipelineInfo.pColorBlendState = &meshColorBlending;
+            meshPipelineInfo.pDepthStencilState = &meshDepthStencil;
+            meshPipelineInfo.pDynamicState = &meshDynamicState;
+            meshPipelineInfo.layout = m_RenderPipelineLayout;
+            VK_CHECK(vkCreateGraphicsPipelines(m_Device, VK_NULL_HANDLE, 1, &meshPipelineInfo, nullptr, &m_MeshPipeline));
+
+            vkDestroyShaderModule(m_Device, meshVertModule, nullptr);
+            vkDestroyShaderModule(m_Device, meshFragModule, nullptr);
+        }
+
         LOG_INFO(std::format("[ParticleSystemPass] Initialized: {} max particles, {} KB particle buffer x2, simulation + sort + render pipelines ready.",
             kMaxParticles, static_cast<uint32_t>(kParticleBufferBytes / 1024)));
         return true;
@@ -722,7 +1138,7 @@ namespace renderer {
         float precipRainFallSpeedMps, float precipSnowFallSpeedMps, float precipSnowWobbleStrength) {
         // Multi-emitter roadmap (subtask A1): this frame's (possibly ImGui-edited) per-emitter
         // parameters, uploaded wholesale -- every field is live-tunable, so a full re-upload every
-        // call is simplest and cheap (kMaxEmitters * 112 bytes == 448 bytes today -- grew from 80
+        // call is simplest and cheap (kMaxEmitters * sizeof(EmitterParams) == 896 bytes today -- grew from 80
         // bytes/emitter when the module stack roadmap's subtask A3 added its two new force modules,
         // still comfortably under vkCmdUpdateBuffer's 65536-byte limit). The waterfall mist
         // (rivers/waterfalls feature) rides this same array as EMITTERS[3], see RecordSimulate's own
@@ -1000,6 +1416,18 @@ namespace renderer {
         ubo.heatShimmerStrength = heatShimmerStrength;
         vkCmdUpdateBuffer(cmd, m_RenderParamsBuffer.Handle(), 0, sizeof(ubo), &ubo);
 
+        // B1 (Mesh Particle render mode): refresh both archetypes' own VkDrawIndexedIndirectCommand.
+        // instanceCount from THIS frame's real CounterBuffer.aliveCount -- must happen HERE (a
+        // vkCmdCopyBuffer, a transfer command, is illegal between vkCmdBeginRendering/
+        // vkCmdEndRendering per the Vulkan spec), NOT inside RecordSort() (explicitly out of scope
+        // for this roadmap step to touch), mirroring RecordSort()'s own identical instanceCount-copy
+        // idiom for m_IndirectDrawBuffer, just performed here instead. The trailing barrier just
+        // below (already covering TRANSFER_WRITE -> DRAW_INDIRECT for the UBO update above) covers
+        // these two copies for free, since they are the exact same source/destination stage pair.
+        VkBufferCopy meshAliveCountCopy{ 4, 4, sizeof(uint32_t) }; // CounterBuffer.aliveCount (offset 4) -> VkDrawIndexedIndirectCommand.instanceCount (also offset 4).
+        vkCmdCopyBuffer(cmd, m_CounterBuffer.Handle(), m_MeshIndirectDrawBuffer[kMeshArchetypeBox].Handle(), 1, &meshAliveCountCopy);
+        vkCmdCopyBuffer(cmd, m_CounterBuffer.Handle(), m_MeshIndirectDrawBuffer[kMeshArchetypeIcosphere].Handle(), 1, &meshAliveCountCopy);
+
         // Covers both this UBO update AND Subtask 3's own trailing barrier scope gap (RecordSort's
         // own trailing barrier only makes the sorted-pair/indirect-draw data visible to
         // COMPUTE_SHADER, not to this draw's VERTEX_SHADER/DRAW_INDIRECT reads -- see RecordSort's
@@ -1087,6 +1515,39 @@ namespace renderer {
         // at Init(), the latter every RecordSort() call (see that method's own trailing comment).
         vkCmdDrawIndirect(cmd, m_IndirectDrawBuffer.Handle(), 0, 1, sizeof(VkDrawIndirectCommand));
 
+        // =====================================================================================
+        // B1 (Mesh Particle render mode) -- 2 instanced draws (one per generated archetype, box
+        // then icosphere), sharing this SAME rendering scope/pipeline layout/descriptor sets as the
+        // billboard draw just above (see m_MeshPipeline's own declaration comment for why it reuses
+        // m_RenderPipelineLayout unmodified). Both archetypes' instanceCount were already refreshed
+        // from CounterBuffer.aliveCount above (before vkCmdBeginRendering -- a transfer command is
+        // illegal inside a dynamic-rendering scope). The vertex shader's own per-instance gating
+        // (ParticleMeshRender.vert's own comment) skips every particle whose emitter is not actually
+        // in Mesh Particle mode with this specific archetype, so issuing this draw unconditionally
+        // (instanceCount == aliveCount, not a pre-filtered subset) is correct even when zero emitters
+        // currently use this render mode -- it simply degenerates every instance.
+        // =====================================================================================
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_MeshPipeline);
+        // Sets 0/1/2/3 are IDENTICAL to the billboard draw just above (same GetCurrentSet()/m_SortSet/
+        // m_RenderSet/m_LightingSet, same pipeline layout) -- vkCmdBindDescriptorSets does not need
+        // to be repeated since binding a different PIPELINE with a COMPATIBLE layout does not
+        // invalidate already-bound descriptor sets, but this codebase does not currently rely on
+        // that guarantee elsewhere, so it is rebound explicitly here for clarity/robustness against
+        // a future pipeline-layout change breaking that assumption silently.
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_RenderPipelineLayout, 0, 4, renderSets, 0, nullptr);
+        VkBuffer meshVertexBuffers[1] = { m_MeshVertexBuffer.Handle() };
+        VkDeviceSize meshVertexOffsets[1] = { 0 };
+        vkCmdBindVertexBuffers(cmd, 0, 1, meshVertexBuffers, meshVertexOffsets);
+        vkCmdBindIndexBuffer(cmd, m_MeshIndexBuffer.Handle(), 0, VK_INDEX_TYPE_UINT32);
+
+        ParticleMeshRenderPC meshPcBox{ kMeshArchetypeBox };
+        vkCmdPushConstants(cmd, m_RenderPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(meshPcBox), &meshPcBox);
+        vkCmdDrawIndexedIndirect(cmd, m_MeshIndirectDrawBuffer[kMeshArchetypeBox].Handle(), 0, 1, sizeof(VkDrawIndexedIndirectCommand));
+
+        ParticleMeshRenderPC meshPcIcosphere{ kMeshArchetypeIcosphere };
+        vkCmdPushConstants(cmd, m_RenderPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(meshPcIcosphere), &meshPcIcosphere);
+        vkCmdDrawIndexedIndirect(cmd, m_MeshIndirectDrawBuffer[kMeshArchetypeIcosphere].Handle(), 0, 1, sizeof(VkDrawIndexedIndirectCommand));
+
         vkCmdEndRendering(cmd);
 
         VkImageMemoryBarrier2 toGeneral{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
@@ -1111,6 +1572,11 @@ namespace renderer {
             if (m_LightingDescriptorPool != VK_NULL_HANDLE) vkDestroyDescriptorPool(m_Device, m_LightingDescriptorPool, nullptr);
             if (m_LightingSetLayout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(m_Device, m_LightingSetLayout, nullptr);
 
+            // B1 (Mesh Particle render mode): m_MeshPipeline reuses m_RenderPipelineLayout (see that
+            // pipeline's own declaration comment) -- destroyed here, before the layout it was built
+            // from, for clarity (a VkPipeline remains valid independent of its originating layout's
+            // lifetime per the Vulkan spec, so this ordering is not strictly required, only tidy).
+            if (m_MeshPipeline != VK_NULL_HANDLE) vkDestroyPipeline(m_Device, m_MeshPipeline, nullptr);
             if (m_RenderPipeline != VK_NULL_HANDLE) vkDestroyPipeline(m_Device, m_RenderPipeline, nullptr);
             if (m_RenderPipelineLayout != VK_NULL_HANDLE) vkDestroyPipelineLayout(m_Device, m_RenderPipelineLayout, nullptr);
             if (m_RenderDescriptorPool != VK_NULL_HANDLE) vkDestroyDescriptorPool(m_Device, m_RenderDescriptorPool, nullptr);
@@ -1153,6 +1619,13 @@ namespace renderer {
         m_PrecipitationParamsBuffer.Destroy();
         m_RenderParamsBuffer.Destroy();
         m_WorldProbeGridParamsBuffer.Destroy();
+
+        // B1 (Mesh Particle render mode).
+        m_MeshVertexBuffer.Destroy();
+        m_MeshIndexBuffer.Destroy();
+        m_MeshIndirectDrawBuffer[0].Destroy();
+        m_MeshIndirectDrawBuffer[1].Destroy();
+        m_MeshPipeline = VK_NULL_HANDLE;
 
         m_LightingDescriptorPool = VK_NULL_HANDLE;
         m_LightingSetLayout = VK_NULL_HANDLE;

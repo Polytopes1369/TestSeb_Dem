@@ -45,6 +45,28 @@ void main() {
     Particle p = particles[particleIndex];
     uint kind = UnpackParticleKind(p.randomSeed);
 
+    // Niagara-parity roadmap (bundled B1/B2/B3 render-mode workstream): this billboard pipeline must
+    // now SKIP any kKindEmber particle whose own emitter opted into Mesh Particle (B1) or
+    // Ribbon/Trail (B2) render mode -- ParticleMeshRender.vert/ParticleRibbonRender.vert draw those
+    // instead, this same frame, against the SAME sorted alive-particle list (see either shader's own
+    // header comment). Precipitation (rain/snow) always bypasses this check and renders as its
+    // original billboard streak/flake regardless -- it has no EmitterParams slot of its own
+    // (Particle::emitterIndex defaults to 0 for it, see that field's own comment), so its kind alone
+    // (not kParticleKindEmber) is what exempts it here. Every skipped instance is pushed to a
+    // degenerate, always-clipped position -- same "skip via clip-space discard, not a separate
+    // compaction pass" convention ParticleMeshRender.vert's own gating uses, for the identical
+    // "avoid touching RecordSort()/ParticleSort.comp" reason.
+    bool isBillboardCandidate = (kind != kParticleKindEmber) || (emitters[p.emitterIndex].renderMode == 0u);
+    if (!isBillboardCandidate) {
+        gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+        outWorldPos = vec3(0.0);
+        outUV = vec2(0.0);
+        outColor = vec4(0.0);
+        outNormalizedAge = 0.0;
+        outKind = kind;
+        return;
+    }
+
     vec2 corner = kQuadCorners[gl_VertexIndex];
     vec2 offset = corner - 0.5;
 

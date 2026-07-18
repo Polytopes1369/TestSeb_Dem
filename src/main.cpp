@@ -1175,6 +1175,23 @@ int main(int argc, char** argv) {
                         }
                         ImGui::PopID();
 
+                        // Niagara-parity roadmap (bundled B1 "Mesh Particle" + B2 "Ribbon/Trail" +
+                        // B3 "sprite orientation/sub-variation" workstream) -- one shared render-mode
+                        // selector per emitter, plus each mode's own knobs (only the ones relevant to
+                        // the currently-selected mode are shown, to keep this panel from becoming
+                        // cluttered with fields that do nothing for the other 2 modes).
+                        ImGui::Separator();
+                        ImGui::TextUnformatted("Render Mode (Niagara-parity roadmap B1/B2/B3)");
+                        ImGui::Combo("Render Mode", reinterpret_cast<int*>(&cfg.renderMode), "Billboard\0Mesh Particle\0Ribbon / Trail\0\0");
+                        if (cfg.renderMode == 1u) {
+                            ImGui::Combo("Mesh Archetype", reinterpret_cast<int*>(&cfg.meshArchetype), "Box\0Icosphere\0\0");
+                        } else if (cfg.renderMode == 2u) {
+                            ImGui::DragFloat("Ribbon Width (m)", &cfg.ribbonWidth, 0.005f, 0.005f, 2.0f);
+                        } else {
+                            ImGui::Combo("Sprite Orientation", reinterpret_cast<int*>(&cfg.spriteOrientationMode), "Camera-Facing\0Velocity-Aligned\0\0");
+                            ImGui::SliderFloat("Shape Sub-Variation", &cfg.subVariationStrength, 0.0f, 1.0f);
+                        }
+
                         // Multi-emitter roadmap (subtask A1) validation/debug instrumentation: proves
                         // this emitter is independently alive/producing particles, not just that the
                         // aggregate total below is nonzero.

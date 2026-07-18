@@ -173,8 +173,51 @@ namespace renderer {
                 { 1.0f, 1.0f, 1.0f, 1.0f }, { 1.0f, 1.0f, 1.0f, 1.0f }
             };
             float sizeCurve[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+
+            // Niagara-parity roadmap (bundled B1 "Mesh Particle" + B2 "Ribbon/Trail" + B3 "sprite
+            // orientation/sub-variation" workstream): ONE render-mode enum shared by all three
+            // subtasks -- they are bundled into a single workstream specifically because they all
+            // extend this same "how does this emitter render" decision, and a shared enum avoids 3
+            // separate, potentially-conflicting notions of "render mode" (see kRenderModeBillboard/
+            // kRenderModeMeshParticle/kRenderModeRibbon below). Appended at the very END of this
+            // struct (after sizeCurve) specifically to minimize textual-diff overlap with the OTHER
+            // parallel workstreams simultaneously adding force-module/curve/depth-collision/
+            // sub-emitter/data-interface fields to this SAME struct -- per this file's own top-level
+            // task instructions.
+            //
+            // renderMode == 0 (Billboard) is the default for every field here BELOW this comment,
+            // so an emitter that never touches any of these new fields (every emitter that existed
+            // before this roadmap step) renders EXACTLY as before -- ParticleRender.vert/.frag's own
+            // gating checks (see those files' own comments) only special-case a particle when its
+            // own emitter's renderMode is explicitly non-zero.
+            uint32_t renderMode = 0;            // 0 = Billboard (default), 1 = Mesh Particle (B1), 2 = Ribbon/Trail (B2). Only meaningful for kKindEmber particles -- precipitation (rain/snow) has no EmitterParams slot of its own (see Particle::emitterIndex's own comment) and always renders as its original billboard streak/flake regardless of this field.
+            uint32_t meshArchetype = 0;          // Render mode 1 (Mesh Particle) only -- which of the two procedural meshes ParticleSystemPass generates once at Init() to instance: 0 = box, 1 = icosphere (see ParticleMeshRender.vert's own comment and this class' own kMeshArchetypeBox/kMeshArchetypeIcosphere).
+            float ribbonWidth = 0.05f;           // Render mode 2 (Ribbon/Trail) only -- half-width, world units, of the trail's cross-section quad-strip (see ParticleRibbonRender.vert's own comment).
+            uint32_t spriteOrientationMode = 0;  // Render mode 0 (Billboard) only -- 0 = camera-facing (Subtask 4's original, unchanged default), 1 = velocity-aligned (B3, see ParticleRender.vert's own comment).
+            float subVariationStrength = 0.0f;   // Render mode 0 (Billboard) only -- [0,1], B3's procedural per-particle analytic-shape perturbation strength; 0.0 (default) renders pixel-identical to the pre-B3 plain soft circle/streak (see ParticleRender.frag's own comment).
+            float _pad2 = 0.0f, _pad3 = 0.0f, _pad4 = 0.0f; // Closes this struct's final 16-byte std430 slot.
         };
-        static_assert(sizeof(EmitterParams) == 192, "EmitterParams must match ParticleCommon.glsl's EmitterParams struct exactly (std430 layout)");
+        static_assert(sizeof(EmitterParams) == 224, "EmitterParams must match ParticleCommon.glsl's EmitterParams struct exactly (std430 layout)");
+
+        // Niagara-parity roadmap: EmitterParams::renderMode values -- see that field's own
+        // declaration comment for the full contract.
+        static constexpr uint32_t kRenderModeBillboard = 0;
+        static constexpr uint32_t kRenderModeMeshParticle = 1;
+        static constexpr uint32_t kRenderModeRibbon = 2;
+
+        // B1 (Mesh Particle): EmitterParams::meshArchetype values -- both meshes are generated once
+        // at Init() into one small shared vertex/index buffer (see this class' own Init() comment on
+        // why this is plain hardware instancing, not the virtualized Nanite-like cluster/DAG pipeline
+        // every OTHER procedurally-generated mesh in this codebase eventually streams through).
+        static constexpr uint32_t kMeshArchetypeBox = 0;
+        static constexpr uint32_t kMeshArchetypeIcosphere = 1;
+
+        // B2 (Ribbon/Trail): how many past world-space positions each particle SLOT keeps in its own
+        // per-slot ring buffer (renderer::ParticleSystemPass's own m_RibbonHistoryBuffer) -- within
+        // the 4-8 sample budget this roadmap step's own task description asks for. Must match
+        // ParticleRibbonCommon.glsl's own kRibbonHistorySamples exactly (that file is the shader-side
+        // mirror this constant sizes the backing buffer for).
+        static constexpr uint32_t kRibbonHistorySamples = 6;
 
         // Maximum simultaneous emitter slots (multi-emitter roadmap, subtask A1) -- small and fixed
         // (unlike kMaxParticles, no sort/perf pressure motivates a larger number yet; a future
@@ -546,6 +589,60 @@ namespace renderer {
         VkDescriptorSetLayout m_LightingSetLayout = VK_NULL_HANDLE;
         VkDescriptorPool m_LightingDescriptorPool = VK_NULL_HANDLE;
         VkDescriptorSet m_LightingSet = VK_NULL_HANDLE;
+
+        // ===================================================================================
+        // B1 (Mesh Particle render mode) -- a small, fixed, shared vertex/index buffer holding BOTH
+        // procedural mesh archetypes (box + icosphere), generated ONCE at Init() by reusing
+        // geom_box.comp/geom_icosphere.comp (the SAME GPU generation shaders the main cluster
+        // pipeline builds its procedural entity meshes from -- see Init()'s own comment for why this
+        // is deliberately NOT plumbed through GpuGeometryPagePool/ClusterDAG). Never written again
+        // after Init() -- neither archetype is parametrized at runtime, EmitterParams::meshArchetype
+        // only SELECTS between the two fixed sub-ranges below via vkCmdDrawIndexedIndirect's own
+        // firstIndex/vertexOffset fields.
+        // ===================================================================================
+        GpuBuffer m_MeshVertexBuffer; // struct_custo.glsl's Vertex (48 bytes), STORAGE (generation write) + VERTEX (render read).
+        GpuBuffer m_MeshIndexBuffer;  // uint32 indices, STORAGE (generation write) + INDEX (render read).
+        // One VkDrawIndexedIndirectCommand per archetype (index 0 = box, 1 = icosphere, matching
+        // kMeshArchetypeBox/kMeshArchetypeIcosphere) -- indexCount/firstIndex/vertexOffset are fixed
+        // at Init() (each archetype's own known sub-range), instanceCount is refreshed every
+        // RecordDraw() call from CounterBuffer.aliveCount (mirrors m_IndirectDrawBuffer's own
+        // instanceCount-copy idiom, done in RecordDraw() rather than RecordSort() specifically so
+        // this feature never has to touch RecordSort()/ParticleSort.comp at all).
+        GpuBuffer m_MeshIndirectDrawBuffer[2];
+        // Reuses m_RenderPipelineLayout (sets 0/1/2/3 = particle/sort/renderParams/lighting -- see
+        // that layout's own comment) unmodified except for one new small push-constant range this
+        // pipeline's own vertex shader uses to know which archetype (box/icosphere) THIS draw call
+        // represents (ParticleRender.vert/.frag, the billboard pipeline sharing the same layout,
+        // simply never declares/reads that range -- legal, see Init()'s own STEP 6c comment).
+        VkPipeline m_MeshPipeline = VK_NULL_HANDLE;
+
+        // ===================================================================================
+        // B2 (Ribbon/Trail render mode) -- per-particle-SLOT position-history ring buffers, a
+        // dedicated descriptor set (set 4 for both the simulation compute pipeline and the ribbon
+        // render pipeline -- see ParticleRibbonCommon.glsl's own header comment for why this is a
+        // SEPARATE set rather than 2 more bindings appended to m_SetLayout) written every
+        // UpdateParticle() call (ParticleSimulation.comp) and read by ParticleRibbonRender.vert to
+        // build each particle's own trailing quad-strip.
+        // ===================================================================================
+        GpuBuffer m_RibbonHistoryBuffer;      // kMaxParticles * kRibbonHistorySamples vec4 positions, GPU_ONLY.
+        GpuBuffer m_RibbonSampleCountBuffer;  // kMaxParticles uint32 "total pushes so far" counters, GPU_ONLY.
+        VkDescriptorSetLayout m_RibbonSetLayout = VK_NULL_HANDLE;
+        VkDescriptorPool m_RibbonDescriptorPool = VK_NULL_HANDLE;
+        VkDescriptorSet m_RibbonSet = VK_NULL_HANDLE;
+        // VkDrawIndirectCommand (non-indexed, procedurally generated via gl_VertexIndex exactly like
+        // the billboard pipeline -- see ParticleRibbonRender.vert's own comment): vertexCount fixed
+        // at Init() (6 vertices/segment * (kRibbonHistorySamples - 1) segments), instanceCount
+        // refreshed every RecordDraw() call from CounterBuffer.aliveCount, same "refresh in
+        // RecordDraw(), never touch RecordSort()" convention as m_MeshIndirectDrawBuffer above.
+        GpuBuffer m_RibbonIndirectDrawBuffer;
+        // A dedicated pipeline layout (unlike m_MeshPipeline's reuse of m_RenderPipelineLayout
+        // above): ribbon rendering needs a 5th descriptor set (m_RibbonSetLayout, the position
+        // history above) on top of the SAME 4 sets the billboard AND mesh pipelines already bind
+        // (particle/sort/renderParams/lighting) -- ribbons are alpha-blended and back-to-front
+        // sorted exactly like billboards (both read SortedPairsBuffer via set 1), unlike a real
+        // opaque 3D mesh instance where draw order does not affect correctness.
+        VkPipelineLayout m_RibbonRenderPipelineLayout = VK_NULL_HANDLE;
+        VkPipeline m_RibbonPipeline = VK_NULL_HANDLE;
     };
 
 }

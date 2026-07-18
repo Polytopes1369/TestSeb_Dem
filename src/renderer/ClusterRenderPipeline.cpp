@@ -1523,6 +1523,14 @@ void ClusterRenderPipeline::RecordFrameEarly(VkCommandBuffer cmdEarly,
             gpu.sizeCurve[key] = cfg.sizeCurve[key];
         }
 
+        // Niagara-parity roadmap (bundled B1/B2/B3 render-mode workstream) -- same "copy the live
+        // ImGui-edited config value into this frame's GPU struct" pattern as every field above.
+        gpu.renderMode = cfg.renderMode;
+        gpu.meshArchetype = cfg.meshArchetype;
+        gpu.ribbonWidth = cfg.ribbonWidth;
+        gpu.spriteOrientationMode = cfg.spriteOrientationMode;
+        gpu.subVariationStrength = cfg.subVariationStrength;
+
         if (cfg.active) {
           m_ParticleSpawnAccumulator[i] += cfg.spawnRate * particleDeltaTimeSeconds;
         }
