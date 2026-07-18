@@ -1237,6 +1237,7 @@ void ClusterRenderPipeline::Shutdown() {
   m_SDFRayMarch.Shutdown();
   m_DebugBufferView.Shutdown();
   m_ParticleDebugView.Shutdown();
+  m_PcgPointCloudDebugView.Shutdown();
 #endif
   m_AtmosClouds.Shutdown();
   m_AtmosFog.Shutdown();
