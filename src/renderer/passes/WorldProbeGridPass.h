@@ -117,6 +117,11 @@ namespace renderer {
 
         void Shutdown();
 
+        // Atmos weather system, Subtask 5: binds renderer::AtmosSkyPass's Sky-View LUT into set 0's
+        // binding 5 -- must be called exactly once after both Init() and AtmosSkyPass's own Init(),
+        // before the first RecordUpdate() call.
+        void SetAtmosSkyView(VkImageView skyViewLUTView, VkSampler skyViewLUTSampler);
+
         // Phase 6 (UE5.8 parity roadmap): recenters the grid's covered WINDOW (snapped to whole-
         // probe steps, so a probe that hasn't left the window keeps its own stable physical texel
         // address across frames -- see the class comment's toroidal-streaming rationale) around
@@ -129,8 +134,10 @@ namespace renderer {
         // (Surface Cache radiance atlas + TLAS visible) and after (grid writes visible to a later
         // sampled read, e.g. renderer::ScreenTracePass) this call -- same discipline as
         // SurfaceCacheGIInjectPass::RecordInject.
+        // `sunDirectionWorld` (Atmos Subtask 5): fed to a probe-ray miss's own Sky-View LUT sample,
+        // points FROM the light TOWARD the scene.
         void RecordUpdate(VkCommandBuffer cmd, const maths::vec3& cameraPositionWorld,
-            const SurfaceCacheTraceContext& traceContext, uint32_t traceMode);
+            const SurfaceCacheTraceContext& traceContext, uint32_t traceMode, const maths::vec3& sunDirectionWorld);
 
         VkImageView GetGridView() const { return m_GridView; }
         VkSampler GetGridSampler() const { return m_GridSampler; }
@@ -192,8 +199,8 @@ namespace renderer {
         static constexpr uint32_t kMaxDirtySlabsPerCall = 3;
 
         void EnqueueDirtyRegionsForGrid(const maths::vec3& cameraPositionWorld);
-        void DrainAndRecordSlabs(VkCommandBuffer cmd, const SurfaceCacheTraceContext& traceContext, uint32_t traceMode);
-        void RecordSlab(VkCommandBuffer cmd, const DirtySlab& slab, const SurfaceCacheTraceContext& traceContext, uint32_t traceMode);
+        void DrainAndRecordSlabs(VkCommandBuffer cmd, const SurfaceCacheTraceContext& traceContext, uint32_t traceMode, const maths::vec3& sunDirectionWorld);
+        void RecordSlab(VkCommandBuffer cmd, const DirtySlab& slab, const SurfaceCacheTraceContext& traceContext, uint32_t traceMode, const maths::vec3& sunDirectionWorld);
     };
 
 }

@@ -41,23 +41,47 @@ set(IMGUI_SOURCES
     ${IMGUI_DIR}/backends/imgui_impl_vulkan.cpp
 )
 
+# --- Configuration Node Editor (Phase 7.1 -- PCG Graph Editor scaffold, editor-tooling only) ---
+# Vendored from thedmd/imgui-node-editor (MIT license), master branch commit
+# 021aa0ea4da13fed864bafb2a92d4c5205076866 (2026-02-20). That project's own docs/README.md states
+# its only dependency is "Vanilla ImGui 1.72+" and that integration is source-only -- "Node Editor
+# sources are located in root project directory. To use it, simply copy&paste sources into your
+# project" -- exactly the same copy-the-sources-in approach already used for ${IMGUI_SOURCES}
+# above, so it is wired in identically. Builds clean against this project's own vendored ImGui
+# 1.92.9 WIP (docking branch) since it only touches ImGui's public API. Only the library's own 4
+# .cpp translation units are vendored (crude_json/imgui_canvas/imgui_node_editor/
+# imgui_node_editor_api) -- the upstream repo's examples/, external/ (its own private ImGui fork
+# submodule, unused here) and docs/ are deliberately NOT copied in, keeping the vendored footprint
+# to exactly what src/renderer/debug/PcgGraphEditorPanel.cpp needs to link against.
+# This is purely an editor tool (an ImGui node-canvas widget), same exclusion discipline as
+# ${IMGUI_SOURCES}: Debug-only, zero object code and zero string/symbol footprint in Release.
+set(NODE_EDITOR_DIR "${CMAKE_CURRENT_SOURCE_DIR}/vendor/imgui-node-editor")
+set(NODE_EDITOR_SOURCES
+    ${NODE_EDITOR_DIR}/crude_json.cpp
+    ${NODE_EDITOR_DIR}/imgui_canvas.cpp
+    ${NODE_EDITOR_DIR}/imgui_node_editor.cpp
+    ${NODE_EDITOR_DIR}/imgui_node_editor_api.cpp
+)
+
 # --- Création de l'exécutable ---
-add_executable(${PROJECT_NAME} 
-    ${ALL_SOURCES} 
-    ${ALL_HEADERS} 
+add_executable(${PROJECT_NAME}
+    ${ALL_SOURCES}
+    ${ALL_HEADERS}
 )
 
 target_sources(${PROJECT_NAME} PRIVATE
     $<$<CONFIG:Debug>:${IMGUI_SOURCES}>
+    $<$<CONFIG:Debug>:${NODE_EDITOR_SOURCES}>
 )
 
 # --- Includes ---
-target_include_directories(${PROJECT_NAME} PRIVATE 
+target_include_directories(${PROJECT_NAME} PRIVATE
     src
     ${Vulkan_INCLUDE_DIRS}
     vendor/vma
     $<$<CONFIG:Debug>:${IMGUI_DIR}>
     $<$<CONFIG:Debug>:${IMGUI_DIR}/backends>
+    $<$<CONFIG:Debug>:${NODE_EDITOR_DIR}>
 )
 
 # --- Linking ---
@@ -169,6 +193,7 @@ add_test(NAME LoadingManagerTests COMMAND LoadingManagerTests)
 
 add_executable(StreamingManagerTests
     src/core/LoadingManager.cpp
+    src/core/Logger.cpp
     src/world/StreamingManager.cpp
     tests/StreamingManagerTests.cpp
 )
@@ -180,6 +205,15 @@ add_executable(BlockCodecTests
     tests/BlockCodecTests.cpp
 )
 target_include_directories(BlockCodecTests PRIVATE src ${Vulkan_INCLUDE_DIRS})
+
+# PCG framework roadmap, Phase 1 ("PCG Data Model"): src/pcg/*.h are header-only data types (no
+# accompanying .cpp yet -- nothing generates/consumes PCG data at runtime until a later phase), so
+# this target links no additional source beyond the test file itself.
+add_executable(PcgDataModelTests
+    tests/PcgDataModelTests.cpp
+)
+target_include_directories(PcgDataModelTests PRIVATE src ${Vulkan_INCLUDE_DIRS})
+add_test(NAME PcgDataModelTests COMMAND PcgDataModelTests)
 add_test(NAME BlockCodecTests COMMAND BlockCodecTests)
 
 add_executable(AsyncDecompressingLoaderTests
@@ -286,17 +320,47 @@ if(WORLDPARTITION_MESHOPT_DEFINE)
 endif()
 add_test(NAME HlodPipelineTests COMMAND HlodPipelineTests)
 
+# Phase 5 (Streaming & Monde roadmap, Part 2, Gap 2): round-trip test for the v1 -> v2
+# RuntimeCellManifest format bump -- deliberately links BOTH the offline writer
+# (tools/WorldPartition/RuntimeCellManifest.cpp) AND the runtime reader (src/world/CellManifest.cpp)
+# in the SAME test executable, the one place in this codebase where crossing the src//tools/
+# boundary in a single binary is exactly the point: this is the one seam the two sides must agree on
+# byte-for-byte, and only a test that links both can actually prove that.
+add_executable(RuntimeCellManifestV2Tests
+    tools/WorldPartition/RuntimeCellManifest.cpp
+    src/world/CellManifest.cpp
+    tests/RuntimeCellManifestV2Tests.cpp
+)
+target_include_directories(RuntimeCellManifestV2Tests PRIVATE src tools ${Vulkan_INCLUDE_DIRS})
+add_test(NAME RuntimeCellManifestV2Tests COMMAND RuntimeCellManifestV2Tests)
+
 # WorldPartitionBakeTool: standalone dev-time content-authoring executable (see
 # tools/WorldPartition/BakeDemoWorld.cpp's own header comment) -- NOT a test, not registered via
 # add_test, run manually once to populate world_data/ for the runtime streaming demo. Links the
 # same OFPA sources as OfpaSerializationTests plus RuntimeCellManifest.cpp.
+#
+# Phase 5 (Streaming & Monde roadmap, Part 2) build-target fix: this target previously did NOT link
+# HlodPipeline.cpp/MeshSimplifier.cpp/Logger.cpp (only HlodPipelineTests did, see
+# WORLDPARTITION_HLOD_SOURCES above) -- BakeDemoWorld.cpp now calls HlodPipeline::BuildHlodForCell
+# (real HLOD proxy baking, Gap 3), so those sources plus the new ArchetypeMeshLibrary.cpp (Gap 1,
+# this tool's own CPU mesh source for HlodPipeline::GatherCellMeshes) must be linked here too, or
+# this target fails at link time with unresolved externals the moment BakeDemoWorld.cpp is compiled
+# against HlodPipeline.h's declarations.
 add_executable(WorldPartitionBakeTool
     ${WORLDPARTITION_OFPA_SOURCES}
     tools/WorldPartition/SpatialHashGrid.cpp
     tools/WorldPartition/RuntimeCellManifest.cpp
+    tools/WorldPartition/HlodPipeline.cpp
+    tools/WorldPartition/ArchetypeMeshLibrary.cpp
+    src/geometry/MeshSimplifier.cpp
+    src/core/Logger.cpp
     tools/WorldPartition/BakeDemoWorld.cpp
 )
 target_include_directories(WorldPartitionBakeTool PRIVATE src tools ${Vulkan_INCLUDE_DIRS})
+if(WORLDPARTITION_MESHOPT_DEFINE)
+    target_compile_definitions(WorldPartitionBakeTool PRIVATE ${WORLDPARTITION_MESHOPT_DEFINE})
+    target_link_libraries(WorldPartitionBakeTool PRIVATE ${WORLDPARTITION_MESHOPT_LIB})
+endif()
 
 # ==============================================================================
 # AUTOMATIZED SHADER COMPILATION & POST-BUILD COPY
@@ -346,10 +410,17 @@ if(Vulkan_GLSLC_EXECUTABLE)
         # MegaLightsShade.comp -- Phase A of the MegaLights native-port roadmap's own inline-HWRT
         # shadow-visibility ray, see that shader's own TraceShadowRay comment; TransparentForward.frag
         # -- the same Phase A follow-up's inlined shadow-ray shading for the translucent/glass path,
-        # see that shader's own TraceShadowRay comment; HeroTessellation.frag -- Phase 7a's own copy
-        # of the same inlined MegaLights shadow-ray + optional reflection trace, see that shader's
-        # own TraceShadowRay/TraceHWRT comments; WaterForward.frag -- Phase 7c's own copy of the
-        # same inlined optional reflection trace, see that shader's own TraceHWRT comment).
+        # see that shader's own TraceShadowRay comment; Tessellation.frag -- the generalized
+        # multi-entity tessellation pass' own copy of the same inlined MegaLights shadow-ray +
+        # optional reflection trace (formerly HeroTessellation.frag, single-entity only -- see
+        # renderer::TessellationPass's own class comment), see that shader's own TraceShadowRay/
+        # TraceHWRT comments; WaterForward.frag -- Phase 7c's own copy of the
+        # same inlined optional reflection trace, see that shader's own TraceHWRT comment;
+        # MegaLightsFinalShade.comp -- MegaLights spatial-reuse follow-up's own Stage 3, the
+        # mandatory shadow-ray trace that used to live in MegaLightsShade.comp before the spatial-
+        # reuse split moved it out, see that file's own TraceShadowRay comment; the new Stage 2 in
+        # between, MegaLightsSpatialReuse.comp, does NOT need this -- it only reads/combines
+        # reservoir SSBOs, no ray query of its own).
         # Every other shader stage keeps glslc's default target-env/target-spv untouched.
         get_filename_component(SHADER_EXT ${SHADER_SRC} EXT)
         set(GLSLC_EXTRA_FLAGS "")
@@ -357,7 +428,8 @@ if(Vulkan_GLSLC_EXECUTABLE)
                 OR SHADER_NAME STREQUAL "SurfaceCacheGIInject.comp" OR SHADER_NAME STREQUAL "ScreenProbeTrace.comp"
                 OR SHADER_NAME STREQUAL "WorldProbeInject.comp" OR SHADER_NAME STREQUAL "ReflectionTrace.comp"
                 OR SHADER_NAME STREQUAL "MegaLightsShade.comp" OR SHADER_NAME STREQUAL "TransparentForward.frag"
-                OR SHADER_NAME STREQUAL "HeroTessellation.frag" OR SHADER_NAME STREQUAL "WaterForward.frag")
+                OR SHADER_NAME STREQUAL "Tessellation.frag" OR SHADER_NAME STREQUAL "WaterForward.frag"
+                OR SHADER_NAME STREQUAL "MegaLightsFinalShade.comp")
             set(GLSLC_EXTRA_FLAGS --target-env=vulkan1.3 --target-spv=spv1.4)
         endif()
 

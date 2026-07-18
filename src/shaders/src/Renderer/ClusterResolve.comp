@@ -80,6 +80,16 @@
 #include "include/shadow_atlas_sampling.glsl"
 #include "include/shadow_sun_sampling.glsl"
 
+// Atmos weather system, Subtask 5: Sky-View LUT (ambient replacement) + Cloud Shadow Map (sun term
+// modulation) -- see ClusterResolveBinned.comp's own identical binding comment (this Debug-only
+// full-screen path needs the exact same 2 bindings as that always-live one, just at different
+// indices since its own binding numbering already differs -- see this file's own binding-list
+// comment at the top).
+#include "include/atmos_sky_lut_mapping.glsl"
+#include "include/atmos_clouds_density.glsl"
+layout(set = 0, binding = 27) uniform sampler2D g_SkyViewLUT;
+layout(set = 0, binding = 28) uniform sampler2D g_CloudShadowMap;
+
 // Step 4 (Virtual Texturing / RVT-SVT parity roadmap): terrain/decal material detail sampled from
 // renderer::VirtualTextureManager's page table + physical atlas, exactly like UE 5.8's Runtime
 // Virtual Texture material expression -- see this shader's own Step 3 material-evaluation comment
@@ -123,8 +133,15 @@ layout(std140, set = 0, binding = 7) uniform ResolveViewParamsUBO {
     mat4 viewProj;
     mat4 prevViewProj; // DEBUG_VIEW_MOTION_VECTORS' own reprojection -- see renderer::ClusterResolvePass::RecordResolve's comment.
     vec2 viewportSize;
-    float _pad0;
-    float _pad1;
+    // Atmos weather system, surface response extension: global [0,1] wetness/snow-coverage scalars
+    // (renderer::AtmosClimatePass::GetSurfaceWetness()/GetSnowCoverage(), see that class' own
+    // RecordUpdate() comment) -- repurposes what were two previously-unused std140 padding floats
+    // (the vec2 viewportSize above still needs padding to a 16-byte boundary before vec3 sunDirection
+    // below; these two floats now carry real data instead of being dead padding, at zero extra UBO
+    // size). Consumed by substrate_bsdf.glsl's ApplySurfaceWeather, called below right before the
+    // Substrate BSDF evaluation.
+    float surfaceWetness;
+    float snowCoverage;
     // Phase 3: sun direction (points FROM the light TOWARD the scene, matching renderer::
     // DirectionalLight's own convention) -- this shader's direct-lighting term now uses the SAME
     // sun direction the shadow was rendered from (see Step 3 below), instead of the pre-Phase-3
@@ -399,9 +416,13 @@ void main() {
         vec3 lightDir = normalize(-g_ViewParams.sunDirection);
         float diff = max(dot(normal, lightDir), 0.0);
         // Phase 3: shadow visibility for the sun, sampled from renderer::VirtualShadowMapPass's
-        // 3-level clipmap -- only the direct `diff` term is shadowed, not the ambient/fill term
-        // below (kAmbientFraction has no directional occluder to speak of).
+        // 3-level clipmap -- only the direct `diff` term is shadowed, not the sky-ambient term below
+        // (its own Sky-View LUT sample already encodes the physical sky, no separate occluder term
+        // needed on top of it).
         float sunVisibility = (diff > 0.0) ? SampleSunShadowVSM(worldPos) : 1.0;
+        // Atmos weather system, Subtask 5: cloud shadow modulation -- see ClusterResolveBinned.comp's
+        // own identical comment.
+        sunVisibility *= texture(g_CloudShadowMap, AtmosCloudShadowUVFromWorldXZ(worldPos.xz)).r;
         // Substrate integration: the view direction EvaluateSubstrateMaterial's specular/Fresnel
         // terms need -- see this file's own ResolveViewParamsUBO.cameraPositionWorld comment.
         vec3 viewDir = normalize(g_ViewParams.cameraPositionWorld - worldPos);
@@ -457,6 +478,14 @@ void main() {
         vec3 vtAlbedo = SampleVirtualTextureLOD(0u, vtUV, vtLod, g_VTVolume.virtualTextureSize, g_VTVolume.tileSize, g_VTVolume.borderSize).rgb;
         mat.base.diffuseAlbedo *= vtAlbedo;
 
+        // Atmos weather system, surface response extension: wet/snow surface modulation, applied
+        // right before the BSDF is evaluated so both the direct sun term AND the sky-ambient
+        // multiply below (mat.base.diffuseAlbedo * skyAmbient) AND the GBuffer albedo/roughness
+        // outputs (gbufferAlbedo/gbufferRoughnessMetallic, set further below from this same `mat`)
+        // all see the weathered material consistently -- see substrate_bsdf.glsl's own
+        // ApplySurfaceWeather comment for the exact formula.
+        mat = ApplySurfaceWeather(mat, normal, g_ViewParams.surfaceWetness, g_ViewParams.snowCoverage);
+
         // Substrate: full Slab BSDF response (diffuse + anisotropic specular + second lobe/Haze +
         // fuzz, vertically layered with the Top slab if any -- see substrate_bsdf.glsl's own
         // EvaluateSubstrateMaterial comment) to the sun's direction, shadowed by sunVisibility.
@@ -467,12 +496,12 @@ void main() {
         // real color/intensity" (substrate_bsdf.glsl's own comment; its diffuse lobe already bakes
         // in the /PI Lambertian normalization, the specular/fuzz lobes need none), so `directResponse
         // * sunRadiance` is already the correct, complete outgoing radiance -- no extra factor here.
-        // kAmbientFraction is a flat hemispheric sky/ambient fill (this engine has no separate
-        // skylight system yet) expressed as a fraction of the sun's own illuminance, so it scales
-        // consistently with whatever sun intensity is configured instead of being a fixed, unscaled
-        // constant; it has no single light direction for a BRDF to respond to, so it stays a plain
-        // diffuseAlbedo tint (unchanged from the pre-Substrate shader's own identical simplification).
-        const float kAmbientFraction = 0.05;
+        // Atmos weather system, Subtask 5: the flat kAmbientFraction*sunRadiance hemispheric fill
+        // (this shader's only skylight approximation before this phase) is replaced by a single
+        // Sky-View LUT sample in the surface normal's own direction -- see ClusterResolveBinned.
+        // comp's own identical comment for the full rationale (cheap one-tap stand-in for a full
+        // cosine-weighted hemisphere integral, still a genuine improvement over a flat constant).
+        vec3 skyAmbient = texture(g_SkyViewLUT, SkyViewLUTUVFromDirection(normal, g_ViewParams.sunDirection)).rgb;
         vec3 sunRadiance = g_ViewParams.sunColor * g_ViewParams.sunIntensity;
         vec3 directResponse = EvaluateSubstrateMaterial(mat, normal, viewDir, lightDir);
         // kEmissiveScale converts this codebase's existing artist-authored, unitless emissive
@@ -484,7 +513,7 @@ void main() {
         // 0.85-albedo diffuse surface under this engine's default sun -- i.e. still reads as
         // "glowing", not just "well lit".
         const float kEmissiveScale = 1500.0;
-        finalColor = mat.base.diffuseAlbedo * kAmbientFraction * sunRadiance
+        finalColor = mat.base.diffuseAlbedo * skyAmbient
             + directResponse * sunRadiance * sunVisibility
             + EvaluateSubstrateEmissive(mat) * kEmissiveScale;
 

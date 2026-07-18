@@ -123,13 +123,15 @@
 #include "renderer/passes/GeometryDecompressionPass.h"
 #include "renderer/streaming/GeometryStreamingCoordinator.h"
 #include "renderer/passes/AtmosClimatePass.h"
+#include "renderer/passes/AtmosCloudsPass.h"
 #include "renderer/passes/AtmosSkyPass.h"
 #include "renderer/passes/AtmosVolumetricFogPass.h"
 #include "renderer/passes/GlobalSDFPass.h"
 #include "renderer/vulkan/GpuBuffer.h"
 #include "renderer/streaming/GpuGeometryPagePool.h"
-#include "renderer/passes/HeroTessellationPass.h"
+#include "renderer/passes/TessellationPass.h"
 #include "renderer/passes/WaterForwardPass.h"
+#include "renderer/passes/ParticleSystemPass.h"
 #include "renderer/passes/HZBPass.h"
 #include "renderer/LightingTypes.h"
 #include "renderer/passes/ProceduralMaskGenerator.h"
@@ -346,6 +348,11 @@ namespace renderer {
         // ImGui tab (atmos_integration_plan.md Subtask 1, objective #4) -- same "borrow a const ref"
         // convention as e.g. GetTracedEntityInfos() elsewhere in this class.
         const AtmosClimatePass& GetAtmosClimate() const { return m_AtmosClimate; }
+
+        // Exposes ParticleSystemPass for main.cpp's own Particles ImGui tab (Subtask 6's own
+        // Debug-only GetLastAliveCountApprox() readout) -- same "borrow a const ref" convention as
+        // GetAtmosClimate() above.
+        const ParticleSystemPass& GetParticleSystem() const { return m_ParticleSystem; }
 
 #ifndef NDEBUG
         // SWRT/HWRT back-end toggle shared by m_GIInject and m_WorldProbes' own trace pass (0 = SWRT
@@ -668,29 +675,64 @@ namespace renderer {
         // same build-separation rule as m_ShadingBin above.
         TransparentForwardPass m_TransparentForward;
 
-        // Phase 7a (UE5.8 parity roadmap, hero asset tessellation): forward-rendered, screen-space-
-        // adaptively-tessellated, procedurally-displaced hero Icosphere (materialID
-        // kHeroMaterialID, culled out of the opaque Nanite path entirely via core::EntityFlags::
-        // IsTransparent -- see VulkanContext::BuildEntityData()'s own comment) -- lit exactly like
-        // m_TransparentForward above (direct+shadowed sun, MegaLights RIS point lights,
-        // m_WorldProbes' indirect diffuse, an optional single-sample front-layer specular
+        // Generalized Nanite Tessellation (renderer::TessellationPass, generalized from the earlier
+        // Phase 7a single-hardcoded-entity "HeroTessellationPass" -- see that class' own class
+        // comment): forward-rendered, screen-space-adaptively-tessellated, procedurally-displaced
+        // pass for every core::EntityFlags::IsTessellated entity (VulkanContext::
+        // kTessellatedEntityIndices, culled out of the opaque Nanite path entirely via
+        // core::EntityFlags::IsTransparent -- see VulkanContext::BuildEntityData()'s own comment)
+        // -- lit exactly like m_TransparentForward above (direct+shadowed sun, MegaLights RIS point
+        // lights, m_WorldProbes' indirect diffuse, an optional single-sample front-layer specular
         // reflection), but fully OPAQUE and depth-WRITING (unlike glass). Recorded right BEFORE
         // m_TransparentForward's own draw -- specifically so that pass' own read-only depth test
-        // correctly occludes glass/translucent entities against this entity's real (displaced)
-        // surface, see HeroTessellationPass's own class comment for the resulting barrier-scope
-        // consequence.
-        HeroTessellationPass m_HeroTessellation;
+        // correctly occludes glass/translucent entities against every tessellated entity's real
+        // (displaced) surface, see TessellationPass's own class comment for the resulting
+        // barrier-scope consequence.
+        TessellationPass m_Tessellation;
 
         // Phase 7c (UE5.8 parity roadmap, water/erosion): forward-rendered water plane (materialID
         // kWaterMaterialID, culled out of the opaque Nanite path via core::EntityFlags::
-        // IsTransparent, same mechanism as m_HeroTessellation above -- see VulkanContext::
+        // IsTransparent, same mechanism as m_Tessellation above -- see VulkanContext::
         // BuildEntityData()'s own comment). Recorded LAST among the forward passes (after
         // m_TransparentForward) -- see WaterForwardPass's own class comment for why: it blits the
-        // ALREADY fully-composited frame (opaque + GI + glass + hero) into its own private
-        // background-snapshot image for its refraction term, so anything drawn after it would be
-        // invisible to that refraction (and anything drawn before it that skipped this ordering
-        // would show through unrealistically, since water is meant to be the top-most surface).
+        // ALREADY fully-composited frame (opaque + GI + glass + tessellated entities) into its own
+        // private background-snapshot image for its refraction term, so anything drawn after it
+        // would be invisible to that refraction (and anything drawn before it that skipped this
+        // ordering would show through unrealistically, since water is meant to be the top-most
+        // surface).
         WaterForwardPass m_WaterForward;
+
+        // GPU-driven particle system (Niagara-style), particle_system_integration_plan.md (project
+        // root), all 6 subtasks now integrated -- see renderer::ParticleSystemPass's own class
+        // comment. RecordSimulate/RecordSort run in RecordFrameEarly (right after m_GlobalSDF's own
+        // update, see that call site's own comment); RecordDraw runs in RecordFrameLate's [13c]
+        // forward block, right after m_WaterForward (matching the plan doc's own "after opaque
+        // Nanite + transparent, before post-process" ordering requirement). Declared after
+        // m_WaterForward (not interleaved with the GI infrastructure below) for the same reason.
+        // Always initialized (not Debug-only), same build-separation rule as m_TransparentForward
+        // above.
+        ParticleSystemPass m_ParticleSystem;
+        // Subtask 6: this pass' own frame-to-frame delta-time tracking, computed independently from
+        // RecordFrameLate's own `deltaTimeSeconds` (that one isn't computed yet by the time
+        // RecordFrameEarly reaches m_ParticleSystem.RecordSimulate() -- see that call site's own
+        // comment) but using the identical clamp-against-stalls formula.
+        float m_LastParticleFrameTimeSeconds = 0.0f;
+        bool m_HasLastParticleFrameTime = false;
+        // Multi-emitter roadmap (subtask A1): one fractional spawn-count carry-over per emitter slot
+        // (was a single float pre-A1) so each emitter's own config::particles::EMITTERS[i].spawnRate
+        // stays exact over time regardless of framerate, independently of every other emitter (e.g.
+        // one emitter at 200/s and another at 40/s each round correctly on their own schedule, never
+        // silently rounding a fractional request down to 0). The rivers/waterfalls feature's mist
+        // emitter (EMITTERS[3]) rides this same per-slot array, not a separate accumulator.
+        float m_ParticleSpawnAccumulator[ParticleSystemPass::kMaxEmitters] = {};
+        // Precipitation feature (rain/snow tied to the Atmos climate simulation) -- identical
+        // fractional-carry-over role as m_ParticleSpawnAccumulator above, just against
+        // config::atmos::PRECIPITATION_INTENSITY * PRECIPITATION_MAX_SPAWN_RATE_PER_SECOND instead
+        // of any embers emitter's own fixed spawnRate. Kept as a separate accumulator (not folded
+        // into the m_ParticleSpawnAccumulator array above) since precipitation is not one of the
+        // config::particles::EMITTERS[] slots -- it has its own dedicated camera-relative spawn-shell
+        // and kind-resolution logic (see RecordSimulate's own precip* parameters).
+        float m_PrecipSpawnAccumulator = 0.0f;
 
         // Lumen-style GI infrastructure -- unlike the debug-only stats/overlay block below, these
         // are real (if not yet light-transport-consuming) systems, not visualization tools, so
@@ -742,6 +784,12 @@ namespace renderer {
         // exercise/verify Phase 3's point-light Virtual Shadow Maps (see Init()'s own comment) --
         // see renderer::LightingTypes.h's own comment for the full field-by-field default.
         SceneLights m_SceneLights;
+        // Dynamic Weather Simulation's seasonal cycle (AtmosClimatePass, see its own
+        // GetSeasonalSunElevationOffsetRadians() comment): the FIXED base sun elevation/azimuth
+        // Init() authors into m_SceneLights.sun.direction, above, kept separately so each frame can
+        // recompute the seasonally-offset direction from this same unchanging base instead of
+        // compounding an offset onto an already-offset value.
+        maths::vec3 m_BaseSunDirection;
 
         // Shared trace-scene descriptor sets (mesh SDF trace + Surface Cache sampling, see
         // SurfaceCacheTraceContext's own class comment) built once from m_GlobalSDF + m_SurfaceCache,
@@ -793,6 +841,10 @@ namespace renderer {
         // class comment. Init'd after m_MegaLights (its own last dependency to become ready: also
         // needs m_AtmosClimate and m_VirtualShadowMap, both already Init'd much earlier).
         AtmosVolumetricFogPass m_AtmosFog;
+        // Atmos weather system, Subtask 4: Procedural Volumetric Clouds -- see AtmosCloudsPass's own
+        // class comment. Only needs m_AtmosClimate (already Init'd much earlier); Init'd here purely
+        // for proximity to the other Atmos passes, not because of any real dependency ordering.
+        AtmosCloudsPass m_AtmosClouds;
 
         // World Probe grid (Lumen "Translucency Volume" / global illumination volume): a low-
         // resolution, camera-centered 3D grid of ambient irradiance probes, fully rebuilt every

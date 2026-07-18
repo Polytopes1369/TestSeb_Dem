@@ -11,7 +11,9 @@
 #include "world/StreamingManager.h"
 #include "world/CellManifest.h"
 #include "world/WorldCellStreamingLoader.h"
+#include "world/LwcOrigin.h"
 #include <exception>
+#include <optional>
 #include <unordered_map>
 #include <vector>
 #include <format>
@@ -19,12 +21,16 @@
 #include <thread>
 #include <chrono>
 #include <algorithm>
+#include <cmath>
 
 #ifndef NDEBUG
 #include "core/debug/DebugTestPipeline.h"
 #include "imgui.h"
 #include "backends/imgui_impl_glfw.h"
 #include "backends/imgui_impl_vulkan.h"
+// Phase 7.1 (PCG editor-tooling roadmap): "PCG Graph Editor" tab scaffold, see that header's own
+// comment for what it does/doesn't do yet.
+#include "renderer/debug/PcgGraphEditorPanel.h"
 #endif
 
 // Unreal-editor style viewport navigation: hold the Right Mouse Button to enable FPS-style
@@ -104,10 +110,11 @@ struct DebugState {
     // enhanced_displacement.glsl). Key 'J' -- moved off 'B' (this branch's original key) during the
     // Substrate integration merge: 'B' was independently claimed there for the DEBUG_VIEW_SUBSTRATE_SLABS
     // view-mode toggle (see that case's own comment), a genuine concurrent-development key collision,
-    // not a duplicate. NOTE: entity 2 is ALSO now VulkanContext::kHeroEntityIndex (Phase 7a hero
-    // tessellation), which routes it through HeroTessellationPass instead of the Nanite VisBuffer path
-    // this flag gates -- see VulkanContext::BuildEntityData()'s own "KNOWN COLLISION" comment. This key
-    // currently has no visible effect until that separate collision is resolved.
+    // not a duplicate. NOTE: entity 2 is ALSO now VulkanContext::kHeroEntityIndex (part of the
+    // generalized Nanite Tessellation feature's kTessellatedEntityIndices), which routes it through
+    // renderer::TessellationPass instead of the Nanite VisBuffer path this flag gates -- see
+    // VulkanContext::BuildEntityData()'s own "KNOWN COLLISION" comment. This key currently has no
+    // visible effect until that separate collision is resolved.
     bool enhancedDisplacementEnabled = true;
     // Phase 1 (Nanite advanced): renderer::ClusterRenderPipeline::SetDebugSplineDeformationEnabled
     // -- gates the runtime Hermite-spline bend on entity 6 (Tube, see spline_deformation.glsl).
@@ -119,8 +126,22 @@ struct DebugState {
     // the default) or keep them fully graphics-queue-serialized (false, the pre-Phase-2 behavior)
     // -- see that setter's own comment for the staged-bring-up rationale. Key 'C' ("async Compute").
     bool asyncComputeEnabled = true;
+    // Phase 5 (Streaming & Monde roadmap, Part 1): "simulate large world offset" diagnostic, 0-1000
+    // (km). See this frame loop's own Debug-only block (right after the fly-camera movement block)
+    // for exactly what this drives -- a REAL, independently-run shadow world::LwcOrigin exercised at
+    // this magnitude, proving the rebase subtraction round-trip stays precise at large offsets
+    // WITHOUT ever perturbing the actual render path (camera.m_Position/authored content untouched).
+    // Defaults to 0.0f (diagnostic inert, zero cost) -- set via the ImGui slider in the Streaming
+    // panel below.
+    float simulatedLwcOffsetKm = 0.0f;
 };
 static DebugState g_DebugState;
+
+// Phase 7.1 (PCG editor-tooling roadmap): owns the "PCG Graph Editor" tab's own imgui-node-editor
+// context -- a pure editor scaffold, see renderer::debug::PcgGraphEditorPanel's own header comment
+// for exactly what it does/doesn't do yet. Initialized once right after ImGui_ImplVulkan_Init()
+// below, drawn from inside ConfigTabs, torn down alongside every other ImGui teardown call.
+static renderer::debug::PcgGraphEditorPanel g_PcgGraphEditorPanel;
 
 static void KeyCallback(GLFWwindow* window, int key, int scancode, int action, int mods) {
     if (action != GLFW_PRESS) return;
@@ -401,6 +422,10 @@ int main(int argc, char** argv) {
     init_info.PipelineInfoMain.PipelineRenderingCreateInfo.depthAttachmentFormat = VK_FORMAT_UNDEFINED;
 
     ImGui_ImplVulkan_Init(&init_info);
+
+    // Phase 7.1 (PCG editor-tooling roadmap): create the node-editor context once ImGui itself is
+    // fully up -- see g_PcgGraphEditorPanel's own declaration-site comment.
+    g_PcgGraphEditorPanel.Init();
 #endif
 
     // Builds the consolidated virtual geometry .cache file (scene.cache): reads back the spawned
@@ -558,6 +583,7 @@ int main(int argc, char** argv) {
 
         // Mirrors the interactive loop's own shutdown order below: ImGui backend/context torn down
         // before the fence/pipeline/context it borrows GPU handles from.
+        g_PcgGraphEditorPanel.Shutdown();
         ImGui_ImplVulkan_Shutdown();
         ImGui_ImplGlfw_Shutdown();
         ImGui::DestroyContext();
@@ -583,14 +609,14 @@ int main(int argc, char** argv) {
     // gracefully disabled (the fixed showcase gallery still renders normally) rather than treated
     // as a fatal error, unlike scene.cache above: streaming is additive, not load-bearing. ---
     world::CellManifest cellManifest;
-    bool streamingEnabled = cellManifest.Load("world_data/cellmanifest.bin");
+    bool streamingEnabled = cellManifest.Load(world::kDefaultManifestPath);
     if (streamingEnabled) {
         LOG_INFO(std::format("[Main] World Partition streaming ENABLED: {} authored cells (cellSize={:.1f}).",
                               cellManifest.RecordCount(), cellManifest.CellSize()));
     } else {
-        LOG_WARNING("[Main] world_data/cellmanifest.bin not found or unreadable -- World Partition "
+        LOG_WARNING(std::format("[Main] '{}' not found or unreadable -- World Partition "
                     "streaming disabled. Run WorldPartitionBakeTool.exe once (see tools/WorldPartition/"
-                    "BakeDemoWorld.cpp) to author the demo world and enable it.");
+                    "BakeDemoWorld.cpp) to author the demo world and enable it.", world::kDefaultManifestPath));
     }
 
     world::WorldCellStreamingLoader worldCellLoader(cellManifest);
@@ -604,9 +630,24 @@ int main(int argc, char** argv) {
     // unit currently rendering it. If more cells fall within g_StreamingHlodRadius simultaneously
     // than there are free units, the newest ones are silently skipped (logged) until an older cell
     // streams back out -- an explicit, accepted degradation of the bounded pool, not a crash.
+    //
+    // Phase 5 (Streaming & Monde roadmap, Part 2, Gap 3): units [0, GetDedicatedStreamingUnitCount())
+    // are NEVER added to this free-list -- VulkanContext::GenerateGeometry() already baked a real,
+    // specific authored cell's own HLOD proxy + fine archetype mesh into each of them at startup
+    // (see that class' own streaming-pool bake-in comment), and always in this exact contiguous
+    // [0, dedicatedCount) range (unit index == that cell's index in world::CellManifest::
+    // GetOrderedCells(), see GenerateGeometry()'s own loop). Handing one of those units to a
+    // DIFFERENT cell via this free-list would show that cell some other cell's baked geometry --
+    // dedicated cells are instead looked up directly every frame via
+    // GetDedicatedStreamingUnitForCell() in the activation loop below. Only the remaining spare
+    // units (kStreamingUnitCount - dedicatedCount -- always >= 1 by construction, and every unit
+    // when world_data/cellmanifest.bin was missing at startup, dedicatedCount == 0) ever enter this
+    // pool, preserving the pre-Gap-3 shared-archetype-rotation fallback for any cell beyond the
+    // dedicated pool's capacity.
     std::unordered_map<world::CellCoord, uint32_t, world::CellCoordHash> cellToStreamingUnit;
     std::vector<uint32_t> freeStreamingUnits;
-    for (uint32_t u = 0; u < vkContext.GetStreamingUnitCount(); ++u) freeStreamingUnits.push_back(u);
+    const uint32_t dedicatedStreamingUnitCount = vkContext.GetDedicatedStreamingUnitCount();
+    for (uint32_t u = dedicatedStreamingUnitCount; u < vkContext.GetStreamingUnitCount(); ++u) freeStreamingUnits.push_back(u);
 
     auto hashCellCoord = [](const world::CellCoord& c) -> uint32_t {
         return static_cast<uint32_t>(c.x) * 73856093u ^ static_cast<uint32_t>(c.z) * 19349663u;
@@ -618,7 +659,31 @@ int main(int argc, char** argv) {
     // radius from the origin as the old 12-primitive grid did, so this same framing still covers
     // the whole gallery on frame 0; from here on the player drives the camera directly (see the
     // Unreal-editor-style fly controller in the main loop below).
-    Camera camera({ 12.3613f, 6.5726f, 0.0f }, { 0.0f, 0.0f, 0.0f });
+    //
+    // Look-at target raised from the origin to (0, 4, 0) -- purely a pitch adjustment, same
+    // position/distance -- so the Atmos sky/cloud system (renderer::AtmosSkyPass/AtmosCloudsPass,
+    // both unconditionally composited by PostProcessComposite.comp's own !hitScene branch) is
+    // actually visible on launch. At the origin target, this camera's pitch was ~-28 degrees with
+    // a 45-degree vertical FOV (Camera::m_FovDegrees), so even the TOP of the frustum (-28 + 22.5 =
+    // -5.5 degrees) stayed below the horizon and the 300x300 procedural terrain
+    // (VulkanContext::GenerateTerrain) filled the entire frame -- the sky/clouds were fully wired
+    // and rendered every frame, just never actually on screen. Raising the target to y=4 shallows
+    // the pitch to ~-11.8 degrees, putting the top of the frustum at ~+10.7 degrees above the
+    // horizon -- enough open sky to read the Sky-View LUT gradient and cloud layer while the
+    // showcase gallery still fills the rest of the frame.
+    Camera camera({ 12.3613f, 6.5726f, 0.0f }, { 0.0f, 4.0f, 0.0f });
+
+    // Phase 5 (Streaming & Monde roadmap, Part 1): the single LWC origin-tracking instance driving
+    // every render-boundary rebase this frame (Camera::UpdateRebased/GetRebasedPosition for the
+    // camera, VulkanContext::UpdateEntityRotations's originOffset parameter for every entity) --
+    // reuses cellManifest.CellSize() (the SAME ground-plane grid world::StreamingManager already
+    // evaluates streaming decisions against, see world::LwcOrigin's own header comment for why this
+    // must stay one spatial partition, not two). Updated once per frame, after the fly-camera
+    // movement block below (so it sees this frame's final camera position) and before both
+    // camera.UpdateRebased() and vkContext.UpdateEntityRotations() (so both consume this frame's
+    // fresh origin, never a stale one from last frame) -- see this loop's own ordering comment at
+    // the update call site below.
+    world::LwcOrigin lwcOrigin;
 
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
@@ -941,6 +1006,17 @@ int main(int argc, char** argv) {
                 }
                 ImGui::DragFloat("Cloud Ray Sample Scale", &config::volumetrics::_VOLUMETRIC_CLOUD_VIEW_RAY_SAMPLE_COUNT_SCALE, 0.05f, 0.1f, 10.0f);
 
+                // --- Local Fog Volumes (UE5.8 rendering-parity gap G8) -- localized box/sphere fog
+                // regions injected additively into the froxel grid (see config::localfog::VOLUMES
+                // and renderer::AtmosVolumetricFogPass). "Enable Local Fog Volumes" is a real runtime
+                // toggle (zeroes the injected count live); "Debug: Local Fog Volume Bounds" is a
+                // Debug-only visualization -- the whole config panel is already #ifndef NDEBUG-gated,
+                // and the config read that drives the shader flag is itself gated in RecordUpdate. ---
+                ImGui::Separator();
+                ImGui::TextUnformatted("Local Fog Volumes");
+                ImGui::Checkbox("Enable Local Fog Volumes", &config::localfog::ENABLE);
+                ImGui::Checkbox("Debug: Local Fog Volume Bounds", &config::debugview::LOCAL_FOG_VOLUME_BOUNDS_VIZ);
+
                 // --- Atmos weather system, Subtask 1: Climatic State Manager & Wind Simulation ---
                 // (atmos_integration_plan.md, project root) -- live sliders over config::atmos::*,
                 // consumed every frame by renderer::AtmosClimatePass::RecordUpdate. Grouped in this
@@ -948,6 +1024,14 @@ int main(int argc, char** argv) {
                 // sky/fog/cloud quality knobs above are this same weather system's other half.
                 ImGui::Separator();
                 ImGui::TextUnformatted("Atmos Climate");
+                // Dynamic Weather Simulation master toggle (see AtmosClimatePass.h's own class
+                // comment) -- same "auto vs. manual" convention config::postprocess::
+                // EXPOSURE_USE_AUTO already establishes in this codebase (ClusterRenderPipeline.cpp's
+                // own ppSettings.useAutoExposure call site). ON (default): the sliders below become
+                // baseline CENTERS the autonomous simulation drifts around (still fully live, still
+                // visibly shift the result) rather than literal per-frame state. OFF: byte-for-byte
+                // the original manual behavior.
+                ImGui::Checkbox("Dynamic Weather Simulation", &config::atmos::DYNAMIC_WEATHER_ENABLED);
                 ImGui::DragFloat("Temperature (C)", &config::atmos::TEMPERATURE_CELSIUS, 0.2f, -20.0f, 45.0f);
                 ImGui::SliderFloat("Relative Humidity", &config::atmos::RELATIVE_HUMIDITY, 0.01f, 1.0f);
                 ImGui::DragFloat("Wind Direction (deg)", &config::atmos::WIND_DIRECTION_DEGREES, 1.0f, 0.0f, 360.0f);
@@ -958,10 +1042,123 @@ int main(int argc, char** argv) {
                 ImGui::DragFloat("Wind Turbulence Roughness", &config::atmos::WIND_TURBULENCE_ROUGHNESS, 0.01f, 0.0f, 1.0f);
                 ImGui::DragFloat("Cloud Density Target", &config::atmos::CLOUD_DENSITY_TARGET, 0.01f, 0.0f, 1.0f);
                 ImGui::DragFloat("Fog Density Target", &config::atmos::FOG_DENSITY_TARGET, 0.01f, 0.0f, 1.0f);
-                ImGui::DragFloat("Rain Strength", &config::atmos::RAIN_STRENGTH, 0.01f, 0.0f, 1.0f);
                 ImGui::TextDisabled("Dew Point: %.2f C", clusterPipeline.GetAtmosClimate().GetLastDewPointCelsius());
                 ImGui::TextDisabled("LCL Height: %.1f m", clusterPipeline.GetAtmosClimate().GetLastLCLHeightMeters());
 
+                // Surface response extension (Substrate material parity: dynamic wet/snow surfaces,
+                // see substrate_bsdf.glsl's own ApplySurfaceWeather comment): read-only inspectors --
+                // NOT authored sliders, per this feature's own requirement that the driving values
+                // come from AtmosClimatePass's own climate-driven accumulator, not manual authoring.
+                // A simple progress-bar visualization (rather than a plain DragFloat/SliderFloat,
+                // which would look editable even though ImGuiSliderFlags_ReadOnly does not exist)
+                // makes it visually obvious these two rows are inspect-only.
+                float surfaceWetness = clusterPipeline.GetAtmosClimate().GetSurfaceWetness();
+                float snowCoverage = clusterPipeline.GetAtmosClimate().GetSnowCoverage();
+                ImGui::TextUnformatted("Surface Wetness (climate-driven, read-only):");
+                ImGui::ProgressBar(surfaceWetness, ImVec2(-1.0f, 0.0f));
+                ImGui::TextUnformatted("Snow Coverage (climate-driven, read-only):");
+                ImGui::ProgressBar(snowCoverage, ImVec2(-1.0f, 0.0f));
+
+                // --- Precipitation (rain/snow particle emission tied to the climate simulation
+                // above, Ubisoft "Atmos"-style) -- live sliders over config::atmos::PRECIPITATION_*,
+                // consumed every frame by renderer::ClusterRenderPipeline::RecordFrameEarly's own
+                // precipitation spawn-accumulator + renderer::ParticleSystemPass::RecordSimulate.
+                // Grouped here (not in the "Particles" tab below) since the driving input is
+                // TEMPERATURE_CELSIUS just above, not a manual emitter toggle. ---
+                ImGui::Separator();
+                ImGui::TextUnformatted("Precipitation");
+                ImGui::SliderFloat("Precipitation Intensity", &config::atmos::PRECIPITATION_INTENSITY, 0.0f, 1.0f);
+                ImGui::DragFloat("Max Spawn Rate (particles/s)", &config::atmos::PRECIPITATION_MAX_SPAWN_RATE_PER_SECOND, 5.0f, 0.0f, 4000.0f);
+                ImGui::DragFloat("Snow Threshold (C)", &config::atmos::PRECIPITATION_SNOW_TEMPERATURE_THRESHOLD_CELSIUS, 0.2f, -20.0f, 20.0f);
+                ImGui::DragFloat("Spawn Radius (m)", &config::atmos::PRECIPITATION_SPAWN_RADIUS_METERS, 0.5f, 1.0f, 200.0f);
+                ImGui::DragFloat("Spawn Height Above Camera (m)", &config::atmos::PRECIPITATION_SPAWN_HEIGHT_ABOVE_CAMERA_METERS, 0.2f, 0.0f, 100.0f);
+                ImGui::DragFloat("Spawn Band Thickness (m)", &config::atmos::PRECIPITATION_SPAWN_BAND_THICKNESS_METERS, 0.2f, 0.5f, 50.0f);
+                ImGui::DragFloat("Floor Below Camera (m)", &config::atmos::PRECIPITATION_FLOOR_BELOW_CAMERA_METERS, 0.5f, 1.0f, 200.0f);
+                ImGui::DragFloat("Rain Fall Speed (m/s)", &config::atmos::PRECIPITATION_RAIN_FALL_SPEED_MPS, 0.1f, 0.5f, 30.0f);
+                ImGui::DragFloat("Snow Fall Speed (m/s)", &config::atmos::PRECIPITATION_SNOW_FALL_SPEED_MPS, 0.05f, 0.1f, 10.0f);
+                ImGui::DragFloat("Snow Wobble Strength", &config::atmos::PRECIPITATION_SNOW_WOBBLE_STRENGTH, 0.02f, 0.0f, 5.0f);
+                ImGui::TextDisabled("Kind: %s", (clusterPipeline.GetAtmosClimate().GetEffectiveTemperatureCelsius() < config::atmos::PRECIPITATION_SNOW_TEMPERATURE_THRESHOLD_CELSIUS) ? "Snow" : "Rain");
+
+                // --- Dynamic Weather Simulation parameters + live read-back (only meaningful while
+                // the toggle above is ON, but left visible/editable even when OFF so a user can dial
+                // them in ahead of re-enabling). ---
+                if (ImGui::TreeNode("Dynamic Weather Simulation Parameters")) {
+                    ImGui::DragFloat("Weather Front Tau (s)", &config::atmos::WEATHER_FRONT_TAU_SECONDS, 0.5f, 1.0f, 300.0f);
+                    ImGui::DragFloat("Weather Front Frequency", &config::atmos::WEATHER_FRONT_FREQUENCY, 0.001f, 0.001f, 0.5f, "%.4f");
+                    ImGui::DragFloat("Year Length (s)", &config::atmos::YEAR_LENGTH_SECONDS, 1.0f, 5.0f, 3600.0f);
+                    ImGui::DragFloat("Seasonal Temp Amplitude (C)", &config::atmos::SEASONAL_TEMPERATURE_AMPLITUDE_CELSIUS, 0.2f, 0.0f, 30.0f);
+                    ImGui::DragFloat("Seasonal Precip Amplitude", &config::atmos::SEASONAL_PRECIP_AMPLITUDE, 0.01f, 0.0f, 1.0f);
+                    ImGui::DragFloat("Seasonal Sun Elevation Amplitude (deg)", &config::atmos::SEASONAL_SUN_ELEVATION_AMPLITUDE_DEGREES, 0.5f, 0.0f, 40.0f);
+                    ImGui::Separator();
+                    ImGui::TextDisabled("Simulation Time: %.1f s", static_cast<float>(clusterPipeline.GetAtmosClimate().GetSimulationTimeSeconds()));
+                    ImGui::TextDisabled("Season Phase: %.2f (0/1=winter, 0.5=summer)", clusterPipeline.GetAtmosClimate().GetSeasonPhase01());
+                    ImGui::TextDisabled("Weather Blend: Clear %.0f%% / Overcast %.0f%% / Stormy %.0f%%",
+                        clusterPipeline.GetAtmosClimate().GetWeatherWeightClear() * 100.0f,
+                        clusterPipeline.GetAtmosClimate().GetWeatherWeightOvercast() * 100.0f,
+                        clusterPipeline.GetAtmosClimate().GetWeatherWeightStormy() * 100.0f);
+                    ImGui::TreePop();
+                }
+
+                ImGui::EndTabItem();
+            }
+
+            // --- Tab Particles (particle_system_integration_plan.md, Subtask 6; multi-emitter
+            // roadmap, subtask A1) --- One collapsible section per config::particles::EMITTERS[]
+            // slot, live-edited directly, consumed every frame by
+            // renderer::ClusterRenderPipeline::RecordFrame's own RecordSimulate/RecordDraw calls.
+            // Names are a purely local Debug-only UI label array -- never stored in EngineConfig.h
+            // (which is shared with Release builds) to keep CLAUDE.md's "zero verbose strings outside
+            // Debug" rule intact.
+            if (ImGui::BeginTabItem("Particles")) {
+                static const char* kEmitterNames[renderer::ParticleSystemPass::kMaxEmitters] = {
+                    "Emitter 0 (Embers)", "Emitter 1 (Ambient Dust)", "Emitter 2", "Emitter 3" };
+
+                for (uint32_t i = 0; i < renderer::ParticleSystemPass::kMaxEmitters; ++i) {
+                    config::particles::EmitterConfig& cfg = config::particles::EMITTERS[i];
+                    ImGui::PushID(static_cast<int>(i));
+                    if (ImGui::CollapsingHeader(kEmitterNames[i], ImGuiTreeNodeFlags_DefaultOpen)) {
+                        ImGui::Checkbox("Active", &cfg.active);
+                        ImGui::DragFloat("Spawn Rate (particles/s)", &cfg.spawnRate, 5.0f, 0.0f, 5000.0f);
+                        ImGui::DragFloat3("Position", &cfg.positionX, 0.05f);
+                        ImGui::Combo("Spawn Shape", reinterpret_cast<int*>(&cfg.spawnShape), "Cone Burst\0Sphere Volume\0\0");
+                        ImGui::DragFloat("Shape Param (sphere radius)", &cfg.shapeParam0, 0.02f, 0.0f, 20.0f);
+                        ImGui::ColorEdit4("Base Color", &cfg.colorR);
+                        ImGui::DragFloatRange2("Size Range", &cfg.sizeMin, &cfg.sizeMax, 0.005f, 0.001f, 5.0f);
+                        ImGui::DragFloatRange2("Lifetime Range (s)", &cfg.lifetimeMin, &cfg.lifetimeMax, 0.05f, 0.1f, 30.0f);
+
+                        ImGui::Separator();
+                        ImGui::TextUnformatted("Physics");
+                        ImGui::DragFloat("Gravity (Y, m/s^2)", &cfg.gravityY, 0.1f, -30.0f, 30.0f);
+                        ImGui::SliderFloat("Bounce Elasticity", &cfg.bounceElasticity, 0.0f, 1.0f);
+                        ImGui::SliderFloat("Friction", &cfg.friction, 0.0f, 1.0f);
+                        ImGui::DragFloat("Wind Drag", &cfg.dragCoefficient, 0.02f, 0.0f, 5.0f);
+
+                        // Multi-emitter roadmap (subtask A1) validation/debug instrumentation: proves
+                        // this emitter is independently alive/producing particles, not just that the
+                        // aggregate total below is nonzero.
+                        ImGui::TextDisabled("Alive (this emitter): %u",
+                            clusterPipeline.GetParticleSystem().GetLastPerEmitterAliveCountApprox(i));
+                    }
+                    ImGui::PopID();
+                }
+
+                ImGui::Separator();
+                ImGui::TextUnformatted("Rendering (shared by every emitter)");
+                ImGui::DragFloat("Soft Fade Distance (m)", &config::particles::SOFT_FADE_DISTANCE, 0.02f, 0.0f, 5.0f);
+                ImGui::Checkbox("Heat Shimmer", &config::particles::HEAT_SHIMMER_ENABLED);
+                ImGui::SliderFloat("Heat Shimmer Strength", &config::particles::HEAT_SHIMMER_STRENGTH, 0.0f, 0.2f);
+
+                ImGui::Separator();
+                ImGui::TextDisabled("Alive: %u / %u", clusterPipeline.GetParticleSystem().GetLastAliveCountApprox(), renderer::ParticleSystemPass::kMaxParticles);
+
+                ImGui::EndTabItem();
+            }
+
+            // --- Tab PCG Graph Editor -- Phase 7.1 (PCG editor-tooling roadmap) scaffold: proves
+            // the vendored thedmd/imgui-node-editor library is wired end-to-end, nothing more.
+            // See renderer::debug::PcgGraphEditorPanel's own header comment for full context. ---
+            if (ImGui::BeginTabItem("PCG Graph Editor")) {
+                g_PcgGraphEditorPanel.Draw();
                 ImGui::EndTabItem();
             }
 
@@ -990,15 +1187,30 @@ int main(int argc, char** argv) {
             ImGui::End();
         }
 
+        // Phase 5 (Streaming & Monde roadmap, Part 1): LWC origin diagnostics -- unconditional
+        // (unlike the streaming panel above, camera-relative rebasing is exercised every frame
+        // regardless of whether world::StreamingManager itself is active). The slider writes into
+        // g_DebugState.simulatedLwcOffsetKm, read by this loop's own shadow-LwcOrigin diagnostic
+        // block above (which runs BEFORE this ImGui code each frame, so this slider's effect is
+        // visible starting next frame -- a one-frame lag identical to the streaming panel's own
+        // documented staleness above, not a correctness issue for an observability control).
+        {
+            ImGui::Begin("LWC (Large World Coordinates)");
+            maths::vec3 originOffset = lwcOrigin.GetCurrentOffset();
+            world::CellCoord originCell = lwcOrigin.GetCurrentCell();
+            ImGui::Text("Origin cell: (%d, %d)", originCell.x, originCell.z);
+            ImGui::Text("Origin offset: (%.2f, %.2f, %.2f)", originOffset.x, originOffset.y, originOffset.z);
+            ImGui::SliderFloat("Simulate large world offset (km)", &g_DebugState.simulatedLwcOffsetKm, 0.0f, 1000.0f);
+            ImGui::TextDisabled("Real render path never reads this slider -- see LwcOrigin.h header comment.");
+            ImGui::End();
+        }
+
         ImGui::Render();
 #endif
 
         if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS) {
             glfwSetWindowShouldClose(window, GLFW_TRUE);
         }
-
-        // Update entity rotations every frame so dynamic primitives spin
-        vkContext.UpdateEntityRotations(static_cast<float>(glfwGetTime()));
 
         // --- Unreal-editor style fly camera -----------------------------------------------
         // Hold the Right Mouse Button to enable FPS-style mouselook (cursor hidden and locked
@@ -1061,9 +1273,69 @@ int main(int argc, char** argv) {
             }
         }
 
+        // Phase 5 (Streaming & Monde roadmap, Part 1): re-evaluate the LWC origin from THIS frame's
+        // final camera position -- must run after the fly-camera movement block above (so
+        // camera.GetPosition() is this frame's final value, not last frame's) and before BOTH
+        // camera.UpdateRebased() and vkContext.UpdateEntityRotations() below (so both consume this
+        // frame's fresh origin). world::StreamingManager::UpdateStreamingSources further below
+        // deliberately keeps reading camera.GetPosition() directly (the TRUE absolute position) --
+        // rebasing is a render-boundary-only concern, never leaks into streaming/gameplay logic.
+        bool lwcRecentered = lwcOrigin.Update(camera.GetPosition(), cellManifest.CellSize());
+        if (lwcRecentered) {
+            world::CellCoord cell = lwcOrigin.GetCurrentCell();
+            maths::vec3 offset = lwcOrigin.GetCurrentOffset();
+            LOG_INFO(std::format(
+                "[LWC] Origin rebased to cell ({}, {}), offset ({:.2f}, {:.2f}, {:.2f}).",
+                cell.x, cell.z, offset.x, offset.y, offset.z));
+        }
+
+#ifndef NDEBUG
+        // Debug-only "simulate large world offset" diagnostic (g_DebugState.simulatedLwcOffsetKm,
+        // ImGui slider below): proves the rebasing math is genuinely robust at large magnitudes
+        // WITHOUT ever perturbing camera.m_Position or any authored content, per the approved plan's
+        // own constraint. A completely separate, shadow world::LwcOrigin instance is fed the real
+        // camera position plus a large simulated bias (0-1000km) -- this is a REAL, independent
+        // execution of the exact same floor-division/cell-hashing/recenter code path the real
+        // lwcOrigin instance above uses, just fed a displaced input, so it genuinely exercises that
+        // code at large magnitudes (not a no-op stub). The actual render path (camera.UpdateRebased/
+        // vkContext.UpdateEntityRotations below) only ever reads the REAL lwcOrigin instance, so
+        // render output is provably pixel-identical regardless of this slider's value -- what the
+        // logged drift below verifies is that subtracting the shadow instance's own (huge) offset
+        // from the same biased position reproduces the real instance's small rebased position to
+        // within float32 epsilon, i.e. the subtraction round-trip itself does not silently lose
+        // precision at up to 1000km, which is the actual property LWC rebasing exists to guarantee.
+        static world::LwcOrigin s_DebugShadowLwcOrigin;
+        if (g_DebugState.simulatedLwcOffsetKm > 0.0f) {
+            maths::vec3 simulatedBias{ g_DebugState.simulatedLwcOffsetKm * 1000.0f, 0.0f, 0.0f };
+            maths::vec3 biasedCameraPos = camera.GetPosition() + simulatedBias;
+            s_DebugShadowLwcOrigin.Update(biasedCameraPos, cellManifest.CellSize());
+
+            maths::vec3 shadowRebased = biasedCameraPos - s_DebugShadowLwcOrigin.GetCurrentOffset();
+            maths::vec3 realRebased = camera.GetRebasedPosition(lwcOrigin.GetCurrentOffset());
+            maths::vec3 drift = shadowRebased - realRebased;
+            float driftMagnitude = std::sqrt(drift.x * drift.x + drift.y * drift.y + drift.z * drift.z);
+
+            static float s_LastLoggedDriftKm = -1.0f;
+            if (std::abs(g_DebugState.simulatedLwcOffsetKm - s_LastLoggedDriftKm) > 0.01f) {
+                LOG_INFO(std::format(
+                    "[LWC Debug] Simulated offset {:.1f} km: shadow-vs-real rebase drift = {:.6f} "
+                    "units (render path untouched, real lwcOrigin never reads this shadow offset).",
+                    g_DebugState.simulatedLwcOffsetKm, driftMagnitude));
+                s_LastLoggedDriftKm = g_DebugState.simulatedLwcOffsetKm;
+            }
+        }
+#endif
+
+        // Update entity rotations every frame so dynamic primitives spin -- rebased into the
+        // current LWC origin cell's frame (Phase 5, Streaming & Monde roadmap, Part 1).
+        vkContext.UpdateEntityRotations(static_cast<float>(glfwGetTime()), lwcOrigin.GetCurrentOffset());
+
         float aspect = static_cast<float>(vkContext.GetSwapchainExtent().width) /
             static_cast<float>(vkContext.GetSwapchainExtent().height);
-        camera.Update(aspect);
+        // Phase 5 (Streaming & Monde roadmap, Part 1): rebased view matrix -- see Camera::
+        // UpdateRebased's own comment. camera.GetPosition() (true absolute) stays untouched for
+        // the streaming-source distance math further below.
+        camera.UpdateRebased(aspect, lwcOrigin.GetCurrentOffset());
 
         // --- Runtime World Partition streaming tick: evaluate desired cell representations from
         // the camera's current position, dispatch queued load/unload work onto the shared
@@ -1082,29 +1354,47 @@ int main(int argc, char** argv) {
             clusterPipeline.GetLoadingManager().PumpCompletions(8u);
 
             for (const world::StreamingPlacementEvent& event : worldCellLoader.DrainEvents()) {
+                // Phase 5 (Streaming & Monde roadmap, Part 2, Gap 3): a cell with its own dedicated,
+                // pre-baked unit ALWAYS uses that exact unit -- looked up fresh every time (cheap,
+                // O(1) unordered_map lookup against a <=kStreamingUnitCount-sized table), never
+                // recorded into cellToStreamingUnit/freeStreamingUnits (see those variables' own
+                // updated header comment), since a dedicated unit is never reassigned to a different
+                // cell for the lifetime of the run.
+                std::optional<uint32_t> dedicatedUnit = vkContext.GetDedicatedStreamingUnitForCell(event.coord);
+
                 if (event.activate) {
                     uint32_t unit;
-                    auto it = cellToStreamingUnit.find(event.coord);
-                    if (it != cellToStreamingUnit.end()) {
-                        unit = it->second;
-                    } else if (!freeStreamingUnits.empty()) {
-                        unit = freeStreamingUnits.back();
-                        freeStreamingUnits.pop_back();
-                        cellToStreamingUnit[event.coord] = unit;
+                    if (dedicatedUnit.has_value()) {
+                        unit = *dedicatedUnit;
                     } else {
-                        LOG_WARNING(std::format(
-                            "[Streaming] Pool exhausted ({} units) -- cannot claim a slot for cell ({}, {}).",
-                            vkContext.GetStreamingUnitCount(), event.coord.x, event.coord.z));
-                        continue;
+                        auto it = cellToStreamingUnit.find(event.coord);
+                        if (it != cellToStreamingUnit.end()) {
+                            unit = it->second;
+                        } else if (!freeStreamingUnits.empty()) {
+                            unit = freeStreamingUnits.back();
+                            freeStreamingUnits.pop_back();
+                            cellToStreamingUnit[event.coord] = unit;
+                        } else {
+                            LOG_WARNING(std::format(
+                                "[Streaming] Pool exhausted ({} units, {} dedicated) -- cannot claim a slot for cell ({}, {}).",
+                                vkContext.GetStreamingUnitCount(), dedicatedStreamingUnitCount, event.coord.x, event.coord.z));
+                            continue;
+                        }
                     }
                     vkContext.SetStreamingUnitState(unit, true, event.useFineVariant,
                                                      event.worldPosition, hashCellCoord(event.coord));
                 } else {
-                    auto it = cellToStreamingUnit.find(event.coord);
-                    if (it != cellToStreamingUnit.end()) {
-                        vkContext.SetStreamingUnitState(it->second, false, false, {}, 0u);
-                        freeStreamingUnits.push_back(it->second);
-                        cellToStreamingUnit.erase(it);
+                    if (dedicatedUnit.has_value()) {
+                        // Simply parked (StreamingInactive) until this same cell reclaims it again --
+                        // never returned to freeStreamingUnits, see this loop's own header comment.
+                        vkContext.SetStreamingUnitState(*dedicatedUnit, false, false, {}, 0u);
+                    } else {
+                        auto it = cellToStreamingUnit.find(event.coord);
+                        if (it != cellToStreamingUnit.end()) {
+                            vkContext.SetStreamingUnitState(it->second, false, false, {}, 0u);
+                            freeStreamingUnits.push_back(it->second);
+                            cellToStreamingUnit.erase(it);
+                        }
                     }
                 }
             }
@@ -1220,8 +1510,21 @@ int main(int argc, char** argv) {
         VkCommandBufferBeginInfo cmdEarlyBeginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
         vkBeginCommandBuffer(cmdEarly, &cmdEarlyBeginInfo);
 
+        // Phase 5 (Streaming & Monde roadmap, Part 1): pass the REBASED camera position (both to
+        // `cameraPositionWorld` and CameraFrameInfo::position), never the raw absolute one --
+        // renderer::ClusterRenderPipeline::m_FrameScratch caches whatever is passed here exactly
+        // once for the whole frame (see that struct's own header comment), so this is the ONE
+        // insertion point that propagates the rebase consistently into every downstream Phase 2-4
+        // system (async-compute GI, VSM, reflections, MegaLights) with zero risk of two divergent
+        // "world space" notions coexisting in one frame. camera.GetPushConstants().view already
+        // encodes the rebased eye point (built by camera.UpdateRebased() above); GetFrameInfo(aspect)
+        // itself still reads the true absolute m_Position internally, so its `position` field is
+        // overwritten here with the same rebased value GetPushConstants() used.
+        CameraFrameInfo rebasedFrameInfo = camera.GetFrameInfo(aspect);
+        rebasedFrameInfo.position = camera.GetRebasedPosition(lwcOrigin.GetCurrentOffset());
+
         clusterPipeline.RecordFrameEarly(cmdEarly, camera.GetPushConstants(),
-            camera.GetPosition(), camera.GetFrameInfo(aspect), static_cast<float>(glfwGetTime()),
+            rebasedFrameInfo.position, rebasedFrameInfo, static_cast<float>(glfwGetTime()),
             vkContext.GetEntityTransformsCPU());
 
         vkEndCommandBuffer(cmdEarly);
@@ -1400,6 +1703,7 @@ int main(int argc, char** argv) {
     vkDeviceWaitIdle(vkContext.GetDevice());
 
 #ifndef NDEBUG
+    g_PcgGraphEditorPanel.Shutdown();
     ImGui_ImplVulkan_Shutdown();
     ImGui_ImplGlfw_Shutdown();
     ImGui::DestroyContext();

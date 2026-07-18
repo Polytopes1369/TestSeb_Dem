@@ -32,7 +32,7 @@ namespace renderer {
     void PostProcessPass::Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
         VkExtent2D displayExtent, VkImageView hdrColorView, VkImageView bloomView,
         VkImageView depthView, VkImageView refractionOffsetView, VkImageView skyViewLUTView,
-        VkImageView volumetricFogView) {
+        VkImageView volumetricFogView, VkImageView cloudsView) {
         Shutdown();
         m_Device = device;
         m_Allocator = allocator;
@@ -134,8 +134,9 @@ namespace renderer {
         std::array<VkDescriptorPoolSize, 4> poolSizes{ {
             // Histogram HDR input + Composite HDR input + Composite g_Bloom (PP2) + Composite
             // g_Depth + Composite g_RefractionOffset (both PP3) + Composite g_SkyViewLUT (Atmos
-            // Subtask 2) + Composite g_VolumetricFog (Atmos Subtask 3).
-            { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 7 },
+            // Subtask 2) + Composite g_VolumetricFog (Atmos Subtask 3) + Composite g_Clouds (Atmos
+            // Subtask 4).
+            { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 8 },
             { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1 },          // Composite output.
             { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4 },
             { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 },         // Composite params.
@@ -209,7 +210,7 @@ namespace renderer {
 
         // --- Stage 3: PostProcessComposite.comp ---
         {
-            std::array<VkDescriptorSetLayoutBinding, 9> bindings{ {
+            std::array<VkDescriptorSetLayoutBinding, 10> bindings{ {
                 { 0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // g_HDRColor
                 { 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },          // g_Output
                 { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },         // ExposureStateSSBO
@@ -219,6 +220,7 @@ namespace renderer {
                 { 6, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // g_RefractionOffset (Phase PP3)
                 { 7, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // g_SkyViewLUT (Atmos Subtask 2)
                 { 8, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // g_VolumetricFog (Atmos Subtask 3)
+                { 9, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // g_Clouds (Atmos Subtask 4)
             } };
             VkDescriptorSetLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
             layoutInfo.bindingCount = static_cast<uint32_t>(bindings.size());
@@ -253,11 +255,13 @@ namespace renderer {
             VkDescriptorImageInfo refractionInfo{ m_LinearSampler, refractionOffsetView, VK_IMAGE_LAYOUT_GENERAL };
             VkDescriptorImageInfo skyViewInfo{ m_LinearSampler, skyViewLUTView, VK_IMAGE_LAYOUT_GENERAL };
             VkDescriptorImageInfo volumetricFogInfo{ m_LinearSampler, volumetricFogView, VK_IMAGE_LAYOUT_GENERAL };
-            std::array<VkWriteDescriptorSet, 4> writes{ {
+            VkDescriptorImageInfo cloudsInfo{ m_LinearSampler, cloudsView, VK_IMAGE_LAYOUT_GENERAL };
+            std::array<VkWriteDescriptorSet, 5> writes{ {
                 { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_CompositeSet, 5, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &depthInfo, nullptr, nullptr },
                 { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_CompositeSet, 6, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &refractionInfo, nullptr, nullptr },
                 { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_CompositeSet, 7, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &skyViewInfo, nullptr, nullptr },
                 { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_CompositeSet, 8, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &volumetricFogInfo, nullptr, nullptr },
+                { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_CompositeSet, 9, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &cloudsInfo, nullptr, nullptr },
             } };
             vkUpdateDescriptorSets(m_Device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
         }

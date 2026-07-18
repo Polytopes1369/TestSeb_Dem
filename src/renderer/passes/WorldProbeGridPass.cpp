@@ -36,8 +36,10 @@ namespace renderer {
             // (config::lumen::PROBE_GRID_RESOLUTION) -- the shader's own bounds check needs this
             // value passed explicitly, it cannot hardcode it.
             int32_t gridResolution = 0;
+            // Atmos weather system, Subtask 5.
+            float sunDirX = 0.0f, sunDirY = 0.0f, sunDirZ = 0.0f;
         };
-        static_assert(sizeof(WorldProbeInjectPushConstants) == 44,
+        static_assert(sizeof(WorldProbeInjectPushConstants) == 56,
             "WorldProbeInjectPushConstants must match WorldProbeInject.comp's push_constant block exactly");
 
         constexpr uint32_t kDispatchWorkgroupSize = 4; // Matches WorldProbeInject.comp's local_size_x/y/z.
@@ -146,26 +148,29 @@ namespace renderer {
         // resources (a smaller set-0 than SurfaceCacheGIInjectPass's -- see the class comment on
         // why probes don't read the 4 per-texel Surface Cache atlases).
         // =====================================================================================
-        VkDescriptorSetLayoutBinding bindings[5]{};
+        VkDescriptorSetLayoutBinding bindings[6]{};
         bindings[0] = { 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
         bindings[1] = { 1, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
         bindings[2] = { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
         bindings[3] = { 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
         bindings[4] = { 4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+        // Atmos weather system, Subtask 5 -- see SetAtmosSkyView()'s own comment.
+        bindings[5] = { 5, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
 
         VkDescriptorSetLayoutCreateInfo setLayoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-        setLayoutInfo.bindingCount = 5;
+        setLayoutInfo.bindingCount = 6;
         setLayoutInfo.pBindings = bindings;
         VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &setLayoutInfo, nullptr, &m_SetLayout));
 
-        VkDescriptorPoolSize poolSizes[3] = {
+        VkDescriptorPoolSize poolSizes[4] = {
             { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1 },
             { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1 },
-            { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3 }
+            { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3 },
+            { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1 }, // g_SkyViewLUT (Atmos Subtask 5).
         };
         VkDescriptorPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
         poolInfo.maxSets = 1;
-        poolInfo.poolSizeCount = 3;
+        poolInfo.poolSizeCount = 4;
         poolInfo.pPoolSizes = poolSizes;
         VK_CHECK(vkCreateDescriptorPool(m_Device, &poolInfo, nullptr, &m_DescriptorPool));
 
@@ -229,6 +234,14 @@ namespace renderer {
         LOG_INFO(std::format("[WorldProbeGridPass] Initialized: {}^3 grid, {} world-unit spacing (toroidal streaming).",
             kGridResolution, kProbeSpacing));
         return true;
+    }
+
+    void WorldProbeGridPass::SetAtmosSkyView(VkImageView skyViewLUTView, VkSampler skyViewLUTSampler) {
+        VkDescriptorImageInfo skyViewInfo{ skyViewLUTSampler, skyViewLUTView, VK_IMAGE_LAYOUT_GENERAL };
+        VkWriteDescriptorSet write{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+        write.dstSet = m_Set; write.dstBinding = 5; write.descriptorCount = 1;
+        write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; write.pImageInfo = &skyViewInfo;
+        vkUpdateDescriptorSets(m_Device, 1, &write, 0, nullptr);
     }
 
     void WorldProbeGridPass::Shutdown() {
@@ -338,7 +351,7 @@ namespace renderer {
     }
 
     void WorldProbeGridPass::RecordSlab(VkCommandBuffer cmd, const DirtySlab& slab,
-        const SurfaceCacheTraceContext& traceContext, uint32_t traceMode) {
+        const SurfaceCacheTraceContext& traceContext, uint32_t traceMode, const maths::vec3& sunDirectionWorld) {
         const int32_t res = static_cast<int32_t>(kGridResolution);
 
         std::vector<WrappedPiece> piecesX = SplitWrappedRange(slab.probeMin[0], slab.probeMax[0], res);
@@ -360,6 +373,7 @@ namespace renderer {
                     pc.frameIndex = m_FrameIndex;
                     pc.traceMode = traceMode;
                     pc.gridResolution = res;
+                    pc.sunDirX = sunDirectionWorld.x; pc.sunDirY = sunDirectionWorld.y; pc.sunDirZ = sunDirectionWorld.z;
                     vkCmdPushConstants(cmd, m_PipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
 
                     uint32_t groupsX = DispatchGroupCount(static_cast<uint32_t>(px.count));
@@ -388,18 +402,18 @@ namespace renderer {
     }
 
     void WorldProbeGridPass::DrainAndRecordSlabs(VkCommandBuffer cmd,
-        const SurfaceCacheTraceContext& traceContext, uint32_t traceMode) {
+        const SurfaceCacheTraceContext& traceContext, uint32_t traceMode, const maths::vec3& sunDirectionWorld) {
         uint32_t processed = 0;
         while (processed < kMaxDirtySlabsPerCall && !m_PendingSlabs.empty()) {
             DirtySlab slab = m_PendingSlabs.front();
             m_PendingSlabs.pop_front();
-            RecordSlab(cmd, slab, traceContext, traceMode);
+            RecordSlab(cmd, slab, traceContext, traceMode, sunDirectionWorld);
             ++processed;
         }
     }
 
     void WorldProbeGridPass::RecordUpdate(VkCommandBuffer cmd, const maths::vec3& cameraPositionWorld,
-        const SurfaceCacheTraceContext& traceContext, uint32_t traceMode) {
+        const SurfaceCacheTraceContext& traceContext, uint32_t traceMode, const maths::vec3& sunDirectionWorld) {
         EnqueueDirtyRegionsForGrid(cameraPositionWorld);
 
         // Pipeline + descriptor sets never change across the (possibly several) dispatches
@@ -410,7 +424,7 @@ namespace renderer {
         VkDescriptorSet sets[3] = { m_Set, traceContext.GetMeshSdfTraceSet(), traceContext.GetSurfaceCacheSamplingSet() };
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_PipelineLayout, 0, 3, sets, 0, nullptr);
 
-        DrainAndRecordSlabs(cmd, traceContext, traceMode);
+        DrainAndRecordSlabs(cmd, traceContext, traceMode, sunDirectionWorld);
 
         ++m_FrameIndex;
     }

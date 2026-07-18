@@ -146,4 +146,14 @@ float RadicalInverse(uint index, uint base) {
 vec2 Halton23(uint index) {
     return vec2(RadicalInverse(index, 2u), RadicalInverse(index, 3u));
 }
+
+// Simple AABB-vs-AABB overlap test (both boxes axis-aligned, no rotation) -- shared, stateless
+// arithmetic, unlike this codebase's per-shader-duplicated ray-AABB slab tests (e.g.
+// SDFRayMarch.comp's own RayIntersectsAABB, which tests a ray SEGMENT against a box, not two
+// static boxes) -- see megalights_bvh.glsl's own header comment, the first consumer, for why this
+// one genuinely is shareable where a trace function is not. Two boxes touching at a shared
+// face/edge/corner count as overlapping (uses <=, not <).
+bool AABBOverlapsAABB(vec3 aMin, vec3 aMax, vec3 bMin, vec3 bMax) {
+    return all(lessThanEqual(aMin, bMax)) && all(lessThanEqual(bMin, aMax));
+}
 #endif

@@ -50,9 +50,12 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <unordered_map>
+#include <vector>
 #include <vulkan/vulkan.h>
 #include <vk_mem_alloc.h>
 #include "core/EngineConfig.h"
+#include "core/EntityData.h" // core::EntityData/EntityTransformCPU -- Feature 1's per-entity material lookup + Feature 2's per-frame overlap test.
 
 #include "core/maths/Maths.h"
 #include "renderer/streaming/FeedbackBuffer.h"
@@ -80,22 +83,87 @@ namespace renderer {
 
         static inline uint32_t kPhysicalPageCapacity = 4096u; // 256 * 128^2 * 4B = 16 MB.
         static inline uint32_t kMaxPagesRenderedPerFrame = 512u; // Generous: the Fallback Mesh is tiny to render.
+        // VSM advanced roadmap, Feature 2 (real static-vs-dynamic page invalidation): own frame
+        // budget for RecordBeginFrame()'s dynamic-page re-render block -- mirrors
+        // kMaxPagesRenderedPerFrame's own exact convention above (a SEPARATE budget, not shared,
+        // since the two blocks serve different purposes: one drains newly-requested pages, the
+        // other re-renders already-resident ones every single frame).
+        static inline uint32_t kMaxDynamicPagesRenderedPerFrame = 512u;
         static constexpr uint32_t kFeedbackCapacity = 256; // Bounded reports/frame, see FeedbackBuffer's own comment.
+
+        // One entity's Fallback Mesh draw range + precomputed per-entity data -- reuses
+        // SurfaceCachePass::EntityDrawRange's own {vertexOffset, firstIndex, indexCount} precedent
+        // verbatim (see that struct's own comment), extended with what Feature 1 (live transforms),
+        // Feature 2 (dynamic invalidation) and Feature 3 (transparency masks) each additionally
+        // need, all precomputed ONCE in Init() (entity flags/materialID never change afterward).
+        struct EntityDrawRange {
+            int32_t vertexOffset = 0;
+            uint32_t firstIndex = 0;
+            uint32_t indexCount = 0;
+            // Rest-pose (bake-time) local-space AABB, same convention as
+            // geometry::FallbackMeshIndexEntry::boundsMin/boundsMax (the same space
+            // ClusterRaster.vert calls "worldPos" before subtracting EntityTransform::center) --
+            // Feature 2's overlap test rotates these 8 corners through the entity's CURRENT
+            // EntityTransformCPU every frame before testing NDC overlap against a page.
+            maths::vec3 boundsMin{};
+            maths::vec3 boundsMax{};
+            // Feature 1/3: this entity's TRUE (non-inflated) authored WPO sway amplitude and mask
+            // slot, read once from geometry::GetEntityMaterialProperties(entityDataCPU[entityID]
+            // .materialID) -- see ShadowMapCaptureAnimated.vert's own header comment for why no
+            // GetOriginalWPOAmplitude() un-inflation is needed here, unlike ClusterRaster.vert.
+            float maxWPOAmplitude = 0.0f;
+            uint32_t maskTextureIndex = 0xFFFFFFFFu; // geometry::kInvalidMaskTextureIndex.
+            // Feature 2: true if core::EntityFlags::IsDynamic | HasSplineDeformation |
+            // HasEnhancedDisplacement was set on this entity at BuildEntityData() time -- only
+            // entities with this true are ever tested against a page's NDC rect; every other
+            // entity is implicitly "never covers dynamic content" without a per-frame test.
+            bool isDynamicCandidate = false;
+            // Feature 2: which deformation-specific conservative bound (if any) to additionally
+            // inflate boundsMin/boundsMax by before the overlap test -- see
+            // EntityAABBOverlapsPageNDC()'s own .cpp comment.
+            bool hasSplineDeformation = false;
+            bool hasEnhancedDisplacement = false;
+        };
 
         // Reads every fallback mesh's geometry from `cacheFilePath` (mirrors ShadowMapPass::Init's
         // STEP 1 exactly -- same combined position-only vertex/index buffer, same scene-bounding-
-        // sphere derivation), builds the depth-only capture pipeline (reuses ShadowMapCapture.vert
-        // unchanged), and initializes the physical page pool + feedback buffer + request queue.
+        // sphere derivation, PLUS Feature 1's own per-entity EntityDrawRange population), builds the
+        // two depth-only capture pipelines (ShadowMapCaptureAnimated.vert unmasked/masked, Feature
+        // 1/3 -- see that shader and ShadowMapCaptureMasked.frag's own header comments;
+        // ShadowMapCapture.vert itself is left untouched, still used by the separate dead-but-kept
+        // ShadowMapPass), and initializes the physical page pool + feedback buffer + request queue.
         // `physicalDevice` is forwarded to VirtualShadowMapPool::Init, which queries the device's
         // actual maxArrayLayers for the pool's D32_SFLOAT image format before sizing it -- see
         // that function's own comment on why kPhysicalPageCapacity cannot just be trusted as-is.
+        // `entityTransformBuffer`/`entityDataBuffer`/`wpoGlobalsBuffer`/`splineControlPointsBuffer`
+        // are the SAME 4 buffers renderer::ClusterHardwareRasterPass::Init already receives (see
+        // that class's own comment for what each one is) -- bound read-only, vertex-stage-only, at
+        // this pass's own fresh descriptor set (bindings 0-3, this pass' own numbering, not a reuse
+        // of ClusterHardwareRasterPass's binding numbers). `entityDataCPU` (index == meshID, the
+        // SAME array renderer::SurfaceCachePass::Init already receives) is read ONCE here, right
+        // after every EntityDrawRange's vertexOffset/firstIndex/indexCount is computed, to look up
+        // each entity's real materialID -> geometry::GetEntityMaterialProperties() and flags -- see
+        // EntityDrawRange's own field comments. `maskImageInfos` is renderer::
+        // ProceduralMaskGenerator::GetMaskImageInfos() (Feature 3) -- bound as this descriptor set's
+        // binding 4 (fragment-stage-only, COMBINED_IMAGE_SAMPLER, descriptorCount ==
+        // maskImageInfos.size()), same pattern ClusterHardwareRasterPass::Init already uses.
         bool Init(VkPhysicalDevice physicalDevice, VkDevice device, VmaAllocator allocator,
-            VkCommandPool commandPool, VkQueue queue, const std::filesystem::path& cacheFilePath);
+            VkCommandPool commandPool, VkQueue queue, const std::filesystem::path& cacheFilePath,
+            VkBuffer entityTransformBuffer, VkBuffer entityDataBuffer, VkBuffer wpoGlobalsBuffer,
+            VkBuffer splineControlPointsBuffer, const core::EntityData* entityDataCPU,
+            const std::vector<VkDescriptorImageInfo>& maskImageInfos);
 
         void Shutdown();
 
+        // `entityTransformsCPU` (Feature 2, VSM advanced roadmap; index == meshID, the SAME
+        // per-frame array renderer::VulkanContext::UpdateEntityRotations() already computes for
+        // renderer::SurfaceCachePass's own identical use) drives this call's dynamic-page
+        // classification + re-render block -- see the .cpp's own comment for the full derivation.
+        // A null pointer is tolerated (skips Feature 2's block entirely, degrading to Feature 1-only
+        // behavior) but every real caller in this codebase always has a valid array to pass.
         void RecordBeginFrame(VkCommandBuffer cmd, const maths::vec3& sunDirection,
-            const SceneLights& sceneLights, const maths::vec3& cameraPosition);
+            const SceneLights& sceneLights, const maths::vec3& cameraPosition,
+            const core::EntityTransformCPU* entityTransformsCPU);
 
         void RecordEndFrame(VkCommandBuffer cmd);
 
@@ -119,15 +187,43 @@ namespace renderer {
         uint32_t GetPhysicalPageCapacity() const { return m_Pool.GetPhysicalCapacity(); }
 
     private:
+        // Feature 1 (live per-entity transforms): renders EVERY entity's Fallback Mesh range into
+        // this page (one vkCmdDrawIndexed per entity, opaque or masked pipeline selected per
+        // entity's own precomputed maskTextureIndex -- Feature 3), instead of the old single
+        // monolithic draw. Still "redraw the whole (tiny) scene per page, clipped by viewport/
+        // scissor" -- see this class' own header comment -- just per-entity now instead of merged
+        // into one draw call, which is what actually lets each entity's CURRENT (deformed/rotated)
+        // geometry reach the shadow page instead of a frozen rest-pose snapshot.
         void RenderPage(VkCommandBuffer cmd, uint32_t vsmIndex, uint32_t localPageIndex, uint32_t physicalLayer,
             const maths::mat4& viewProj);
+
+        // Feature 2 (real static-vs-dynamic page invalidation): re-tests EVERY currently-resident
+        // page (any VSM -- sun cascade or point light face) against every dynamic-candidate
+        // entity's CURRENT world-space AABB, writing the verdict into m_Pool via
+        // SetPageCoversDynamicContent(). Called once per RecordBeginFrame() call, before that
+        // method's own dynamic-page re-render block reads m_Pool.GetResidentDynamicPageIDs(). See
+        // the .cpp for the full NDC-overlap derivation.
+        void ClassifyDynamicPages(const core::EntityTransformCPU* entityTransformsCPU);
+
+        // True if `range`'s current (rotated about its own EntityTransformCPU pivot, deformation-
+        // inflated) world-space AABB overlaps the page NDC sub-rectangle [ndcXMin,ndcXMax] x
+        // [ndcYMin,ndcYMax] under `viewProj` -- see the .cpp definition for the exact derivation
+        // (mirrors RenderPage's own virtual-viewport math in reverse to recover a page's NDC
+        // sub-rect, and PostProcessPass.cpp's own manual clip-space projection pattern, since
+        // maths::mat4 has no vec4 type/operator* to lean on -- see that file's own comment).
+        bool EntityAABBOverlapsPageNDC(const EntityDrawRange& range, const core::EntityTransformCPU& xform,
+            const maths::mat4& viewProj, float ndcXMin, float ndcXMax, float ndcYMin, float ndcYMax) const;
 
         VkDevice m_Device = VK_NULL_HANDLE;
         VmaAllocator m_Allocator = VK_NULL_HANDLE;
 
-        GpuBuffer m_VertexBuffer; // geometry::FallbackVertex[], GPU_ONLY (only .position read) -- own copy, see class comment.
+        GpuBuffer m_VertexBuffer; // geometry::FallbackVertex[], GPU_ONLY (position + uv both read now, Feature 1/3) -- own copy, see class comment.
         GpuBuffer m_IndexBuffer;  // uint32_t[], GPU_ONLY.
         uint32_t m_TotalIndexCount = 0;
+
+        // Feature 1: one entry per entity present in the Fallback Mesh table -- see EntityDrawRange's
+        // own comment. Keyed by entityID (== meshID).
+        std::unordered_map<uint32_t, EntityDrawRange> m_EntityRanges;
 
         maths::vec3 m_SceneBoundsCenter{};
         float m_SceneBoundsRadius = 0.0f;
@@ -136,8 +232,19 @@ namespace renderer {
         FeedbackBuffer m_Feedback;
         geometry::StreamingRequestQueue m_RequestQueue; // Fully generic (opaque uint32 IDs) -- reused as-is, own instance.
 
+        // Feature 1/3: one descriptor set (EntityTransformBuffer/EntityDataBuffer/WPOGlobalsUBO/
+        // SplineControlPointsSSBO at bindings 0-3, all vertex-stage-only, + the bindless mask array
+        // at binding 4, fragment-stage-only) shared by both pipelines below -- mirrors
+        // ClusterHardwareRasterPass::Init's own layout pattern (see that class's comment), written
+        // once at Init(), never updated again (only the buffers' own CONTENTS change per frame,
+        // exactly like ClusterHardwareRasterPass's identical descriptor set).
+        VkDescriptorSetLayout m_DescriptorSetLayout = VK_NULL_HANDLE;
+        VkDescriptorPool m_DescriptorPool = VK_NULL_HANDLE;
+        VkDescriptorSet m_DescriptorSet = VK_NULL_HANDLE;
+
         VkPipelineLayout m_PipelineLayout = VK_NULL_HANDLE;
-        VkPipeline m_Pipeline = VK_NULL_HANDLE;
+        VkPipeline m_Pipeline = VK_NULL_HANDLE;       // ShadowMapCaptureAnimated.vert only -- unmasked entities (Feature 1).
+        VkPipeline m_MaskedPipeline = VK_NULL_HANDLE; // + ShadowMapCaptureMasked.frag -- masked entities (Feature 3).
 
         // This frame's VSM view-projection matrices, recomputed every RecordBeginFrame() call --
         // consumed both by RenderPage() (for whatever pages get (re)rendered this frame) and

@@ -114,6 +114,13 @@ constexpr uint32_t VSM_SUN_LEVEL_COUNT = 3u;
 inline float VSM_SUN_BASE_RADIUS = 2.0f;
 inline uint32_t VSM_PHYSICAL_PAGE_CAPACITY = 4096u;
 inline uint32_t VSM_MAX_PAGES_RENDERED_PER_FRAME = 512u;
+// VSM advanced roadmap, Feature 2 (real static-vs-dynamic page invalidation): own frame budget for
+// re-rendering resident pages classified "covers dynamic content" every frame -- see
+// renderer::VirtualShadowMapPass::kMaxDynamicPagesRenderedPerFrame's own comment (mirrors
+// VSM_MAX_PAGES_RENDERED_PER_FRAME's exact convention above). Not per-quality-profile-tiered (like
+// BUILD_VIRTUAL_TEXTURES above, unlike VSM_MAX_PAGES_RENDERED_PER_FRAME) -- this demo's whole
+// resident page count is small enough that a single generous default covers every profile.
+inline uint32_t VSM_MAX_DYNAMIC_PAGES_RENDERED_PER_FRAME = 512u;
 
 inline uint32_t _GI_QUALITY = 4;
 inline bool _HARDWARE_RAYTRACING = true;
@@ -124,6 +131,30 @@ inline uint32_t _REFLECTIONS_DOWNSAMPLE_FACTOR = 1;
 inline bool _HARDWARE_RAYTRACING_NANITE_MODE = true;
 inline bool _MEGALIGHTS_ENABLE = true;
 } // namespace lumen
+
+// Phase 4 of the "Nanite advanced" roadmap (light BVH for RIS spatial bias, temporal ReSTIR with
+// per-frame revalidated visibility -- see the approved plan) -- live simulation/tuning knobs, same
+// convention as atmos:: above: not a hardware-quality tier, so NOT mirrored into
+// EngineConfig_{Low,Medium,High,Extrem}.h / ApplyProfile()'s per-tier overrides.
+namespace megalights {
+// World-unit radius of the query box renderer::MegaLightsPass's geometry::LightBVH is traversed
+// against (megalights_bvh.glsl's GatherSpatialLightCandidates) to bias SelectLightRIS's candidate
+// draw toward lights near the current shading point -- see that function's own header comment for
+// why this is a BIAS, not an O(N)-avoidance optimization. Tuned to cover one hero-zone light
+// cluster (renderer::GenerateProceduralLights' own ~1.2-unit jittered-disk placement radius around
+// the MegaLights showcase zone) while excluding neighboring zones, which sit >= kZonePitch (4.0
+// units, MegaLightsTypes.cpp) away.
+inline float SPATIAL_BIAS_RADIUS = 3.25f;
+
+// Spatial reuse follow-up (still Phase 4): screen-space PIXEL radius (not a world-space one, unlike
+// SPATIAL_BIAS_RADIUS above -- this biases which NEIGHBORING SCREEN PIXELS' reservoirs
+// MegaLightsSpatialReuse.comp resamples, not which lights) the golden-angle Vogel-disk neighbor
+// pattern scales against. Kept modest: large enough to meaningfully reduce single-frame variance,
+// small enough that the geometry-similarity reject (world-space distance + normal cosine, same
+// heuristic/thresholds as the temporal reuse disocclusion test) still passes for most of a
+// continuous surface at this demo's typical view distances.
+inline float SPATIAL_REUSE_RADIUS_PIXELS = 24.0f;
+} // namespace megalights
 
 namespace reflections {
 inline uint32_t _QUALITY = 4;
@@ -323,6 +354,12 @@ inline bool SSR_FALLBACK_ENABLED = true;
 // renderer::ClusterRenderPipeline::RecordFrame for the actual list/ordering this indexes into.
 namespace debugview {
 inline int SELECTED_BUFFER_INDEX = 0;
+// Debug-only (ImGui "Volumetric" tab, main.cpp) -- when true, renderer::AtmosVolumetricFogPass
+// renders each config::localfog::VOLUMES entry as a bright, per-volume distinct color inside the
+// froxel grid so its extent/shape is directly visible. Read ONLY inside #ifndef NDEBUG blocks (its
+// ImGui checkbox and the RecordUpdate read that drives the shader flag are both gated), so this
+// never contributes any GPU work in a Release build -- see AtmosVolumetricFogPass::RecordUpdate.
+inline bool LOCAL_FOG_VOLUME_BOUNDS_VIZ = false;
 } // namespace debugview
 
 namespace volumetrics {
@@ -332,6 +369,62 @@ inline bool _VOLUMETRIC_FOG_ENABLE = true;
 inline uint32_t _VOLUMETRIC_FOG_GRID_PIXEL_SIZE = 4;
 inline float _VOLUMETRIC_CLOUD_VIEW_RAY_SAMPLE_COUNT_SCALE = 2.0f;
 } // namespace volumetrics
+
+// Local Fog Volumes (UE5.8 rendering-parity gap G8) -- localized, oriented-box or sphere fog
+// regions, each with its own density/color/vertical-falloff and an optional shadowed sun
+// contribution, injected ADDITIVELY into renderer::AtmosVolumetricFogPass's froxel grid on top of
+// the global Exponential Height Fog (postprocess::FOG_*) + Froxel Volumetric Fog. Authored scene
+// content (like config::particles::EMITTERS[] and the VulkanContext zone layout), read ONCE at
+// AtmosVolumetricFogPass::Init to build a small std430 SSBO -- so unlike the postprocess::FOG_*
+// analytic knobs above these are NOT live-tunable per-parameter; only the master ENABLE toggle
+// below takes effect at runtime (it zeroes the injected count for one frame). Same live-toggle
+// convention as volumetrics::_VOLUMETRIC_FOG_ENABLE.
+namespace localfog {
+
+// SSBO capacity. Only the first `active` entries of VOLUMES[] below are uploaded/injected.
+constexpr uint32_t kMaxLocalFogVolumes = 8u;
+
+// 0 = oriented box (halfExtents + yaw), 1 = sphere (sphereRadius, orientation ignored).
+enum class Shape : uint32_t { Box = 0u, Sphere = 1u };
+
+struct LocalFogVolumeConfig {
+    bool active = false;
+    uint32_t shape = 0u;                        // Shape (cast from localfog::Shape).
+    float centerX = 0.0f, centerY = 0.0f, centerZ = 0.0f; // World-space center.
+    float halfX = 1.0f, halfY = 1.0f, halfZ = 1.0f;       // Box half-extents (world units); ignored for a sphere.
+    float sphereRadius = 1.0f;                  // Sphere radius (world units); ignored for a box.
+    float yawDegrees = 0.0f;                    // Box orientation about world +Y; ignored for a sphere.
+    float density = 0.2f;                       // Base extinction density (world^-1) at the volume's base.
+    float heightFalloff = 0.6f;                 // Vertical density decay rate (like FOG_HEIGHT_FALLOFF) within the volume.
+    float edgeSoftness = 0.3f;                  // [0, 1) fractional soft-edge shell so volumes blend into the air.
+    float colorR = 0.8f, colorG = 0.87f, colorB = 1.0f;   // Scattering albedo/tint.
+    bool receivesSunShadow = true;              // Sample the VSM sun shadow for this volume's in-scatter.
+};
+
+// Master runtime toggle (live ImGui "Volumetric" tab). OFF injects a count of 0 for that frame
+// without touching the uploaded SSBO -- see AtmosVolumetricFogPass::RecordUpdate.
+inline bool ENABLE = true;
+
+// Two authored showcase volumes (placed relative to the VulkanContext::GridSlot zone gallery,
+// which spans XZ ~[-5, +5] at ground level, and the rivers/waterfalls feature's waterfall base at
+// world ~(12, -0.6, 12) -- see config::particles::EMITTERS[3]):
+//   [0] a broad, low, gently-yawed box of ground-hugging valley mist blanketing the whole gallery.
+//   [1] a denser sphere of mist billowing at the waterfall base -- COMPLEMENTS (does not fight) the
+//       waterfall's mist/foam sprite particles by adding a soft volumetric body of in-scattered
+//       light around them, rather than re-emitting the same sprites.
+inline LocalFogVolumeConfig VOLUMES[kMaxLocalFogVolumes] = {
+    LocalFogVolumeConfig{ /*active*/ true, /*shape*/ static_cast<uint32_t>(Shape::Box),
+        /*center*/ 0.0f, -0.35f, 0.0f, /*half*/ 9.0f, 1.3f, 9.0f, /*sphereRadius*/ 0.0f,
+        /*yaw*/ 18.0f, /*density*/ 0.14f, /*heightFalloff*/ 0.9f, /*edgeSoftness*/ 0.35f,
+        /*color*/ 0.78f, 0.85f, 1.0f, /*receivesSunShadow*/ true },
+    LocalFogVolumeConfig{ /*active*/ true, /*shape*/ static_cast<uint32_t>(Shape::Sphere),
+        /*center*/ 12.0f, -0.3f, 12.0f, /*half*/ 0.0f, 0.0f, 0.0f, /*sphereRadius*/ 4.5f,
+        /*yaw*/ 0.0f, /*density*/ 0.4f, /*heightFalloff*/ 0.6f, /*edgeSoftness*/ 0.4f,
+        /*color*/ 0.85f, 0.92f, 1.0f, /*receivesSunShadow*/ true },
+    LocalFogVolumeConfig{}, LocalFogVolumeConfig{}, LocalFogVolumeConfig{},
+    LocalFogVolumeConfig{}, LocalFogVolumeConfig{},
+};
+} // namespace localfog
 
 // Atmos weather system (atmos_integration_plan.md, Subtask 1: Climatic State Manager & Wind
 // Simulation) -- live simulation knobs, not a quality-preset tier, so unlike volumetrics:: above
@@ -349,8 +442,114 @@ inline float WIND_TURBULENCE_SCALE = 1.0f;
 inline float WIND_TURBULENCE_ROUGHNESS = 0.5f;
 inline float CLOUD_DENSITY_TARGET = 0.5f; // [0,1] -- unconsumed until Subtask 4 (Volumetric Clouds).
 inline float FOG_DENSITY_TARGET = 0.1f; // [0,1] -- unconsumed until Subtask 3 (Froxel Volumetric Fog).
-inline float RAIN_STRENGTH = 0.0f; // [0,1] -- unconsumed until a future precipitation pass.
+
+// Precipitation feature (rain/snow particle emission tied to the climate simulation, Ubisoft
+// "Atmos"-style) -- 0 = no precipitation at all (no spawn dispatch is even issued, see
+// renderer::ClusterRenderPipeline::RecordFrameEarly's own precipitation spawn-accumulator comment).
+// Renamed from the earlier placeholder RAIN_STRENGTH (which already fed AtmosGlobalsUBO.rainStrength
+// -- see AtmosClimatePass::RecordUpdate -- but nothing consumed it yet): this IS that future
+// precipitation pass, so the one knob now does double duty as both the GPU UBO field every
+// Atmos shader already mirrors and the actual particle spawn-rate driver below, rather than adding a
+// second, confusingly-overlapping slider. Also the baseline the Dynamic Weather Simulation below
+// drifts around when enabled (see that section's own comment).
+inline float PRECIPITATION_INTENSITY = 0.0f; // [0,1].
+inline float PRECIPITATION_MAX_SPAWN_RATE_PER_SECOND = 900.0f; // Particles/second at PRECIPITATION_INTENSITY == 1.0 -- scaled linearly below that.
+inline float PRECIPITATION_SNOW_TEMPERATURE_THRESHOLD_CELSIUS = 2.0f; // config::atmos::TEMPERATURE_CELSIUS below this spawns snow instead of rain (see renderer::ClusterRenderPipeline's own precipitation-kind-selection comment).
+inline float PRECIPITATION_SPAWN_RADIUS_METERS = 22.0f; // Half-extent (X/Z) of the horizontal spawn-shell box centered on the camera.
+inline float PRECIPITATION_SPAWN_HEIGHT_ABOVE_CAMERA_METERS = 16.0f; // How far above the camera the spawn band's midpoint sits.
+inline float PRECIPITATION_SPAWN_BAND_THICKNESS_METERS = 4.0f; // Vertical thickness of the spawn band (particles jitter +/- half this around the height above).
+inline float PRECIPITATION_FLOOR_BELOW_CAMERA_METERS = 20.0f; // A precip particle sinking this far below the camera is force-recycled even with no Global SDF geometry underneath (open sky/ocean/unstreamed regions).
+inline float PRECIPITATION_RAIN_FALL_SPEED_MPS = 9.0f; // Real-world raindrop terminal velocity is roughly 5-10 m/s depending on droplet size.
+inline float PRECIPITATION_SNOW_FALL_SPEED_MPS = 1.2f; // Real-world snowflake terminal velocity is roughly 0.5-1.5 m/s -- much slower than rain, see ParticleSimulation.comp's own fall-speed-relaxation comment.
+inline float PRECIPITATION_SNOW_WOBBLE_STRENGTH = 0.5f; // m/s -- horizontal sine-wobble amplitude added on top of wind drift, snow only.
+
+// --- Dynamic Weather Simulation (post-Subtask-1 addition, see AtmosClimatePass.h's own class
+// comment) -- when DYNAMIC_WEATHER_ENABLED, TEMPERATURE_CELSIUS/RELATIVE_HUMIDITY/WIND_SPEED_MPS/
+// CLOUD_DENSITY_TARGET/FOG_DENSITY_TARGET/PRECIPITATION_INTENSITY above are REINTERPRETED as
+// baseline "centers" the autonomous simulation drifts around, rather than literal per-frame state;
+// the fields below are the simulation's own parameters (front cadence, smoothing, season length/
+// amplitude), all still live ImGui sliders (main.cpp's Volumetric tab). ---
+inline bool DYNAMIC_WEATHER_ENABLED = true; // Master toggle: ON = autonomous drift, OFF = original static-read path (manual sliders take full, literal effect).
+inline float WEATHER_FRONT_TAU_SECONDS = 45.0f; // Exponential-approach smoothing time constant for weather-front drift (current += (target-current)*(1-exp(-dt/tau))) -- tens of seconds, so fronts are gradual, not per-frame twitchy.
+inline float WEATHER_FRONT_FREQUENCY = 0.015f; // How fast the clear/overcast/stormy blend weights drift, in noise-cycles per simulated second -- low-frequency by design (see AtmosClimatePass.cpp's own AtmosFbm1D), never an obviously-looping sine.
+inline float YEAR_LENGTH_SECONDS = 180.0f; // Simulated seconds per full seasonal cycle (winter->summer->winter) -- default 3 minutes so a demo session can actually observe a season change; a periodic function IS correct here (unlike weather fronts).
+inline float SEASONAL_TEMPERATURE_AMPLITUDE_CELSIUS = 12.0f; // Peak-to-baseline swing the seasonal cycle adds/subtracts from TEMPERATURE_CELSIUS (summer = +amplitude, winter = -amplitude).
+inline float SEASONAL_PRECIP_AMPLITUDE = 0.35f; // Peak-to-baseline swing the seasonal cycle adds/subtracts from PRECIPITATION_INTENSITY's target (winter = wetter, summer = drier).
+inline float SEASONAL_SUN_ELEVATION_AMPLITUDE_DEGREES = 15.0f; // Peak seasonal sweep applied to the scene's fixed base sun elevation angle (see ClusterRenderPipeline::Init()'s own sun-direction comment) -- a modest elevation-only sweep, no azimuth/axial-tilt astronomy.
 } // namespace atmos
+
+// GPU particle system (particle_system_integration_plan.md, Subtask 6: Final Integration) -- live
+// emitter/simulation knobs, same "runtime state, not a quality-preset tier" convention as
+// config::atmos:: above (not mirrored into EngineConfig_{Low,Medium,High,Extrem}.h), tuned live via
+// main.cpp's own Particles ImGui tab.
+namespace particles {
+
+// Multi-emitter roadmap (subtask A1 of the Niagara-parity plan): must match
+// renderer::ParticleSystemPass::kMaxEmitters exactly -- kept as a plain literal (not a shared
+// constant) since core/ intentionally does not include any renderer/ header, matching this
+// codebase's own established convention of manually documenting cross-layer value parity in
+// comments rather than adding a layering dependency (see e.g. ParticleCommon.glsl's own byte-layout
+// comments for the same pattern applied to struct layouts).
+inline constexpr uint32_t kMaxEmitters = 4;
+
+// Per-emitter, live-tunable spawn/physics/rendering parameters -- one instance per EMITTERS[] slot,
+// edited directly by main.cpp's Particles ImGui tab (one collapsible section per emitter) and read
+// every frame by renderer::ClusterRenderPipeline to build the EmitterParams array it passes to
+// renderer::ParticleSystemPass::RecordSimulate(). Replaces the old single flat set of
+// SPAWN_RATE_PER_SECOND/EMITTER_POSITION_*/GRAVITY/BOUNCE_ELASTICITY/FRICTION/DRAG_COEFFICIENT
+// globals this namespace used to hold directly (subtask A1 keeps their per-emitter defaults exactly
+// equivalent to the old always-on single emitter -- see EMITTERS[0] below).
+struct EmitterConfig {
+    bool active = false;
+    float positionX = 0.0f, positionY = 0.0f, positionZ = 0.0f;
+    float spawnRate = 0.0f;       // New particles/second this emitter requests -- ClusterRenderPipeline accumulates the fractional remainder per-emitter so this is exact over time even at a variable framerate.
+    float colorR = 1.0f, colorG = 1.0f, colorB = 1.0f, colorA = 1.0f;
+    float sizeMin = 0.1f, sizeMax = 0.1f;
+    float lifetimeMin = 2.0f, lifetimeMax = 4.0f;
+    float gravityY = -9.8f;       // World-space Y acceleration, m/s^2.
+    float bounceElasticity = 0.4f; // [0,1] -- fraction of normal-relative speed kept after a Global SDF collision.
+    float friction = 0.85f;        // [0,1] -- fraction of tangential-relative speed kept after a Global SDF collision.
+    float dragCoefficient = 0.5f;  // How strongly velocity relaxes toward the local Atmos wind vector each second.
+    uint32_t spawnShape = 0;       // 0 = Cone burst ("embers" launch), 1 = Sphere volume drift ("ambient dust").
+    float shapeParam0 = 0.3f;      // Sphere shape's radius in world units; unused by Cone.
+};
+
+// Slot 0 preserves the ORIGINAL single-emitter defaults exactly (same position/spawn rate/physics
+// values the old flat globals held) so this roadmap step changes nothing about the existing "embers"
+// look by default. Slot 1 is a new "Ambient Dust" emitter proving multi-emitter support end-to-end
+// (a slow-drifting sphere-volume spawn, distinct color/physics/shape from slot 0, both active
+// simultaneously). Slot 2 starts inactive, ready for further ImGui-driven experimentation.
+//
+// Slot 3 is the rivers/waterfalls feature's own waterfall mist/foam emitter -- rides this same
+// multi-emitter array rather than a bespoke dispatch, using the same "Sphere volume drift" shape
+// (spawnShape == 1) as slot 1's Ambient Dust, tuned for a soft, near-weightless billow instead of a
+// hard fall (low gravityY, no bounce/friction, full wind drag) and a pale blue-white, short-lived,
+// fairly large soft sprite. Position MUST match river_spline.glsl's own kRiverControlXZ[3]/
+// kRiverControlHeight[3] (the waterfall base control point) -- kept here as a separate,
+// explicitly-documented mirror (same "keep in sync" convention as water_params.glsl's own
+// kWaterLevel vs. VulkanContext.cpp's identical literal) rather than plumbing the GLSL-side spline
+// data back into C++, since this is the only C++ call site that needs it. Y is roughly midway down
+// the P2->P3 drop (0.8 to -1.0), where the falling sheet breaks up into mist.
+inline EmitterConfig EMITTERS[kMaxEmitters] = {
+    EmitterConfig{ /*active*/ true, /*position*/ 0.0f, 3.0f, 0.0f, /*spawnRate*/ 200.0f,
+        /*color*/ 1.0f, 0.7f, 0.3f, 1.0f, /*size*/ 0.1f, 0.1f, /*lifetime*/ 2.0f, 4.0f,
+        /*gravityY*/ -9.8f, /*bounce*/ 0.4f, /*friction*/ 0.85f, /*drag*/ 0.5f,
+        /*spawnShape*/ 0u, /*shapeParam0*/ 0.3f },
+    EmitterConfig{ /*active*/ true, /*position*/ 4.0f, 2.0f, 2.0f, /*spawnRate*/ 40.0f,
+        /*color*/ 0.6f, 0.7f, 0.85f, 0.5f, /*size*/ 0.03f, 0.07f, /*lifetime*/ 4.0f, 7.0f,
+        /*gravityY*/ -0.2f, /*bounce*/ 0.0f, /*friction*/ 0.0f, /*drag*/ 1.0f,
+        /*spawnShape*/ 1u, /*shapeParam0*/ 1.5f },
+    EmitterConfig{},
+    EmitterConfig{ /*active*/ true, /*position*/ 12.0f, -0.6f, 12.0f, /*spawnRate*/ 60.0f,
+        /*color*/ 0.85f, 0.92f, 1.0f, 0.65f, /*size*/ 0.18f, 0.40f, /*lifetime*/ 0.8f, 1.7f,
+        /*gravityY*/ -0.1f, /*bounce*/ 0.0f, /*friction*/ 0.0f, /*drag*/ 1.0f,
+        /*spawnShape*/ 1u, /*shapeParam0*/ 1.2f },
+};
+
+inline float SOFT_FADE_DISTANCE = 0.5f; // World units -- see ParticleRender.frag's own softFade comment.
+inline bool HEAT_SHIMMER_ENABLED = false;
+inline float HEAT_SHIMMER_STRENGTH = 0.02f; // Only applied when HEAT_SHIMMER_ENABLED is true -- see ParticleSystemPass::RecordDraw's own comment on why this is a per-draw-call, not per-particle, toggle.
+} // namespace particles
 
 // Active loaded state
 inline bool g_ProfileLoaded = false;

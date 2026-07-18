@@ -1,0 +1,116 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+
+// Rivers/waterfalls feature: generates the flowing-water ribbon mesh (river course + one steep
+// waterfall segment where two adjacent control points drop sharply, see river_spline.glsl's own
+// kRiverControlHeight comment) that follows river_spline.glsl's authored path. Near-literal mirror
+// of geom_terrain.comp's own dispatch shape/Params UBO/Vertex-write pattern (see that shader's own
+// header comment) -- the only real difference is the position/normal source: an analytic
+// RiverSurfacePosition(t, s, halfWidth) evaluation along the spline instead of a 2D heightfield
+// sample.
+//
+// Deliberately dispatched with `meshID` == the SAME entity as VulkanContext::GenerateWaterPlane's
+// own flat lake quad, immediately after it, continuing that call's own runningVertexOffset/
+// runningIndexOffset (see VulkanContext::GenerateGeometry's WATER block and GenerateRiver()'s own
+// comment) -- exactly the same "N chained compute dispatches, one shared meshID" convention
+// GenerateBox already establishes for its 6 per-face dispatches. This is a deliberate choice NOT
+// to widen VulkanContext::kEntityCount with a new dedicated river entity: the river is rendered by
+// the SAME renderer::WaterForwardPass draw call as the lake (one shared EntityDrawRange, one
+// shared kWaterMaterialID), with WaterForward.frag distinguishing "am I lake or river/waterfall
+// water this fragment" purely from world position via river_spline.glsl's own RiverChannelMask --
+// see that shader's own header comment.
+
+#include "include/struct_custo.glsl"
+#include "include/river_spline.glsl"
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(std430, binding = 0) writeonly buffer VertexBuffer { Vertex vertices[]; };
+layout(std430, binding = 1) writeonly buffer IndexBuffer  { uint indices[]; };
+
+layout(std140, binding = 2) uniform Params
+{
+    uint  segmentsAlong;  // Grid resolution along the downstream (t) axis.
+    uint  segmentsAcross; // Grid resolution across the channel (s) axis -- typically small (a
+                          // ribbon is much narrower than it is long).
+    float halfWidth;      // River_spline.glsl's own kRiverHalfWidth, passed through explicitly
+                          // rather than referenced directly so this Params UBO stays self-
+                          // contained (matches every other geom_*.comp's own convention).
+    float _padUnused;     // Keeps the float/uint pairs 8-byte aligned -- mirrors PlaneParams'
+                          // own std140 layout discipline (VulkanContext.cpp's RiverParams mirror
+                          // must match this exactly).
+    uint  meshID;
+    float materialID;
+    uint  vertexOffset;
+    uint  indexOffset;
+    float worldOffsetX;
+    float worldOffsetY;
+    float worldOffsetZ;
+};
+
+void main()
+{
+    if (segmentsAlong < 2u || segmentsAcross < 2u || halfWidth <= 0.0)
+    {
+        return;
+    }
+
+    uint i = gl_GlobalInvocationID.x; // along (t)
+    uint j = gl_GlobalInvocationID.y; // across (s)
+    if (i >= segmentsAlong || j >= segmentsAcross) return;
+
+    float t = (float(i) / float(segmentsAlong - 1u)) * kRiverArcParamMax;
+    float s = (float(j) / float(segmentsAcross - 1u)) * 2.0 - 1.0; // [-1, 1]
+
+    uint vIdx = i + j * segmentsAlong;
+
+    Vertex v;
+    v.position = RiverSurfacePosition(t, s, halfWidth);
+
+    // Analytic central-difference normal (same technique as geom_terrain.comp's own -- see that
+    // shader's header comment): sample the closed-form surface at small t/s offsets instead of a
+    // heightfield, since this surface is itself already a closed-form function of (t, s).
+    float epsT = kRiverArcParamMax / float(segmentsAlong) * 0.5;
+    float epsS = 1.0 / float(segmentsAcross) * 0.5;
+    vec3 pT0 = RiverSurfacePosition(max(t - epsT, 0.0), s, halfWidth);
+    vec3 pT1 = RiverSurfacePosition(min(t + epsT, kRiverArcParamMax), s, halfWidth);
+    vec3 pS0 = RiverSurfacePosition(t, max(s - epsS, -1.0), halfWidth);
+    vec3 pS1 = RiverSurfacePosition(t, min(s + epsS, 1.0), halfWidth);
+    vec3 tangentAlong = pT1 - pT0;
+    vec3 tangentAcross = pS1 - pS0;
+    v.normal = normalize(cross(tangentAcross, tangentAlong));
+    // A degenerate (near-zero-length) tangent at the clamped domain edges falls back to a
+    // world-up normal rather than propagating NaN from normalize(vec3(0)).
+    if (any(isnan(v.normal))) {
+        v.normal = vec3(0.0, 1.0, 0.0);
+    }
+
+    // uv.x carries the downstream arc parameter (normalized [0,1]) -- WaterForward.frag does NOT
+    // consume this directly (it re-derives flow direction/speed analytically from world position
+    // via river_spline.glsl, see that shader's own header comment on why: geometry::FallbackVertex
+    // has no uv2/flow-vector channel to survive the Fallback Mesh reduction WaterForwardPass
+    // actually draws from). Kept populated anyway for consistency with every other geom_*.comp
+    // primitive and as a harmless future hook.
+    v.uv         = vec2(t / kRiverArcParamMax, (s + 1.0) * 0.5);
+    v.uv2        = v.uv;
+    v.meshID     = meshID;
+    v.materialID = materialID;
+
+    v.position += vec3(worldOffsetX, worldOffsetY, worldOffsetZ);
+    vertices[vertexOffset + vIdx] = v;
+
+    if (i < segmentsAlong - 1u && j < segmentsAcross - 1u)
+    {
+        uint idx = vIdx;
+        uint tIdx = indexOffset + (j * (segmentsAlong - 1u) + i) * 6u;
+
+        // Same winding convention as geom_terrain.comp's own quad split.
+        indices[tIdx + 0u] = vertexOffset + idx + segmentsAlong;
+        indices[tIdx + 1u] = vertexOffset + idx + 1u;
+        indices[tIdx + 2u] = vertexOffset + idx;
+
+        indices[tIdx + 3u] = vertexOffset + idx + segmentsAlong;
+        indices[tIdx + 4u] = vertexOffset + idx + segmentsAlong + 1u;
+        indices[tIdx + 5u] = vertexOffset + idx + 1u;
+    }
+}

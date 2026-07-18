@@ -9,7 +9,7 @@ namespace core {
         uint32_t cellID;
         uint32_t flags; // Bit 0: CastShadows, Bit 1: IsInteractive, Bit 2: IsDynamic, Bit 3: UseCustomFog,
                          // Bit 4: IsTransparent, Bit 5: HasEnhancedDisplacement, Bit 6: HasSplineDeformation,
-                         // Bit 7: StreamingInactive
+                         // Bit 7: StreamingInactive, Bit 8: IsTessellated
     };
 
     enum EntityFlags : uint32_t {
@@ -36,7 +36,21 @@ namespace core {
         // (always geometrically valid, just parked) mesh never actually rasterizes. Always 0 for
         // every non-streaming entity -- untouched by VulkanContext::BuildEntityData()'s original
         // showcase-entity loop, so this bit changes nothing about their existing behavior.
-        StreamingInactive = 1 << 7
+        StreamingInactive = 1 << 7,
+        // Generalized Nanite Tessellation (renderer::TessellationPass, generalized from the earlier
+        // Phase 7a single-hardcoded-entity "HeroTessellationPass"): opts ANY entity into the
+        // screen-space-adaptively-tessellated + procedurally-displaced forward pass instead of the
+        // opaque Nanite VisBuffer pipeline -- real UE5.8 Nanite Tessellation (5.5+) is a per-mesh
+        // opt-in flag, not a single hardcoded hero asset, and this bit is what makes that true here.
+        // Same exclusion mechanism as IsTransparent (ClusterLODCompact.comp's own per-entity
+        // candidate-routing stage also checks this bit -- see that shader's own EntityDataBuffer
+        // comment): an IsTessellated entity's clusters must never reach the opaque candidate list,
+        // since renderer::TessellationPass renders it directly from its own Fallback Mesh geometry
+        // instead, exactly like the hero entity's own pre-existing forced-IsTransparent exclusion
+        // did. VulkanContext::BuildEntityData() also still forces IsTransparent true for every
+        // IsTessellated entity (not just materialID-based alpha), for that same exclusion reason --
+        // NOT because tessellated entities are actually alpha-blended.
+        IsTessellated = 1 << 8
     };
 
     inline void SetFlag(uint32_t& flags, EntityFlags f, bool value) {
@@ -58,9 +72,19 @@ namespace core {
     // VulkanContext class, only on plain data/handles it exposes).
     struct EntityTransformCPU {
         maths::mat4 rotation;
+        // Rest-pose world-space rotation pivot -- Phase 5 (Streaming & Monde roadmap, Part 1) never
+        // rebases this field (see struct_custo.glsl's EntityTransform comment for why: it also
+        // doubles as the rotation pivot against the immutable, always-absolute baked vertex data).
         maths::vec3 center;
         // Additional world-space offset on top of the rotate-about-center result -- see
-        // struct_custo.glsl's EntityTransform comment. Zero for every non-streaming entity.
+        // struct_custo.glsl's EntityTransform comment. Phase 5 (Streaming & Monde roadmap, Part 1):
+        // this is now "-world::LwcOrigin::GetCurrentOffset()" for every entity (no longer literally
+        // zero for non-streaming entities), so the composed transform this struct describes is
+        // relative to the CURRENT LWC origin cell, not absolute world space -- consumers of this CPU
+        // mirror (SurfaceCacheRayTracingPass's per-frame TLAS refit, GlobalSDFPass's object-space
+        // compositing) therefore operate in the SAME per-frame rebased reference frame as the
+        // rasterized VisBuffer pipeline, matching renderer::ClusterRenderPipeline::m_FrameScratch's
+        // own single-choke-point rebased camera value -- one "world space" notion per frame.
         maths::vec3 translation{};
     };
 }

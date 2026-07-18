@@ -110,6 +110,28 @@ namespace renderer {
         uint32_t GetResidentPageCount() const { return m_ResidentCount; }
         uint32_t GetPhysicalCapacity() const { return m_PhysicalPageCapacity; }
 
+        // VSM advanced roadmap, Feature 2 (real static-vs-dynamic page invalidation): marks/reads
+        // whether `logicalPageID` currently covers any dynamic (rotating/deformed) entity, per
+        // renderer::VirtualShadowMapPass's own per-frame NDC-overlap classification -- this class
+        // itself never computes the classification, only stores it. Reset to false on the EVICTED
+        // logicalPageID whenever a page is evicted (see EvictOneLeastRecentlyUsed), so a page's
+        // classification never survives a residency gap: if that same logical page is later
+        // re-allocated (possibly to a different physical layer), it reclassifies from scratch
+        // rather than inheriting a stale verdict.
+        void SetPageCoversDynamicContent(uint32_t logicalPageID, bool coversDynamic);
+        bool GetPageCoversDynamicContent(uint32_t logicalPageID) const;
+
+        // Every currently-resident logical page ID, regardless of dynamic/static classification --
+        // walks the existing intrusive LRU list (no separate bookkeeping), same O(m_ResidentCount)
+        // cost as a full LRU traversal. Used by VirtualShadowMapPass::ClassifyDynamicPages() to
+        // re-test every resident page's classification once per frame.
+        std::vector<uint32_t> GetResidentPageIDs() const;
+
+        // Only the resident logical page IDs currently classified as covering dynamic content --
+        // same LRU walk as GetResidentPageIDs(), filtered by m_LogicalPageCoversDynamic. Used by
+        // VirtualShadowMapPass::RecordBeginFrame()'s own dynamic-page re-render block.
+        std::vector<uint32_t> GetResidentDynamicPageIDs() const;
+
         VkImage GetPhysicalPoolImage() const { return m_PhysicalPoolImage; }
         // Sampling view (sampler2DArray) spanning every physical layer.
         VkImageView GetPhysicalPoolArrayView() const { return m_PhysicalPoolArrayView; }
@@ -155,6 +177,10 @@ namespace renderer {
         // Dense flat map (not unordered_map: the logicalPageID domain is small -- totalVSMCount *
         // 256 -- and every ID in [0, size) is a valid index, so a plain array beats a hash map).
         std::vector<uint32_t> m_LogicalToPhysical;
+        // VSM advanced roadmap, Feature 2: parallel to m_LogicalToPhysical (same dense domain, same
+        // size, same index) -- see SetPageCoversDynamicContent/GetPageCoversDynamicContent's own
+        // comment.
+        std::vector<bool> m_LogicalPageCoversDynamic;
         std::vector<LRUNode> m_LRUNodes; // Sized m_PhysicalPageCapacity.
         uint32_t m_LRUMostRecentPage = kInvalidShadowPhysicalPage;
         uint32_t m_LRULeastRecentPage = kInvalidShadowPhysicalPage;

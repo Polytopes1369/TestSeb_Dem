@@ -44,6 +44,13 @@ const float ATMOS_FOG_PI = 3.14159265358979323846;
 #include "include/shadow_atlas_sampling.glsl"
 #include "include/shadow_sun_sampling.glsl"
 
+// Local Fog Volumes (UE5.8 rendering-parity gap G8): the list of localized box/sphere fog regions
+// injected additively into this froxel grid, on top of the global fog term below -- see
+// local_fog_volumes.glsl's own header comment for the full rationale and std430 layout.
+#define LOCAL_FOG_VOLUMES_SET 0
+#define LOCAL_FOG_VOLUMES_BINDING 11
+#include "include/local_fog_volumes.glsl"
+
 layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
 
 const int ATMOS_FOG_GRID_WIDTH = 160;
@@ -77,6 +84,8 @@ layout(push_constant) uniform AtmosVolumetricFogPC {
     float sunColorR, sunColorG, sunColorB;
     float sunIlluminance;
     uint frameIndex;
+    uint localFogVolumeCount; // Local Fog Volumes (G8): number of valid entries in g_LocalFogVolumes (0 = feature off).
+    uint debugVizBounds;      // Debug-only bounds visualization (always 0 in Release -- see AtmosVolumetricFogPass::RecordUpdate).
 } pc;
 
 vec3 GetCameraPosition() { return vec3(pc.cameraPositionX, pc.cameraPositionY, pc.cameraPositionZ); }
@@ -184,6 +193,17 @@ void InjectMediaProps(ivec3 coord) {
     float scatteringCoeff = density * ATMOS_FOG_ALBEDO;
     float extinctionCoeff = density;
 
+    // Local Fog Volumes (G8): add each covering volume's extinction on top of the global term so the
+    // Beer-Lambert integration (mode 2, AccumulateFog) attenuates correctly through the localized
+    // fog. The matching per-volume in-scattered radiance (its own scattering tint + optionally-
+    // shadowed sun) is added by InjectLight (mode 1), which re-evaluates the SAME
+    // EvaluateLocalFogVolumeDensity() at this froxel. The local volumes' scattering is deliberately
+    // NOT folded into scatteringCoeff here -- that channel feeds only the GLOBAL fog's white/sun-
+    // tinted in-scatter in mode 1, whereas each local volume carries its own scattering albedo.
+    for (uint i = 0u; i < pc.localFogVolumeCount; ++i) {
+        extinctionCoeff += EvaluateLocalFogVolumeDensity(g_LocalFogVolumes.volumes[i], worldPos);
+    }
+
     imageStore(g_MediaPropsStorage, coord, vec4(scatteringCoeff, extinctionCoeff, 0.0, 0.0));
 }
 
@@ -258,9 +278,12 @@ void InjectLight(ivec3 coord) {
     vec3 sunContribution = vec3(scatteringCoeff * sunVisibility * phaseSun * pc.sunIlluminance) * GetSunColor();
 
     // --- One stochastic MegaLights point light ---
+    // `pointRadiance` is the in-scattered radiance PER UNIT scattering coefficient (i.e. with the
+    // scatteringCoeff factor pulled out), so the SAME sampled point light can light both the global
+    // fog (below) and every local fog volume (further below), each scaled by its own scattering.
     uint seed = uint(coord.x) + uint(coord.y) * uint(ATMOS_FOG_GRID_WIDTH) + uint(coord.z) * uint(ATMOS_FOG_GRID_WIDTH * ATMOS_FOG_GRID_HEIGHT);
     uint lightIndex; float invPdf;
-    vec3 pointContribution = vec3(0.0);
+    vec3 pointRadiance = vec3(0.0);
     if (SelectVolumeLightRIS(worldPos, seed, pc.frameIndex, lightIndex, invPdf)) {
         MegaLight light = g_Lights.lights[lightIndex];
         vec3 toLight = light.position - worldPos;
@@ -272,10 +295,46 @@ void InjectLight(ivec3 coord) {
         float nd2 = normalizedDist * normalizedDist;
         float window = saturate((1.0 - nd2 * nd2) * (1.0 - nd2 * nd2));
 
-        pointContribution = scatteringCoeff * light.color * (light.intensity / distSq) * window * phasePoint * invPdf;
+        pointRadiance = light.color * (light.intensity / distSq) * window * phasePoint * invPdf;
+    }
+    vec3 pointContribution = scatteringCoeff * pointRadiance; // Global fog's point-light in-scatter (unchanged).
+
+    // --- Local Fog Volumes (G8): additive per-volume in-scattered radiance ---
+    // Each covering volume re-evaluates the SAME EvaluateLocalFogVolumeDensity() as InjectMediaProps
+    // above, then lights that density with its OWN scattering albedo/tint (colorShadow.rgb), the sun
+    // (optionally shadowed via the same VirtualShadowMapPass lookup already computed for the global
+    // fog -- gated per-volume by colorShadow.w, the "receives sun shadow" flag), and the same RIS
+    // point light. Sun/phase reuse the values above, so a volume costs only its own density eval +
+    // a few multiplies.
+    vec3 localContribution = vec3(0.0);
+    for (uint i = 0u; i < pc.localFogVolumeCount; ++i) {
+        LocalFogVolume vol = g_LocalFogVolumes.volumes[i];
+        float localDensity = EvaluateLocalFogVolumeDensity(vol, worldPos);
+        if (localDensity <= 0.0) {
+            continue;
+        }
+        vec3 localScattering = localDensity * vol.colorShadow.rgb;              // Per-volume scattering albedo/tint.
+        float volSunVis = (vol.colorShadow.w > 0.5) ? sunVisibility : 1.0;      // Optional "receives sun shadow".
+        vec3 volSun = localScattering * (volSunVis * phaseSun * pc.sunIlluminance) * GetSunColor();
+        vec3 volPoint = localScattering * pointRadiance;                        // Tinted by the medium's own albedo.
+        localContribution += volSun + volPoint;
     }
 
-    imageStore(g_RawLightStorage, coord, vec4(sunContribution + pointContribution, 0.0));
+    // Debug-only bounds visualization: emit a bright, per-volume distinct color for every froxel
+    // inside a local fog volume, so each volume's extent/shape reads clearly regardless of the
+    // scene's own lighting. pc.debugVizBounds is forced 0 in Release (its ImGui toggle and the
+    // config read that drives it are both #ifndef NDEBUG-gated -- see AtmosVolumetricFogPass::
+    // RecordUpdate), so this branch is never taken in a production build.
+    if (pc.debugVizBounds != 0u) {
+        for (uint i = 0u; i < pc.localFogVolumeCount; ++i) {
+            if (EvaluateLocalFogVolumeDensity(g_LocalFogVolumes.volumes[i], worldPos) > 0.0) {
+                vec3 hue = 0.5 + 0.5 * cos(vec3(0.0, 2.09439510, 4.18879020) + float(i) * 1.7);
+                localContribution += hue * 6.0;
+            }
+        }
+    }
+
+    imageStore(g_RawLightStorage, coord, vec4(sunContribution + pointContribution + localContribution, 0.0));
 }
 
 // --- mode 2: AccumulateFog -----------------------------------------------------------------------

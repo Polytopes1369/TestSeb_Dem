@@ -416,9 +416,17 @@ bool ClusterRenderPipeline::Init(
   // established "self-contained pass" convention -- see e.g. renderer::VirtualShadowMapPass's own
   // class comment).
   // =========================================================================================
+  // VSM advanced roadmap, Feature 1/3: the 4 buffers below are the SAME ones
+  // m_HardwareRaster.Init()/m_SoftwareRaster.Init()/m_Resolve.Init() already received above (all
+  // already created/uploaded at this point in Init()), plus createInfo.entityDataCPU (Feature 1's
+  // per-entity material lookup) and m_MaskGenerator.GetMaskImageInfos() (Feature 3, initialized
+  // earlier at STEP 6 above, before any consumer pass that binds it).
   if (!m_VirtualShadowMap.Init(createInfo.physicalDevice, createInfo.device, createInfo.allocator,
                                createInfo.commandPool, createInfo.queue,
-                               createInfo.cacheFilePath)) {
+                               createInfo.cacheFilePath,
+                               createInfo.entityTransformBuffer, createInfo.entityDataBuffer,
+                               m_WPOGlobalsBuffer.Handle(), m_SplineControlPointsBuffer.Handle(),
+                               createInfo.entityDataCPU, m_MaskGenerator.GetMaskImageInfos())) {
     LOG_ERROR("[ClusterRenderPipeline] Failed to initialize VirtualShadowMapPass.");
     return false;
   }
@@ -500,6 +508,11 @@ bool ClusterRenderPipeline::Init(
   // The lower afternoon elevation (vs. a near-overhead default) is what actually produces long,
   // clearly readable cast shadows instead of short near-vertical ones.
   m_SceneLights.sun.direction = maths::vec3(0.678f, -0.713f, -0.178f).Normalize();
+  // Dynamic Weather Simulation's seasonal cycle rotates the sun's ELEVATION angle only (see
+  // RecordFrame()'s own [1y] block and AtmosClimatePass::GetSeasonalSunElevationOffsetRadians's
+  // comment) -- it needs this exact fixed base direction to offset from every frame, never the
+  // (potentially already-offset) live m_SceneLights.sun.direction, so it is captured here once.
+  m_BaseSunDirection = m_SceneLights.sun.direction;
   // Mild warm tint for late-afternoon sunlight (intensity left at its existing default -- a 45
   // degree summer sun is still strong, not golden-hour-grazing).
   m_SceneLights.sun.color = maths::vec3(1.0f, 0.88f, 0.72f);
@@ -569,6 +582,9 @@ bool ClusterRenderPipeline::Init(
     LOG_ERROR("[ClusterRenderPipeline] Failed to initialize SurfaceCacheGIInjectPass.");
     return false;
   }
+  // Atmos weather system, Subtask 5: one-time wiring (see SurfaceCacheGIInjectPass::SetAtmosSkyView's
+  // own comment) -- m_AtmosSky is already Init'd above and its Sky-View LUT view/sampler never change.
+  m_GIInject.SetAtmosSkyView(m_AtmosSky.GetSkyViewLUTView(), m_AtmosSky.GetLUTSampler());
   // Phase 2 (UE5.8 parity roadmap): specular reflections -- needs m_Resolve's GBuffer (already
   // Init'd, STEP 6 above), including its Phase 1a roughness/metallic channel, plus
   // m_TraceContext/m_SurfaceCacheRT for its own trace pass.
@@ -583,6 +599,9 @@ bool ClusterRenderPipeline::Init(
   // Init'd), so must Init after both.
   m_ScreenSpaceEffects.Init(createInfo.device, createInfo.allocator, createInfo.commandPool,
                             createInfo.queue, createInfo.renderExtent, m_Resolve, m_Reflection);
+  // Atmos weather system, Subtask 5: one-time wiring (see ScreenSpaceEffectsPass::SetAtmosSkyView's
+  // own comment) -- m_AtmosSky is already Init'd above and its Sky-View LUT view/sampler never change.
+  m_ScreenSpaceEffects.SetAtmosSkyView(m_AtmosSky.GetSkyViewLUTView(), m_AtmosSky.GetLUTSampler());
   // Phase A of the MegaLights native-port roadmap: procedurally scatter kMaxMegaLights point
   // lights around the demo's 13-entity grid (see MegaLightsTypes.h's own GenerateProceduralLights
   // comment), then Init the pass -- needs m_Resolve's GBuffer (same as m_Reflection above) and
@@ -606,6 +625,22 @@ bool ClusterRenderPipeline::Init(
     return false;
   }
 
+  // Atmos weather system, Subtask 4: Procedural Volumetric Clouds -- half-res output sized from
+  // this frame's own render extent (see AtmosCloudsPass.h's own class comment for why).
+  if (!m_AtmosClouds.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
+                          createInfo.renderExtent, m_AtmosClimate)) {
+    LOG_ERROR("[ClusterRenderPipeline] Failed to initialize AtmosCloudsPass.");
+    return false;
+  }
+  // Atmos weather system, Subtask 5: one-time wiring, now that both producers (m_AtmosSky, just
+  // above; m_AtmosClouds, just Init'd here) exist -- see SurfaceCachePass::SetAtmosCloudShadow's and
+  // ClusterResolvePass::SetAtmosCloudLighting's own comments. Neither the Sky-View LUT nor the Cloud
+  // Shadow Map's view/sampler are ever recreated after their owning pass' Init(), so these bindings
+  // are never refreshed again.
+  m_SurfaceCache.SetAtmosCloudShadow(m_AtmosClouds.GetCloudShadowMapView(), m_AtmosClouds.GetCloudShadowMapSampler());
+  m_Resolve.SetAtmosCloudLighting(m_AtmosSky.GetLUTSampler(), m_AtmosSky.GetSkyViewLUTView(),
+                                  m_AtmosClouds.GetCloudShadowMapSampler(), m_AtmosClouds.GetCloudShadowMapView());
+
   // World Probe grid (Lumen "Translucency Volume") -- reuses the same shared trace-scene sets and
   // HWRT/BLAS/TLAS as every other GI consumer above; see ClusterRenderPipeline.h's own comment on
   // its live consumers (m_ScreenTrace's fallback, GICompositePass's debug visualization). Must be
@@ -615,6 +650,9 @@ bool ClusterRenderPipeline::Init(
     LOG_ERROR("[ClusterRenderPipeline] Failed to initialize WorldProbeGridPass.");
     return false;
   }
+  // Atmos weather system, Subtask 5: one-time wiring (see WorldProbeGridPass::SetAtmosSkyView's own
+  // comment) -- m_AtmosSky is already Init'd above and its Sky-View LUT view/sampler never change.
+  m_WorldProbes.SetAtmosSkyView(m_AtmosSky.GetSkyViewLUTView(), m_AtmosSky.GetLUTSampler());
 
   // Forward-rendered translucent/transparent materials (see TransparentForwardPass's own class
   // comment) -- reuses the SAME indexEntries/dagEntries this function loaded above for
@@ -642,46 +680,65 @@ bool ClusterRenderPipeline::Init(
                             m_SplineControlPointsBuffer.Handle());
   m_TransparentForward.SetVirtualShadowMap(m_VirtualShadowMap);
 
-  // Phase 7a (UE5.8 parity roadmap, hero asset tessellation): forward-rendered, tessellated/
-  // displaced hero Icosphere -- see ClusterRenderPipeline.h's own comment on m_HeroTessellation.
-  // Same borrowed-resource contract as m_TransparentForward above, resolved for the hero entity
-  // instead of every transparent entity; `heroMaterial` is the caller's own
-  // materialTable.params[renderer::kHeroMaterialID] slot (populated by
-  // GenerateShowcaseMaterialTable()'s own hero-recipe override, see that function's own comment).
+  // Generalized Nanite Tessellation (renderer::TessellationPass, generalized from the earlier
+  // Phase 7a single-hardcoded-entity "HeroTessellationPass") -- forward-rendered, tessellated/
+  // displaced entities -- see ClusterRenderPipeline.h's own comment on m_Tessellation. Same
+  // borrowed-resource contract as m_TransparentForward above, resolved for every
+  // core::EntityFlags::IsTessellated entity instead of a single hardcoded hero; `materialTable`
+  // passes the FULL table (each entity keeps its own materialID -- see VulkanContext::
+  // kTessellatedEntityIndices' own comment for the exact entity/material choices) instead of one
+  // hero-only slot.
   {
-    // Matches VulkanContext::kHeroEntityIndex exactly (the Icosphere, generated first -- see that
-    // class' own comment) -- a plain literal here rather than a cross-file constant reference,
-    // since ClusterRenderPipeline.cpp does not otherwise depend on VulkanContext.h.
-    constexpr uint32_t kHeroEntityID = 2u;
+    // Matches VulkanContext::kTessellatedEntityIndices exactly -- plain literals here rather than
+    // a cross-file constant reference, since ClusterRenderPipeline.cpp does not otherwise depend
+    // on VulkanContext.h (same convention the pre-generalization kHeroEntityID/kWaterEntityID
+    // literals right below already establish).
+    constexpr std::array<uint32_t, 3> kTessellatedEntityIDs = { 2u, 3u, 9u };
     const auto& entityRanges = m_SurfaceCache.GetEntityRanges();
-    const auto heroRangeIt = entityRanges.find(kHeroEntityID);
-    if (heroRangeIt == entityRanges.end()) {
-      LOG_ERROR("[ClusterRenderPipeline] Hero entity (meshID=2) has no Fallback Mesh draw range -- cannot initialize HeroTessellationPass.");
-      return false;
+
+    std::vector<TessellatedEntityDrawInfo> tessellatedEntities;
+    tessellatedEntities.reserve(kTessellatedEntityIDs.size());
+    for (uint32_t entityID : kTessellatedEntityIDs) {
+      const auto rangeIt = entityRanges.find(entityID);
+      if (rangeIt == entityRanges.end()) {
+        LOG_ERROR(std::format("[ClusterRenderPipeline] Tessellated entity (meshID={}) has no Fallback Mesh draw range -- cannot initialize TessellationPass.", entityID));
+        return false;
+      }
+      // Every tessellated entity keeps its OWN materialID exactly as VulkanContext::
+      // BuildEntityData() assigned it (the hero entity's own override to kHeroMaterialID already
+      // baked in by that point) -- read back from createInfo.entityDataCPU, the same CPU-side
+      // mirror (index == meshID) SurfaceCachePass::Init() above already reads for an identical
+      // reason (see that field's own comment).
+      TessellatedEntityDrawInfo info{};
+      info.drawRange = rangeIt->second;
+      info.entityID = entityID;
+      info.materialID = createInfo.entityDataCPU[entityID].materialID;
+      tessellatedEntities.push_back(info);
     }
-    if (!m_HeroTessellation.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
+
+    if (!m_Tessellation.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
                             GICompositePass::kOutputFormat, createInfo.depthFormat,
                             createInfo.entityTransformBuffer,
-                            createInfo.materialTable.params[kHeroMaterialID],
+                            createInfo.materialTable.params,
                             m_SurfaceCache.GetVertexBuffer(), m_SurfaceCache.GetIndexBuffer(),
-                            heroRangeIt->second, kHeroEntityID,
+                            tessellatedEntities,
                             m_SurfaceCacheRT.GetTLASHandle(), m_SurfaceCacheRT.GetDrawRangeBuffer(),
                             m_MegaLights.GetLightBufferHandle(), m_MegaLights.GetLightBufferSize(),
                             m_VirtualShadowMap, m_WorldProbes, m_TraceContext)) {
-      LOG_ERROR("[ClusterRenderPipeline] Failed to initialize HeroTessellationPass.");
+      LOG_ERROR("[ClusterRenderPipeline] Failed to initialize TessellationPass.");
       return false;
     }
   }
 
   // Phase 7c (UE5.8 parity roadmap, water/erosion): forward-rendered water plane -- see
   // ClusterRenderPipeline.h's own comment on m_WaterForward. Same borrowed-resource contract as
-  // m_HeroTessellation above, resolved for the water entity; `waterMaterial` is the caller's own
+  // m_Tessellation above, resolved for the water entity; `waterMaterial` is the caller's own
   // materialTable.params[renderer::kWaterMaterialID] slot (populated by
   // GenerateShowcaseMaterialTable()'s own water-recipe override, see that function's own comment).
   {
     // Matches VulkanContext::kWaterEntityIndex exactly (the water plane, generated last -- see
     // that class' own comment) -- a plain literal here rather than a cross-file constant
-    // reference, same convention kHeroEntityID above already establishes.
+    // reference, same convention kTessellatedEntityIDs above already establishes.
     constexpr uint32_t kWaterEntityID = 15u;
     const auto& entityRanges = m_SurfaceCache.GetEntityRanges();
     const auto waterRangeIt = entityRanges.find(kWaterEntityID);
@@ -700,6 +757,24 @@ bool ClusterRenderPipeline::Init(
       LOG_ERROR("[ClusterRenderPipeline] Failed to initialize WaterForwardPass.");
       return false;
     }
+  }
+
+  // GPU particle system (particle_system_integration_plan.md): buffer/descriptor-set skeleton
+  // (Subtask 1) + simulation (Subtask 2) + sort (Subtask 3) + billboard render + Lumen/VSM lighting
+  // (Subtasks 4-5) pipelines -- see renderer::ParticleSystemPass's own class comment. Depends on
+  // m_AtmosClimate (wind), m_GlobalSDF (collision clipmaps, both Init'd above at STEP 7),
+  // m_Resolve (GBuffer depth copy for soft particles, Init'd far earlier at STEP 6),
+  // m_VirtualShadowMap (sun shadow, STEP 7) and m_WorldProbes (indirect diffuse, just above) -- all
+  // five already ready by this point. colorFormat/depthFormat match TransparentForwardPass::Init's
+  // own call site immediately below: this pass draws onto the SAME m_GIComposite output image and
+  // real depth-stencil buffer every other forward pass targets. RecordSimulate/RecordSort/
+  // RecordDraw are all implemented but NOT yet called from RecordFrame (Subtask 6 wires that up),
+  // so this Init() has no RecordFrame ordering consequence yet.
+  if (!m_ParticleSystem.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
+                             m_AtmosClimate, m_GlobalSDF, m_Resolve, m_VirtualShadowMap, m_WorldProbes,
+                             GICompositePass::kOutputFormat, createInfo.depthFormat)) {
+    LOG_ERROR("[ClusterRenderPipeline] Failed to initialize ParticleSystemPass.");
+    return false;
   }
 
   // Screen Trace GI -- linear screen-space depth raymarching falling back to the World Probe grid.
@@ -748,7 +823,7 @@ bool ClusterRenderPipeline::Init(
   m_PostProcess.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
       m_DisplayExtent, m_DepthOfField.GetOutputView(), m_Bloom.GetOutputView(),
       m_Resolve.GetOutputDepthView(), m_TransparentForward.GetRefractionOffsetView(),
-      m_AtmosSky.GetSkyViewLUTView(), m_AtmosFog.GetIntegratedFogView());
+      m_AtmosSky.GetSkyViewLUTView(), m_AtmosFog.GetIntegratedFogView(), m_AtmosClouds.GetCloudView());
 
 #ifndef NDEBUG
   // Two-tier SDF ray march DEBUG VISUALIZATION (see ClusterRenderPipeline.h's own comment on
@@ -950,6 +1025,7 @@ void ClusterRenderPipeline::Shutdown() {
   m_SDFRayMarch.Shutdown();
   m_DebugBufferView.Shutdown();
 #endif
+  m_AtmosClouds.Shutdown();
   m_AtmosFog.Shutdown();
   m_MegaLights.Shutdown();
   m_ScreenSpaceEffects.Shutdown();
@@ -997,8 +1073,9 @@ void ClusterRenderPipeline::Shutdown() {
   m_DebugTraceMode = 0;
 #endif
 
-  m_HeroTessellation.Shutdown();
+  m_Tessellation.Shutdown();
   m_WaterForward.Shutdown();
+  m_ParticleSystem.Shutdown();
   m_TransparentForward.Shutdown();
   m_ShadingBin.Shutdown();
   m_Resolve.Shutdown();
@@ -1298,9 +1375,42 @@ void ClusterRenderPipeline::RecordFrameEarly(VkCommandBuffer cmdEarly,
   // consumer added inside that same block always sees an already-current buffer this frame.
   // =========================================================================================
   m_AtmosClimate.RecordUpdate(cmdEarly, globalTimeSeconds);
+
+  // Dynamic Weather Simulation, seasonal cycle: rotate this frame's sun ELEVATION angle away from
+  // m_BaseSunDirection (Init()'s own fixed default, see that call site's comment) by
+  // m_AtmosClimate's freshly-recomputed seasonal offset (0 at the equinox phases, swept +/-
+  // config::atmos::SEASONAL_SUN_ELEVATION_AMPLITUDE_DEGREES at summer/winter solstice). Recomputed
+  // from the FIXED base every frame (never accumulated onto the live m_SceneLights.sun.direction)
+  // so this is exact regardless of frame rate or how long the demo has been running. Must happen
+  // here, before m_AtmosSky.RecordUpdate below (and every later consumer this same frame -- VSM,
+  // SurfaceCache, m_Resolve, ...) reads m_SceneLights.sun.direction.
+  //
+  // Decomposition/reconstruction uses the exact azimuth/elevation convention Init()'s own sun-
+  // direction comment documents: direction FROM scene TOWARD sun = (cos(El)*sin(Az), sin(El),
+  // -cos(El)*cos(Az)); DirectionalLight::direction is that vector's reverse. Only the elevation
+  // term changes -- azimuth is held fixed, deliberately not attempting real axial-tilt astronomy
+  // (a modest elevation-only sweep is what was asked for).
+  {
+    const float seasonalOffsetRad = m_AtmosClimate.GetSeasonalSunElevationOffsetRadians();
+    const float baseElevationRad = std::asin(std::clamp(-m_BaseSunDirection.y, -1.0f, 1.0f));
+    const float azimuthRad = std::atan2(-m_BaseSunDirection.x, m_BaseSunDirection.z);
+    // Clamped well away from the horizon (0) and zenith (90 deg) singularities -- the base
+    // elevation is ~45.5 degrees and the configured amplitude defaults to 15 degrees, so this
+    // clamp is a safety margin, not an expected steady-state limiter.
+    const float newElevationRad = std::clamp(baseElevationRad + seasonalOffsetRad,
+        5.0f * (3.14159265358979323846f / 180.0f), 85.0f * (3.14159265358979323846f / 180.0f));
+    const float cosElev = std::cos(newElevationRad);
+    const float sinElev = std::sin(newElevationRad);
+    m_SceneLights.sun.direction = maths::vec3(
+        -cosElev * std::sin(azimuthRad),
+        -sinElev,
+        cosElev * std::cos(azimuthRad)).Normalize();
+  }
+
   // Atmos weather system, Subtask 2: Sky-View LUT refresh -- see AtmosSkyPass::RecordUpdate's own
   // comment for the Transmittance/Multi-Scattering dirty-tracking policy. Sun direction/intensity
-  // sourced the same way m_Resolve's own sun uniform below is (m_SceneLights.sun).
+  // sourced the same way m_Resolve's own sun uniform below is (m_SceneLights.sun) -- already
+  // reflects this frame's seasonal elevation offset, applied immediately above.
   m_AtmosSky.RecordUpdate(cmdEarly, m_SceneLights.sun.direction, m_SceneLights.sun.intensity);
 
   // =========================================================================================
@@ -1332,7 +1442,7 @@ void ClusterRenderPipeline::RecordFrameEarly(VkCommandBuffer cmdEarly,
     // [12]) need THIS frame's VSM view-projection matrices + any pages rendered this frame already
     // visible -- RecordBeginFrame()'s own trailing barrier (when it renders any page) covers that.
     // See VirtualShadowMapPass's own class comment for the full one-frame-lag feedback contract.
-    m_VirtualShadowMap.RecordBeginFrame(cmdEarly, sunDirection, m_SceneLights, cameraFrameInfo.position);
+    m_VirtualShadowMap.RecordBeginFrame(cmdEarly, sunDirection, m_SceneLights, cameraFrameInfo.position, entityTransformsCPU);
 
     // 1b. Virtual Texture streaming: reads back LAST frame's page-miss feedback (m_Resolve's own
     // ClusterResolve.comp/ClusterResolveBinned.comp VT sampling call, see SetVirtualTexture()'s own
@@ -1360,6 +1470,85 @@ void ClusterRenderPipeline::RecordFrameEarly(VkCommandBuffer cmdEarly,
     // moved to async, does not sample the Global SDF at all).
     m_GlobalSDF.RecordUpdate(cmdEarly, cameraFrameInfo.position, entityTransformsCPU);
 
+    // 3b. GPU particle system, Subtask 6: simulate + sort this frame's particles. Must run after
+    // m_GlobalSDF's own update just above (ParticleSimulation.comp's collision response samples
+    // THIS frame's clipmap windows, see RecordSimulate's own comment) and after m_AtmosClimate's
+    // update earlier this frame (wind). Own dt tracking -- RecordFrameLate's own `deltaTimeSeconds`
+    // isn't computed until much later in the frame, see m_LastParticleFrameTimeSeconds' own
+    // declaration comment -- same clamp-against-stalls formula as that one.
+    {
+      float particleDeltaTimeSeconds = m_HasLastParticleFrameTime
+          ? (globalTimeSeconds - m_LastParticleFrameTimeSeconds) : (1.0f / 60.0f);
+      particleDeltaTimeSeconds = std::clamp(particleDeltaTimeSeconds, 0.0f, 0.25f);
+      m_LastParticleFrameTimeSeconds = globalTimeSeconds;
+      m_HasLastParticleFrameTime = true;
+
+      // Multi-emitter roadmap (subtask A1): build this frame's full EmitterParams array + one
+      // spawn-count per emitter slot from config::particles::EMITTERS[] (live ImGui state) -- each
+      // slot keeps its OWN fractional spawn-rate accumulator (m_ParticleSpawnAccumulator[i]) so an
+      // inactive emitter simply never accumulates (no burst of stale spawns if it is later
+      // reactivated) while every active emitter stays exact over time regardless of framerate.
+      ParticleSystemPass::EmitterParams particleEmitters[ParticleSystemPass::kMaxEmitters]{};
+      uint32_t particleSpawnCounts[ParticleSystemPass::kMaxEmitters]{};
+      for (uint32_t i = 0; i < ParticleSystemPass::kMaxEmitters; ++i) {
+        const config::particles::EmitterConfig& cfg = config::particles::EMITTERS[i];
+        ParticleSystemPass::EmitterParams& gpu = particleEmitters[i];
+        gpu.positionX = cfg.positionX; gpu.positionY = cfg.positionY; gpu.positionZ = cfg.positionZ;
+        gpu.shapeParam0 = cfg.shapeParam0;
+        gpu.colorR = cfg.colorR; gpu.colorG = cfg.colorG; gpu.colorB = cfg.colorB; gpu.colorA = cfg.colorA;
+        gpu.sizeMin = cfg.sizeMin; gpu.sizeMax = cfg.sizeMax;
+        gpu.lifetimeMin = cfg.lifetimeMin; gpu.lifetimeMax = cfg.lifetimeMax;
+        gpu.gravityY = cfg.gravityY; gpu.bounceElasticity = cfg.bounceElasticity;
+        gpu.friction = cfg.friction; gpu.dragCoefficient = cfg.dragCoefficient;
+        gpu.spawnShape = cfg.spawnShape;
+
+        if (cfg.active) {
+          m_ParticleSpawnAccumulator[i] += cfg.spawnRate * particleDeltaTimeSeconds;
+        }
+        uint32_t spawnCount = static_cast<uint32_t>(m_ParticleSpawnAccumulator[i]);
+        particleSpawnCounts[i] = spawnCount;
+        m_ParticleSpawnAccumulator[i] -= static_cast<float>(spawnCount);
+      }
+
+      // Precipitation feature (Ubisoft "Atmos"-style: rain/snow tied directly to the climate
+      // simulation, not a manual toggle) -- spawn rate scales with config::atmos::
+      // PRECIPITATION_INTENSITY (0 = no precipitation, no dispatch is even issued below), and the
+      // rain-vs-snow KIND is resolved here, every frame, purely from the live simulated temperature
+      // (m_AtmosClimate::GetEffectiveTemperatureCelsius() -- the Dynamic Weather Simulation's own
+      // smoothed/seasonally-offset value when enabled, or the raw config::atmos::TEMPERATURE_CELSIUS
+      // slider otherwise, so precipitation kind tracks whichever temperature the simulation is
+      // actually driving) -- below PRECIPITATION_SNOW_TEMPERATURE_THRESHOLD_CELSIUS (default 2.0 C,
+      // matching real-world sleet/snow transition) spawns snow, otherwise rain. Same
+      // fractional-accumulator idiom as each embers emitter above (see m_PrecipSpawnAccumulator's
+      // own declaration comment) -- precipitation is not one of config::particles::EMITTERS[], it
+      // has its own dedicated camera-relative spawn-shell and kind resolution instead.
+      m_PrecipSpawnAccumulator += config::atmos::PRECIPITATION_INTENSITY * config::atmos::PRECIPITATION_MAX_SPAWN_RATE_PER_SECOND * particleDeltaTimeSeconds;
+      uint32_t precipSpawnCount = static_cast<uint32_t>(m_PrecipSpawnAccumulator);
+      m_PrecipSpawnAccumulator -= static_cast<float>(precipSpawnCount);
+
+      uint32_t precipKind = (m_AtmosClimate.GetEffectiveTemperatureCelsius() < config::atmos::PRECIPITATION_SNOW_TEMPERATURE_THRESHOLD_CELSIUS)
+          ? 2u  // kParticleKindSnow (ParticleCommon.glsl) -- mirrored as a plain literal here since this is a CPU-side .cpp file, not a GLSL includer.
+          : 1u; // kParticleKindRain
+
+      float precipCenterWorld[3] = { cameraFrameInfo.position.x, cameraFrameInfo.position.y, cameraFrameInfo.position.z };
+
+      // Rivers/waterfalls feature: the waterfall mist/foam emitter is config::particles::EMITTERS[3]
+      // (see that array's own comment) -- it rides the SAME per-emitter particleEmitters/
+      // particleSpawnCounts arrays built by the loop above, needing no separate accumulator, position,
+      // or RecordSimulate parameter of its own.
+      m_ParticleSystem.RecordSimulate(cmdEarly, m_GlobalSDF, particleDeltaTimeSeconds, globalTimeSeconds,
+          particleEmitters, particleSpawnCounts,
+          precipCenterWorld, precipSpawnCount, precipKind,
+          config::atmos::PRECIPITATION_SPAWN_RADIUS_METERS, config::atmos::PRECIPITATION_SPAWN_HEIGHT_ABOVE_CAMERA_METERS,
+          config::atmos::PRECIPITATION_SPAWN_BAND_THICKNESS_METERS, config::atmos::PRECIPITATION_FLOOR_BELOW_CAMERA_METERS,
+          config::atmos::PRECIPITATION_RAIN_FALL_SPEED_MPS, config::atmos::PRECIPITATION_SNOW_FALL_SPEED_MPS,
+          config::atmos::PRECIPITATION_SNOW_WOBBLE_STRENGTH);
+
+      float particleCameraPosition[3] = { cameraFrameInfo.position.x, cameraFrameInfo.position.y, cameraFrameInfo.position.z };
+      float particleCameraForward[3] = { cameraFrameInfo.forward.x, cameraFrameInfo.forward.y, cameraFrameInfo.forward.z };
+      m_ParticleSystem.RecordSort(cmdEarly, particleCameraPosition, particleCameraForward);
+    }
+
     // 4. Secondary-bounce injection into m_SurfaceCache's own radiance atlas + the TLAS refit that
     // must precede it (Phase 4 integration) -- `useAsyncCompute` (m_FrameScratch, see its own
     // comment above) picks between two mutually exclusive paths:
@@ -1380,7 +1569,7 @@ void ClusterRenderPipeline::RecordFrameEarly(VkCommandBuffer cmdEarly,
 
       if (radiosityEnabled) {
         for (uint32_t bounce = 0; bounce < kRadiosityBounceCount; ++bounce) {
-          m_GIInject.RecordInject(cmdEarly, m_TraceContext, m_SurfaceCache, traceMode);
+          m_GIInject.RecordInject(cmdEarly, m_TraceContext, m_SurfaceCache, traceMode, m_SceneLights.sun.direction);
 
           // Unlike SurfaceCachePass::RecordCapture/VirtualShadowMapPass::RecordBeginFrame/
           // GlobalSDFPass::RecordUpdate, SurfaceCacheGIInjectPass::RecordInject does NOT end with
@@ -1489,7 +1678,7 @@ void ClusterRenderPipeline::RecordAsyncCompute(VkCommandBuffer asyncComputeCmd) 
 
   if (radiosityEnabled) {
     for (uint32_t bounce = 0; bounce < kRadiosityBounceCount; ++bounce) {
-      m_GIInject.RecordInject(asyncComputeCmd, m_TraceContext, m_SurfaceCache, traceMode);
+      m_GIInject.RecordInject(asyncComputeCmd, m_TraceContext, m_SurfaceCache, traceMode, m_SceneLights.sun.direction);
 
       // Intra-queue (asyncComputeCmd both sides), so purely the usual execution/memory
       // dependency -- no queue-family-ownership concern here. Same rationale as the fallback
@@ -1937,17 +2126,25 @@ void ClusterRenderPipeline::RecordFrameMid(VkCommandBuffer cmdMid, VkCommandBuff
   // GI-related Global SDF state -- only renderer::VirtualShadowMapPass's own shadow UBOs (direct
   // sun shadowing, not indirect GI) and renderer::VirtualTextureManager's page table.
   // =========================================================================================
+  // Atmos weather system, surface response extension: global wetness/snow-coverage state, already
+  // integrated this frame by m_AtmosClimate.RecordUpdate() (called much earlier in RecordFrameEarly,
+  // well before this cmdMid section) -- threaded straight into whichever resolve path runs below,
+  // exactly the same way sun/cameraPositionWorld already are, and available in BOTH Debug and
+  // Release since this is a real rendering feature (only the ImGui inspector sliders are
+  // Debug-only), matching CLAUDE.md's requirement that this behave identically in both configs.
+  float surfaceWetness = m_AtmosClimate.GetSurfaceWetness();
+  float snowCoverage = m_AtmosClimate.GetSnowCoverage();
 #ifndef NDEBUG
   if (cameraCopy.debugViewMode == DEBUG_VIEW_NORMAL) {
     m_ShadingBin.RecordClassifyAndSort(cmdMid, m_RenderExtent);
-    m_Resolve.RecordResolveBinned(cmdMid, viewProj, m_SceneLights.sun, cameraPositionWorld, m_ShadingBin);
+    m_Resolve.RecordResolveBinned(cmdMid, viewProj, m_SceneLights.sun, cameraPositionWorld, surfaceWetness, snowCoverage, m_ShadingBin);
   } else {
     maths::mat4 prevViewProjForResolve = m_HasPrevViewProj ? m_PrevViewProj : viewProj;
-    m_Resolve.RecordResolve(cmdMid, viewProj, prevViewProjForResolve, m_SceneLights.sun, cameraPositionWorld, cameraCopy.debugViewMode);
+    m_Resolve.RecordResolve(cmdMid, viewProj, prevViewProjForResolve, m_SceneLights.sun, cameraPositionWorld, surfaceWetness, snowCoverage, cameraCopy.debugViewMode);
   }
 #else
   m_ShadingBin.RecordClassifyAndSort(cmdMid, m_RenderExtent);
-  m_Resolve.RecordResolveBinned(cmdMid, viewProj, m_SceneLights.sun, cameraPositionWorld, m_ShadingBin);
+  m_Resolve.RecordResolveBinned(cmdMid, viewProj, m_SceneLights.sun, cameraPositionWorld, surfaceWetness, snowCoverage, m_ShadingBin);
 #endif
 }
 
@@ -2090,7 +2287,7 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
       ssrFallbackSettings.ssrFallbackMaxDistanceWorld = config::postprocess::SSR_FALLBACK_MAX_DISTANCE_WORLD;
       ssrFallbackSettings.ssrFallbackThicknessWorld = config::postprocess::SSR_FALLBACK_THICKNESS_WORLD;
       ssrFallbackSettings.ssrFallbackIntensity = config::postprocess::SSR_FALLBACK_ENABLED ? config::postprocess::SSR_FALLBACK_INTENSITY : 0.0f;
-      m_ScreenSpaceEffects.RecordSSRFallback(cmdLate, viewProj, cameraPositionWorld, ssrFallbackSettings);
+      m_ScreenSpaceEffects.RecordSSRFallback(cmdLate, viewProj, cameraPositionWorld, m_SceneLights.sun.direction, ssrFallbackSettings);
     }
   }
 
@@ -2110,6 +2307,14 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
   // `megaLightsEnabled` (debug-only toggle, main.cpp's 'X' key) gates the call entirely, same
   // Release-always-on convention as `reflectionsEnabled` above (a real live consumer from frame
   // one).
+  //
+  // Phase 4 of the "Nanite advanced" roadmap (light BVH for RIS spatial bias, temporal ReSTIR with
+  // per-frame revalidated visibility): RecordShade now also takes `prevViewProjForMegaLights` --
+  // its own reservoir reprojection needs the previous frame's combined view-projection matrix, same
+  // `m_HasPrevViewProj` frame-0-safety ternary already used for [12b2]'s own
+  // prevViewProjForReflection above (identity matrix on the very first frame ever recorded; see
+  // MegaLightsPass::RecordShade's own header comment for why an identity matrix is always safe here
+  // even then, thanks to the reservoir's own sentinel-fill invalid-history guard).
   // =========================================================================================
   {
 #ifndef NDEBUG
@@ -2118,7 +2323,8 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
     bool megaLightsEnabled = true;
 #endif
     if (megaLightsEnabled) {
-      m_MegaLights.RecordShade(cmdLate, viewProj, cameraPositionWorld, m_FrameIndex);
+      maths::mat4 prevViewProjForMegaLights = m_HasPrevViewProj ? m_PrevViewProj : maths::mat4{};
+      m_MegaLights.RecordShade(cmdLate, viewProj, prevViewProjForMegaLights, cameraPositionWorld, m_FrameIndex);
     }
   }
 
@@ -2146,7 +2352,7 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
   bool worldProbesEnabled = true;
 #endif
   if (worldProbesEnabled) {
-    m_WorldProbes.RecordUpdate(cmdLate, cameraFrameInfo.position, m_TraceContext, traceMode);
+    m_WorldProbes.RecordUpdate(cmdLate, cameraFrameInfo.position, m_TraceContext, traceMode, m_SceneLights.sun.direction);
     {
       VkMemoryBarrier2 barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
       barrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
@@ -2262,12 +2468,12 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
     VkImage transparentTargetImage = m_GIComposite.GetOutputImage();
     VkImageView transparentTargetView = m_GIComposite.GetOutputView();
 
-    // Phase 7a (UE5.8 parity roadmap, hero asset tessellation): recorded BEFORE the glass/
-    // translucent draw below, deliberately -- this pass WRITES real depth (unlike glass, which
-    // only reads it), so glass's own subsequent depth test correctly occludes against this
-    // entity's real (displaced) surface. See HeroTessellationPass's own class comment for the
-    // widened synchronization scope this write requires on exit.
-    m_HeroTessellation.RecordDraw(cmdLate, viewProj, cameraFrameInfo.position,
+    // Generalized Nanite Tessellation: recorded BEFORE the glass/translucent draw below,
+    // deliberately -- this pass WRITES real depth (unlike glass, which only reads it), so glass's
+    // own subsequent depth test correctly occludes against every tessellated entity's real
+    // (displaced) surface. See TessellationPass's own class comment for the widened
+    // synchronization scope this write requires on exit.
+    m_Tessellation.RecordDraw(cmdLate, viewProj, cameraFrameInfo.position,
         transparentTargetImage, transparentTargetView, m_DepthImage, m_DepthImageView,
         m_RenderExtent, traceMode, m_FrameIndex, m_TraceContext, m_WorldProbes, m_SceneLights);
 
@@ -2282,6 +2488,26 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
     m_WaterForward.RecordDraw(cmdLate, viewProj, cameraFrameInfo.position,
         transparentTargetImage, transparentTargetView, m_DepthImage, m_DepthImageView,
         m_RenderExtent, traceMode, m_FrameIndex, globalTimeSeconds, m_TraceContext);
+
+    // GPU particle system, Subtask 6: recorded LAST among the forward passes (even after
+    // m_WaterForward) -- particles are the plan doc's own "after opaque Nanite + transparent,
+    // before post-process" top layer. Draws onto the SAME transparentTargetImage/View + real depth
+    // buffer every forward pass above targets, and into m_TransparentForward's own shared
+    // heat-distortion image (see ParticleSystemPass::RecordDraw's own comment on why that's safe
+    // with no extra barrier). cameraRight/cameraUp are not tracked anywhere in CameraFrameInfo (see
+    // that struct's own field list) -- derived here via the same forward-cross-worldUp formula
+    // renderer::AtmosVolumetricFogPass::RecordUpdate/SDFRayMarchPass::RecordRayMarch already use.
+    {
+      const maths::vec3 worldUpHint{0.0f, 1.0f, 0.0f};
+      const maths::vec3 particleCameraRight = cameraFrameInfo.forward.Cross(worldUpHint).Normalize();
+      const maths::vec3 particleCameraUp = particleCameraRight.Cross(cameraFrameInfo.forward);
+      float particleHeatShimmerStrength = config::particles::HEAT_SHIMMER_ENABLED ? config::particles::HEAT_SHIMMER_STRENGTH : 0.0f;
+      m_ParticleSystem.RecordDraw(cmdLate, transparentTargetImage, transparentTargetView, m_DepthImageView,
+          m_TransparentForward.GetRefractionOffsetView(), m_RenderExtent,
+          viewProj, cameraFrameInfo.position, particleCameraRight, particleCameraUp,
+          m_SceneLights.sun.direction, m_SceneLights.sun.color, m_SceneLights.sun.intensity,
+          config::particles::SOFT_FADE_DISTANCE, particleHeatShimmerStrength, globalTimeSeconds);
+    }
   }
 
   // Phase 2 (Lumen advanced roadmap) fix, 2026-07-17: the old [1z2] hand-off block that used to
@@ -2452,6 +2678,12 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
           cameraFrameInfo.fovYRadians, cameraFrameInfo.aspectRatio,
           m_SceneLights.sun.direction, m_SceneLights.sun.color, m_SceneLights.sun.intensity, m_FrameIndex);
 
+      // Atmos weather system, Subtask 4: refresh the half-res cloud raymarch immediately alongside
+      // the fog update above -- same producer/consumer-adjacency reasoning.
+      m_AtmosClouds.RecordUpdate(cmdLate, cameraPositionWorld, cameraFrameInfo.forward, maths::vec3{0.0f, 1.0f, 0.0f},
+          cameraFrameInfo.fovYRadians, cameraFrameInfo.aspectRatio,
+          m_SceneLights.sun.direction, m_SceneLights.sun.color, m_SceneLights.sun.intensity);
+
       m_PostProcess.RecordComposite(cmdLate, deltaTimeSeconds, ppSettings, invViewProj, prevViewProjForPostProcess, cameraPositionWorld,
           viewProj, m_SceneLights.sun.direction, cameraFrameInfo.forward,
           cameraFrameInfo.fovYRadians, cameraFrameInfo.aspectRatio, m_FrameIndex);
@@ -2512,7 +2744,8 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
 
     m_DebugOverlay.BuildFrameText(gpuMemUsedMB, pendingPageLoads, bytesPerSecond, hwTriangleCount, swTriangleCount,
         fps, static_cast<float>(m_RenderExtent.width), static_cast<float>(m_RenderExtent.height),
-        m_DebugRadiosityEnabled, m_DebugSSRTEnabled, traceMode, m_DebugWorldProbesEnabled);
+        m_DebugRadiosityEnabled, m_DebugSSRTEnabled, traceMode, m_DebugWorldProbesEnabled,
+        m_ParticleSystem.GetLastAliveCountApprox(), ParticleSystemPass::kMaxParticles);
 
     // Determine blitSourceImage early to draw HUD directly onto it -- m_PostProcess's own output
     // (not m_TAATSR's raw HDR buffer) in the normal path now, so the HUD's own colors (e.g. plain

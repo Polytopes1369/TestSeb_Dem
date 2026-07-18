@@ -1,14 +1,15 @@
 #version 460
 #extension GL_GOOGLE_include_directive : enable
 
-// Phase 7a (UE5.8 parity roadmap, hero asset tessellation): tessellation evaluation shader --
+// Generalized Nanite Tessellation (renderer::TessellationPass): tessellation evaluation shader --
 // barycentric-interpolates position/normal from the 3 control points (renderer::
-// HeroTessellationPass's own patch, patchControlPoints=3), samples displacement_noise.glsl's fbm
+// TessellationPass's own patch, patchControlPoints=3), samples displacement_noise.glsl's fbm
 // at the interpolated WORLD-SPACE position (not UV -- see that file's own header comment),
 // offsets the position along the interpolated normal, and recomputes the true perturbed normal via
 // central differencing -- then owns the final clip-space projection (gl_Position), since it alone
-// knows the DISPLACED surface's true position (see HeroTessellation.vert's own comment on why that
-// shader deliberately leaves gl_Position unset).
+// knows the DISPLACED surface's true position (see Tessellation.vert's own comment on why that
+// shader deliberately leaves gl_Position unset). Runs identically for every tessellated entity's
+// own draw call.
 //
 // Crack-free guarantee: two adjacent triangles share exactly the same 2 control points on a common
 // edge (the Fallback Mesh is a proper indexed mesh) AND compute the same gl_TessLevelOuter for
@@ -20,7 +21,7 @@
 
 layout(triangles, fractional_odd_spacing, ccw) in;
 
-layout(push_constant) uniform HeroTessellationConstants {
+layout(push_constant) uniform TessellationConstants {
     mat4 viewProj;
     float cameraPositionWorldX, cameraPositionWorldY, cameraPositionWorldZ;
     float _pad0;
@@ -30,7 +31,7 @@ layout(push_constant) uniform HeroTessellationConstants {
     uint entityCount;
     float viewportWidth, viewportHeight;
     float displacementScale;
-    float _pad1;
+    uint materialID;
 } pc;
 
 layout(location = 0) in vec3 inWorldPos[];
