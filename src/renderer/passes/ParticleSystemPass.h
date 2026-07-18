@@ -115,14 +115,33 @@ namespace renderer {
         // config::particles::SPAWN_RATE_PER_SECOND's own default (200/s) and a ~2-4s particle
         // lifetime, steady-state alive count is only a few hundred -- 65536 slots was ~100x more
         // capacity than this demo's own single test emitter would ever actually use. Reduced to
-        // 4096 (2^12): still generous headroom over realistic steady-state counts, and cuts
-        // RecordSort()'s own dispatch count from 136 to 78 ((12*13)/2) with each dispatch covering
-        // 16x fewer workgroups -- resolved the hang. If a future scene needs a much larger particle
-        // budget, RecordSort's O(log2(N)^2) full-buffer network is the thing to replace first (a
-        // shared-memory local-merge bitonic sort, or an indirect dispatch sized to the actual
-        // aliveCount rounded up to the next power of two instead of always sorting the full fixed
-        // capacity), not just raising this constant back up.
-        static constexpr uint32_t kMaxParticles = 4096;
+        // 4096 (2^12) at the time: still generous headroom over realistic steady-state counts, and
+        // cut RecordSort()'s own dispatch count from 136 to 78 ((12*13)/2) with each dispatch
+        // covering 16x fewer workgroups -- resolved the hang, but only by shrinking the CAPACITY,
+        // not by fixing the actual root inefficiency (every dispatch always covered the full fixed
+        // capacity regardless of how many particles were actually alive).
+        //
+        // Subtask A2 (particle sort & budget scaling roadmap) fix: raised back up to 65536 (the
+        // ORIGINAL pre-incident value) now that the root inefficiency above is actually fixed --
+        // see RecordSort()'s own comment and ParticleSort.comp's SortDispatchArgsBuffer for the full
+        // mechanism. In short: InitKeys (mode 0) still touches all kMaxParticles slots every frame
+        // (a cheap, bandwidth-bound single pass -- never the expensive part, so left unchanged and
+        // un-indirected), but every one of the O(log2(N)^2) CompareExchange dispatches (mode 1, the
+        // actually expensive part that caused the original TDR) is now issued via
+        // vkCmdDispatchIndirect with a workgroup count computed FRESH, same-frame, by a tiny
+        // single-thread compute pre-pass (mode 2) from THIS frame's real CounterBuffer.aliveCount,
+        // rounded up to the next power of two -- zero staleness, unlike this class' own Debug-only
+        // GetLastAliveCountApprox() readback, since it never leaves the GPU this frame. Any
+        // CompareExchange thread this shrinks away (index >= that padded count) is PROVABLY a
+        // sentinel-vs-sentinel no-op: InitKeys still unconditionally fills the ENTIRE
+        // [aliveCount, kMaxParticles) tail with the identical sentinel key every frame, and the
+        // padded count is by construction >= aliveCount, so skipping those threads can never drop a
+        // real particle or corrupt a real compare-exchange -- see RecordSort()'s own comment for the
+        // full argument. Net effect: steady-state GPU cost now tracks actual alive count again
+        // (typically a few hundred to a few thousand for this demo's default emitters, see
+        // config::particles::EMITTERS[]), regardless of how large this capacity constant is, so
+        // raising it back to 65536 does not reintroduce the original TDR. Must remain a power of two.
+        static constexpr uint32_t kMaxParticles = 65536;
 
         // Allocates every buffer this pass owns (see this class' own header comment for the full
         // list) via `allocator`, seeds the dead-list with every index 0..kMaxParticles-1 and the
@@ -402,6 +421,14 @@ namespace renderer {
         // (uint index + float key per entry), GPU_ONLY, never host-written (ParticleSort.comp's own
         // InitKeys pass is this buffer's only writer, every single frame it runs).
         GpuBuffer m_SortedPairsBuffer;
+        // Subtask A2 (particle sort & budget scaling roadmap) -- set 1, binding 1 (alongside
+        // m_SortedPairsBuffer's own binding 0): a VkDispatchIndirectCommand-compatible
+        // (uint32 x/y/z, 12 bytes) GPU-only buffer, COMPUTE-only (ParticleRender.vert/.frag, this
+        // set's OTHER consumer pipeline, never reads it). RecordSort()'s own mode == 2 pre-pass
+        // rewrites it every call from THIS frame's real aliveCount; every subsequent mode == 1
+        // CompareExchange dispatch reads its workgroup count via vkCmdDispatchIndirect -- see
+        // kMaxParticles' own comment and RecordSort()'s own comment for the full mechanism/proof.
+        GpuBuffer m_SortDispatchArgsBuffer;
         VkDescriptorSetLayout m_SortSetLayout = VK_NULL_HANDLE;
         VkDescriptorPool m_SortDescriptorPool = VK_NULL_HANDLE;
         VkDescriptorSet m_SortSet = VK_NULL_HANDLE;
