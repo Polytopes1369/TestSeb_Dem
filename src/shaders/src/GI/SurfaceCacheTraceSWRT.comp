@@ -14,6 +14,7 @@
 
 #include "include/mesh_sdf_trace.glsl"
 #include "include/surface_cache_sampling.glsl"
+#include "include/atmos_sky_lut_mapping.glsl"
 
 layout(local_size_x = 64) in;
 
@@ -43,12 +44,22 @@ layout(std430, set = 0, binding = 1) writeonly buffer RayResultBuffer {
     RayResult g_Results[];
 };
 
+// Atmos weather system, Subtask 5: renderer::AtmosSkyPass's Sky-View LUT, sampled on a miss (see
+// main()'s own comment) -- this is THE central SWRT trace shader every SWRT-back-end GI consumer
+// (renderer::SurfaceCacheGIInjectPass, renderer::WorldProbeGridPass's SWRT mode) shares, so fixing
+// the miss result here fixes it for all of them at once.
+layout(set = 0, binding = 2) uniform sampler2D g_SkyViewLUT;
+
 layout(push_constant) uniform SWRTPushConstants {
     uint rayCount;
     // Must be dynamically uniform across the whole dispatch (see mesh_sdf_trace.glsl's
     // TraceMeshSDFScene comment) -- a push constant, read identically by every invocation,
     // satisfies that trivially.
     uint entityCount;
+    // Atmos weather system, Subtask 5: sun direction for the Sky-View LUT's sun-relative azimuth
+    // mapping on a miss -- points FROM the light TOWARD the scene (renderer::ClusterResolvePass's
+    // own convention).
+    float sunDirX, sunDirY, sunDirZ;
 } pc;
 
 void main() {
@@ -72,7 +83,11 @@ void main() {
         result.color = SampleCardRadiance(hitLocalPos, hitLocalNormal, hitEntity.firstCardIndex, hitEntity.cardCount);
         result.hit = 1.0;
     } else {
-        result.color = vec3(0.0);
+        // Atmos weather system, Subtask 5: a miss (ray escapes to the sky) now returns the physical
+        // Sky-View LUT color instead of black -- every consumer of this shared trace result (Surface
+        // Cache secondary bounce, World Probe injection) picks this up automatically.
+        vec2 skyUV = SkyViewLUTUVFromDirection(rayDir, vec3(pc.sunDirX, pc.sunDirY, pc.sunDirZ));
+        result.color = texture(g_SkyViewLUT, skyUV).rgb;
         result.hit = 0.0;
     }
 

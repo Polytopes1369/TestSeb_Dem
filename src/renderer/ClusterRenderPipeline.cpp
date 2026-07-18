@@ -577,6 +577,9 @@ bool ClusterRenderPipeline::Init(
     LOG_ERROR("[ClusterRenderPipeline] Failed to initialize SurfaceCacheGIInjectPass.");
     return false;
   }
+  // Atmos weather system, Subtask 5: one-time wiring (see SurfaceCacheGIInjectPass::SetAtmosSkyView's
+  // own comment) -- m_AtmosSky is already Init'd above and its Sky-View LUT view/sampler never change.
+  m_GIInject.SetAtmosSkyView(m_AtmosSky.GetSkyViewLUTView(), m_AtmosSky.GetLUTSampler());
   // Phase 2 (UE5.8 parity roadmap): specular reflections -- needs m_Resolve's GBuffer (already
   // Init'd, STEP 6 above), including its Phase 1a roughness/metallic channel, plus
   // m_TraceContext/m_SurfaceCacheRT for its own trace pass.
@@ -591,6 +594,9 @@ bool ClusterRenderPipeline::Init(
   // Init'd), so must Init after both.
   m_ScreenSpaceEffects.Init(createInfo.device, createInfo.allocator, createInfo.commandPool,
                             createInfo.queue, createInfo.renderExtent, m_Resolve, m_Reflection);
+  // Atmos weather system, Subtask 5: one-time wiring (see ScreenSpaceEffectsPass::SetAtmosSkyView's
+  // own comment) -- m_AtmosSky is already Init'd above and its Sky-View LUT view/sampler never change.
+  m_ScreenSpaceEffects.SetAtmosSkyView(m_AtmosSky.GetSkyViewLUTView(), m_AtmosSky.GetLUTSampler());
   // Phase A of the MegaLights native-port roadmap: procedurally scatter kMaxMegaLights point
   // lights around the demo's 13-entity grid (see MegaLightsTypes.h's own GenerateProceduralLights
   // comment), then Init the pass -- needs m_Resolve's GBuffer (same as m_Reflection above) and
@@ -621,6 +627,14 @@ bool ClusterRenderPipeline::Init(
     LOG_ERROR("[ClusterRenderPipeline] Failed to initialize AtmosCloudsPass.");
     return false;
   }
+  // Atmos weather system, Subtask 5: one-time wiring, now that both producers (m_AtmosSky, just
+  // above; m_AtmosClouds, just Init'd here) exist -- see SurfaceCachePass::SetAtmosCloudShadow's and
+  // ClusterResolvePass::SetAtmosCloudLighting's own comments. Neither the Sky-View LUT nor the Cloud
+  // Shadow Map's view/sampler are ever recreated after their owning pass' Init(), so these bindings
+  // are never refreshed again.
+  m_SurfaceCache.SetAtmosCloudShadow(m_AtmosClouds.GetCloudShadowMapView(), m_AtmosClouds.GetCloudShadowMapSampler());
+  m_Resolve.SetAtmosCloudLighting(m_AtmosSky.GetLUTSampler(), m_AtmosSky.GetSkyViewLUTView(),
+                                  m_AtmosClouds.GetCloudShadowMapSampler(), m_AtmosClouds.GetCloudShadowMapView());
 
   // World Probe grid (Lumen "Translucency Volume") -- reuses the same shared trace-scene sets and
   // HWRT/BLAS/TLAS as every other GI consumer above; see ClusterRenderPipeline.h's own comment on
@@ -631,6 +645,9 @@ bool ClusterRenderPipeline::Init(
     LOG_ERROR("[ClusterRenderPipeline] Failed to initialize WorldProbeGridPass.");
     return false;
   }
+  // Atmos weather system, Subtask 5: one-time wiring (see WorldProbeGridPass::SetAtmosSkyView's own
+  // comment) -- m_AtmosSky is already Init'd above and its Sky-View LUT view/sampler never change.
+  m_WorldProbes.SetAtmosSkyView(m_AtmosSky.GetSkyViewLUTView(), m_AtmosSky.GetLUTSampler());
 
   // Forward-rendered translucent/transparent materials (see TransparentForwardPass's own class
   // comment) -- reuses the SAME indexEntries/dagEntries this function loaded above for
@@ -1397,7 +1414,7 @@ void ClusterRenderPipeline::RecordFrameEarly(VkCommandBuffer cmdEarly,
 
       if (radiosityEnabled) {
         for (uint32_t bounce = 0; bounce < kRadiosityBounceCount; ++bounce) {
-          m_GIInject.RecordInject(cmdEarly, m_TraceContext, m_SurfaceCache, traceMode);
+          m_GIInject.RecordInject(cmdEarly, m_TraceContext, m_SurfaceCache, traceMode, m_SceneLights.sun.direction);
 
           // Unlike SurfaceCachePass::RecordCapture/VirtualShadowMapPass::RecordBeginFrame/
           // GlobalSDFPass::RecordUpdate, SurfaceCacheGIInjectPass::RecordInject does NOT end with
@@ -1506,7 +1523,7 @@ void ClusterRenderPipeline::RecordAsyncCompute(VkCommandBuffer asyncComputeCmd) 
 
   if (radiosityEnabled) {
     for (uint32_t bounce = 0; bounce < kRadiosityBounceCount; ++bounce) {
-      m_GIInject.RecordInject(asyncComputeCmd, m_TraceContext, m_SurfaceCache, traceMode);
+      m_GIInject.RecordInject(asyncComputeCmd, m_TraceContext, m_SurfaceCache, traceMode, m_SceneLights.sun.direction);
 
       // Intra-queue (asyncComputeCmd both sides), so purely the usual execution/memory
       // dependency -- no queue-family-ownership concern here. Same rationale as the fallback
@@ -2107,7 +2124,7 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
       ssrFallbackSettings.ssrFallbackMaxDistanceWorld = config::postprocess::SSR_FALLBACK_MAX_DISTANCE_WORLD;
       ssrFallbackSettings.ssrFallbackThicknessWorld = config::postprocess::SSR_FALLBACK_THICKNESS_WORLD;
       ssrFallbackSettings.ssrFallbackIntensity = config::postprocess::SSR_FALLBACK_ENABLED ? config::postprocess::SSR_FALLBACK_INTENSITY : 0.0f;
-      m_ScreenSpaceEffects.RecordSSRFallback(cmdLate, viewProj, cameraPositionWorld, ssrFallbackSettings);
+      m_ScreenSpaceEffects.RecordSSRFallback(cmdLate, viewProj, cameraPositionWorld, m_SceneLights.sun.direction, ssrFallbackSettings);
     }
   }
 
@@ -2163,7 +2180,7 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
   bool worldProbesEnabled = true;
 #endif
   if (worldProbesEnabled) {
-    m_WorldProbes.RecordUpdate(cmdLate, cameraFrameInfo.position, m_TraceContext, traceMode);
+    m_WorldProbes.RecordUpdate(cmdLate, cameraFrameInfo.position, m_TraceContext, traceMode, m_SceneLights.sun.direction);
     {
       VkMemoryBarrier2 barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
       barrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;

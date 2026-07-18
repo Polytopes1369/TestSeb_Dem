@@ -1,0 +1,91 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+
+// Atmos weather system, Subtask 5 (atmos_integration_plan.md): Cloud Shadow Map -- for a
+// ATMOS_CLOUD_SHADOW_HALF_EXTENT-radius horizontal patch of the DEMO's own real world space (see
+// atmos_clouds_density.glsl's own AtmosCloudShadowUVFromWorldXZ comment for why this is deliberately
+// NOT the km-scale planet-local frame the rest of that file's constants use), raymarches STRAIGHT UP
+// TOWARD THE SUN through the entire cloud shell (inner to outer radius, still in the km-scale
+// vertical frame -- only the horizontal XZ placement differs, see the `ro` construction below)
+// accumulating optical depth, storing transmittance = exp(-tau) into a 512x512 R8_UNORM map. Reuses
+// AtmosClouds.comp's own SampleCloudDensity() (via the shared atmos_clouds_density.glsl include) so
+// this shadow map and the visible clouds' own procedural noise stay code-identical -- see that
+// include's own header comment for why this had to be extracted out of AtmosClouds.comp rather than
+// duplicated.
+//
+// Consumed by ClusterResolve(Binned).comp (direct sun term) and SurfaceCacheCapture.frag (indirect
+// bounce direct-light injection), both sampling this map via atmos_clouds_density.glsl's own
+// AtmosCloudShadowUVFromWorldXZ(worldPos.xz) -- the single shared mapping every consumer must use.
+
+#include "include/atmos_clouds_density.glsl"
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(r8, set = 0, binding = 0) uniform writeonly image2D g_ShadowMapStorage;
+layout(set = 0, binding = 1) uniform sampler3D g_ShapeNoiseSampler;
+layout(set = 0, binding = 2) uniform sampler3D g_DetailNoiseSampler;
+
+layout(std140, set = 0, binding = 3) uniform AtmosGlobalsUBO {
+    vec3 windDirection; float windSpeed;
+    float temperature, humidity, dewPoint, condensationLCL;
+    float cloudDensityTarget, fogDensityTarget, rainStrength, time;
+    vec4 windTurbulenceParams;
+} g_AtmosGlobals;
+
+layout(push_constant) uniform AtmosCloudShadowsPC {
+    float sunDirX, sunDirY, sunDirZ; // Points FROM the light TOWARD the scene.
+    float _pad0;
+} pc;
+
+// Must match renderer::AtmosCloudsPass::kCloudShadowMapResolution exactly.
+const int ATMOS_CLOUD_SHADOW_RESOLUTION = 512;
+const int ATMOS_CLOUD_SHADOW_MARCH_STEPS = 24;
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (pixel.x >= ATMOS_CLOUD_SHADOW_RESOLUTION || pixel.y >= ATMOS_CLOUD_SHADOW_RESOLUTION) {
+        return;
+    }
+
+    vec2 uv = (vec2(pixel) + 0.5) / float(ATMOS_CLOUD_SHADOW_RESOLUTION);
+    vec2 worldXZ = (uv * 2.0 - 1.0) * ATMOS_CLOUD_SHADOW_HALF_EXTENT;
+
+    // Only XZ comes from the demo's own real world space -- Y is still the km-scale planet-local
+    // vertical placement every other Atmos cloud/sky raymarch uses (see class comment).
+    vec3 ro = vec3(worldXZ.x, ATMOS_CLOUDS_GROUND_RADIUS_KM + ATMOS_CLOUDS_CAMERA_HEIGHT_KM, worldXZ.y);
+    vec3 towardSun = -vec3(pc.sunDirX, pc.sunDirY, pc.sunDirZ);
+
+    float tInner0, tInner1;
+    bool hitInner = AtmosCloudsRaySphereIntersect(ro, towardSun, ATMOS_CLOUDS_INNER_RADIUS_KM, tInner0, tInner1);
+    float tOuter0, tOuter1;
+    bool hitOuter = AtmosCloudsRaySphereIntersect(ro, towardSun, ATMOS_CLOUDS_OUTER_RADIUS_KM, tOuter0, tOuter1);
+
+    if (!hitOuter || tOuter1 <= 0.0) {
+        imageStore(g_ShadowMapStorage, pixel, vec4(1.0, 0.0, 0.0, 0.0));
+        return;
+    }
+
+    float marchStart = (hitInner && tInner1 > 0.0) ? tInner1 : max(tOuter0, 0.0);
+    float marchEnd = tOuter1;
+    if (marchEnd <= marchStart + 1.0e-4) {
+        imageStore(g_ShadowMapStorage, pixel, vec4(1.0, 0.0, 0.0, 0.0));
+        return;
+    }
+
+    // Marches in the km-scale vertical frame (towardSun's own Y component dominates for anything
+    // but a near-horizon sun), so the tiny world-unit XZ offset above never meaningfully changes
+    // march length -- only WHICH noise-density samples are taken along the way.
+    float stepSize = (marchEnd - marchStart) / float(ATMOS_CLOUD_SHADOW_MARCH_STEPS);
+    float opticalDepth = 0.0;
+    for (int i = 0; i < ATMOS_CLOUD_SHADOW_MARCH_STEPS; ++i) {
+        float t = marchStart + (float(i) + 0.5) * stepSize;
+        vec3 pos = ro + towardSun * t;
+        float density = SampleCloudDensity(g_ShapeNoiseSampler, g_DetailNoiseSampler, pos,
+            g_AtmosGlobals.windDirection, g_AtmosGlobals.windSpeed, g_AtmosGlobals.time,
+            g_AtmosGlobals.cloudDensityTarget, g_AtmosGlobals.humidity);
+        opticalDepth += density * ATMOS_CLOUDS_EXTINCTION_SCALE * stepSize;
+    }
+
+    float transmittance = clamp(exp(-opticalDepth), 0.0, 1.0);
+    imageStore(g_ShadowMapStorage, pixel, vec4(transmittance, 0.0, 0.0, 0.0));
+}

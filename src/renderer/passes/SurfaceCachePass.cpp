@@ -420,7 +420,7 @@ namespace renderer {
         m_LightingUBO.Create(allocator, sizeof(SurfaceCacheLightingUBO),
             VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, VMA_MEMORY_USAGE_CPU_TO_GPU, /*mapped=*/true);
 
-        VkDescriptorSetLayoutBinding lightingBindings[8]{};
+        VkDescriptorSetLayoutBinding lightingBindings[9]{};
         lightingBindings[0].binding = 0;
         lightingBindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
         lightingBindings[0].descriptorCount = 1;
@@ -453,15 +453,20 @@ namespace renderer {
         lightingBindings[7].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         lightingBindings[7].descriptorCount = 1;
         lightingBindings[7].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        // Atmos weather system, Subtask 5 -- see SetAtmosCloudShadow()'s own comment.
+        lightingBindings[8].binding = 8; // g_CloudShadowMap (sampler2D).
+        lightingBindings[8].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        lightingBindings[8].descriptorCount = 1;
+        lightingBindings[8].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
 
         VkDescriptorSetLayoutCreateInfo lightingSetLayoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-        lightingSetLayoutInfo.bindingCount = 8;
+        lightingSetLayoutInfo.bindingCount = 9;
         lightingSetLayoutInfo.pBindings = lightingBindings;
         VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &lightingSetLayoutInfo, nullptr, &m_LightingSetLayout));
 
         VkDescriptorPoolSize lightingPoolSizes[3]{};
         lightingPoolSizes[0] = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 3 };          // Bindings 0, 4, 5.
-        lightingPoolSizes[1] = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1 };  // Binding 1.
+        lightingPoolSizes[1] = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2 };  // Bindings 1, 8 (Atmos Subtask 5).
         lightingPoolSizes[2] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4 };          // Bindings 2, 3, 6, 7.
         VkDescriptorPoolCreateInfo lightingPoolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
         lightingPoolInfo.maxSets = 1;
@@ -682,6 +687,12 @@ namespace renderer {
         writes[3] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_LightingDescriptorSet, 4, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &sunLevelsInfo, nullptr };
         writes[4] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_LightingDescriptorSet, 5, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &pointFacesInfo, nullptr };
         vkUpdateDescriptorSets(m_Device, 5, writes, 0, nullptr);
+    }
+
+    void SurfaceCachePass::SetAtmosCloudShadow(VkImageView cloudShadowView, VkSampler cloudShadowSampler) {
+        VkDescriptorImageInfo cloudShadowInfo{ cloudShadowSampler, cloudShadowView, VK_IMAGE_LAYOUT_GENERAL };
+        VkWriteDescriptorSet write{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_LightingDescriptorSet, 8, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &cloudShadowInfo, nullptr, nullptr };
+        vkUpdateDescriptorSets(m_Device, 1, &write, 0, nullptr);
     }
 
     void SurfaceCachePass::UpdateLighting(const SceneLights& lights) {

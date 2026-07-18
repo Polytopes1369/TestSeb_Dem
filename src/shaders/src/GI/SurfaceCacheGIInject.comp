@@ -31,6 +31,7 @@
 #include "include/octahedral.glsl"
 #include "include/mesh_sdf_trace.glsl"        // set 1
 #include "include/surface_cache_sampling.glsl" // set 2
+#include "include/atmos_sky_lut_mapping.glsl"
 
 layout(local_size_x = 8, local_size_y = 8) in;
 
@@ -50,6 +51,10 @@ layout(set = 0, binding = 5) uniform accelerationStructureEXT g_TLAS;
 #define FALLBACK_GEOMETRY_BASE_BINDING 6
 #include "include/fallback_geometry.glsl"
 
+// Atmos weather system, Subtask 5: renderer::AtmosSkyPass's Sky-View LUT, sampled on a hemisphere-
+// ray miss (see main()'s own comment) instead of contributing 0.
+layout(set = 0, binding = 9) uniform sampler2D g_SkyViewLUT;
+
 layout(push_constant) uniform GIInjectPushConstants {
     uvec2 atlasOffset; // This dispatch's card's atlasOffset (renderer::SurfaceCacheGIInjectPass::RecordInject()).
     uvec2 atlasSize;   // This dispatch's card's atlasSize -- also the dispatch's own bounds check.
@@ -57,6 +62,9 @@ layout(push_constant) uniform GIInjectPushConstants {
     uint sampleCount;  // Hemisphere rays traced per texel this call.
     uint frameIndex;   // Halton sequence temporal offset, advanced by the caller across calls for temporal variety.
     uint traceMode;    // 0 = SWRT (TraceMeshSDFScene), 1 = HWRT (TraceHWRT, inline ray query).
+    // Atmos weather system, Subtask 5: sun direction for the Sky-View LUT's sun-relative azimuth
+    // mapping on a miss -- points FROM the light TOWARD the scene.
+    float sunDirX, sunDirY, sunDirZ;
 } pc;
 
 // Malley's method: a uniform sample on the unit disk, lifted onto the hemisphere by
@@ -157,6 +165,12 @@ void main() {
         if (hit) {
             EntityInfo hitEntity = g_Entities[hitEntityIndex];
             accumulated += SampleCardRadiance(hitLocalPos, hitLocalNormal, hitEntity.firstCardIndex, hitEntity.cardCount);
+        } else {
+            // Atmos weather system, Subtask 5: a hemisphere-ray miss (escapes to the sky) now
+            // contributes the physical Sky-View LUT color instead of 0 -- makes the surface cache's
+            // own indirect bounce respond to sky color/sun elevation/cloud cover.
+            vec2 skyUV = SkyViewLUTUVFromDirection(dir, vec3(pc.sunDirX, pc.sunDirY, pc.sunDirZ));
+            accumulated += texture(g_SkyViewLUT, skyUV).rgb;
         }
     }
 
