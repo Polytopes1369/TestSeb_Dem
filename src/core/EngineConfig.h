@@ -179,7 +179,24 @@ inline uint32_t _REFRACTION_QUALITY = 3;
 
 // Physical Camera
 inline float EXPOSURE_APERTURE = 4.0f;             // f-stop.
-inline float EXPOSURE_SHUTTER_SPEED_SECONDS = 1.0f / 60.0f;
+// 1/8000s (was 1/60s) as of the 2026-07-18 exposure re-tuning pass: the 2026-07-17 lighting
+// recalibration (LightingTypes.h's DirectionalLight::intensity) moved the sun to a real 10,000 lux,
+// but this manual EV100 (aperture/shutter/ISO -> log2(N^2/t * 100/ISO), see PostProcessPass.cpp's
+// ComputeManualEV100) was left at its old pre-recalibration value (EV100 ~9.9, MaxLuminance =
+// 1.2*2^EV100 ~= 1152), washing DEBUG_VIEW_NORMAL out toward white independently of Bloom state.
+// A first-pass theoretical correction (1/500s, EV100 ~13.0) accounted only for the direct sun term
+// (ClusterResolve.comp's `directResponse * sunRadiance`) and proved nowhere near enough once
+// measured -- ClusterResolve.comp's `diffuseAlbedo * skyAmbient` sky-view-LUT ambient term plus the
+// multi-bounce GI passes (Surface Cache / Screen Trace / World Probes) stack substantial additional
+// real-lux-scale radiance on top of direct lighting, pushing total scene luminance far past what a
+// direct-only estimate predicts. Retuned empirically instead (rebuild + --test-pipeline +
+// pixel-sampled luminance histogram of the DEBUG_VIEW_NORMAL screenshots, tests #8-10): 1/8000s
+// raises EV100 to ~17.0 (MaxLuminance ~153600), landing mid-scene luminance at ~160/255 (avg,
+// sampled) with zero clipped (255) pixels and real highlight/shadow contrast -- correctly exposed
+// with headroom above for specular highlights. Aperture left untouched (EXPOSURE_APERTURE also
+// drives DepthOfField.comp's circle-of-confusion f-stop, so changing it would shift DoF blur
+// strength as a side effect); 1/8000s is a realistic, if fast, daylight electronic-shutter speed.
+inline float EXPOSURE_SHUTTER_SPEED_SECONDS = 1.0f / 8000.0f;
 inline float EXPOSURE_ISO = 100.0f;
 // Manual (not Auto) for now: renderer::MegaLightsPass (Phase A) has no temporal reservoir reuse
 // yet (per-frame RIS re-samples a different light, spatially but not temporally denoised -- see
