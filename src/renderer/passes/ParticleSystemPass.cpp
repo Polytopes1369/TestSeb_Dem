@@ -33,9 +33,11 @@ namespace renderer {
         // per-emitter value read from EmitterParamsBuffer inside the shader itself (SpawnParticle
         // indexes it by `emitterIndex` below; UpdateParticle indexes it by the particle's own stored
         // Particle.emitterIndex), not a single global passed in fresh every call. `emitterIndex` is
-        // the new field, meaningful only when mode == 1 (spawn) -- it selects which EmitterParams
-        // slot this particular spawn dispatch is spawning for (see RecordSimulate's own per-emitter
-        // dispatch loop).
+        // the new field, meaningful only when mode == 1 (spawn embers) -- it selects which
+        // EmitterParams slot this particular spawn dispatch is spawning for (see RecordSimulate's own
+        // per-emitter dispatch loop). Reconciled with the precipitation feature's own mode == 2
+        // (spawn precipitation) -- both features share this one push-constant block/shader, each
+        // mode reads only the fields relevant to it.
         struct ParticleSimulationPC {
             float dt = 0.0f;
             float time = 0.0f;
@@ -44,10 +46,25 @@ namespace renderer {
             int32_t clipmapResolution = 0;
             uint32_t spawnCount = 0;
             uint32_t randomSeedBase = 0;
-            uint32_t emitterIndex = 0;
-            int32_t mode = 0;
+            uint32_t emitterIndex = 0; // Only meaningful when mode == 1 (spawn embers for this emitter slot).
+            int32_t mode = 0; // 0 = update, 1 = spawn embers, 2 = spawn precipitation.
+            // Precipitation feature (mode == 2 only) -- see ParticleSimulation.comp's own header comment.
+            uint32_t precipSpawnCount = 0;
+            uint32_t precipKind = 0; // kParticleKindRain or kParticleKindSnow (ParticleCommon.glsl).
         };
-        static_assert(sizeof(ParticleSimulationPC) == 92, "ParticleSimulationPC must match ParticleSimulation.comp's own push-constant block exactly");
+        static_assert(sizeof(ParticleSimulationPC) == 100, "ParticleSimulationPC must match ParticleSimulation.comp's own push-constant block exactly");
+        static_assert(sizeof(ParticleSimulationPC) <= 128, "ParticleSimulationPC must stay within the Vulkan-guaranteed minimum maxPushConstantsSize (128 bytes) -- move any new fields into PrecipitationParamsUBO instead of growing this struct further");
+
+        // Precipitation feature -- std140 mirror of ParticleSimulation.comp's own PrecipitationParamsUBO
+        // (environment set, binding 2). Deliberately a UBO rather than more push-constant fields: see
+        // ParticleSimulationPC's own static_assert above for why this codebase keeps that struct under
+        // the guaranteed-minimum push-constant budget.
+        struct PrecipitationParamsUBO {
+            float centerX = 0.0f, centerY = 0.0f, centerZ = 0.0f, spawnRadius = 0.0f;
+            float spawnHeightAboveCenter = 0.0f, spawnBandThickness = 0.0f, floorBelowCenter = 0.0f, rainFallSpeed = 0.0f;
+            float snowFallSpeed = 0.0f, snowWobbleStrength = 0.0f, _pad0 = 0.0f, _pad1 = 0.0f;
+        };
+        static_assert(sizeof(PrecipitationParamsUBO) == 48, "PrecipitationParamsUBO must match ParticleSimulation.comp's own UBO exactly (std140 layout)");
 
         // Byte-for-byte mirror of ParticleSort.comp's own SortedPair struct -- 8 bytes, std430
         // (two 4-byte scalars, no padding needed).
@@ -86,7 +103,7 @@ namespace renderer {
         static_assert(sizeof(ParticleRenderParamsUBO) == 240, "ParticleRenderParamsUBO must match ParticleRender.vert/.frag's own UBO exactly (std140 layout)");
 
         // Byte-for-byte mirror of world_probe_sampling.glsl's WorldProbeGridParamsUBO (std140) --
-        // identical to renderer::HeroTessellationPass's own copy (see that class' own comment).
+        // identical to renderer::TessellationPass's own copy (see that class' own comment).
         struct WorldProbeGridParamsUBO {
             float gridOriginX = 0.0f, gridOriginY = 0.0f, gridOriginZ = 0.0f;
             float probeSpacing = 0.0f;
@@ -303,17 +320,25 @@ namespace renderer {
             clipmapSamplerInfo.unnormalizedCoordinates = VK_FALSE;
             VK_CHECK(vkCreateSampler(m_Device, &clipmapSamplerInfo, nullptr, &m_ClipmapSampler));
 
-            VkDescriptorSetLayoutBinding envBindings[2]{};
+            // Precipitation feature: this pass' own PrecipitationParamsUBO, created here (before the
+            // descriptor writes below need its handle) and updated every RecordSimulate() call --
+            // see m_PrecipitationParamsBuffer's own declaration comment for why it lives in this
+            // environment set rather than in a push constant.
+            m_PrecipitationParamsBuffer.Create(allocator, sizeof(PrecipitationParamsUBO),
+                VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
+
+            VkDescriptorSetLayoutBinding envBindings[3]{};
             envBindings[0] = { 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
             envBindings[1] = { 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, GlobalSDFPass::kLevelCount, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+            envBindings[2] = { 2, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
 
             VkDescriptorSetLayoutCreateInfo envLayoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-            envLayoutInfo.bindingCount = 2;
+            envLayoutInfo.bindingCount = 3;
             envLayoutInfo.pBindings = envBindings;
             VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &envLayoutInfo, nullptr, &m_EnvironmentSetLayout));
 
             VkDescriptorPoolSize envPoolSizes[2] = {
-                { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 },
+                { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2 }, // AtmosGlobalsUBO (binding 0) + PrecipitationParamsUBO (binding 2).
                 { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, GlobalSDFPass::kLevelCount }
             };
             VkDescriptorPoolCreateInfo envPoolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
@@ -333,11 +358,13 @@ namespace renderer {
             for (uint32_t level = 0; level < GlobalSDFPass::kLevelCount; ++level) {
                 clipmapInfos[level] = { m_ClipmapSampler, globalSDF.GetClipmapView(level), VK_IMAGE_LAYOUT_GENERAL };
             }
+            VkDescriptorBufferInfo precipParamsInfo{ m_PrecipitationParamsBuffer.Handle(), 0, m_PrecipitationParamsBuffer.Size() };
 
-            VkWriteDescriptorSet envWrites[2]{};
+            VkWriteDescriptorSet envWrites[3]{};
             envWrites[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_EnvironmentSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &atmosGlobalsInfo, nullptr };
             envWrites[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_EnvironmentSet, 1, 0, GlobalSDFPass::kLevelCount, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, clipmapInfos, nullptr, nullptr };
-            vkUpdateDescriptorSets(m_Device, 2, envWrites, 0, nullptr);
+            envWrites[2] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_EnvironmentSet, 2, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &precipParamsInfo, nullptr };
+            vkUpdateDescriptorSets(m_Device, 3, envWrites, 0, nullptr);
 
             VkDescriptorSetLayout simSetLayouts[2] = { m_SetLayout, m_EnvironmentSetLayout };
             VkPushConstantRange pushRange{ VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(ParticleSimulationPC) };
@@ -659,18 +686,24 @@ namespace renderer {
     }
 
     void ParticleSystemPass::RecordSimulate(VkCommandBuffer cmd, const GlobalSDFPass& globalSDF, float dt, float time,
-        const EmitterParams emitters[kMaxEmitters], const uint32_t spawnCounts[kMaxEmitters]) {
+        const EmitterParams emitters[kMaxEmitters], const uint32_t spawnCounts[kMaxEmitters],
+        const float precipCenterWorld[3], uint32_t precipSpawnCount, uint32_t precipKind,
+        float precipSpawnRadiusMeters, float precipSpawnHeightAboveCenterMeters,
+        float precipSpawnBandThicknessMeters, float precipFloorBelowCenterMeters,
+        float precipRainFallSpeedMps, float precipSnowFallSpeedMps, float precipSnowWobbleStrength) {
         // Multi-emitter roadmap (subtask A1): this frame's (possibly ImGui-edited) per-emitter
         // parameters, uploaded wholesale -- every field is live-tunable, so a full re-upload every
         // call is simplest and cheap (kMaxEmitters * 80 bytes == 320 bytes today).
         vkCmdUpdateBuffer(cmd, m_EmitterParamsBuffer.Handle(), 0, sizeof(EmitterParams) * kMaxEmitters, emitters);
 
-        // Reset aliveCount to 0 (offset 4) and set spawnQueue to the total requested across every
-        // emitter this call (offset 8, informational only -- see ParticleCommon.glsl's own
-        // CounterBuffer comment, no shader ever reads this field) -- leaves deadCount (offset 0) and
-        // _pad0 (offset 12) untouched, since only the GPU itself tracks deadCount's true current
-        // value (see this method's own header comment for why aliveCount's reset-then-rebuild is
-        // correct here).
+        // Reset aliveCount to 0 (offset 4) and set spawnQueue to the total ember spawn count
+        // requested across every emitter this call (offset 8, informational only -- see
+        // ParticleCommon.glsl's own CounterBuffer comment, no shader ever reads this field) -- leaves
+        // deadCount (offset 0) and _pad0 (offset 12) untouched, since only the GPU itself tracks
+        // deadCount's true current value (see this method's own header comment for why aliveCount's
+        // reset-then-rebuild is correct here). Precipitation's own precipSpawnCount travels via the
+        // push constant instead (see ParticleSimulationPC's own comment), so this pair of updates is
+        // unaffected by that feature.
         uint32_t zero = 0u;
         vkCmdUpdateBuffer(cmd, m_CounterBuffer.Handle(), 4, sizeof(uint32_t), &zero);
         uint32_t totalSpawnRequested = 0u;
@@ -687,8 +720,28 @@ namespace renderer {
         // CONTENTS meaningful is actually Release-excluded.
         vkCmdFillBuffer(cmd, m_PerEmitterAliveCountBuffer.Handle(), 0, VK_WHOLE_SIZE, 0u);
 
+        // Precipitation feature: this frame's camera-relative spawn-shell geometry + per-kind fall
+        // speed/wobble constants, consumed by BOTH the mode == 2 spawn dispatch below (spawn-shell
+        // geometry) and the mode == 0 update dispatch (fall speed/wobble/floor, for every
+        // rain/snow particle currently alive, not just ones spawned this frame) -- see
+        // m_PrecipitationParamsBuffer's own declaration comment for why this is a UBO instead of more
+        // push-constant fields.
+        PrecipitationParamsUBO precipUbo{};
+        precipUbo.centerX = precipCenterWorld[0];
+        precipUbo.centerY = precipCenterWorld[1];
+        precipUbo.centerZ = precipCenterWorld[2];
+        precipUbo.spawnRadius = precipSpawnRadiusMeters;
+        precipUbo.spawnHeightAboveCenter = precipSpawnHeightAboveCenterMeters;
+        precipUbo.spawnBandThickness = precipSpawnBandThicknessMeters;
+        precipUbo.floorBelowCenter = precipFloorBelowCenterMeters;
+        precipUbo.rainFallSpeed = precipRainFallSpeedMps;
+        precipUbo.snowFallSpeed = precipSnowFallSpeedMps;
+        precipUbo.snowWobbleStrength = precipSnowWobbleStrength;
+        vkCmdUpdateBuffer(cmd, m_PrecipitationParamsBuffer.Handle(), 0, sizeof(precipUbo), &precipUbo);
+
         VulkanUtils::RecordMemoryBarrier(cmd, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
-            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_UNIFORM_READ_BIT);
 
         VkDescriptorSet sets[2] = { GetCurrentSet(), m_EnvironmentSet };
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_SimPipeline);
@@ -707,6 +760,8 @@ namespace renderer {
         }
         pc.clipmapResolution = static_cast<int32_t>(GlobalSDFPass::kClipmapResolution);
         pc.randomSeedBase = static_cast<uint32_t>(time * 1000.0f) * 2654435761u;
+        pc.precipSpawnCount = precipSpawnCount;
+        pc.precipKind = precipKind;
 
         // One spawn dispatch per active emitter this call -- every dispatch pops from the SAME
         // shared dead-list (see this class' own header comment on why the free-lists are not
@@ -728,6 +783,25 @@ namespace renderer {
             // spawn dispatch this same loop) is about to read (and mutated deadCount) -- both are
             // COMPUTE_SHADER-stage, so a same-stage execution + memory barrier is all that is needed
             // between them.
+            VulkanUtils::RecordMemoryBarrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+        }
+
+        // Precipitation feature -- a second, independent spawn dispatch (mode == 2), against the SAME
+        // shared dead-list the embers spawn above just drew from (see ParticleSimulation.comp's own
+        // TryPopDeadListSlot comment for why this is the correct "share the pool, back off gracefully"
+        // behavior rather than a starvation risk). Deliberately its own dispatch, not folded into the
+        // mode == 1 one above: embers and precipitation have entirely different spawn-volume/initial-
+        // velocity logic (SpawnParticle vs SpawnPrecipitationParticle), and this codebase's own
+        // established "one shader, multiple modes via a push-constant int + branch in main()"
+        // convention (see this file's own header comment) keeps that branch at the dispatch level,
+        // not re-decided per-thread inside a single fused kernel.
+        if (precipSpawnCount > 0) {
+            pc.mode = 2;
+            vkCmdPushConstants(cmd, m_SimPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+            uint32_t precipSpawnGroups = (precipSpawnCount + 63u) / 64u;
+            vkCmdDispatch(cmd, precipSpawnGroups, 1, 1);
+
             VulkanUtils::RecordMemoryBarrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
                 VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
         }
@@ -1005,6 +1079,7 @@ namespace renderer {
             m_ParticleBuffer[i].Destroy();
         }
 
+        m_PrecipitationParamsBuffer.Destroy();
         m_RenderParamsBuffer.Destroy();
         m_WorldProbeGridParamsBuffer.Destroy();
 

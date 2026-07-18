@@ -27,8 +27,22 @@ struct Particle {
     vec4 color;
     vec2 size;
     float rotation;      // Radians, billboard-plane rotation (Subtask 4).
-    uint randomSeed;     // Per-particle PRNG state, re-seeded at spawn (Subtask 2).
-    uint emitterIndex;   // Which EmitterParamsBuffer slot spawned this particle (subtask A1: multi-emitter).
+    uint randomSeed;     // Per-particle PRNG state, re-seeded at spawn (Subtask 2). Precipitation
+                          // feature: the TOP 2 BITS (bits 30-31, see PackParticleKind/UnpackParticleKind
+                          // below) are stolen to tag which emitter "kind" spawned this particle --
+                          // randomSeed is otherwise dead after spawn (SpawnParticle re-seeds it once, no
+                          // other consumer -- CPU or GPU -- ever reads it as a raw PRNG value again), so
+                          // this is where the tag lives even though the multi-emitter roadmap (subtask
+                          // A1, below) later added spare pad floats to this struct for other reasons --
+                          // moving the tag would mean touching every already-tested precipitation
+                          // call site for zero functional benefit. The remaining 30 bits keep plenty of
+                          // entropy for UpdateParticle's own per-particle wobble phase (Subtask
+                          // precipitation, snow horizontal drift).
+    // Multi-emitter roadmap (subtask A1): which EmitterParamsBuffer slot spawned this particle -- only
+    // meaningful for kKindEmber particles (see below); precipitation's own physics (mode == 2 spawn,
+    // the kind-branch in UpdateParticle) never reads this field, it uses randomSeed's packed kind tag
+    // and the separate PrecipitationParamsUBO instead.
+    uint emitterIndex;
     float _pad0, _pad1, _pad2;
 };
 
@@ -37,6 +51,8 @@ struct Particle {
 // every field is directly editable via main.cpp's Particles ImGui tab
 // (config::particles::EMITTERS[]). Mirrors renderer::ParticleSystemPass::EmitterParams byte-for-byte
 // -- 80 bytes, std430, same "flat floats, vec3 packs with trailing scalar" layout as Particle above.
+// Only consumed for kKindEmber particles -- precipitation (rain/snow) has its own dedicated
+// PrecipitationParamsUBO (this file's own binding declarations further down) instead.
 struct EmitterParams {
     vec3 position;
     float shapeParam0;      // Spawn-shape parameter: Sphere (spawnShape==1) = radius in world units; Cone (spawnShape==0) = unused.
@@ -50,6 +66,23 @@ struct EmitterParams {
     uint spawnShape;         // 0 = Cone burst (legacy "embers" launch direction/jitter), 1 = Sphere volume drift spawn.
     float _pad0, _pad1, _pad2;
 };
+
+// Particle "kind" tag, packed into Particle.randomSeed's top 2 bits (see that field's own comment).
+// kKindEmber is 0 so every particle spawned before this feature existed (and every non-precipitation
+// spawn today) is correctly tagged without needing to touch SpawnParticle's existing embers path.
+const uint kParticleKindEmber = 0u;
+const uint kParticleKindRain = 1u;
+const uint kParticleKindSnow = 2u;
+
+uint PackParticleSeed(uint kind, uint rawSeed) {
+    return (kind << 30u) | (rawSeed & 0x3FFFFFFFu);
+}
+uint UnpackParticleKind(uint packedSeed) {
+    return packedSeed >> 30u;
+}
+uint UnpackParticleRawSeed(uint packedSeed) {
+    return packedSeed & 0x3FFFFFFFu;
+}
 
 // Double-buffered particle state (renderer::ParticleSystemPass::m_ParticleBuffer[2]) -- Subtask 2's
 // simulation compute shader reads the PREVIOUS frame's buffer and writes the buffer for THIS frame,

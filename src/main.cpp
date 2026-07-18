@@ -107,10 +107,11 @@ struct DebugState {
     // enhanced_displacement.glsl). Key 'J' -- moved off 'B' (this branch's original key) during the
     // Substrate integration merge: 'B' was independently claimed there for the DEBUG_VIEW_SUBSTRATE_SLABS
     // view-mode toggle (see that case's own comment), a genuine concurrent-development key collision,
-    // not a duplicate. NOTE: entity 2 is ALSO now VulkanContext::kHeroEntityIndex (Phase 7a hero
-    // tessellation), which routes it through HeroTessellationPass instead of the Nanite VisBuffer path
-    // this flag gates -- see VulkanContext::BuildEntityData()'s own "KNOWN COLLISION" comment. This key
-    // currently has no visible effect until that separate collision is resolved.
+    // not a duplicate. NOTE: entity 2 is ALSO now VulkanContext::kHeroEntityIndex (part of the
+    // generalized Nanite Tessellation feature's kTessellatedEntityIndices), which routes it through
+    // renderer::TessellationPass instead of the Nanite VisBuffer path this flag gates -- see
+    // VulkanContext::BuildEntityData()'s own "KNOWN COLLISION" comment. This key currently has no
+    // visible effect until that separate collision is resolved.
     bool enhancedDisplacementEnabled = true;
     // Phase 1 (Nanite advanced): renderer::ClusterRenderPipeline::SetDebugSplineDeformationEnabled
     // -- gates the runtime Hermite-spline bend on entity 6 (Tube, see spline_deformation.glsl).
@@ -986,6 +987,14 @@ int main(int argc, char** argv) {
                 // sky/fog/cloud quality knobs above are this same weather system's other half.
                 ImGui::Separator();
                 ImGui::TextUnformatted("Atmos Climate");
+                // Dynamic Weather Simulation master toggle (see AtmosClimatePass.h's own class
+                // comment) -- same "auto vs. manual" convention config::postprocess::
+                // EXPOSURE_USE_AUTO already establishes in this codebase (ClusterRenderPipeline.cpp's
+                // own ppSettings.useAutoExposure call site). ON (default): the sliders below become
+                // baseline CENTERS the autonomous simulation drifts around (still fully live, still
+                // visibly shift the result) rather than literal per-frame state. OFF: byte-for-byte
+                // the original manual behavior.
+                ImGui::Checkbox("Dynamic Weather Simulation", &config::atmos::DYNAMIC_WEATHER_ENABLED);
                 ImGui::DragFloat("Temperature (C)", &config::atmos::TEMPERATURE_CELSIUS, 0.2f, -20.0f, 45.0f);
                 ImGui::SliderFloat("Relative Humidity", &config::atmos::RELATIVE_HUMIDITY, 0.01f, 1.0f);
                 ImGui::DragFloat("Wind Direction (deg)", &config::atmos::WIND_DIRECTION_DEGREES, 1.0f, 0.0f, 360.0f);
@@ -996,9 +1005,48 @@ int main(int argc, char** argv) {
                 ImGui::DragFloat("Wind Turbulence Roughness", &config::atmos::WIND_TURBULENCE_ROUGHNESS, 0.01f, 0.0f, 1.0f);
                 ImGui::DragFloat("Cloud Density Target", &config::atmos::CLOUD_DENSITY_TARGET, 0.01f, 0.0f, 1.0f);
                 ImGui::DragFloat("Fog Density Target", &config::atmos::FOG_DENSITY_TARGET, 0.01f, 0.0f, 1.0f);
-                ImGui::DragFloat("Rain Strength", &config::atmos::RAIN_STRENGTH, 0.01f, 0.0f, 1.0f);
                 ImGui::TextDisabled("Dew Point: %.2f C", clusterPipeline.GetAtmosClimate().GetLastDewPointCelsius());
                 ImGui::TextDisabled("LCL Height: %.1f m", clusterPipeline.GetAtmosClimate().GetLastLCLHeightMeters());
+
+                // --- Precipitation (rain/snow particle emission tied to the climate simulation
+                // above, Ubisoft "Atmos"-style) -- live sliders over config::atmos::PRECIPITATION_*,
+                // consumed every frame by renderer::ClusterRenderPipeline::RecordFrameEarly's own
+                // precipitation spawn-accumulator + renderer::ParticleSystemPass::RecordSimulate.
+                // Grouped here (not in the "Particles" tab below) since the driving input is
+                // TEMPERATURE_CELSIUS just above, not a manual emitter toggle. ---
+                ImGui::Separator();
+                ImGui::TextUnformatted("Precipitation");
+                ImGui::SliderFloat("Precipitation Intensity", &config::atmos::PRECIPITATION_INTENSITY, 0.0f, 1.0f);
+                ImGui::DragFloat("Max Spawn Rate (particles/s)", &config::atmos::PRECIPITATION_MAX_SPAWN_RATE_PER_SECOND, 5.0f, 0.0f, 4000.0f);
+                ImGui::DragFloat("Snow Threshold (C)", &config::atmos::PRECIPITATION_SNOW_TEMPERATURE_THRESHOLD_CELSIUS, 0.2f, -20.0f, 20.0f);
+                ImGui::DragFloat("Spawn Radius (m)", &config::atmos::PRECIPITATION_SPAWN_RADIUS_METERS, 0.5f, 1.0f, 200.0f);
+                ImGui::DragFloat("Spawn Height Above Camera (m)", &config::atmos::PRECIPITATION_SPAWN_HEIGHT_ABOVE_CAMERA_METERS, 0.2f, 0.0f, 100.0f);
+                ImGui::DragFloat("Spawn Band Thickness (m)", &config::atmos::PRECIPITATION_SPAWN_BAND_THICKNESS_METERS, 0.2f, 0.5f, 50.0f);
+                ImGui::DragFloat("Floor Below Camera (m)", &config::atmos::PRECIPITATION_FLOOR_BELOW_CAMERA_METERS, 0.5f, 1.0f, 200.0f);
+                ImGui::DragFloat("Rain Fall Speed (m/s)", &config::atmos::PRECIPITATION_RAIN_FALL_SPEED_MPS, 0.1f, 0.5f, 30.0f);
+                ImGui::DragFloat("Snow Fall Speed (m/s)", &config::atmos::PRECIPITATION_SNOW_FALL_SPEED_MPS, 0.05f, 0.1f, 10.0f);
+                ImGui::DragFloat("Snow Wobble Strength", &config::atmos::PRECIPITATION_SNOW_WOBBLE_STRENGTH, 0.02f, 0.0f, 5.0f);
+                ImGui::TextDisabled("Kind: %s", (clusterPipeline.GetAtmosClimate().GetEffectiveTemperatureCelsius() < config::atmos::PRECIPITATION_SNOW_TEMPERATURE_THRESHOLD_CELSIUS) ? "Snow" : "Rain");
+
+                // --- Dynamic Weather Simulation parameters + live read-back (only meaningful while
+                // the toggle above is ON, but left visible/editable even when OFF so a user can dial
+                // them in ahead of re-enabling). ---
+                if (ImGui::TreeNode("Dynamic Weather Simulation Parameters")) {
+                    ImGui::DragFloat("Weather Front Tau (s)", &config::atmos::WEATHER_FRONT_TAU_SECONDS, 0.5f, 1.0f, 300.0f);
+                    ImGui::DragFloat("Weather Front Frequency", &config::atmos::WEATHER_FRONT_FREQUENCY, 0.001f, 0.001f, 0.5f, "%.4f");
+                    ImGui::DragFloat("Year Length (s)", &config::atmos::YEAR_LENGTH_SECONDS, 1.0f, 5.0f, 3600.0f);
+                    ImGui::DragFloat("Seasonal Temp Amplitude (C)", &config::atmos::SEASONAL_TEMPERATURE_AMPLITUDE_CELSIUS, 0.2f, 0.0f, 30.0f);
+                    ImGui::DragFloat("Seasonal Precip Amplitude", &config::atmos::SEASONAL_PRECIP_AMPLITUDE, 0.01f, 0.0f, 1.0f);
+                    ImGui::DragFloat("Seasonal Sun Elevation Amplitude (deg)", &config::atmos::SEASONAL_SUN_ELEVATION_AMPLITUDE_DEGREES, 0.5f, 0.0f, 40.0f);
+                    ImGui::Separator();
+                    ImGui::TextDisabled("Simulation Time: %.1f s", static_cast<float>(clusterPipeline.GetAtmosClimate().GetSimulationTimeSeconds()));
+                    ImGui::TextDisabled("Season Phase: %.2f (0/1=winter, 0.5=summer)", clusterPipeline.GetAtmosClimate().GetSeasonPhase01());
+                    ImGui::TextDisabled("Weather Blend: Clear %.0f%% / Overcast %.0f%% / Stormy %.0f%%",
+                        clusterPipeline.GetAtmosClimate().GetWeatherWeightClear() * 100.0f,
+                        clusterPipeline.GetAtmosClimate().GetWeatherWeightOvercast() * 100.0f,
+                        clusterPipeline.GetAtmosClimate().GetWeatherWeightStormy() * 100.0f);
+                    ImGui::TreePop();
+                }
 
                 ImGui::EndTabItem();
             }
