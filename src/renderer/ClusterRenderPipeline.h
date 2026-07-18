@@ -383,6 +383,11 @@ namespace renderer {
         // convention as e.g. GetTracedEntityInfos() elsewhere in this class.
         const AtmosClimatePass& GetAtmosClimate() const { return m_AtmosClimate; }
 
+        // Exposes the procedural creature's bone hierarchy/pose for main.cpp's Animation ImGui tab
+        // (animation::debug::AnimationDebugPanel) -- same "borrow a const ref" convention as
+        // GetAtmosClimate() above.
+        const animation::SkeletalAnimator& GetSkeletalAnimator() const { return m_SkeletalAnimator; }
+
         // Exposes ParticleSystemPass for main.cpp's own Particles ImGui tab (Subtask 6's own
         // Debug-only GetLastAliveCountApprox() readout) -- same "borrow a const ref" convention as
         // GetAtmosClimate() above.

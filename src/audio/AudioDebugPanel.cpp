@@ -51,12 +51,18 @@ void AudioDebugPanel::RenderImGui(const audio::AudioEngine& engine) {
 
                 ImGui::Separator();
                 ImGui::Text("  [%u] %s", i, sourceName);
+                // Read-only display of live engine state (pan/distanceGain are throwaway local
+                // copies, not connected back to the engine) -- ImGuiSliderFlags has no read-only
+                // flag, so BeginDisabled()/EndDisabled() is the correct way to show a slider
+                // without allowing drag/Ctrl+Click-edit interaction.
+                ImGui::BeginDisabled();
                 ImGui::SliderFloat(
                     ("Pan##" + std::to_string(i)).c_str(),
-                    &pan, -1.0f, 1.0f, "%.2f", ImGuiSliderFlags_ReadOnly);
+                    &pan, -1.0f, 1.0f, "%.2f");
                 ImGui::SliderFloat(
                     ("Distance Gain##" + std::to_string(i)).c_str(),
-                    &distanceGain, 0.0f, 1.0f, "%.2f", ImGuiSliderFlags_ReadOnly);
+                    &distanceGain, 0.0f, 1.0f, "%.2f");
+                ImGui::EndDisabled();
             }
         }
         ImGui::Unindent();
