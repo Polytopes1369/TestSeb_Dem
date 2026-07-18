@@ -422,7 +422,8 @@ namespace debugpipeline {
             else if (hasWarning && result.status == TestStatus::Pass) { result.status = TestStatus::Warn; }
 
             const char* statusStr = result.status == TestStatus::Pass ? "PASS"
-                                     : result.status == TestStatus::Warn ? "WARN" : "FAIL";
+                                     : result.status == TestStatus::Warn ? "WARN"
+                                     : result.status == TestStatus::Skip ? "SKIP" : "FAIL";
             LOG_INFO(std::format("[DebugTestPipeline] [{}] {}", statusStr, name));
 
             report.AddResult(std::move(result));

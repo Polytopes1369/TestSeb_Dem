@@ -797,12 +797,23 @@ namespace renderer {
         }
 
         // ---------------------------------------------------------------------------------------
-        // Same sanity idea for the 12 non-floor (sculpted, grid-arranged) primitives: each entity's
-        // whole grid slot + own half-extent puts every one of its clusters, at every DAG level,
-        // well within a generous +/-10m box on X/Z and +/-3m on Y (see VulkanContext::GridSlot's
-        // 3m spacing / 3-wide grid and each primitive's own ~1-2m size). A node outside that would
-        // mean THAT entity's own cache data is corrupt -- independent of the floor investigation
-        // above, e.g. relevant to the box primitive's own persistent crack.
+        // Same sanity idea for the 12 non-floor (sculpted, grid-arranged) SHOWCASE primitives only
+        // (entityID < kFloorEntityID, i.e. 0-11): each entity's whole grid slot + own half-extent
+        // puts every one of its clusters, at every DAG level, well within a generous +/-10m box on
+        // X/Z and +/-3m on Y (see VulkanContext::GridSlot's 3m spacing / 3-wide grid and each
+        // primitive's own ~1-2m size). A node outside that would mean THAT entity's own cache data
+        // is corrupt -- independent of the floor investigation above, e.g. relevant to the box
+        // primitive's own persistent crack.
+        //
+        // entityID > kFloorEntityID (PCG-scattered trees/vegetation/rocks, world::PcgCellLoader /
+        // pcg::GeneratePcgContentForCell) is deliberately OUT of scope here: those clusters' own
+        // sphereCenter is legitimately baked at their real, spread-out world-space position (e.g.
+        // a tree planted 400 units from the origin), not relative to a shared local origin the way
+        // the 12 tightly grid-arranged showcase primitives are -- confirmed by inspecting real
+        // flagged samples, which were tiny-radius (~0.3-0.7) leaf/twig clusters sitting at
+        // Y~=0 (ground level, well inside the Y bound) with only X/Z far outside it, consistent
+        // with an ordinary planted tree and not corrupt data. Checking them against this box was
+        // always a scope bug, not a real corruption signal.
         // ---------------------------------------------------------------------------------------
         constexpr float kPrimitiveXZBound = 10.0f;
         constexpr float kPrimitiveYBound = 3.0f;
@@ -810,7 +821,7 @@ namespace renderer {
         std::unordered_map<uint32_t, std::string> primitiveOutlierExamplesByEntity;
         for (uint32_t i = 0; i < m_TotalNodeCount; ++i) {
             const DAGNodePayload& node = m_DebugDagNodesCopy[i];
-            if (node.entityID == kFloorEntityID) {
+            if (node.entityID >= kFloorEntityID) {
                 continue;
             }
             bool outOfBounds = std::abs(node.sphereCenter.x) > kPrimitiveXZBound
