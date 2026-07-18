@@ -7,8 +7,10 @@
 #include <cstring>
 #include <format>
 #include <fstream>
+#include <optional>
 #include <stdexcept>
 #include <string>
+#include <thread>
 
 #include "core/Logger.h"
 #ifndef NDEBUG
@@ -39,10 +41,11 @@
 // world::IWorldCellLoader implementation) directly, simulating exactly what world::StreamingManager
 // would trigger from a worker thread -- see that method's own header comment
 // (renderer/ClusterRenderPipeline.h) for exactly what it checks, INCLUDING Phase 6.4's ("Generation
-// Caching") own reload/cache-hit verification (step 5 there), added directly into this SAME test
-// function rather than a separate one -- it needs the exact same scratch PcgVolume/PcgCellLoader
-// setup this test already builds, so a second, near-duplicate test function would just be that same
-// setup copy-pasted. world::PcgCellLoader.h and
+// Caching") own reload/cache-hit verification (step 5 there) AND Phase 6.5's ("Bake-vs-Runtime
+// Determinism Validation") own direct-call-vs-live-runtime comparison (that method's own internal
+// STEP 5), BOTH added directly into this SAME test function rather than a separate one each -- they
+// need the exact same scratch PcgVolume/PcgCellLoader setup this test already builds, so a second,
+// near-duplicate test function would just be that same setup copy-pasted. world::PcgCellLoader.h and
 // WorldPartition/PcgVolumeActor.h are BOTH whole-file Debug-only (see their own header comments for
 // why -- the tools/WorldPartition/ Release-link boundary) so including them here unconditionally is
 // harmless (an empty header in Release) and matches this file's own established convention (see the
@@ -4265,6 +4268,52 @@ namespace {
             return pcg::PcgNodeExecuteResult::Ok(std::move(outputs));
         });
 
+    // PCG roadmap Phase 6.5 ("Bake-vs-Runtime Determinism Validation"): epsilon-tolerant scalar
+    // compare for cross-checking two independently-computed pcg::PcgSpawnRequest lists below.
+    // Mirrors tests/PcgCellGeneratorTests.cpp's own NearlyEqual() (identical 1.0e-4f default
+    // epsilon) -- duplicated here rather than shared since that file is a separate, standalone
+    // CTest executable target with no header of its own to include from (this codebase's
+    // "framework-free tests/*.cpp" convention, see PcgCellLoaderTests.cpp's own top-of-file
+    // comment for why those targets never share headers with the main engine's own .cpp files).
+    bool NearlyEqual(float a, float b, float epsilon = 1.0e-4f) {
+        return std::fabs(a - b) <= epsilon;
+    }
+
+    // Field-by-field comparison of two pcg::PcgSpawnRequest lists -- same count, and for each index
+    // (order matters: pcg::GeneratePcgContentForCell's own documented per-volume, per-point
+    // insertion order, see that function's own top-of-file comment) the same meshID/materialID
+    // (exact, integer) and the same position/rotation/scale (epsilon, floating-point). Returns an
+    // empty string if everything matches, or a human-readable description of the FIRST mismatch
+    // found otherwise -- used by RunPcgCellLoaderSmokeTest's own Phase 6.5 step to produce an
+    // actionable log line instead of a bare boolean, exactly like every other check in that
+    // function's own established "LOG_ERROR with the specific numbers involved" convention.
+    std::string FirstSpawnRequestMismatch(const std::vector<pcg::PcgSpawnRequest>& a, const std::vector<pcg::PcgSpawnRequest>& b,
+        const std::string& labelA, const std::string& labelB) {
+        if (a.size() != b.size()) {
+            return std::format("{} produced {} spawn request(s) but {} produced {}", labelA, a.size(), labelB, b.size());
+        }
+        for (size_t i = 0; i < a.size(); ++i) {
+            const pcg::PcgSpawnRequest& ra = a[i];
+            const pcg::PcgSpawnRequest& rb = b[i];
+            if (ra.meshID != rb.meshID || ra.materialID != rb.materialID) {
+                return std::format("request[{}]: meshID/materialID differ ({} has {}:{}, {} has {}:{})",
+                    i, labelA, ra.meshID, ra.materialID, labelB, rb.meshID, rb.materialID);
+            }
+            if (!NearlyEqual(ra.position.x, rb.position.x) || !NearlyEqual(ra.position.y, rb.position.y) || !NearlyEqual(ra.position.z, rb.position.z)) {
+                return std::format("request[{}]: position differs between {} ({:.4f},{:.4f},{:.4f}) and {} ({:.4f},{:.4f},{:.4f})",
+                    i, labelA, ra.position.x, ra.position.y, ra.position.z, labelB, rb.position.x, rb.position.y, rb.position.z);
+            }
+            if (!NearlyEqual(ra.rotation.x, rb.rotation.x) || !NearlyEqual(ra.rotation.y, rb.rotation.y) ||
+                !NearlyEqual(ra.rotation.z, rb.rotation.z) || !NearlyEqual(ra.rotation.w, rb.rotation.w)) {
+                return std::format("request[{}]: rotation differs between {} and {}", i, labelA, labelB);
+            }
+            if (!NearlyEqual(ra.scale.x, rb.scale.x) || !NearlyEqual(ra.scale.y, rb.scale.y) || !NearlyEqual(ra.scale.z, rb.scale.z)) {
+                return std::format("request[{}]: scale differs between {} and {}", i, labelA, labelB);
+            }
+        }
+        return {};
+    }
+
 } // namespace
 
 bool ClusterRenderPipeline::RunPcgCellLoaderSmokeTest(
@@ -4533,6 +4582,105 @@ bool ClusterRenderPipeline::RunPcgCellLoaderSmokeTest(
     return false;
   }
 
+  // =========================================================================================
+  // STEP 5 -- PCG roadmap Phase 6.5 ("Bake-vs-Runtime Determinism Validation"), the actual gap this
+  // step closes: every check above (Steps 3/4) only ever compares AGGREGATE INSTANCE COUNTS
+  // (pcgPass.GetLiveInstanceCount(), already torn down above) -- none of them verify that individual
+  // spawn requests (position/rotation/scale/meshID/materialID, IN ORDER) actually survived the LIVE
+  // runtime path (worker-thread-style LoadCellFullDetail -> world::PcgCellLoader's own generation-
+  // result cache -> PcgCellLoadEvent -> Pump() -> PcgInstanceSpawnManager::SpawnInstances())
+  // unchanged from what pcg::GeneratePcgContentForCell() itself actually produced -- a bug that kept
+  // the COUNT right but scrambled ORDER, corrupted one position, or mapped the wrong cached entry to
+  // this coord would sail straight through Steps 3/4 undetected.
+  //
+  // This step re-derives, BY HAND, the exact pcg::PcgCellGenerationInput world::PcgCellLoader::
+  // StageFullDetailGeneration() (world/PcgCellLoader.cpp) built internally for this SAME cell back
+  // in Step 3's original load, and calls pcg::GeneratePcgContentForCell() on it DIRECTLY -- entirely
+  // independent of cellLoader, its cache, or any worker-thread plumbing -- simulating exactly what a
+  // hypothetical future OFFLINE BAKE TOOL would do (pcg::PcgCellGenerator.h's own top-of-file
+  // comment explicitly names "a hypothetical future offline bake tool" as one of the callers
+  // GeneratePcgContentForCell's purity contract was written for). cellLoader itself is untouched by
+  // pcgPass.Shutdown() above (it owns no Vulkan resources of its own -- only pcgPass/spawnManager
+  // do), so its own cache is still fully valid to query here.
+  //
+  // Two independent comparisons follow:
+  //   (a) "simulated bake", run once on THIS thread and once on a genuinely separate std::thread
+  //       (joined before comparison), must be byte-identical to ITSELF across threads -- proving
+  //       pcg::GeneratePcgContentForCell is deterministic ACROSS THREADS, not just across repeated
+  //       same-thread calls (already covered by tests/PcgCellGeneratorTests.cpp's own
+  //       TestDeterminism). Every LoadCellFullDetail() call in Steps 3/4 above ran synchronously on
+  //       this same thread (see that call site's own comment for why that was a deliberate,
+  //       acknowledged simplification) -- this is the first place in this test a real second thread
+  //       is used, exactly the property world::PcgCellLoader's own documented worker-thread calling
+  //       contract (PcgCellLoader.h's own header comment) depends on but never itself verified.
+  //   (b) "simulated bake" vs. world::PcgCellLoader::GetCachedResultForTest()'s own live-runtime-
+  //       cached result for the same coord -- the literal "bake-vs-runtime" proof this phase is
+  //       named for: does the LIVE streaming-triggered path ever silently diverge from what a direct
+  //       call to the same underlying pure function (what a real offline bake tool would call)
+  //       produces? A non-degenerate-count guard (below) keeps this from vacuously passing if some
+  //       unrelated regression made every call path return the same EMPTY result.
+  // =========================================================================================
+  pcg::PcgCellGenerationInput bakeInput;
+  bakeInput.cellCoord = world::ToOfflineCellCoord(world::CellCoord{ 0, 0 });
+  bakeInput.overlappingVolumes = { volumeDesc };
+  bakeInput.cellSize = kTestCellSize;
+
+  const pcg::PcgCellGenerationResult bakeResultMainThread = pcg::GeneratePcgContentForCell(bakeInput);
+
+  pcg::PcgCellGenerationResult bakeResultWorkerThread;
+  {
+    std::thread bakeWorker([&bakeInput, &bakeResultWorkerThread]() {
+      bakeResultWorkerThread = pcg::GeneratePcgContentForCell(bakeInput);
+    });
+    bakeWorker.join();
+  }
+
+  const std::optional<pcg::PcgCellGenerationResult> runtimeResult = cellLoader.GetCachedResultForTest(world::CellCoord{ 0, 0 });
+
+  if (!bakeResultMainThread.success || !bakeResultWorkerThread.success) {
+    LOG_ERROR(std::format(
+        "[ClusterRenderPipeline] PCG cell-loader smoke test FAILED (Phase 6.5): the simulated-bake call "
+        "to pcg::GeneratePcgContentForCell reported failure (main-thread success={}, worker-thread "
+        "success={}).", bakeResultMainThread.success, bakeResultWorkerThread.success));
+    return false;
+  }
+  if (!runtimeResult.has_value()) {
+    LOG_ERROR(
+        "[ClusterRenderPipeline] PCG cell-loader smoke test FAILED (Phase 6.5): world::PcgCellLoader::"
+        "GetCachedResultForTest(CellCoord{0,0}) returned no cached entry -- expected one populated by "
+        "this test's own Step 3 load.");
+    return false;
+  }
+  if (bakeResultMainThread.spawnRequests.size() != expectedInstanceCount) {
+    LOG_ERROR(std::format(
+        "[ClusterRenderPipeline] PCG cell-loader smoke test FAILED (Phase 6.5): simulated-bake spawn "
+        "request count ({}) does not match this test's own expected grid point count ({}) -- the "
+        "bake-vs-runtime comparison below would otherwise risk vacuously comparing two "
+        "empty/degenerate lists.", bakeResultMainThread.spawnRequests.size(), expectedInstanceCount));
+    return false;
+  }
+
+  const std::string mismatchBakeVsBake = FirstSpawnRequestMismatch(
+      bakeResultMainThread.spawnRequests, bakeResultWorkerThread.spawnRequests, "main-thread bake", "worker-thread bake");
+  if (!mismatchBakeVsBake.empty()) {
+    LOG_ERROR(std::format(
+        "[ClusterRenderPipeline] PCG cell-loader smoke test FAILED (Phase 6.5): pcg::GeneratePcgContentForCell "
+        "produced DIFFERENT output when called from two different threads with byte-identical input -- {}.",
+        mismatchBakeVsBake));
+    return false;
+  }
+
+  const std::string mismatchBakeVsRuntime = FirstSpawnRequestMismatch(
+      bakeResultMainThread.spawnRequests, runtimeResult->spawnRequests, "simulated bake", "live PcgCellLoader runtime");
+  if (!mismatchBakeVsRuntime.empty()) {
+    LOG_ERROR(std::format(
+        "[ClusterRenderPipeline] PCG cell-loader smoke test FAILED (Phase 6.5): the LIVE world::PcgCellLoader "
+        "runtime path diverged from a direct, standalone pcg::GeneratePcgContentForCell call for the same cell "
+        "-- {}. A real offline bake tool calling GeneratePcgContentForCell directly would NOT reproduce what "
+        "the live streaming path actually served.", mismatchBakeVsRuntime));
+    return false;
+  }
+
   std::string passMsg = std::format(
       "[ClusterRenderPipeline] PCG cell-loader smoke test PASSED: 1 volume indexed into 1 cell, "
       "LoadCellFullDetail+Pump acquired {} real instance(s) (matching the grid's own deterministic "
@@ -4542,8 +4690,14 @@ bool ClusterRenderPipeline::RunPcgCellLoaderSmokeTest(
       "via exactly 1 cache hit and 0 additional cache misses (pcg::GeneratePcgContentForCell ran only "
       "ONCE in total, for the original load). world::IWorldCellLoader -> pcg::GeneratePcgContentForCell "
       "-> world::PcgCellLoader::Pump -> pcg::PcgInstanceSpawnManager -> renderer::PcgInstanceDrawPass "
-      "verified end-to-end, including the Phase 6.4 cache.",
-      expectedInstanceCount, expectedInstanceCount);
+      "verified end-to-end, including the Phase 6.4 cache. Phase 6.5 (Bake-vs-Runtime Determinism): a "
+      "direct, standalone pcg::GeneratePcgContentForCell call (simulating a hypothetical offline bake "
+      "tool), run on both this thread and a separate worker thread, reproduced byte-identical spawn "
+      "requests ({} entries: matching meshID/materialID/position/rotation/scale, in the same order) to "
+      "what the LIVE world::PcgCellLoader runtime path actually cached and served -- proving the live "
+      "streaming-triggered path never silently diverges from what an offline bake would produce, and "
+      "that pcg::GeneratePcgContentForCell is deterministic across threads.",
+      expectedInstanceCount, expectedInstanceCount, expectedInstanceCount);
   LOG_INFO(passMsg);
   m_PcgCellLoaderSmokeTestResult.passed = true;
   m_PcgCellLoaderSmokeTestResult.details = std::move(passMsg);

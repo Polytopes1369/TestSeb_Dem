@@ -61,7 +61,11 @@
 // world::PcgCellLoader) was originally checked for and NOT present when tests 13-16 were first wired
 // in; it landed on main in a later merge and was reconciled in alongside a RenderPass<> migration
 // that also touched this class -- see that merge commit's own message for the conflict-resolution
-// details.
+// details. Phase 6.4 ("Generation Caching") and Phase 6.5 ("Bake-vs-Runtime Determinism
+// Validation") both later extended RunPcgCellLoaderSmokeTest() itself (additional internal steps
+// against the SAME scratch PcgVolume/PcgCellLoader setup, see that method's own header comment) --
+// test 17 below still surfaces both automatically via the same GetPcgCellLoaderSmokeTestResult()
+// query, no new report entry needed for either.
 #ifndef NDEBUG
 
 #include "core/debug/DebugTestPipeline.h"
@@ -911,9 +915,17 @@ namespace debugpipeline {
                     "PcgInstanceSpawnManager::SpawnInstances() call acquiring exactly the grid source "
                     "node's own deterministic point count; LoadCellHlod() on a different cell is confirmed "
                     "a documented no-op (live instance count unchanged); UnloadCell()+Pump() despawns every "
-                    "acquired instance back to 0 -- proves the LIVE streaming-triggered generation path "
-                    "world::StreamingManager would drive works end-to-end, simulating exactly that trigger "
-                    "without needing a real StreamingManager/CellManifest/camera.",
+                    "acquired instance back to 0; a cached reload (Phase 6.4) reproduces the same instance "
+                    "count via a proven cache hit; and (Phase 6.5, \"Bake-vs-Runtime Determinism "
+                    "Validation\") a direct, standalone pcg::GeneratePcgContentForCell call simulating a "
+                    "hypothetical offline bake tool -- run on both the calling thread and a separate "
+                    "worker thread -- reproduces BYTE-IDENTICAL spawn requests (same meshID/materialID/"
+                    "position/rotation/scale, in the same order, not just the same aggregate count) to "
+                    "what the live world::PcgCellLoader runtime path actually cached and served -- proves "
+                    "the LIVE streaming-triggered generation path world::StreamingManager would drive "
+                    "works end-to-end AND never silently diverges from what a real offline bake tool "
+                    "would produce, simulating exactly that trigger without needing a real "
+                    "StreamingManager/CellManifest/camera.",
                     result.details,
                     "Ran once at startup (main.cpp, right after ClusterRenderPipeline::Init()), via a "
                     "throwaway world::PcgCellLoader against a scratch temp directory (%TEMP%/"
