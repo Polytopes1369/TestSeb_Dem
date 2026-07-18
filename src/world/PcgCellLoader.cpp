@@ -67,14 +67,68 @@ namespace world {
         auto it = m_VolumeIndex.find(coord);
         if (it == m_VolumeIndex.end() || it->second.empty()) return; // No PCG volumes overlap this cell -- nothing to generate.
 
-        // worldpartition::CellCoord (3-axis, y always 0 in this codebase's Grid2D-only runtime
-        // streaming grid) -- see PcgVolumeCellIndex.h's own ToOfflineCellCoord comment.
-        pcg::PcgCellGenerationInput input;
-        input.cellCoord = ToOfflineCellCoord(coord);
-        input.overlappingVolumes = it->second;
-        input.cellSize = m_CellSize;
+        // --- Phase 6.4 ("Generation Caching"): consult m_GenerationResultCache BEFORE calling the
+        // (potentially slow -- disk read + JSON parse + graph evaluation per overlapping volume)
+        // pcg::GeneratePcgContentForCell() below. See PcgCellLoader.h's own top-of-file "Phase 6.4"
+        // comment for the full key-choice/eviction-policy/thread-safety rationale; this is just that
+        // policy's actual implementation. `result` ends up populated either way (from the cache on a
+        // hit, freshly generated on a miss) and is always a value THIS function fully owns from this
+        // point on -- std::move-ing out of it below (building the PcgCellLoadEvent) is therefore
+        // always safe, regardless of which path filled it in. ---
+        pcg::PcgCellGenerationResult result;
+        bool cacheHit = false;
+        {
+            std::lock_guard<std::mutex> cacheLock(m_CacheMutex);
+            auto cacheIt = m_GenerationResultCache.find(coord);
+            if (cacheIt != m_GenerationResultCache.end()) {
+                result = cacheIt->second; // Copy out while still holding the lock: cheap (a handful of small PcgSpawnRequest structs at most, see this cache's own bound comment), and avoids handing out a reference/pointer that a concurrent worker thread's insert for a DIFFERENT coord could invalidate via unordered_map rehashing.
+                cacheHit = true;
+                ++m_CacheHitCount;
+            } else {
+                ++m_CacheMissCount;
+            }
+        }
 
-        const pcg::PcgCellGenerationResult result = pcg::GeneratePcgContentForCell(input);
+        if (cacheHit) {
+            LOG_INFO(std::format(
+                "[PcgCellLoader] Cache HIT for cell ({}, {}): reusing {} previously-generated spawn "
+                "request(s), pcg::GeneratePcgContentForCell was NOT called.", coord.x, coord.z, result.spawnRequests.size()));
+        } else {
+            // worldpartition::CellCoord (3-axis, y always 0 in this codebase's Grid2D-only runtime
+            // streaming grid) -- see PcgVolumeCellIndex.h's own ToOfflineCellCoord comment.
+            pcg::PcgCellGenerationInput input;
+            input.cellCoord = ToOfflineCellCoord(coord);
+            input.overlappingVolumes = it->second;
+            input.cellSize = m_CellSize;
+
+            LOG_INFO(std::format(
+                "[PcgCellLoader] Cache MISS for cell ({}, {}): running pcg::GeneratePcgContentForCell "
+                "(first load of this cell since construction, or since the last cache-clearing event -- "
+                "this class never clears its own cache once populated).", coord.x, coord.z));
+
+            result = pcg::GeneratePcgContentForCell(input);
+
+            // Cache every STRUCTURALLY successful result, including a legitimately empty one (an
+            // empty spawnRequests list with success == true is still a valid, deterministic, reusable
+            // answer -- e.g. every overlapping volume's graph clipped to zero surviving points inside
+            // THIS exact cell; see PcgCellGenerationResult's own field comment, PcgCellGenerator.h).
+            // A STRUCTURAL failure (success == false, e.g. a non-positive cellSize) is deliberately
+            // NOT cached: m_CellSize is fixed for this instance's whole lifetime, so caching it would
+            // not meaningfully save more than the trivial check GeneratePcgContentForCell already
+            // performs first, and leaving it uncached keeps the LOG_WARNING below firing on every
+            // call for that already-rare, not-recoverable-by-retry case -- exactly this class'
+            // pre-6.4 behavior for it, unchanged.
+            if (result.success) {
+                std::lock_guard<std::mutex> cacheLock(m_CacheMutex);
+                // emplace (insert-only-if-absent), not insert_or_assign: if another worker thread's
+                // concurrent miss for this SAME coord already won this race, its own result is
+                // byte-identical to ours (pcg::GeneratePcgContentForCell is pure/deterministic -- see
+                // PcgCellGenerator.h's own "Determinism" comment), so whichever copy actually ends up
+                // cached is immaterial.
+                m_GenerationResultCache.emplace(coord, result);
+            }
+        }
+
         if (!result.success) {
             LOG_WARNING(std::format(
                 "[PcgCellLoader] GeneratePcgContentForCell({}, {}) FAILED: {}", coord.x, coord.z, result.errorMessage));

@@ -38,7 +38,11 @@
 // on-disk PcgGraph asset + PcgVolume .actor file and drives world::PcgCellLoader (the new
 // world::IWorldCellLoader implementation) directly, simulating exactly what world::StreamingManager
 // would trigger from a worker thread -- see that method's own header comment
-// (renderer/ClusterRenderPipeline.h) for exactly what it checks. world::PcgCellLoader.h and
+// (renderer/ClusterRenderPipeline.h) for exactly what it checks, INCLUDING Phase 6.4's ("Generation
+// Caching") own reload/cache-hit verification (step 5 there), added directly into this SAME test
+// function rather than a separate one -- it needs the exact same scratch PcgVolume/PcgCellLoader
+// setup this test already builds, so a second, near-duplicate test function would just be that same
+// setup copy-pasted. world::PcgCellLoader.h and
 // WorldPartition/PcgVolumeActor.h are BOTH whole-file Debug-only (see their own header comments for
 // why -- the tools/WorldPartition/ Release-link boundary) so including them here unconditionally is
 // harmless (an empty header in Release) and matches this file's own established convention (see the
@@ -4481,16 +4485,79 @@ bool ClusterRenderPipeline::RunPcgCellLoaderSmokeTest(
   cellLoader.Pump();
   const uint32_t liveAfterUnload = pcgPass.GetLiveInstanceCount();
   const size_t loadedCellsAfterUnload = cellLoader.GetLoadedCellCount();
-  pcgPass.Shutdown();
 
   if (liveAfterUnload != 0) {
     LOG_ERROR(std::format(
         "[ClusterRenderPipeline] PCG cell-loader smoke test FAILED: expected 0 live instances after "
         "UnloadCell+Pump, got {}.", liveAfterUnload));
+    pcgPass.Shutdown();
     return false;
   }
   if (loadedCellsAfterUnload != 0) {
     LOG_ERROR(std::format("[ClusterRenderPipeline] PCG cell-loader smoke test FAILED: expected 0 tracked loaded cells after unload, got {}.", loadedCellsAfterUnload));
+    pcgPass.Shutdown();
+    return false;
+  }
+
+  // --- Phase 6.4 ("Generation Caching") -- baseline check: the FIRST LoadCellFullDetail (above,
+  // before this cell had ever been generated) must have been exactly 1 cache miss and 0 cache hits.
+  // Not strictly required for this test to prove caching works (the reload check right below is the
+  // real proof), but pins down the starting point so a counter that was broken from the start (e.g.
+  // always reporting a hit) cannot coincidentally still pass the reload check below. ---
+  const size_t missCountBeforeReload = cellLoader.GetCacheMissCount();
+  const size_t hitCountBeforeReload = cellLoader.GetCacheHitCount();
+  if (missCountBeforeReload != 1 || hitCountBeforeReload != 0) {
+    LOG_ERROR(std::format(
+        "[ClusterRenderPipeline] PCG cell-loader smoke test FAILED: expected exactly 1 cache miss and "
+        "0 cache hits after the cell's first-ever LoadCellFullDetail, got {} miss(es) and {} hit(s).",
+        missCountBeforeReload, hitCountBeforeReload));
+    pcgPass.Shutdown();
+    return false;
+  }
+
+  // =========================================================================================
+  // STEP 4 -- PCG roadmap Phase 6.4 ("Generation Caching"), the actual subject under test: reload
+  // the SAME cell after the UnloadCell above -- exactly the "camera re-crosses a cell boundary"
+  // scenario that motivates this phase (see world::PcgCellLoader.h's own top-of-file "Phase 6.4"
+  // comment). UnloadCell() never evicts m_GenerationResultCache (only m_CellToAcquiredSlots), so
+  // this reload must be served ENTIRELY from that cache -- pcg::GeneratePcgContentForCell must NOT
+  // run again, and the resulting instance count must reproduce the exact same
+  // expectedInstanceCount as the original load.
+  // =========================================================================================
+  cellLoader.LoadCellFullDetail(world::CellCoord{ 0, 0 });
+  cellLoader.Pump();
+
+  const uint32_t liveAfterReload = pcgPass.GetLiveInstanceCount();
+  const size_t hitCountAfterReload = cellLoader.GetCacheHitCount();
+  const size_t missCountAfterReload = cellLoader.GetCacheMissCount();
+  const size_t cachedCellCountAfterReload = cellLoader.GetCachedCellCount();
+  pcgPass.Shutdown();
+
+  if (liveAfterReload != expectedInstanceCount) {
+    LOG_ERROR(std::format(
+        "[ClusterRenderPipeline] PCG cell-loader smoke test FAILED: expected {} live instance(s) after "
+        "the CACHED reload (UnloadCell then a second LoadCellFullDetail+Pump for the same coord), got {}.",
+        expectedInstanceCount, liveAfterReload));
+    return false;
+  }
+  if (hitCountAfterReload != 1) {
+    LOG_ERROR(std::format(
+        "[ClusterRenderPipeline] PCG cell-loader smoke test FAILED: expected exactly 1 cache hit after "
+        "the reload, got {} -- the reload should have been served entirely from "
+        "world::PcgCellLoader's own generation-result cache.", hitCountAfterReload));
+    return false;
+  }
+  if (missCountAfterReload != missCountBeforeReload) {
+    LOG_ERROR(std::format(
+        "[ClusterRenderPipeline] PCG cell-loader smoke test FAILED: cache miss count changed on reload "
+        "(was {}, now {}) -- pcg::GeneratePcgContentForCell must NOT run again for an already-cached "
+        "coord.", missCountBeforeReload, missCountAfterReload));
+    return false;
+  }
+  if (cachedCellCountAfterReload != 1) {
+    LOG_ERROR(std::format(
+        "[ClusterRenderPipeline] PCG cell-loader smoke test FAILED: expected exactly 1 cached cell "
+        "after the reload, got {}.", cachedCellCountAfterReload));
     return false;
   }
 
@@ -4498,10 +4565,13 @@ bool ClusterRenderPipeline::RunPcgCellLoaderSmokeTest(
       "[ClusterRenderPipeline] PCG cell-loader smoke test PASSED: 1 volume indexed into 1 cell, "
       "LoadCellFullDetail+Pump acquired {} real instance(s) (matching the grid's own deterministic "
       "point count), LoadCellHlod verified as a documented no-op, UnloadCell+Pump despawned every "
-      "acquired instance back to 0. world::IWorldCellLoader -> pcg::GeneratePcgContentForCell -> "
-      "world::PcgCellLoader::Pump -> pcg::PcgInstanceSpawnManager -> renderer::PcgInstanceDrawPass "
-      "verified end-to-end.",
-      expectedInstanceCount);
+      "acquired instance back to 0, and Phase 6.4's generation-result cache was proven live: a SECOND "
+      "LoadCellFullDetail+Pump for the same coord after that unload reproduced the same {} instance(s) "
+      "via exactly 1 cache hit and 0 additional cache misses (pcg::GeneratePcgContentForCell ran only "
+      "ONCE in total, for the original load). world::IWorldCellLoader -> pcg::GeneratePcgContentForCell "
+      "-> world::PcgCellLoader::Pump -> pcg::PcgInstanceSpawnManager -> renderer::PcgInstanceDrawPass "
+      "verified end-to-end, including the Phase 6.4 cache.",
+      expectedInstanceCount, expectedInstanceCount);
   LOG_INFO(passMsg);
   m_PcgCellLoaderSmokeTestResult.passed = true;
   m_PcgCellLoaderSmokeTestResult.details = std::move(passMsg);
