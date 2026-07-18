@@ -82,6 +82,10 @@ void main() {
     if (GetFlag(entityFlags, ENTITY_FLAG_IS_TRANSPARENT)) {
         return; // Shaded by TransparentForwardPass instead -- see EntityDataBuffer's own comment.
     }
+    if (GetFlag(entityFlags, ENTITY_FLAG_STREAMING_INACTIVE)) {
+        return; // Idle streaming slot (core::EntityFlags::StreamingInactive) -- geometrically valid
+                // but not currently claimed by any streamed-in world cell, so it must never draw.
+    }
 
     // Phase 1 (Nanite advanced): see displacement_bounds.glsl's own header comment for why this
     // inflated bound is later reversed (GetOriginalWPOAmplitude) at every ApplyWPODeformation call

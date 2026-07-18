@@ -15,11 +15,12 @@
 // re-derive each bounding volume in the entity's CURRENT orientation, using the exact same formula
 // as the vertex shaders, so every downstream test stays consistent with what is actually rasterized.
 
-// Rotates a rest-pose world-space point about the entity's own pivot (xform.center) -- identical to
-// ClusterRaster.vert's per-vertex transform.
+// Rotates a rest-pose world-space point about the entity's own pivot (xform.center) and applies
+// its additional world-space translation (see struct_custo.glsl's EntityTransform comment) --
+// identical to ClusterRaster.vert's per-vertex transform.
 vec3 TransformClusterCenterByEntity(vec3 restPoseCenter, EntityTransform xform) {
     mat3 rotation = mat3(xform.rotation);
-    return xform.center + rotation * (restPoseCenter - xform.center);
+    return xform.translation + xform.center + rotation * (restPoseCenter - xform.center);
 }
 
 // Rotates a direction (no pivot/translation involved): used for the cluster's normal cone axis.

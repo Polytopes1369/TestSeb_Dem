@@ -121,7 +121,7 @@ void main() {
         localPos = mix(localPos, ApplySplineDeformation(localPos, splineControlPoints), g_WPOGlobals.splineDeformationDebugMultiplier);
     }
 
-    worldPos = xform.center + rotation * localPos;
+    worldPos = xform.translation + xform.center + rotation * localPos;
 
     worldPos = ApplyWPODeformation(worldPos, cluster.clusterID, GetOriginalWPOAmplitude(cluster.maxWPOAmplitude, ed.flags), g_WPOGlobals.globalTime);
 

@@ -217,14 +217,18 @@ struct ChamferBoxParams {
 };
 
 // CPU mirror of the GLSL EntityTransform struct (struct_custo.glsl): must match
-// its std430 layout exactly (mat4 = 64 bytes, vec3 + pad = 16 bytes) since it
-// is memcpy'd wholesale into m_EntityTransformBuffer every frame.
+// its std430 layout exactly (mat4 = 64 bytes, vec3 + pad = 16 bytes, vec3 + pad = 16 bytes) since
+// it is memcpy'd wholesale into m_EntityTransformBuffer every frame.
 struct EntityTransform {
   maths::mat4 rotation;
   float centerX;
   float centerY;
   float centerZ;
   float _pad0;
+  float translationX;
+  float translationY;
+  float translationZ;
+  float _pad1;
 };
 
 // geom_box.comp reads its Params via push constants (not the shared UBO),
@@ -423,7 +427,7 @@ void VulkanContext::Init(std::string_view appName, GLFWwindow *window) {
   // re-upload the whole array with a plain memcpy every frame (mirrors the
   // m_ParamsBuffer update pattern).
   VkBufferCreateInfo etInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-  etInfo.size = sizeof(EntityTransform) * kEntityCount;
+  etInfo.size = sizeof(EntityTransform) * kTotalEntityCount;
   etInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
   VmaAllocationCreateInfo etAlloc{.usage = VMA_MEMORY_USAGE_CPU_TO_GPU};
   if (vmaCreateBuffer(m_Allocator, &etInfo, &etAlloc, &m_EntityTransformBuffer,
@@ -1497,6 +1501,33 @@ void VulkanContext::BuildEntityData() {
       core::SetFlag(entity.flags, core::EntityFlags::HasSplineDeformation, true);
     }
   }
+
+  // --- Runtime World Partition streaming pool (see kStreamingUnitCount's own comment) ---
+  // Continues the SAME core::IDManager sequence the loop above started (deliberately not reset --
+  // see BuildEntityData()'s own "Context 0" comment), so meshIDs stay dense across the whole
+  // [0, kTotalEntityCount) range. Every slot starts fully valid (a real, small, pre-baked mesh --
+  // see GenerateGeometry()'s streaming block) but core::EntityFlags::StreamingInactive so it never
+  // draws until world::WorldCellStreamingLoader's main-thread pump claims it via
+  // SetStreamingUnitState().
+  for (uint32_t i = kEntityCount; i < kTotalEntityCount; ++i) {
+    core::EntityID id = core::IDManager::GetNextID();
+    uint32_t unit = (i - kEntityCount) / kStreamingSlotsPerUnit;
+    uint32_t shape = unit % kStreamingArchetypeShapeCount;
+
+    core::EntityData &entity = m_EntityData[i];
+    entity.meshID = static_cast<uint32_t>(id & 0xFFFFFFFFu);
+    entity.materialID = renderer::kStreamingArchetypeMaterialIDBase + shape;
+    entity.cellID = 0u;
+    entity.flags = 0u;
+    core::SetFlag(entity.flags, core::EntityFlags::CastShadows, true);
+    core::SetFlag(entity.flags, core::EntityFlags::StreamingInactive, true);
+
+    // Streaming archetype materials are always opaque (see MaterialParameterTable.h's own
+    // kStreamingArchetypeMaterialIDBase comment) -- looked up by materialID, NOT by entity index i
+    // as the loop above does, since materialID == i only holds for the fixed showcase gallery.
+    bool isTransparent = m_MaterialTable.isTransparent[entity.materialID];
+    core::SetFlag(entity.flags, core::EntityFlags::IsTransparent, isTransparent);
+  }
 }
 
 void VulkanContext::UploadEntityData() {
@@ -1504,7 +1535,7 @@ void VulkanContext::UploadEntityData() {
   // uploading the CPU-authored m_EntityData requires a temporary host-visible
   // staging buffer plus an explicit GPU-side copy, mirroring the
   // one-time-submit pattern used elsewhere in Init().
-  VkDeviceSize uploadSize = sizeof(core::EntityData) * kEntityCount;
+  VkDeviceSize uploadSize = sizeof(core::EntityData) * kTotalEntityCount;
 
   VkBufferCreateInfo stagingInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
   stagingInfo.size = uploadSize;
@@ -2440,6 +2471,56 @@ void VulkanContext::GenerateGeometry() {
                        kWaterLevel, runningVertexOffset, runningIndexOffset);
   }
 
+  // -------------------------------------------------------------------------
+  // RUNTIME WORLD PARTITION STREAMING POOL (entities kStreamingSlotBase..kTotalEntityCount-1) --
+  // see kStreamingUnitCount's own header comment for why streamed-in content is drawn from a small
+  // fixed set of pre-baked shapes (live per-cell Nanite cluster DAG builds are not feasible on a
+  // streaming budget) rather than unique per-cell geometry.
+  //
+  // Every unit's 2 slots are baked at their OWN distinct, widely-separated parking position (never
+  // the origin, and never shared with another slot) -- geom_autosmooth.comp's post-pass welds
+  // normals across ANY vertices within a small world-space epsilon regardless of meshID (see that
+  // shader's own comment), so baking multiple archetypes on top of each other at (0,0,0) would
+  // silently corrupt their normals. world::WorldCellStreamingLoader's runtime translation (see
+  // struct_custo.glsl's EntityTransform comment) is an ADDITIVE offset on top of whatever position
+  // a mesh is baked at -- exactly the same rotation-pivot math every other entity already uses, see
+  // UpdateEntityRotations()'s streaming-pool loop below -- so parking slots stay fully compatible
+  // with being moved to an arbitrary cell position at runtime.
+  // -------------------------------------------------------------------------
+  {
+    constexpr float kParkSpacing = 3.0f;
+    constexpr float kParkBaseX = -400.0f; // Far outside the showcase gallery (a few meters around the origin) and the streaming demo world itself (see BakeDemoWorld.cpp's kWorldCenterX).
+    constexpr float kParkBaseZ = -400.0f;
+
+    for (uint32_t unit = 0; unit < kStreamingUnitCount; ++unit) {
+      uint32_t shape = unit % kStreamingArchetypeShapeCount;
+
+      uint32_t coarseIdx = StreamingUnitCoarseSlot(unit);
+      maths::vec2 coarseSlot{ kParkBaseX + static_cast<float>(coarseIdx) * kParkSpacing, kParkBaseZ };
+      GenerateBox(0.6f, 0.6f, 0.6f, m_EntityData[coarseIdx].meshID, coarseSlot, runningVertexOffset, runningIndexOffset);
+
+      uint32_t fineIdx = StreamingUnitFineSlot(unit);
+      maths::vec2 fineSlot{ kParkBaseX + static_cast<float>(fineIdx) * kParkSpacing, kParkBaseZ };
+      switch (shape) {
+        case 0: { // Rock: icosphere.
+          uint32_t baseFaceCount = 20u, vertsPerFace = 0u;
+          GenerateIcosphere(0.5f, false, false, true, m_EntityData[fineIdx].meshID, fineSlot,
+                             runningVertexOffset, runningIndexOffset, baseFaceCount, vertsPerFace);
+          break;
+        }
+        case 1: // Bush: UV sphere.
+          GenerateSphere(0.5f, m_EntityData[fineIdx].meshID, fineSlot, runningVertexOffset, runningIndexOffset);
+          break;
+        case 2: // Tree: capsule (trunk + canopy silhouette stand-in).
+          GenerateCapsule(0.25f, 0.8f, m_EntityData[fineIdx].meshID, fineSlot, runningVertexOffset, runningIndexOffset);
+          break;
+        default: // Debris: torus (irregular scrap silhouette stand-in).
+          GenerateTorus(0.35f, 0.12f, 0.0f, 0.0f, m_EntityData[fineIdx].meshID, fineSlot, runningVertexOffset, runningIndexOffset);
+          break;
+      }
+    }
+  }
+
   m_TotalVertexCount = runningVertexOffset;
   m_TotalIndexCount = runningIndexOffset;
 
@@ -2506,7 +2587,7 @@ void VulkanContext::UpdateEntityRotations(float timeSeconds) {
   constexpr float kFloorTopY = -0.8f;
   constexpr float kWallCenterY = kFloorTopY + kWallSpan * 0.5f;
 
-  std::array<EntityTransform, kEntityCount> transforms{};
+  std::array<EntityTransform, kTotalEntityCount> transforms{};
 
   for (uint32_t meshID = 0; meshID < kEntityCount; ++meshID) {
     EntityTransform &xform = transforms[meshID];
@@ -2584,6 +2665,29 @@ void VulkanContext::UpdateEntityRotations(float timeSeconds) {
         xform.rotation, maths::vec3{xform.centerX, xform.centerY, xform.centerZ}};
   }
 
+  // --- Runtime World Partition streaming pool: static (no self-rotation), positioned entirely by
+  // m_StreamingUnitTranslation (see SetStreamingUnitState()) -- center/rotation stay exactly as
+  // baked (identity rotation, center == the slot's own parking position, see GenerateGeometry()'s
+  // streaming block), so worldPos == translation + bakedPos (this class's own EntityTransform
+  // comment). Both slots of a unit always share the same translation. ---
+  for (uint32_t unit = 0; unit < kStreamingUnitCount; ++unit) {
+    const maths::vec3 &t = m_StreamingUnitTranslation[unit];
+    for (uint32_t slotInUnit = 0; slotInUnit < kStreamingSlotsPerUnit; ++slotInUnit) {
+      uint32_t i = kStreamingSlotBase + unit * kStreamingSlotsPerUnit + slotInUnit;
+      EntityTransform &xform = transforms[i];
+      xform.rotation = maths::mat4{};
+      xform.centerX = 0.0f;
+      xform.centerY = 0.0f;
+      xform.centerZ = 0.0f;
+      xform._pad0 = 0.0f;
+      xform.translationX = t.x;
+      xform.translationY = t.y;
+      xform.translationZ = t.z;
+      xform._pad1 = 0.0f;
+      m_EntityTransformsCPU[i] = core::EntityTransformCPU{ xform.rotation, maths::vec3{0.0f, 0.0f, 0.0f}, t };
+    }
+  }
+
   void *mapped = nullptr;
   if (vmaMapMemory(m_Allocator, m_EntityTransformAllocation, &mapped) !=
       VK_SUCCESS) {
@@ -2591,8 +2695,84 @@ void VulkanContext::UpdateEntityRotations(float timeSeconds) {
         "Failed to map Entity Transform buffer for per-frame update!");
   }
   std::memcpy(mapped, transforms.data(),
-              sizeof(EntityTransform) * kEntityCount);
+              sizeof(EntityTransform) * kTotalEntityCount);
   vmaUnmapMemory(m_Allocator, m_EntityTransformAllocation);
+}
+
+void VulkanContext::SetStreamingUnitState(uint32_t unit, bool active, bool useFineVariant,
+                                           const maths::vec3 &worldPos, uint32_t cellID) {
+  assert(unit < kStreamingUnitCount);
+
+  // Translation takes effect on the NEXT UpdateEntityRotations() call (once per frame, see that
+  // function's own streaming-pool loop) -- no GPU touch needed here, unlike EntityData below,
+  // because the whole transform buffer is already re-uploaded wholesale every frame regardless.
+  m_StreamingUnitTranslation[unit] = active ? worldPos : maths::vec3{0.0f, 0.0f, 0.0f};
+
+  uint32_t coarseIdx = StreamingUnitCoarseSlot(unit);
+  uint32_t fineIdx = StreamingUnitFineSlot(unit);
+
+  bool coarseActive = active && !useFineVariant;
+  bool fineActive = active && useFineVariant;
+
+  core::EntityData &coarse = m_EntityData[coarseIdx];
+  core::SetFlag(coarse.flags, core::EntityFlags::StreamingInactive, !coarseActive);
+  coarse.cellID = coarseActive ? cellID : 0u;
+
+  core::EntityData &fine = m_EntityData[fineIdx];
+  core::SetFlag(fine.flags, core::EntityFlags::StreamingInactive, !fineActive);
+  fine.cellID = fineActive ? cellID : 0u;
+
+  PatchStreamingUnitEntityData(unit);
+}
+
+void VulkanContext::PatchStreamingUnitEntityData(uint32_t unit) {
+  uint32_t coarseIdx = StreamingUnitCoarseSlot(unit);
+  // The 2 slots of a unit are always adjacent (see StreamingUnitCoarseSlot/StreamingUnitFineSlot),
+  // so a single 2-element staging buffer + one vkCmdCopyBuffer region covers both.
+  VkDeviceSize patchSize = sizeof(core::EntityData) * kStreamingSlotsPerUnit;
+  VkDeviceSize dstOffset = sizeof(core::EntityData) * coarseIdx;
+
+  VkBufferCreateInfo stagingInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+  stagingInfo.size = patchSize;
+  stagingInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+
+  VmaAllocationCreateInfo stagingAllocInfo{};
+  stagingAllocInfo.usage = VMA_MEMORY_USAGE_CPU_ONLY;
+  stagingAllocInfo.flags = VMA_ALLOCATION_CREATE_MAPPED_BIT;
+
+  VkBuffer stagingBuffer = VK_NULL_HANDLE;
+  VmaAllocation stagingAllocation = VK_NULL_HANDLE;
+  VmaAllocationInfo stagingAllocResultInfo{};
+  if (vmaCreateBuffer(m_Allocator, &stagingInfo, &stagingAllocInfo,
+                      &stagingBuffer, &stagingAllocation,
+                      &stagingAllocResultInfo) != VK_SUCCESS) {
+    LOG_ERROR("[VulkanContext] Failed to allocate streaming-slot EntityData staging buffer!");
+    return;
+  }
+  std::memcpy(stagingAllocResultInfo.pMappedData, &m_EntityData[coarseIdx],
+              static_cast<size_t>(patchSize));
+
+  renderer::VulkanUtils::ExecuteOneShotCommands(m_Device, m_CommandPool, m_GraphicsQueue, [&](VkCommandBuffer cmd) {
+    VkBufferCopy copyRegion{};
+    copyRegion.srcOffset = 0;
+    copyRegion.dstOffset = dstOffset;
+    copyRegion.size = patchSize;
+    vkCmdCopyBuffer(cmd, stagingBuffer, m_EntityBuffer, 1, &copyRegion);
+
+    // Same transfer-write -> vertex/compute-shader-read visibility barrier as UploadEntityData().
+    VkMemoryBarrier2 memBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    memBarrier.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+    memBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    memBarrier.dstStageMask = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    memBarrier.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
+
+    VkDependencyInfo depInfo{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    depInfo.memoryBarrierCount = 1;
+    depInfo.pMemoryBarriers = &memBarrier;
+    vkCmdPipelineBarrier2(cmd, &depInfo);
+  });
+
+  vmaDestroyBuffer(m_Allocator, stagingBuffer, stagingAllocation);
 }
 
 void VulkanContext::DebugReadbackGeometrySample(uint32_t vertsPerFace,

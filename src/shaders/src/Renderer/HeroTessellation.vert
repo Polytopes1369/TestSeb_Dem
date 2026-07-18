@@ -55,6 +55,6 @@ layout(location = 1) out vec3 outWorldNormal;
 void main() {
     EntityTransform xform = entityTransforms[pc.entityID];
     mat3 rotation = mat3(xform.rotation);
-    outWorldPos = xform.center + rotation * (inPosition - xform.center);
+    outWorldPos = xform.translation + xform.center + rotation * (inPosition - xform.center);
     outWorldNormal = rotation * inNormal;
 }

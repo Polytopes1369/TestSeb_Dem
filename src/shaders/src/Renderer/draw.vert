@@ -44,7 +44,7 @@ void main() {
     EntityTransform xform = entityTransforms[ed.meshID];
     mat3 rotation = mat3(xform.rotation);
     vec3 localPos = v.position - xform.center;
-    vec3 worldPos = xform.center + rotation * localPos;
+    vec3 worldPos = xform.translation + xform.center + rotation * localPos;
 
     // 4. Visibility Buffer IDs.
     // ClusterID: this draw call still renders the flat, non-clustered per-entity SSBOs built by
