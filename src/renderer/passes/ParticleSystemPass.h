@@ -249,6 +249,12 @@ namespace renderer {
         // count (each with its own emitterIndex/spawnCount push-constant pair), all popping from the
         // SAME shared dead-list (see this class' own header comment on why the free-lists are not
         // per-emitter), followed by the usual single update dispatch over every particle slot.
+        //
+        // Rivers/waterfalls feature: the waterfall mist/foam emitter (config::particles::EMITTERS[3]
+        // by convention -- see that array's own comment) rides this SAME per-emitter `emitters`/
+        // `spawnCounts` mechanism above, not a separate dispatch -- it is authored with a low-gravity,
+        // high-drag "Sphere volume drift" recipe (spawnShape == 1, same shape kind as the "Ambient
+        // Dust" emitter) positioned at the falls' own base, so it needs no shader-side special case.
         void RecordSimulate(VkCommandBuffer cmd, const GlobalSDFPass& globalSDF, float dt, float time,
             const EmitterParams emitters[kMaxEmitters], const uint32_t spawnCounts[kMaxEmitters],
             const float precipCenterWorld[3], uint32_t precipSpawnCount, uint32_t precipKind,

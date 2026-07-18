@@ -96,8 +96,8 @@ layout(push_constant) uniform ParticleSimulationPC {
     int clipmapResolution;
     uint spawnCount;
     uint randomSeedBase;      // Per-call PRNG salt (e.g. frame index) so repeated spawns don't reuse the same jitter sequence.
-    uint emitterIndex;        // Which EmitterParamsBuffer slot to spawn for -- only meaningful when mode == 1.
-    int mode;                 // 0 = update existing particles, 1 = spawn embers, 2 = spawn precipitation.
+    uint emitterIndex;        // Which EmitterParamsBuffer slot to spawn for -- only meaningful when mode == 1. The rivers/waterfalls feature's waterfall mist is EMITTERS[3], spawned through this same path.
+    int mode;                 // 0 = update existing particles, 1 = spawn embers for this emitterIndex, 2 = spawn precipitation.
     uint precipSpawnCount;    // mode == 2 only -- how many precipitation particles to spawn this dispatch.
     uint precipKind;          // mode == 2 only -- kParticleKindRain or kParticleKindSnow (CPU-resolved from Atmos temperature).
 } pc;
@@ -172,6 +172,10 @@ vec3 RandomInUnitSphere(inout uint seed) {
     return v; // Vanishingly unlikely (8 rejections in a row, ~1.5% volume ratio) -- fall through with whatever v currently holds rather than looping unbounded in a shader.
 }
 
+// Rivers/waterfalls feature: the waterfall mist/foam emitter (config::particles::EMITTERS[3], see
+// that array's own comment) rides this SAME per-emitter path as any other emitter, authored with
+// spawnShape == 1 (Sphere volume drift) below for a soft, near-weightless billow rather than a
+// bespoke recipe -- no special-casing needed here.
 void SpawnParticle(uint slotIndex, uint spawnRequestIndex, uint emitterIndex) {
     uint seed = HashUint(pc.randomSeedBase ^ (slotIndex * 2654435761u) ^ (spawnRequestIndex * 40503u) ^ (emitterIndex * 2246822519u));
     EmitterParams e = emitters[emitterIndex];

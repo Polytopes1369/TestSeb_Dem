@@ -722,7 +722,8 @@ namespace renderer {
         // (was a single float pre-A1) so each emitter's own config::particles::EMITTERS[i].spawnRate
         // stays exact over time regardless of framerate, independently of every other emitter (e.g.
         // one emitter at 200/s and another at 40/s each round correctly on their own schedule, never
-        // silently rounding a fractional request down to 0).
+        // silently rounding a fractional request down to 0). The rivers/waterfalls feature's mist
+        // emitter (EMITTERS[3]) rides this same per-slot array, not a separate accumulator.
         float m_ParticleSpawnAccumulator[ParticleSystemPass::kMaxEmitters] = {};
         // Precipitation feature (rain/snow tied to the Atmos climate simulation) -- identical
         // fractional-carry-over role as m_ParticleSpawnAccumulator above, just against

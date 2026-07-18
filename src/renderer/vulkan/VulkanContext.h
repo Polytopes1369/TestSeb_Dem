@@ -338,6 +338,9 @@ private:
     // Params UBO / DispatchGeometryCompute path as every other non-box primitive above (in fact
     // byte-identical to PlaneParams, see GenerateTerrain()'s own comment).
     VkPipeline m_TerrainPipeline = VK_NULL_HANDLE;
+    // Rivers/waterfalls feature: geom_river.comp -- same shared Params UBO / DispatchGeometryCompute
+    // path, own RiverParams struct (see GenerateRiver()'s own comment).
+    VkPipeline m_RiverPipeline = VK_NULL_HANDLE;
 
     // The box is generated via 6 dispatches (one per cube face) of the same geom_box.comp
     // module, each specialized with a different VkSpecializationInfo (axis mapping / winding)
@@ -590,6 +593,22 @@ private:
     void GenerateCapsule(
         float Radius, float Height,
         uint32_t meshID, maths::vec2 slot,
+        uint32_t& runningVertexOffset, uint32_t& runningIndexOffset);
+
+    // Rivers/waterfalls feature: dispatches m_RiverPipeline (geom_river.comp), generating the
+    // spline-following water ribbon (river course + waterfall segment, see river_spline.glsl's own
+    // kRiverControlHeight comment) CHAINED onto the same `meshID`/`runningVertexOffset`/
+    // `runningIndexOffset` as an immediately-preceding GenerateWaterPlane() call for the flat lake
+    // quad -- deliberately NOT a new renderer::EntityData slot (see geom_river.comp's own header
+    // comment for why: one shared renderer::WaterForwardPass draw, one shared kWaterMaterialID,
+    // zero VulkanContext::kEntityCount ripple). `segmentsAlong`/`segmentsAcross` size the ribbon's
+    // generation grid; the actual world-space path/width come from river_spline.glsl's own
+    // constants (kRiverControlXZ/kRiverControlHeight/kRiverHalfWidth), not from parameters here --
+    // unlike every other Generate*() primitive, this shape's authoring lives in the shared GLSL
+    // include specifically so terrain_noise.glsl's channel carve and this mesh generator can never
+    // silently drift apart (see that file's own header comment for the full 3-consumer contract).
+    void GenerateRiver(
+        uint32_t meshID, uint32_t segmentsAlong, uint32_t segmentsAcross,
         uint32_t& runningVertexOffset, uint32_t& runningIndexOffset);
 
     // Authors m_EntityData on the CPU: assigns each of the kEntityCount entities a meshID via

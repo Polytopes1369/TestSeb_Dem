@@ -456,7 +456,18 @@ struct EmitterConfig {
 // values the old flat globals held) so this roadmap step changes nothing about the existing "embers"
 // look by default. Slot 1 is a new "Ambient Dust" emitter proving multi-emitter support end-to-end
 // (a slow-drifting sphere-volume spawn, distinct color/physics/shape from slot 0, both active
-// simultaneously). Slots 2-3 start inactive, ready for further ImGui-driven experimentation.
+// simultaneously). Slot 2 starts inactive, ready for further ImGui-driven experimentation.
+//
+// Slot 3 is the rivers/waterfalls feature's own waterfall mist/foam emitter -- rides this same
+// multi-emitter array rather than a bespoke dispatch, using the same "Sphere volume drift" shape
+// (spawnShape == 1) as slot 1's Ambient Dust, tuned for a soft, near-weightless billow instead of a
+// hard fall (low gravityY, no bounce/friction, full wind drag) and a pale blue-white, short-lived,
+// fairly large soft sprite. Position MUST match river_spline.glsl's own kRiverControlXZ[3]/
+// kRiverControlHeight[3] (the waterfall base control point) -- kept here as a separate,
+// explicitly-documented mirror (same "keep in sync" convention as water_params.glsl's own
+// kWaterLevel vs. VulkanContext.cpp's identical literal) rather than plumbing the GLSL-side spline
+// data back into C++, since this is the only C++ call site that needs it. Y is roughly midway down
+// the P2->P3 drop (0.8 to -1.0), where the falling sheet breaks up into mist.
 inline EmitterConfig EMITTERS[kMaxEmitters] = {
     EmitterConfig{ /*active*/ true, /*position*/ 0.0f, 3.0f, 0.0f, /*spawnRate*/ 200.0f,
         /*color*/ 1.0f, 0.7f, 0.3f, 1.0f, /*size*/ 0.1f, 0.1f, /*lifetime*/ 2.0f, 4.0f,
@@ -467,7 +478,10 @@ inline EmitterConfig EMITTERS[kMaxEmitters] = {
         /*gravityY*/ -0.2f, /*bounce*/ 0.0f, /*friction*/ 0.0f, /*drag*/ 1.0f,
         /*spawnShape*/ 1u, /*shapeParam0*/ 1.5f },
     EmitterConfig{},
-    EmitterConfig{},
+    EmitterConfig{ /*active*/ true, /*position*/ 12.0f, -0.6f, 12.0f, /*spawnRate*/ 60.0f,
+        /*color*/ 0.85f, 0.92f, 1.0f, 0.65f, /*size*/ 0.18f, 0.40f, /*lifetime*/ 0.8f, 1.7f,
+        /*gravityY*/ -0.1f, /*bounce*/ 0.0f, /*friction*/ 0.0f, /*drag*/ 1.0f,
+        /*spawnShape*/ 1u, /*shapeParam0*/ 1.2f },
 };
 
 inline float SOFT_FADE_DISTANCE = 0.5f; // World units -- see ParticleRender.frag's own softFade comment.

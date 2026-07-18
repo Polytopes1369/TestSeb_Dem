@@ -221,6 +221,26 @@ struct ChamferBoxParams {
   float worldOffsetZ;
 };
 
+// Rivers/waterfalls feature: geom_river.comp's own Params UBO -- deliberately NOT byte-identical
+// to PlaneParams (unlike GenerateTerrain's reuse of it): this shape has no width/length/
+// worldOffsetX/Z of its own (the path lives entirely in river_spline.glsl, shared by both this
+// dispatch and terrain_noise.glsl's channel carve -- see that file's own header comment), only a
+// generation-grid resolution and the ribbon half-width. Must match geom_river.comp's own Params
+// block exactly (std140).
+struct RiverParams {
+  uint32_t segmentsAlong;
+  uint32_t segmentsAcross;
+  float halfWidth;
+  float _padUnused;
+  uint32_t meshID;
+  float materialID;
+  uint32_t vertexOffset;
+  uint32_t indexOffset;
+  float worldOffsetX;
+  float worldOffsetY;
+  float worldOffsetZ;
+};
+
 // CPU mirror of the GLSL EntityTransform struct (struct_custo.glsl): must match
 // its std430 layout exactly (mat4 = 64 bytes, vec3 + pad = 16 bytes, vec3 + pad = 16 bytes) since
 // it is memcpy'd wholesale into m_EntityTransformBuffer every frame.
@@ -1369,6 +1389,7 @@ void VulkanContext::CreatePipelinesAndDescriptors() {
       {"shaders/geom_TorusKnot.comp.spv", &m_TorusKnotPipeline},
       {"shaders/geom_chamferBox.comp.spv", &m_ChamferBoxPipeline},
       {"shaders/geom_terrain.comp.spv", &m_TerrainPipeline},
+      {"shaders/geom_river.comp.spv", &m_RiverPipeline},
       {"shaders/autosmooth.comp.spv", &m_AutosmoothPipeline},
   };
   for (const auto &desc : simplePrimitives) {
@@ -2260,6 +2281,38 @@ void VulkanContext::GenerateWaterPlane(
   runningIndexOffset += 6u * (params.widthSegments - 1u) * (params.lengthSegments - 1u);
 }
 
+void VulkanContext::GenerateRiver(
+    uint32_t meshID, uint32_t segmentsAlong, uint32_t segmentsAcross,
+    uint32_t& runningVertexOffset, uint32_t& runningIndexOffset) {
+  assert(segmentsAlong >= 2u);
+  assert(segmentsAcross >= 2u);
+
+  RiverParams params{};
+  params.segmentsAlong = segmentsAlong;
+  params.segmentsAcross = segmentsAcross;
+  // Must match river_spline.glsl's own kRiverHalfWidth exactly -- passed through explicitly (see
+  // this struct's own comment) rather than re-derived here.
+  params.halfWidth = 2.2f;
+  params.meshID = meshID;
+  params.materialID = 0.0f; // See GenerateTerrain()'s own identical comment on this field.
+  params.vertexOffset = runningVertexOffset;
+  params.indexOffset = runningIndexOffset;
+  params.worldOffsetX = 0.0f; // river_spline.glsl's control points are already world-space.
+  params.worldOffsetY = 0.0f;
+  params.worldOffsetZ = 0.0f;
+
+  uint32_t totalVerts = segmentsAlong * segmentsAcross;
+  constexpr uint32_t kLocalSizeXY = 8u; // geom_river.comp local_size = (8, 8, 1)
+  uint32_t groupCountX = (segmentsAlong + kLocalSizeXY - 1u) / kLocalSizeXY;
+  uint32_t groupCountY = (segmentsAcross + kLocalSizeXY - 1u) / kLocalSizeXY;
+
+  DispatchGeometryCompute(m_RiverPipeline, m_ComputePipelineLayout, &params,
+                          sizeof(params), nullptr, 0, groupCountX, groupCountY, 1);
+
+  runningVertexOffset += totalVerts;
+  runningIndexOffset += 6u * (segmentsAlong - 1u) * (segmentsAcross - 1u);
+}
+
 void VulkanContext::GenerateCapsule(
     float Radius, float Height,
     uint32_t meshID, maths::vec2 slot,
@@ -2645,6 +2698,19 @@ void VulkanContext::GenerateGeometry() {
   // shader work on pixels the terrain always occludes). 2x2 segments (a single quad): wave
   // perturbation is per-fragment (WaterForward.frag), not per-vertex, so more segments would add
   // nothing -- see GenerateWaterPlane()'s own comment.
+  //
+  // Rivers/waterfalls feature: immediately CHAINS a second dispatch (GenerateRiver(), geom_river.
+  // comp) onto this SAME meshID/entity, continuing runningVertexOffset/runningIndexOffset exactly
+  // like the earlier BOX block's own 6 chained per-face dispatches -- the flowing-water ribbon
+  // (river course + one waterfall segment, path authored once in river_spline.glsl) becomes part
+  // of the SAME Fallback Mesh / EntityDrawRange / renderer::WaterForwardPass draw call as the flat
+  // lake plane, needing no new renderer::EntityData slot, no ClusterRenderPipeline wiring, and no
+  // new MaterialParameterTable entry -- see geom_river.comp's own header comment for the full
+  // reasoning. 96x10 segments: long enough along the ~55-world-unit path (see river_spline.glsl's
+  // own kRiverControlXZ) to resolve the sharp waterfall segment without the QEM-simplified
+  // Fallback Mesh (geometry::BuildFallbackMesh, error-driven, not a fixed decimation ratio --
+  // see that header's own comment) collapsing it away entirely, and wide enough across (10) for
+  // the ribbon's own lateral wave/normal detail.
   // -------------------------------------------------------------------------
   {
     maths::vec2 slot = {0.0f, 0.0f}; // centered at the world origin, same as the terrain itself
@@ -2652,6 +2718,7 @@ void VulkanContext::GenerateGeometry() {
     constexpr float kWaterLevel = -1.0f; // Mirrors water_params.glsl's kWaterLevel -- keep in sync.
     GenerateWaterPlane(kWaterPlaneSpan, kWaterPlaneSpan, 2u, 2u, m_EntityData[kWaterEntityIndex].meshID, slot,
                        kWaterLevel, runningVertexOffset, runningIndexOffset);
+    GenerateRiver(m_EntityData[kWaterEntityIndex].meshID, 96u, 10u, runningVertexOffset, runningIndexOffset);
   }
 
   // -------------------------------------------------------------------------
@@ -3415,7 +3482,7 @@ void VulkanContext::Shutdown() {
        {m_ConePipeline, m_IcospherePipeline, m_PlanePipeline, m_SpherePipeline,
         m_TorusPipeline, m_TubePipeline, m_CapsulePipeline, m_CylinderPipeline,
         m_PyramidPipeline, m_TorusKnotPipeline, m_ChamferBoxPipeline,
-        m_TerrainPipeline, m_AutosmoothPipeline}) {
+        m_TerrainPipeline, m_RiverPipeline, m_AutosmoothPipeline}) {
     if (pipeline != VK_NULL_HANDLE) {
       vkDestroyPipeline(m_Device, pipeline, nullptr);
     }
