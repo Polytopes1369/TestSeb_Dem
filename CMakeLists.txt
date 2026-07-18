@@ -335,6 +335,18 @@ add_executable(PcgBooleanSetOpsTests
 target_include_directories(PcgBooleanSetOpsTests PRIVATE src ${Vulkan_INCLUDE_DIRS})
 add_test(NAME PcgBooleanSetOpsTests COMMAND PcgBooleanSetOpsTests)
 
+# PCG framework roadmap, Phase 3.1 ("Density Filter, Transform Filter, Attribute Noise/Remap"):
+# src/pcg/PcgDensityTransformFilter.cpp is the real implementation under test (density
+# keep/remap, per-point-seed transform jitter, coherent value-noise density modulation); it
+# depends only on the header-only Phase 1 PCG data-model types (PcgPointData.h/PcgSeededRandom.h),
+# so this target links no other project source beyond that .cpp and the test file itself.
+add_executable(PcgDensityTransformFilterTests
+    src/pcg/PcgDensityTransformFilter.cpp
+    tests/PcgDensityTransformFilterTests.cpp
+)
+target_include_directories(PcgDensityTransformFilterTests PRIVATE src ${Vulkan_INCLUDE_DIRS})
+add_test(NAME PcgDensityTransformFilterTests COMMAND PcgDensityTransformFilterTests)
+
 add_executable(AsyncDecompressingLoaderTests
     src/io/AsyncFileStreamer.cpp
     src/io/BlockCodec.cpp
