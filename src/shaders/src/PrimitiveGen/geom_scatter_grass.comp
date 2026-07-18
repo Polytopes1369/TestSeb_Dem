@@ -1,0 +1,94 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+
+// Vegetation scatter (UE5.8 rendering-parity gap G2), grass archetype generator. Bakes ONE small
+// "grass tuft" base mesh (a fan of crossed, tapered billboard-style cards) once at
+// renderer::VegetationScatterPass::Init into the pass' own dedicated vertex/index buffers -- NOT the
+// shared Nanite geometry SSBO, so this mesh never enters the cluster DAG (the whole point of G2:
+// grass is instanced thousands of times, it must not cost one Nanite entity per blade). Follows the
+// exact style/convention of geom_box.comp / geom_terrain.comp (write the standard struct_custo.glsl
+// Vertex, global indices = vertexOffset + local), the cheap-cross-quad-card technique of
+// geom_tree_leaves.comp, and this project's zero-texture rule (a card is a shape, colored/lit at
+// draw time -- no alpha texture).
+//
+// One invocation per card. Each card is a tapered quad standing on the local XZ origin, growing up
+// +Y, rotated around +Y so the cards fan out and cross each other (reads as a rounded tuft from any
+// angle). A gentle forward bend + per-card length jitter (hashed) breaks the "cloned card" look.
+// Winding is irrelevant: the draw pipeline uses VK_CULL_MODE_NONE (cards are viewed from both sides).
+
+#include "include/struct_custo.glsl"
+#include "include/math_utils.glsl"          // PI
+#include "include/VegetationCommon.glsl"    // VegHash*
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) writeonly buffer VertexBuffer { Vertex vertices[]; };
+layout(std430, binding = 1) writeonly buffer IndexBuffer  { uint indices[]; };
+
+layout(push_constant) uniform Params {
+    uint  bladeCount;      // Number of crossed cards in the tuft.
+    float bladeHeight;     // Base card height, world units (per-card jittered below).
+    float bladeHalfWidth;  // Base card half-width at the ground, world units.
+    float bendAmount;      // Forward lean of the card top, world units.
+    uint  seed;            // Deterministic per-card jitter seed.
+    uint  meshID;
+    float materialID;
+    uint  vertexOffset;    // Base offset of the grass archetype's region in the shared vertex buffer.
+    uint  indexOffset;     // Base offset of the grass archetype's region in the shared index buffer.
+} pc;
+
+void main() {
+    uint card = gl_GlobalInvocationID.x;
+    if (card >= pc.bladeCount) {
+        return;
+    }
+
+    // Deterministic per-card variation.
+    uint h = VegHashCombine(pc.seed, card);
+    float jitterLen = 0.75 + VegHashToUnitFloat(h) * 0.5;                       // [0.75, 1.25]
+    float jitterBend = (VegHashToUnitFloat(VegHashU(h)) * 2.0 - 1.0);           // [-1, 1]
+    // Even angular fan across a half turn (cards are double-sided, so a half turn already covers all
+    // viewing directions), plus a small hashed angular wobble.
+    float baseAngle = (float(card) + 0.5) / float(pc.bladeCount) * PI;
+    float angleWobble = (VegHashToUnitFloat(VegHashU(h ^ 0x55u)) * 2.0 - 1.0) * 0.25;
+    float angle = baseAngle + angleWobble;
+
+    // In-plane horizontal direction of this card (its "width" axis).
+    vec3 right = vec3(cos(angle), 0.0, sin(angle));
+    // The card's flat-face normal (perpendicular to the card plane, in the horizontal plane).
+    vec3 faceNormal = vec3(-sin(angle), 0.0, cos(angle));
+    // Grass reads as lit mostly from the sky/sun overhead: bias the shading normal strongly upward
+    // so a tuft doesn't flicker dark as the camera crosses the card's edge-on silhouette.
+    vec3 shadingNormal = normalize(faceNormal * 0.35 + vec3(0.0, 1.0, 0.0));
+
+    float height = pc.bladeHeight * jitterLen;
+    float halfWTop = pc.bladeHalfWidth * 0.15;   // Taper toward a near-point tip.
+    vec3 bend = vec3(cos(angle + 1.5708), 0.0, sin(angle + 1.5708)) * pc.bendAmount * jitterBend;
+
+    // 4 vertices: two at the ground (full width), two at the tip (tapered + bent).
+    vec3 p0 = -right * pc.bladeHalfWidth;                          // bottom "left"
+    vec3 p1 =  right * pc.bladeHalfWidth;                          // bottom "right"
+    vec3 p2 =  right * halfWTop + vec3(0.0, height, 0.0) + bend;   // top "right"
+    vec3 p3 = -right * halfWTop + vec3(0.0, height, 0.0) + bend;   // top "left"
+
+    vec3 offset = vec3(0.0); // Base mesh lives at the local origin; instancing places it in the world.
+
+    uint vBase = pc.vertexOffset + card * 4u;
+    Vertex v;
+    v.meshID = pc.meshID;
+    v.materialID = pc.materialID;
+    v.normal = shadingNormal;
+
+    v.position = p0 + offset; v.uv = vec2(0.0, 0.0); v.uv2 = v.uv; vertices[vBase + 0u] = v;
+    v.position = p1 + offset; v.uv = vec2(1.0, 0.0); v.uv2 = v.uv; vertices[vBase + 1u] = v;
+    v.position = p2 + offset; v.uv = vec2(1.0, 1.0); v.uv2 = v.uv; vertices[vBase + 2u] = v;
+    v.position = p3 + offset; v.uv = vec2(0.0, 1.0); v.uv2 = v.uv; vertices[vBase + 3u] = v;
+
+    uint iBase = pc.indexOffset + card * 6u;
+    indices[iBase + 0u] = vBase + 0u;
+    indices[iBase + 1u] = vBase + 1u;
+    indices[iBase + 2u] = vBase + 2u;
+    indices[iBase + 3u] = vBase + 0u;
+    indices[iBase + 4u] = vBase + 2u;
+    indices[iBase + 5u] = vBase + 3u;
+}

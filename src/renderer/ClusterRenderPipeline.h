@@ -132,6 +132,7 @@
 #include "renderer/passes/TessellationPass.h"
 #include "renderer/passes/WaterForwardPass.h"
 #include "renderer/passes/ParticleSystemPass.h"
+#include "renderer/passes/VegetationScatterPass.h"
 #include "renderer/passes/HZBPass.h"
 #include "renderer/LightingTypes.h"
 #include "renderer/passes/ProceduralMaskGenerator.h"
@@ -353,6 +354,18 @@ namespace renderer {
         // Debug-only GetLastAliveCountApprox() readout) -- same "borrow a const ref" convention as
         // GetAtmosClimate() above.
         const ParticleSystemPass& GetParticleSystem() const { return m_ParticleSystem; }
+
+        // Exposes the vegetation scatter pass for main.cpp's own Debug "Vegetation" ImGui tab
+        // (instance-count readout) -- same "borrow a const ref" convention as GetParticleSystem().
+        const VegetationScatterPass& GetVegetationScatter() const { return m_VegetationScatter; }
+
+#ifndef NDEBUG
+        // Debug-only: re-runs the vegetation scatter generator from the current config::vegetation::
+        // density/region/seed knobs. Waits for the device to go idle first (the generation is a
+        // blocking one-shot submit on the graphics queue, so no in-flight frame may still reference
+        // the instance buffer) -- backs the Debug "Vegetation" tab's Regenerate button.
+        void RegenerateVegetationScatter();
+#endif
 
 #ifndef NDEBUG
         // SWRT/HWRT back-end toggle shared by m_GIInject and m_WorldProbes' own trace pass (0 = SWRT
@@ -712,6 +725,16 @@ namespace renderer {
         // Always initialized (not Debug-only), same build-separation rule as m_TransparentForward
         // above.
         ParticleSystemPass m_ParticleSystem;
+
+        // GPU-instanced procedural vegetation scatter (UE5.8 rendering-parity gap G2): grass/shrub/
+        // rock instances scattered across the terrain -- see renderer::VegetationScatterPass's own
+        // class comment for why this follows the particle-system instancing template rather than the
+        // per-entity Nanite pattern the just-merged ProceduralTreePass uses. RecordCull/RecordDraw run
+        // in RecordFrameLate's [13c] forward block, right after m_Tessellation (both are opaque,
+        // depth-writing forward passes) and before m_TransparentForward, so glass depth-tests against
+        // the scatter and water snapshots a frame that includes it. Always initialized (not Debug-
+        // only), same build-separation rule as m_ParticleSystem above.
+        VegetationScatterPass m_VegetationScatter;
         // Subtask 6: this pass' own frame-to-frame delta-time tracking, computed independently from
         // RecordFrameLate's own `deltaTimeSeconds` (that one isn't computed yet by the time
         // RecordFrameEarly reaches m_ParticleSystem.RecordSimulate() -- see that call site's own

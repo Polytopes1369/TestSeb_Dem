@@ -777,6 +777,19 @@ bool ClusterRenderPipeline::Init(
     return false;
   }
 
+  // GPU-instanced procedural vegetation scatter (UE5.8 rendering-parity gap G2) -- grass/shrub/rock
+  // instances across the terrain. Depends on m_VirtualShadowMap + m_WorldProbes (forward lighting,
+  // both Init'd just above) and m_HZB (per-instance occlusion cull, Init'd far earlier). Draws onto
+  // the SAME m_GIComposite output color + real depth buffer every other forward pass targets. The
+  // scatter itself is generated (bake-time) inside this Init(), like ProceduralTreePass.
+  if (!m_VegetationScatter.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
+                                m_VirtualShadowMap, m_WorldProbes,
+                                m_HZB.GetFullView(), m_HZB.GetMipExtent(0), m_HZB.GetMipLevelCount(),
+                                GICompositePass::kOutputFormat, createInfo.depthFormat)) {
+    LOG_ERROR("[ClusterRenderPipeline] Failed to initialize VegetationScatterPass.");
+    return false;
+  }
+
   // Screen Trace GI -- linear screen-space depth raymarching falling back to the World Probe grid.
   m_ScreenTrace.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
                      createInfo.renderExtent, m_Resolve.GetOutputDepthView(), m_Resolve.GetOutputNormalView(),
@@ -1076,6 +1089,7 @@ void ClusterRenderPipeline::Shutdown() {
   m_Tessellation.Shutdown();
   m_WaterForward.Shutdown();
   m_ParticleSystem.Shutdown();
+  m_VegetationScatter.Shutdown();
   m_TransparentForward.Shutdown();
   m_ShadingBin.Shutdown();
   m_Resolve.Shutdown();
@@ -1101,6 +1115,20 @@ void ClusterRenderPipeline::Shutdown() {
   m_RenderExtent = {0, 0};
   m_Device = VK_NULL_HANDLE;
 }
+
+#ifndef NDEBUG
+void ClusterRenderPipeline::RegenerateVegetationScatter() {
+  // The scatter generator is a blocking one-shot submit on the graphics queue; no in-flight frame
+  // may still reference the instance buffer while it is being overwritten. A full device idle is the
+  // simplest guaranteed-safe fence here (Debug-only, invoked from the ImGui "Vegetation" tab -- a
+  // one-off stall on a manual button press is acceptable, matching the profile-reload path's own
+  // vkDeviceWaitIdle convention).
+  if (m_Device != VK_NULL_HANDLE) {
+    vkDeviceWaitIdle(m_Device);
+    m_VegetationScatter.GenerateScatter();
+  }
+}
+#endif
 
 #ifndef NDEBUG
 // Index->buffer table for the ImGui "Buffer Viewer" dropdown (config::debugview::
@@ -2497,6 +2525,26 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
     m_Tessellation.RecordDraw(cmdLate, viewProj, cameraFrameInfo.position,
         transparentTargetImage, transparentTargetView, m_DepthImage, m_DepthImageView,
         m_RenderExtent, traceMode, m_FrameIndex, m_TraceContext, m_WorldProbes, m_SceneLights);
+
+    // GPU-instanced vegetation scatter (UE5.8 rendering-parity gap G2): recorded right after
+    // m_Tessellation (both are opaque, depth-WRITING forward passes leaving depth in READ_ONLY on
+    // exit) and BEFORE m_TransparentForward -- so glass depth-tests against the scatter and
+    // m_WaterForward (drawn last) snapshots a frame that includes it. The per-instance frustum/HZB
+    // cull runs first (compute, outside any rendering scope), against this frame's freshly-rebuilt
+    // HZB (the [13] Second HZB rebuild above), then the indirect instanced draw. Gated by the live
+    // master toggle + a nonzero scattered-instance count (a zero-instance scene skips both entirely).
+    if (config::vegetation::ENABLED && m_VegetationScatter.GetInstanceCount() > 0) {
+      m_VegetationScatter.RecordCull(cmdLate, viewProj, cameraFrameInfo.position,
+          config::vegetation::OCCLUSION_CULL_ENABLED);
+      bool vegetationWireframe = false;
+#ifndef NDEBUG
+      vegetationWireframe = config::vegetation::WIREFRAME;
+#endif
+      m_VegetationScatter.RecordDraw(cmdLate, transparentTargetImage, transparentTargetView,
+          m_DepthImage, m_DepthImageView, m_RenderExtent, viewProj, cameraFrameInfo.position,
+          m_SceneLights.sun.direction, m_SceneLights.sun.color, m_SceneLights.sun.intensity,
+          vegetationWireframe);
+    }
 
     m_TransparentForward.RecordDraw(cmdLate, transparentTargetImage, transparentTargetView, m_DepthImageView,
         m_RenderExtent, cameraCopy.view, cameraCopy.proj, m_Decompression.GetDecompressedIndexPoolBuffer(),
