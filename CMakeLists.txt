@@ -508,6 +508,7 @@ add_executable(PcgGpuNodeExecutorTests
     src/renderer/vulkan/VmaUsage.cpp
     src/renderer/vulkan/VulkanUtils.cpp
     src/renderer/vulkan/VulkanPipeline.cpp
+    src/core/ResourcePath.cpp
     src/core/Logger.cpp
     tests/PcgGpuTestUtils.cpp
     tests/PcgGpuNodeExecutorTests.cpp
@@ -550,6 +551,7 @@ add_executable(VirtualTextureTests
     src/renderer/vulkan/VmaUsage.cpp
     src/renderer/vulkan/VulkanUtils.cpp
     src/renderer/vulkan/VulkanPipeline.cpp
+    src/core/ResourcePath.cpp
     src/core/Logger.cpp
     tests/VirtualTextureTests.cpp
 )
@@ -566,6 +568,7 @@ add_executable(VirtualTextureRenderPassTests
     src/renderer/vulkan/VmaUsage.cpp
     src/renderer/vulkan/VulkanUtils.cpp
     src/renderer/vulkan/VulkanPipeline.cpp
+    src/core/ResourcePath.cpp
     src/core/Logger.cpp
     tests/VirtualTextureRenderPassTests.cpp
 )

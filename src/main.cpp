@@ -7,6 +7,7 @@
 #include "core/Camera.h"
 #include "core/EntityData.h"
 #include "core/EngineConfig.h"
+#include "core/ResourcePath.h"
 #include "geometry/VirtualGeometryCacheTest.h"
 #include "world/StreamingManager.h"
 #include "world/CellManifest.h"
@@ -612,7 +613,7 @@ int main(int argc, char** argv) {
     pipelineInfo.depthImage = vkContext.GetDepthImage();
     pipelineInfo.depthImageView = vkContext.GetDepthImageView();
     pipelineInfo.depthFormat = vkContext.GetDepthFormat();
-    pipelineInfo.cacheFilePath = "scene.cache";
+    pipelineInfo.cacheFilePath = core::ResolveExeRelativePath("scene.cache");
     pipelineInfo.entityTransformBuffer = vkContext.GetEntityTransformBuffer();
     pipelineInfo.entityDataBuffer = vkContext.GetEntityBuffer();
     pipelineInfo.materialTable = vkContext.GetMaterialTable();
@@ -852,7 +853,7 @@ int main(int argc, char** argv) {
     // gracefully disabled (the fixed showcase gallery still renders normally) rather than treated
     // as a fatal error, unlike scene.cache above: streaming is additive, not load-bearing. ---
     world::CellManifest cellManifest;
-    bool streamingEnabled = cellManifest.Load(world::kDefaultManifestPath);
+    bool streamingEnabled = cellManifest.Load(core::ResolveExeRelativePath(world::kDefaultManifestPath));
     if (streamingEnabled) {
         LOG_INFO(std::format("[Main] World Partition streaming ENABLED: {} authored cells (cellSize={:.1f}).",
                               cellManifest.RecordCount(), cellManifest.CellSize()));

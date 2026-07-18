@@ -1,13 +1,19 @@
 #include "renderer/vulkan/VulkanPipeline.h"
 #include "core/Logger.h"
+#include "core/ResourcePath.h"
+#include <filesystem>
 #include <format>
 #include <fstream>
 #include <stdexcept>
 
 std::vector<char> VulkanPipeline::ReadShaderFile(const std::string& path) {
-    std::ifstream file(path, std::ios::ate | std::ios::binary);
+    // Shader paths are baked-in relative literals (e.g. "shaders/geom_cone.comp.spv") resolved
+    // against the exe's own directory -- the process CWD depends on how DemoSceneVK.exe was
+    // launched and is not reliably the build/deploy directory the .spv files live next to.
+    const std::filesystem::path resolvedPath = core::ResolveExeRelativePath(path);
+    std::ifstream file(resolvedPath, std::ios::ate | std::ios::binary);
     if (!file.is_open()) {
-        throw std::runtime_error(std::format("VulkanPipeline: failed to open SPIR-V file: {}", path));
+        throw std::runtime_error(std::format("VulkanPipeline: failed to open SPIR-V file: {}", resolvedPath.string()));
     }
     const size_t fileSize = static_cast<size_t>(file.tellg());
     std::vector<char> buffer(fileSize);
