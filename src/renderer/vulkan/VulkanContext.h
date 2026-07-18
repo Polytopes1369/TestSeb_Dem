@@ -17,6 +17,7 @@
 // acyclic addition.
 #include "world/CellManifest.h"
 #include <array>
+#include <cassert>
 #include <optional>
 #include <string_view>
 #include <unordered_map>
@@ -231,6 +232,24 @@ public:
     // world_data/cellmanifest.bin was missing/unreadable at startup (every unit then falls back to
     // the pre-Phase-5 shared 4-archetype rotation, exactly as before this feature).
     uint32_t GetDedicatedStreamingUnitCount() const { return static_cast<uint32_t>(m_CellToStreamingUnit.size()); }
+
+    // Phase 0.2 (UE5.8-parity PCG roadmap, "PCG Instance Draw Path"): the real, already-baked
+    // meshID/materialID of streaming unit `unit`'s FINE (full-detail) archetype variant -- lets a
+    // caller (main.cpp's PcgInstanceDrawPass smoke test) point new PCG draw instances at already-
+    // resident geometry without needing this class's own private streaming-slot layout constants
+    // (StreamingUnitFineSlot/kStreamingSlotBase, both private -- see this class' own header comment
+    // on why every existing "iterate every entity" consumer instead goes through GetEntityData()/
+    // GetEntityCount()). `unit` must be < GetStreamingUnitCount(). Valid any time after Init() has
+    // run BuildEntityData() -- every streaming unit's fine-variant EntityData is authored there
+    // unconditionally, regardless of whether any world cell has actually claimed the unit yet (see
+    // SetStreamingUnitState()'s own comment: an idle unit still carries a real, valid meshID, only
+    // core::EntityFlags::StreamingInactive hides it from being drawn by the normal per-frame cut).
+    struct StreamingArchetypeMeshInfo { uint32_t meshID = 0; uint32_t materialID = 0; };
+    StreamingArchetypeMeshInfo GetStreamingArchetypeFineMeshInfo(uint32_t unit) const {
+        assert(unit < kStreamingUnitCount);
+        uint32_t fineIdx = StreamingUnitFineSlot(unit);
+        return { m_InstanceRegistry[fineIdx].meshID, m_InstanceRegistry[fineIdx].materialID };
+    }
 
 #ifndef NDEBUG
     // Phase 0.1 (UE5.8-parity PCG roadmap, "Dynamic Instance Registry"): CPU-only startup smoke test

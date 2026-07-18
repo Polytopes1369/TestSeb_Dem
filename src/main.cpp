@@ -526,6 +526,36 @@ int main(int argc, char** argv) {
         return -1;
     }
 
+#ifndef NDEBUG
+    // Phase 0.2 (UE5.8-parity PCG roadmap, "PCG Instance Draw Path"): proves renderer::
+    // PcgInstanceDrawPass's GPU-driven instanced-mesh draw path actually rasterizes real Nanite
+    // cluster geometry (not a billboard) end-to-end -- see ClusterRenderPipeline::
+    // RunPcgInstanceDrawSmokeTest's own comment for exactly what it checks. Reuses 3 already-
+    // resident World Partition streaming archetype meshes (Rock/Bush/Tree fine variants, units
+    // 0/1/2 -- unit % kStreamingArchetypeShapeCount selects the shape, see VulkanContext::
+    // GetStreamingArchetypeFineMeshInfo's own comment) as test content, since no real PCG spawner
+    // exists yet (Phase 4 is the real spawner). Not fatal on failure (logged only), matching the
+    // InstanceRegistry smoke test's own "no runtime caller depends on this yet" convention above.
+    {
+        std::vector<renderer::ClusterRenderPipeline::PcgSmokeTestInstanceDesc> pcgSmokeInstances;
+        static constexpr uint32_t kSmokeUnits[3] = { 0u, 1u, 2u }; // Rock, Bush, Tree (unit % 4 == archetype shape).
+        static constexpr float kSmokeOffsetsX[3] = { -3.0f, 0.0f, 3.0f };
+        for (uint32_t i = 0; i < 3u; ++i) {
+            VulkanContext::StreamingArchetypeMeshInfo meshInfo = vkContext.GetStreamingArchetypeFineMeshInfo(kSmokeUnits[i]);
+            renderer::ClusterRenderPipeline::PcgSmokeTestInstanceDesc desc{};
+            desc.meshID = meshInfo.meshID;
+            desc.materialID = meshInfo.materialID;
+            desc.position = maths::vec3(kSmokeOffsetsX[i], 0.0f, 0.0f);
+            desc.rotation = maths::quat();
+            desc.scale = maths::vec3(1.0f, 1.0f, 1.0f);
+            pcgSmokeInstances.push_back(desc);
+        }
+        if (!clusterPipeline.RunPcgInstanceDrawSmokeTest(pcgSmokeInstances, vkContext.GetCommandPool(), vkContext.GetGraphicsQueue())) {
+            LOG_ERROR("[Main] PcgInstanceDrawPass smoke test FAILED -- see log above for the specific check.");
+        }
+    }
+#endif
+
     // Frame-pacing fence, created signaled so the first frame's wait passes immediately. Replaces
     // the old per-frame vkDeviceWaitIdle: the CPU now only waits for the previous frame's own
     // submission (never for a full device drain) and there are zero mid-frame CPU waits -- the

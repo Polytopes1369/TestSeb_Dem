@@ -19,6 +19,7 @@
 #include "io/CacheFileManager.h"
 #include "renderer/MegaLightsTypes.h"
 #include "renderer/vulkan/GpuBuffer.h"
+#include "renderer/vulkan/GpuImage.h" // Phase 0.2: RunPcgInstanceDrawSmokeTest()'s own offscreen color/depth images.
 #include "renderer/vulkan/VulkanUtils.h"
 
 namespace renderer {
@@ -144,6 +145,15 @@ bool ClusterRenderPipeline::Init(
   LOG_INFO(
       std::format("[ClusterRenderPipeline] Cache tables read: {} clusters.",
                   totalClusterCount));
+
+#ifndef NDEBUG
+  // Phase 0.2 (UE5.8-parity PCG roadmap, "PCG Instance Draw Path"): retains a copy of the full
+  // index/DAG tables purely for RunPcgInstanceDrawSmokeTest()'s own CPU-side leaf-cluster scan --
+  // see m_DebugIndexEntriesCopy's own declaration comment (mirrors ClusterLODSelectionPass::
+  // m_DebugDagNodesCopy's identical precedent). Never read by any GPU-facing code below.
+  m_DebugIndexEntriesCopy = indexEntries;
+  m_DebugDagEntriesCopy = dagEntries;
+#endif
 
   // =========================================================================================
   // STEP 2 -- Streaming: read the whole geometry section into one host-visible
@@ -3020,5 +3030,280 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
   m_HasPrevViewProj = true;
   ++m_FrameIndex;
 }
+
+#ifndef NDEBUG
+bool ClusterRenderPipeline::RunPcgInstanceDrawSmokeTest(
+    const std::vector<PcgSmokeTestInstanceDesc>& instances, VkCommandPool commandPool, VkQueue queue) {
+  LOG_INFO("[ClusterRenderPipeline] Running PcgInstanceDrawPass smoke test...");
+
+  if (instances.empty()) {
+    LOG_ERROR("[ClusterRenderPipeline] PcgInstanceDrawPass smoke test FAILED: no instances supplied.");
+    return false;
+  }
+  if (m_DebugIndexEntriesCopy.empty() || m_DebugDagEntriesCopy.empty()) {
+    LOG_ERROR("[ClusterRenderPipeline] PcgInstanceDrawPass smoke test FAILED: no cached cluster/DAG "
+              "table (m_DebugIndexEntriesCopy empty -- was this called before Init() succeeded?).");
+    return false;
+  }
+
+  // --- Self-contained offscreen render target -- does not touch any live scene attachment or the
+  // real per-frame RecordFrame*() sequence. ---
+  constexpr uint32_t kTestWidth = 256;
+  constexpr uint32_t kTestHeight = 256;
+  constexpr VkFormat kTestColorFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
+  constexpr VkFormat kTestDepthFormat = VK_FORMAT_D32_SFLOAT;
+
+  GpuImage colorImage;
+  GpuImage depthImage;
+  {
+    VkImageCreateInfo colorInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    colorInfo.imageType = VK_IMAGE_TYPE_2D;
+    colorInfo.format = kTestColorFormat;
+    colorInfo.extent = {kTestWidth, kTestHeight, 1};
+    colorInfo.mipLevels = 1;
+    colorInfo.arrayLayers = 1;
+    colorInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+    colorInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+    colorInfo.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    colorInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    colorImage.Create(m_Allocator, m_Device, colorInfo, VMA_MEMORY_USAGE_GPU_ONLY, VK_IMAGE_ASPECT_COLOR_BIT);
+
+    VkImageCreateInfo depthInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    depthInfo.imageType = VK_IMAGE_TYPE_2D;
+    depthInfo.format = kTestDepthFormat;
+    depthInfo.extent = {kTestWidth, kTestHeight, 1};
+    depthInfo.mipLevels = 1;
+    depthInfo.arrayLayers = 1;
+    depthInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+    depthInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+    depthInfo.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+    depthInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    depthImage.Create(m_Allocator, m_Device, depthInfo, VMA_MEMORY_USAGE_GPU_ONLY, VK_IMAGE_ASPECT_DEPTH_BIT);
+  }
+
+  // --- Throwaway PcgInstanceDrawPass instance, borrowing this pipeline's already-resident
+  // geometry buffers (m_PagePool / m_Decompression) -- never a persistent member of this class. ---
+  PcgInstanceDrawPass pcgPass;
+  maths::vec3 sunDir = (m_BaseSunDirection.Length() > 0.0f) ? m_BaseSunDirection.Normalize() : maths::vec3(0.3f, 0.8f, 0.4f).Normalize();
+  pcgPass.Init(m_Device, m_Allocator, commandPool, queue,
+      m_PagePool.GetPhysicalPoolBuffer(), GenerateShowcaseMaterialTable(),
+      sunDir, maths::vec3(1.0f, 0.96f, 0.9f), 3.0f, maths::vec3(0.12f, 0.12f, 0.14f),
+      kTestColorFormat, kTestDepthFormat,
+      static_cast<uint32_t>(instances.size()), 256u);
+
+  maths::vec3 sceneCenter(0.0f, 0.0f, 0.0f);
+  for (const PcgSmokeTestInstanceDesc& desc : instances) {
+    sceneCenter = sceneCenter + desc.position;
+  }
+  sceneCenter = sceneCenter * (1.0f / static_cast<float>(instances.size()));
+
+  bool acquireFailed = false;
+  for (const PcgSmokeTestInstanceDesc& desc : instances) {
+    uint32_t slot = pcgPass.AcquireInstance(desc.meshID, desc.materialID, desc.position, desc.rotation, desc.scale);
+    if (slot == PcgInstanceDrawPass::kInvalidInstance) {
+      LOG_ERROR("[ClusterRenderPipeline] PcgInstanceDrawPass smoke test FAILED: AcquireInstance() returned kInvalidInstance.");
+      acquireFailed = true;
+    }
+  }
+  if (acquireFailed) {
+    pcgPass.Shutdown();
+    colorImage.Destroy();
+    depthImage.Destroy();
+    return false;
+  }
+
+  uint32_t candidateCount = pcgPass.UploadInstances(commandPool, queue, m_DebugIndexEntriesCopy, m_DebugDagEntriesCopy, m_PagePool);
+  if (candidateCount == 0) {
+    LOG_ERROR("[ClusterRenderPipeline] PcgInstanceDrawPass smoke test FAILED: UploadInstances() produced zero "
+              "candidate clusters (no supplied meshID had any matching leaf cluster in the cache tables).");
+    pcgPass.Shutdown();
+    colorImage.Destroy();
+    depthImage.Destroy();
+    return false;
+  }
+
+  // --- Camera framed to see every supplied instance from a fixed distance/angle. ---
+  maths::vec3 eye = sceneCenter + maths::vec3(0.0f, 4.0f, 12.0f);
+  maths::mat4 view = maths::mat4::LookAt(eye, sceneCenter, maths::vec3(0.0f, 1.0f, 0.0f));
+  maths::mat4 proj = maths::mat4::PerspectiveVulkan(60.0f * (3.14159265f / 180.0f),
+      static_cast<float>(kTestWidth) / static_cast<float>(kTestHeight), 0.1f, 100.0f);
+  CameraPushConstants camera{};
+  camera.view = view;
+  camera.proj = proj;
+
+  maths::mat4 viewProj = proj * view;
+  ClusterCullViewParams cullViewParams{};
+  cullViewParams.frustumPlanes = ExtractFrustumPlanes(viewProj);
+  cullViewParams.cameraPositionWorld = eye;
+
+  GpuBuffer drawCountReadback;
+  drawCountReadback.Create(m_Allocator, sizeof(uint32_t), VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_CPU_ONLY, /*mapped=*/true);
+
+  VkDeviceSize colorBytes = static_cast<VkDeviceSize>(kTestWidth) * kTestHeight * 8; // RGBA16F = 8 bytes/pixel.
+  GpuBuffer colorReadback;
+  colorReadback.Create(m_Allocator, colorBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_CPU_ONLY, /*mapped=*/true);
+
+  VulkanUtils::ExecuteOneShotCommands(m_Device, commandPool, queue, [&](VkCommandBuffer cmd) {
+    VkImageMemoryBarrier2 toAttachment[2]{};
+    toAttachment[0] = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+    toAttachment[0].srcStageMask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
+    toAttachment[0].srcAccessMask = 0;
+    toAttachment[0].dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+    toAttachment[0].dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+    toAttachment[0].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    toAttachment[0].newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    toAttachment[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toAttachment[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toAttachment[0].image = colorImage.Image();
+    toAttachment[0].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+
+    toAttachment[1] = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+    toAttachment[1].srcStageMask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
+    toAttachment[1].srcAccessMask = 0;
+    toAttachment[1].dstStageMask = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
+    toAttachment[1].dstAccessMask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    toAttachment[1].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    toAttachment[1].newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    toAttachment[1].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toAttachment[1].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toAttachment[1].image = depthImage.Image();
+    toAttachment[1].subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+
+    VkDependencyInfo depInfo0{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    depInfo0.imageMemoryBarrierCount = 2;
+    depInfo0.pImageMemoryBarriers = toAttachment;
+    vkCmdPipelineBarrier2(cmd, &depInfo0);
+
+    // GPU frustum/backface cull + atomic compaction (renderer::ClusterCullingPass, composed inside
+    // pcgPass) -- recorded BEFORE vkCmdBeginRendering, matching every other cull-then-raster
+    // sequence in this codebase. Its own trailing barrier already makes the indirect-command/
+    // draw-count buffers visible to VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT for RecordDraw() below.
+    pcgPass.RecordClear(cmd);
+    pcgPass.RecordCull(cmd, cullViewParams);
+
+    VkRenderingAttachmentInfo colorAttachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    colorAttachment.imageView = colorImage.View();
+    colorAttachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    colorAttachment.clearValue.color = {{0.02f, 0.02f, 0.03f, 1.0f}};
+
+    VkRenderingAttachmentInfo depthAttachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    depthAttachment.imageView = depthImage.View();
+    depthAttachment.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    depthAttachment.clearValue.depthStencil = {0.0f, 0}; // Reversed-Z: far/clear = 0.0.
+
+    VkRenderingInfo renderingInfo{VK_STRUCTURE_TYPE_RENDERING_INFO};
+    renderingInfo.renderArea = {{0, 0}, {kTestWidth, kTestHeight}};
+    renderingInfo.layerCount = 1;
+    renderingInfo.colorAttachmentCount = 1;
+    renderingInfo.pColorAttachments = &colorAttachment;
+    renderingInfo.pDepthAttachment = &depthAttachment;
+
+    vkCmdBeginRendering(cmd, &renderingInfo);
+    pcgPass.RecordDraw(cmd, camera, {kTestWidth, kTestHeight}, m_Decompression.GetDecompressedIndexPoolBuffer());
+    vkCmdEndRendering(cmd);
+
+    VkImageMemoryBarrier2 toTransfer{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+    toTransfer.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+    toTransfer.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+    toTransfer.dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+    toTransfer.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+    toTransfer.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    toTransfer.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    toTransfer.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toTransfer.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toTransfer.image = colorImage.Image();
+    toTransfer.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    VkDependencyInfo depInfo1{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    depInfo1.imageMemoryBarrierCount = 1;
+    depInfo1.pImageMemoryBarriers = &toTransfer;
+    vkCmdPipelineBarrier2(cmd, &depInfo1);
+
+    VkBufferImageCopy copyRegion{};
+    copyRegion.bufferOffset = 0;
+    copyRegion.bufferRowLength = 0;
+    copyRegion.bufferImageHeight = 0;
+    copyRegion.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    copyRegion.imageOffset = {0, 0, 0};
+    copyRegion.imageExtent = {kTestWidth, kTestHeight, 1};
+    vkCmdCopyImageToBuffer(cmd, colorImage.Image(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, colorReadback.Handle(), 1, &copyRegion);
+
+    VkBufferCopy drawCountCopy{0, 0, sizeof(uint32_t)};
+    vkCmdCopyBuffer(cmd, pcgPass.GetDrawCountBuffer(), drawCountReadback.Handle(), 1, &drawCountCopy);
+
+    VkMemoryBarrier2 finalBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    finalBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+    finalBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    finalBarrier.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT;
+    finalBarrier.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT;
+    VkDependencyInfo depInfo2{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    depInfo2.memoryBarrierCount = 1;
+    depInfo2.pMemoryBarriers = &finalBarrier;
+    vkCmdPipelineBarrier2(cmd, &depInfo2);
+  });
+
+  uint32_t gpuDrawCount = 0;
+  std::memcpy(&gpuDrawCount, drawCountReadback.MappedData(), sizeof(uint32_t));
+
+  // Minimal IEEE 754 binary16 -> float decode, sufficient for this "is this pixel above the
+  // background threshold" magnitude check (never used for anything precision-sensitive).
+  auto HalfToFloatApprox = [](uint16_t h) -> float {
+    uint32_t sign = static_cast<uint32_t>(h & 0x8000u) << 16;
+    uint32_t exponent = (h >> 10) & 0x1Fu;
+    uint32_t mantissa = h & 0x3FFu;
+    uint32_t bits;
+    if (exponent == 0) {
+      bits = sign;
+    } else if (exponent == 0x1Fu) {
+      bits = sign | 0x7F800000u | (mantissa << 13);
+    } else {
+      bits = sign | ((exponent - 15u + 127u) << 23) | (mantissa << 13);
+    }
+    float f;
+    std::memcpy(&f, &bits, sizeof(f));
+    return f;
+  };
+
+  bool foundNonBackgroundPixel = false;
+  const auto* pixels = static_cast<const uint16_t*>(colorReadback.MappedData()); // RGBA16F, 4x uint16 per pixel.
+  constexpr float kBackgroundThreshold = 0.04f; // Above the clear color's own ~0.02-0.03 channel values.
+  for (uint32_t sample = 0; sample < kTestWidth * kTestHeight && !foundNonBackgroundPixel; ++sample) {
+    float r = HalfToFloatApprox(pixels[sample * 4 + 0]);
+    float g = HalfToFloatApprox(pixels[sample * 4 + 1]);
+    float b = HalfToFloatApprox(pixels[sample * 4 + 2]);
+    if (r > kBackgroundThreshold || g > kBackgroundThreshold || b > kBackgroundThreshold) {
+      foundNonBackgroundPixel = true;
+    }
+  }
+
+  drawCountReadback.Destroy();
+  colorReadback.Destroy();
+  pcgPass.Shutdown();
+  colorImage.Destroy();
+  depthImage.Destroy();
+
+  if (gpuDrawCount == 0) {
+    LOG_ERROR("[ClusterRenderPipeline] PcgInstanceDrawPass smoke test FAILED: GPU-computed draw "
+              "count (renderer::ClusterCullingPass's own atomic counter) is 0 -- every candidate "
+              "cluster was culled (frustum/backface) despite the camera being framed to see them.");
+    return false;
+  }
+  if (!foundNonBackgroundPixel) {
+    LOG_ERROR("[ClusterRenderPipeline] PcgInstanceDrawPass smoke test FAILED: the rendered offscreen "
+              "image contains no pixel above the background threshold -- clusters survived culling "
+              "(draw count > 0) but nothing visibly rasterized.");
+    return false;
+  }
+
+  LOG_INFO(std::format(
+      "[ClusterRenderPipeline] PcgInstanceDrawPass smoke test PASSED: {} instance(s), {} candidate "
+      "cluster(s), GPU draw count={}, non-background pixel(s) found in the {}x{} offscreen render.",
+      instances.size(), candidateCount, gpuDrawCount, kTestWidth, kTestHeight));
+  return true;
+}
+#endif
 
 } // namespace renderer
