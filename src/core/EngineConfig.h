@@ -368,6 +368,16 @@ inline bool LOCAL_FOG_VOLUME_BOUNDS_VIZ = false;
 // this never contributes any GPU work in a Release build -- same convention as
 // LOCAL_FOG_VOLUME_BOUNDS_VIZ just above.
 inline bool PCG_POINT_CLOUD_VIZ = false;
+#ifndef NDEBUG
+// UE5.8 rendering-parity gap G10b (ImGui "Path Tracer" tab, main.cpp) -- when true, renderer::
+// ClusterRenderPipeline runs its reference offline Path Tracer (renderer::PathTracerPass) and blits
+// its progressively-accumulated, tonemapped result to the swapchain in place of the real-time
+// Lumen/MegaLights composite, as a ground-truth validation view (exactly what UE5.8's own Path
+// Tracer render mode is for). Wrapped in #ifndef NDEBUG (a "mode de visualisation", CLAUDE.md rule
+// 8 -- same strict Release-exclusion convention as config::vegetation::WIREFRAME): read ONLY inside
+// #ifndef NDEBUG blocks, so it contributes zero code/symbols to a Release build.
+inline bool PATH_TRACER_ENABLED = false;
+#endif
 } // namespace debugview
 
 namespace volumetrics {

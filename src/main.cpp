@@ -1251,6 +1251,25 @@ int main(int argc, char** argv) {
                 ImGui::EndTabItem();
             }
 
+            // --- Tab Path Tracer (UE5.8 rendering-parity gap G10b) -- DEBUG-only reference/ground-
+            // truth offline path tracer, to validate the real-time Lumen view against. The whole
+            // Engine Configuration Panel is already inside #ifndef NDEBUG, so this tab (and the
+            // config::debugview::PATH_TRACER_ENABLED toggle, itself #ifndef NDEBUG) never exists in
+            // a Release build. ---
+            if (ImGui::BeginTabItem("Path Tracer")) {
+                ImGui::Checkbox("Reference Path Tracer (bypass Lumen/MegaLights)", &config::debugview::PATH_TRACER_ENABLED);
+                ImGui::TextWrapped("Unbiased offline reference: full Substrate BSDF + NEE, multi-bounce, "
+                    "progressively accumulated while the camera is stationary (accumulation resets on "
+                    "camera movement). Ground-truth comparison against the real-time Lumen view.");
+                ImGui::Separator();
+                if (config::debugview::PATH_TRACER_ENABLED) {
+                    ImGui::Text("Accumulated samples: %u", clusterPipeline.GetPathTracerSampleCount());
+                } else {
+                    ImGui::TextDisabled("Enable to start accumulating a reference image.");
+                }
+                ImGui::EndTabItem();
+            }
+
             // --- Tab Volumetric ---
             if (ImGui::BeginTabItem("Volumetric")) {
                 int skyQual = static_cast<int>(config::volumetrics::_SKY_ATMOSPHERE_QUALITY);

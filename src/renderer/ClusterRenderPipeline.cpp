@@ -668,6 +668,24 @@ bool ClusterRenderPipeline::Init(
     }
   }
 
+#ifndef NDEBUG
+  // UE5.8 rendering-parity gap G10b: reference Path Tracer (DEBUG-only, CLAUDE.md rule 8). Init'd
+  // after m_SurfaceCacheRT/m_Resolve/m_MegaLights so it can bind their already-built resources
+  // unmodified: the SAME scene TLAS + Fallback Mesh geometry (m_SurfaceCacheRT), the material-table
+  // SSBO (m_Resolve.GetMaterialParamsBuffer()), and the point-light SSBO (m_MegaLights). Its own
+  // per-traced-entity materialID buffer is built from createInfo.entityDataCPU. Failure here is
+  // logged but non-fatal -- the reference view simply stays unavailable, the real-time pipeline is
+  // unaffected.
+  if (!m_PathTracer.Init(createInfo.physicalDevice, createInfo.device, createInfo.allocator,
+                         createInfo.commandPool, createInfo.queue, createInfo.renderExtent,
+                         m_TraceContext, m_SurfaceCache, m_SurfaceCacheRT,
+                         createInfo.entityDataCPU,
+                         m_Resolve.GetMaterialParamsBuffer(), VK_WHOLE_SIZE,
+                         m_MegaLights.GetLightBufferHandle(), m_MegaLights.GetLightBufferSize())) {
+    LOG_ERROR("[ClusterRenderPipeline] Failed to initialize PathTracerPass (reference path tracer unavailable).");
+  }
+#endif
+
   // Atmos weather system, Subtask 3: Froxel Volumetric Fog -- needs m_AtmosClimate (AtmosGlobalsUBO),
   // m_MegaLights (light SSBO), and m_VirtualShadowMap (shadow atlas/page-table/feedback/sun-levels),
   // all already Init'd above.
@@ -1272,6 +1290,7 @@ void ClusterRenderPipeline::Shutdown() {
   m_DebugBufferView.Shutdown();
   m_ParticleDebugView.Shutdown();
   m_PcgPointCloudDebugView.Shutdown();
+  m_PathTracer.Shutdown(); // UE5.8 gap G10b reference Path Tracer (Debug-only).
 #endif
   m_AtmosClouds.Shutdown();
   m_AtmosFog.Shutdown();
@@ -3301,6 +3320,27 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
   }
 #endif
 
+#ifndef NDEBUG
+  // =========================================================================================
+  // [13z] UE5.8 rendering-parity gap G10b: reference Path Tracer (DEBUG-only, CLAUDE.md rule 8).
+  // When enabled, trace + progressively-accumulate + resolve into m_PathTracer's own tonemapped
+  // display image, which the [14] blit below then routes to the swapchain in place of the normal
+  // composite. Recorded here, right before the blit: the scene TLAS + Fallback Mesh geometry +
+  // material/light SSBOs it binds were all made available for RT/compute reads by the GI passes
+  // ([12b2] Reflections / [12b3] MegaLights) earlier this same frame, and m_PathTracer::RecordFrame
+  // emits its own internal RT-write -> resolve-read barrier; the resolve dispatch's display-image
+  // write (COMPUTE_SHADER SHADER_STORAGE_WRITE) is then made visible to the blit by the SAME
+  // resolveToBlitBarrier below every other blit-source candidate already relies on. The whole
+  // real-time pipeline still runs this frame (its results are simply overwritten by the blit-source
+  // swap) -- deliberately kept simple for a Debug-only validation tool. cameraCopy.view is the
+  // jitter-free view matrix m_PathTracer uses for camera-movement accumulation reset; m_SceneLights.
+  // sun is this frame's seasonally-adjusted sun (see [1y]) so the reference matches the live sun.
+  if (config::debugview::PATH_TRACER_ENABLED) {
+      m_PathTracer.RecordFrame(cmdLate, m_FrameScratch.invViewProj, cameraCopy.view,
+          cameraPositionWorld, m_SceneLights.sun, m_FrameIndex);
+  }
+#endif
+
   // =========================================================================================
   // [14] Blit the final image (Phase PP1's m_PostProcess output in the normal view path -- itself
   // always sourced from m_TAATSR's own upscaled HDR output, see [13e] above -- or one of the
@@ -3344,6 +3384,12 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
   // dispatch itself already happened earlier at [13a.5], see that call site's own comment).
   if (config::debugview::SELECTED_BUFFER_INDEX != 0) {
       blitSourceImage = m_DebugBufferView.GetOutputImage();
+  }
+  // UE5.8 rendering-parity gap G10b: reference Path Tracer takes final priority when active -- its
+  // tonemapped display image (render-resolution RGBA8, recorded at [13z] above) replaces the whole
+  // real-time composite. Placed last so it wins over the Numpad debug views / Buffer Viewer above.
+  if (config::debugview::PATH_TRACER_ENABLED && m_PathTracer.GetDisplayImage() != VK_NULL_HANDLE) {
+      blitSourceImage = m_PathTracer.GetDisplayImage();
   }
 #endif
 
