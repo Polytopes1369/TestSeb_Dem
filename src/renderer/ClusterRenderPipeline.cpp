@@ -1532,6 +1532,10 @@ void ClusterRenderPipeline::RecordFrameEarly(VkCommandBuffer cmdEarly,
 
       float precipCenterWorld[3] = { cameraFrameInfo.position.x, cameraFrameInfo.position.y, cameraFrameInfo.position.z };
 
+      // Rivers/waterfalls feature: the waterfall mist/foam emitter is config::particles::EMITTERS[3]
+      // (see that array's own comment) -- it rides the SAME per-emitter particleEmitters/
+      // particleSpawnCounts arrays built by the loop above, needing no separate accumulator, position,
+      // or RecordSimulate parameter of its own.
       m_ParticleSystem.RecordSimulate(cmdEarly, m_GlobalSDF, particleDeltaTimeSeconds, globalTimeSeconds,
           particleEmitters, particleSpawnCounts,
           precipCenterWorld, precipSpawnCount, precipKind,

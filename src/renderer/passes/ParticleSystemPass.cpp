@@ -47,7 +47,7 @@ namespace renderer {
             uint32_t spawnCount = 0;
             uint32_t randomSeedBase = 0;
             uint32_t emitterIndex = 0; // Only meaningful when mode == 1 (spawn embers for this emitter slot).
-            int32_t mode = 0; // 0 = update, 1 = spawn embers, 2 = spawn precipitation.
+            int32_t mode = 0; // 0 = update, 1 = spawn embers (waterfall mist is EMITTERS[3], see RecordSimulate's own comment), 2 = spawn precipitation.
             // Precipitation feature (mode == 2 only) -- see ParticleSimulation.comp's own header comment.
             uint32_t precipSpawnCount = 0;
             uint32_t precipKind = 0; // kParticleKindRain or kParticleKindSnow (ParticleCommon.glsl).
@@ -693,7 +693,9 @@ namespace renderer {
         float precipRainFallSpeedMps, float precipSnowFallSpeedMps, float precipSnowWobbleStrength) {
         // Multi-emitter roadmap (subtask A1): this frame's (possibly ImGui-edited) per-emitter
         // parameters, uploaded wholesale -- every field is live-tunable, so a full re-upload every
-        // call is simplest and cheap (kMaxEmitters * 80 bytes == 320 bytes today).
+        // call is simplest and cheap (kMaxEmitters * 80 bytes == 320 bytes today). The waterfall mist
+        // (rivers/waterfalls feature) rides this same array as EMITTERS[3], see RecordSimulate's own
+        // header comment.
         vkCmdUpdateBuffer(cmd, m_EmitterParamsBuffer.Handle(), 0, sizeof(EmitterParams) * kMaxEmitters, emitters);
 
         // Reset aliveCount to 0 (offset 4) and set spawnQueue to the total ember spawn count
@@ -788,14 +790,14 @@ namespace renderer {
         }
 
         // Precipitation feature -- a second, independent spawn dispatch (mode == 2), against the SAME
-        // shared dead-list the embers spawn above just drew from (see ParticleSimulation.comp's own
-        // TryPopDeadListSlot comment for why this is the correct "share the pool, back off gracefully"
-        // behavior rather than a starvation risk). Deliberately its own dispatch, not folded into the
-        // mode == 1 one above: embers and precipitation have entirely different spawn-volume/initial-
-        // velocity logic (SpawnParticle vs SpawnPrecipitationParticle), and this codebase's own
-        // established "one shader, multiple modes via a push-constant int + branch in main()"
-        // convention (see this file's own header comment) keeps that branch at the dispatch level,
-        // not re-decided per-thread inside a single fused kernel.
+        // shared dead-list the per-emitter spawns above just drew from (see ParticleSimulation.comp's
+        // own TryPopDeadListSlot comment for why this is the correct "share the pool, back off
+        // gracefully" behavior rather than a starvation risk). Deliberately its own dispatch, not
+        // folded into the mode == 1 loop above: embers/mist and precipitation have entirely different
+        // spawn-volume/initial-velocity logic (SpawnParticle vs SpawnPrecipitationParticle), and this
+        // codebase's own established "one shader, multiple modes via a push-constant int + branch in
+        // main()" convention (see this file's own header comment) keeps that branch at the dispatch
+        // level, not re-decided per-thread inside a single fused kernel.
         if (precipSpawnCount > 0) {
             pc.mode = 2;
             vkCmdPushConstants(cmd, m_SimPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);

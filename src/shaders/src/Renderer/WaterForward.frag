@@ -27,6 +27,13 @@
 #include "include/material_params.glsl"
 #include "include/terrain_noise.glsl" // SampleTerrainHeight -- the real seabed depth reference.
 #include "include/water_params.glsl"  // kWaterLevel
+// Rivers/waterfalls feature: this pass is the SHARED draw for both the flat lake plane and the
+// river/waterfall ribbon (see geom_river.comp's own header comment for why they share one
+// renderer::WaterForwardPass draw call instead of a dedicated river pass/entity) -- river_spline.glsl
+// lets this shader classify "am I lake or river/waterfall this fragment" and derive a flow
+// direction/speed purely from world position, since geometry::FallbackVertex carries no spare
+// per-vertex channel (uv2) through the Fallback Mesh proxy this pass actually draws from.
+#include "include/river_spline.glsl"
 
 // Single-element buffer -- this pass only ever shades ONE fixed material (see
 // renderer::WaterForwardPass.cpp's own `waterMaterial` parameter comment), same convention
@@ -137,10 +144,40 @@ bool TraceHWRT(vec3 rayOrigin, vec3 rayDir, float tMax, out uint outEntityIndex,
 }
 
 void main() {
+    // --- Rivers/waterfalls feature: classify this fragment against river_spline.glsl's authored
+    // path -- riverMask is 0 on the open lake (unchanged behavior below) and ramps to 1 on/near the
+    // river or waterfall channel; riverTangentXZ is the local downstream direction; riverSlope is
+    // the local downhill steepness (world-height-drop per world-XZ-arc-unit), near-vertical at the
+    // one waterfall segment (see river_spline.glsl's own kRiverControlHeight comment) -- used below
+    // to scale both the flow-scroll speed and the whitewater/foam brightening. ---
+    float riverT, riverSurfaceHeight, riverDistance;
+    vec2 riverClosestXZ, riverTangentXZ;
+    ClosestPointOnRiverPolyline(inWorldPos.xz, riverT, riverClosestXZ, riverSurfaceHeight, riverTangentXZ, riverDistance);
+    float riverMask = 1.0 - smoothstep(kRiverBandInnerHalfWidth, kRiverBandOuterHalfWidth, riverDistance);
+    float riverSlope = riverMask > 0.0 ? RiverSlopeAtT(riverT) : 0.0;
+
+    // Flow-mapped UV scroll: shifts the sampling coordinate upstream over time (so the noise
+    // pattern itself appears to travel downstream, along riverTangentXZ) -- scaled by riverMask so
+    // this is an exact no-op on the open lake (mask == 0, sampleXZ == inWorldPos.xz unchanged).
+    // kRiverBaseFlowSpeed/kRiverSlopeSpeedGain: a gentle river reach still visibly drifts; the
+    // waterfall segment's own much larger riverSlope drives the speed far higher, exactly the
+    // "steeper == faster visual flow" requirement this feature targets.
+    const float kRiverBaseFlowSpeed = 0.6;
+    const float kRiverSlopeSpeedGain = 2.5;
+    float flowSpeed = kRiverBaseFlowSpeed + riverSlope * kRiverSlopeSpeedGain;
+    vec2 flowShiftedXZ = inWorldPos.xz - riverTangentXZ * (pc.timeSeconds * flowSpeed * riverMask);
+
     // The wave-perturbed normal IS this surface's shading normal -- a flat, wave-free water plane
     // has inWorldNormal == (0,1,0) exactly, and ComputeWaveNormal reduces to the same (0,1,0) at
     // zero amplitude (its own construction, mirroring geom_terrain.comp's identical guarantee).
-    vec3 n = ComputeWaveNormal(inWorldPos.xz, pc.timeSeconds);
+    vec3 n = ComputeWaveNormal(flowShiftedXZ, pc.timeSeconds);
+    // Blends in a higher-frequency, faster-evolving second wave sample where the river is both
+    // present AND steep (rapids/waterfall) -- a cheap stand-in for real turbulence, giving the
+    // waterfall segment a visibly choppier normal than the calm upstream reach or the lake.
+    if (riverMask > 0.0 && riverSlope > 0.0) {
+        vec3 turbulentNormal = ComputeWaveNormal(flowShiftedXZ * 3.0, pc.timeSeconds * 1.7);
+        n = normalize(mix(n, turbulentNormal, riverMask * clamp(riverSlope * 0.6, 0.0, 1.0)));
+    }
     MaterialParams mat = g_MaterialParams.mat;
 
     // --- Refraction: sample the frozen background snapshot through a wave-perturbed UV offset,
@@ -151,7 +188,12 @@ void main() {
     // repurposed as the maximum absorption blend strength (NOT a fixed-function blend alpha --
     // this shader composes manually, see this file's own header comment). ---
     vec2 screenUV = gl_FragCoord.xy / vec2(pc.viewportWidth, pc.viewportHeight);
-    float waterDepth = max(kWaterLevel - SampleTerrainHeight(inWorldPos.xz), 0.0);
+    // Depth reference is THIS fragment's own rasterized surface height (inWorldPos.y), not the
+    // flat-lake-only kWaterLevel constant: exactly equal to kWaterLevel on the lake (a flat plane,
+    // so this is a no-op there), but correctly follows the river ribbon's own authored, non-flat
+    // surface height upstream of the lake (see river_spline.glsl's own kRiverControlHeight comment
+    // for why a river's water surface is not a single fixed Y the way the lake's is).
+    float waterDepth = max(inWorldPos.y - SampleTerrainHeight(inWorldPos.xz), 0.0);
     // Attenuate the UV offset near the shore (shallow water) so the refraction distortion doesn't
     // visibly displace the shoreline itself -- same smoothstep-taper idiom terrain_shading.glsl's
     // own beach band already uses.
@@ -210,6 +252,13 @@ void main() {
     // directly (blendEnable=false). ---
     float fresnelScalar = clamp(fresnel.r, 0.0, 1.0); // F0 is achromatic, so r==g==b already.
     vec3 outRGB = mix(refractedTinted, reflectionRadiance, fresnelScalar);
+
+    // --- Rivers/waterfalls feature: whitewater/foam -- brightens toward near-white proportionally
+    // to riverMask (am I on the channel at all) times riverSlope (how steep, unsigned m/m), so the
+    // calm upstream reach stays a normal tinted-water look while the waterfall segment and any
+    // sharp rapids read as visibly foamy, without needing a separate foam texture/material. ---
+    float whitewater = riverMask * clamp(riverSlope * 0.5, 0.0, 1.0);
+    outRGB = mix(outRGB, vec3(0.90, 0.95, 1.0), whitewater * 0.6);
 
     outColor = vec4(outRGB, 1.0);
 }
