@@ -89,8 +89,21 @@ target_sources(${PROJECT_NAME} PRIVATE
 )
 
 # --- Includes ---
+# `tools` (unconditional, ALL configs -- not just Debug): PCG roadmap Phase 6.2 ("Partitioned PCG
+# Cell Execution", src/pcg/PcgCellGenerator.h/.cpp) is CORE, always-on runtime generation logic (see
+# that file's own top-of-file comment) that includes "WorldPartition/PcgVolumeActor.h" for its
+# header-only worldpartition::PcgVolumeDesc/CellCoord/AABB types. Since src/pcg/PcgCellGenerator.cpp
+# is picked up by ALL_SOURCES's unconditional `file(GLOB_RECURSE ... "src/*.cpp")` above, it compiles
+# in EVERY configuration, so this include path must resolve in Release too -- unlike the
+# Debug-only `tools` entry further below (WORLD PARTITION OFFLINE TOOLSET section), which exists for
+# a genuinely Debug-only consumer (PcgVolumeInspector.h). This costs nothing in the shipping binary:
+# an include search path adds zero bytes on its own, only actually-compiled-and-linked object code
+# does -- and PcgCellGenerator.cpp deliberately never calls any tools/WorldPartition/*.cpp compiled
+# function (see its own CellWorldBounds() comment), so no additional tools/WorldPartition/*.cpp
+# source is added to this target's Release build by this change.
 target_include_directories(${PROJECT_NAME} PRIVATE
     src
+    tools
     ${Vulkan_INCLUDE_DIRS}
     vendor/vma
     $<$<CONFIG:Debug>:${IMGUI_DIR}>
@@ -212,6 +225,7 @@ add_test(NAME ClusterMaskSplitTests COMMAND ClusterMaskSplitTests)
 
 add_executable(LoadingManagerTests
     src/core/LoadingManager.cpp
+    src/core/Logger.cpp
     tests/LoadingManagerTests.cpp
 )
 target_include_directories(LoadingManagerTests PRIVATE src ${Vulkan_INCLUDE_DIRS})
@@ -328,6 +342,75 @@ add_executable(PcgBiomeRulesTests
 )
 target_include_directories(PcgBiomeRulesTests PRIVATE src ${Vulkan_INCLUDE_DIRS})
 add_test(NAME PcgBiomeRulesTests COMMAND PcgBiomeRulesTests)
+
+# PCG framework roadmap, Phase 8.2 ("Ecosystem Exclusion" -- second subtask of Phase 8,
+# Biome/Ecosystem): PcgEcosystemExclusion.cpp adds cross-layer suppression on top of Phase 8.1's
+# ApplyBiome output, reusing Phase 3.2's PcgSpatialHashGrid (PcgSelfPruningFilter.h/.cpp) directly
+# for its two-set proximity query rather than reimplementing spatial hashing. This test target's
+# own end-to-end test builds a real PcgBiomeRuleSet and runs ApplyBiome before applying ecosystem
+# rules to its output, so it links the identical dependency set PcgBiomeRulesTests above already
+# establishes (every Phase 3 filter file ApplyBiomeLayer composes, plus their own transitive
+# dependencies) alongside PcgEcosystemExclusion.cpp itself. Also links src/core/Logger.cpp: unlike
+# PcgBiomeRules.cpp, PcgEcosystemExclusion.cpp's ApplyEcosystemRules calls LOG_WARNING (an unknown
+# layer-name rule is logged, not a crash -- see PcgEcosystemExclusion.h's own header comment), the
+# same "link Logger.cpp because this file's own code calls into it" precedent every other LOG_*-
+# calling test target above already follows (e.g. LoadingManagerTests).
+add_executable(PcgEcosystemExclusionTests
+    src/pcg/PcgEcosystemExclusion.cpp
+    src/pcg/PcgBiomeRules.cpp
+    src/pcg/PcgDensityTransformFilter.cpp
+    src/pcg/PcgSlopeHeightFilter.cpp
+    src/pcg/PcgTerrainSampler.cpp
+    src/pcg/PcgBooleanSetOps.cpp
+    src/pcg/PcgSplineSampler.cpp
+    src/pcg/PcgSelfPruningFilter.cpp
+    src/core/Logger.cpp
+    tests/PcgEcosystemExclusionTests.cpp
+)
+target_include_directories(PcgEcosystemExclusionTests PRIVATE src ${Vulkan_INCLUDE_DIRS})
+add_test(NAME PcgEcosystemExclusionTests COMMAND PcgEcosystemExclusionTests)
+
+# PCG framework roadmap, Phase 8.3 ("Climate-Driven Biome Selection" -- third subtask of Phase 8,
+# Biome/Ecosystem, sequential after Phase 8.1 above): PcgClimateBiomeSelector.cpp is pure composition
+# over Phase 8.1's own pcg::ApplyBiome (no new point-set filtering algorithm of its own), so this
+# target links the identical Phase 3 filter .cpp set PcgBiomeRulesTests already needs (ApplyBiome's
+# own transitive link-time dependency set, see that target's own comment above) plus PcgBiomeRules.cpp
+# itself.
+#
+# Unlike every other tests/*.cpp target in this file, this one's own production code
+# (PcgClimateBiomeSelector.cpp) references a full renderer::AtmosClimatePass definition (for
+# SampleCurrentClimate -- see that function's own header comment on why PcgClimateBiomeSelector.h
+# itself only forward-declares the type), which pulls in Vulkan/VMA headers; and this SPECIFIC test
+# file goes one step further and actually constructs a real (never-Init()'d) renderer::AtmosClimatePass
+# value for TestSampleCurrentClimateSanity, which requires AtmosClimatePass's GpuBuffer member's
+# out-of-line destructor (GpuBuffer.cpp) to link, which in turn needs a real VMA implementation TU
+# (VmaUsage.cpp) and Logger.cpp (GpuBuffer.cpp's own LOG_INFO/LOG_ERROR call sites under a Debug
+# build) -- the exact same Vulkan/VMA link-time dependency set PcgGpuNodeExecutorTests below already
+# establishes for a different reason (real GPU dispatch there; here, only a never-Init()'d value's
+# construction/destruction ever actually runs -- no live VkDevice/VkQueue/VmaAllocator is required or
+# even constructed, since Init()/RecordUpdate() are deliberately never called by this test).
+# AtmosClimatePass.cpp itself is also linked (its RecordUpdate() body calls
+# VulkanUtils::RecordMemoryBarrier, an unresolved external at link time otherwise, even though this
+# test never calls RecordUpdate) -- see VulkanUtils.cpp alongside it for that reason.
+add_executable(PcgClimateBiomeSelectorTests
+    src/pcg/PcgClimateBiomeSelector.cpp
+    src/pcg/PcgBiomeRules.cpp
+    src/pcg/PcgDensityTransformFilter.cpp
+    src/pcg/PcgSlopeHeightFilter.cpp
+    src/pcg/PcgTerrainSampler.cpp
+    src/pcg/PcgBooleanSetOps.cpp
+    src/pcg/PcgSplineSampler.cpp
+    src/pcg/PcgSelfPruningFilter.cpp
+    src/renderer/passes/AtmosClimatePass.cpp
+    src/renderer/vulkan/GpuBuffer.cpp
+    src/renderer/vulkan/VmaUsage.cpp
+    src/renderer/vulkan/VulkanUtils.cpp
+    src/core/Logger.cpp
+    tests/PcgClimateBiomeSelectorTests.cpp
+)
+target_include_directories(PcgClimateBiomeSelectorTests PRIVATE src ${Vulkan_INCLUDE_DIRS} vendor/vma)
+target_link_libraries(PcgClimateBiomeSelectorTests PRIVATE Vulkan::Vulkan)
+add_test(NAME PcgClimateBiomeSelectorTests COMMAND PcgClimateBiomeSelectorTests)
 
 # PCG framework roadmap, Phase 5.1+5.2 ("PCG Graph Engine Core"): the node/link graph data model +
 # JSON serialization (src/pcg/PcgGraph.cpp) and the CPU topological evaluator + subgraph support
@@ -452,6 +535,14 @@ add_executable(AsyncDecompressingLoaderTests
 target_include_directories(AsyncDecompressingLoaderTests PRIVATE src ${Vulkan_INCLUDE_DIRS})
 add_test(NAME AsyncDecompressingLoaderTests COMMAND AsyncDecompressingLoaderTests)
 
+add_executable(AsyncFileStreamerBenchmark
+    src/io/AsyncFileStreamer.cpp
+    src/core/Logger.cpp
+    tests/AsyncFileStreamerBenchmark.cpp
+)
+target_include_directories(AsyncFileStreamerBenchmark PRIVATE src ${Vulkan_INCLUDE_DIRS})
+add_test(NAME AsyncFileStreamerBenchmark COMMAND AsyncFileStreamerBenchmark)
+
 add_executable(VirtualTextureTests
     src/renderer/streaming/VirtualTextureManager.cpp
     src/renderer/vulkan/GpuBuffer.cpp
@@ -521,6 +612,27 @@ set(WORLDPARTITION_PCG_VOLUME_SOURCES
     tools/WorldPartition/SpatialHashGrid.cpp
     tools/WorldPartition/PcgVolumeActor.cpp
 )
+
+# PCG roadmap Phase 7.4 ("PCG Volume Parameter Override UI",
+# src/renderer/debug/PcgVolumeInspector.h/.cpp): the ONLY place in this codebase where the offline
+# tools/WorldPartition/ toolset gets linked into the shipping DemoSceneVK target itself, rather
+# than one of the standalone tests/*.cpp executables above -- and even then, ONLY for the Debug
+# configuration (see the $<$<CONFIG:Debug>:...> generator expressions below, the exact same idiom
+# ${IMGUI_SOURCES}/${NODE_EDITOR_SOURCES} already use above for other Debug-only vendored/tooling
+# code). PcgVolumeInspector scans world_data/actors/ for authored PcgVolume .actor files at
+# Debug-build startup, which requires worldpartition::ReadActorFile/TryParsePcgVolumeDesc
+# (WORLDPARTITION_PCG_VOLUME_SOURCES above) to actually be linked in. The Release configuration
+# compiles ZERO of this: PcgVolumeInspector.h/.cpp are themselves whole-file #ifndef NDEBUG-gated,
+# AND the generator expression below drops WORLDPARTITION_PCG_VOLUME_SOURCES/the `tools` include
+# directory entirely from a Release build -- WorldPartitionTypes.h's own header comment ("never
+# linked into the shipping DemoSceneVK executable") still holds for Release, the actual shipping
+# configuration this project ships.
+target_sources(${PROJECT_NAME} PRIVATE
+    $<$<CONFIG:Debug>:${WORLDPARTITION_PCG_VOLUME_SOURCES}>
+)
+target_include_directories(${PROJECT_NAME} PRIVATE
+    $<$<CONFIG:Debug>:${CMAKE_CURRENT_SOURCE_DIR}/tools>
+)
 set(WORLDPARTITION_HLOD_SOURCES
     tools/WorldPartition/Uuid.cpp
     tools/WorldPartition/SpatialHashGrid.cpp
@@ -552,6 +664,37 @@ add_executable(PcgVolumeActorTests
 )
 target_include_directories(PcgVolumeActorTests PRIVATE src tools ${Vulkan_INCLUDE_DIRS})
 add_test(NAME PcgVolumeActorTests COMMAND PcgVolumeActorTests)
+
+# PCG roadmap Phase 6.2 ("Partitioned PCG Cell Execution", src/pcg/PcgCellGenerator.h/.cpp): links
+# the full Phase 5.1/5.2/5.4 graph-engine core (PcgGraph/PcgGraphEvaluator/PcgNodePlugin, same set
+# PcgMeshSpawnerTests above links) plus PcgMeshSpawner.cpp (Phase 4.1, the one real native node type
+# a well-formed PCG Volume graph is expected to end in) and PcgBooleanSetOps.cpp/PcgSplineSampler.cpp
+# (Phase 3.3's IntersectWithVolume, used to clip a graph's raw-Points fallback output to the cell's
+# own bounds -- PcgBooleanSetOps.cpp itself depends on PcgSplineSampler.cpp's arc-length utilities,
+# same as PcgBooleanSetOpsTests above). Also links src/core/Logger.cpp: PcgCellGenerator.cpp is the
+# first of this exact source group to actually call LOG_WARNING (Debug-only diagnostic logging for a
+# gracefully-skipped volume), needed to satisfy that symbol in a Debug build (a no-op macro, and
+# therefore no link dependency at all, in Release -- see core/Logger.h). Finally links
+# ${WORLDPARTITION_PCG_VOLUME_SOURCES} (defined above) purely for THIS TEST's own convenience --
+# building real worldpartition::PcgVolumeDesc test fixtures does not itself require any of those
+# compiled functions, but this test target is free to link the full offline toolset (unlike
+# src/pcg/PcgCellGenerator.cpp itself, which deliberately does not -- see that file's own
+# CellWorldBounds() comment) since a standalone CTest executable never ships.
+add_executable(PcgCellGeneratorTests
+    src/pcg/PcgGraph.cpp
+    src/pcg/PcgGraphEvaluator.cpp
+    src/pcg/PcgNodePlugin.cpp
+    src/pcg/PcgMeshSpawner.cpp
+    src/pcg/PcgBooleanSetOps.cpp
+    src/pcg/PcgSplineSampler.cpp
+    src/pcg/PcgCellGenerator.cpp
+    ${CRUDE_JSON_SOURCES}
+    ${WORLDPARTITION_PCG_VOLUME_SOURCES}
+    src/core/Logger.cpp
+    tests/PcgCellGeneratorTests.cpp
+)
+target_include_directories(PcgCellGeneratorTests PRIVATE src tools ${Vulkan_INCLUDE_DIRS})
+add_test(NAME PcgCellGeneratorTests COMMAND PcgCellGeneratorTests)
 
 add_executable(HlodPipelineTests
     ${WORLDPARTITION_HLOD_SOURCES}

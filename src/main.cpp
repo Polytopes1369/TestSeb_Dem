@@ -35,6 +35,10 @@
 // Phase 7.3 (PCG editor-tooling roadmap): "Node Data Inspector" panel drawn alongside the canvas
 // above, plus its own self-contained demo PcgGraph (see that header's DemoGraphState comment).
 #include "renderer/debug/PcgNodeDataInspector.h"
+// Phase 7.4 (PCG editor-tooling roadmap, closes out Phase 7): "PCG Volume Inspector" -- browses
+// authored (or synthetic-demo fallback) PCG Volumes and edits seed/bounds/graph-asset-path in
+// memory. See that header's own comment for the full scope rationale.
+#include "renderer/debug/PcgVolumeInspector.h"
 #endif
 
 // Unreal-editor style viewport navigation: hold the Right Mouse Button to enable FPS-style
@@ -131,6 +135,13 @@ struct DebugState {
     bool glintEnabled = true;
     float glintDensityScale = 1.0f;
     float glintIntensityScale = 1.0f;
+    // UE5.8 rendering-parity gap G6 (Substrate horizontal mixing): renderer::ClusterRenderPipeline::
+    // SetDebugMixMaskSharpnessScale tunes the A/B blend sharpness of every horizontally-mixed
+    // material live (multiplies its authored mixContrast, see substrate_bsdf.glsl's
+    // EvaluateSubstrateMixMask). Driven from the Post FX ImGui tab below; Release always renders at
+    // the authored value (scale 1.0, no toggle), matching glint*/sss* above. The raw mix mask itself
+    // is inspected via the DEBUG_VIEW_SUBSTRATE_MIXING view mode (keyboard 'N'), not this scalar.
+    float mixSharpnessScale = 1.0f;
     // Phase 1 (Nanite advanced): renderer::ClusterRenderPipeline::SetDebugEnhancedDisplacementEnabled
     // -- gates the multi-octave procedural noise displacement on entity 2 (Icosphere, see
     // enhanced_displacement.glsl). Key 'J' -- moved off 'B' (this branch's original key) during the
@@ -180,6 +191,13 @@ static renderer::debug::PcgGraphEditorPanel g_PcgGraphEditorPanel;
 // in this roadmap).
 static renderer::debug::PcgNodeDataInspector g_PcgNodeDataInspector;
 static renderer::debug::DemoGraphState g_PcgInspectorDemoGraph;
+
+// Phase 7.4 (PCG editor-tooling roadmap): the "PCG Volume Inspector" section drawn right below
+// g_PcgNodeDataInspector's own child region above, inside the same "PCG Graph Editor" tab -- the
+// 4th and final section of Phase 7 (see renderer::debug::PcgVolumeInspector's own header comment
+// for the full scope rationale: browses/edits authored-or-synthetic-demo PCG Volumes' top-level
+// fields, in memory only). Initialized once right after g_PcgInspectorDemoGraph above.
+static renderer::debug::PcgVolumeInspector g_PcgVolumeInspector;
 
 static void KeyCallback(GLFWwindow* window, int key, int scancode, int action, int mods) {
     if (action != GLFW_PRESS) return;
@@ -307,6 +325,14 @@ static void KeyCallback(GLFWwindow* window, int key, int scancode, int action, i
         // already claimed" situation as 'M' above.
         g_DebugState.viewMode = DEBUG_VIEW_SUBSTRATE_SLABS;
         LOG_INFO("[Debug] View Mode: SUBSTRATE SLABS");
+        break;
+    case GLFW_KEY_N:
+        // Substrate horizontal mixing (UE5.8 rendering-parity gap G6): 'N' for "mixiNg" -- same
+        // "plain letter key, every numpad slot already claimed" situation as 'B'/'M' above.
+        // Visualizes the raw per-pixel A/B mix mask (blue = base "A" slab, red = mixB "B" slab) --
+        // see ClusterResolve.comp's own viewMode==17 branch.
+        g_DebugState.viewMode = DEBUG_VIEW_SUBSTRATE_MIXING;
+        LOG_INFO("[Debug] View Mode: SUBSTRATE MIXING");
         break;
     case GLFW_KEY_K:
         // See renderer::ClusterRenderPipeline::RequestDebugDAGCutGapsDump()'s own comment: this
@@ -468,6 +494,11 @@ int main(int argc, char** argv) {
     // Phase 7.3 (PCG editor-tooling roadmap): build + evaluate the Node Data Inspector's own
     // self-contained demo graph once -- see g_PcgInspectorDemoGraph's own declaration-site comment.
     g_PcgInspectorDemoGraph = renderer::debug::BuildDemoInspectorGraph();
+
+    // Phase 7.4 (PCG editor-tooling roadmap): scan world_data/actors/ for real PcgVolume actors
+    // (falling back to 3 synthetic in-memory demo volumes if none exist yet) -- see
+    // g_PcgVolumeInspector's own declaration-site comment.
+    g_PcgVolumeInspector.Init();
 #endif
 
     // Builds the consolidated virtual geometry .cache file (scene.cache): reads back the spawned
@@ -1067,6 +1098,11 @@ int main(int argc, char** argv) {
                 ImGui::Checkbox("Glint / Sparkle", &g_DebugState.glintEnabled);
                 ImGui::SliderFloat("Glint Density", &g_DebugState.glintDensityScale, 0.0f, 2.0f);
                 ImGui::SliderFloat("Glint Intensity", &g_DebugState.glintIntensityScale, 0.0f, 4.0f);
+                // UE5.8 rendering-parity gap G6: Substrate horizontal mixing -- live A/B blend-sharpness
+                // tuning of the rusting-metal showcase (Pyramid, slot 9, in renderer::
+                // GenerateShowcaseMaterialTable); higher = crisper rust-patch edges. The raw A/B mask
+                // itself is inspected via the SUBSTRATE MIXING view mode (keyboard 'N').
+                ImGui::SliderFloat("Mix Sharpness", &g_DebugState.mixSharpnessScale, 0.0f, 4.0f);
                 ImGui::EndTabItem();
             }
 
@@ -1492,6 +1528,22 @@ int main(int argc, char** argv) {
                 }
                 ImGui::EndChild();
 
+                // Phase 7.4 (PCG editor-tooling roadmap, closes out Phase 7): "PCG Volume
+                // Inspector" -- browses PcgVolume actors discovered under world_data/actors/ (or,
+                // absent any today, 3 synthetic in-memory demo volumes -- see
+                // renderer::debug::PcgVolumeInspector's own header comment) and edits each one's
+                // seed/bounds/graph-asset-path IN MEMORY ONLY (no write-back in this phase).
+                ImGui::Separator();
+                ImGui::TextWrapped(
+                    "Phase 7.4: PCG Volume Inspector -- browse authored (or, absent any today, "
+                    "SYNTHETIC in-memory demo) PCG Volumes and edit each one's seed/bounds/graph "
+                    "asset path IN MEMORY. Write-back to disk is out of scope for this phase -- see "
+                    "PcgVolumeInspector.h's own header comment for the full scope rationale.");
+                if (ImGui::BeginChild("PcgVolumeInspector_Child", ImVec2(0.0f, 420.0f), ImGuiChildFlags_Borders)) {
+                    g_PcgVolumeInspector.Draw();
+                }
+                ImGui::EndChild();
+
                 ImGui::EndTabItem();
             }
 
@@ -1775,6 +1827,9 @@ int main(int argc, char** argv) {
         // scale (an A/B off), otherwise the two sliders scale the material-authored glint live.
         clusterPipeline.SetDebugGlintDensityScale(g_DebugState.glintDensityScale);
         clusterPipeline.SetDebugGlintIntensityScale(g_DebugState.glintEnabled ? g_DebugState.glintIntensityScale : 0.0f);
+        // UE5.8 rendering-parity gap G6 (Substrate horizontal mixing): live A/B blend-sharpness knob
+        // (multiplies every horizontally-mixed material's authored mixContrast; 1.0 = unchanged).
+        clusterPipeline.SetDebugMixMaskSharpnessScale(g_DebugState.mixSharpnessScale);
         clusterPipeline.SetDebugEnhancedDisplacementEnabled(g_DebugState.enhancedDisplacementEnabled);
         clusterPipeline.SetDebugSplineDeformationEnabled(g_DebugState.splineDeformationEnabled);
         clusterPipeline.SetDebugAsyncComputeEnabled(g_DebugState.asyncComputeEnabled);
