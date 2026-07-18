@@ -510,6 +510,25 @@ namespace renderer {
         // scope existence is guarded out of Release entirely, not merely skipped at runtime.
         void ValidateSplineBounds() const;
 
+        // Phase 0.3 (PCG roadmap, dynamic Lumen registration) validation: registers a small,
+        // synthetic-entityID set of test entities into BOTH m_GlobalSDF and m_SurfaceCache at
+        // runtime -- reusing already-baked Fallback Mesh geometry read back out of this pipeline's
+        // OWN scene.cache (borrowed from a few already-resident entityIDs via
+        // GlobalSDFPass::GetTracedEntityInfos(), since every entityID this engine's content
+        // currently defines is already part of each pass's fixed Init()-time roster -- there is no
+        // "dormant" entityID left to register from, so a fresh SYNTHETIC identity is used instead;
+        // see GlobalSDFPass::RegisterEntity/SurfaceCachePass::RegisterEntity's own comments for the
+        // full "newEntityID vs sourceEntityID" contract this exercises). Confirms the entities are
+        // counted in each pass's composite/atlas list, exercises one real
+        // RecordUpdate()/UpdateVisibility()+RecordCapture() dispatch through one-shot command
+        // buffers so the new code paths actually run at least once (not just get counted), then
+        // unregisters everything it added and confirms every count returns to its pre-test
+        // baseline. Entirely log-based (LOG_INFO/LOG_ERROR in the .cpp) -- called once, at the very
+        // end of Init(), same placement convention as ValidateSplineBounds() above (both need the
+        // rest of this pipeline's Init()-time state -- here, m_GlobalSDF/m_SurfaceCache's own fixed
+        // roster -- already fully built).
+        void RunPhase03DynamicLumenSmokeTest(VkCommandPool commandPool, VkQueue queue);
+
         // Maps config::debugview::SELECTED_BUFFER_INDEX to one of this pipeline's own GBuffer/GI
         // intermediate views (see the big index->buffer table in this method's own .cpp
         // definition) and dispatches m_DebugBufferView with it -- backs the ImGui "Buffer Viewer"

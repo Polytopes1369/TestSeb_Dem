@@ -100,6 +100,8 @@ namespace renderer {
 
         m_Device = device;
         m_Allocator = allocator;
+        // Phase 0.3: stashed for RegisterEntity()'s later re-reads -- see that member's own comment.
+        m_CacheFilePath = cacheFilePath;
 
         // =====================================================================================
         // STEP 1 -- Read every fallback mesh's geometry and build one CPU-side Mesh SDF per
@@ -293,12 +295,22 @@ namespace renderer {
         uint32_t entityCount = static_cast<uint32_t>(m_Entities.size());
         // At least 1 set/descriptor reserved even with zero entities, so a valid (if never
         // sampled) set 1 can still be bound during clear-mode dispatches -- see RecordSlab.
-        uint32_t entitySetCount = std::max(entityCount, 1u);
+        // Phase 0.3 (PCG roadmap, dynamic Lumen registration): + kMaxDynamicEntities extra
+        // descriptors/sets, headroom RegisterEntity() draws from at runtime -- sized in at Init()
+        // time since growing a VkDescriptorPool itself is not a supported operation; this is the
+        // same "reserve fixed headroom up front" discipline core::InstanceRegistry's own bounded
+        // capacity established for Phase 0.1.
+        uint32_t entitySetCount = std::max(entityCount, 1u) + kMaxDynamicEntities;
 
         VkDescriptorPoolSize poolSizes[2]{};
         poolSizes[0] = { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, kLevelCount };
         poolSizes[1] = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, entitySetCount };
         VkDescriptorPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
+        // Phase 0.3: FREE_DESCRIPTOR_SET_BIT so UnregisterEntity() can vkFreeDescriptorSets() a
+        // dynamically-registered entity's own set individually, reclaiming its slot of the
+        // kMaxDynamicEntities headroom for a LATER RegisterEntity() call instead of only ever being
+        // able to grow until the pool is exhausted.
+        poolInfo.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
         poolInfo.maxSets = kLevelCount + entitySetCount;
         poolInfo.poolSizeCount = 2;
         poolInfo.pPoolSizes = poolSizes;
@@ -492,6 +504,8 @@ namespace renderer {
         for (ClipmapLevel& level : m_Levels) { level = ClipmapLevel{}; }
         m_Entities.clear();
         m_PendingSlabs.clear();
+        m_CacheFilePath.clear();
+        m_DynamicEntityCount = 0; // Phase 0.3.
 
         m_Pipeline = VK_NULL_HANDLE;
         m_PipelineLayout = VK_NULL_HANDLE;
@@ -750,6 +764,218 @@ namespace renderer {
         }
 
         DrainAndRecordSlabs(cmd, entityTransformsCPU);
+    }
+
+    bool GlobalSDFPass::RegisterEntity(uint32_t newEntityID, uint32_t sourceEntityID, VkCommandPool commandPool, VkQueue queue) {
+        // --- Reject a collision with an already-resident entity (Init-time OR a prior
+        // RegisterEntity() call) -- see this method's own header comment. ---
+        for (const EntitySDF& existing : m_Entities) {
+            if (existing.entityID == newEntityID) {
+                LOG_WARNING(std::format(
+                    "[GlobalSDFPass] RegisterEntity: entityID={} is already registered; ignoring.", newEntityID));
+                return false;
+            }
+        }
+        if (m_DynamicEntityCount >= kMaxDynamicEntities) {
+            LOG_WARNING(std::format(
+                "[GlobalSDFPass] RegisterEntity: dynamic entity capacity ({}) exhausted, cannot register "
+                "newEntityID={} (sourceEntityID={}).", kMaxDynamicEntities, newEntityID, sourceEntityID));
+            return false;
+        }
+
+        // --- Re-read sourceEntityID's Fallback Mesh geometry from the cache file (mirrors Init()'s
+        // own STEP 1, for exactly one entity, on the calling thread -- see this method's own header
+        // comment for why this does not go through core::LoadingManager). ---
+        geometry::CacheFileManager cacheManager;
+        geometry::CacheFileHeader header{};
+        if (!cacheManager.ReadHeader(m_CacheFilePath, header)) {
+            LOG_ERROR(std::format("[GlobalSDFPass] RegisterEntity: failed to read cache header '{}'.", m_CacheFilePath.string()));
+            return false;
+        }
+        std::vector<geometry::FallbackMeshIndexEntry> fallbackTable;
+        if (!cacheManager.ReadFallbackMeshTable(m_CacheFilePath, header, fallbackTable)) {
+            LOG_ERROR("[GlobalSDFPass] RegisterEntity: failed to read the fallback-mesh table.");
+            return false;
+        }
+        auto entryIt = std::find_if(fallbackTable.begin(), fallbackTable.end(),
+            [sourceEntityID](const geometry::FallbackMeshIndexEntry& entry) { return entry.entityID == sourceEntityID; });
+        if (entryIt == fallbackTable.end()) {
+            LOG_WARNING(std::format(
+                "[GlobalSDFPass] RegisterEntity: sourceEntityID={} has no Fallback Mesh in '{}'; cannot register newEntityID={}.",
+                sourceEntityID, m_CacheFilePath.string(), newEntityID));
+            return false;
+        }
+
+        std::vector<geometry::FallbackVertex> vertices;
+        std::vector<uint32_t> indices;
+        if (!cacheManager.ReadFallbackMeshGeometry(m_CacheFilePath, *entryIt, vertices, indices)) {
+            LOG_ERROR(std::format(
+                "[GlobalSDFPass] RegisterEntity: failed to read Fallback Mesh geometry for sourceEntityID={}.", sourceEntityID));
+            return false;
+        }
+        if (vertices.empty() || indices.size() < 3) {
+            LOG_WARNING(std::format(
+                "[GlobalSDFPass] RegisterEntity: sourceEntityID={} has empty Fallback Mesh geometry; cannot register newEntityID={}.",
+                sourceEntityID, newEntityID));
+            return false;
+        }
+
+        std::vector<maths::vec3> positions;
+        positions.reserve(vertices.size());
+        for (const geometry::FallbackVertex& v : vertices) {
+            positions.push_back(maths::vec3{ v.position[0], v.position[1], v.position[2] });
+        }
+
+        geometry::MeshSDF sdf = geometry::BuildMeshSDF(positions, indices, kEntitySDFResolution);
+        if (sdf.resolution == 0) {
+            LOG_WARNING(std::format(
+                "[GlobalSDFPass] RegisterEntity: BuildMeshSDF produced an empty SDF for sourceEntityID={}; "
+                "cannot register newEntityID={}.", sourceEntityID, newEntityID));
+            return false;
+        }
+
+        std::vector<float> decodedGrid(static_cast<size_t>(sdf.resolution) * sdf.resolution * sdf.resolution);
+        for (uint32_t z = 0; z < sdf.resolution; ++z) {
+            for (uint32_t y = 0; y < sdf.resolution; ++y) {
+                for (uint32_t x = 0; x < sdf.resolution; ++x) {
+                    decodedGrid[(static_cast<size_t>(z) * sdf.resolution + y) * sdf.resolution + x] =
+                        geometry::DecodeMeshSDFVoxel(sdf, x, y, z);
+                }
+            }
+        }
+
+        // --- GPU resources: this entity's own dedicated sampled 3D SDF image + descriptor set,
+        // allocated from the SAME pool/layout Init() built, drawing on the kMaxDynamicEntities
+        // headroom reserved there (see Init()'s own STEP 2 comment). ---
+        EntitySDF entitySdf{};
+        entitySdf.volumeMin = sdf.volumeMin;
+        entitySdf.voxelSize = sdf.voxelSize;
+        entitySdf.resolution = sdf.resolution;
+        entitySdf.entityID = newEntityID;
+        entitySdf.dynamic = true;
+
+        VkImageCreateInfo imageInfo{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+        imageInfo.imageType = VK_IMAGE_TYPE_3D;
+        imageInfo.format = kClipmapFormat;
+        imageInfo.extent = { entitySdf.resolution, entitySdf.resolution, entitySdf.resolution };
+        imageInfo.mipLevels = 1;
+        imageInfo.arrayLayers = 1;
+        imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+        imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+        imageInfo.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        VmaAllocationCreateInfo gpuOnlyAlloc{};
+        gpuOnlyAlloc.usage = VMA_MEMORY_USAGE_GPU_ONLY;
+        VK_CHECK(vmaCreateImage(m_Allocator, &imageInfo, &gpuOnlyAlloc, &entitySdf.image, &entitySdf.allocation, nullptr));
+
+        VkImageViewCreateInfo viewInfo{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+        viewInfo.image = entitySdf.image;
+        viewInfo.viewType = VK_IMAGE_VIEW_TYPE_3D;
+        viewInfo.format = kClipmapFormat;
+        viewInfo.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+        VK_CHECK(vkCreateImageView(m_Device, &viewInfo, nullptr, &entitySdf.view));
+
+        VkDescriptorSetAllocateInfo dsAllocInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+        dsAllocInfo.descriptorPool = m_DescriptorPool;
+        dsAllocInfo.descriptorSetCount = 1;
+        dsAllocInfo.pSetLayouts = &m_EntitySetLayout;
+        VK_CHECK(vkAllocateDescriptorSets(m_Device, &dsAllocInfo, &entitySdf.descriptorSet));
+
+        VkDescriptorImageInfo descImageInfo{};
+        descImageInfo.sampler = m_EntitySampler;
+        descImageInfo.imageView = entitySdf.view;
+        descImageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        VkWriteDescriptorSet write{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+        write.dstSet = entitySdf.descriptorSet;
+        write.dstBinding = 0;
+        write.descriptorCount = 1;
+        write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        write.pImageInfo = &descImageInfo;
+        vkUpdateDescriptorSets(m_Device, 1, &write, 0, nullptr);
+
+        // --- One-shot upload + permanent layout transition (mirrors Init()'s own STEP 3, for
+        // exactly this one entity). ---
+        VkDeviceSize uploadBytes = static_cast<VkDeviceSize>(decodedGrid.size()) * sizeof(float);
+        VkBuffer stagingBuffer = VK_NULL_HANDLE;
+        VmaAllocation stagingAllocation = VK_NULL_HANDLE;
+        VmaAllocationInfo stagingAllocResultInfo{};
+        VkBufferCreateInfo stagingInfo{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+        stagingInfo.size = uploadBytes;
+        stagingInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+        VmaAllocationCreateInfo stagingAllocInfo{};
+        stagingAllocInfo.usage = VMA_MEMORY_USAGE_CPU_ONLY;
+        stagingAllocInfo.flags = VMA_ALLOCATION_CREATE_MAPPED_BIT;
+        VK_CHECK(vmaCreateBuffer(m_Allocator, &stagingInfo, &stagingAllocInfo, &stagingBuffer, &stagingAllocation, &stagingAllocResultInfo));
+        std::memcpy(stagingAllocResultInfo.pMappedData, decodedGrid.data(), static_cast<size_t>(uploadBytes));
+
+        VulkanUtils::ExecuteOneShotCommands(m_Device, commandPool, queue, [&](VkCommandBuffer cmd) {
+            VulkanUtils::TransitionImageLayout(cmd, entitySdf.image,
+                VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+
+            VkBufferImageCopy copyRegion{};
+            copyRegion.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+            copyRegion.imageExtent = { entitySdf.resolution, entitySdf.resolution, entitySdf.resolution };
+            vkCmdCopyBufferToImage(cmd, stagingBuffer, entitySdf.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copyRegion);
+
+            VulkanUtils::TransitionImageLayout(cmd, entitySdf.image,
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+            });
+        vmaDestroyBuffer(m_Allocator, stagingBuffer, stagingAllocation);
+
+        // --- Commit: append to the composite list, mark its own region dirty in every level so the
+        // next RecordUpdate() actually composites it (mirrors the Phase 4 rotation path's own
+        // per-entity dirty-region enqueue -- see EnqueueDirtyRegionsForEntity's own comment). ---
+        const float boundingRadius = entitySdf.voxelSize * static_cast<float>(entitySdf.resolution) * 0.5f;
+        const maths::vec3 entityCenter = entitySdf.volumeMin + maths::vec3{ boundingRadius, boundingRadius, boundingRadius };
+
+        m_Entities.push_back(entitySdf);
+        ++m_DynamicEntityCount;
+
+        EnqueueDirtyRegionsForEntity(newEntityID, entityCenter, boundingRadius * 1.7321f); // sqrt(3) cube-diagonal margin, same as RecordUpdate's own rotation-path call.
+
+        LOG_INFO(std::format(
+            "[GlobalSDFPass] RegisterEntity: newEntityID={} (sourceEntityID={}, {}^3 SDF) registered -- "
+            "{} entit{} now composited ({} dynamic, {}/{} headroom used).",
+            newEntityID, sourceEntityID, entitySdf.resolution, m_Entities.size(),
+            m_Entities.size() == 1 ? "y" : "ies", m_DynamicEntityCount, m_DynamicEntityCount, kMaxDynamicEntities));
+        return true;
+    }
+
+    void GlobalSDFPass::UnregisterEntity(uint32_t entityID) {
+        auto it = std::find_if(m_Entities.begin(), m_Entities.end(),
+            [entityID](const EntitySDF& entity) { return entity.entityID == entityID && entity.dynamic; });
+        if (it == m_Entities.end()) {
+            LOG_WARNING(std::format(
+                "[GlobalSDFPass] UnregisterEntity: entityID={} is not a dynamically-registered entity "
+                "(either unknown, or one of Init()'s fixed-roster entries -- never removable); ignoring.", entityID));
+            return;
+        }
+
+        // Mark the region this entity's own volume covered dirty in every level BEFORE destroying
+        // its GPU resources below, so the next RecordUpdate() clears-and-recomposites those slabs
+        // without it (see this method's own header comment).
+        const float boundingRadius = it->voxelSize * static_cast<float>(it->resolution) * 0.5f;
+        const maths::vec3 entityCenter = it->volumeMin + maths::vec3{ boundingRadius, boundingRadius, boundingRadius };
+        EnqueueDirtyRegionsForEntity(entityID, entityCenter, boundingRadius * 1.7321f);
+
+        if (it->view != VK_NULL_HANDLE) vkDestroyImageView(m_Device, it->view, nullptr);
+        if (it->image != VK_NULL_HANDLE) vmaDestroyImage(m_Allocator, it->image, it->allocation);
+        if (it->descriptorSet != VK_NULL_HANDLE) {
+            vkFreeDescriptorSets(m_Device, m_DescriptorPool, 1, &it->descriptorSet);
+        }
+
+        m_Entities.erase(it);
+        --m_DynamicEntityCount;
+
+        LOG_INFO(std::format(
+            "[GlobalSDFPass] UnregisterEntity: entityID={} removed -- {} entit{} now composited ({} dynamic, "
+            "{}/{} headroom used).",
+            entityID, m_Entities.size(), m_Entities.size() == 1 ? "y" : "ies", m_DynamicEntityCount,
+            m_DynamicEntityCount, kMaxDynamicEntities));
     }
 
 }

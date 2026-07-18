@@ -807,6 +807,11 @@ bool ClusterRenderPipeline::Init(
   // Phase 1 (Nanite advanced): cross-checks SPLINE_MAX_DEVIATION against the authored curve's true
   // worst-case displacement -- see ValidateSplineBounds()'s own comment.
   ValidateSplineBounds();
+
+  // Phase 0.3 (PCG roadmap, dynamic Lumen registration): register/composite/unregister round-trip
+  // smoke test -- see RunPhase03DynamicLumenSmokeTest()'s own comment. Both m_GlobalSDF and
+  // m_SurfaceCache are already fully Init()'d by this point (STEP order above).
+  RunPhase03DynamicLumenSmokeTest(createInfo.commandPool, createInfo.queue);
 #endif
 
   LOG_INFO(
@@ -931,6 +936,129 @@ void ClusterRenderPipeline::ValidateSplineBounds() const {
         LOG_INFO(std::format(
             "[ClusterRenderPipeline] ValidateSplineBounds: true worst-case spline displacement {:.4f} "
             "is within SPLINE_MAX_DEVIATION ({:.4f}). OK.", maxDisplacement, kSplineMaxDeviation));
+    }
+}
+
+void ClusterRenderPipeline::RunPhase03DynamicLumenSmokeTest(VkCommandPool commandPool, VkQueue queue) {
+    LOG_INFO("[ClusterRenderPipeline] Phase 0.3 dynamic Lumen registration smoke test: starting...");
+
+    // Borrow a few already-known entityIDs' baked geometry to register under FRESH synthetic
+    // identities -- see GlobalSDFPass::RegisterEntity/SurfaceCachePass::RegisterEntity's own
+    // comments for why a brand-new entityID is required here: every entityID this engine's current
+    // content set defines is already part of both passes' fixed Init()-time roster (this is exactly
+    // the "dynamic add" scenario Phase 0.3 targets -- a genuinely NEW entity, not a pre-existing
+    // one). GetTracedEntityInfos() is simply the cheapest already-public way to enumerate valid
+    // source entityIDs whose Fallback Mesh geometry is known-good.
+    std::vector<GlobalSDFPass::TracedEntityInfo> traced = m_GlobalSDF.GetTracedEntityInfos();
+    if (traced.empty()) {
+        LOG_WARNING("[ClusterRenderPipeline] Phase 0.3 smoke test: no entities loaded, skipping "
+                    "(nothing to borrow Fallback Mesh geometry from).");
+        return;
+    }
+
+    constexpr uint32_t kTestEntityCount = 3;
+    // Sentinel range, comfortably outside core::IDManager's small, dense, sequentially-assigned
+    // entityID space -- guaranteed to never collide with a real entity.
+    constexpr uint32_t kSyntheticEntityIDBase = 0x7FFF0000u;
+
+    const uint32_t testCount = std::min<uint32_t>(kTestEntityCount, static_cast<uint32_t>(traced.size()));
+    uint32_t sourceEntityIDs[kTestEntityCount]{};
+    uint32_t newEntityIDs[kTestEntityCount]{};
+    for (uint32_t i = 0; i < testCount; ++i) {
+        sourceEntityIDs[i] = traced[traced.size() - testCount + i].entityID;
+        newEntityIDs[i] = kSyntheticEntityIDBase + i;
+    }
+
+    const uint32_t sdfCountBefore = static_cast<uint32_t>(m_GlobalSDF.GetTracedEntityInfos().size());
+    const uint32_t cardCountBefore = m_SurfaceCache.GetActiveCardCount();
+
+    uint32_t sdfRegisteredOk = 0, cardsRegisteredOk = 0;
+    for (uint32_t i = 0; i < testCount; ++i) {
+        bool sdfOk = m_GlobalSDF.RegisterEntity(newEntityIDs[i], sourceEntityIDs[i], commandPool, queue);
+        bool cardOk = m_SurfaceCache.RegisterEntity(newEntityIDs[i], sourceEntityIDs[i], commandPool, queue);
+        sdfRegisteredOk += sdfOk ? 1u : 0u;
+        cardsRegisteredOk += cardOk ? 1u : 0u;
+        LOG_INFO(std::format(
+            "[ClusterRenderPipeline] Phase 0.3 smoke test: RegisterEntity(newEntityID={}, sourceEntityID={}) "
+            "-> GlobalSDF={} SurfaceCache={}.",
+            newEntityIDs[i], sourceEntityIDs[i], sdfOk ? "OK" : "FAIL", cardOk ? "OK" : "FAIL"));
+    }
+
+    const uint32_t sdfCountAfterRegister = static_cast<uint32_t>(m_GlobalSDF.GetTracedEntityInfos().size());
+    const uint32_t cardCountAfterRegister = m_SurfaceCache.GetActiveCardCount();
+    LOG_INFO(std::format(
+        "[ClusterRenderPipeline] Phase 0.3 smoke test: after registration -- Global SDF composite entities "
+        "{} -> {} ({} succeeded), Surface Cache active cards {} -> {} ({} entities succeeded).",
+        sdfCountBefore, sdfCountAfterRegister, sdfRegisteredOk,
+        cardCountBefore, cardCountAfterRegister, cardsRegisteredOk));
+
+    // --- Exercise one real Global SDF composite dispatch so RecordSlab's per-entity min-composite
+    // loop actually runs at least once against the new entries, not just gets counted. Bounded
+    // cost regardless of scene size (kMaxDirtySlabsPerCall slabs per call, each a cheap AABB
+    // overlap test against at most entityCount+kMaxDynamicEntities entities -- see RecordUpdate's
+    // own class-comment note), so safe to run unconditionally here.
+    //
+    // Deliberately NOT also exercising SurfaceCachePass::UpdateVisibility()/RecordCapture() here:
+    // an early version of this smoke test did, using a deliberately oversized frustum to
+    // guarantee the 3 new entities' cards were visible -- but UpdateVisibility() frustum-tests
+    // EVERY card in m_Cards, not just the newly-registered ones, so that oversized frustum also
+    // made the ENTIRE Init()-time roster's ~138 cards simultaneously "visible" for the first time
+    // this process ever called UpdateVisibility() at all (normally the real per-frame camera only
+    // ever makes a small, frustum-culled fraction resident at once). That drove the atlas past its
+    // real capacity and into AllocateCardPage()'s EvictAllUnwantedCards()/DefragmentAtlas()
+    // fallback chain for every one of the ~100+ cards that did not fit, each retry re-sorting and
+    // re-packing every other already-resident card from scratch -- an O(n^2 log n) cascade at
+    // n~150 that made real startup take several extra minutes. Confirmed via measurement, not
+    // guessed. Getting the new cards CAPTURED is exactly what the real game's own first
+    // UpdateVisibility()/RecordCapture() calls (driven by the actual camera, moments after this
+    // smoke test unregisters everything again) already do for any card that is still resident at
+    // that point -- redundant, risky-if-widened-further, and outside what this validation actually
+    // needs to prove. The count-based evidence above/below (active card count moving by exactly
+    // the expected amount and back) is the log-based check this task's own scope explicitly calls
+    // sufficient.
+    VulkanUtils::ExecuteOneShotCommands(m_Device, commandPool, queue, [&](VkCommandBuffer cmd) {
+        // entityTransformsCPU == nullptr is safe here: RecordUpdate()'s own rotation-path indexing
+        // is gated on entityTransformsCPU != nullptr (see that method's own comment), so passing
+        // nullptr unconditionally skips it regardless of config::ENTITY_SELF_ROTATION_ENABLED's
+        // value -- see RegisterEntity()'s own "risk" note on why a synthetic entityID must never
+        // reach that indexing.
+        m_GlobalSDF.RecordUpdate(cmd, maths::vec3{ 0.0f, 0.0f, 0.0f }, nullptr);
+        });
+    // One RecordUpdate() call only drains up to kMaxDirtySlabsPerCall slabs (see that method's own
+    // "asynchronous" class-comment note) -- drain any remainder across a few more one-shot calls so
+    // this smoke test's own composite dispatch actually completes now, instead of silently
+    // deferring to whatever the first real frame after this happens to drain.
+    for (uint32_t i = 0; i < 8 && !m_GlobalSDF.IsFullyStreamed(); ++i) {
+        VulkanUtils::ExecuteOneShotCommands(m_Device, commandPool, queue, [&](VkCommandBuffer cmd) {
+            m_GlobalSDF.RecordUpdate(cmd, maths::vec3{ 0.0f, 0.0f, 0.0f }, nullptr);
+            });
+    }
+    LOG_INFO(std::format(
+        "[ClusterRenderPipeline] Phase 0.3 smoke test: Global SDF composite dispatch exercised (fully "
+        "streamed: {}).", m_GlobalSDF.IsFullyStreamed() ? "yes" : "no"));
+
+    // --- Unregister everything this smoke test itself added, confirming every count returns to its
+    // pre-test baseline. ---
+    for (uint32_t i = 0; i < testCount; ++i) {
+        m_GlobalSDF.UnregisterEntity(newEntityIDs[i]);
+        m_SurfaceCache.UnregisterEntity(newEntityIDs[i]);
+    }
+
+    const uint32_t sdfCountAfterUnregister = static_cast<uint32_t>(m_GlobalSDF.GetTracedEntityInfos().size());
+    const uint32_t cardCountAfterUnregister = m_SurfaceCache.GetActiveCardCount();
+    const bool sdfCleanupOk = (sdfCountAfterUnregister == sdfCountBefore);
+    const bool cardCleanupOk = (cardCountAfterUnregister == cardCountBefore);
+    LOG_INFO(std::format(
+        "[ClusterRenderPipeline] Phase 0.3 smoke test: after unregistration -- Global SDF composite entities "
+        "{} (baseline {}, {}), Surface Cache active cards {} (baseline {}, {}).",
+        sdfCountAfterUnregister, sdfCountBefore, sdfCleanupOk ? "OK" : "MISMATCH",
+        cardCountAfterUnregister, cardCountBefore, cardCleanupOk ? "OK" : "MISMATCH"));
+
+    const bool allOk = (sdfRegisteredOk == testCount) && (cardsRegisteredOk == testCount) && sdfCleanupOk && cardCleanupOk;
+    if (allOk) {
+        LOG_INFO("[ClusterRenderPipeline] Phase 0.3 dynamic Lumen registration smoke test: PASSED.");
+    } else {
+        LOG_ERROR("[ClusterRenderPipeline] Phase 0.3 dynamic Lumen registration smoke test: FAILED.");
     }
 }
 #endif
