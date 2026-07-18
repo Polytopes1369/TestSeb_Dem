@@ -1271,7 +1271,7 @@ void ClusterRenderPipeline::RecordFrameEarly(VkCommandBuffer cmdEarly,
   // AtmosClimatePass.h's own class comment); placed immediately before [1z] so a future Fog/Cloud
   // consumer added inside that same block always sees an already-current buffer this frame.
   // =========================================================================================
-  m_AtmosClimate.RecordUpdate(cmd, globalTimeSeconds);
+  m_AtmosClimate.RecordUpdate(cmdEarly, globalTimeSeconds);
 
   // =========================================================================================
   // [1z] Lumen-style GI infrastructure: Virtual Shadow Map page requests/renders (Phase 3) ->
@@ -2423,7 +2423,7 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
   // one exception that actually produces new GPU work this frame) so it's recorded before both the
   // HUD-targeting selection and the final blit's own selection reference its output image.
   if (config::debugview::SELECTED_BUFFER_INDEX != 0) {
-    RecordDebugBufferView(cmd);
+    RecordDebugBufferView(cmdLate);
   }
 
   // =========================================================================================
