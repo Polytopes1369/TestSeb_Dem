@@ -1,4 +1,4 @@
-#include "renderer/passes/MegaLightsPass.h"
+﻿#include "renderer/passes/MegaLightsPass.h"
 
 #include <algorithm>
 #include <cfloat>
@@ -412,7 +412,7 @@ namespace renderer {
             pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
             pipelineInfo.stage.module = shaderModule;
             pipelineInfo.stage.pName = "main";
-            VK_CHECK(vkCreateComputePipelines(m_Device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_ShadePipeline));
+            VK_CHECK(vkCreateComputePipelines(m_Device, VulkanPipeline::GetPipelineCache(), 1, &pipelineInfo, nullptr, &m_ShadePipeline));
             vkDestroyShaderModule(m_Device, shaderModule, nullptr);
             RegisterResource([this] { vkDestroyPipeline(m_Device, m_ShadePipeline, nullptr); m_ShadePipeline = VK_NULL_HANDLE; });
         }
@@ -493,7 +493,7 @@ namespace renderer {
             pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
             pipelineInfo.stage.module = shaderModule;
             pipelineInfo.stage.pName = "main";
-            VK_CHECK(vkCreateComputePipelines(m_Device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_SpatialReusePipeline));
+            VK_CHECK(vkCreateComputePipelines(m_Device, VulkanPipeline::GetPipelineCache(), 1, &pipelineInfo, nullptr, &m_SpatialReusePipeline));
             vkDestroyShaderModule(m_Device, shaderModule, nullptr);
             RegisterResource([this] { vkDestroyPipeline(m_Device, m_SpatialReusePipeline, nullptr); m_SpatialReusePipeline = VK_NULL_HANDLE; });
         }
@@ -598,7 +598,7 @@ namespace renderer {
             pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
             pipelineInfo.stage.module = shaderModule;
             pipelineInfo.stage.pName = "main";
-            VK_CHECK(vkCreateComputePipelines(m_Device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_FinalShadePipeline));
+            VK_CHECK(vkCreateComputePipelines(m_Device, VulkanPipeline::GetPipelineCache(), 1, &pipelineInfo, nullptr, &m_FinalShadePipeline));
             vkDestroyShaderModule(m_Device, shaderModule, nullptr);
             RegisterResource([this] { vkDestroyPipeline(m_Device, m_FinalShadePipeline, nullptr); m_FinalShadePipeline = VK_NULL_HANDLE; });
         }
@@ -649,7 +649,7 @@ namespace renderer {
             pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
             pipelineInfo.stage.module = shaderModule;
             pipelineInfo.stage.pName = "main";
-            VK_CHECK(vkCreateComputePipelines(m_Device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_CompositePipeline));
+            VK_CHECK(vkCreateComputePipelines(m_Device, VulkanPipeline::GetPipelineCache(), 1, &pipelineInfo, nullptr, &m_CompositePipeline));
             vkDestroyShaderModule(m_Device, shaderModule, nullptr);
             RegisterResource([this] { vkDestroyPipeline(m_Device, m_CompositePipeline, nullptr); m_CompositePipeline = VK_NULL_HANDLE; });
         }

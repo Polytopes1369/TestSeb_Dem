@@ -1,4 +1,4 @@
-#include "renderer/passes/GlobalSDFPass.h"
+﻿#include "renderer/passes/GlobalSDFPass.h"
 
 #include <algorithm>
 #include <cstring>
@@ -473,7 +473,7 @@ namespace renderer {
         pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
         pipelineInfo.stage.module = shaderModule;
         pipelineInfo.stage.pName = "main";
-        VK_CHECK(vkCreateComputePipelines(m_Device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_Pipeline));
+        VK_CHECK(vkCreateComputePipelines(m_Device, VulkanPipeline::GetPipelineCache(), 1, &pipelineInfo, nullptr, &m_Pipeline));
         vkDestroyShaderModule(m_Device, shaderModule, nullptr);
 
         return true;

@@ -51,11 +51,28 @@ namespace renderer {
 
         static constexpr VkFormat kOutputFormat = VK_FORMAT_R8G8B8A8_UNORM;
         static constexpr uint32_t kHistogramBinCount = 256u;
-        // Log2-luminance range the histogram covers: roughly EV -10 (deep shadow) to EV +4 (bright
-        // sky/sun highlight) in raw linear luminance terms -- wide enough for both indoor-dark and
-        // outdoor-bright demoscene scenes without every sample collapsing into the two end bins.
-        static constexpr float kMinLogLuminance = -10.0f;
-        static constexpr float kLogLuminanceRange = 14.0f;
+        // Log2-luminance range the histogram covers, in the SAME raw linear g_HDRColor units the
+        // scene is actually lit in -- i.e. real photometric nits, not a normalized [0,1] "unitless"
+        // scale. Re-tuned 2026-07-19 (Task F11, enabling Auto Exposure): the OLD range here
+        // ([2^-10, 2^-10+2^14] = [~0.001, 16]) predates the 2026-07-17/18 lighting recalibration to
+        // real UE5.8 lux/candela values (world::DirectionalLight::intensity = 10,000 lux -- see that
+        // struct's own comment) and the matching manual Physical Camera re-tune (EXPOSURE_APERTURE's
+        // own comment: EV100 ~17.0, MaxLuminance = 1.2*2^EV100 ~= 153,600). Under that real-lux
+        // scale, a directly-sunlit mid-albedo diffuse surface alone already reads ~1,500-2,000 nits
+        // (irradiance*albedo/pi), with GGX specular highlights and the sky/sun disk itself reaching
+        // into the tens of thousands -- i.e. almost every non-black pixel in a real scene would have
+        // clamped into the histogram's single top bin (256) under the old range, collapsing Auto
+        // Exposure's weighted-mean luminance to a constant ~16 regardless of true scene content
+        // (targetEV100 = log2(16*100/12.5) ~= 7.0, a ~10-stop under-exposure vs the correct ~17.0 --
+        // a severe, constant blow-out, not oscillation, but just as wrong). New range covers
+        // [2^-6, 2^-6+2^24] = [~0.0156, ~262,144]: comfortably brackets the manual metering's own
+        // MaxLuminance ceiling with headroom for brighter specular fireflies (BloomUpsampleComposite
+        // .comp/PostProcessComposite.comp's own SanitizeHDR guards separately cap those at 50,000
+        // before they reach Bloom), while still resolving ~0.094 EV/bin (24 stops / 254 usable bins)
+        // -- plenty fine for a stable weighted-mean read. Sub-0.005 luminance is still routed to the
+        // dedicated bin 0 (see AutoExposureHistogram.comp's own ColorToBin()), unaffected by this.
+        static constexpr float kMinLogLuminance = -6.0f;
+        static constexpr float kLogLuminanceRange = 24.0f;
 
         // Physical Camera + White Balance + Color Correction, all user/scene tunable -- exposed as
         // one plain struct (not Debug-only: these are legitimate Release-time artistic controls,
@@ -70,6 +87,17 @@ namespace renderer {
             float exposureCompensationEV = 0.0f;
             float adaptationSpeedUpEVPerSec = 3.0f;   // Scene darkened -> exposure rising.
             float adaptationSpeedDownEVPerSec = 1.0f; // Scene brightened -> exposure falling.
+            // UE5.8's own Auto Exposure Histogram metering defaults: only the middle slice of the
+            // histogram's CUMULATIVE population (by pixel count, not by bin index) feeds the
+            // weighted-mean luminance -- the bottom `histogramLowPercent`% (deep shadow/near-black
+            // pixels, which would otherwise pull exposure up whenever a scene has a lot of shadow
+            // area on screen) and the top `100-histogramHighPercent`% (small, intense specular
+            // highlights/fireflies -- including MegaLights' own residual per-pixel ReSTIR noise,
+            // see EXPOSURE_USE_AUTO's own EngineConfig.h comment for why that mattered here
+            // specifically) are trimmed before averaging. See AutoExposureAdapt.comp's own comment
+            // for the exact trimmed-weighted-mean algorithm this drives.
+            float histogramLowPercent = 80.0f;
+            float histogramHighPercent = 98.3f;
 
             // White Balance
             float whiteBalanceTempKelvin = 6500.0f; // 6500 = neutral (D65).
@@ -325,6 +353,8 @@ namespace renderer {
             float exposureCompensationEV = 0.0f;
             float manualEV100 = 0.0f;
             uint32_t useAutoExposure = 1u;
+            float histogramLowPercent = 80.0f;
+            float histogramHighPercent = 98.3f;
         };
 
         // Byte-for-byte mirror of AutoExposureHistogram.comp's push_constant block.
@@ -348,6 +378,21 @@ namespace renderer {
         GpuBuffer m_HistogramBuffer;      // 256 x uint, cleared by AutoExposureAdapt.comp every frame.
         GpuBuffer m_ExposureStateBuffer;  // { float currentEV100; float currentAvgLuminance; }, persistent.
         GpuBuffer m_ParamsBuffer;         // PostProcessParamsUBO, re-uploaded every frame.
+
+#ifndef NDEBUG
+        // Debug-only Auto Exposure telemetry (Task F11): a tiny persistently-mapped (CPU_ONLY,
+        // mapped=true) 1-frame-latent copy of m_ExposureStateBuffer, recorded at the tail of every
+        // RecordComposite() call and logged at the TOP of the next one -- same "record this frame,
+        // consume next frame after the frame-fence wait already guarantees completion" pattern as
+        // renderer::ClusterLODSelectionPass's own m_DebugDecisionReadbackBuffer/RecordDebugReadback
+        // (see that class's own comment for the full fence-ordering argument, which applies
+        // identically here since this pass also only ever runs on cmdLate). Exists purely so a
+        // Debug build can log currentEV100/currentAvgLuminance to demo_log.txt every few frames for
+        // empirical flicker validation (a raw scalar time series is far more reliable than diffing
+        // screenshots) -- zero Release footprint, matching CLAUDE.md's Debug/Release separation rule.
+        GpuBuffer m_DebugExposureReadbackBuffer;
+        uint32_t m_DebugExposureLogFrameCounter = 0u;
+#endif
 
         VkDescriptorPool m_DescriptorPool = VK_NULL_HANDLE;
 

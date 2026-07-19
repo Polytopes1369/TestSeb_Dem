@@ -21,8 +21,8 @@
 //      whole downsample chain (mip 0 = thresholded box-filter of `hdrSourceView`, mips 1..N-1 =
 //      plain box-filter of the mip above), then the whole upsample chain (mip N-2 down to mip 0,
 //      each = this mip's own downsample-chain detail + a tent-filtered upsample of the smaller
-//      mip), with the mip-0 call additionally generating Lens Flare/Anamorphic Flare/Lens Dirt
-//      (100% procedural, no texture asset for any of the three) and adding them on top.
+//      mip), with the mip-0 call additionally generating Lens Flare (Ghosts + Halo)/Anamorphic
+//      Flare/Lens Dirt (100% procedural, no texture asset for any of the four) and adding them on top.
 //
 // GetOutputView() (the upsample chain's own mip 0) is what renderer::PostProcessPass's composite
 // shader samples and adds to the HDR scene color.
@@ -59,6 +59,15 @@ namespace renderer {
             float ghostIntensity = 0.3f;
             uint32_t ghostCount = 4u;
             float ghostSpacing = 1.0f;
+
+            // Halo: single fixed-radius ring sample, opposite side of screen center from the
+            // source -- the other classic image-based lens-flare element alongside the ghost chain.
+            float haloIntensity = 0.12f;
+            float haloWidth = 0.45f;
+
+            // Per-ghost/halo chromatic shift: small per-channel radial UV split at each flare
+            // sample (real lens ghosting separates color slightly per internal reflection).
+            float chromaticShift = 0.008f;
 
             float anamorphicIntensity = 0.15f;
             float anamorphicStretch = 0.10f; // UV-space half-width of the horizontal streak kernel.
@@ -100,6 +109,9 @@ namespace renderer {
             float ghostIntensity = 0.0f;
             uint32_t ghostCount = 0u;
             float ghostSpacing = 0.0f;
+            float haloIntensity = 0.0f;
+            float haloWidth = 0.0f;
+            float chromaticShift = 0.0f;
             float anamorphicIntensity = 0.0f;
             float anamorphicStretch = 0.0f;
             float dirtIntensity = 0.0f;

@@ -207,18 +207,33 @@ inline float EXPOSURE_APERTURE = 4.0f;             // f-stop.
 // strength as a side effect); 1/8000s is a realistic, if fast, daylight electronic-shutter speed.
 inline float EXPOSURE_SHUTTER_SPEED_SECONDS = 1.0f / 8000.0f;
 inline float EXPOSURE_ISO = 100.0f;
-// Manual (not Auto) for now: renderer::MegaLightsPass (Phase A) has no temporal reservoir reuse
-// yet (per-frame RIS re-samples a different light, spatially but not temporally denoised -- see
-// that class' own header comment, "Phase B" is the planned fix) -- Auto Exposure's histogram
-// directly measures that per-frame luminance noise and reacts to it every frame, amplifying an
-// otherwise-subtle spatial grain into a visible global brightness flicker. Manual metering (a
-// fixed EV100 snapped instantly every frame, see AutoExposureAdapt.comp's own Auto/Manual branch)
-// removes that reactive amplification entirely; MegaLights' own residual per-pixel grain is a
-// separate, much smaller-magnitude cosmetic issue tracked against the Phase B temporal-reuse work.
-inline bool EXPOSURE_USE_AUTO = false;
+// Auto Exposure re-enabled (Task F11, 2026-07-19; UE5.8's own Post Process Volume default is Auto,
+// not Manual). Previously hardcoded Manual-only because renderer::MegaLightsPass's Phase A had no
+// temporal reservoir reuse (per-frame RIS re-sampled a different light, spatially but not
+// temporally denoised) -- Auto Exposure's histogram directly measures that per-frame luminance
+// noise and reacts to it every frame, amplifying an otherwise-subtle spatial grain into a visible
+// global brightness flicker. That gap is closed: MegaLightsPass's Phase 4 (see that class' own
+// header comment, "temporal ReSTIR ... folded directly into MegaLightsShade.comp") now temporally
+// accumulates reservoirs across frames, and renderer::TAATSRPass caps its own adaptive TAA alpha
+// at 0.5 (a second, independent smoothing layer over the same per-pixel noise). On top of both of
+// those, AutoExposureAdapt.comp's own histogram metering now also trims to the UE-style
+// [EXPOSURE_HISTOGRAM_LOW_PERCENT, EXPOSURE_HISTOGRAM_HIGH_PERCENT] cumulative-population slice
+// instead of averaging the WHOLE histogram (see that shader's own comment) -- any residual
+// per-pixel MegaLights noise or specular fireflies now has to be common to a wide swath of the
+// frame's pixel population, not just a handful of outliers, before it can move the metered
+// exposure at all. Also re-tuned this same pass, PostProcessPass::kMinLogLuminance/
+// kLogLuminanceRange (see that constant's own header comment): the histogram's luminance range
+// itself was still a pre-recalibration relic that clamped nearly this whole real-lux-scale scene
+// into its single top bin, which -- independent of any flicker question -- would have made Auto
+// Exposure compute a constant, badly WRONG exposure the moment it was ever turned on.
+inline bool EXPOSURE_USE_AUTO = true;
 inline float EXPOSURE_COMPENSATION_EV = 0.0f;
-inline float EXPOSURE_ADAPTATION_SPEED_UP_EV_PER_SEC = 3.0f;   // Scene darkened -> exposure rising.
-inline float EXPOSURE_ADAPTATION_SPEED_DOWN_EV_PER_SEC = 1.0f; // Scene brightened -> exposure falling.
+inline float EXPOSURE_ADAPTATION_SPEED_UP_EV_PER_SEC = 3.0f;   // Scene darkened -> exposure rising. (UE5.8 default.)
+inline float EXPOSURE_ADAPTATION_SPEED_DOWN_EV_PER_SEC = 1.0f; // Scene brightened -> exposure falling. (UE5.8 default.)
+// UE5.8's own Auto Exposure Histogram "Low Percent"/"High Percent" defaults -- see
+// AutoExposureAdapt.comp's own comment for exactly how these trim the metering average.
+inline float EXPOSURE_HISTOGRAM_LOW_PERCENT = 80.0f;
+inline float EXPOSURE_HISTOGRAM_HIGH_PERCENT = 98.3f;
 
 // White Balance
 inline float WHITE_BALANCE_TEMP_KELVIN = 6500.0f;  // 6500 = neutral (D65).
@@ -270,10 +285,28 @@ inline float BLOOM_SOFT_KNEE = 0.5f;
 inline float BLOOM_INTENSITY = 1.0f;
 inline float BLOOM_UPSAMPLE_RADIUS = 1.0f;
 
-// Lens Flare (procedural radial ghosts, no texture asset)
+// Lens Flare (procedural radial ghosts, no texture asset). Shares BLOOM_THRESHOLD as its own
+// bright-pass threshold rather than a separate knob -- the ghost chain samples
+// renderer::BloomPass's own downsample chain (kFlareSourceMip), the SAME already-thresholded
+// bright-pass BLOOM_THRESHOLD produces, so a second threshold would just re-extract brights the
+// pass already extracted once (see BloomPass.h's own class comment for why that double work is
+// deliberately avoided).
 inline float LENS_FLARE_GHOST_INTENSITY = 0.3f;
 inline uint32_t LENS_FLARE_GHOST_COUNT = 4u;
 inline float LENS_FLARE_GHOST_SPACING = 1.0f;
+
+// Halo: a single fixed-radius ring sample along the same source-to-center line the ghost chain
+// walks (see BloomUpsampleComposite.comp's own SampleHalo comment) -- the other classic image-
+// based lens-flare element alongside the ghost chain (UE5.8's own Bloom settings expose "Ghosts"
+// and "Halo" as two distinct knobs; this project's single dual-filter mip chain produces both).
+inline float HALO_INTENSITY = 0.12f;
+inline float HALO_WIDTH = 0.45f;  // UV-space radius from screen center, opposite side from the source.
+
+// Per-ghost/halo chromatic shift: a small per-channel RADIAL UV split applied at each ghost/halo
+// sample (real lens ghosting separates color slightly per internal reflection/incidence angle) --
+// distinct from CHROMATIC_ABERRATION_INTENSITY below, which aberrates the base scene capture
+// itself, not the flare/ghost samples.
+inline float LENS_FLARE_CHROMATIC_SHIFT = 0.008f;
 
 // Anamorphic Lens Flare (procedural horizontal streak, no texture asset)
 inline float ANAMORPHIC_FLARE_INTENSITY = 0.15f;
@@ -370,6 +403,13 @@ inline float FILM_GRAIN_RESPONSE_MIDPOINT = 0.5f;
 // every shader with a redundant enabled/disabled branch. Not wired into ApplyProfile() (these are
 // live debug/comparison switches, not a hardware-quality tier).
 inline bool BLOOM_ENABLED = true;
+// Separate from BLOOM_ENABLED: zeroes only the ghost/halo/anamorphic-streak terms at the
+// RecordGenerate call site (ClusterRenderPipeline.cpp), leaving the base bloom glow itself under
+// BLOOM_ENABLED's own independent control -- matches UE5.8, where "Lens Flares" is its own Bloom
+// sub-toggle distinct from the base bloom bleed. Lens Dirt needs no separate gate here: its own
+// mask (BloomUpsampleComposite.comp) only ever attenuates the ghost+streak+halo term, so it is
+// already a visual no-op once this toggle zeroes that term.
+inline bool LENS_FLARE_ENABLED = true;
 inline bool CHROMATIC_ABERRATION_ENABLED = true;
 inline bool VIGNETTE_ENABLED = true;
 inline bool HEAT_DISTORTION_ENABLED = true;

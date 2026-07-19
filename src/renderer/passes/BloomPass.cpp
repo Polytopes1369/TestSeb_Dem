@@ -346,6 +346,9 @@ namespace renderer {
             pc.ghostIntensity = settings.ghostIntensity;
             pc.ghostCount = settings.ghostCount;
             pc.ghostSpacing = settings.ghostSpacing;
+            pc.haloIntensity = settings.haloIntensity;
+            pc.haloWidth = settings.haloWidth;
+            pc.chromaticShift = settings.chromaticShift;
             pc.anamorphicIntensity = settings.anamorphicIntensity;
             pc.anamorphicStretch = settings.anamorphicStretch;
             pc.dirtIntensity = settings.dirtIntensity;

@@ -1,4 +1,4 @@
-#include "renderer/passes/WaterForwardPass.h"
+﻿#include "renderer/passes/WaterForwardPass.h"
 
 #include <cstring>
 #include <format>
@@ -350,7 +350,7 @@ namespace renderer {
         pipelineInfo.layout = m_PipelineLayout;
         pipelineInfo.pNext = &pipelineRendering;
 
-        if (vkCreateGraphicsPipelines(m_Device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_Pipeline) != VK_SUCCESS) {
+        if (vkCreateGraphicsPipelines(m_Device, VulkanPipeline::GetPipelineCache(), 1, &pipelineInfo, nullptr, &m_Pipeline) != VK_SUCCESS) {
             throw std::runtime_error("Failed to create WaterForwardPass graphics pipeline!");
         }
         RegisterResource([this] { vkDestroyPipeline(m_Device, m_Pipeline, nullptr); m_Pipeline = VK_NULL_HANDLE; });

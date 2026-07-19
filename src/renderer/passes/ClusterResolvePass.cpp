@@ -163,7 +163,8 @@ namespace renderer {
         VK_CHECK(vkCreateImageView(m_Device, &viewInfo, nullptr, &m_OutputColorView));
 
         // --- Minimal GBuffer: normal/depth/albedo/roughness-metallic, same extent, same
-        // STORAGE|SAMPLED usage as the color image above (renderer::ScreenProbeGIPass samples the
+        // STORAGE|SAMPLED usage as the color image above (this codebase's downstream GI/lighting
+        // passes -- e.g. renderer::ReflectionTrace, renderer::MegaLightsShade -- sample the
         // first 3; only this shader ever writes any of them) minus COLOR_ATTACHMENT_BIT -- none of
         // these 4 images is ever bound as a render attachment, unlike the color image above (see
         // its own usage-flags comment). ---
@@ -578,10 +579,11 @@ namespace renderer {
         // GetOutputColorImage() visible to a later sampled read (a future preview/blit pass) or a
         // transfer-based blit to the swapchain -- whichever a caller ends up using; both dst
         // stage/access pairs are included since this class does not itself know which.
-        // SHADER_STORAGE_READ is additionally included (on top of SAMPLED_READ) because
-        // renderer::ScreenProbeGIPass reads the 3 new GBuffer outputs (normal/depth/albedo) via
-        // plain imageLoad, not a sampler -- and read-modify-writes GetOutputColorImage() itself
-        // the same way.
+        // SHADER_STORAGE_READ is additionally included (on top of SAMPLED_READ) because several
+        // GI/lighting passes (e.g. renderer::ReflectionTrace, renderer::MegaLightsShade) read the
+        // 3 GBuffer outputs (normal/depth/albedo) via plain imageLoad, not a sampler -- and
+        // renderer::ReflectionPass::RecordGather read-modify-writes GetOutputColorImage() itself
+        // the same way (see that method's own comment).
         VulkanUtils::RecordMemoryBarrier(cmd,
             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_COPY_BIT,

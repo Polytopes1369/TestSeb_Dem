@@ -167,6 +167,7 @@
 #include "renderer/debug/ClusterTriangleStatsPass.h"
 #include "renderer/debug/DebugBufferViewPass.h"
 #include "renderer/debug/DebugTextOverlay.h"
+#include "renderer/debug/GpuTimestampProfiler.h"
 #include "renderer/debug/ParticleDebugViewPass.h"
 // PCG editor-tooling roadmap, Phase 7.2 ("PCG Point Cloud Debug Visualization"): draws
 // RunPcgFullPipelineSmokeTest()'s own point set as wireframe box gizmos -- see that class' own
@@ -739,6 +740,29 @@ namespace renderer {
         // config::debugview::PCG_POINT_CLOUD_VIZ), main.cpp never touches the raw pcg::PcgPoint
         // data itself.
         uint32_t GetDebugPcgPointCloudCount() const { return m_PcgPointCloudDebugView.GetPointCount(); }
+
+        // B1 (audit-fix roadmap, per-pass GPU timestamp profiler): rolling-averaged GPU milliseconds
+        // for every graphics-queue pass zone recorded so far this session (RecordFrameEarly/
+        // RecordFrameMid/RecordFrameLate, all on the same queue -- see m_GpuProfiler's own
+        // declaration comment) -- read live by main.cpp's "GPU Profiler" ImGui section. Calling this
+        // mutates m_GpuProfiler's own internal rolling-average state (see
+        // debug::GpuTimestampProfiler::GetResults()'s own comment) -- callers should call it at most
+        // once per real frame.
+        std::vector<debug::GpuTimestampProfiler::ZoneResult> GetGpuProfilerResults() { return m_GpuProfiler.GetResults(); }
+
+        // Sum of m_GpuProfiler's own zone averages -- see GetTotalAvgMs()'s own comment for why this
+        // must be called AFTER GetGpuProfilerResults() within the same frame to reflect the results
+        // that call just produced, not a stale prior frame's sum.
+        float GetGpuProfilerTotalAvgMs() { return m_GpuProfiler.GetTotalAvgMs(); }
+
+        // Async-compute queue's own independent instance (RecordAsyncCompute()'s own separate
+        // command buffer/queue -- see m_GpuProfilerAsync's own declaration comment). Same
+        // once-per-frame mutation contract as GetGpuProfilerResults() above. Empty (not merely all-
+        // zero) every frame this session never once routed through the async-compute queue -- see
+        // RecordAsyncCompute()'s own early-return comment.
+        std::vector<debug::GpuTimestampProfiler::ZoneResult> GetGpuProfilerAsyncResults() { return m_GpuProfilerAsync.GetResults(); }
+
+        bool IsGpuProfilerSupported() const { return m_GpuProfiler.IsSupported(); }
 #endif
 
     private:
@@ -1406,6 +1430,28 @@ namespace renderer {
         PcgSmokeTestResult m_PcgFullPipelineSmokeTestResult;
         PcgSmokeTestResult m_Phase03DynamicLumenSmokeTestResult;
         PcgSmokeTestResult m_PcgCellLoaderSmokeTestResult;
+
+        // B1 (audit-fix roadmap, per-pass GPU timestamp profiler): instruments every major
+        // m_*.Record*() call across RecordFrameEarly()/RecordFrameMid()/RecordFrameLate() -- all
+        // three are recorded into cmdEarly/cmdMid/cmdLate, submitted IN THAT ORDER to the SAME
+        // graphics queue every frame (see this class' own header comment), so one shared query pool
+        // with BeginFrame() called once (at the very top of RecordFrameEarly(), before the first
+        // zone) and zones opened/closed across all three command buffers works exactly like
+        // ParticleSystemPass::m_TimestampQueryPool's own precedent of writing timestamps from two
+        // different command buffers into one pool.
+        debug::GpuTimestampProfiler m_GpuProfiler;
+
+        // RecordAsyncCompute()'s own separate async-compute queue command buffer needs its OWN pool
+        // (a query pool's reset/write/copy commands must all be recorded against command buffers
+        // whose queue family the pool doesn't otherwise care about, but the whole point of tracking
+        // this queue separately is that its GPU work runs CONCURRENTLY with cmdMid on the graphics
+        // queue -- folding it into m_GpuProfiler's own shared timeline would misrepresent overlapping
+        // work as serialized). Only ever written when m_FrameScratch.useAsyncCompute is true this
+        // frame (RecordAsyncCompute() returns immediately, recording nothing at all, otherwise) --
+        // see that method's own early-return comment. A session that never once routes through the
+        // async-compute queue simply never calls this instance's BeginFrame(), so
+        // GetGpuProfilerAsyncResults() stays empty rather than reporting misleading all-zero zones.
+        debug::GpuTimestampProfiler m_GpuProfilerAsync;
 #endif
     };
 

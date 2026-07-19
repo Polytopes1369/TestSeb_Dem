@@ -1,4 +1,4 @@
-#include "renderer/passes/SurfaceCacheSWRTPass.h"
+﻿#include "renderer/passes/SurfaceCacheSWRTPass.h"
 
 #include "core/Logger.h"
 #include "renderer/passes/SurfaceCacheTraceContext.h"
@@ -87,7 +87,7 @@ namespace renderer {
         pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
         pipelineInfo.stage.module = shaderModule;
         pipelineInfo.stage.pName = "main";
-        VK_CHECK(vkCreateComputePipelines(m_Device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_Pipeline));
+        VK_CHECK(vkCreateComputePipelines(m_Device, VulkanPipeline::GetPipelineCache(), 1, &pipelineInfo, nullptr, &m_Pipeline));
         vkDestroyShaderModule(m_Device, shaderModule, nullptr);
 
         LOG_INFO("[SurfaceCacheSWRTPass] Initialized SWRT trace pipeline.");
