@@ -69,8 +69,10 @@ namespace renderer {
         static constexpr VkFormat kOutputColorFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
         // Minimal GBuffer, written alongside the shaded color above from the exact same per-pixel
         // normal/albedo/depth this shader already reconstructs in its Step 2/3 (previously computed
-        // and discarded) -- consumed by renderer::ScreenProbeGIPass for probe placement/tracing,
-        // the bilateral gather reconstruction, and the ClusterResolve.comp debug view modes 12
+        // and discarded) -- consumed by this codebase's screen-space GI/lighting passes
+        // (renderer::ScreenTracePass for its per-pixel raymarch, renderer::ReflectionTrace /
+        // renderer::MegaLightsShade for their own imageLoad reads, renderer::ATrousDenoisePass as
+        // its edge-stopping guide), and the ClusterResolve.comp debug view modes 12
         // (motion vectors) / 14 (spatial probes).
         static constexpr VkFormat kOutputNormalFormat = VK_FORMAT_R16G16_SFLOAT;   // Octahedral-encoded world-space normal (include/octahedral.glsl).
         static constexpr VkFormat kOutputDepthFormat = VK_FORMAT_R32_SFLOAT;       // The winning (hw-vs-sw arbitrated) NDC depth -- not stored anywhere else.

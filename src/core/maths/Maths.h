@@ -247,8 +247,9 @@ namespace maths {
             return result;
         }
 
-        // General 4x4 inverse (cofactor expansion / adjugate method) -- needed by
-        // renderer::ScreenProbeGIPass to unproject a GBuffer pixel's depth back to a world position
+        // General 4x4 inverse (cofactor expansion / adjugate method) -- needed by this codebase's
+        // screen-space GI/lighting passes (e.g. renderer::ScreenTracePass, renderer::ReflectionPass,
+        // renderer::MegaLightsPass) to unproject a GBuffer pixel's depth back to a world position
         // (inverse(viewProj) * clip), where neither view (not just a rigid transform once WPO/sway
         // deformation is folded in) nor proj is assumed to have a cheaper closed-form inverse.
         // Returns the identity matrix if `m` is singular (determinant ~0) rather than dividing by
