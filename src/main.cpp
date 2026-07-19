@@ -46,6 +46,20 @@
 #include "audio/AudioDebugPanel.h"
 #include "animation/AnimationDebugPanel.h"
 #include "world/WorldPartitionDebugPanel.h"
+// PCG roadmap Phase 6.3 ("Runtime Generator Hook") REAL wiring (code-audit Lane D.2, 2026-07-19):
+// world::PcgCellLoader is whole-file Debug-only (see that header's own top-of-file comment -- it
+// depends on tools/WorldPartition/'s OFPA actor-file-parsing compiled object code, which the
+// top-level CMakeLists.txt links into this executable only for the Debug configuration, matching
+// CLAUDE.md's "no tooling weight in the shipping .exe" rule), so everything that constructs/drives
+// one is necessarily Debug-only too, not by choice made here. renderer::PcgInstanceDrawPass and
+// pcg::PcgInstanceSpawnManager below are themselves fully Release-compiled, always-on mechanisms
+// (see their own header comments) -- only the PCG-Volume-discovery half of this feature forces the
+// whole block Debug-only.
+#include "world/PcgCellLoader.h"
+#include "pcg/PcgInstanceSpawnManager.h"
+#include "renderer/passes/PcgInstanceDrawPass.h"
+// (renderer::debug::kDefaultPcgVolumeActorsRootDir comes from renderer/debug/PcgVolumeInspector.h,
+// already included above.)
 #endif
 
 // Unreal-editor style viewport navigation: hold the Right Mouse Button to enable FPS-style
@@ -872,6 +886,71 @@ int main(int argc, char** argv) {
     // Update() are simply never called below) so its lifetime doesn't need its own conditional scope.
     world::StreamingManager streamingManager(cellManifest.CellSize(), worldCellLoader,
                                               clusterPipeline.GetLoadingManager(), /*maxConcurrentLoads=*/4);
+
+#ifndef NDEBUG
+    // --- PCG roadmap Phase 6.3 ("Runtime Generator Hook") REAL wiring (code-audit Lane D.2,
+    // 2026-07-19): closes the gap between RunPcgCellLoaderSmokeTest() above (which drives
+    // world::PcgCellLoader's own IWorldCellLoader methods directly against a synthetic scratch
+    // scenario, see that method's own comment -- "without needing a live StreamingManager/
+    // CellManifest/camera at all") and actual gameplay. Before this change, world::PcgCellLoader was
+    // NEVER constructed anywhere outside that one smoke test -- no live, camera-driven
+    // world::StreamingManager anywhere in this codebase ever held a reference to one, so an authored
+    // PCG Volume (world_data/actors/*.actor) could not actually stream its content in/out as the
+    // player's camera moved, no matter how correct Phase 6.1-6.5's own individually-tested pieces
+    // were. This second, PCG-dedicated world::StreamingManager -- fed the SAME camera-driven
+    // world::StreamingSource list as `streamingManager` above, every frame (see this block's own
+    // per-frame call site further down) -- is exactly the integration PcgCellLoader.h's own top-of-
+    // file "Coexistence with WorldCellStreamingLoader" comment describes as still outstanding: "a
+    // caller can wire [world::PcgCellLoader] into its OWN StreamingManager instance ... whenever a
+    // future phase decides to actually run it against live camera-driven streaming." This is that
+    // phase.
+    //
+    // Scanned FIRST (a plain, cheap disk scan, no GPU work) so this entire feature stays a true no-op
+    // -- zero GPU allocations, zero extra StreamingManager -- when, as is currently the case for this
+    // checkout, world_data/actors/ contains no authored PcgVolume .actor file at all (see
+    // world::PcgCellLoader.h's own "nothing in this codebase yet AUTHORS a real PcgVolume actor file
+    // for a Release-relevant scenario" comment): there is then nothing whatsoever for a second
+    // streaming manager to do, so none of the objects below are even constructed.
+    const std::filesystem::path pcgActorsRootDir = core::ResolveExeRelativePath(renderer::debug::kDefaultPcgVolumeActorsRootDir);
+    const size_t pcgAuthoredVolumeCount = world::ScanPcgVolumeActorFiles(pcgActorsRootDir).size();
+
+    std::optional<renderer::PcgInstanceDrawPass> livePcgDrawPass;
+    std::optional<pcg::PcgInstanceSpawnManager> livePcgSpawnManager;
+    std::optional<world::PcgCellLoader> livePcgCellLoader;
+    std::optional<world::StreamingManager> livePcgStreamingManager;
+
+    if (streamingEnabled && pcgAuthoredVolumeCount > 0) {
+        // Bounded, generously-sized pools for future authored content -- see this class' own Init()
+        // comment for what each buffer holds; both figures are headroom over the largest smoke-test
+        // scenario (RunPcgCellLoaderSmokeTest's own 8192 candidate-cluster budget) without being
+        // large enough to risk the kind of GPU-memory/driver-TDR surprise this codebase has hit
+        // before with an oversized fixed pool (see ParticleSystem's own kMaxParticles precedent).
+        constexpr uint32_t kLivePcgMaxInstances = 4096u;
+        constexpr uint32_t kLivePcgMaxCandidateClusters = 65536u;
+
+        livePcgDrawPass.emplace();
+        livePcgDrawPass->Init(vkContext.GetDevice(), vkContext.GetAllocator(), vkContext.GetCommandPool(), vkContext.GetGraphicsQueue(),
+            clusterPipeline.GetPagePoolPhysicalBuffer(), vkContext.GetMaterialTable(),
+            clusterPipeline.GetBaseSunDirection(), maths::vec3(1.0f, 0.96f, 0.9f), 3.0f, maths::vec3(0.12f, 0.12f, 0.14f),
+            VK_FORMAT_R16G16B16A16_SFLOAT, VK_FORMAT_D32_SFLOAT,
+            kLivePcgMaxInstances, kLivePcgMaxCandidateClusters);
+
+        livePcgSpawnManager.emplace(*livePcgDrawPass);
+        livePcgCellLoader.emplace(pcgActorsRootDir, cellManifest.CellSize(), *livePcgSpawnManager);
+        livePcgStreamingManager.emplace(cellManifest.CellSize(), *livePcgCellLoader,
+                                         clusterPipeline.GetLoadingManager(), /*maxConcurrentLoads=*/4);
+
+        LOG_INFO(std::format(
+            "[Main] Live PCG Volume streaming ENABLED: {} authored volume(s) indexed into {} cell(s) "
+            "under '{}'.", livePcgCellLoader->GetVolumeCount(), livePcgCellLoader->GetIndexedCellCount(),
+            pcgActorsRootDir.string()));
+    } else {
+        LOG_INFO(std::format(
+            "[Main] Live PCG Volume streaming: no authored PcgVolume actor file(s) found under '{}' -- "
+            "skipping (nothing to stream). Author one via the PCG Volume Inspector panel to exercise "
+            "this path.", pcgActorsRootDir.string()));
+    }
+#endif
 
     // Bounded free-list over VulkanContext's kStreamingUnitCount physical GPU slots (see that
     // class's own header comment on why the pool is small and fixed) -- maps a claimed cell to the
@@ -1987,6 +2066,32 @@ int main(int argc, char** argv) {
         }
 
 #ifndef NDEBUG
+        // --- PCG roadmap Phase 6.3 ("Runtime Generator Hook") REAL wiring: the live, camera-driven
+        // counterpart to the archetype-content streaming tick just above -- see this pair's own
+        // construction-site comment for the full rationale. Ticked with the EXACT SAME
+        // world::StreamingSource list (same camera position/radii) as `streamingManager` above so a
+        // PCG Volume and a hand-authored archetype cell stream in/out in lockstep for a camera moving
+        // through both. Only actually runs when livePcgStreamingManager was constructed above (i.e.
+        // world_data/actors/ had at least one authored PcgVolume actor file at startup) -- a
+        // std::optional that never got emplaced is inert, matching this codebase's own
+        // "additive, not load-bearing" convention for optional content elsewhere (e.g. cellmanifest.bin
+        // itself). PumpCompletions() budget/ordering mirrors the archetype loader's own call just
+        // above; livePcgCellLoader->Pump() (main-thread-only, per PcgCellLoader.h's own contract) must
+        // run AFTER that PumpCompletions() call so any LoadCellFullDetail()/UnloadCell() a worker
+        // thread completed THIS frame has already had a chance to stage its own PcgCellLoadEvent
+        // before Pump() drains the queue. ---
+        if (livePcgStreamingManager.has_value()) {
+            std::vector<world::StreamingSource> pcgSources{
+                world::StreamingSource{ camera.GetPosition(), g_StreamingDetailRadius, g_StreamingHlodRadius, 0u }
+            };
+            livePcgStreamingManager->UpdateStreamingSources(pcgSources);
+            livePcgStreamingManager->Update();
+            clusterPipeline.GetLoadingManager().PumpCompletions(8u);
+            livePcgCellLoader->Pump();
+        }
+#endif
+
+#ifndef NDEBUG
         camera.SetDebugViewMode(g_DebugState.viewMode);
         camera.SetDebugOcclusionCullingDisabled(g_DebugState.disableOcclusionCulling);
         clusterPipeline.SetDebugTraceMode(g_DebugState.traceMode);
@@ -2321,6 +2426,17 @@ int main(int argc, char** argv) {
     ImGui_ImplGlfw_Shutdown();
     ImGui::DestroyContext();
     vkDestroyDescriptorPool(vkContext.GetDevice(), imguiPool, nullptr);
+
+    // PCG roadmap Phase 6.3 REAL wiring: livePcgDrawPass owns real GPU resources (graphics pipeline,
+    // descriptor sets, several GpuBuffers, a composed renderer::ClusterCullingPass -- see
+    // renderer::PcgInstanceDrawPass's own class comment) that must be explicitly torn down before
+    // vkContext.Shutdown() below destroys the VkDevice/VmaAllocator they were allocated from, exactly
+    // like every RunPcg*SmokeTest() local instance's own pcgPass.Shutdown() call already does. A
+    // no-op if world_data/actors/ had zero authored PcgVolume actor files at startup (the optional
+    // was never emplaced -- see this pair's own construction-site comment).
+    if (livePcgDrawPass.has_value()) {
+        livePcgDrawPass->Shutdown();
+    }
 #endif
 
     vkDestroyFence(vkContext.GetDevice(), frameFence, nullptr);
