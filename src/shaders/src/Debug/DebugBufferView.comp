@@ -22,6 +22,14 @@ layout(local_size_x = 8, local_size_y = 8) in;
 layout(set = 0, binding = 0) uniform sampler2D g_Source;
 layout(rgba8, set = 0, binding = 1) uniform writeonly image2D g_Output;
 
+// Same persistent { currentEV100; currentAvgLuminance; } SSBO renderer::PostProcessPass's own
+// PostProcessComposite.comp reads (byte-for-byte identical layout -- see that shader's own
+// ExposureStateSSBO), bound once by renderer::debug::DebugBufferViewPass::Init and never rewritten.
+layout(std430, set = 0, binding = 2) readonly buffer ExposureStateSSBO {
+    float currentEV100;
+    float currentAvgLuminance;
+} g_Exposure;
+
 layout(push_constant) uniform DebugBufferViewPC {
     uint visualizationMode; // 0 = passthrough, 1 = grayscale, 2 = octahedral normal, 3 = HDR tonemap.
 } pc;
@@ -47,11 +55,15 @@ void main() {
     } else if (pc.visualizationMode == kModeOctNormal) {
         color = OctDecode(raw.rg) * 0.5 + 0.5;
     } else if (pc.visualizationMode == kModeTonemap) {
-        // Fixed display-only exposure (this shader has no access to the real eye-adapted
-        // g_Exposure state, and doesn't need it -- this is a raw-signal debug view, not the final
-        // graded image): a flat 1.0 EV100 scale keeps mid-range HDR values visible without needing
-        // the full Physical Camera pipeline.
-        color = ACESFilmicTonemap(raw.rgb);
+        // This codebase's scene is calibrated to real lux/candela radiance (see EngineConfig.h's
+        // own EXPOSURE_SHUTTER_SPEED_SECONDS comment) -- raw HDR texels here are typically in the
+        // tens of thousands, which saturates every channel to white if fed into ACES directly.
+        // Apply the SAME exposure normalization PostProcessComposite.comp applies (its own
+        // `exposureMultiplier` comment) using the real, eye-adapted g_Exposure.currentEV100 for
+        // THIS frame, so this raw-signal debug view still shows structure/contrast instead of a
+        // flat white image.
+        float exposureMultiplier = 1.0 / (1.2 * exp2(g_Exposure.currentEV100));
+        color = ACESFilmicTonemap(raw.rgb * exposureMultiplier);
     } else {
         color = raw.rgb; // kModePassthrough: already display-ready (e.g. albedo).
     }

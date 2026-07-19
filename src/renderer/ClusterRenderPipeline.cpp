@@ -1016,7 +1016,9 @@ bool ClusterRenderPipeline::Init(
   // Backs the ImGui "Buffer Viewer" dropdown -- see debug::DebugBufferViewPass's own class
   // comment. Sized to m_DisplayExtent (it's blitted to the swapchain the same way
   // m_PostProcess's own output is, not sized to any one candidate buffer's own resolution).
-  m_DebugBufferView.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue, m_DisplayExtent);
+  // `m_PostProcess.GetExposureStateBuffer()` requires m_PostProcess.Init() (above) to have already
+  // run -- see DebugBufferViewPass::Init's own header comment.
+  m_DebugBufferView.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue, m_DisplayExtent, m_PostProcess.GetExposureStateBuffer());
 
   // Subtask E3 (Debug Buffer Viewer extension): backs Buffer Viewer index 15 -- see
   // debug::ParticleDebugViewPass's own class comment. Sized to its own fixed 256x256 grid, not
