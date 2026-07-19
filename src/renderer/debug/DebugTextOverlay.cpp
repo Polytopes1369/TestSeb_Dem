@@ -264,7 +264,7 @@ namespace renderer::debug {
     void DebugTextOverlay::BuildFrameText(float gpuMemUsedMB, uint32_t pendingPageLoads, float bytesPerSecond,
         uint32_t hwTriangleCount, uint32_t swTriangleCount, float fps, float viewportWidthPixels, float viewportHeightPixels,
         bool radiosityEnabled, bool ssrtEnabled, uint32_t traceMode, bool worldProbesEnabled,
-        uint32_t aliveParticleCount, uint32_t maxParticleCount) {
+        uint32_t worldProbePendingSlabs, uint32_t aliveParticleCount, uint32_t maxParticleCount) {
         m_PendingGlyphs.clear();
 
         constexpr float kMarginX = 8.0f;
@@ -280,12 +280,18 @@ namespace renderer::debug {
         AppendLine(std::format("GI: RADIOSITY={} SSRT={} TRACE={}",
             radiosityEnabled ? "ON" : "OFF", ssrtEnabled ? "ON" : "OFF", traceMode == 0u ? "SWRT" : "HWRT"),
             kMarginX, y); y += kLineHeight;
-        // Unlike the RADIOSITY/SSRT/TRACE line above (all real, consumed GI terms), WORLDPROBES
-        // reflects a system that is computed but has no live consumer yet -- see
-        // ClusterRenderPipeline::m_DebugWorldProbesEnabled's own comment. Shown on its own line so
-        // that fact stays visible instead of implying parity with the other three.
-        AppendLine(std::format("WORLDPROBES={} (not yet sampled)", worldProbesEnabled ? "ON" : "OFF"),
-            kMarginX, y); y += kLineHeight;
+        // Real probe-grid state (replaces the old hardcoded "(not yet sampled)" label, which
+        // outlived the grid actually gaining live consumers on 2026-07-16 and had become pure
+        // misinformation): READY = every probe in the covered window is traced, BUILDING = that
+        // many dirty slabs still queued (first-frame full-volume build, a large camera jump's
+        // backlog, or a requested full re-trace -- see WorldProbeGridPass::RequestFullRetrace).
+        if (worldProbePendingSlabs > 0u) {
+            AppendLine(std::format("WORLDPROBES={} BUILDING ({} SLABS)", worldProbesEnabled ? "ON" : "OFF", worldProbePendingSlabs),
+                kMarginX, y); y += kLineHeight;
+        } else {
+            AppendLine(std::format("WORLDPROBES={} READY", worldProbesEnabled ? "ON" : "OFF"),
+                kMarginX, y); y += kLineHeight;
+        }
         AppendLine(std::format("GPU PARTICLES: {}/{}", aliveParticleCount, maxParticleCount), kMarginX, y); y += kLineHeight;
 
         // Bottom-left profile name overlay (e.g. low, medium, high)

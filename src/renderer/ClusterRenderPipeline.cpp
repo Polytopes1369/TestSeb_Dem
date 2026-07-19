@@ -3167,12 +3167,15 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
   // the rest of this frame's GI additions.
   //
   // `worldProbesEnabled` (debug-only toggle, main.cpp's 'H' key) gates this dispatch entirely --
-  // see SetDebugWorldProbesEnabled()'s own comment. UNLIKE radiosityEnabled/ssrtEnabled above,
-  // this system has no live consumer yet (SampleWorldProbeGrid() is called only by the dead
-  // ScreenTracePass/GICompositePass, per the 2026-07-16 UE5.8-parity audit) -- so Release
-  // hardcodes this OFF instead of ON, skipping the dispatch (and its trailing barrier, since
-  // nothing this frame reads the grid either way) rather than paying its GPU cost for zero visual
-  // effect. Flip Release's hardcoded default once a real consumer samples this grid.
+  // see SetDebugWorldProbesEnabled()'s own comment. The grid has real live consumers every frame
+  // (m_ScreenTrace's own miss fallback + GICompositePass's DEBUG_VIEW_SPATIAL_PROBES view), so
+  // Release hardcodes this ON below; the Debug toggle exists purely for A/B cost comparison.
+  // Build timing: the very FIRST RecordUpdate() call enqueues the entire grid volume as one
+  // dirty slab and drains it immediately (WorldProbeGridPass::m_HasValidWindow starts false), so
+  // every probe is traced by the end of frame 1 -- but against whatever the Surface Cache has
+  // captured BY then (it fills at CARDS_PER_FRAME_BUDGET cards/frame), and a probe is only ever
+  // re-traced when camera motion reveals it anew. See RequestDebugWorldProbeRetrace() for the
+  // manual full re-trace this implies wanting once the cache has finished warming.
   // =========================================================================================
 #ifndef NDEBUG
   bool worldProbesEnabled = m_DebugWorldProbesEnabled;
@@ -3773,7 +3776,7 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
     m_DebugOverlay.BuildFrameText(gpuMemUsedMB, pendingPageLoads, bytesPerSecond, hwTriangleCount, swTriangleCount,
         fps, static_cast<float>(m_RenderExtent.width), static_cast<float>(m_RenderExtent.height),
         m_DebugRadiosityEnabled, m_DebugSSRTEnabled, traceMode, m_DebugWorldProbesEnabled,
-        m_ParticleSystem.GetLastAliveCountApprox(), ParticleSystemPass::kMaxParticles);
+        m_WorldProbes.GetPendingSlabCount(), m_ParticleSystem.GetLastAliveCountApprox(), ParticleSystemPass::kMaxParticles);
 
     // Determine blitSourceImage early to draw HUD directly onto it -- m_PostProcess's own output
     // (not m_TAATSR's raw HDR buffer) in the normal path now, so the HUD's own colors (e.g. plain

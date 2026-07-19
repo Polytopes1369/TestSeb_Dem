@@ -184,6 +184,13 @@ struct DebugState {
     // when on, DecalProject.comp outlines every projected decal's oriented box (bright cyan) so decal
     // placement/extent is directly verifiable. Off by default; driven from the Post FX ImGui tab below.
     bool showDecalBounds = false;
+    // One-shot request consumed (and reset) once per frame by the main loop, which calls
+    // renderer::ClusterRenderPipeline::RequestDebugWorldProbeRetrace() -- same pattern as
+    // dumpDAGCutGapsRequested above. Set by the ImGui "Rebuild World Probes" button (Lumen tab):
+    // forces a full probe-grid re-trace against the CURRENT Surface Cache contents, since probes
+    // traced on frame 1 against a still-cold cache are otherwise never refreshed under a static
+    // camera (see WorldProbeGridPass::RequestFullRetrace's own comment).
+    bool rebuildWorldProbesRequested = false;
 };
 static DebugState g_DebugState;
 
@@ -1160,6 +1167,18 @@ int main(int argc, char** argv) {
                     config::nanite::INDEX_BUFFER_BYTES = static_cast<uint64_t>(iMB) * 1024 * 1024;
                 }
 
+                // Live pass toggles (mirrors of the keyboard shortcuts, applied every frame by the
+                // SetDebug* block at the bottom of the main loop -- same g_DebugState fields, so
+                // the checkbox and its keyboard twin always stay in sync).
+                ImGui::Separator();
+                ImGui::Text("Live Features (A/B)");
+                bool occlusionCulling = !g_DebugState.disableOcclusionCulling; // Stored inverted (a "disable" flag) -- present it positively.
+                if (ImGui::Checkbox("Occlusion Culling (HZB) [Numpad .]", &occlusionCulling)) {
+                    g_DebugState.disableOcclusionCulling = !occlusionCulling;
+                }
+                ImGui::Checkbox("Enhanced Displacement (TorusKnot) [J]", &g_DebugState.enhancedDisplacementEnabled);
+                ImGui::Checkbox("Spline Deformation (Tube) [U]", &g_DebugState.splineDeformationEnabled);
+
                 ImGui::EndTabItem();
             }
 
@@ -1179,6 +1198,28 @@ int main(int argc, char** argv) {
 
             // --- Tab Lumen ---
             if (ImGui::BeginTabItem("Lumen")) {
+                // Live pass toggles (mirrors of the keyboard shortcuts, applied every frame by the
+                // SetDebug* block at the bottom of the main loop -- same g_DebugState fields, so
+                // the checkbox and its keyboard twin always stay in sync).
+                ImGui::Text("Live Passes (A/B)");
+                ImGui::Checkbox("Radiosity (multi-bounce GI) [G]", &g_DebugState.radiosityEnabled);
+                ImGui::Checkbox("Screen Trace GI (SSRT) [F]", &g_DebugState.ssrtEnabled);
+                ImGui::Checkbox("World Probe Grid [H]", &g_DebugState.worldProbesEnabled);
+                ImGui::Checkbox("Specular Reflections [R]", &g_DebugState.reflectionsEnabled);
+                ImGui::Checkbox("MegaLights (direct) [X]", &g_DebugState.megaLightsEnabled);
+                ImGui::Checkbox("Async-Compute GI [C]", &g_DebugState.asyncComputeEnabled);
+                int traceModeInt = static_cast<int>(g_DebugState.traceMode);
+                if (ImGui::Combo("GI Trace Back-End [T/Y]", &traceModeInt, "SWRT (Mesh SDF)\0HWRT (Ray Tracing)\0")) {
+                    g_DebugState.traceMode = static_cast<uint32_t>(traceModeInt);
+                }
+                // One-shot full probe-grid re-trace against the CURRENT Surface Cache -- see
+                // g_DebugState.rebuildWorldProbesRequested's own comment for why this exists
+                // (frame-1 probes traced against a cold cache never refresh on a static camera).
+                if (ImGui::Button("Rebuild World Probes")) {
+                    g_DebugState.rebuildWorldProbesRequested = true;
+                }
+                ImGui::Separator();
+
                 int budget = static_cast<int>(config::lumen::CARDS_PER_FRAME_BUDGET);
                 if (ImGui::DragInt("Cards Frame Budget", &budget, 1, 1, 128)) {
                     config::lumen::CARDS_PER_FRAME_BUDGET = static_cast<uint32_t>(budget);
@@ -1260,6 +1301,65 @@ int main(int argc, char** argv) {
             // --- Tab Post FX (real-time per-effect enable/disable -- see config::postprocess's
             // own *_ENABLED block comment for how each toggle actually takes effect) ---
             if (ImGui::BeginTabItem("Post FX")) {
+                // Master switches: flip every per-effect toggle in this tab at once (the 16
+                // config::postprocess::*_ENABLED cvars below plus the g_DebugState-driven SSS /
+                // Glint / TAA-TSR passes) -- the fastest way to isolate "is the artifact
+                // post-processing at all?" before bisecting effect by effect.
+                if (ImGui::Button("All Post FX ON")) {
+                    config::postprocess::BLOOM_ENABLED = true;
+                    config::postprocess::CHROMATIC_ABERRATION_ENABLED = true;
+                    config::postprocess::VIGNETTE_ENABLED = true;
+                    config::postprocess::HEAT_DISTORTION_ENABLED = true;
+                    config::postprocess::MOTION_BLUR_ENABLED = true;
+                    config::postprocess::HEIGHT_FOG_ENABLED = true;
+                    config::postprocess::GOD_RAYS_ENABLED = true;
+                    config::postprocess::PANINI_ENABLED = true;
+                    config::postprocess::SHARPEN_ENABLED = true;
+                    config::postprocess::FILM_GRAIN_ENABLED = true;
+                    config::postprocess::WHITE_BALANCE_ENABLED = true;
+                    config::postprocess::COLOR_CORRECTION_ENABLED = true;
+                    config::postprocess::DOF_ENABLED = true;
+                    config::postprocess::AO_ENABLED = true;
+                    config::postprocess::CONTACT_SHADOW_ENABLED = true;
+                    config::postprocess::SSR_FALLBACK_ENABLED = true;
+                    g_DebugState.sssEnabled = true;
+                    g_DebugState.glintEnabled = true;
+                    g_DebugState.taatsrEnabled = true;
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("All Post FX OFF")) {
+                    config::postprocess::BLOOM_ENABLED = false;
+                    config::postprocess::CHROMATIC_ABERRATION_ENABLED = false;
+                    config::postprocess::VIGNETTE_ENABLED = false;
+                    config::postprocess::HEAT_DISTORTION_ENABLED = false;
+                    config::postprocess::MOTION_BLUR_ENABLED = false;
+                    config::postprocess::HEIGHT_FOG_ENABLED = false;
+                    config::postprocess::GOD_RAYS_ENABLED = false;
+                    config::postprocess::PANINI_ENABLED = false;
+                    config::postprocess::SHARPEN_ENABLED = false;
+                    config::postprocess::FILM_GRAIN_ENABLED = false;
+                    config::postprocess::WHITE_BALANCE_ENABLED = false;
+                    config::postprocess::COLOR_CORRECTION_ENABLED = false;
+                    config::postprocess::DOF_ENABLED = false;
+                    config::postprocess::AO_ENABLED = false;
+                    config::postprocess::CONTACT_SHADOW_ENABLED = false;
+                    config::postprocess::SSR_FALLBACK_ENABLED = false;
+                    g_DebugState.sssEnabled = false;
+                    g_DebugState.glintEnabled = false;
+                    g_DebugState.taatsrEnabled = false;
+                }
+                ImGui::Separator();
+                ImGui::Checkbox("TAA / TSR [A]", &g_DebugState.taatsrEnabled);
+                // Exposure: both read fresh from config every frame by RecordFrame (ppSettings /
+                // bloomSettings), so these edits take effect on the very next frame.
+                ImGui::Checkbox("Auto Exposure (eye adaptation)", &config::postprocess::EXPOSURE_USE_AUTO);
+                // Live bloom tuning against this scene's real-lux HDR luminance scale (raw scene
+                // radiance runs in the thousands-to-tens-of-thousands here -- see
+                // EXPOSURE_SHUTTER_SPEED_SECONDS' own EngineConfig.h comment) -- the threshold is
+                // compared PRE-exposure in BloomDownsample.comp, hence the large range.
+                ImGui::DragFloat("Bloom Threshold (HDR lum)", &config::postprocess::BLOOM_THRESHOLD, 100.0f, 0.0f, 200000.0f, "%.0f");
+                ImGui::DragFloat("Bloom Intensity", &config::postprocess::BLOOM_INTENSITY, 0.01f, 0.0f, 4.0f);
+                ImGui::Separator();
                 ImGui::Checkbox("Bloom", &config::postprocess::BLOOM_ENABLED);
                 ImGui::Checkbox("Chromatic Aberration", &config::postprocess::CHROMATIC_ABERRATION_ENABLED);
                 ImGui::Checkbox("Vignette", &config::postprocess::VIGNETTE_ENABLED);
@@ -2242,6 +2342,11 @@ int main(int argc, char** argv) {
         clusterPipeline.SetDebugEnhancedDisplacementEnabled(g_DebugState.enhancedDisplacementEnabled);
         clusterPipeline.SetDebugSplineDeformationEnabled(g_DebugState.splineDeformationEnabled);
         clusterPipeline.SetDebugAsyncComputeEnabled(g_DebugState.asyncComputeEnabled);
+        if (g_DebugState.rebuildWorldProbesRequested) {
+            clusterPipeline.RequestDebugWorldProbeRetrace();
+            g_DebugState.rebuildWorldProbesRequested = false;
+            LOG_INFO("[Debug] Requested full World Probe grid re-trace (next frame re-enqueues the entire volume).");
+        }
         if (g_DebugState.dumpDAGCutGapsRequested) {
             clusterPipeline.RequestDebugDAGCutGapsDump();
             g_DebugState.dumpDAGCutGapsRequested = false;

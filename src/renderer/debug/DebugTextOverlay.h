@@ -75,13 +75,18 @@ namespace renderer::debug {
         // (the render extent's width, needed to right-align the FPS text) drive the top-right
         // counter; `radiosityEnabled`/`ssrtEnabled`/`traceMode` (0 = SWRT, 1 = HWRT)/
         // `worldProbesEnabled` mirror ClusterRenderPipeline's own current debug-toggle state exactly.
+        // `worldProbePendingSlabs` (WorldProbeGridPass::GetPendingSlabCount()): 0 means every probe
+        // in the grid's covered window has been traced ("READY"), nonzero means that many dirty
+        // slabs are still queued for later frames ("BUILDING") -- real state, replacing the old
+        // hardcoded "(not yet sampled)" label that outlived the grid actually gaining live
+        // consumers (ScreenTracePass's miss fallback) on 2026-07-16.
         // `aliveParticleCount`/`maxParticleCount` (particle system Subtask 6): renderer::
         // ParticleSystemPass::GetLastAliveCountApprox()/kMaxParticles -- the former is a 1-2-frame-
         // stale GPU->CPU readback, see that method's own comment.
         void BuildFrameText(float gpuMemUsedMB, uint32_t pendingPageLoads, float bytesPerSecond,
             uint32_t hwTriangleCount, uint32_t swTriangleCount, float fps, float viewportWidthPixels, float viewportHeightPixels,
             bool radiosityEnabled, bool ssrtEnabled, uint32_t traceMode, bool worldProbesEnabled,
-            uint32_t aliveParticleCount, uint32_t maxParticleCount);
+            uint32_t worldProbePendingSlabs, uint32_t aliveParticleCount, uint32_t maxParticleCount);
 
         // `outputColorFormat` must be the ACTUAL format of `outputColorView`'s underlying image --
         // selects between the two pipelines Init() built (see that method's own comment). Every
