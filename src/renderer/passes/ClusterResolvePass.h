@@ -70,10 +70,12 @@ namespace renderer {
         // Minimal GBuffer, written alongside the shaded color above from the exact same per-pixel
         // normal/albedo/depth this shader already reconstructs in its Step 2/3 (previously computed
         // and discarded) -- consumed by this codebase's screen-space GI/lighting passes
-        // (renderer::ScreenTracePass for its per-pixel raymarch, renderer::ReflectionTrace /
-        // renderer::MegaLightsShade for their own imageLoad reads, renderer::ATrousDenoisePass as
-        // its edge-stopping guide), and the ClusterResolve.comp debug view modes 12
-        // (motion vectors) / 14 (spatial probes).
+        // (renderer::ScreenTracePass for its per-pixel raymarch, renderer::ScreenProbeGIPass for its
+        // own probe placement/tracing + bilateral gather reconstruction (F9, restored -- real
+        // Lumen's "Screen Probe Gather," config::lumen::GIMode::HighQuality's own near-field term),
+        // renderer::ReflectionTrace / renderer::MegaLightsShade for their own imageLoad reads,
+        // renderer::ATrousDenoisePass as its edge-stopping guide), and the ClusterResolve.comp debug
+        // view modes 12 (motion vectors) / 14 (spatial probes).
         static constexpr VkFormat kOutputNormalFormat = VK_FORMAT_R16G16_SFLOAT;   // Octahedral-encoded world-space normal (include/octahedral.glsl).
         static constexpr VkFormat kOutputDepthFormat = VK_FORMAT_R32_SFLOAT;       // The winning (hw-vs-sw arbitrated) NDC depth -- not stored anywhere else.
         static constexpr VkFormat kOutputAlbedoFormat = VK_FORMAT_R8G8B8A8_UNORM;  // The real per-material PBR base color (renderer::MaterialParameterTable), pre-lighting.

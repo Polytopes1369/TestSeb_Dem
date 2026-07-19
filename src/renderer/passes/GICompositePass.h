@@ -1,9 +1,22 @@
 #pragma once
-// Final GI composite: blends renderer::ClusterResolvePass's direct-lit color with
-// renderer::ATrousDenoisePass's denoised indirect-diffuse term into one owned rgba16f (linear HDR)
-// output image -- the image renderer::ClusterRenderPipeline's own final blit now sources from
-// (via renderer::TAATSRPass then renderer::PostProcessPass) instead of ClusterResolvePass's output
-// directly.
+// Final GI composite: blends renderer::ClusterResolvePass's direct-lit color with an indirect-
+// diffuse term into one owned rgba16f (linear HDR) output image -- the image renderer::
+// ClusterRenderPipeline's own final blit now sources from (via renderer::TAATSRPass then
+// renderer::PostProcessPass) instead of ClusterResolvePass's output directly.
+//
+// --- F1/F9 (UE5.8 parity roadmap): GI mode selects the indirect term's SOURCE ---
+// The indirect term is one of two mutually exclusive inputs, chosen per frame by the always-on
+// `giMode` push constant (config::lumen::GI_MODE, NOT Debug-only -- both GI modes exist in
+// Release): GIMode::HighQuality reads `g_ScreenProbeGI` (renderer::ScreenProbeGIPass::GetOutputView(),
+// real Lumen's own "Screen Probe Gather" near-field term, restored F9); GIMode::Lite reads
+// `g_DenoisedGI` (renderer::ATrousDenoisePass's denoised renderer::ScreenTracePass output, which in
+// Lite mode is itself primarily a probe-grid sample -- see ScreenTrace.comp's own giMode branch,
+// F1). Both bindings are always POPULATED with a valid image (both images exist for this pass'
+// entire lifetime), but renderer::ClusterRenderPipeline::RecordFrame only actually RE-DISPATCHES
+// renderer::ScreenProbeGIPass's own (expensive, ray-traced) Trace/Temporal/Gather trio while
+// GIMode::HighQuality is active -- in Lite mode that trio is skipped entirely (preserving Lite's
+// own performance advantage) and `g_ScreenProbeGI` simply goes unsampled this frame (GIComposite
+// .comp's own giMode branch never reads it), harmlessly stale rather than freshly re-traced.
 //
 // --- Debug view modes 13 (LUMEN) / 14 (SPATIAL PROBES) ---
 // core/Camera.h already reserves DEBUG_VIEW_LUMEN=13 / DEBUG_VIEW_SPATIAL_PROBES=14 (previously
@@ -23,6 +36,7 @@
 #include <vk_mem_alloc.h>
 
 #include "core/Camera.h"
+#include "core/EngineConfig.h"
 #include "core/maths/Maths.h"
 #include "renderer/vulkan/GpuBuffer.h"
 
@@ -50,25 +64,31 @@ namespace renderer {
         static constexpr VkFormat kOutputFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
 
         // `directColorView` (renderer::ClusterResolvePass::GetOutputColorView()), `denoisedGIView`
-        // (renderer::ATrousDenoisePass::GetOutputView()), and `aoView` (Phase PP4, renderer::
-        // ScreenSpaceEffectsPass::GetAOView() -- multiplies the denoised GI term, see GIComposite
-        // .comp's own comment) are always bound (set 0, bindings 1/2/3). In a Debug build only,
-        // `depthView` and `worldProbes` are ALSO bound (see the class comment) to support the two
-        // debug view modes; both parameters are ignored entirely in a Release build (still accepted
-        // unconditionally so call sites do not need their own `#ifndef NDEBUG` branch).
+        // (renderer::ATrousDenoisePass::GetOutputView(), GIMode::Lite's own source),
+        // `screenProbeGIView` (F9, renderer::ScreenProbeGIPass::GetOutputView(), GIMode::HighQuality's
+        // own source -- see the class comment's own GI-mode note), and `aoView` (Phase PP4, renderer::
+        // ScreenSpaceEffectsPass::GetAOView() -- multiplies the SELECTED indirect term, see
+        // GIComposite.comp's own comment) are always bound (set 0, bindings 1/2/3/4). In a Debug
+        // build only, `depthView` and `worldProbes` are ALSO bound (see the class comment) to
+        // support the two debug view modes; both parameters are ignored entirely in a Release build
+        // (still accepted unconditionally so call sites do not need their own `#ifndef NDEBUG` branch).
         void Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
             VkExtent2D renderExtent, VkImageView directColorView, VkImageView denoisedGIView,
-            VkImageView aoView, VkImageView depthView, const WorldProbeGridPass& worldProbes);
+            VkImageView screenProbeGIView, VkImageView aoView, VkImageView depthView,
+            const WorldProbeGridPass& worldProbes);
 
         void Shutdown();
 
-        // Dispatches one invocation per output pixel: finalColor = directColor + denoisedGI. In a
-        // Debug build, `camera`/`cameraPositionWorld`/`worldProbeGridOrigin` additionally drive the
-        // viewMode 13/14 visualizations (unused, and not even present as parameters' worth of real
-        // work, in Release -- see the class comment). Caller owns every synchronization barrier
-        // before (direct color + denoised GI + [Debug] depth + World Probe grid all visible) and
-        // after (GetOutputImage() visible to the final blit) this call.
-        void RecordComposite(VkCommandBuffer cmd
+        // Dispatches one invocation per output pixel: finalColor = directColor + [g_ScreenProbeGI |
+        // g_DenoisedGI][giMode] (see the class comment's own GI-mode note) * ao. `giMode`
+        // (config::lumen::GI_MODE) is always present, Release included -- NOT a Debug-only
+        // parameter, since both GI modes ship in Release. In a Debug build, `camera`/
+        // `cameraPositionWorld`/`worldProbes` additionally drive the viewMode 13/14 visualizations
+        // (unused, and not even present as parameters' worth of real work, in Release -- see the
+        // class comment). Caller owns every synchronization barrier before (direct color + both GI
+        // term images + [Debug] depth + World Probe grid all visible) and after (GetOutputImage()
+        // visible to the final blit) this call.
+        void RecordComposite(VkCommandBuffer cmd, config::lumen::GIMode giMode
 #ifndef NDEBUG
             , const CameraPushConstants& camera, const maths::vec3& cameraPositionWorld,
             const WorldProbeGridPass& worldProbes

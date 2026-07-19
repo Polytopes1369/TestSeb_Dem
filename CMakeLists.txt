@@ -834,9 +834,13 @@ if(Vulkan_GLSLC_EXECUTABLE)
         # reservoir SSBOs, no ray query of its own; ParticleRender.frag -- Niagara-parity
         # render-integration roadmap, D1 (MegaLights sampling for particles): the same inlined
         # MegaLights shadow-visibility-ray shading TransparentForward.frag/Tessellation.frag already
-        # carry their own copy of, see that shader's own TraceShadowRay comment). ScreenProbeTrace.comp
-        # used to be in this list too -- deleted along with the rest of ScreenProbeGIPass
-        # (confirmed-dead, see ClusterRenderPipeline.h's own comment on why).
+        # carry their own copy of, see that shader's own TraceShadowRay comment; ScreenProbeTrace.comp
+        # -- F9 (UE5.8 parity roadmap): renderer::ScreenProbeGIPass's own ray-generation stage,
+        # restored from the ScreenProbeGIPass deletion this list's own tombstone note used to
+        # reference (see ClusterRenderPipeline.h's own restoration comment) -- its own inline HWRT
+        # TraceHWRT is a byte-for-byte copy of SurfaceCacheGIInject.comp's, same GL_EXT_ray_query
+        # requirement. ScreenProbeTemporal/Gather/Classify.comp do NOT need this -- none of them
+        # issues a ray query of their own, only Trace does).
         # Every other shader stage keeps glslc's default target-env/target-spv untouched.
         get_filename_component(SHADER_EXT ${SHADER_SRC} EXT)
         set(GLSLC_EXTRA_FLAGS "")
@@ -845,7 +849,8 @@ if(Vulkan_GLSLC_EXECUTABLE)
                 OR SHADER_NAME STREQUAL "WorldProbeInject.comp" OR SHADER_NAME STREQUAL "ReflectionTrace.comp"
                 OR SHADER_NAME STREQUAL "MegaLightsShade.comp" OR SHADER_NAME STREQUAL "TransparentForward.frag"
                 OR SHADER_NAME STREQUAL "Tessellation.frag" OR SHADER_NAME STREQUAL "WaterForward.frag"
-                OR SHADER_NAME STREQUAL "MegaLightsFinalShade.comp" OR SHADER_NAME STREQUAL "ParticleRender.frag")
+                OR SHADER_NAME STREQUAL "MegaLightsFinalShade.comp" OR SHADER_NAME STREQUAL "ParticleRender.frag"
+                OR SHADER_NAME STREQUAL "ScreenProbeTrace.comp")
             set(GLSLC_EXTRA_FLAGS --target-env=vulkan1.3 --target-spv=spv1.4)
         endif()
 
