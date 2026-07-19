@@ -308,6 +308,19 @@ namespace renderer {
         // anything handed this reference, exactly as m_LoadingManager's own comment already states.
         core::LoadingManager& GetLoadingManager() { return m_LoadingManager; }
 
+        // PCG roadmap Phase 6.3 ("Runtime Generator Hook") REAL wiring: the two pieces of this
+        // pipeline's private Vulkan/lighting state that a persistent, LIVE renderer::PcgInstanceDrawPass
+        // (owned by main.cpp, not a smoke-test-local) needs for its own Init() call but had no public
+        // accessor for before -- every OTHER Init() parameter (device/allocator/commandPool/queue/
+        // materialTable) is already reachable from main.cpp directly via VulkanContext's own public
+        // getters (GetDevice/GetAllocator/GetCommandPool/GetGraphicsQueue/GetMaterialTable); only the
+        // resident geometry page pool's physical buffer and the showcase scene's baked sun direction
+        // are private to THIS class. Mirrors exactly what RunPcgCellLoaderSmokeTest's own STEP 2 local
+        // setup already reads internally (m_PagePool.GetPhysicalPoolBuffer(), m_BaseSunDirection) --
+        // both cheap, read-only forwards, no new state or ownership transfer.
+        VkBuffer GetPagePoolPhysicalBuffer() const { return m_PagePool.GetPhysicalPoolBuffer(); }
+        maths::vec3 GetBaseSunDirection() const { return m_BaseSunDirection; }
+
         // Phase 2 (Lumen advanced roadmap) fix: the frame is now recorded across 4 calls instead of
         // one RecordFrame() -- see this class' own header comment ("Per-frame GPU work") for the
         // full root-cause/redesign explanation and main.cpp for the exact submit sequence each call
