@@ -27,6 +27,7 @@
 #include <atomic>
 #include <string>
 #include <functional>
+#include <array>
 
 #ifndef NDEBUG
 #include "core/debug/DebugTestPipeline.h"
@@ -1329,6 +1330,147 @@ int main(int argc, char** argv) {
                 };
                 ImGui::Combo("Buffer", &config::debugview::SELECTED_BUFFER_INDEX, kBufferNames, IM_ARRAYSIZE(kBufferNames));
                 ImGui::TextWrapped("Shows the selected buffer instead of the normal final image. Not tied to the Numpad debug-view-mode keys.");
+                ImGui::EndTabItem();
+            }
+
+            // --- Tab Profiler (audit-fix roadmap B1/D2) -- per-pass GPU timestamp profiler +
+            // VMA heap budget overlay, both Debug-only per CLAUDE.md rule 8. Neither reads/writes
+            // any live rendering state -- both are pure observability over data the engine already
+            // produces every frame (renderer::debug::GpuTimestampProfiler's own rolling averages,
+            // VMA's own vmaGetHeapBudgets()/vmaCalculateStatistics()). ---
+            if (ImGui::BeginTabItem("Profiler")) {
+                // B1: per-pass GPU timestamp profiler (renderer::debug::GpuTimestampProfiler).
+                if (ImGui::CollapsingHeader("GPU Profiler", ImGuiTreeNodeFlags_DefaultOpen)) {
+                    if (!clusterPipeline.IsGpuProfilerSupported()) {
+                        ImGui::TextDisabled("Timestamp queries unsupported on this GPU/driver -- profiler disabled.");
+                    } else {
+                        // GetGpuProfilerResults()/GetGpuProfilerAsyncResults() both mutate their own
+                        // profiler's rolling-average state as a side effect (see
+                        // debug::GpuTimestampProfiler::GetResults()'s own comment) -- called exactly
+                        // once per real frame here, matching that contract. GetGpuProfilerTotalAvgMs()
+                        // is called AFTER GetGpuProfilerResults() so it reflects the same averages the
+                        // table below just displayed, not a stale prior frame's sum (see that
+                        // accessor's own comment).
+                        std::vector<renderer::debug::GpuTimestampProfiler::ZoneResult> zones = clusterPipeline.GetGpuProfilerResults();
+                        float totalMs = clusterPipeline.GetGpuProfilerTotalAvgMs();
+                        std::vector<renderer::debug::GpuTimestampProfiler::ZoneResult> asyncZones = clusterPipeline.GetGpuProfilerAsyncResults();
+
+                        ImGui::Text("Graphics queue total (sum of zone averages): %.3f ms", totalMs);
+                        ImGui::TextWrapped("Not a true whole-frame GPU time: async-compute-queue work runs concurrently "
+                            "(see the separate table below) and any un-instrumented GPU work is simply absent.");
+
+                        if (ImGui::BeginTable("GpuProfilerTable", 3, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
+                            ImGui::TableSetupColumn("Pass (graphics queue)");
+                            ImGui::TableSetupColumn("Avg ms (~30-frame)");
+                            ImGui::TableSetupColumn("Last ms");
+                            ImGui::TableHeadersRow();
+                            for (const renderer::debug::GpuTimestampProfiler::ZoneResult& zone : zones) {
+                                ImGui::TableNextRow();
+                                ImGui::TableSetColumnIndex(0);
+                                ImGui::TextUnformatted(zone.name.c_str());
+                                ImGui::TableSetColumnIndex(1);
+                                ImGui::Text("%.3f", zone.avgGpuMs);
+                                ImGui::TableSetColumnIndex(2);
+                                ImGui::Text("%.3f", zone.lastGpuMs);
+                            }
+                            ImGui::EndTable();
+                        }
+
+                        if (!asyncZones.empty()) {
+                            ImGui::Separator();
+                            ImGui::TextWrapped("Async-compute queue (runs concurrently with the graphics-queue "
+                                "'FrameMid' work above -- these durations are NOT additive with the total above):");
+                            if (ImGui::BeginTable("GpuProfilerAsyncTable", 3, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
+                                ImGui::TableSetupColumn("Pass (async-compute queue)");
+                                ImGui::TableSetupColumn("Avg ms (~30-frame)");
+                                ImGui::TableSetupColumn("Last ms");
+                                ImGui::TableHeadersRow();
+                                for (const renderer::debug::GpuTimestampProfiler::ZoneResult& zone : asyncZones) {
+                                    ImGui::TableNextRow();
+                                    ImGui::TableSetColumnIndex(0);
+                                    ImGui::TextUnformatted(zone.name.c_str());
+                                    ImGui::TableSetColumnIndex(1);
+                                    ImGui::Text("%.3f", zone.avgGpuMs);
+                                    ImGui::TableSetColumnIndex(2);
+                                    ImGui::Text("%.3f", zone.lastGpuMs);
+                                }
+                                ImGui::EndTable();
+                            }
+                        }
+
+                        if (ImGui::Button("Log Snapshot")) {
+                            LOG_INFO(std::format("[GPU Profiler] Snapshot -- graphics queue total: {:.3f} ms", totalMs));
+                            for (const renderer::debug::GpuTimestampProfiler::ZoneResult& zone : zones) {
+                                LOG_INFO(std::format("[GPU Profiler]   {} : avg {:.3f} ms, last {:.3f} ms", zone.name, zone.avgGpuMs, zone.lastGpuMs));
+                            }
+                            for (const renderer::debug::GpuTimestampProfiler::ZoneResult& zone : asyncZones) {
+                                LOG_INFO(std::format("[GPU Profiler]   (async) {} : avg {:.3f} ms, last {:.3f} ms", zone.name, zone.avgGpuMs, zone.lastGpuMs));
+                            }
+                        }
+                    }
+                }
+
+                // D2: VRAM budget overlay -- vmaGetHeapBudgets() every ~60 frames (cheap, see
+                // VMA's own doc comment: "can be called every frame or even before every
+                // allocation"), vmaCalculateStatistics() only on demand (the button below) since VMA's
+                // own docs describe it as "intended to be used rarely, once in a while".
+                if (ImGui::CollapsingHeader("VRAM", ImGuiTreeNodeFlags_DefaultOpen)) {
+                    static uint32_t vramFrameCounter = 0;
+                    static std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> cachedHeapBudgets{};
+                    static uint32_t cachedHeapCount = 0;
+                    // Shared by the "Calculate Detailed Statistics" button below and the popup body
+                    // that displays its result -- MUST be declared once, here, at this enclosing
+                    // scope (not as two separate `static` locals inside the button/popup blocks
+                    // below, which -- despite both being `static` -- are two DISTINCT objects since
+                    // C++ function-local statics are scoped to their own lexical block).
+                    static VmaTotalStatistics s_LastDetailedStats{};
+                    ++vramFrameCounter;
+                    if (vramFrameCounter == 1 || (vramFrameCounter % 60) == 0) {
+                        const VkPhysicalDeviceMemoryProperties* memProps = nullptr;
+                        vmaGetMemoryProperties(vkContext.GetAllocator(), &memProps);
+                        cachedHeapCount = memProps->memoryHeapCount;
+                        vmaGetHeapBudgets(vkContext.GetAllocator(), cachedHeapBudgets.data());
+                    }
+
+                    VkDeviceSize totalUsageBytes = 0;
+                    VkDeviceSize totalBudgetBytes = 0;
+                    if (ImGui::BeginTable("VramHeapTable", 3, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
+                        ImGui::TableSetupColumn("Heap");
+                        ImGui::TableSetupColumn("Usage (MiB)");
+                        ImGui::TableSetupColumn("Budget (MiB)");
+                        ImGui::TableHeadersRow();
+                        for (uint32_t heap = 0; heap < cachedHeapCount; ++heap) {
+                            totalUsageBytes += cachedHeapBudgets[heap].usage;
+                            totalBudgetBytes += cachedHeapBudgets[heap].budget;
+                            ImGui::TableNextRow();
+                            ImGui::TableSetColumnIndex(0);
+                            ImGui::Text("Heap %u", heap);
+                            ImGui::TableSetColumnIndex(1);
+                            ImGui::Text("%.1f", static_cast<double>(cachedHeapBudgets[heap].usage) / (1024.0 * 1024.0));
+                            ImGui::TableSetColumnIndex(2);
+                            ImGui::Text("%.1f", static_cast<double>(cachedHeapBudgets[heap].budget) / (1024.0 * 1024.0));
+                        }
+                        ImGui::EndTable();
+                    }
+                    ImGui::Text("Total: %.1f MiB used / %.1f MiB budget",
+                        static_cast<double>(totalUsageBytes) / (1024.0 * 1024.0),
+                        static_cast<double>(totalBudgetBytes) / (1024.0 * 1024.0));
+
+                    if (ImGui::Button("Calculate Detailed Statistics")) {
+                        // vmaCalculateStatistics() walks every block/allocation -- deliberately only
+                        // run here, on demand (VMA's own docs describe it as "intended to be used
+                        // rarely, once in a while"), never per-frame like vmaGetHeapBudgets() above.
+                        vmaCalculateStatistics(vkContext.GetAllocator(), &s_LastDetailedStats);
+                        ImGui::OpenPopup("VramDetailedStatsPopup");
+                    }
+                    if (ImGui::BeginPopup("VramDetailedStatsPopup")) {
+                        ImGui::Text("Blocks: %u", s_LastDetailedStats.total.statistics.blockCount);
+                        ImGui::Text("Allocations: %u", s_LastDetailedStats.total.statistics.allocationCount);
+                        ImGui::Text("Block bytes: %.1f MiB", static_cast<double>(s_LastDetailedStats.total.statistics.blockBytes) / (1024.0 * 1024.0));
+                        ImGui::Text("Allocation bytes: %.1f MiB", static_cast<double>(s_LastDetailedStats.total.statistics.allocationBytes) / (1024.0 * 1024.0));
+                        ImGui::EndPopup();
+                    }
+                }
                 ImGui::EndTabItem();
             }
 
