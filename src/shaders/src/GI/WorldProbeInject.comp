@@ -14,6 +14,16 @@
 // Card radiance (surface_cache_sampling.glsl) for every ray that lands on a surface, and writes
 // the averaged result as this probe's ambient irradiance into its wrapped (toroidal) texel address.
 //
+// --- F1 ("Lumen Lite", UE5.8 parity roadmap): probe occlusion ---
+// Alongside the irradiance average, this shader also accumulates the MEAN and MEAN-SQUARED hit
+// distance across the same kProbeSampleDirections rays (a miss contributes kFarDistance, i.e. "no
+// occluder found in this direction" -- exactly the DDGI convention for an unoccluded ray) and
+// writes that (mean, mean^2) pair into g_ProbeOcclusion at the same texel. world_probe_sampling.glsl's
+// ChebyshevVisibility() uses this to down-weight a probe corner at sample time whenever the shading
+// point is farther from that probe than its own mean hit distance -- see
+// renderer::WorldProbeGridPass.h's own "probe occlusion" class-comment note for why this is a
+// per-probe aggregate rather than full per-direction DDGI visibility.
+//
 // --- Why 14 fixed directions instead of importance-sampled hemisphere rays ---
 // A Surface Cache texel has a known surface normal to orient a cosine-weighted hemisphere around
 // (see SurfaceCacheGIInject.comp's own CosineWeightedHemisphereSample). A World Probe floats in
@@ -31,18 +41,21 @@
 layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
 
 layout(set = 0, binding = 0, rgba16f) uniform writeonly image3D g_ProbeGrid;
-layout(set = 0, binding = 1) uniform accelerationStructureEXT g_TLAS;
+// F1: (mean, mean-squared) hit distance across this probe's kProbeSampleDirections rays -- see
+// this file's own "probe occlusion" header comment.
+layout(set = 0, binding = 1, rg16f) uniform writeonly image3D g_ProbeOcclusion;
+layout(set = 0, binding = 2) uniform accelerationStructureEXT g_TLAS;
 
 // Mirrors SurfaceCacheGIInject.comp's own vertex/index/draw-range bindings exactly (same struct
 // layouts, same underlying buffers) so the HWRT trace path below computes a geometric hit normal
 // exactly the same way that shader's own TraceHWRT does.
 #define FALLBACK_GEOMETRY_SET 0
-#define FALLBACK_GEOMETRY_BASE_BINDING 2
+#define FALLBACK_GEOMETRY_BASE_BINDING 3
 #include "include/fallback_geometry.glsl"
 
 // Atmos weather system, Subtask 5: renderer::AtmosSkyPass's Sky-View LUT, sampled on a probe-ray
 // miss (see main()'s own comment) instead of contributing 0.
-layout(set = 0, binding = 5) uniform sampler2D g_SkyViewLUT;
+layout(set = 0, binding = 6) uniform sampler2D g_SkyViewLUT;
 
 // Phase 6 (UE5.8 parity roadmap): one dispatch now covers a single wrap-contiguous PIECE of a
 // dirty slab (renderer::WorldProbeGridPass::RecordSlab), not the whole grid -- `dispatchMinTexel`
@@ -57,7 +70,9 @@ layout(set = 0, binding = 5) uniform sampler2D g_SkyViewLUT;
 layout(push_constant) uniform WorldProbeInjectPushConstants {
     int dispatchMinTexelX; int dispatchMinTexelY; int dispatchMinTexelZ;
     float dispatchWorldMinX; float dispatchWorldMinY; float dispatchWorldMinZ;
-    float probeSpacing;
+    // F1: this dispatch's OWN clipmap level spacing (renderer::WorldProbeGridPass::GetLevelSpacing) --
+    // was a single flat `probeSpacing` pre-F1; now varies per level (level L = base spacing * 2^L).
+    float levelSpacing;
     uint entityCount;  // Dynamically uniform -- see mesh_sdf_trace.glsl's own requirement.
     uint frameIndex;   // Halton sequence temporal offset, advanced by the caller across calls.
     uint traceMode;    // 0 = SWRT (TraceMeshSDFScene), 1 = HWRT (TraceHWRT, inline ray query).
@@ -92,8 +107,14 @@ vec3 FetchPosition(uint globalVertexIndex) {
 }
 
 // Identical shape to SurfaceCacheGIInject.comp's own TraceHWRT -- see that shader's comment for
-// why this is the only way to issue a hardware trace from a plain compute shader.
-bool TraceHWRT(vec3 rayOrigin, vec3 rayDir, float tMax, out uint outEntityIndex, out vec3 outLocalPos, out vec3 outLocalNormal) {
+// why this is the only way to issue a hardware trace from a plain compute shader. F1: +outHitDistance
+// -- rayQueryGetIntersectionTEXT() is already the WORLD-space parametric distance along the ray as
+// initialized (rayOrigin/rayDir passed to rayQueryInitializeEXT below are this shader's own
+// world-space probePos/dir), unlike outLocalPos (deliberately left in OBJECT space, matching every
+// other TraceHWRT in this codebase) -- so this is the one piece of hit data that needs no further
+// transform to become the world-space occlusion distance world_probe_sampling.glsl's
+// ChebyshevVisibility() consumes.
+bool TraceHWRT(vec3 rayOrigin, vec3 rayDir, float tMax, out uint outEntityIndex, out vec3 outLocalPos, out vec3 outLocalNormal, out float outHitDistance) {
     rayQueryEXT rq;
     rayQueryInitializeEXT(rq, g_TLAS, gl_RayFlagsOpaqueEXT, 0xFF, rayOrigin, 1.0e-3, rayDir, tMax);
     while (rayQueryProceedEXT(rq)) {
@@ -107,6 +128,7 @@ bool TraceHWRT(vec3 rayOrigin, vec3 rayDir, float tMax, out uint outEntityIndex,
     outEntityIndex = uint(rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true));
     int primitiveID = rayQueryGetIntersectionPrimitiveIndexEXT(rq, true);
     float hitT = rayQueryGetIntersectionTEXT(rq, true);
+    outHitDistance = hitT;
     vec3 objOrigin = rayQueryGetIntersectionObjectRayOriginEXT(rq, true);
     vec3 objDir = rayQueryGetIntersectionObjectRayDirectionEXT(rq, true);
     outLocalPos = objOrigin + objDir * hitT;
@@ -143,20 +165,35 @@ void main() {
     // centers the sample within its own probe cell -- preserves this shader's original per-probe
     // sampling convention exactly (pre-Phase-6, this was `gridOrigin + (probeCoord+0.5)*spacing`).
     vec3 dispatchWorldMin = vec3(pc.dispatchWorldMinX, pc.dispatchWorldMinY, pc.dispatchWorldMinZ);
-    vec3 probePos = dispatchWorldMin + (vec3(gl_GlobalInvocationID) + 0.5) * pc.probeSpacing;
+    vec3 probePos = dispatchWorldMin + (vec3(gl_GlobalInvocationID) + 0.5) * pc.levelSpacing;
 
     vec3 accumulated = vec3(0.0);
+    // F1: running sums for this probe's occlusion (mean, mean^2) hit distance -- see this file's
+    // own "probe occlusion" header comment.
+    float distSum = 0.0;
+    float distSqSum = 0.0;
     for (uint s = 0u; s < kProbeSampleDirections; ++s) {
         vec3 dir = kSampleDirections[s];
 
         uint hitEntityIndex;
         vec3 hitLocalPos, hitLocalNormal;
         bool hit;
+        float hitDistance;
         if (pc.traceMode == 0u) {
             hit = TraceMeshSDFScene(probePos, dir, kFarDistance, pc.entityCount, hitEntityIndex, hitLocalPos, hitLocalNormal);
+            // TraceMeshSDFScene's rayOrigin/rayDir (probePos/dir, both passed in world space, with
+            // no per-entity object-space transform applied inside that function -- see its own
+            // comment) means outLocalPos (hitLocalPos here) is ALREADY a world-space position, so
+            // the world-space hit distance is simply its distance from probePos.
+            hitDistance = hit ? distance(hitLocalPos, probePos) : kFarDistance;
         } else {
-            hit = TraceHWRT(probePos, dir, kFarDistance, hitEntityIndex, hitLocalPos, hitLocalNormal);
+            hit = TraceHWRT(probePos, dir, kFarDistance, hitEntityIndex, hitLocalPos, hitLocalNormal, hitDistance);
+            if (!hit) {
+                hitDistance = kFarDistance;
+            }
         }
+        distSum += hitDistance;
+        distSqSum += hitDistance * hitDistance;
 
         if (hit) {
             EntityInfo hitEntity = g_Entities[hitEntityIndex];
@@ -172,4 +209,8 @@ void main() {
 
     vec3 irradiance = accumulated / float(kProbeSampleDirections);
     imageStore(g_ProbeGrid, destTexel, vec4(irradiance, 1.0));
+
+    float meanDist = distSum / float(kProbeSampleDirections);
+    float meanSqDist = distSqSum / float(kProbeSampleDirections);
+    imageStore(g_ProbeOcclusion, destTexel, vec4(meanDist, meanSqDist, 0.0, 0.0));
 }

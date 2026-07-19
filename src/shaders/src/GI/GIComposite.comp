@@ -33,7 +33,8 @@ layout(std140, set = 0, binding = 8) uniform GICompositeViewParamsUBO {
 
 #define WORLD_PROBE_GRID_SET 0
 #define WORLD_PROBE_GRID_BINDING 9
-#define WORLD_PROBE_GRID_PARAMS_BINDING 10
+#define WORLD_PROBE_GRID_OCCLUSION_BINDING 10
+#define WORLD_PROBE_GRID_PARAMS_BINDING 11
 #include "include/world_probe_sampling.glsl"
 
 layout(push_constant) uniform DebugPC {
@@ -67,7 +68,7 @@ void main() {
         float ndcDepth = texelFetch(g_Depth, pixel, 0).r;
         if (ndcDepth < 1.0) {
             vec3 worldPos = ReconstructWorldPos(pixel, ndcDepth);
-            finalColor = SampleWorldProbeGrid(worldPos);
+            finalColor = SampleWorldProbeGrid(worldPos, g_ViewParams.cameraPos);
         } else {
             finalColor = vec3(0.0); // Sky/background -- no world position to sample the grid at.
         }

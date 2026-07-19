@@ -206,7 +206,7 @@ void main() {
     // Indirect stays a simple ambient multiply by the base slab's diffuse albedo only (no BRDF --
     // it has no single light direction), matching ClusterResolve.comp's own identical simplification
     // for its 0.15 ambient/fill term.
-    vec3 indirectLighting = SampleWorldProbeGrid(inWorldPos);
+    vec3 indirectLighting = SampleWorldProbeGrid(inWorldPos, g_ViewParams.cameraPositionWorld);
 
     // NOT weighted by mat.alpha here -- this pipeline's fixed-function blend (srcColorBlendFactor =
     // VK_BLEND_FACTOR_SRC_ALPHA) already multiplies the WHOLE outRGB by outAlpha; an explicit

@@ -646,9 +646,11 @@ namespace renderer {
         //     here (re-uploaded into this pass' own small ParticlePointLightsUBO every call, since
         //     unlike the VSM resources themselves, the light POSITIONS/colors are ordinary per-frame
         //     CPU data, not a borrowed GPU handle).
-        //   `worldProbeGridOrigin` (D6 fix) -- `renderer::WorldProbeGridPass::GetGridOriginWorld()`'s
-        //     CURRENT value, re-uploaded into m_WorldProbeGridParamsBuffer every call instead of the
-        //     stale one-time Init()-time value (see this class' own Init() comment on D6).
+        //   `worldProbes` (D6 fix; F1 "Lumen Lite" -- was a single `worldProbeGridOrigin` vec3, now
+        //     the owning pass itself so every renderer::WorldProbeGridPass::kLevelCount level's own
+        //     CURRENT origin/spacing can be re-uploaded) -- re-uploaded into
+        //     m_WorldProbeGridParamsBuffer every call instead of the stale one-time Init()-time
+        //     value (see this class' own Init() comment on D6).
         //   `frameIndex` (D1) -- decorrelates MegaLights' own RIS candidate draw across frames,
         //     exactly like MegaLightsShade.comp/TransparentForward.frag's own `frameIndex` push
         //     constant already does.
@@ -657,7 +659,7 @@ namespace renderer {
             const maths::mat4& viewProj, const maths::vec3& cameraPositionWorld,
             const maths::vec3& cameraRightWorld, const maths::vec3& cameraUpWorld, const maths::vec3& cameraForwardWorld,
             const maths::vec3& sunDirectionWorld, const maths::vec3& sunColor, float sunIntensity,
-            const SceneLights& sceneLights, const maths::vec3& worldProbeGridOrigin,
+            const SceneLights& sceneLights, const WorldProbeGridPass& worldProbes,
             float softFadeDistanceWorld, float heatShimmerStrength, float globalTimeSeconds, uint32_t frameIndex);
 
     private:
