@@ -246,7 +246,19 @@ namespace renderer {
             float ribbonWidth = 0.05f;           // Render mode 2 (Ribbon/Trail) only -- half-width, world units, of the trail's cross-section quad-strip (see ParticleRibbonRender.vert's own comment).
             uint32_t spriteOrientationMode = 0;  // Render mode 0 (Billboard) only -- 0 = camera-facing (Subtask 4's original, unchanged default), 1 = velocity-aligned (B3, see ParticleRender.vert's own comment).
             float subVariationStrength = 0.0f;   // Render mode 0 (Billboard) only -- [0,1], B3's procedural per-particle analytic-shape perturbation strength; 0.0 (default) renders pixel-identical to the pre-B3 plain soft circle/streak (see ParticleRender.frag's own comment).
-            float _pad2 = 0.0f, _pad3 = 0.0f, _pad4 = 0.0f; // Closes this struct's final 16-byte std430 slot.
+            // Feature F7 (UE5.7/5.8 Niagara parity: shadow-casting particles) -- repurposes what was
+            // the first of 3 trailing pad floats (`_pad2`) closing this struct's final 16-byte std430
+            // slot, same "reuse a trailing pad slot, no struct-size change" convention this struct's
+            // own module-stack/curve/sub-emitter blocks above already established repeatedly (see
+            // e.g. curlNoiseEnabled's own declaration comment). Nonzero = this emitter's alive
+            // kKindEmber particles are rendered depth-only into every Virtual Shadow Map page whose
+            // frustum overlaps this emitter's own (coarse, fixed-radius) world bounds -- see
+            // renderer::VirtualShadowMapPass::RecordParticleShadows's own comment for the full
+            // mechanism. Default off: casting shadows for every particle in flight is not free (an
+            // extra depth-only instanced draw per touched page, every frame), so this is opt-in per
+            // emitter, mirroring depthCollisionEnabled/subEmitterEnabled's own opt-in convention above.
+            uint32_t castShadows = 0;
+            float _pad3 = 0.0f, _pad4 = 0.0f; // Closes this struct's final 16-byte std430 slot.
         };
         static_assert(sizeof(EmitterParams) == 256, "EmitterParams must match ParticleCommon.glsl's EmitterParams struct exactly (std430 layout)");
 
@@ -422,6 +434,24 @@ namespace renderer {
 
         VkBuffer GetIndirectDrawBufferHandle() const { return m_IndirectDrawBuffer.Handle(); }
         VkBuffer GetCounterBufferHandle() const { return m_CounterBuffer.Handle(); }
+
+        // Feature F7 (shadow-casting particles): raw buffer handles for renderer::
+        // VirtualShadowMapPass's own particle-shadow-capture descriptor set to bind read-only,
+        // vertex-stage-only -- the same "borrow a raw VkBuffer handle, build your own descriptor set
+        // against it" convention every other cross-pass wiring in this codebase already uses (e.g.
+        // this pass' own Init() borrowing `entityTransformBuffer`/`entityDataBuffer`), NOT
+        // GetCurrentSet()'s full descriptor-set contract (that layout's binding numbers are
+        // particle-shader-specific, see ParticleCommon.glsl's own header comment on why every
+        // particle shader hardcodes set 0's 4 bindings). Unlike GetParticleBufferHandleForDebugView()
+        // above, these are NOT Debug-only -- shadow casting is real rendering behavior, must work
+        // identically in Release (CLAUDE.md's build-separation rule only excludes debug/diagnostic
+        // tooling, not gameplay-visible features). `GetCurrentSet()`'s own "most recently written"
+        // ping-pong index applies here too (see that accessor's own comment) -- these always resolve
+        // to whichever physical particle buffer m_CurrentIndex currently names.
+        VkBuffer GetParticleBufferHandle() const { return m_ParticleBuffer[m_CurrentIndex].Handle(); }
+        VkBuffer GetAliveListBufferHandle() const { return m_AliveListBuffer.Handle(); }
+        VkDeviceSize GetAliveListBufferSize() const { return m_AliveListBuffer.Size(); }
+        VkBuffer GetEmitterParamsBufferHandle() const { return m_EmitterParamsBuffer.Handle(); }
 
 #ifndef NDEBUG
         // Debug-only observability (Subtask 6's own "GPU Particles: alive/max" HUD/ImGui readout):
@@ -646,9 +676,11 @@ namespace renderer {
         //     here (re-uploaded into this pass' own small ParticlePointLightsUBO every call, since
         //     unlike the VSM resources themselves, the light POSITIONS/colors are ordinary per-frame
         //     CPU data, not a borrowed GPU handle).
-        //   `worldProbeGridOrigin` (D6 fix) -- `renderer::WorldProbeGridPass::GetGridOriginWorld()`'s
-        //     CURRENT value, re-uploaded into m_WorldProbeGridParamsBuffer every call instead of the
-        //     stale one-time Init()-time value (see this class' own Init() comment on D6).
+        //   `worldProbes` (D6 fix; F1 "Lumen Lite" -- was a single `worldProbeGridOrigin` vec3, now
+        //     the owning pass itself so every renderer::WorldProbeGridPass::kLevelCount level's own
+        //     CURRENT origin/spacing can be re-uploaded) -- re-uploaded into
+        //     m_WorldProbeGridParamsBuffer every call instead of the stale one-time Init()-time
+        //     value (see this class' own Init() comment on D6).
         //   `frameIndex` (D1) -- decorrelates MegaLights' own RIS candidate draw across frames,
         //     exactly like MegaLightsShade.comp/TransparentForward.frag's own `frameIndex` push
         //     constant already does.
@@ -657,7 +689,7 @@ namespace renderer {
             const maths::mat4& viewProj, const maths::vec3& cameraPositionWorld,
             const maths::vec3& cameraRightWorld, const maths::vec3& cameraUpWorld, const maths::vec3& cameraForwardWorld,
             const maths::vec3& sunDirectionWorld, const maths::vec3& sunColor, float sunIntensity,
-            const SceneLights& sceneLights, const maths::vec3& worldProbeGridOrigin,
+            const SceneLights& sceneLights, const WorldProbeGridPass& worldProbes,
             float softFadeDistanceWorld, float heatShimmerStrength, float globalTimeSeconds, uint32_t frameIndex);
 
     private:

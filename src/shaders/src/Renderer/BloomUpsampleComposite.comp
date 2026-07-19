@@ -13,11 +13,13 @@
 // separate mip chains (an in-place read-modify-write of one chain would read neighboring texels of
 // the very same subresource this dispatch is writing, an unsynchronized hazard).
 //
-// The FINAL call (mip 0, `pc.isFinalMip != 0`) additionally generates this pipeline's Lens Flare,
-// Anamorphic Lens Flare, and Lens Dirt -- 100% procedural, no texture asset for any of the three
-// (per this project's own CLAUDE.md constraint) -- and adds them on top of the plain bloom blend
-// before writing the pipeline's final bloom+flare+dirt image, which renderer::PostProcessPass's
-// own composite shader (PostProcessComposite.comp) samples and adds to the HDR scene color.
+// The FINAL call (mip 0, `pc.isFinalMip != 0`) additionally generates this pipeline's Lens Flare
+// (Ghosts + Halo), Anamorphic Lens Flare, and Lens Dirt -- 100% procedural, no texture asset for
+// any of the four (per this project's own CLAUDE.md constraint), each sourced from
+// renderer::BloomPass's own already-thresholded downsample chain (kFlareSourceMip) -- no separate
+// bright-pass re-extraction -- and added on top of the plain bloom blend before writing the
+// pipeline's final bloom+flare+dirt image, which renderer::PostProcessPass's own composite shader
+// (PostProcessComposite.comp) samples and adds to the HDR scene color at the same exposed scale.
 
 #include "include/math_utils.glsl"
 
@@ -37,6 +39,13 @@ layout(push_constant) uniform PC {
     float ghostIntensity;
     uint ghostCount;
     float ghostSpacing;
+    // Halo (single fixed-radius ring, opposite side of center from the source) -- only meaningful
+    // when isFinalMip.
+    float haloIntensity;
+    float haloWidth;
+    // Per-ghost/halo chromatic shift (small per-channel radial UV split) -- only meaningful when
+    // isFinalMip.
+    float chromaticShift;
     // Anamorphic Lens Flare (horizontal streak) -- only meaningful when isFinalMip.
     float anamorphicIntensity;
     float anamorphicStretch; // UV-space half-width of the horizontal streak kernel.
@@ -97,18 +106,68 @@ float LensDirtMask(vec2 uv, float scale) {
     return smoothstep(0.55, 0.95, n);
 }
 
+// Samples `tex` 3 times, one per channel, each offset a small distance `shift` along `dir` (UV
+// space) from `uv` -- a per-flare-sample analogue of PostProcessComposite.comp's own
+// SampleWithChromaticAberration, but RADIAL along the ghost/halo chain's own line-through-center
+// direction rather than the screen-center direction of the base scene capture (the two are only
+// the same line for a ghost sitting exactly on it, which by construction they always are here).
+// Real lens ghosting separates color slightly per internal reflection/incidence angle, so each
+// individual ghost/halo sample gets its own small fringe rather than one uniform tint.
+vec3 SampleChromaticShifted(sampler2D tex, vec2 uv, vec2 dir, float shift) {
+    vec3 r = SanitizeHDR(textureLod(tex, clamp(uv + dir * shift, vec2(0.0), vec2(1.0)), 0.0).rgb);
+    vec3 g = SanitizeHDR(textureLod(tex, clamp(uv, vec2(0.0), vec2(1.0)), 0.0).rgb);
+    vec3 b = SanitizeHDR(textureLod(tex, clamp(uv - dir * shift, vec2(0.0), vec2(1.0)), 0.0).rgb);
+    return vec3(r.r, g.g, b.b);
+}
+
+// Ghost chain: inverted/scaled resamples of the bright-pass source along the line through screen
+// center. The sample position is first POINT-REFLECTED through the center (mirroredUV = 1 - uv --
+// a real lens's internal reflections invert the image), then walked along the mirroredUV-to-center
+// vector at a signed, scaled distance `t` per ghost that spans PAST the center (t outside [0, 1],
+// not just between the mirrored point and the center) -- this is what actually produces the classic
+// multi-ghost chain crossing through and beyond the center, landing ghosts back on the ORIGINAL
+// side of the screen from the source, not merely between the source and the center.
 vec3 SampleGhosts(vec2 uv) {
-    vec2 ghostVec = (vec2(0.5) - uv) * pc.ghostSpacing;
+    vec2 mirroredUV = vec2(1.0) - uv;
+    vec2 ghostVec = (vec2(0.5) - mirroredUV) * pc.ghostSpacing;
+    float ghostVecLen = length(ghostVec);
+    vec2 ghostDir = ghostVecLen > 1.0e-5 ? ghostVec / ghostVecLen : vec2(1.0, 0.0);
+
     vec3 result = vec3(0.0);
     for (uint i = 0u; i < pc.ghostCount; ++i) {
-        float t = float(i) / max(float(pc.ghostCount - 1u), 1.0);
-        vec2 ghostUV = fract(uv + ghostVec * t);
-        float weight = 1.0 - abs(t - 0.5) * 1.6; // Falls off toward both ends of the ghost chain.
+        float t01 = float(i) / max(float(pc.ghostCount - 1u), 1.0); // [0, 1] across the chain.
+        float t = t01 * 2.2 - 0.6; // Signed/scaled: ~[-0.6, 1.6], deliberately spanning past both ends.
+        vec2 ghostUV = mirroredUV + ghostVec * t;
+        // Off-screen ghost samples are skipped entirely rather than fract()-wrapped (which would
+        // smear the opposite screen edge in) or clamped (which would streak toward the border).
+        if (any(lessThan(ghostUV, vec2(0.0))) || any(greaterThan(ghostUV, vec2(1.0)))) {
+            continue;
+        }
+        float weight = 1.0 - abs(t01 - 0.5) * 1.6; // Falls off toward both ends of the ghost chain.
         weight = clamp(weight, 0.0, 1.0);
-        vec3 sampleColor = SanitizeHDR(textureLod(g_FlareSource, ghostUV, 0.0).rgb);
-        result += sampleColor * GhostTint(t) * weight;
+        vec3 sampleColor = SampleChromaticShifted(g_FlareSource, ghostUV, ghostDir, pc.chromaticShift);
+        result += sampleColor * GhostTint(t01) * weight;
     }
     return result * pc.ghostIntensity;
+}
+
+// Halo: the other classic image-based lens-flare element alongside the ghost chain -- a single
+// sample at a FIXED UV-space radius from screen center, on the line through center from the
+// source, landing on the opposite side (a real lens forms this from a shallow-incidence internal
+// reflection off the front element, always at roughly the same angular radius regardless of the
+// source's own distance from center).
+vec3 SampleHalo(vec2 uv) {
+    vec2 toCenter = vec2(0.5) - uv;
+    float toCenterLen = length(toCenter);
+    // Degenerate at dead-center (source exactly at screen center): no well-defined halo direction,
+    // and the term is negligible there regardless (a halo ring around a centered source is
+    // rotationally symmetric, no single direction reads differently) -- pick an arbitrary axis.
+    vec2 dir = toCenterLen > 1.0e-5 ? toCenter / toCenterLen : vec2(1.0, 0.0);
+    vec2 haloUV = vec2(0.5) + dir * pc.haloWidth;
+    if (any(lessThan(haloUV, vec2(0.0))) || any(greaterThan(haloUV, vec2(1.0)))) {
+        return vec3(0.0); // Ring sample fell off-screen -- no wrap/clamp smear, same policy as ghosts.
+    }
+    return SampleChromaticShifted(g_FlareSource, haloUV, dir, pc.chromaticShift) * pc.haloIntensity;
 }
 
 vec3 SampleAnamorphicStreak(vec2 uv) {
@@ -143,12 +202,13 @@ void main() {
 
     if (pc.isFinalMip != 0u) {
         vec3 ghosts = SampleGhosts(uv);
+        vec3 halo = SampleHalo(uv);
         vec3 streak = SampleAnamorphicStreak(uv);
         float dirt = LensDirtMask(uv, pc.dirtScale);
-        // Lens Dirt only attenuates the flare/glare contribution (ghosts + anamorphic streak),
-        // never the base bloom bleed -- matches how real dirt/smudges on a lens element only
-        // scatter light that grazes that specific optical path, not the whole glow halo.
-        result += (ghosts + streak) * mix(1.0, dirt, pc.dirtIntensity);
+        // Lens Dirt only attenuates the flare/glare contribution (ghosts + halo + anamorphic
+        // streak), never the base bloom bleed -- matches how real dirt/smudges on a lens element
+        // only scatter light that grazes that specific optical path, not the whole glow halo.
+        result += (ghosts + halo + streak) * mix(1.0, dirt, pc.dirtIntensity);
     }
 
     // Clamp the WRITTEN result into a finite, fp16-representable range before the store. This is the

@@ -1,11 +1,21 @@
 #version 460
 #extension GL_GOOGLE_include_directive : enable
 
-// Final GI composite: finalColor = directLitColor + denoisedIndirectGI, written into this pass'
-// own owned rgba16f (linear HDR) output image -- see renderer::GICompositePass's own class comment
-// for why the two debug-view-mode branches below (and every binding/push-constant they need) are
-// entirely `#ifdef _DEBUG`-gated, mirroring ClusterResolve.comp's own existing convention for its
-// debug viewMode push constant.
+// Final GI composite: finalColor = directLitColor + indirectGI, written into this pass' own owned
+// rgba16f (linear HDR) output image.
+//
+// F1/F9 (UE5.8 parity roadmap): `indirectGI` is one of two mutually exclusive sources, chosen by
+// the always-on (Release included) `pc.giMode` push constant (config::lumen::GIMode):
+// GIMode::HighQuality (0) reads g_ScreenProbeGI (renderer::ScreenProbeGIPass::GetOutputView(), real
+// Lumen's own "Screen Probe Gather" near-field term, restored F9); GIMode::Lite (1) reads
+// g_DenoisedGI (renderer::ATrousDenoisePass's denoised renderer::ScreenTracePass output, F1's own
+// probe-grid-primary term with the per-pixel march skipped -- see ScreenTrace.comp's own giMode
+// branch). Both are always bound; see renderer::GICompositePass's own class comment for why an
+// unsampled one going stale between mode switches is harmless.
+//
+// See renderer::GICompositePass's own class comment for why the two debug-view-mode branches below
+// (and every OTHER binding/push-constant field they need) are entirely `#ifdef _DEBUG`-gated,
+// mirroring ClusterResolve.comp's own existing convention for its debug viewMode push constant.
 
 layout(local_size_x = 8, local_size_y = 8) in;
 
@@ -13,11 +23,19 @@ layout(local_size_x = 8, local_size_y = 8) in;
 // constant's own comment for why (direct + GI, both already HDR, must not be hard-clipped here).
 layout(rgba16f, set = 0, binding = 0) uniform writeonly image2D g_Output;
 layout(set = 0, binding = 1) uniform sampler2D g_DirectColor;
-layout(set = 0, binding = 2) uniform sampler2D g_DenoisedGI;
+layout(set = 0, binding = 2) uniform sampler2D g_DenoisedGI;      // GIMode::Lite.
 // Phase PP4: renderer::ScreenSpaceEffectsPass's own GTAO.comp output (r8, [0,1]) -- multiplies
-// ONLY the denoised indirect GI term below, never the direct sun term (already shadow-tested by
+// ONLY the selected indirect GI term below, never the direct sun term (already shadow-tested by
 // renderer::VirtualShadowMapPass), matching UE5.8's own GTAO scope.
 layout(set = 0, binding = 3) uniform sampler2D g_AO;
+layout(set = 0, binding = 4) uniform sampler2D g_ScreenProbeGI;   // F9: GIMode::HighQuality.
+
+layout(push_constant) uniform CompositePC {
+    uint giMode; // config::lumen::GIMode -- 0 = HighQuality (g_ScreenProbeGI), 1 = Lite (g_DenoisedGI).
+#ifdef _DEBUG
+    uint viewMode;
+#endif
+} pc;
 
 #ifdef _DEBUG
 layout(set = 0, binding = 7) uniform sampler2D g_Depth;
@@ -33,12 +51,9 @@ layout(std140, set = 0, binding = 8) uniform GICompositeViewParamsUBO {
 
 #define WORLD_PROBE_GRID_SET 0
 #define WORLD_PROBE_GRID_BINDING 9
-#define WORLD_PROBE_GRID_PARAMS_BINDING 10
+#define WORLD_PROBE_GRID_OCCLUSION_BINDING 10
+#define WORLD_PROBE_GRID_PARAMS_BINDING 11
 #include "include/world_probe_sampling.glsl"
-
-layout(push_constant) uniform DebugPC {
-    uint viewMode;
-} pc;
 
 vec3 ReconstructWorldPos(ivec2 pixel, float ndcDepth) {
     vec2 ndcXY = (vec2(pixel) + 0.5) / g_ViewParams.viewportSize * 2.0 - 1.0;
@@ -56,18 +71,21 @@ void main() {
     }
 
     vec3 directColor = texelFetch(g_DirectColor, pixel, 0).rgb;
-    vec3 denoisedGI = texelFetch(g_DenoisedGI, pixel, 0).rgb;
+    // F1/F9: select this frame's indirect term by GI mode -- see this file's own header comment.
+    vec3 indirectGI = (pc.giMode == 0u)
+        ? texelFetch(g_ScreenProbeGI, pixel, 0).rgb
+        : texelFetch(g_DenoisedGI, pixel, 0).rgb;
     float ao = texelFetch(g_AO, pixel, 0).r;
-    vec3 finalColor = directColor + denoisedGI * ao;
+    vec3 finalColor = directColor + indirectGI * ao;
 
 #ifdef _DEBUG
-    if (pc.viewMode == 13u) { // DEBUG_VIEW_LUMEN: the denoised indirect GI term alone.
-        finalColor = denoisedGI;
+    if (pc.viewMode == 13u) { // DEBUG_VIEW_LUMEN: the selected indirect GI term alone.
+        finalColor = indirectGI;
     } else if (pc.viewMode == 14u) { // DEBUG_VIEW_SPATIAL_PROBES: visualize the World Probe grid directly.
         float ndcDepth = texelFetch(g_Depth, pixel, 0).r;
         if (ndcDepth < 1.0) {
             vec3 worldPos = ReconstructWorldPos(pixel, ndcDepth);
-            finalColor = SampleWorldProbeGrid(worldPos);
+            finalColor = SampleWorldProbeGrid(worldPos, g_ViewParams.cameraPos);
         } else {
             finalColor = vec3(0.0); // Sky/background -- no world position to sample the grid at.
         }

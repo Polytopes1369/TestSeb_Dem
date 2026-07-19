@@ -404,6 +404,13 @@ bool ClusterRenderPipeline::Init(
   m_MaskGenerator.Init(createInfo.device, createInfo.allocator,
                        createInfo.commandPool, createInfo.queue);
 
+  // F12 (UE5.8 rendering-parity gap: Texture-based Light Functions + projected Caustics):
+  // procedurally generates the Light Function gobo array + caustics texture once, before m_Resolve
+  // below (its sole consumer) is initialized -- same "producer generator Init's before any pass
+  // binds its output" convention as m_MaskGenerator just above.
+  m_LightFunctionGenerator.Init(createInfo.device, createInfo.allocator,
+                                createInfo.commandPool, createInfo.queue);
+
   std::array<VkFormat, 2> visBufferFormats{createInfo.visBufferFormat,
                                            createInfo.visBufferFormat};
   m_HardwareRaster.Init(createInfo.device,
@@ -444,7 +451,9 @@ bool ClusterRenderPipeline::Init(
       createInfo.entityDataBuffer,
       createInfo.materialTable.params,
       m_SplineControlPointsBuffer.Handle(),
-      m_SkeletalAnimator.GetBoneMatricesBuffer());
+      m_SkeletalAnimator.GetBoneMatricesBuffer(),
+      m_LightFunctionGenerator.GetLightFunctionImageInfos(),
+      m_LightFunctionGenerator.GetCausticsImageInfo());
 
   // Phase 1b: the shading-bin sort pass needs m_Resolve's own 5 output image views (its Classify
   // stage writes background pixels directly into them, see ClusterShadingBinPass's own class
@@ -896,6 +905,13 @@ bool ClusterRenderPipeline::Init(
     return false;
   }
 
+  // Feature F7 (shadow-casting particles): one-time deferred wiring -- m_VirtualShadowMap.Init()
+  // (much earlier above) could not take m_ParticleSystem's buffers as an Init() parameter the way
+  // entityTransformBuffer/entityDataBuffer above are, since m_ParticleSystem itself did not exist
+  // yet at that point -- see VirtualShadowMapPass::SetParticleSystem's own comment for the full
+  // "deferred binding, same pattern as SetVirtualShadowMap" rationale.
+  m_VirtualShadowMap.SetParticleSystem(m_ParticleSystem);
+
   // GPU-instanced procedural vegetation scatter (UE5.8 rendering-parity gap G2) -- grass/shrub/rock
   // instances across the terrain. Depends on m_VirtualShadowMap + m_WorldProbes (forward lighting,
   // both Init'd just above) and m_HZB (per-instance occlusion cull, Init'd far earlier). Draws onto
@@ -938,21 +954,39 @@ bool ClusterRenderPipeline::Init(
     return false;
   }
 
-  // Screen Trace GI -- linear screen-space depth raymarching falling back to the World Probe grid.
+  // Screen Trace GI -- GIMode::HighQuality's own linear screen-space depth raymarch falling back to
+  // the World Probe grid, or GIMode::Lite's own (march-skipped) probe-grid-primary sample -- see
+  // ScreenTrace.comp's own giMode branch (F1).
   m_ScreenTrace.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
                      createInfo.renderExtent, m_Resolve.GetOutputDepthView(), m_Resolve.GetOutputNormalView(),
                      m_Resolve.GetOutputColorView(), m_WorldProbes);
 
+  // F9 (UE5.8 parity roadmap): Screen Space Probe GI -- GIMode::HighQuality's own near-field gather
+  // (real Lumen's "Screen Probe Gather"), restored from the tombstoned deletion this class' own
+  // header comment describes. Needs the same trace-scene resources m_ScreenTrace/m_GIInject/
+  // m_WorldProbes already share (m_TraceContext, m_SurfaceCache, m_SurfaceCacheRT), plus m_Resolve's
+  // GBuffer for its own probe placement/gather.
+  if (!m_ScreenProbeGI.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
+                            createInfo.renderExtent, m_TraceContext, m_SurfaceCache, m_SurfaceCacheRT, m_Resolve)) {
+    LOG_ERROR("[ClusterRenderPipeline] Failed to initialize ScreenProbeGIPass.");
+    return false;
+  }
+
   // Final spatial denoiser: denoises m_ScreenTrace's own output GI image, guided by
-  // m_Resolve's own G-buffer normal/depth -- both already Init'd (STEP 6 above).
+  // m_Resolve's own G-buffer normal/depth -- both already Init'd (STEP 6 above). Only feeds
+  // GIMode::Lite's own composite input (see m_GIComposite.Init's own comment); GIMode::HighQuality
+  // reads m_ScreenProbeGI's own output directly instead (that pass already temporally accumulates,
+  // see its own class comment on why it needs no separate spatial denoise pass).
   m_Denoiser.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
       createInfo.renderExtent, m_ScreenTrace.GetOutputView(), m_Resolve.GetOutputDepthView(),
       m_Resolve.GetOutputNormalView());
 
-  // GI Composite: blends m_Resolve's direct lighting / reflections with the denoised indirect GI.
+  // GI Composite: blends m_Resolve's direct lighting / reflections with [m_ScreenProbeGI |
+  // m_Denoiser]'s own indirect term, selected per frame by config::lumen::GI_MODE -- see
+  // GICompositePass's own class comment.
   m_GIComposite.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
       createInfo.renderExtent, m_Resolve.GetOutputColorView(), m_Denoiser.GetOutputView(),
-      m_ScreenSpaceEffects.GetAOView(), m_Resolve.GetOutputDepthView(), m_WorldProbes);
+      m_ScreenProbeGI.GetOutputView(), m_ScreenSpaceEffects.GetAOView(), m_Resolve.GetOutputDepthView(), m_WorldProbes);
 
   // Screen-space Subsurface Scattering (UE5.8 rendering-parity gap G4): a separable diffusion-profile
   // blur applied IN PLACE to m_GIComposite's fully-lit output image, gated per-pixel by each
@@ -974,6 +1008,14 @@ bool ClusterRenderPipeline::Init(
   m_DepthOfField.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
       m_DisplayExtent, m_TAATSR.GetOutputView(), m_Resolve.GetOutputDepthView());
 
+  // UE5.8-parity "Accumulation Depth of Field" (config::postprocess::DOF_MODE == 1): same inputs as
+  // m_DepthOfField just above (both read m_TAATSR's own HDR output + m_Resolve's own depth) -- always
+  // Init'd alongside it so the live ImGui mode toggle never needs a resize/recreate, only a history
+  // reset (see [13e]'s own resetHistory computation below). Must also Init before m_Bloom, same
+  // reason as m_DepthOfField.
+  m_DepthOfFieldAccumulation.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
+      m_DisplayExtent, m_TAATSR.GetOutputView(), m_Resolve.GetOutputDepthView());
+
   // Phase PP2 (post-process stack roadmap): Bloom/Lens Flare/Anamorphic Flare/Lens Dirt, reading
   // m_DepthOfField's own output -- must Init before m_PostProcess so its own GetOutputView()
   // already exists for m_PostProcess.Init's own g_Bloom binding.
@@ -990,10 +1032,19 @@ bool ClusterRenderPipeline::Init(
   // exists), not just bound once here. `depthView`/`refractionOffsetView` (Phase PP3) ARE just
   // bound once here -- both keep a fixed identity for this pipeline's entire lifetime (see
   // PostProcessPass::Init's own comment).
+  // F3 (UE5.8 rendering-parity gap: Fog Screen Space Scattering) -- must Init before m_PostProcess so
+  // its own GetOutputView() already exists for m_PostProcess.Init's own g_FogScattered binding (same
+  // "producer Init's before consumer Init's" convention as m_DepthOfField/m_Bloom above). Reads
+  // m_Resolve's depth (its only other input besides m_AtmosFog's own 3D texture/sampler, already
+  // Init'd -- see ClusterRenderPipeline.h's own m_AtmosFog placement comment).
+  m_FogScatter.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
+      m_DisplayExtent, m_Resolve.GetOutputDepthView(), m_AtmosFog.GetIntegratedFogView(), m_AtmosFog.GetFogSampler());
+
   m_PostProcess.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
       m_DisplayExtent, m_DepthOfField.GetOutputView(), m_Bloom.GetOutputView(),
       m_Resolve.GetOutputDepthView(), m_TransparentForward.GetRefractionOffsetView(),
-      m_AtmosSky.GetSkyViewLUTView(), m_AtmosFog.GetIntegratedFogView(), m_AtmosClouds.GetCloudView());
+      m_AtmosSky.GetSkyViewLUTView(), m_AtmosFog.GetIntegratedFogView(), m_AtmosClouds.GetCloudView(),
+      m_FogScatter.GetOutputView());
 
 #ifndef NDEBUG
   // Two-tier SDF ray march DEBUG VISUALIZATION (see ClusterRenderPipeline.h's own comment on
@@ -1395,6 +1446,7 @@ void ClusterRenderPipeline::Shutdown() {
   m_ScreenSpaceEffects.Shutdown();
   m_Reflection.Shutdown();
   m_ScreenTrace.Shutdown();
+  m_ScreenProbeGI.Shutdown();
   m_GIComposite.Shutdown();
   m_Decals.Shutdown();
   m_SubsurfaceScattering.Shutdown();
@@ -1405,8 +1457,10 @@ void ClusterRenderPipeline::Shutdown() {
   // top-of-function Shutdown() call, never explicitly on a real pipeline teardown) -- fixed here
   // alongside adding m_Bloom's own equivalent call.
   m_PostProcess.Shutdown();
+  m_FogScatter.Shutdown(); // F3 -- Init'd right before m_PostProcess above, shut down right after it (reverse order).
   m_Bloom.Shutdown();
   m_DepthOfField.Shutdown();
+  m_DepthOfFieldAccumulation.Shutdown();
   m_TAATSR.Shutdown();
   m_WorldProbes.Shutdown();
   m_GIInject.Shutdown();
@@ -1434,6 +1488,7 @@ void ClusterRenderPipeline::Shutdown() {
   m_VTManager.Shutdown();
   m_PrevViewProj = maths::mat4{};
   m_HasPrevViewProj = false;
+  m_DOFAccumulationWasActive = false;
   m_FrameIndex = 0;
 #ifndef NDEBUG
   m_DebugTraceMode = 0;
@@ -1450,6 +1505,7 @@ void ClusterRenderPipeline::Shutdown() {
   m_SoftwareRaster.Shutdown();
   m_HardwareRaster.Shutdown();
   m_MaskGenerator.Shutdown();
+  m_LightFunctionGenerator.Shutdown(); // F12
   m_OcclusionCulling.Shutdown();
   m_Streaming.Shutdown();
   m_LODSelection.Shutdown();
@@ -1533,7 +1589,11 @@ void ClusterRenderPipeline::RecordDebugBufferView(VkCommandBuffer cmd) {
         case 7: sourceView = m_ScreenSpaceEffects.GetAOView(); mode = debug::DebugBufferViewPass::VisualizationMode::kGrayscale; break;
         case 8: sourceView = m_Bloom.GetOutputView(); mode = debug::DebugBufferViewPass::VisualizationMode::kTonemap; break;
         case 9: sourceView = m_TAATSR.GetOutputView(); mode = debug::DebugBufferViewPass::VisualizationMode::kTonemap; break;
-        case 10: sourceView = m_DepthOfField.GetOutputView(); mode = debug::DebugBufferViewPass::VisualizationMode::kTonemap; break;
+        // Shows whichever DOF sub-pass config::postprocess::DOF_MODE actually ran this frame (see
+        // RecordFrame's own [13e] for the identical branch) -- the OTHER one's own output view would
+        // be frozen/stale since only the active pass is dispatched each frame.
+        case 10: sourceView = (config::postprocess::DOF_MODE != 0) ? m_DepthOfFieldAccumulation.GetOutputView() : m_DepthOfField.GetOutputView();
+                 mode = debug::DebugBufferViewPass::VisualizationMode::kTonemap; break;
         case 11: sourceView = m_ScreenTrace.GetOutputView(); mode = debug::DebugBufferViewPass::VisualizationMode::kTonemap; break;
         case 12: sourceView = m_Denoiser.GetOutputView(); mode = debug::DebugBufferViewPass::VisualizationMode::kTonemap; break;
         case 13: sourceView = m_GIComposite.GetOutputView(); mode = debug::DebugBufferViewPass::VisualizationMode::kTonemap; break;
@@ -2064,6 +2124,10 @@ void ClusterRenderPipeline::RecordFrameEarly(VkCommandBuffer cmdEarly,
         gpu.spriteOrientationMode = cfg.spriteOrientationMode;
         gpu.subVariationStrength = cfg.subVariationStrength;
 
+        // Feature F7 (shadow-casting particles): same "copy the live ImGui-edited config value into
+        // this frame's GPU struct" pattern as every field above.
+        gpu.castShadows = cfg.castShadows ? 1u : 0u;
+
         if (cfg.active) {
           m_ParticleSpawnAccumulator[i] += cfg.spawnRate * particleDeltaTimeSeconds;
         }
@@ -2142,6 +2206,19 @@ void ClusterRenderPipeline::RecordFrameEarly(VkCommandBuffer cmdEarly,
 #ifndef NDEBUG
       m_GpuProfiler.EndZone(cmdEarly);
 #endif
+
+      // Feature F7 (shadow-casting particles): must run AFTER RecordSimulate/RecordSort just above
+      // (records its own explicit VkBarrier2 between their compute-shader writes and this call's own
+      // vertex-shader reads, see VirtualShadowMapPass::RecordParticleShadows' own comment) so this
+      // frame's freshly-simulated alive-particle positions/alive-list/indirect-draw-args are what get
+      // rendered into whichever VSM pages m_VirtualShadowMap.RecordBeginFrame() (much earlier this
+      // same frame, see [1] above) already rendered entity geometry into -- layers a light-facing,
+      // alpha-tested particle-shadow footprint on top of those pages' own depth, LOAD_OP_LOAD (never
+      // erasing what RecordBeginFrame already captured). Deliberately NOT wrapped in its own
+      // GpuProfiler zone (unlike every RecordXxx() call above) -- this codebase's Debug-only
+      // per-pass GPU timestamp profiler is being rolled out by a concurrent effort; leaving this one
+      // call unzoned avoids colliding with that in-flight work.
+      m_VirtualShadowMap.RecordParticleShadows(cmdEarly, m_ParticleSystem);
     }
 
     // 4. Secondary-bounce injection into m_SurfaceCache's own radiance atlas + the TLAS refit that
@@ -3029,9 +3106,11 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
   // next frame -- identical one-frame-lag placement to m_VirtualShadowMap.RecordEndFrame() above.
   m_VTStreaming.RecordEndFrame(cmdLate);
 
-  // [12b] Screen Trace GI (Lumen Screen Trace + World Probe fallback): traces linear screen-space
-  // rays against the GBuffer depth/normal, falling back to the 3D world probe grid on miss.
-  // Writes to its own dedicated output image (m_ScreenTrace.GetOutputImage()).
+  // [12b] Screen Trace GI (Lumen Screen Trace + World Probe fallback/primary -- see F1's own
+  // GIMode switch): in GIMode::HighQuality, traces linear screen-space rays against the GBuffer
+  // depth/normal, falling back to the multi-level world probe grid on miss; in GIMode::Lite, skips
+  // the march and samples the probe grid directly as this pixel's own GI term. Writes to its own
+  // dedicated output image (m_ScreenTrace.GetOutputImage()).
   // =========================================================================================
   {
 #ifndef NDEBUG
@@ -3043,7 +3122,7 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
     m_GpuProfiler.BeginZone(cmdLate, "ScreenTrace");
 #endif
     if (ssrtEnabled) {
-      m_ScreenTrace.RecordTrace(cmdLate, cameraCopy, cameraPositionWorld, m_WorldProbes.GetGridOriginWorld(), m_FrameIndex);
+      m_ScreenTrace.RecordTrace(cmdLate, cameraCopy, cameraPositionWorld, m_WorldProbes, m_FrameIndex, config::lumen::GI_MODE);
     } else {
       VkClearColorValue blackClear{};
       blackClear.float32[0] = 0.0f;
@@ -3051,6 +3130,33 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
       blackClear.float32[2] = 0.0f;
       blackClear.float32[3] = 0.0f;
       VulkanUtils::ClearComputeImageToGeneral(cmdLate, m_ScreenTrace.GetOutputImage(), blackClear);
+    }
+#ifndef NDEBUG
+    m_GpuProfiler.EndZone(cmdLate);
+#endif
+  }
+
+  // =========================================================================================
+  // [12b1] F9 (UE5.8 parity roadmap): Screen Space Probe GI -- GIMode::HighQuality's own near-field
+  // gather (real Lumen's "Screen Probe Gather"), restored from the tombstoned deletion
+  // renderer::ScreenProbeGIPass's own header comment describes. Needs m_Resolve's GBuffer
+  // (already visible from [11]/[12]'s own barriers) and the same Surface Cache atlas + TLAS
+  // visibility [1z]'s m_GIInject already established this frame. Only actually re-dispatched
+  // while GIMode::HighQuality is active -- see this block's own `giModeIsHQ` gate and
+  // GICompositePass's own class comment for why leaving it un-re-traced in Lite mode is harmless
+  // (its own output image simply goes unsampled that frame).
+  // =========================================================================================
+  {
+    bool giModeIsHQ = (config::lumen::GI_MODE == config::lumen::GIMode::HighQuality);
+#ifndef NDEBUG
+    m_GpuProfiler.BeginZone(cmdLate, "ScreenProbeGI");
+#endif
+    if (giModeIsHQ) {
+      maths::mat4 prevViewProjForScreenProbeGI = m_HasPrevViewProj ? m_PrevViewProj : maths::mat4{};
+      m_ScreenProbeGI.RecordUpdateViewParams(cmdLate, viewProj, prevViewProjForScreenProbeGI);
+      m_ScreenProbeGI.RecordTrace(cmdLate, m_TraceContext, m_TraceContext.GetEntityCount(), traceMode, m_FrameIndex);
+      m_ScreenProbeGI.RecordTemporal(cmdLate);
+      m_ScreenProbeGI.RecordGather(cmdLate);
     }
 #ifndef NDEBUG
     m_GpuProfiler.EndZone(cmdLate);
@@ -3157,25 +3263,25 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
   }
 
   // =========================================================================================
-  // [12c] World Probe grid: fully rebuilt every frame from the Surface Cache radiance atlas
-  // [1z] already re-injected into this frame ("Propagate Surface Cache lighting directly
-  // into this 3D grid at each frame") -- INTENDED as what dynamic/off-screen objects would
-  // sample for indirect light (world_probe_sampling.glsl's SampleWorldProbeGrid) -- also the
-  // fallback m_ScreenTrace itself samples on a screen-space march miss, since a screen-space march
-  // only ever sees on-screen pixels. Independent GPU work
-  // from [12b] above (no data dependency either way), just recorded after it for locality with
-  // the rest of this frame's GI additions.
+  // [12c] World Probe grid: F1's own multi-level clipmap (renderer::WorldProbeGridPass::kLevelCount
+  // levels), incrementally streamed every frame from the Surface Cache radiance atlas [1z] already
+  // re-injected this frame -- sampled every frame by m_ScreenTrace, either as its screen-space
+  // march's miss fallback (config::lumen::GIMode::HighQuality) or as the PRIMARY GI term with the
+  // march skipped entirely (GIMode::Lite -- see ScreenTrace.comp's own giMode branch), plus,
+  // Debug-only, m_GIComposite's DEBUG_VIEW_SPATIAL_PROBES visualization. Independent GPU work from
+  // [12b] above (no data dependency either way), just recorded after it for locality with the rest
+  // of this frame's GI additions.
   //
   // `worldProbesEnabled` (debug-only toggle, main.cpp's 'H' key) gates this dispatch entirely --
-  // see SetDebugWorldProbesEnabled()'s own comment. The grid has real live consumers every frame
-  // (m_ScreenTrace's own miss fallback + GICompositePass's DEBUG_VIEW_SPATIAL_PROBES view), so
-  // Release hardcodes this ON below; the Debug toggle exists purely for A/B cost comparison.
-  // Build timing: the very FIRST RecordUpdate() call enqueues the entire grid volume as one
-  // dirty slab and drains it immediately (WorldProbeGridPass::m_HasValidWindow starts false), so
-  // every probe is traced by the end of frame 1 -- but against whatever the Surface Cache has
-  // captured BY then (it fills at CARDS_PER_FRAME_BUDGET cards/frame), and a probe is only ever
-  // re-traced when camera motion reveals it anew. See RequestDebugWorldProbeRetrace() for the
-  // manual full re-trace this implies wanting once the cache has finished warming.
+  // see SetDebugWorldProbesEnabled()'s own comment. This system is a live, load-bearing consumer in
+  // BOTH GI modes (Lite mode's own primary GI term, HighQuality mode's own fallback) -- Release
+  // hardcodes this ON unconditionally, matching that.
+  // Build timing: each level's very FIRST RecordUpdate() call enqueues its entire grid volume as
+  // one dirty slab (ClipmapLevel::hasValidWindow starts false) and the shared drain budget covers
+  // them all within the first call(s) -- but each probe is traced against whatever the Surface
+  // Cache has captured BY then (it fills at CARDS_PER_FRAME_BUDGET cards/frame), and a probe is
+  // only ever re-traced when camera motion reveals it anew. See RequestDebugWorldProbeRetrace()
+  // for the manual full re-trace this implies wanting once the cache has finished warming.
   // =========================================================================================
 #ifndef NDEBUG
   bool worldProbesEnabled = m_DebugWorldProbesEnabled;
@@ -3231,14 +3337,16 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
   }
 
   // =========================================================================================
-  // [12e] GI Composite: blends direct lit color/reflections with denoised indirect GI.
+  // [12e] GI Composite: blends direct lit color/reflections with [m_ScreenProbeGI |
+  // m_Denoiser]'s own indirect term, selected by config::lumen::GI_MODE -- see GICompositePass's
+  // own class comment.
   // =========================================================================================
 #ifndef NDEBUG
   m_GpuProfiler.BeginZone(cmdLate, "GIComposite");
 #endif
-  m_GIComposite.RecordComposite(cmdLate
+  m_GIComposite.RecordComposite(cmdLate, config::lumen::GI_MODE
 #ifndef NDEBUG
-      , cameraCopy, cameraPositionWorld, m_WorldProbes.GetGridOriginWorld()
+      , cameraCopy, cameraPositionWorld, m_WorldProbes
 #endif
   );
 #ifndef NDEBUG
@@ -3470,11 +3578,12 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
     // SDFRayMarchPass::RecordRayMarch already use; forward (D5) is simply cameraFrameInfo.forward
     // itself, already tracked.
     //
-    // Niagara-parity render-integration roadmap: `m_SceneLights` (D3 point lights) and
-    // `m_WorldProbes.GetGridOriginWorld()` (D6 fix -- this frame's CURRENT toroidal-recenter origin,
-    // not a stale Init()-time snapshot) and `m_FrameIndex` (D1 MegaLights RIS decorrelation) are all
-    // already tracked/available at this call site, same values every other consumer below/above
-    // already reads.
+    // Niagara-parity render-integration roadmap: `m_SceneLights` (D3 point lights) and `m_WorldProbes`
+    // itself (D6 fix -- F1 "Lumen Lite" passes the whole pass now, not a single stale-snapshot
+    // origin, so ParticleSystemPass::RecordDraw can read every clipmap level's own CURRENT
+    // toroidal-recenter origin) and `m_FrameIndex` (D1 MegaLights RIS decorrelation) are all already
+    // tracked/available at this call site, same values every other consumer below/above already
+    // reads.
     {
       const maths::vec3 worldUpHint{0.0f, 1.0f, 0.0f};
       const maths::vec3 particleCameraRight = cameraFrameInfo.forward.Cross(worldUpHint).Normalize();
@@ -3487,7 +3596,7 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
           m_TransparentForward.GetRefractionOffsetView(), m_RenderExtent,
           viewProj, cameraFrameInfo.position, particleCameraRight, particleCameraUp, cameraFrameInfo.forward,
           m_SceneLights.sun.direction, m_SceneLights.sun.color, m_SceneLights.sun.intensity,
-          m_SceneLights, m_WorldProbes.GetGridOriginWorld(),
+          m_SceneLights, m_WorldProbes,
           config::particles::SOFT_FADE_DISTANCE, particleHeatShimmerStrength, globalTimeSeconds, m_FrameIndex);
 #ifndef NDEBUG
       m_GpuProfiler.EndZone(cmdLate);
@@ -3544,14 +3653,29 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
   }
 
   // =========================================================================================
-  // [13e] Phase PP3: physically-derived Depth of Field over m_TAATSR's own freshly-written HDR
-  // output -- must run before [13f]'s Bloom (see DepthOfFieldPass's own class comment for why: an
-  // out-of-focus highlight should itself bloom into a soft disc, which only happens if DOF's own
-  // blur runs first). m_TAATSR.GetOutputView() ping-pongs between 2 images every RecordPass() call
-  // (just above), so m_DepthOfField's own source descriptor must be re-written every frame too.
+  // [13e] Phase PP3: Depth of Field over m_TAATSR's own freshly-written HDR output -- must run
+  // before [13f]'s Bloom (see DepthOfFieldPass's own class comment for why: an out-of-focus
+  // highlight should itself bloom into a soft disc, which only happens if DOF's own blur runs
+  // first). m_TAATSR.GetOutputView() ping-pongs between 2 images every RecordPass() call (just
+  // above), so whichever DOF sub-pass is active below must have its own source descriptor
+  // re-written every frame too.
+  //
+  // config::postprocess::DOF_MODE picks which of two resolve techniques actually runs this frame:
+  // 0 (Gather, default) = m_DepthOfField's own single-frame 16-tap Poisson gather; 1 (Accumulation,
+  // UE5.8-parity) = m_DepthOfFieldAccumulation's own per-frame single-lens-sample + temporal-
+  // reprojection accumulation (see that class' own header comment for the full technique). Only the
+  // ACTIVE pass is dispatched this frame -- the inactive one is simply left untouched (its own
+  // ping-pong history stops advancing) rather than wastefully running two full-screen compute passes
+  // every frame. Switching INTO Accumulation forces one history reset on m_DepthOfFieldAccumulation
+  // the frame it (re-)becomes active (m_DOFAccumulationWasActive tracks this), since its ping-pong
+  // buffers may hold stale/never-written-this-session data from the last time it ran (or none at
+  // all); ordinary camera motion while it stays active is instead handled PER-PIXEL by
+  // DepthOfFieldAccumulation.comp's own reprojection/disocclusion test, exactly like m_TAATSR's own
+  // resetHistory above only covers the first-frame/toggle-off case, not everyday camera movement.
   // =========================================================================================
+  VkImageView dofOutputView = VK_NULL_HANDLE;
   {
-      m_DepthOfField.UpdateSourceDescriptor(m_TAATSR.GetOutputView());
+      bool useAccumulationDOF = (config::postprocess::DOF_MODE != 0);
 
       // m_TAATSR's own output image's last writer is always its own compute dispatch -- re-stated
       // here explicitly rather than relying on m_TAATSR::RecordPass' own trailing barrier (which
@@ -3566,17 +3690,49 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
       taatsrToDofDep.pMemoryBarriers = &taatsrToDofBarrier;
       vkCmdPipelineBarrier2(cmdLate, &taatsrToDofDep);
 
-      DepthOfFieldPass::Settings dofSettings{};
-      dofSettings.focalLengthMM = config::postprocess::DOF_FOCAL_LENGTH_MM;
-      dofSettings.focusDistanceWorldUnits = config::postprocess::DOF_FOCUS_DISTANCE_WORLD_UNITS;
-      dofSettings.maxCoCRadiusPixels = config::postprocess::DOF_ENABLED ? config::postprocess::DOF_MAX_COC_RADIUS_PIXELS : 0.0f;
+      if (useAccumulationDOF) {
+          m_DepthOfFieldAccumulation.UpdateSourceDescriptor(m_TAATSR.GetOutputView());
+
+          // Full history reset only on the first frame ever or the frame this mode is
+          // (re-)selected -- ordinary camera motion is handled per-pixel inside the shader instead
+          // (see this block's own header comment).
+          bool dofResetHistory = !m_HasPrevViewProj || !m_DOFAccumulationWasActive;
+          maths::mat4 prevViewProjForDOF = m_HasPrevViewProj ? m_PrevViewProj : viewProj;
+
+          DepthOfFieldAccumulationPass::Settings dofAccumSettings{};
+          dofAccumSettings.focalLengthMM = config::postprocess::DOF_FOCAL_LENGTH_MM;
+          dofAccumSettings.focusDistanceWorldUnits = config::postprocess::DOF_FOCUS_DISTANCE_WORLD_UNITS;
+          dofAccumSettings.maxCoCRadiusPixels = config::postprocess::DOF_ENABLED ? config::postprocess::DOF_MAX_COC_RADIUS_PIXELS : 0.0f;
+          dofAccumSettings.maxAccumulationSamples = config::postprocess::DOF_ACCUMULATION_MAX_SAMPLES;
 #ifndef NDEBUG
-      m_GpuProfiler.BeginZone(cmdLate, "DepthOfField");
+          m_GpuProfiler.BeginZone(cmdLate, "DepthOfFieldAccumulation");
 #endif
-      m_DepthOfField.RecordGenerate(cmdLate, invViewProj, cameraPositionWorld, config::postprocess::EXPOSURE_APERTURE, dofSettings);
+          m_DepthOfFieldAccumulation.RecordGenerate(cmdLate, invViewProj, prevViewProjForDOF, cameraPositionWorld,
+              config::postprocess::EXPOSURE_APERTURE, m_FrameIndex, dofResetHistory, dofAccumSettings);
 #ifndef NDEBUG
-      m_GpuProfiler.EndZone(cmdLate);
+          m_GpuProfiler.EndZone(cmdLate);
 #endif
+
+          dofOutputView = m_DepthOfFieldAccumulation.GetOutputView();
+      } else {
+          m_DepthOfField.UpdateSourceDescriptor(m_TAATSR.GetOutputView());
+
+          DepthOfFieldPass::Settings dofSettings{};
+          dofSettings.focalLengthMM = config::postprocess::DOF_FOCAL_LENGTH_MM;
+          dofSettings.focusDistanceWorldUnits = config::postprocess::DOF_FOCUS_DISTANCE_WORLD_UNITS;
+          dofSettings.maxCoCRadiusPixels = config::postprocess::DOF_ENABLED ? config::postprocess::DOF_MAX_COC_RADIUS_PIXELS : 0.0f;
+#ifndef NDEBUG
+          m_GpuProfiler.BeginZone(cmdLate, "DepthOfField");
+#endif
+          m_DepthOfField.RecordGenerate(cmdLate, invViewProj, cameraPositionWorld, config::postprocess::EXPOSURE_APERTURE, dofSettings);
+#ifndef NDEBUG
+          m_GpuProfiler.EndZone(cmdLate);
+#endif
+
+          dofOutputView = m_DepthOfField.GetOutputView();
+      }
+
+      m_DOFAccumulationWasActive = useAccumulationDOF;
   }
 
   // =========================================================================================
@@ -3584,34 +3740,43 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
   // then Phase PP1's Physical Camera auto-exposure -> White Balance -> Color Correction -> ACES
   // Tone Mapping -> Gamma Correction composite (also folding in Phase PP3's Motion Blur / Height
   // Fog / Heat Distortion -- see PostProcessComposite.comp's own comment) -- both reading
-  // m_DepthOfField's own freshly-written output -- see BloomPass's and PostProcessPass's own class
-  // comments for why m_PostProcess must be the very last compute step before [14]'s blit (and
-  // before [13b]'s Debug-only stat overlay below, which now draws onto ITS output instead of
-  // m_TAATSR's raw HDR buffer). m_DepthOfField's own output view identity is effectively "per-
-  // frame" too (it wraps m_TAATSR's own ping-ponged source), so both passes' own descriptor sets
-  // pointing at it must be re-written every frame, exactly like m_TAATSR.UpdateDescriptorSets()
-  // itself is called every frame above. Both run unconditionally every frame, exactly like [13d]'s
-  // own TAA/TSR pass -- the debug views that substitute a different, deliberately-untonemapped
-  // diagnostic image as the blit source instead (m_GIComposite/m_SDFRayMarch/m_Resolve, see [14]'s
-  // own blitSourceImage swap below) simply never read either pass' output, same as how those views
-  // already ignore m_TAATSR's own output today.
+  // [13e]'s own `dofOutputView` (whichever DOF sub-pass was actually active this frame) -- see
+  // BloomPass's and PostProcessPass's own class comments for why m_PostProcess must be the very
+  // last compute step before [14]'s blit (and before [13b]'s Debug-only stat overlay below, which
+  // now draws onto ITS output instead of m_TAATSR's raw HDR buffer). `dofOutputView`'s own identity
+  // is effectively "per-frame" too (it wraps m_TAATSR's own ping-ponged source, and may itself
+  // alternate between two ping-pong images when Accumulation mode is active), so both passes' own
+  // descriptor sets pointing at it must be re-written every frame, exactly like
+  // m_TAATSR.UpdateDescriptorSets() itself is called every frame above. Both run unconditionally
+  // every frame, exactly like [13d]'s own TAA/TSR pass -- the debug views that substitute a
+  // different, deliberately-untonemapped diagnostic image as the blit source instead
+  // (m_GIComposite/m_SDFRayMarch/m_Resolve, see [14]'s own blitSourceImage swap below) simply never
+  // read either pass' output, same as how those views already ignore m_TAATSR's own output today.
   // =========================================================================================
   {
-      m_Bloom.UpdateSourceDescriptor(m_DepthOfField.GetOutputView());
-      m_PostProcess.UpdateDescriptorSets(m_DepthOfField.GetOutputView(), m_Bloom.GetOutputView());
+      m_Bloom.UpdateSourceDescriptor(dofOutputView);
+      m_PostProcess.UpdateDescriptorSets(dofOutputView, m_Bloom.GetOutputView());
 
-      // m_DepthOfField's own trailing barrier (inside RecordGenerate) already makes its output
-      // visible to COMPUTE_SHADER/SHADER_SAMPLED_READ -- no further barrier needed before m_Bloom/
-      // m_PostProcess read it here.
+      // [13e]'s own active DOF sub-pass already ends its RecordGenerate() with a trailing barrier
+      // making `dofOutputView` visible to COMPUTE_SHADER/SHADER_SAMPLED_READ -- no further barrier
+      // needed before m_Bloom/m_PostProcess read it here.
 
       BloomPass::Settings bloomSettings{};
       bloomSettings.threshold = config::postprocess::BLOOM_THRESHOLD;
       bloomSettings.softKnee = config::postprocess::BLOOM_SOFT_KNEE;
       bloomSettings.upsampleRadius = config::postprocess::BLOOM_UPSAMPLE_RADIUS;
-      bloomSettings.ghostIntensity = config::postprocess::LENS_FLARE_GHOST_INTENSITY;
+      // LENS_FLARE_ENABLED gates only the ghost/halo/anamorphic-streak terms (real-time "Post FX"
+      // toggle, ImGui, main.cpp) -- independent of BLOOM_ENABLED's own base-glow gate below. Lens
+      // Dirt needs no separate gate: BloomUpsampleComposite.comp's own dirt mask only ever
+      // attenuates this same ghost+streak+halo term, so it is already a no-op once zeroed here.
+      const bool lensFlareOn = config::postprocess::LENS_FLARE_ENABLED;
+      bloomSettings.ghostIntensity = lensFlareOn ? config::postprocess::LENS_FLARE_GHOST_INTENSITY : 0.0f;
       bloomSettings.ghostCount = config::postprocess::LENS_FLARE_GHOST_COUNT;
       bloomSettings.ghostSpacing = config::postprocess::LENS_FLARE_GHOST_SPACING;
-      bloomSettings.anamorphicIntensity = config::postprocess::ANAMORPHIC_FLARE_INTENSITY;
+      bloomSettings.haloIntensity = lensFlareOn ? config::postprocess::HALO_INTENSITY : 0.0f;
+      bloomSettings.haloWidth = config::postprocess::HALO_WIDTH;
+      bloomSettings.chromaticShift = config::postprocess::LENS_FLARE_CHROMATIC_SHIFT;
+      bloomSettings.anamorphicIntensity = lensFlareOn ? config::postprocess::ANAMORPHIC_FLARE_INTENSITY : 0.0f;
       bloomSettings.anamorphicStretch = config::postprocess::ANAMORPHIC_FLARE_STRETCH;
       bloomSettings.dirtIntensity = config::postprocess::LENS_DIRT_INTENSITY;
       bloomSettings.dirtScale = config::postprocess::LENS_DIRT_SCALE;
@@ -3672,6 +3837,7 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
       ppSettings.fogHeightOffset = config::postprocess::FOG_HEIGHT_OFFSET;
       ppSettings.fogStartDistance = config::postprocess::FOG_START_DISTANCE;
       ppSettings.fogMaxOpacity = config::postprocess::FOG_MAX_OPACITY;
+      ppSettings.fogScreenSpaceScatteringEnabled = config::atmos::FOG_SCREEN_SPACE_SCATTERING_ENABLED;
       ppSettings.godRaysIntensity = config::postprocess::GOD_RAYS_ENABLED ? config::postprocess::GOD_RAYS_INTENSITY : 0.0f;
       ppSettings.godRaysDecay = config::postprocess::GOD_RAYS_DECAY;
       ppSettings.godRaysDensity = config::postprocess::GOD_RAYS_DENSITY;
@@ -3699,6 +3865,16 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
       m_AtmosFog.RecordUpdate(cmdLate, cameraPositionWorld, cameraFrameInfo.forward, maths::vec3{0.0f, 1.0f, 0.0f},
           cameraFrameInfo.fovYRadians, cameraFrameInfo.aspectRatio,
           m_SceneLights.sun.direction, m_SceneLights.sun.color, m_SceneLights.sun.intensity, m_FrameIndex);
+
+      // F3 (Fog Screen Space Scattering): refresh immediately after its one producer (m_AtmosFog,
+      // just above) and before its one consumer (m_PostProcess.RecordComposite, below) -- same
+      // producer/consumer-adjacency convention m_AtmosFog's own RecordUpdate call site already
+      // documents. blurRadiusPixels forced to 0 when the master toggle is off, which makes
+      // FogScreenSpaceScattering.comp's own per-pixel work degenerate to a pure passthrough of the
+      // freshly-extracted (unblurred) fog sample -- see FogScreenSpaceScatteringPass::RecordScatter's
+      // own comment for why this pass is always recorded rather than conditionally skipped.
+      m_FogScatter.RecordScatter(cmdLate, invViewProj, cameraPositionWorld, cameraFrameInfo.forward,
+          config::atmos::FOG_SCREEN_SPACE_SCATTERING_ENABLED ? config::atmos::FOG_SCATTER_BLUR_RADIUS_PIXELS : 0.0f);
 
       // Atmos weather system, Subtask 4: refresh the half-res cloud raymarch immediately alongside
       // the fog update above -- same producer/consumer-adjacency reasoning.
@@ -3776,7 +3952,8 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
     m_DebugOverlay.BuildFrameText(gpuMemUsedMB, pendingPageLoads, bytesPerSecond, hwTriangleCount, swTriangleCount,
         fps, static_cast<float>(m_RenderExtent.width), static_cast<float>(m_RenderExtent.height),
         m_DebugRadiosityEnabled, m_DebugSSRTEnabled, traceMode, m_DebugWorldProbesEnabled,
-        m_WorldProbes.GetPendingSlabCount(), m_ParticleSystem.GetLastAliveCountApprox(), ParticleSystemPass::kMaxParticles);
+        static_cast<uint32_t>(config::lumen::GI_MODE), m_WorldProbes.GetPendingSlabCount(),
+        m_ParticleSystem.GetLastAliveCountApprox(), ParticleSystemPass::kMaxParticles);
 
     // Determine blitSourceImage early to draw HUD directly onto it -- m_PostProcess's own output
     // (not m_TAATSR's raw HDR buffer) in the normal path now, so the HUD's own colors (e.g. plain

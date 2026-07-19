@@ -11,6 +11,7 @@
 #include "renderer/debug/BitmapFont8x8.h"
 
 #include "core/EngineConfig.h"
+#include "renderer/passes/WorldProbeGridPass.h"
 
 namespace renderer::debug {
 
@@ -263,7 +264,7 @@ namespace renderer::debug {
 
     void DebugTextOverlay::BuildFrameText(float gpuMemUsedMB, uint32_t pendingPageLoads, float bytesPerSecond,
         uint32_t hwTriangleCount, uint32_t swTriangleCount, float fps, float viewportWidthPixels, float viewportHeightPixels,
-        bool radiosityEnabled, bool ssrtEnabled, uint32_t traceMode, bool worldProbesEnabled,
+        bool radiosityEnabled, bool ssrtEnabled, uint32_t traceMode, bool worldProbesEnabled, uint32_t giMode,
         uint32_t worldProbePendingSlabs, uint32_t aliveParticleCount, uint32_t maxParticleCount) {
         m_PendingGlyphs.clear();
 
@@ -277,19 +278,23 @@ namespace renderer::debug {
         AppendLine(std::format("READ: {:.1f} KB/S", bytesPerSecond / 1024.0f), kMarginX, y); y += kLineHeight;
         AppendLine(std::format("HW TRIS: {}", hwTriangleCount), kMarginX, y); y += kLineHeight;
         AppendLine(std::format("SW TRIS: {}", swTriangleCount), kMarginX, y); y += kLineHeight;
-        AppendLine(std::format("GI: RADIOSITY={} SSRT={} TRACE={}",
-            radiosityEnabled ? "ON" : "OFF", ssrtEnabled ? "ON" : "OFF", traceMode == 0u ? "SWRT" : "HWRT"),
+        AppendLine(std::format("GI: RADIOSITY={} SSRT={} TRACE={} MODE={}",
+            radiosityEnabled ? "ON" : "OFF", ssrtEnabled ? "ON" : "OFF", traceMode == 0u ? "SWRT" : "HWRT",
+            giMode == 0u ? "HQ" : "LITE"),
             kMarginX, y); y += kLineHeight;
-        // Real probe-grid state (replaces the old hardcoded "(not yet sampled)" label, which
-        // outlived the grid actually gaining live consumers on 2026-07-16 and had become pure
-        // misinformation): READY = every probe in the covered window is traced, BUILDING = that
-        // many dirty slabs still queued (first-frame full-volume build, a large camera jump's
+        // F1 ("Lumen Lite"): WORLDPROBES is a live, load-bearing consumer in BOTH GI modes (Lite
+        // mode's own PRIMARY term, HighQuality mode's own screen-trace-miss fallback) -- see
+        // renderer::WorldProbeGridPass.h's own class comment. The line also reports real build
+        // state: READY = every probe in every level's covered window is traced, BUILDING = that
+        // many dirty slabs still queued (first-frame full-volume builds, a large camera jump's
         // backlog, or a requested full re-trace -- see WorldProbeGridPass::RequestFullRetrace).
         if (worldProbePendingSlabs > 0u) {
-            AppendLine(std::format("WORLDPROBES={} BUILDING ({} SLABS)", worldProbesEnabled ? "ON" : "OFF", worldProbePendingSlabs),
+            AppendLine(std::format("WORLDPROBES={} ({} levels) BUILDING ({} SLABS)",
+                worldProbesEnabled ? "ON" : "OFF", renderer::WorldProbeGridPass::kLevelCount, worldProbePendingSlabs),
                 kMarginX, y); y += kLineHeight;
         } else {
-            AppendLine(std::format("WORLDPROBES={} READY", worldProbesEnabled ? "ON" : "OFF"),
+            AppendLine(std::format("WORLDPROBES={} ({} levels) READY",
+                worldProbesEnabled ? "ON" : "OFF", renderer::WorldProbeGridPass::kLevelCount),
                 kMarginX, y); y += kLineHeight;
         }
         AppendLine(std::format("GPU PARTICLES: {}/{}", aliveParticleCount, maxParticleCount), kMarginX, y); y += kLineHeight;

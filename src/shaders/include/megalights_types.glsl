@@ -43,6 +43,27 @@ uint MegaLightIESProfile(MegaLight light) { return light.iesProfileAndFlags & 0x
 // True when a rect light emits from both faces.
 bool MegaLightRectTwoSided(MegaLight light) { return (light.iesProfileAndFlags & MEGALIGHT_FLAG_RECT_TWOSIDED) != 0u; }
 
+// F2b (UE5.8 rendering-parity gap: Lighting Channels) -- a UE-style 3-bit mask (channels 0/1/2)
+// carried in bits 9-11 of MegaLight::iesProfileAndFlags, deliberately leaving bit 8 (rect two-sided)
+// and the low IES-profile byte (bits 0-7) untouched. A light only lights an entity/fog volume whose
+// OWN mask (renderer::MaterialParameters::lightingChannelMask -- see material_params.glsl's own
+// MaterialLightingChannelMask()) shares at least one bit with this one -- MegaLightsFinalShade.comp/
+// TransparentForward.frag/AtmosVolumetricFog.comp all AND the two masks before letting a light
+// contribute (see each call site's own comment).
+const uint MEGALIGHT_CHANNEL_MASK_SHIFT = 9u;
+const uint MEGALIGHT_CHANNEL_MASK_BITS = 0x7u; // 3 bits -> channels 0/1/2.
+
+// Raw-zero (every light GenerateProceduralLights()/ParticleLightExtract.comp/etc. authored before
+// F2b ever existed, and every light this feature's own scene-setup code never explicitly assigns a
+// channel to) decodes as channel-0-ONLY, matching UE5.8's own "every light defaults to Lighting
+// Channel 0" convention -- so a scene that never touches this field keeps its EXACT pre-F2b behavior
+// (every light on channel 0, every entity/fog volume also defaults to channel 0 -- see
+// MaterialLightingChannelMask()'s own identical convention -- so every AND-test below still passes).
+uint MegaLightChannelMask(MegaLight light) {
+    uint raw = (light.iesProfileAndFlags >> MEGALIGHT_CHANNEL_MASK_SHIFT) & MEGALIGHT_CHANNEL_MASK_BITS;
+    return (raw == 0u) ? 1u : raw;
+}
+
 // Feature 1 of Phase 4 (MegaLights advanced roadmap: light BVH for RIS spatial bias) -- the fixed
 // capacity of the spatial candidate pool megalights_bvh.glsl's GatherSpatialLightCandidates fills
 // and megalights_ris.glsl's SelectLightRIS draws from. Declared here (not in either of those two

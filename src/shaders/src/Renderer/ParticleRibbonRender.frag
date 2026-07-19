@@ -85,7 +85,7 @@ void main() {
 
     float sunVisibility = SampleSunShadowVSM(inWorldPos);
     vec3 sunRadiance = g_Params.sunColor * g_Params.sunIntensity * sunVisibility;
-    vec3 indirectDiffuse = SampleWorldProbeGrid(inWorldPos);
+    vec3 indirectDiffuse = SampleWorldProbeGrid(inWorldPos, g_Params.cameraPosition);
     vec3 lighting = sunRadiance + indirectDiffuse + vec3(0.02);
 
     outColor = vec4(inColor.rgb * lighting, alpha);

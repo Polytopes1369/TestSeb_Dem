@@ -13,7 +13,9 @@ namespace renderer {
         // directions of the view-projection matrix are needed: invViewProj to reconstruct a
         // pixel + depth-buffer value into a world-space position (once, per pixel), viewProj to
         // re-project each marched step's world-space sample back to screen space to compare
-        // against the depth buffer (every step of the march).
+        // against the depth buffer (every step of the march). F1: `_pad0` repurposed as `giMode`
+        // (config::lumen::GIMode -- HighQuality runs the march below unchanged, Lite skips it
+        // entirely, see ScreenTrace.comp's own giMode branch); struct size is unchanged.
         struct ScreenTraceViewParams {
             maths::mat4 viewProj;
             maths::mat4 invViewProj;
@@ -21,7 +23,7 @@ namespace renderer {
             uint32_t frameIndex = 0;
             float viewportWidth = 0.0f;
             float viewportHeight = 0.0f;
-            float _pad0 = 0.0f;
+            uint32_t giMode = 0;
             float _pad1 = 0.0f;
         };
         static_assert(sizeof(ScreenTraceViewParams) == 160,
@@ -97,25 +99,28 @@ namespace renderer {
         // =====================================================================================
         // Descriptor set 0: output image, 3 sampled G-buffer/color inputs (static for this pass'
         // whole lifetime), this pass' own view-params UBO, and world_probe_sampling.glsl's own
-        // sampler3D + params UBO (bindings 5/6, matching that header's #define contract below).
+        // multi-level sampler3D arrays + params UBO (bindings 5/6/7, matching that header's
+        // #define contract below). F1: binding 5 (grid) and binding 6 (occlusion) are now each a
+        // WorldProbeGridPass::kLevelCount-element sampler3D array, not a single sampler.
         // =====================================================================================
-        VkDescriptorSetLayoutBinding bindings[7]{};
+        VkDescriptorSetLayoutBinding bindings[8]{};
         bindings[0] = { 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };          // g_NoisyGIOutput
         bindings[1] = { 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // g_Depth
         bindings[2] = { 2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // g_Normal
         bindings[3] = { 3, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // g_DirectColor
         bindings[4] = { 4, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };         // ScreenTraceViewParamsUBO
-        bindings[5] = { 5, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // g_WorldProbeGrid
-        bindings[6] = { 6, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };         // WorldProbeGridParamsUBO
+        bindings[5] = { 5, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, WorldProbeGridPass::kLevelCount, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // g_WorldProbeGrid[]
+        bindings[6] = { 6, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, WorldProbeGridPass::kLevelCount, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // g_WorldProbeOcclusion[]
+        bindings[7] = { 7, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };         // WorldProbeGridParamsUBO
 
         VkDescriptorSetLayoutCreateInfo setLayoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-        setLayoutInfo.bindingCount = 7;
+        setLayoutInfo.bindingCount = 8;
         setLayoutInfo.pBindings = bindings;
         VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &setLayoutInfo, nullptr, &m_SetLayout));
 
         VkDescriptorPoolSize poolSizes[3] = {
             { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1 },
-            { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 4 },
+            { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3 + 2 * WorldProbeGridPass::kLevelCount },
             { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2 }
         };
         VkDescriptorPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
@@ -143,18 +148,27 @@ namespace renderer {
         VkDescriptorImageInfo normalInfo{ m_NearestSampler, normalView, VK_IMAGE_LAYOUT_GENERAL };
         VkDescriptorImageInfo directColorInfo{ m_NearestSampler, directColorView, VK_IMAGE_LAYOUT_GENERAL };
         VkDescriptorBufferInfo viewParamsInfo{ m_ViewParamsBuffer.Handle(), 0, m_ViewParamsBuffer.Size() };
-        VkDescriptorImageInfo worldProbeGridInfo{ worldProbes.GetGridSampler(), worldProbes.GetGridView(), VK_IMAGE_LAYOUT_GENERAL };
+
+        // F1: one VkDescriptorImageInfo per level for both the grid and occlusion sampler arrays --
+        // mirrors renderer::SDFRayMarchPass.cpp's own multi-level clipmap descriptor-array write.
+        VkDescriptorImageInfo worldProbeGridInfos[WorldProbeGridPass::kLevelCount]{};
+        VkDescriptorImageInfo worldProbeOcclusionInfos[WorldProbeGridPass::kLevelCount]{};
+        for (uint32_t level = 0; level < WorldProbeGridPass::kLevelCount; ++level) {
+            worldProbeGridInfos[level] = { worldProbes.GetGridSampler(), worldProbes.GetGridView(level), VK_IMAGE_LAYOUT_GENERAL };
+            worldProbeOcclusionInfos[level] = { worldProbes.GetGridSampler(), worldProbes.GetOcclusionView(level), VK_IMAGE_LAYOUT_GENERAL };
+        }
         VkDescriptorBufferInfo worldProbeGridParamsInfo{ m_WorldProbeGridParamsBuffer.Handle(), 0, m_WorldProbeGridParamsBuffer.Size() };
 
-        VkWriteDescriptorSet writes[7]{};
+        VkWriteDescriptorSet writes[8]{};
         writes[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_Set, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &outputInfo, nullptr, nullptr };
         writes[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_Set, 1, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &depthInfo, nullptr, nullptr };
         writes[2] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_Set, 2, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &normalInfo, nullptr, nullptr };
         writes[3] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_Set, 3, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &directColorInfo, nullptr, nullptr };
         writes[4] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_Set, 4, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &viewParamsInfo, nullptr };
-        writes[5] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_Set, 5, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &worldProbeGridInfo, nullptr, nullptr };
-        writes[6] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_Set, 6, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &worldProbeGridParamsInfo, nullptr };
-        vkUpdateDescriptorSets(m_Device, 7, writes, 0, nullptr);
+        writes[5] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_Set, 5, 0, WorldProbeGridPass::kLevelCount, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, worldProbeGridInfos, nullptr, nullptr };
+        writes[6] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_Set, 6, 0, WorldProbeGridPass::kLevelCount, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, worldProbeOcclusionInfos, nullptr, nullptr };
+        writes[7] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_Set, 7, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &worldProbeGridParamsInfo, nullptr };
+        vkUpdateDescriptorSets(m_Device, 8, writes, 0, nullptr);
 
         VkPipelineLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
         layoutInfo.setLayoutCount = 1;
@@ -206,7 +220,8 @@ namespace renderer {
     }
 
     void ScreenTracePass::RecordTrace(VkCommandBuffer cmd, const CameraPushConstants& camera,
-        const maths::vec3& cameraPositionWorld, const maths::vec3& worldProbeGridOrigin, uint32_t frameIndex) {
+        const maths::vec3& cameraPositionWorld, const WorldProbeGridPass& worldProbes,
+        uint32_t frameIndex, config::lumen::GIMode giMode) {
         ScreenTraceViewParams viewParams{};
         viewParams.viewProj = camera.proj * camera.view;
         viewParams.invViewProj = viewParams.viewProj.Inverse();
@@ -216,13 +231,17 @@ namespace renderer {
         viewParams.frameIndex = frameIndex;
         viewParams.viewportWidth = static_cast<float>(m_RenderExtent.width);
         viewParams.viewportHeight = static_cast<float>(m_RenderExtent.height);
+        viewParams.giMode = static_cast<uint32_t>(giMode);
         vkCmdUpdateBuffer(cmd, m_ViewParamsBuffer.Handle(), 0, sizeof(ScreenTraceViewParams), &viewParams);
 
         WorldProbeGridParams gridParams{};
-        gridParams.gridOriginX = worldProbeGridOrigin.x;
-        gridParams.gridOriginY = worldProbeGridOrigin.y;
-        gridParams.gridOriginZ = worldProbeGridOrigin.z;
-        gridParams.probeSpacing = WorldProbeGridPass::kProbeSpacing;
+        for (uint32_t level = 0; level < WorldProbeGridPass::kLevelCount; ++level) {
+            const maths::vec3& origin = worldProbes.GetGridOriginWorld(level);
+            gridParams.levels[level].originX = origin.x;
+            gridParams.levels[level].originY = origin.y;
+            gridParams.levels[level].originZ = origin.z;
+            gridParams.levels[level].spacing = WorldProbeGridPass::GetLevelSpacing(level);
+        }
         gridParams.gridResolution = static_cast<float>(WorldProbeGridPass::kGridResolution);
         vkCmdUpdateBuffer(cmd, m_WorldProbeGridParamsBuffer.Handle(), 0, sizeof(WorldProbeGridParams), &gridParams);
 

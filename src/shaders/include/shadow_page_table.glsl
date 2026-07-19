@@ -32,6 +32,21 @@ uint ShadowLogicalPageID(uint vsmIndex, uvec2 localPageCoord) {
     return vsmIndex * SHADOW_PAGES_PER_VSM + ShadowLocalPageIndex(localPageCoord);
 }
 
+// VSM sun-clipmap camera re-centering (Feature F14): wraps a page-grid coordinate into
+// [0, SHADOW_PAGES_PER_AXIS) -- used by shadow_sun_sampling.glsl to convert a sun clipmap level's
+// per-frame RASTER page position (a screen-space slice of the level's CURRENT NDC frustum, which
+// shifts every time the window re-centers) into the WORLD-ANCHORED, toroidally wrapped page-table
+// slot that persists across a re-center (see renderer::VirtualShadowMapPass's own class comment for
+// the CPU-side half of this contract -- RenderPage()/ClassifyDynamicPages() perform the exact
+// inverse conversion there). GLSL's `%` can return a negative result for a negative left operand
+// (unlike this file's CPU counterpart, WrapPageCoord in VirtualShadowMapPass.cpp, which uses
+// std::floor-style semantics) -- the extra `+ SHADOW_PAGES_PER_AXIS` before the second `%`
+// guarantees a non-negative result either way.
+ivec2 ShadowWrapPageCoord(ivec2 coord) {
+    ivec2 m = ivec2(SHADOW_PAGES_PER_AXIS);
+    return ((coord % m) + m) % m;
+}
+
 bool IsShadowPageResident(uint logicalPageID) {
     return g_ShadowPageTable.physicalLayer[logicalPageID] != SHADOW_PAGE_UNMAPPED;
 }

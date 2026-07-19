@@ -48,6 +48,20 @@
 #include "audio/AudioDebugPanel.h"
 #include "animation/AnimationDebugPanel.h"
 #include "world/WorldPartitionDebugPanel.h"
+// PCG roadmap Phase 6.3 ("Runtime Generator Hook") REAL wiring (code-audit Lane D.2, 2026-07-19):
+// world::PcgCellLoader is whole-file Debug-only (see that header's own top-of-file comment -- it
+// depends on tools/WorldPartition/'s OFPA actor-file-parsing compiled object code, which the
+// top-level CMakeLists.txt links into this executable only for the Debug configuration, matching
+// CLAUDE.md's "no tooling weight in the shipping .exe" rule), so everything that constructs/drives
+// one is necessarily Debug-only too, not by choice made here. renderer::PcgInstanceDrawPass and
+// pcg::PcgInstanceSpawnManager below are themselves fully Release-compiled, always-on mechanisms
+// (see their own header comments) -- only the PCG-Volume-discovery half of this feature forces the
+// whole block Debug-only.
+#include "world/PcgCellLoader.h"
+#include "pcg/PcgInstanceSpawnManager.h"
+#include "renderer/passes/PcgInstanceDrawPass.h"
+// (renderer::debug::kDefaultPcgVolumeActorsRootDir comes from renderer/debug/PcgVolumeInspector.h,
+// already included above.)
 #endif
 
 // Unreal-editor style viewport navigation: hold the Right Mouse Button to enable FPS-style
@@ -485,6 +499,19 @@ int main(int argc, char** argv) {
         LOG_CRITICAL("Failed to create GLFW window!");
         glfwTerminate();
         return -1;
+    }
+
+    // F2 frame-pacing fix: query the primary monitor's actual refresh rate once at startup so the
+    // CPU-side frame capper further down the main loop can tell whether it is redundant with the
+    // swapchain's VK_PRESENT_MODE_FIFO_KHR vsync block (see the capper site for the full beat-
+    // frequency rationale). A monitor reporting <=0 Hz (rare, but seen on some virtual/RDP displays)
+    // is treated as "unknown" and the capper falls back to its original always-on behavior.
+    int monitorRefreshHz = 0;
+    if (GLFWmonitor* primaryMonitor = glfwGetPrimaryMonitor()) {
+        if (const GLFWvidmode* videoMode = glfwGetVideoMode(primaryMonitor)) {
+            monitorRefreshHz = videoMode->refreshRate;
+            LOG_INFO(std::format("[Main] Primary monitor refresh rate: {} Hz (TARGET_FPS = {})", monitorRefreshHz, config::TARGET_FPS));
+        }
     }
 
 #ifndef NDEBUG
@@ -971,6 +998,71 @@ int main(int argc, char** argv) {
     world::StreamingManager streamingManager(cellManifest.CellSize(), worldCellLoader,
                                               clusterPipeline.GetLoadingManager(), /*maxConcurrentLoads=*/4);
 
+#ifndef NDEBUG
+    // --- PCG roadmap Phase 6.3 ("Runtime Generator Hook") REAL wiring (code-audit Lane D.2,
+    // 2026-07-19): closes the gap between RunPcgCellLoaderSmokeTest() above (which drives
+    // world::PcgCellLoader's own IWorldCellLoader methods directly against a synthetic scratch
+    // scenario, see that method's own comment -- "without needing a live StreamingManager/
+    // CellManifest/camera at all") and actual gameplay. Before this change, world::PcgCellLoader was
+    // NEVER constructed anywhere outside that one smoke test -- no live, camera-driven
+    // world::StreamingManager anywhere in this codebase ever held a reference to one, so an authored
+    // PCG Volume (world_data/actors/*.actor) could not actually stream its content in/out as the
+    // player's camera moved, no matter how correct Phase 6.1-6.5's own individually-tested pieces
+    // were. This second, PCG-dedicated world::StreamingManager -- fed the SAME camera-driven
+    // world::StreamingSource list as `streamingManager` above, every frame (see this block's own
+    // per-frame call site further down) -- is exactly the integration PcgCellLoader.h's own top-of-
+    // file "Coexistence with WorldCellStreamingLoader" comment describes as still outstanding: "a
+    // caller can wire [world::PcgCellLoader] into its OWN StreamingManager instance ... whenever a
+    // future phase decides to actually run it against live camera-driven streaming." This is that
+    // phase.
+    //
+    // Scanned FIRST (a plain, cheap disk scan, no GPU work) so this entire feature stays a true no-op
+    // -- zero GPU allocations, zero extra StreamingManager -- when, as is currently the case for this
+    // checkout, world_data/actors/ contains no authored PcgVolume .actor file at all (see
+    // world::PcgCellLoader.h's own "nothing in this codebase yet AUTHORS a real PcgVolume actor file
+    // for a Release-relevant scenario" comment): there is then nothing whatsoever for a second
+    // streaming manager to do, so none of the objects below are even constructed.
+    const std::filesystem::path pcgActorsRootDir = core::ResolveExeRelativePath(renderer::debug::kDefaultPcgVolumeActorsRootDir);
+    const size_t pcgAuthoredVolumeCount = world::ScanPcgVolumeActorFiles(pcgActorsRootDir).size();
+
+    std::optional<renderer::PcgInstanceDrawPass> livePcgDrawPass;
+    std::optional<pcg::PcgInstanceSpawnManager> livePcgSpawnManager;
+    std::optional<world::PcgCellLoader> livePcgCellLoader;
+    std::optional<world::StreamingManager> livePcgStreamingManager;
+
+    if (streamingEnabled && pcgAuthoredVolumeCount > 0) {
+        // Bounded, generously-sized pools for future authored content -- see this class' own Init()
+        // comment for what each buffer holds; both figures are headroom over the largest smoke-test
+        // scenario (RunPcgCellLoaderSmokeTest's own 8192 candidate-cluster budget) without being
+        // large enough to risk the kind of GPU-memory/driver-TDR surprise this codebase has hit
+        // before with an oversized fixed pool (see ParticleSystem's own kMaxParticles precedent).
+        constexpr uint32_t kLivePcgMaxInstances = 4096u;
+        constexpr uint32_t kLivePcgMaxCandidateClusters = 65536u;
+
+        livePcgDrawPass.emplace();
+        livePcgDrawPass->Init(vkContext.GetDevice(), vkContext.GetAllocator(), vkContext.GetCommandPool(), vkContext.GetGraphicsQueue(),
+            clusterPipeline.GetPagePoolPhysicalBuffer(), vkContext.GetMaterialTable(),
+            clusterPipeline.GetBaseSunDirection(), maths::vec3(1.0f, 0.96f, 0.9f), 3.0f, maths::vec3(0.12f, 0.12f, 0.14f),
+            VK_FORMAT_R16G16B16A16_SFLOAT, VK_FORMAT_D32_SFLOAT,
+            kLivePcgMaxInstances, kLivePcgMaxCandidateClusters);
+
+        livePcgSpawnManager.emplace(*livePcgDrawPass);
+        livePcgCellLoader.emplace(pcgActorsRootDir, cellManifest.CellSize(), *livePcgSpawnManager);
+        livePcgStreamingManager.emplace(cellManifest.CellSize(), *livePcgCellLoader,
+                                         clusterPipeline.GetLoadingManager(), /*maxConcurrentLoads=*/4);
+
+        LOG_INFO(std::format(
+            "[Main] Live PCG Volume streaming ENABLED: {} authored volume(s) indexed into {} cell(s) "
+            "under '{}'.", livePcgCellLoader->GetVolumeCount(), livePcgCellLoader->GetIndexedCellCount(),
+            pcgActorsRootDir.string()));
+    } else {
+        LOG_INFO(std::format(
+            "[Main] Live PCG Volume streaming: no authored PcgVolume actor file(s) found under '{}' -- "
+            "skipping (nothing to stream). Author one via the PCG Volume Inspector panel to exercise "
+            "this path.", pcgActorsRootDir.string()));
+    }
+#endif
+
     // Bounded free-list over VulkanContext's kStreamingUnitCount physical GPU slots (see that
     // class's own header comment on why the pool is small and fixed) -- maps a claimed cell to the
     // unit currently rendering it. If more cells fall within g_StreamingHlodRadius simultaneously
@@ -1212,6 +1304,18 @@ int main(int argc, char** argv) {
                 if (ImGui::Combo("GI Trace Back-End [T/Y]", &traceModeInt, "SWRT (Mesh SDF)\0HWRT (Ray Tracing)\0")) {
                     g_DebugState.traceMode = static_cast<uint32_t>(traceModeInt);
                 }
+                // F1 ("Lumen Lite", UE5.8 parity roadmap): GI quality mode -- HighQuality is this
+                // codebase's pre-F1 per-pixel Screen Trace + probe-fallback path (F9: upgraded to
+                // real Lumen's own Screen Probe Gather near-field term); Lite is the new probe-
+                // grid-PRIMARY irradiance-field gather with the per-pixel march skipped entirely --
+                // see config::lumen::GI_MODE's own comment and ScreenTrace.comp's giMode branch.
+                // A/B this against the WORLDPROBES/SSRT line in the always-on debug text HUD
+                // (renderer::debug::DebugTextOverlay) and the top-right FPS counter for the ~2x
+                // faster claim UE5.8's own Lumen Lite makes over High Quality.
+                int giModeIdx = static_cast<int>(config::lumen::GI_MODE);
+                if (ImGui::Combo("GI Mode", &giModeIdx, "High Quality\0Lite\0\0")) {
+                    config::lumen::GI_MODE = static_cast<config::lumen::GIMode>(giModeIdx);
+                }
                 // One-shot full probe-grid re-trace against the CURRENT Surface Cache -- see
                 // g_DebugState.rebuildWorldProbesRequested's own comment for why this exists
                 // (frame-1 probes traced against a cold cache never refresh on a static camera).
@@ -1219,7 +1323,6 @@ int main(int argc, char** argv) {
                     g_DebugState.rebuildWorldProbesRequested = true;
                 }
                 ImGui::Separator();
-
                 int budget = static_cast<int>(config::lumen::CARDS_PER_FRAME_BUDGET);
                 if (ImGui::DragInt("Cards Frame Budget", &budget, 1, 1, 128)) {
                     config::lumen::CARDS_PER_FRAME_BUDGET = static_cast<uint32_t>(budget);
@@ -1286,6 +1389,37 @@ int main(int argc, char** argv) {
                 ImGui::TextWrapped("RIS / spatial reuse (shared with point lights):");
                 ImGui::DragFloat("Spatial Bias Radius (world)", &config::megalights::SPATIAL_BIAS_RADIUS, 0.05f, 0.0f, 16.0f);
                 ImGui::DragFloat("Spatial Reuse Radius (px)", &config::megalights::SPATIAL_REUSE_RADIUS_PIXELS, 0.5f, 0.0f, 128.0f);
+
+                // F2b (UE5.8 Lighting Channels): every light/entity defaults to channel 0 (bit 0) --
+                // see renderer::MegaLightChannelMask()/MaterialLightingChannelMask()'s own comment
+                // (megalights_types.glsl / material_params.glsl) for the exact "raw zero == channel 0"
+                // convention. These 3 checkboxes drive ONLY the volumetric fog's own reception mask
+                // (config::megalights::FOG_LIGHTING_CHANNEL_MASK, threaded by renderer::
+                // AtmosVolumetricFogPass::RecordUpdate into AtmosVolumetricFog.comp's own
+                // pc.fogLightingChannelMask) -- a live, zero-scene-data-risk way to verify the F2b
+                // gating mechanism end-to-end: unchecking "Channel 0" here makes the fog stop
+                // responding to every default-authored light instantly. Per-light/per-entity channel
+                // authoring itself is a scene-setup-time API (renderer::PackMegaLightChannelMask() /
+                // MaterialParameters::lightingChannelMask), not a per-object runtime UI -- the same
+                // "scene setup authors it, Debug ImGui verifies it live" split this codebase already
+                // uses for e.g. Local Fog Volumes (config::localfog::VOLUMES vs. its own bounds-viz
+                // toggle above).
+                ImGui::Separator();
+                ImGui::TextWrapped("Lighting Channels (F2b) -- fog reception mask:");
+                bool fogCh0 = (config::megalights::FOG_LIGHTING_CHANNEL_MASK & 0x1u) != 0u;
+                bool fogCh1 = (config::megalights::FOG_LIGHTING_CHANNEL_MASK & 0x2u) != 0u;
+                bool fogCh2 = (config::megalights::FOG_LIGHTING_CHANNEL_MASK & 0x4u) != 0u;
+                if (ImGui::Checkbox("Fog Channel 0 (default)", &fogCh0)) {
+                    config::megalights::FOG_LIGHTING_CHANNEL_MASK = (config::megalights::FOG_LIGHTING_CHANNEL_MASK & ~0x1u) | (fogCh0 ? 0x1u : 0u);
+                }
+                ImGui::SameLine();
+                if (ImGui::Checkbox("Channel 1", &fogCh1)) {
+                    config::megalights::FOG_LIGHTING_CHANNEL_MASK = (config::megalights::FOG_LIGHTING_CHANNEL_MASK & ~0x2u) | (fogCh1 ? 0x2u : 0u);
+                }
+                ImGui::SameLine();
+                if (ImGui::Checkbox("Channel 2", &fogCh2)) {
+                    config::megalights::FOG_LIGHTING_CHANNEL_MASK = (config::megalights::FOG_LIGHTING_CHANNEL_MASK & ~0x4u) | (fogCh2 ? 0x4u : 0u);
+                }
                 ImGui::EndTabItem();
             }
 
@@ -1361,6 +1495,28 @@ int main(int argc, char** argv) {
                 ImGui::DragFloat("Bloom Intensity", &config::postprocess::BLOOM_INTENSITY, 0.01f, 0.0f, 4.0f);
                 ImGui::Separator();
                 ImGui::Checkbox("Bloom", &config::postprocess::BLOOM_ENABLED);
+                // F13: Lens Flare (Ghosts + Halo) + Anamorphic Streak -- independent of the "Bloom"
+                // checkbox above (BLOOM_ENABLED gates only the base glow bleed; this gates only the
+                // ghost/halo/streak terms baked into the same renderer::BloomPass output -- see
+                // config::postprocess::LENS_FLARE_ENABLED's own comment). Toggling this off alone
+                // still leaves plain bloom visible; toggling "Bloom" off removes everything
+                // (including flares) since the whole shared mip-chain output is zeroed downstream.
+                ImGui::Checkbox("Lens Flare (Ghosts/Halo)", &config::postprocess::LENS_FLARE_ENABLED);
+                if (config::postprocess::LENS_FLARE_ENABLED) {
+                    ImGui::Indent();
+                    ImGui::SliderFloat("Ghost Intensity", &config::postprocess::LENS_FLARE_GHOST_INTENSITY, 0.0f, 2.0f);
+                    int ghostCount = static_cast<int>(config::postprocess::LENS_FLARE_GHOST_COUNT);
+                    if (ImGui::SliderInt("Ghost Count", &ghostCount, 1, 8)) {
+                        config::postprocess::LENS_FLARE_GHOST_COUNT = static_cast<uint32_t>(ghostCount);
+                    }
+                    ImGui::SliderFloat("Ghost Spacing", &config::postprocess::LENS_FLARE_GHOST_SPACING, 0.0f, 2.0f);
+                    ImGui::SliderFloat("Halo Intensity", &config::postprocess::HALO_INTENSITY, 0.0f, 2.0f);
+                    ImGui::SliderFloat("Halo Width", &config::postprocess::HALO_WIDTH, 0.0f, 1.0f);
+                    ImGui::SliderFloat("Chromatic Shift", &config::postprocess::LENS_FLARE_CHROMATIC_SHIFT, 0.0f, 0.05f);
+                    ImGui::SliderFloat("Anamorphic Streak Intensity", &config::postprocess::ANAMORPHIC_FLARE_INTENSITY, 0.0f, 1.0f);
+                    ImGui::SliderFloat("Anamorphic Streak Stretch", &config::postprocess::ANAMORPHIC_FLARE_STRETCH, 0.0f, 0.5f);
+                    ImGui::Unindent();
+                }
                 ImGui::Checkbox("Chromatic Aberration", &config::postprocess::CHROMATIC_ABERRATION_ENABLED);
                 ImGui::Checkbox("Vignette", &config::postprocess::VIGNETTE_ENABLED);
                 ImGui::Checkbox("Heat Distortion", &config::postprocess::HEAT_DISTORTION_ENABLED);
@@ -1373,6 +1529,21 @@ int main(int argc, char** argv) {
                 ImGui::Checkbox("White Balance", &config::postprocess::WHITE_BALANCE_ENABLED);
                 ImGui::Checkbox("Color Correction", &config::postprocess::COLOR_CORRECTION_ENABLED);
                 ImGui::Checkbox("Depth of Field", &config::postprocess::DOF_ENABLED);
+                // UE5.8-parity "Accumulation Depth of Field" -- live A/B toggle between the original
+                // single-frame 16-tap Poisson gather (DepthOfFieldPass) and the new cinematic,
+                // path-tracer-like per-frame single-lens-sample temporal accumulation
+                // (DepthOfFieldAccumulationPass) -- see that class' own header comment. Only
+                // meaningful while "Depth of Field" above is checked (DOF_ENABLED zeroes the CoC for
+                // whichever mode is active, same convention as every other *_ENABLED toggle here).
+                ImGui::Indent();
+                ImGui::Combo("DOF Mode", &config::postprocess::DOF_MODE, "Gather\0Accumulation (UE5.8)\0\0");
+                if (config::postprocess::DOF_MODE != 0) {
+                    ImGui::SliderFloat("Accumulation Max Samples", &config::postprocess::DOF_ACCUMULATION_MAX_SAMPLES, 4.0f, 256.0f);
+                    ImGui::TextDisabled("Frames since last reset: %u", clusterPipeline.GetDOFAccumulationFramesSinceReset());
+                    ImGui::TextWrapped("Converges toward path-traced-quality bokeh while the camera is stationary; "
+                        "falls back toward Gather-mode quality under motion/disocclusion.");
+                }
+                ImGui::Unindent();
                 ImGui::Checkbox("Ambient Occlusion (GTAO)", &config::postprocess::AO_ENABLED);
                 ImGui::Checkbox("Contact Shadows", &config::postprocess::CONTACT_SHADOW_ENABLED);
                 ImGui::Checkbox("SSR Fallback", &config::postprocess::SSR_FALLBACK_ENABLED);
@@ -1631,6 +1802,15 @@ int main(int argc, char** argv) {
                 ImGui::DragFloat("Wind Turbulence Roughness", &config::atmos::WIND_TURBULENCE_ROUGHNESS, 0.01f, 0.0f, 1.0f);
                 ImGui::DragFloat("Cloud Density Target", &config::atmos::CLOUD_DENSITY_TARGET, 0.01f, 0.0f, 1.0f);
                 ImGui::DragFloat("Fog Density Target", &config::atmos::FOG_DENSITY_TARGET, 0.01f, 0.0f, 1.0f);
+
+                // F3 (UE5.8 rendering-parity gap: Fog Screen Space Scattering) -- see renderer::
+                // FogScreenSpaceScatteringPass's own class comment. Unchecking this live A/B-compares
+                // against the pre-F3 crisp-froxel lookup at zero extra pipeline cost (the pass itself
+                // always runs -- see FogScreenSpaceScatteringPass::RecordScatter's own comment for why
+                // -- only PostProcessComposite.comp's own sample source branches).
+                ImGui::Separator();
+                ImGui::Checkbox("Fog Screen Space Scattering (F3)", &config::atmos::FOG_SCREEN_SPACE_SCATTERING_ENABLED);
+                ImGui::DragFloat("Fog Scatter Blur Radius (px)", &config::atmos::FOG_SCATTER_BLUR_RADIUS_PIXELS, 0.25f, 0.0f, 64.0f);
                 ImGui::TextDisabled("Dew Point: %.2f C", clusterPipeline.GetAtmosClimate().GetLastDewPointCelsius());
                 ImGui::TextDisabled("LCL Height: %.1f m", clusterPipeline.GetAtmosClimate().GetLastLCLHeightMeters());
 
@@ -1824,6 +2004,10 @@ int main(int argc, char** argv) {
                             ImGui::Combo("Sprite Orientation", reinterpret_cast<int*>(&cfg.spriteOrientationMode), "Camera-Facing\0Velocity-Aligned\0\0");
                             ImGui::SliderFloat("Shape Sub-Variation", &cfg.subVariationStrength, 0.0f, 1.0f);
                         }
+
+                        // Feature F7 (UE5.7/5.8 Niagara parity: shadow-casting particles). See
+                        // config::particles::EmitterConfig::castShadows's own declaration comment.
+                        ImGui::Checkbox("Cast Shadows (VSM)", &cfg.castShadows);
 
                         // Multi-emitter roadmap (subtask A1) validation/debug instrumentation: proves
                         // this emitter is independently alive/producing particles, not just that the
@@ -2319,6 +2503,32 @@ int main(int argc, char** argv) {
         }
 
 #ifndef NDEBUG
+        // --- PCG roadmap Phase 6.3 ("Runtime Generator Hook") REAL wiring: the live, camera-driven
+        // counterpart to the archetype-content streaming tick just above -- see this pair's own
+        // construction-site comment for the full rationale. Ticked with the EXACT SAME
+        // world::StreamingSource list (same camera position/radii) as `streamingManager` above so a
+        // PCG Volume and a hand-authored archetype cell stream in/out in lockstep for a camera moving
+        // through both. Only actually runs when livePcgStreamingManager was constructed above (i.e.
+        // world_data/actors/ had at least one authored PcgVolume actor file at startup) -- a
+        // std::optional that never got emplaced is inert, matching this codebase's own
+        // "additive, not load-bearing" convention for optional content elsewhere (e.g. cellmanifest.bin
+        // itself). PumpCompletions() budget/ordering mirrors the archetype loader's own call just
+        // above; livePcgCellLoader->Pump() (main-thread-only, per PcgCellLoader.h's own contract) must
+        // run AFTER that PumpCompletions() call so any LoadCellFullDetail()/UnloadCell() a worker
+        // thread completed THIS frame has already had a chance to stage its own PcgCellLoadEvent
+        // before Pump() drains the queue. ---
+        if (livePcgStreamingManager.has_value()) {
+            std::vector<world::StreamingSource> pcgSources{
+                world::StreamingSource{ camera.GetPosition(), g_StreamingDetailRadius, g_StreamingHlodRadius, 0u }
+            };
+            livePcgStreamingManager->UpdateStreamingSources(pcgSources);
+            livePcgStreamingManager->Update();
+            clusterPipeline.GetLoadingManager().PumpCompletions(8u);
+            livePcgCellLoader->Pump();
+        }
+#endif
+
+#ifndef NDEBUG
         camera.SetDebugViewMode(g_DebugState.viewMode);
         camera.SetDebugOcclusionCullingDisabled(g_DebugState.disableOcclusionCulling);
         clusterPipeline.SetDebugTraceMode(g_DebugState.traceMode);
@@ -2630,13 +2840,36 @@ int main(int argc, char** argv) {
 
         vkQueuePresentKHR(vkContext.GetGraphicsQueue(), &presentInfo);
 
-        // High-precision frame rate capper to enforce TARGET_FPS
+        // High-precision frame rate capper to enforce TARGET_FPS.
+        //
+        // F2 double-pacing fix: VulkanContext creates the swapchain with VK_PRESENT_MODE_FIFO_KHR
+        // (VulkanContext.cpp, ~line 1217), which already blocks vkQueuePresentKHR until the next
+        // vblank -- FIFO is itself a complete frame-pacing mechanism tied to the display's true
+        // refresh cadence. Also running this CPU-side sleep on top of that is harmless only when
+        // the two clocks share a frequency; when TARGET_FPS does not evenly divide the monitor's
+        // actual refresh rate (e.g. the common default: a 60fps target on a 144Hz panel, where
+        // 144/60 = 2.4, not integral) the two independent clocks beat against each other and
+        // produce irregular, jittery present intervals instead of the intended steady cadence.
+        //
+        // Fix: when TARGET_FPS is already at or above the display's own natural cap
+        // (monitorRefreshHz queried once at startup near window creation), FIFO vsync alone is
+        // sufficient pacing -- skip the CPU sleep entirely for this frame. This is the common case:
+        // the default Medium/High/Extrem profiles all target 60fps, and the overwhelming majority
+        // of displays are >=60Hz. When TARGET_FPS is intentionally BELOW the display's refresh rate
+        // (the Low tier's deliberate 30fps throttle on a 60Hz+ display), FIFO alone cannot reach
+        // that lower rate -- vsync would happily present at the full 60Hz -- so the CPU capper is
+        // still required there and its behavior is left completely unchanged. An unknown refresh
+        // rate (monitorRefreshHz <= 0) conservatively keeps the capper active, matching the
+        // pre-existing always-on behavior.
         static double lastFrameTime = glfwGetTime();
-        double targetFrameTime = 1.0 / static_cast<double>(config::TARGET_FPS);
-        while (glfwGetTime() - lastFrameTime < targetFrameTime) {
-            double remaining = targetFrameTime - (glfwGetTime() - lastFrameTime);
-            if (remaining > 0.002) {
-                std::this_thread::sleep_for(std::chrono::microseconds(static_cast<int64_t>((remaining - 0.001) * 1000000.0)));
+        const bool needsCpuCapper = (monitorRefreshHz <= 0) || (static_cast<int>(config::TARGET_FPS) < monitorRefreshHz);
+        if (needsCpuCapper) {
+            double targetFrameTime = 1.0 / static_cast<double>(config::TARGET_FPS);
+            while (glfwGetTime() - lastFrameTime < targetFrameTime) {
+                double remaining = targetFrameTime - (glfwGetTime() - lastFrameTime);
+                if (remaining > 0.002) {
+                    std::this_thread::sleep_for(std::chrono::microseconds(static_cast<int64_t>((remaining - 0.001) * 1000000.0)));
+                }
             }
         }
         lastFrameTime = glfwGetTime();
@@ -2658,6 +2891,17 @@ int main(int argc, char** argv) {
     ImGui_ImplGlfw_Shutdown();
     ImGui::DestroyContext();
     vkDestroyDescriptorPool(vkContext.GetDevice(), imguiPool, nullptr);
+
+    // PCG roadmap Phase 6.3 REAL wiring: livePcgDrawPass owns real GPU resources (graphics pipeline,
+    // descriptor sets, several GpuBuffers, a composed renderer::ClusterCullingPass -- see
+    // renderer::PcgInstanceDrawPass's own class comment) that must be explicitly torn down before
+    // vkContext.Shutdown() below destroys the VkDevice/VmaAllocator they were allocated from, exactly
+    // like every RunPcg*SmokeTest() local instance's own pcgPass.Shutdown() call already does. A
+    // no-op if world_data/actors/ had zero authored PcgVolume actor files at startup (the optional
+    // was never emplaced -- see this pair's own construction-site comment).
+    if (livePcgDrawPass.has_value()) {
+        livePcgDrawPass->Shutdown();
+    }
 #endif
 
     vkDestroyFence(vkContext.GetDevice(), frameFence, nullptr);

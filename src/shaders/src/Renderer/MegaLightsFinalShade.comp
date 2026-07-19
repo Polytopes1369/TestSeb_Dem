@@ -149,6 +149,17 @@ void main() {
     else if (light.lightType == MEGALIGHT_TYPE_RECT)        { typeEnable = g_ViewParams.typedLightControls.y; typeScale = g_ViewParams.typedLightControls.w; }
     else if (light.lightType == MEGALIGHT_TYPE_PHOTOMETRIC) { typeEnable = g_ViewParams.typedLightControls.z; typeScale = g_ViewParams.typedLightControls.w; }
 
+    // F2b (UE5.8 Lighting Channels): a light only shades an entity it shares at least one channel
+    // bit with -- see MegaLightChannelMask()/MaterialLightingChannelMask()'s own comments for the
+    // "raw zero == channel 0" default that keeps every pre-F2b scene's visuals unchanged. Folded into
+    // typeEnable (already an unconditional multiplier on the final radiance below) rather than an
+    // early-return, since the mandatory shadow-visibility ray still traces exactly the same way
+    // either way -- this only needs to zero the CONTRIBUTION, not skip the ray (skipping it would
+    // make the reservoir's implicit per-pixel cost data-dependent, an avoidable divergence source).
+    if ((MegaLightChannelMask(light) & MaterialLightingChannelMask(mat)) == 0u) {
+        typeEnable = 0.0;
+    }
+
     vec3 radiance = vec3(0.0);
 
     if (light.lightType == MEGALIGHT_TYPE_RECT) {

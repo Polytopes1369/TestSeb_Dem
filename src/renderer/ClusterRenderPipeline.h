@@ -140,6 +140,7 @@
 #include "renderer/passes/FurStrandPass.h"
 #include "renderer/passes/HZBPass.h"
 #include "renderer/LightingTypes.h"
+#include "renderer/passes/ProceduralLightFunctionGenerator.h"
 #include "renderer/passes/ProceduralMaskGenerator.h"
 #include "renderer/passes/ReflectionPass.h"
 #include "renderer/passes/ScreenSpaceEffectsPass.h"
@@ -156,9 +157,12 @@
 #include "renderer/passes/WorldProbeGridPass.h"
 #include "renderer/passes/TAATSRPass.h"
 #include "renderer/passes/DepthOfFieldPass.h"
+#include "renderer/passes/DepthOfFieldAccumulationPass.h"
 #include "renderer/passes/BloomPass.h"
+#include "renderer/passes/FogScreenSpaceScatteringPass.h"
 #include "renderer/passes/PostProcessPass.h"
 #include "renderer/passes/ScreenTracePass.h"
+#include "renderer/passes/ScreenProbeGIPass.h"
 #include "renderer/passes/GICompositePass.h"
 #include "renderer/passes/SubsurfaceScatteringPass.h"
 #include "renderer/passes/DecalProjectionPass.h"
@@ -307,6 +311,19 @@ namespace renderer {
         // anything handed this reference, exactly as m_LoadingManager's own comment already states.
         core::LoadingManager& GetLoadingManager() { return m_LoadingManager; }
 
+        // PCG roadmap Phase 6.3 ("Runtime Generator Hook") REAL wiring: the two pieces of this
+        // pipeline's private Vulkan/lighting state that a persistent, LIVE renderer::PcgInstanceDrawPass
+        // (owned by main.cpp, not a smoke-test-local) needs for its own Init() call but had no public
+        // accessor for before -- every OTHER Init() parameter (device/allocator/commandPool/queue/
+        // materialTable) is already reachable from main.cpp directly via VulkanContext's own public
+        // getters (GetDevice/GetAllocator/GetCommandPool/GetGraphicsQueue/GetMaterialTable); only the
+        // resident geometry page pool's physical buffer and the showcase scene's baked sun direction
+        // are private to THIS class. Mirrors exactly what RunPcgCellLoaderSmokeTest's own STEP 2 local
+        // setup already reads internally (m_PagePool.GetPhysicalPoolBuffer(), m_BaseSunDirection) --
+        // both cheap, read-only forwards, no new state or ownership transfer.
+        VkBuffer GetPagePoolPhysicalBuffer() const { return m_PagePool.GetPhysicalPoolBuffer(); }
+        maths::vec3 GetBaseSunDirection() const { return m_BaseSunDirection; }
+
         // Phase 2 (Lumen advanced roadmap) fix: the frame is now recorded across 4 calls instead of
         // one RecordFrame() -- see this class' own header comment ("Per-frame GPU work") for the
         // full root-cause/redesign explanation and main.cpp for the exact submit sequence each call
@@ -403,6 +420,15 @@ namespace renderer {
         // toggle. Plain accessor (the count itself is not debug-only data), same convention as
         // GetVegetationScatter().GetInstanceCount() above.
         uint32_t GetDecalCount() const { return m_Decals.GetDecalCount(); }
+
+        // UE5.8-parity "Accumulation Depth of Field": frames elapsed since m_DepthOfFieldAccumulation's
+        // own history last fully reset (first frame / a Gather -> Accumulation mode switch) -- read by
+        // main.cpp's own Debug "Post FX" ImGui tab for a live convergence readout next to the DOF Mode
+        // combo. Plain accessor (not debug-only data, same convention as GetDecalCount() above). Only
+        // advances while config::postprocess::DOF_MODE == 1 -- [13e] only dispatches whichever DOF
+        // sub-pass is actually selected each frame (not both), so this value simply freezes at its
+        // last count while Gather mode is active instead of ticking meaninglessly in the background.
+        uint32_t GetDOFAccumulationFramesSinceReset() const { return m_DepthOfFieldAccumulation.GetFramesSinceReset(); }
 
         // UE5.8 rendering-parity gap G10a: hair/fur strand pass (strand-count readout) -- same
         // "borrow a const ref" convention as GetVegetationScatter().
@@ -923,6 +949,13 @@ namespace renderer {
         // class comment. GetMaskImageInfos() is threaded into all three passes below.
         ProceduralMaskGenerator m_MaskGenerator;
 
+        // F12 (UE5.8 rendering-parity gap: Texture-based Light Functions + projected Caustics):
+        // generates the bindless Light Function gobo array (light_functions.glsl) + the caustics
+        // pattern texture (caustics_projection.glsl) once at Init() time, before m_Resolve below is
+        // initialized (its own sole consumer) -- see ProceduralLightFunctionGenerator's own class
+        // comment.
+        ProceduralLightFunctionGenerator m_LightFunctionGenerator;
+
         // Generic multithreaded background-job pool (hardware_concurrency worker threads) -- see
         // core::LoadingManager's own class comment. Currently consumed by m_GlobalSDF::Init() to
         // fan its per-entity Mesh SDF bake out across every core instead of a single-threaded loop
@@ -1193,16 +1226,21 @@ namespace renderer {
         // benefits from.
         SurfaceCacheGIInjectPass m_GIInject;
 
-        // NOTE: this class previously also owned a ScreenProbeGIPass ("Screen Space Probe GI" /
-        // Lumen "Screen Probe Gather") here -- a per-8x8-tile SH probe grid, temporally accumulated,
-        // gathered back into m_Resolve's output color image via read-modify-write. The
-        // ScreenTracePass/GICompositePass integration below replaced it as this codebase's near-
-        // field screen-space GI term (a plain per-pixel screen-space march instead of a per-tile
-        // probe grid); the instantiation was removed here to stop paying for its ~10 full-resolution
-        // images/3 pipelines every run. ScreenProbeGIPass.h/.cpp and its 4 shaders (ScreenProbeTrace/
-        // Temporal/Gather/Classify.comp, the last from Phase 6's hierarchical placement) were deleted
-        // outright -- zero remaining references anywhere in this codebase (confirmed via repo-wide
-        // grep before deletion), same as ShadowMapPass.h/.cpp above.
+        // F9 (UE5.8 parity roadmap): Screen Space Probe GI ("Screen Probe Gather" -- a per-8x8-tile
+        // SH probe grid, temporally accumulated, hierarchically classified into an always-on coarse
+        // grid + selectively-retraced fine grid, see that class' own header comment) -- RESTORED
+        // here as config::lumen::GIMode::HighQuality's own near-field gather, replacing the plain
+        // per-pixel m_ScreenTrace march that HighQuality used while this was deleted. This class had
+        // been removed outright by an earlier perf pass (own ~10 full-resolution-image /
+        // 3-pipeline cost concern, since disproven -- see this class' own restored header comment:
+        // its probe images were already sized at PROBE resolution, not full render resolution, even
+        // before deletion) once F1 ("Lumen Lite") gave GIMode::Lite its own cheap alternative via
+        // m_WorldProbes -- m_ScreenTrace now serves ONLY GIMode::Lite's per-pixel term (and, in
+        // HighQuality, nothing -- see RecordFrame()'s own [12b]/[12b1] comments), while this owns
+        // HighQuality's own indirect term. GICompositePass composites direct color + [this pass'
+        // GetOutputView() | m_Denoiser's ATrous-denoised m_ScreenTrace output] depending on
+        // config::lumen::GI_MODE.
+        ScreenProbeGIPass m_ScreenProbeGI;
 
         // Phase 2 (UE5.8 parity roadmap): specular reflections / GI -- traces ONE GGX-VNDF-
         // importance-sampled ray per pixel per frame (full resolution), sampling the same
@@ -1280,11 +1318,22 @@ namespace renderer {
         // see DepthOfFieldPass's own class comment. m_Bloom and m_PostProcess both read ITS
         // GetOutputView() now, not m_TAATSR's directly.
         DepthOfFieldPass m_DepthOfField;
+        // UE5.8-parity "Accumulation Depth of Field" (config::postprocess::DOF_MODE == 1): alternative
+        // resolve technique reading the SAME m_TAATSR output as m_DepthOfField above -- see
+        // DepthOfFieldAccumulationPass's own class comment. Always Init'd alongside m_DepthOfField
+        // (both stay resident so the live ImGui toggle never needs a resize/recreate); RecordFrame's
+        // own [13e] picks whichever one's GetOutputView() feeds m_Bloom/m_PostProcess this frame.
+        DepthOfFieldAccumulationPass m_DepthOfFieldAccumulation;
         // Phase PP2 (post-process stack roadmap): Bloom / Lens Flare / Anamorphic Lens Flare / Lens
         // Dirt, all one dual-filter mip chain reading m_DepthOfField's own output -- see BloomPass's
         // own class comment. Recorded before m_PostProcess (below), whose composite shader samples
         // its GetOutputView() and adds it into the scene color.
         BloomPass m_Bloom;
+        // F3 (UE5.8 rendering-parity gap: Fog Screen Space Scattering): depth-aware bilateral spread
+        // of m_AtmosFog's own per-pixel in-scattered radiance, recorded immediately before
+        // m_PostProcess (below) -- see FogScreenSpaceScatteringPass's own class comment for why it
+        // must run adjacent to its one producer (m_AtmosFog) and one consumer (m_PostProcess).
+        FogScreenSpaceScatteringPass m_FogScatter;
         // Phase PP1 (post-process stack roadmap): Physical Camera / Auto Exposure / White Balance /
         // Color Correction / ACES Tone Mapping / Gamma Correction -- the normal-view-path blit
         // source instead of m_TAATSR's own raw HDR output directly (see PostProcessPass's own class
@@ -1299,6 +1348,12 @@ namespace renderer {
         // frame's" value has run.
         maths::mat4 m_PrevViewProj{};
         bool m_HasPrevViewProj = false;
+
+        // Whether m_DepthOfFieldAccumulation was the active DOF pass on the PREVIOUS frame --
+        // compared against config::postprocess::DOF_MODE each frame so a Gather -> Accumulation mode
+        // switch forces one full history reset (its ping-pong buffers may hold stale/never-written
+        // data while a different mode was active) -- see [13e]'s own resetHistory computation.
+        bool m_DOFAccumulationWasActive = false;
 
         // Advances once per RecordFrame() call -- ScreenProbeTrace.comp's own per-frame Fibonacci-
         // sphere jitter rotation (include/sh_probe.glsl's JitterDirection).

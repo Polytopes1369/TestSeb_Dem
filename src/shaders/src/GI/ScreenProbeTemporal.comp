@@ -1,0 +1,149 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+
+// Screen Space Probe GI -- temporal accumulation (renderer::ScreenProbeGIPass, Part 3 deliverable):
+// one invocation per probe. Reprojects this frame's own probe world position (just written by
+// ScreenProbeTrace.comp into the CURRENT ping-pong slot) through the PREVIOUS frame's view-
+// projection matrix to find where this same world point sat on screen last frame, bilinearly
+// samples the HISTORY slot's SH coefficients + world position + normal at that reprojected
+// location (hardware-filtered, via renderer::ScreenProbeGIPass's shared linear/clamp sampler --
+// SH coefficients are a linear representation, so bilinearly interpolating them is exactly
+// equivalent to bilinearly interpolating the function they represent), runs a disocclusion test
+// (depth/normal delta) against that history sample, and exponentially blends
+// (alpha ~= renderer::ScreenProbeGIPass::kTemporalAlpha, or a full alpha = 1.0 reset on
+// disocclusion) the new raw sample toward the history -- writing the result back into the SAME
+// (current) slot's SH images, overwriting the raw sample RecordTrace() just wrote there.
+//
+// --- Phase 6 (UE5.8 parity roadmap): shared fine/coarse entry point, flattened 1D dispatch ---
+// Serves BOTH grids of renderer::ScreenProbeGIPass's two-level hierarchy, exactly like
+// ScreenProbeTrace.comp (see that shader's own comment for the dispatchMode/tileSize contract).
+// local_size changed from 2D (8,8) to 1D (64) specifically so ONE shader variant can be dispatched
+// either directly over the always-on COARSE grid (flattened index -> 2D coord) or indirectly over
+// ONLY the compacted list of FINE tiles ScreenProbeClassify.comp flagged this frame -- a 2D
+// indirect dispatch has no clean way to draw its X/Y group counts from a single flat element
+// count, whereas a 1D dispatch does (mirrors ScreenProbeTrace.comp's own choice not to flatten
+// ITS dispatch: Trace's fine indirect dispatch uses workgroupSize=1 in
+// BuildDispatchIndirectArgs.comp -- one full workgroup per tile, no reason to flatten -- while
+// Temporal's local_size_x=64 needs an actual flat index to stay one thread per probe).
+
+#include "include/octahedral.glsl"
+
+layout(local_size_x = 64) in;
+
+const float kTemporalAlpha = 0.05;
+// World-space distance a reprojected probe's own position may drift from this frame's freshly-
+// traced position before its history is rejected outright -- a fraction of this demoscene's own
+// ~14m camera-orbit-diameter scene scale (main.cpp's CameraOrbit distance), i.e. "roughly one
+// probe tile's worth of surface movement," not an arbitrary constant.
+const float kDisocclusionDistanceThreshold = 0.5;
+const float kDisocclusionCosThreshold = 0.5; // ~60 degrees.
+
+layout(rgba16f, set = 0, binding = 0) uniform image2D g_ProbeSHR;         // Current slot, read-modify-write.
+layout(rgba16f, set = 0, binding = 1) uniform image2D g_ProbeSHG;
+layout(rgba16f, set = 0, binding = 2) uniform image2D g_ProbeSHB;
+layout(rgba32f, set = 0, binding = 3) uniform readonly image2D g_ProbeWorldPos; // Current slot -- already final for this frame.
+layout(rg16f, set = 0, binding = 4) uniform readonly image2D g_ProbeNormal;     // Current slot.
+layout(set = 0, binding = 5) uniform sampler2D g_HistorySHR;
+layout(set = 0, binding = 6) uniform sampler2D g_HistorySHG;
+layout(set = 0, binding = 7) uniform sampler2D g_HistorySHB;
+layout(set = 0, binding = 8) uniform sampler2D g_HistoryWorldPos;
+layout(set = 0, binding = 9) uniform sampler2D g_HistoryNormal;
+
+#define SCREEN_PROBE_VIEW_PARAMS_SET 0
+#define SCREEN_PROBE_VIEW_PARAMS_BINDING 10
+#include "include/screen_probe_view_params.glsl"
+
+// Phase 6: mirrors ScreenProbeTrace.comp's own ActiveFineTileListSSBO exactly (packed uint
+// coords) -- only read (never written) here, and only when pc.dispatchMode == 1.
+layout(std430, set = 0, binding = 11) readonly buffer ActiveFineTileListSSBO {
+    uint count;
+    uint coords[];
+} g_ActiveFineTileList;
+
+layout(push_constant) uniform TemporalPushConstants {
+    uint probeCountX;  // THIS dispatch's own grid size (fine or coarse, whichever pc.tileSize selects) -- deliberately NOT g_ViewParams.probeGridSize below, which is always the fine grid's size regardless of which grid this dispatch is processing.
+    uint probeCountY;
+    uint tileSize;     // Phase 6: kProbeTileSize (fine) or kCoarseProbeTileSize (coarse) -- replaces the old hardcoded constant.
+    uint dispatchMode; // Phase 6: 0 = direct grid (flattened gl_GlobalInvocationID.x), 1 = indirect compacted list.
+} pc;
+
+void main() {
+    ivec2 probeCoord;
+    if (pc.dispatchMode == 0u) {
+        // Direct dispatch -- the always-on COARSE grid (or, before Phase 6, the fine grid's own
+        // former unconditional-every-frame dispatch). Flattened 1D index -> 2D coord (see this
+        // file's own header comment on why local_size_x is now 1D).
+        uint idx = gl_GlobalInvocationID.x;
+        uint total = pc.probeCountX * pc.probeCountY;
+        if (idx >= total) {
+            return;
+        }
+        probeCoord = ivec2(int(idx % pc.probeCountX), int(idx / pc.probeCountX));
+    } else {
+        // Indirect dispatch -- the selectively-updated FINE grid. Unlike ScreenProbeTrace.comp's
+        // own indirect dispatch (workgroupSize=1, so gl_WorkGroupID.x never overshoots
+        // g_ActiveFineTileList.count), this shader's local_size_x=64 means the LAST workgroup can
+        // overshoot the true count by up to 63 threads (BuildDispatchIndirectArgs.comp rounds
+        // groupCountX up) -- those extra threads would otherwise read STALE leftover entries from
+        // a previous, possibly larger, frame's list (only `count` is reset every frame, not the
+        // array payload itself), so this bounds check is required for correctness, not just
+        // defensive robustness.
+        if (gl_GlobalInvocationID.x >= g_ActiveFineTileList.count) {
+            return;
+        }
+        uint packed = g_ActiveFineTileList.coords[gl_GlobalInvocationID.x];
+        probeCoord = ivec2(int(packed & 0xFFFFu), int(packed >> 16u));
+    }
+
+    vec4 newWorldPos = imageLoad(g_ProbeWorldPos, probeCoord);
+    if (newWorldPos.a < 0.5) {
+        // Invalid probe (no geometry at its representative pixel this frame, see
+        // ScreenProbeTrace.comp's own comment) -- SH is already zero from the trace pass, nothing
+        // to reproject/blend.
+        return;
+    }
+    vec3 newNormal = OctDecode(imageLoad(g_ProbeNormal, probeCoord).rg);
+    vec4 newSHR = imageLoad(g_ProbeSHR, probeCoord);
+    vec4 newSHG = imageLoad(g_ProbeSHG, probeCoord);
+    vec4 newSHB = imageLoad(g_ProbeSHB, probeCoord);
+
+    vec4 prevClip = g_ViewParams.prevViewProj * vec4(newWorldPos.xyz, 1.0);
+
+    float alpha = 1.0; // Default: full reset (disocclusion / no valid history to blend against).
+    vec4 historySHR = vec4(0.0), historySHG = vec4(0.0), historySHB = vec4(0.0);
+
+    if (prevClip.w > 1.0e-4) {
+        vec2 prevNDC = prevClip.xy / prevClip.w;
+        vec2 prevScreen = (prevNDC * 0.5 + 0.5) * g_ViewParams.viewportSize;
+
+        // Screen pixel -> continuous probe-space coordinate, where integer value i corresponds
+        // exactly to probe i's own representative pixel (i*tileSize + tileSize/2 -- see
+        // ScreenProbeTrace.comp's own centerPixel derivation) -- then +0.5 to convert into a
+        // sampler2D's normalized-UV convention (texel i's center sits at (i+0.5)/size). Divides by
+        // pc.probeCountX/Y (THIS dispatch's own grid size), not g_ViewParams.probeGridSize (always
+        // the fine grid's size) -- see pc.probeCountX's own comment for why.
+        float tileSize = float(pc.tileSize);
+        vec2 probeSpace = (prevScreen - vec2(tileSize * 0.5)) / tileSize;
+        vec2 prevProbeUV = (probeSpace + 0.5) / vec2(float(pc.probeCountX), float(pc.probeCountY));
+
+        if (all(greaterThanEqual(prevProbeUV, vec2(0.0))) && all(lessThanEqual(prevProbeUV, vec2(1.0)))) {
+            vec4 historyWorldPos = texture(g_HistoryWorldPos, prevProbeUV);
+            vec3 historyNormal = OctDecode(texture(g_HistoryNormal, prevProbeUV).rg);
+
+            bool disoccluded = historyWorldPos.a < 0.5
+                || distance(historyWorldPos.xyz, newWorldPos.xyz) > kDisocclusionDistanceThreshold
+                || dot(historyNormal, newNormal) < kDisocclusionCosThreshold;
+
+            if (!disoccluded) {
+                historySHR = texture(g_HistorySHR, prevProbeUV);
+                historySHG = texture(g_HistorySHG, prevProbeUV);
+                historySHB = texture(g_HistorySHB, prevProbeUV);
+                alpha = kTemporalAlpha;
+            }
+        }
+    }
+
+    imageStore(g_ProbeSHR, probeCoord, mix(historySHR, newSHR, alpha));
+    imageStore(g_ProbeSHG, probeCoord, mix(historySHG, newSHG, alpha));
+    imageStore(g_ProbeSHB, probeCoord, mix(historySHB, newSHB, alpha));
+}

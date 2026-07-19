@@ -9,6 +9,19 @@ namespace renderer {
 
     namespace {
 
+        // Byte-for-byte mirror of GIComposite.comp's own push_constant block. `giMode`
+        // (config::lumen::GIMode) is always present -- NOT Debug-only, both GI modes ship in
+        // Release -- selecting between g_ScreenProbeGI (HighQuality) and g_DenoisedGI (Lite); see
+        // GICompositePass.h's own class comment. `viewMode` stays Debug-only (DEBUG_VIEW_LUMEN/
+        // DEBUG_VIEW_SPATIAL_PROBES), folded into the same push-constant range/struct so the byte
+        // layout matches the shader side exactly in both configurations.
+        struct GICompositePushConstants {
+            uint32_t giMode = 0;
+#ifndef NDEBUG
+            uint32_t viewMode = 0;
+#endif
+        };
+
 #ifndef NDEBUG
         // Byte-for-byte mirror of GICompositeViewParamsUBO in GIComposite.comp (std140, debug-only).
         struct GICompositeViewParams {
@@ -26,7 +39,7 @@ namespace renderer {
 
     void GICompositePass::Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
         VkExtent2D renderExtent, VkImageView directColorView, VkImageView denoisedGIView,
-        VkImageView aoView, VkImageView depthView, const WorldProbeGridPass& worldProbes) {
+        VkImageView screenProbeGIView, VkImageView aoView, VkImageView depthView, const WorldProbeGridPass& worldProbes) {
         Shutdown();
         m_Device = device;
         m_Allocator = allocator;
@@ -90,13 +103,13 @@ namespace renderer {
         VK_CHECK(vkCreateSampler(m_Device, &samplerInfo, nullptr, &m_NearestSampler));
 
 #ifndef NDEBUG
-        constexpr uint32_t kBindingCount = 8;
+        constexpr uint32_t kBindingCount = 10;
         m_ViewParamsBuffer.Create(allocator, sizeof(GICompositeViewParams),
             VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
         m_WorldProbeGridParamsBuffer.Create(allocator, sizeof(WorldProbeGridParams),
             VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
 #else
-        constexpr uint32_t kBindingCount = 4;
+        constexpr uint32_t kBindingCount = 5;
         (void)depthView;
         (void)worldProbes;
 #endif
@@ -104,13 +117,19 @@ namespace renderer {
         std::vector<VkDescriptorSetLayoutBinding> bindings(kBindingCount);
         bindings[0] = { 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };          // g_Output
         bindings[1] = { 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // g_DirectColor
-        bindings[2] = { 2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // g_DenoisedGI
+        bindings[2] = { 2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // g_DenoisedGI (GIMode::Lite)
         bindings[3] = { 3, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // g_AO (Phase PP4, always-on)
+        // F9: g_ScreenProbeGI (GIMode::HighQuality) -- always bound (Release included), see the
+        // class comment's own GI-mode note.
+        bindings[4] = { 4, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // g_ScreenProbeGI
 #ifndef NDEBUG
-        bindings[4] = { 7, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // g_Depth
-        bindings[5] = { 8, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };         // GICompositeViewParamsUBO
-        bindings[6] = { 9, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // g_WorldProbeGrid
-        bindings[7] = { 10, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };        // WorldProbeGridParamsUBO
+        bindings[5] = { 7, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };  // g_Depth
+        bindings[6] = { 8, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };          // GICompositeViewParamsUBO
+        // F1: g_WorldProbeGrid/g_WorldProbeOcclusion are now each a WorldProbeGridPass::kLevelCount
+        // -element sampler3D array (multi-level clipmap), not a single sampler.
+        bindings[7] = { 9, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, WorldProbeGridPass::kLevelCount, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };  // g_WorldProbeGrid[]
+        bindings[8] = { 10, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, WorldProbeGridPass::kLevelCount, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // g_WorldProbeOcclusion[]
+        bindings[9] = { 11, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };        // WorldProbeGridParamsUBO
 #endif
 
         VkDescriptorSetLayoutCreateInfo setLayoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
@@ -121,14 +140,14 @@ namespace renderer {
 #ifndef NDEBUG
         VkDescriptorPoolSize poolSizes[3] = {
             { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1 },
-            { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 5 },
+            { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 5 + 2 * WorldProbeGridPass::kLevelCount },
             { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2 }
         };
         uint32_t poolSizeCount = 3;
 #else
         VkDescriptorPoolSize poolSizes[2] = {
             { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1 },
-            { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3 }
+            { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 4 }
         };
         uint32_t poolSizeCount = 2;
 #endif
@@ -148,12 +167,15 @@ namespace renderer {
         VkDescriptorImageInfo directColorInfo{ m_NearestSampler, directColorView, VK_IMAGE_LAYOUT_GENERAL };
         VkDescriptorImageInfo denoisedGIInfo{ m_NearestSampler, denoisedGIView, VK_IMAGE_LAYOUT_GENERAL };
         VkDescriptorImageInfo aoInfo{ m_NearestSampler, aoView, VK_IMAGE_LAYOUT_GENERAL };
+        // F9: g_ScreenProbeGI -- always bound, see the class comment's own GI-mode note.
+        VkDescriptorImageInfo screenProbeGIInfo{ m_NearestSampler, screenProbeGIView, VK_IMAGE_LAYOUT_GENERAL };
 
         std::vector<VkWriteDescriptorSet> writes(kBindingCount);
         writes[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_Set, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &outputInfo, nullptr, nullptr };
         writes[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_Set, 1, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &directColorInfo, nullptr, nullptr };
         writes[2] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_Set, 2, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &denoisedGIInfo, nullptr, nullptr };
         writes[3] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_Set, 3, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &aoInfo, nullptr, nullptr };
+        writes[4] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_Set, 4, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &screenProbeGIInfo, nullptr, nullptr };
 
 #ifndef NDEBUG
         // GENERAL, not DEPTH_STENCIL_READ_ONLY_OPTIMAL: `depthView` is renderer::
@@ -167,29 +189,37 @@ namespace renderer {
         // of downstream errors once the shader actually sampled it) on every Debug run.
         VkDescriptorImageInfo depthInfo{ m_NearestSampler, depthView, VK_IMAGE_LAYOUT_GENERAL };
         VkDescriptorBufferInfo viewParamsInfo{ m_ViewParamsBuffer.Handle(), 0, m_ViewParamsBuffer.Size() };
-        VkDescriptorImageInfo worldProbeGridInfo{ worldProbes.GetGridSampler(), worldProbes.GetGridView(), VK_IMAGE_LAYOUT_GENERAL };
+        // F1: one VkDescriptorImageInfo per level for both the grid and occlusion sampler arrays --
+        // mirrors renderer::ScreenTracePass.cpp's own identical multi-level descriptor-array write.
+        VkDescriptorImageInfo worldProbeGridInfos[WorldProbeGridPass::kLevelCount]{};
+        VkDescriptorImageInfo worldProbeOcclusionInfos[WorldProbeGridPass::kLevelCount]{};
+        for (uint32_t level = 0; level < WorldProbeGridPass::kLevelCount; ++level) {
+            worldProbeGridInfos[level] = { worldProbes.GetGridSampler(), worldProbes.GetGridView(level), VK_IMAGE_LAYOUT_GENERAL };
+            worldProbeOcclusionInfos[level] = { worldProbes.GetGridSampler(), worldProbes.GetOcclusionView(level), VK_IMAGE_LAYOUT_GENERAL };
+        }
         VkDescriptorBufferInfo worldProbeGridParamsInfo{ m_WorldProbeGridParamsBuffer.Handle(), 0, m_WorldProbeGridParamsBuffer.Size() };
 
-        writes[4] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_Set, 7, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &depthInfo, nullptr, nullptr };
-        writes[5] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_Set, 8, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &viewParamsInfo, nullptr };
-        writes[6] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_Set, 9, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &worldProbeGridInfo, nullptr, nullptr };
-        writes[7] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_Set, 10, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &worldProbeGridParamsInfo, nullptr };
+        writes[5] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_Set, 7, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &depthInfo, nullptr, nullptr };
+        writes[6] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_Set, 8, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &viewParamsInfo, nullptr };
+        writes[7] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_Set, 9, 0, WorldProbeGridPass::kLevelCount, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, worldProbeGridInfos, nullptr, nullptr };
+        writes[8] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_Set, 10, 0, WorldProbeGridPass::kLevelCount, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, worldProbeOcclusionInfos, nullptr, nullptr };
+        writes[9] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_Set, 11, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &worldProbeGridParamsInfo, nullptr };
 #endif
         vkUpdateDescriptorSets(m_Device, kBindingCount, writes.data(), 0, nullptr);
 
         VkPipelineLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
         layoutInfo.setLayoutCount = 1;
         layoutInfo.pSetLayouts = &m_SetLayout;
-#ifndef NDEBUG
+        // F1: `giMode` is always present (Release included) -- see GICompositePushConstants' own
+        // comment; `viewMode` (Debug-only) is folded into the same push-constant range so the
+        // shader-side struct's byte layout matches sizeof(GICompositePushConstants) exactly in
+        // both configurations.
         VkPushConstantRange pushRange{};
         pushRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
         pushRange.offset = 0;
-        pushRange.size = sizeof(uint32_t); // viewMode
+        pushRange.size = sizeof(GICompositePushConstants);
         layoutInfo.pushConstantRangeCount = 1;
         layoutInfo.pPushConstantRanges = &pushRange;
-#else
-        layoutInfo.pushConstantRangeCount = 0;
-#endif
         VK_CHECK(vkCreatePipelineLayout(m_Device, &layoutInfo, nullptr, &m_PipelineLayout));
 
         VkShaderModule shaderModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/GIComposite.comp.spv");
@@ -238,10 +268,10 @@ namespace renderer {
         m_Device = VK_NULL_HANDLE;
     }
 
-    void GICompositePass::RecordComposite(VkCommandBuffer cmd
+    void GICompositePass::RecordComposite(VkCommandBuffer cmd, config::lumen::GIMode giMode
 #ifndef NDEBUG
         , const CameraPushConstants& camera, const maths::vec3& cameraPositionWorld,
-        const maths::vec3& worldProbeGridOrigin
+        const WorldProbeGridPass& worldProbes
 #endif
     ) {
 #ifndef NDEBUG
@@ -255,10 +285,13 @@ namespace renderer {
         vkCmdUpdateBuffer(cmd, m_ViewParamsBuffer.Handle(), 0, sizeof(GICompositeViewParams), &viewParams);
 
         WorldProbeGridParams gridParams{};
-        gridParams.gridOriginX = worldProbeGridOrigin.x;
-        gridParams.gridOriginY = worldProbeGridOrigin.y;
-        gridParams.gridOriginZ = worldProbeGridOrigin.z;
-        gridParams.probeSpacing = WorldProbeGridPass::kProbeSpacing;
+        for (uint32_t level = 0; level < WorldProbeGridPass::kLevelCount; ++level) {
+            const maths::vec3& origin = worldProbes.GetGridOriginWorld(level);
+            gridParams.levels[level].originX = origin.x;
+            gridParams.levels[level].originY = origin.y;
+            gridParams.levels[level].originZ = origin.z;
+            gridParams.levels[level].spacing = WorldProbeGridPass::GetLevelSpacing(level);
+        }
         gridParams.gridResolution = static_cast<float>(WorldProbeGridPass::kGridResolution);
         vkCmdUpdateBuffer(cmd, m_WorldProbeGridParamsBuffer.Handle(), 0, sizeof(WorldProbeGridParams), &gridParams);
 
@@ -277,10 +310,12 @@ namespace renderer {
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_Pipeline);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_PipelineLayout, 0, 1, &m_Set, 0, nullptr);
 
+        GICompositePushConstants pc{};
+        pc.giMode = static_cast<uint32_t>(giMode);
 #ifndef NDEBUG
-        uint32_t viewMode = camera.debugViewMode;
-        vkCmdPushConstants(cmd, m_PipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(uint32_t), &viewMode);
+        pc.viewMode = camera.debugViewMode;
 #endif
+        vkCmdPushConstants(cmd, m_PipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
 
         uint32_t groupCountX = (m_RenderExtent.width + kWorkgroupSize - 1) / kWorkgroupSize;
         uint32_t groupCountY = (m_RenderExtent.height + kWorkgroupSize - 1) / kWorkgroupSize;

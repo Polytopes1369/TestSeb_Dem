@@ -105,6 +105,19 @@ namespace renderer {
         // for an eviction candidate just because nothing re-requested it.
         void TouchPage(uint32_t logicalPageID);
 
+        // VSM sun-clipmap re-centering (Feature F14): forcibly evicts `logicalPageID` if it is
+        // currently resident, freeing its physical layer back to the free list and writing
+        // kUnmappedSentinel into the GPU page table -- unlike EvictOneLeastRecentlyUsed (only ever
+        // invoked internally, LRU-driven, when the pool is full), this is called explicitly by
+        // renderer::VirtualShadowMapPass whenever a sun clipmap level's covered window re-centers
+        // and a specific (vsmIndex, localPageIndex) slot's WORLD-TILE mapping just changed (see
+        // that class's own toroidal-wrap header comment) -- the page's cached depth content, if
+        // any, is for the wrong world tile now and must never be silently reused by a future
+        // AllocatePage() call for the same logicalPageID. A no-op if the page was never resident
+        // (the common case: most logical page IDs a level's window sweeps past were never actually
+        // requested/rendered in the first place).
+        void InvalidatePage(VkCommandBuffer cmd, uint32_t logicalPageID);
+
         bool IsResident(uint32_t logicalPageID) const;
         uint32_t GetPhysicalLayer(uint32_t logicalPageID) const;
         uint32_t GetResidentPageCount() const { return m_ResidentCount; }

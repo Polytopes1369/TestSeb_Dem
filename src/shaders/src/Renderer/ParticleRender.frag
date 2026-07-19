@@ -279,7 +279,7 @@ void main() {
     // particle sitting in full shadow with no probe coverage nearby from going pure black. ---
     float sunVisibility = SampleSunShadowVSM(inWorldPos);
     vec3 sunRadiance = g_Params.sunColor * g_Params.sunIntensity * sunVisibility;
-    vec3 indirectDiffuse = SampleWorldProbeGrid(inWorldPos);
+    vec3 indirectDiffuse = SampleWorldProbeGrid(inWorldPos, g_Params.cameraPosition);
 
     // D2 (scoped-down Surface Cache supplement -- see this file's own header comment): blend in a
     // SECOND World Probe Grid tap taken at the reconstructed nearby-surface position, weighted by
@@ -290,7 +290,7 @@ void main() {
     if (hasNearbySurface) {
         float surfaceProximity = 1.0 - clamp((sceneDist - particleDist) / max(g_Params.softFadeDistance, 1.0e-4), 0.0, 1.0);
         float blendToSurface = surfaceProximity * surfaceProximity; // Smoother falloff than linear.
-        vec3 surfaceIndirect = SampleWorldProbeGrid(sceneWorldPos);
+        vec3 surfaceIndirect = SampleWorldProbeGrid(sceneWorldPos, g_Params.cameraPosition);
         indirectDiffuse = mix(indirectDiffuse, surfaceIndirect, blendToSurface);
     }
 

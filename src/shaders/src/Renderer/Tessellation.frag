@@ -181,7 +181,7 @@ void main() {
     float sunVisibility = (sunNdotL > 0.0) ? SampleSunShadowVSM(inWorldPos) : 1.0;
     vec3 sunRadiance = g_Lighting.sunColor.rgb * g_Lighting.sunDirectionAndIntensity.w * sunVisibility;
     vec3 sunResponse = EvaluateSubstrateMaterial(mat, n, viewDir, sunDir) * sunRadiance;
-    vec3 indirectLighting = SampleWorldProbeGrid(inWorldPos);
+    vec3 indirectLighting = SampleWorldProbeGrid(inWorldPos, cameraPositionWorld);
 
     // Fully opaque -- no blend stage involved (blendEnable = false, see
     // renderer::TessellationPass's own class comment), so no alpha-weighting concern here.
