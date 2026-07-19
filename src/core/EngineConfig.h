@@ -195,18 +195,33 @@ inline float EXPOSURE_APERTURE = 4.0f;             // f-stop.
 // strength as a side effect); 1/8000s is a realistic, if fast, daylight electronic-shutter speed.
 inline float EXPOSURE_SHUTTER_SPEED_SECONDS = 1.0f / 8000.0f;
 inline float EXPOSURE_ISO = 100.0f;
-// Manual (not Auto) for now: renderer::MegaLightsPass (Phase A) has no temporal reservoir reuse
-// yet (per-frame RIS re-samples a different light, spatially but not temporally denoised -- see
-// that class' own header comment, "Phase B" is the planned fix) -- Auto Exposure's histogram
-// directly measures that per-frame luminance noise and reacts to it every frame, amplifying an
-// otherwise-subtle spatial grain into a visible global brightness flicker. Manual metering (a
-// fixed EV100 snapped instantly every frame, see AutoExposureAdapt.comp's own Auto/Manual branch)
-// removes that reactive amplification entirely; MegaLights' own residual per-pixel grain is a
-// separate, much smaller-magnitude cosmetic issue tracked against the Phase B temporal-reuse work.
-inline bool EXPOSURE_USE_AUTO = false;
+// Auto Exposure re-enabled (Task F11, 2026-07-19; UE5.8's own Post Process Volume default is Auto,
+// not Manual). Previously hardcoded Manual-only because renderer::MegaLightsPass's Phase A had no
+// temporal reservoir reuse (per-frame RIS re-sampled a different light, spatially but not
+// temporally denoised) -- Auto Exposure's histogram directly measures that per-frame luminance
+// noise and reacts to it every frame, amplifying an otherwise-subtle spatial grain into a visible
+// global brightness flicker. That gap is closed: MegaLightsPass's Phase 4 (see that class' own
+// header comment, "temporal ReSTIR ... folded directly into MegaLightsShade.comp") now temporally
+// accumulates reservoirs across frames, and renderer::TAATSRPass caps its own adaptive TAA alpha
+// at 0.5 (a second, independent smoothing layer over the same per-pixel noise). On top of both of
+// those, AutoExposureAdapt.comp's own histogram metering now also trims to the UE-style
+// [EXPOSURE_HISTOGRAM_LOW_PERCENT, EXPOSURE_HISTOGRAM_HIGH_PERCENT] cumulative-population slice
+// instead of averaging the WHOLE histogram (see that shader's own comment) -- any residual
+// per-pixel MegaLights noise or specular fireflies now has to be common to a wide swath of the
+// frame's pixel population, not just a handful of outliers, before it can move the metered
+// exposure at all. Also re-tuned this same pass, PostProcessPass::kMinLogLuminance/
+// kLogLuminanceRange (see that constant's own header comment): the histogram's luminance range
+// itself was still a pre-recalibration relic that clamped nearly this whole real-lux-scale scene
+// into its single top bin, which -- independent of any flicker question -- would have made Auto
+// Exposure compute a constant, badly WRONG exposure the moment it was ever turned on.
+inline bool EXPOSURE_USE_AUTO = true;
 inline float EXPOSURE_COMPENSATION_EV = 0.0f;
-inline float EXPOSURE_ADAPTATION_SPEED_UP_EV_PER_SEC = 3.0f;   // Scene darkened -> exposure rising.
-inline float EXPOSURE_ADAPTATION_SPEED_DOWN_EV_PER_SEC = 1.0f; // Scene brightened -> exposure falling.
+inline float EXPOSURE_ADAPTATION_SPEED_UP_EV_PER_SEC = 3.0f;   // Scene darkened -> exposure rising. (UE5.8 default.)
+inline float EXPOSURE_ADAPTATION_SPEED_DOWN_EV_PER_SEC = 1.0f; // Scene brightened -> exposure falling. (UE5.8 default.)
+// UE5.8's own Auto Exposure Histogram "Low Percent"/"High Percent" defaults -- see
+// AutoExposureAdapt.comp's own comment for exactly how these trim the metering average.
+inline float EXPOSURE_HISTOGRAM_LOW_PERCENT = 80.0f;
+inline float EXPOSURE_HISTOGRAM_HIGH_PERCENT = 98.3f;
 
 // White Balance
 inline float WHITE_BALANCE_TEMP_KELVIN = 6500.0f;  // 6500 = neutral (D65).

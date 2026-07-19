@@ -3,10 +3,12 @@
 
 // Stage 2/3 of renderer::PostProcessPass's exposure pipeline (Phase PP1, post-process stack
 // roadmap). Single workgroup, 256 threads (one per histogram bin, matching AutoExposureHistogram
-// .comp's bin count exactly): parallel-reduces g_Histogram into a sample-count-weighted mean bin
-// index (bin 0, the "near black" bucket, contributes zero weight by construction -- see
-// AutoExposureHistogram.comp's own comment), converts that back to average scene luminance, derives
-// this frame's target EV100 (Auto Exposure Histogram metering, replicating Unreal Engine's own
+// .comp's bin count exactly): reduces g_Histogram into a PERCENTILE-TRIMMED sample-count-weighted
+// mean bin index (bin 0, the "near black" bucket, contributes zero weight by construction -- see
+// AutoExposureHistogram.comp's own comment; bins below `histogramLowPercent`% or above
+// `histogramHighPercent`% of the remaining cumulative population are ALSO excluded -- see the
+// per-bin trim loop below), converts that back to average scene luminance, derives this frame's
+// target EV100 (Auto Exposure Histogram metering, replicating Unreal Engine's own
 // `EV100 = log2(avgLuminance * 100 / K)` calibration with K=12.5, the standard reflected-light-
 // meter constant) OR takes the Physical-Camera manual EV100 computed CPU-side in
 // renderer::PostProcessPass::RecordComposite() (aperture/shutter/ISO -- cheap scalar math, not
@@ -17,6 +19,20 @@
 // adaptation lag). Also clears g_Histogram.bins back to zero for next frame's
 // AutoExposureHistogram.comp run (see that shader's own comment for why it needs no separate
 // clear step of its own).
+//
+// Percentile trim (Task F11, 2026-07-19): matches Unreal Engine 5.8's own Auto Exposure Histogram
+// "Low Percent"/"High Percent" defaults (80 / 98.3) -- only the middle slice of the histogram's
+// CUMULATIVE population (by pixel count, not by luminance bin) feeds the weighted mean. This
+// trims two failure modes a raw whole-histogram average is vulnerable to: (1) a scene with a lot
+// of on-screen shadow/dark background area pulling exposure up even though the actual subject
+// matter is well-lit, and (2) a small number of very bright pixels (specular highlights, the sun
+// disk, or -- the specific case this project hit before Task F11 -- renderer::MegaLightsPass's
+// own residual per-pixel ReSTIR noise/fireflies, see EXPOSURE_USE_AUTO's own EngineConfig.h
+// comment) dragging the mean, and therefore the metered exposure, around frame-to-frame even
+// though the true "average scene brightness" barely changed. The single-thread serial scan below
+// (thread 0 only, 255 iterations over already-workgroup-local `sBinCounts`) is negligible cost at
+// this dispatch(1,1,1) scale -- correctness/readability was prioritized over further
+// parallelizing an already-cheap once-per-frame reduction.
 
 layout(local_size_x = 256) in;
 
@@ -39,31 +55,65 @@ layout(push_constant) uniform PC {
     float exposureCompensationEV;
     float manualEV100;         // CPU-computed from Physical Camera aperture/shutter/ISO.
     uint useAutoExposure;      // 0 = Manual (instant), nonzero = Auto Exposure Histogram (adapted).
+    float histogramLowPercent;  // UE-style: trim the darkest [0, histogramLowPercent]% of the population.
+    float histogramHighPercent; // UE-style: trim the brightest (100-histogramHighPercent]% of the population.
 } pc;
 
-shared uint sWeightedSum[256];
+shared uint sBinCounts[256];
 shared uint sBin0Count;
 
 void main() {
     uint i = gl_LocalInvocationIndex;
     uint countForThisBin = g_Histogram.bins[i];
+    sBinCounts[i] = countForThisBin;
     if (i == 0u) {
         sBin0Count = countForThisBin;
     }
-    sWeightedSum[i] = countForThisBin * i;
     g_Histogram.bins[i] = 0u; // Cleared here so AutoExposureHistogram.comp needs no clear of its own.
     barrier();
 
-    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
-        if (i < stride) {
-            sWeightedSum[i] += sWeightedSum[i + stride];
-        }
-        barrier();
-    }
-
+    // Single-thread serial reduction (see this file's own header comment for why this is fine at
+    // this dispatch(1,1,1)/256-bin scale): every other invocation in this workgroup only exists to
+    // cooperatively fill sBinCounts[] above via the barrier() -- from here on, thread 0 alone
+    // computes the percentile-trimmed weighted mean and writes the persisted exposure state.
     if (i == 0u) {
         float totalNonBlack = max(pc.pixelCount - float(sBin0Count), 1.0);
-        float meanBin = float(sWeightedSum[0]) / totalNonBlack; // Weighted mean bin index, [1..255] range.
+        float lowThreshold = totalNonBlack * clamp(pc.histogramLowPercent, 0.0, 100.0) * 0.01;
+        float highThreshold = totalNonBlack * clamp(pc.histogramHighPercent, 0.0, 100.0) * 0.01;
+
+        // Fractional-overlap trim: each bin's count is clipped to however much of it falls inside
+        // [lowThreshold, highThreshold] of the CUMULATIVE (bin 0 excluded) population, so the trim
+        // boundary doesn't jump a whole bin's worth of weight at once frame-to-frame as the
+        // histogram's shape shifts slightly -- a smoother, less flicker-prone cut than a hard
+        // per-bin threshold would give.
+        float cumulative = 0.0;
+        float weightedSum = 0.0;
+        float trimmedCount = 0.0;
+        for (uint bin = 1u; bin < 256u; ++bin) {
+            float binCount = float(sBinCounts[bin]);
+            float cumulativeBefore = cumulative;
+            cumulative += binCount;
+            float rangeLo = max(cumulativeBefore, lowThreshold);
+            float rangeHi = min(cumulative, highThreshold);
+            float countInRange = max(rangeHi - rangeLo, 0.0);
+            weightedSum += countInRange * float(bin);
+            trimmedCount += countInRange;
+        }
+
+        // Degenerate guard: an extreme/misconfigured percentile pair (or a near-uniform histogram)
+        // could trim every bin to zero weight -- fall back to the untrimmed weighted mean instead
+        // of dividing by zero / freezing exposure.
+        float meanBin;
+        if (trimmedCount > 0.5) {
+            meanBin = weightedSum / trimmedCount;
+        } else {
+            float fullWeightedSum = 0.0;
+            for (uint bin = 1u; bin < 256u; ++bin) {
+                fullWeightedSum += float(sBinCounts[bin]) * float(bin);
+            }
+            meanBin = fullWeightedSum / totalNonBlack;
+        }
+
         float logLum = ((meanBin - 1.0) / 254.0) * pc.logLuminanceRange + pc.minLogLuminance;
         float avgLuminance = exp2(logLum);
 
