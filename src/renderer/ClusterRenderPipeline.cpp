@@ -2825,9 +2825,11 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
   // next frame -- identical one-frame-lag placement to m_VirtualShadowMap.RecordEndFrame() above.
   m_VTStreaming.RecordEndFrame(cmdLate);
 
-  // [12b] Screen Trace GI (Lumen Screen Trace + World Probe fallback): traces linear screen-space
-  // rays against the GBuffer depth/normal, falling back to the 3D world probe grid on miss.
-  // Writes to its own dedicated output image (m_ScreenTrace.GetOutputImage()).
+  // [12b] Screen Trace GI (Lumen Screen Trace + World Probe fallback/primary -- see F1's own
+  // GIMode switch): in GIMode::HighQuality, traces linear screen-space rays against the GBuffer
+  // depth/normal, falling back to the multi-level world probe grid on miss; in GIMode::Lite, skips
+  // the march and samples the probe grid directly as this pixel's own GI term. Writes to its own
+  // dedicated output image (m_ScreenTrace.GetOutputImage()).
   // =========================================================================================
   {
 #ifndef NDEBUG
@@ -2836,7 +2838,7 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
     bool ssrtEnabled = true;
 #endif
     if (ssrtEnabled) {
-      m_ScreenTrace.RecordTrace(cmdLate, cameraCopy, cameraPositionWorld, m_WorldProbes.GetGridOriginWorld(), m_FrameIndex);
+      m_ScreenTrace.RecordTrace(cmdLate, cameraCopy, cameraPositionWorld, m_WorldProbes, m_FrameIndex, config::lumen::GI_MODE);
     } else {
       VkClearColorValue blackClear{};
       blackClear.float32[0] = 0.0f;
@@ -2935,22 +2937,19 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
   }
 
   // =========================================================================================
-  // [12c] World Probe grid: fully rebuilt every frame from the Surface Cache radiance atlas
-  // [1z] already re-injected into this frame ("Propagate Surface Cache lighting directly
-  // into this 3D grid at each frame") -- INTENDED as what dynamic/off-screen objects would
-  // sample for indirect light (world_probe_sampling.glsl's SampleWorldProbeGrid) -- also the
-  // fallback m_ScreenTrace itself samples on a screen-space march miss, since a screen-space march
-  // only ever sees on-screen pixels. Independent GPU work
-  // from [12b] above (no data dependency either way), just recorded after it for locality with
-  // the rest of this frame's GI additions.
+  // [12c] World Probe grid: F1's own multi-level clipmap (renderer::WorldProbeGridPass::kLevelCount
+  // levels), incrementally streamed every frame from the Surface Cache radiance atlas [1z] already
+  // re-injected this frame -- sampled every frame by m_ScreenTrace, either as its screen-space
+  // march's miss fallback (config::lumen::GIMode::HighQuality) or as the PRIMARY GI term with the
+  // march skipped entirely (GIMode::Lite -- see ScreenTrace.comp's own giMode branch), plus,
+  // Debug-only, m_GIComposite's DEBUG_VIEW_SPATIAL_PROBES visualization. Independent GPU work from
+  // [12b] above (no data dependency either way), just recorded after it for locality with the rest
+  // of this frame's GI additions.
   //
   // `worldProbesEnabled` (debug-only toggle, main.cpp's 'H' key) gates this dispatch entirely --
-  // see SetDebugWorldProbesEnabled()'s own comment. UNLIKE radiosityEnabled/ssrtEnabled above,
-  // this system has no live consumer yet (SampleWorldProbeGrid() is called only by the dead
-  // ScreenTracePass/GICompositePass, per the 2026-07-16 UE5.8-parity audit) -- so Release
-  // hardcodes this OFF instead of ON, skipping the dispatch (and its trailing barrier, since
-  // nothing this frame reads the grid either way) rather than paying its GPU cost for zero visual
-  // effect. Flip Release's hardcoded default once a real consumer samples this grid.
+  // see SetDebugWorldProbesEnabled()'s own comment. This system is a live, load-bearing consumer in
+  // BOTH GI modes (Lite mode's own primary GI term, HighQuality mode's own fallback) -- Release
+  // hardcodes this ON unconditionally, matching that.
   // =========================================================================================
 #ifndef NDEBUG
   bool worldProbesEnabled = m_DebugWorldProbesEnabled;
@@ -2998,7 +2997,7 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
   // =========================================================================================
   m_GIComposite.RecordComposite(cmdLate
 #ifndef NDEBUG
-      , cameraCopy, cameraPositionWorld, m_WorldProbes.GetGridOriginWorld()
+      , cameraCopy, cameraPositionWorld, m_WorldProbes
 #endif
   );
 
@@ -3181,11 +3180,12 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
     // SDFRayMarchPass::RecordRayMarch already use; forward (D5) is simply cameraFrameInfo.forward
     // itself, already tracked.
     //
-    // Niagara-parity render-integration roadmap: `m_SceneLights` (D3 point lights) and
-    // `m_WorldProbes.GetGridOriginWorld()` (D6 fix -- this frame's CURRENT toroidal-recenter origin,
-    // not a stale Init()-time snapshot) and `m_FrameIndex` (D1 MegaLights RIS decorrelation) are all
-    // already tracked/available at this call site, same values every other consumer below/above
-    // already reads.
+    // Niagara-parity render-integration roadmap: `m_SceneLights` (D3 point lights) and `m_WorldProbes`
+    // itself (D6 fix -- F1 "Lumen Lite" passes the whole pass now, not a single stale-snapshot
+    // origin, so ParticleSystemPass::RecordDraw can read every clipmap level's own CURRENT
+    // toroidal-recenter origin) and `m_FrameIndex` (D1 MegaLights RIS decorrelation) are all already
+    // tracked/available at this call site, same values every other consumer below/above already
+    // reads.
     {
       const maths::vec3 worldUpHint{0.0f, 1.0f, 0.0f};
       const maths::vec3 particleCameraRight = cameraFrameInfo.forward.Cross(worldUpHint).Normalize();
@@ -3195,7 +3195,7 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
           m_TransparentForward.GetRefractionOffsetView(), m_RenderExtent,
           viewProj, cameraFrameInfo.position, particleCameraRight, particleCameraUp, cameraFrameInfo.forward,
           m_SceneLights.sun.direction, m_SceneLights.sun.color, m_SceneLights.sun.intensity,
-          m_SceneLights, m_WorldProbes.GetGridOriginWorld(),
+          m_SceneLights, m_WorldProbes,
           config::particles::SOFT_FADE_DISTANCE, particleHeatShimmerStrength, globalTimeSeconds, m_FrameIndex);
     }
 
@@ -3449,6 +3449,7 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
     m_DebugOverlay.BuildFrameText(gpuMemUsedMB, pendingPageLoads, bytesPerSecond, hwTriangleCount, swTriangleCount,
         fps, static_cast<float>(m_RenderExtent.width), static_cast<float>(m_RenderExtent.height),
         m_DebugRadiosityEnabled, m_DebugSSRTEnabled, traceMode, m_DebugWorldProbesEnabled,
+        static_cast<uint32_t>(config::lumen::GI_MODE),
         m_ParticleSystem.GetLastAliveCountApprox(), ParticleSystemPass::kMaxParticles);
 
     // Determine blitSourceImage early to draw HUD directly onto it -- m_PostProcess's own output

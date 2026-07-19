@@ -88,7 +88,7 @@ void main() {
     // Direct sun (VSM-shadowed) + indirect diffuse (World Probe Grid).
     float sunVisibility = SampleSunShadowVSM(inWorldPos);
     vec3 sunLight = g_Params.sunColor * g_Params.sunIntensity * sunVisibility;
-    vec3 indirectDiffuse = SampleWorldProbeGrid(inWorldPos);
+    vec3 indirectDiffuse = SampleWorldProbeGrid(inWorldPos, g_Params.cameraPos);
 
     // Root-to-tip density AO (see this file's own header comment): the cheap self-shadow stand-in.
     float rootAO = mix(clamp(g_Params.rootDarken, 0.0, 1.0), 1.0, inStrandT);

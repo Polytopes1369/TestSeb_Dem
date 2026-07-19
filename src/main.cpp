@@ -1088,6 +1088,19 @@ int main(int argc, char** argv) {
 
             // --- Tab Lumen ---
             if (ImGui::BeginTabItem("Lumen")) {
+                // F1 ("Lumen Lite", UE5.8 parity roadmap): GI quality mode -- HighQuality is this
+                // codebase's pre-F1 per-pixel Screen Trace + probe-fallback path (F9: upgraded to
+                // real Lumen's own Screen Probe Gather near-field term); Lite is the new probe-
+                // grid-PRIMARY irradiance-field gather with the per-pixel march skipped entirely --
+                // see config::lumen::GI_MODE's own comment and ScreenTrace.comp's giMode branch.
+                // A/B this against the WORLDPROBES/SSRT line in the always-on debug text HUD
+                // (renderer::debug::DebugTextOverlay) and the top-right FPS counter for the ~2x
+                // faster claim UE5.8's own Lumen Lite makes over High Quality.
+                int giModeIdx = static_cast<int>(config::lumen::GI_MODE);
+                if (ImGui::Combo("GI Mode", &giModeIdx, "High Quality\0Lite\0\0")) {
+                    config::lumen::GI_MODE = static_cast<config::lumen::GIMode>(giModeIdx);
+                }
+                ImGui::Separator();
                 int budget = static_cast<int>(config::lumen::CARDS_PER_FRAME_BUDGET);
                 if (ImGui::DragInt("Cards Frame Budget", &budget, 1, 1, 128)) {
                     config::lumen::CARDS_PER_FRAME_BUDGET = static_cast<uint32_t>(budget);

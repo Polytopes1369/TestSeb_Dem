@@ -77,7 +77,7 @@ void main() {
     float sunVisibility = SampleSunShadowVSM(inWorldPos);
     vec3 sunRadiance = g_Params.sunColor * g_Params.sunIntensity * NdotL * sunVisibility;
 
-    vec3 indirectDiffuse = SampleWorldProbeGrid(inWorldPos);
+    vec3 indirectDiffuse = SampleWorldProbeGrid(inWorldPos, g_Params.cameraPos);
 
     // A small ambient floor keeps foliage sitting in full shadow with no nearby probe coverage from
     // crushing to pure black (same convention ParticleRender.frag uses).
