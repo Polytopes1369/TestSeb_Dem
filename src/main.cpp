@@ -1295,6 +1295,21 @@ int main(int argc, char** argv) {
                 ImGui::Checkbox("White Balance", &config::postprocess::WHITE_BALANCE_ENABLED);
                 ImGui::Checkbox("Color Correction", &config::postprocess::COLOR_CORRECTION_ENABLED);
                 ImGui::Checkbox("Depth of Field", &config::postprocess::DOF_ENABLED);
+                // UE5.8-parity "Accumulation Depth of Field" -- live A/B toggle between the original
+                // single-frame 16-tap Poisson gather (DepthOfFieldPass) and the new cinematic,
+                // path-tracer-like per-frame single-lens-sample temporal accumulation
+                // (DepthOfFieldAccumulationPass) -- see that class' own header comment. Only
+                // meaningful while "Depth of Field" above is checked (DOF_ENABLED zeroes the CoC for
+                // whichever mode is active, same convention as every other *_ENABLED toggle here).
+                ImGui::Indent();
+                ImGui::Combo("DOF Mode", &config::postprocess::DOF_MODE, "Gather\0Accumulation (UE5.8)\0\0");
+                if (config::postprocess::DOF_MODE != 0) {
+                    ImGui::SliderFloat("Accumulation Max Samples", &config::postprocess::DOF_ACCUMULATION_MAX_SAMPLES, 4.0f, 256.0f);
+                    ImGui::TextDisabled("Frames since last reset: %u", clusterPipeline.GetDOFAccumulationFramesSinceReset());
+                    ImGui::TextWrapped("Converges toward path-traced-quality bokeh while the camera is stationary; "
+                        "falls back toward Gather-mode quality under motion/disocclusion.");
+                }
+                ImGui::Unindent();
                 ImGui::Checkbox("Ambient Occlusion (GTAO)", &config::postprocess::AO_ENABLED);
                 ImGui::Checkbox("Contact Shadows", &config::postprocess::CONTACT_SHADOW_ENABLED);
                 ImGui::Checkbox("SSR Fallback", &config::postprocess::SSR_FALLBACK_ENABLED);
