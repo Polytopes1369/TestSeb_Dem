@@ -265,7 +265,7 @@ namespace renderer::debug {
     void DebugTextOverlay::BuildFrameText(float gpuMemUsedMB, uint32_t pendingPageLoads, float bytesPerSecond,
         uint32_t hwTriangleCount, uint32_t swTriangleCount, float fps, float viewportWidthPixels, float viewportHeightPixels,
         bool radiosityEnabled, bool ssrtEnabled, uint32_t traceMode, bool worldProbesEnabled, uint32_t giMode,
-        uint32_t aliveParticleCount, uint32_t maxParticleCount) {
+        uint32_t worldProbePendingSlabs, uint32_t aliveParticleCount, uint32_t maxParticleCount) {
         m_PendingGlyphs.clear();
 
         constexpr float kMarginX = 8.0f;
@@ -282,12 +282,21 @@ namespace renderer::debug {
             radiosityEnabled ? "ON" : "OFF", ssrtEnabled ? "ON" : "OFF", traceMode == 0u ? "SWRT" : "HWRT",
             giMode == 0u ? "HQ" : "LITE"),
             kMarginX, y); y += kLineHeight;
-        // F1 ("Lumen Lite", UE5.8 parity roadmap): WORLDPROBES is now a live, load-bearing consumer
-        // in BOTH GI modes (Lite mode's own PRIMARY term, HighQuality mode's own screen-trace-miss
-        // fallback) -- see renderer::WorldProbeGridPass.h's own class comment. No longer "not yet
-        // sampled" (that was true pre-F1, before the ScreenTracePass/GICompositePass integration).
-        AppendLine(std::format("WORLDPROBES={} ({} levels)", worldProbesEnabled ? "ON" : "OFF", renderer::WorldProbeGridPass::kLevelCount),
-            kMarginX, y); y += kLineHeight;
+        // F1 ("Lumen Lite"): WORLDPROBES is a live, load-bearing consumer in BOTH GI modes (Lite
+        // mode's own PRIMARY term, HighQuality mode's own screen-trace-miss fallback) -- see
+        // renderer::WorldProbeGridPass.h's own class comment. The line also reports real build
+        // state: READY = every probe in every level's covered window is traced, BUILDING = that
+        // many dirty slabs still queued (first-frame full-volume builds, a large camera jump's
+        // backlog, or a requested full re-trace -- see WorldProbeGridPass::RequestFullRetrace).
+        if (worldProbePendingSlabs > 0u) {
+            AppendLine(std::format("WORLDPROBES={} ({} levels) BUILDING ({} SLABS)",
+                worldProbesEnabled ? "ON" : "OFF", renderer::WorldProbeGridPass::kLevelCount, worldProbePendingSlabs),
+                kMarginX, y); y += kLineHeight;
+        } else {
+            AppendLine(std::format("WORLDPROBES={} ({} levels) READY",
+                worldProbesEnabled ? "ON" : "OFF", renderer::WorldProbeGridPass::kLevelCount),
+                kMarginX, y); y += kLineHeight;
+        }
         AppendLine(std::format("GPU PARTICLES: {}/{}", aliveParticleCount, maxParticleCount), kMarginX, y); y += kLineHeight;
 
         // Bottom-left profile name overlay (e.g. low, medium, high)

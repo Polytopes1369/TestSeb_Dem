@@ -3276,6 +3276,12 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
   // see SetDebugWorldProbesEnabled()'s own comment. This system is a live, load-bearing consumer in
   // BOTH GI modes (Lite mode's own primary GI term, HighQuality mode's own fallback) -- Release
   // hardcodes this ON unconditionally, matching that.
+  // Build timing: each level's very FIRST RecordUpdate() call enqueues its entire grid volume as
+  // one dirty slab (ClipmapLevel::hasValidWindow starts false) and the shared drain budget covers
+  // them all within the first call(s) -- but each probe is traced against whatever the Surface
+  // Cache has captured BY then (it fills at CARDS_PER_FRAME_BUDGET cards/frame), and a probe is
+  // only ever re-traced when camera motion reveals it anew. See RequestDebugWorldProbeRetrace()
+  // for the manual full re-trace this implies wanting once the cache has finished warming.
   // =========================================================================================
 #ifndef NDEBUG
   bool worldProbesEnabled = m_DebugWorldProbesEnabled;
@@ -3946,7 +3952,7 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
     m_DebugOverlay.BuildFrameText(gpuMemUsedMB, pendingPageLoads, bytesPerSecond, hwTriangleCount, swTriangleCount,
         fps, static_cast<float>(m_RenderExtent.width), static_cast<float>(m_RenderExtent.height),
         m_DebugRadiosityEnabled, m_DebugSSRTEnabled, traceMode, m_DebugWorldProbesEnabled,
-        static_cast<uint32_t>(config::lumen::GI_MODE),
+        static_cast<uint32_t>(config::lumen::GI_MODE), m_WorldProbes.GetPendingSlabCount(),
         m_ParticleSystem.GetLastAliveCountApprox(), ParticleSystemPass::kMaxParticles);
 
     // Determine blitSourceImage early to draw HUD directly onto it -- m_PostProcess's own output

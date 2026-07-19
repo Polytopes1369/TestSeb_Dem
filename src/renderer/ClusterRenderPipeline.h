@@ -503,6 +503,13 @@ namespace renderer {
         // defaults to true too, purely for A/B cost comparison via this toggle.
         void SetDebugWorldProbesEnabled(bool enabled) { m_DebugWorldProbesEnabled = enabled; }
 
+        // Forces m_WorldProbes' next RecordUpdate() to re-trace its ENTIRE grid against the
+        // current Surface Cache contents -- see WorldProbeGridPass::RequestFullRetrace()'s own
+        // comment for why that matters (frame-1 probes traced against a cold cache otherwise stay
+        // stale forever under a static camera). Driven by main.cpp's ImGui "Rebuild World Probes"
+        // button, same one-shot request pattern as RequestDebugDAGCutGapsDump().
+        void RequestDebugWorldProbeRetrace() { m_WorldProbes.RequestFullRetrace(); }
+
         // Independently gates RecordFrame()'s [12b2] m_Reflection RecordTrace/RecordTemporal/
         // RecordGather trio -- see main.cpp's 'R' key. Like SetDebugWorldProbesEnabled above, this
         // pass has a real live consumer from its very first frame (m_Resolve's own output color

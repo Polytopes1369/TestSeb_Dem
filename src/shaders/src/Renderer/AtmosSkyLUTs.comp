@@ -313,10 +313,20 @@ void ComputeSkyViewLUT(ivec2 pixel) {
         // Single scattering (direct sun, phase-weighted) + isotropic multi-scattering (already
         // integrated over all directions by ComputeMultiScatteringLUT -- no phase weighting needed,
         // matches Hillaire's own convention of treating multi-scatter as directionally uniform).
+        // `multiScatterContribution` (sampled from the Multi-Scattering LUT, mode 1 above) ALREADY
+        // has pc.sunIlluminance baked in -- that bake pass' own `inscatter` term multiplies by it
+        // once per step before the closed-form geometric series is applied and the result stored.
+        // Re-multiplying the combined (singleScatter + multiScatter) sum by pc.sunIlluminance below
+        // would therefore scale the multi-scatter term by sunIlluminance TWICE (sunIlluminance^2) --
+        // at this engine's real-photometric sun (10,000 lux, see LightingTypes.h's own recalibration
+        // comment), that squared an already-large multi-scatter contribution into one comprehensively
+        // overwhelming every other term, saturating every channel toward flat white and erasing the
+        // Rayleigh blue/red differential that gives the sky its color. singleScatter, by contrast,
+        // was never pre-scaled, so it still needs its own single multiplication here.
         vec3 singleScatter = (rayleighScatter * rayleighPhaseValue + vec3(mieScatter * miePhaseValue)) * sunTransmittance;
         vec3 multiScatter = (rayleighScatter + vec3(mieScatter)) * multiScatterContribution;
 
-        radiance += throughput * (singleScatter + multiScatter) * pc.sunIlluminance * stepSize;
+        radiance += throughput * (singleScatter * pc.sunIlluminance + multiScatter) * stepSize;
         throughput *= stepTransmittance;
     }
 

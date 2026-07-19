@@ -170,6 +170,26 @@ namespace renderer {
         VkImageView GetGridView(uint32_t level) const { return m_Levels[level].gridView; }
         VkImageView GetOcclusionView(uint32_t level) const { return m_Levels[level].occlusionView; }
         VkSampler GetGridSampler() const { return m_GridSampler; }
+
+        // Forces the next RecordUpdate() call to re-enqueue EVERY level's entire grid volume as
+        // dirty (exactly like each level's very first call ever, see ClipmapLevel::hasValidWindow's
+        // own comment), re-tracing every probe against the CURRENT Surface Cache contents. Exists
+        // because the incremental toroidal streaming above only ever re-traces probes newly
+        // revealed by camera motion -- a probe traced on frame 1 against a still-cold, partially-
+        // captured Surface Cache keeps that stale irradiance indefinitely under a static camera.
+        // Driven by the ImGui "Rebuild World Probes" button (main.cpp's Lumen tab, Debug-only).
+        void RequestFullRetrace() {
+            for (ClipmapLevel& level : m_Levels) {
+                level.hasValidWindow = false;
+            }
+        }
+
+        // How many dirty slabs (across every level -- m_PendingSlabs is one shared queue) are
+        // still queued after the most recent RecordUpdate() call (0 = every probe in every level's
+        // covered window has been traced) -- feeds the Debug overlay's WORLDPROBES status line so
+        // the on-screen text reflects real state instead of a hardcoded label.
+        uint32_t GetPendingSlabCount() const { return static_cast<uint32_t>(m_PendingSlabs.size()); }
+
         // The world-space MINIMUM corner of `level`'s CURRENTLY COVERED WINDOW (i.e.
         // `snappedCenterProbe * GetLevelSpacing(level) - halfExtent`), as of the most recent
         // RecordUpdate() call -- NOT necessarily where texel (0,0,0) physically lives anymore (that
