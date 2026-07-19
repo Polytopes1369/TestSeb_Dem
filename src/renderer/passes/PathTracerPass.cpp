@@ -1,4 +1,4 @@
-// UE5.8 rendering-parity gap G10b -- reference Path Tracer pass implementation. The ENTIRE file is
+﻿// UE5.8 rendering-parity gap G10b -- reference Path Tracer pass implementation. The ENTIRE file is
 // wrapped in #ifndef NDEBUG (CLAUDE.md rule 8, "modes de visualisation" excluded from Release): in a
 // Release build this compiles to an empty translation unit -- zero code / symbols survive. See
 // PathTracerPass.h's own header comment for the full rationale.
@@ -282,7 +282,7 @@ namespace renderer {
         // NEE shadow rays use inline rayQueryEXT, which does not count toward pipeline recursion.
         rtPipelineInfo.maxPipelineRayRecursionDepth = 1;
         rtPipelineInfo.layout = m_TracePipelineLayout;
-        VK_CHECK(g_RTFunctions.vkCreateRayTracingPipelinesKHR(m_Device, VK_NULL_HANDLE, VK_NULL_HANDLE, 1, &rtPipelineInfo, nullptr, &m_TracePipeline));
+        VK_CHECK(g_RTFunctions.vkCreateRayTracingPipelinesKHR(m_Device, VK_NULL_HANDLE, VulkanPipeline::GetPipelineCache(), 1, &rtPipelineInfo, nullptr, &m_TracePipeline));
 
         vkDestroyShaderModule(m_Device, rgenModule, nullptr);
         vkDestroyShaderModule(m_Device, missModule, nullptr);

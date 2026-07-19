@@ -1,4 +1,4 @@
-#include "renderer/passes/TessellationPass.h"
+﻿#include "renderer/passes/TessellationPass.h"
 
 #include <array>
 #include <cstring>
@@ -359,7 +359,7 @@ namespace renderer {
         pipelineInfo.layout = m_PipelineLayout;
         pipelineInfo.pNext = &pipelineRendering;
 
-        VK_CHECK(vkCreateGraphicsPipelines(m_Device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_Pipeline));
+        VK_CHECK(vkCreateGraphicsPipelines(m_Device, VulkanPipeline::GetPipelineCache(), 1, &pipelineInfo, nullptr, &m_Pipeline));
         RegisterResource([this] { vkDestroyPipeline(m_Device, m_Pipeline, nullptr); m_Pipeline = VK_NULL_HANDLE; });
 
         vkDestroyShaderModule(m_Device, vertModule, nullptr);
