@@ -1261,6 +1261,28 @@ int main(int argc, char** argv) {
             // own *_ENABLED block comment for how each toggle actually takes effect) ---
             if (ImGui::BeginTabItem("Post FX")) {
                 ImGui::Checkbox("Bloom", &config::postprocess::BLOOM_ENABLED);
+                // F13: Lens Flare (Ghosts + Halo) + Anamorphic Streak -- independent of the "Bloom"
+                // checkbox above (BLOOM_ENABLED gates only the base glow bleed; this gates only the
+                // ghost/halo/streak terms baked into the same renderer::BloomPass output -- see
+                // config::postprocess::LENS_FLARE_ENABLED's own comment). Toggling this off alone
+                // still leaves plain bloom visible; toggling "Bloom" off removes everything
+                // (including flares) since the whole shared mip-chain output is zeroed downstream.
+                ImGui::Checkbox("Lens Flare (Ghosts/Halo)", &config::postprocess::LENS_FLARE_ENABLED);
+                if (config::postprocess::LENS_FLARE_ENABLED) {
+                    ImGui::Indent();
+                    ImGui::SliderFloat("Ghost Intensity", &config::postprocess::LENS_FLARE_GHOST_INTENSITY, 0.0f, 2.0f);
+                    int ghostCount = static_cast<int>(config::postprocess::LENS_FLARE_GHOST_COUNT);
+                    if (ImGui::SliderInt("Ghost Count", &ghostCount, 1, 8)) {
+                        config::postprocess::LENS_FLARE_GHOST_COUNT = static_cast<uint32_t>(ghostCount);
+                    }
+                    ImGui::SliderFloat("Ghost Spacing", &config::postprocess::LENS_FLARE_GHOST_SPACING, 0.0f, 2.0f);
+                    ImGui::SliderFloat("Halo Intensity", &config::postprocess::HALO_INTENSITY, 0.0f, 2.0f);
+                    ImGui::SliderFloat("Halo Width", &config::postprocess::HALO_WIDTH, 0.0f, 1.0f);
+                    ImGui::SliderFloat("Chromatic Shift", &config::postprocess::LENS_FLARE_CHROMATIC_SHIFT, 0.0f, 0.05f);
+                    ImGui::SliderFloat("Anamorphic Streak Intensity", &config::postprocess::ANAMORPHIC_FLARE_INTENSITY, 0.0f, 1.0f);
+                    ImGui::SliderFloat("Anamorphic Streak Stretch", &config::postprocess::ANAMORPHIC_FLARE_STRETCH, 0.0f, 0.5f);
+                    ImGui::Unindent();
+                }
                 ImGui::Checkbox("Chromatic Aberration", &config::postprocess::CHROMATIC_ABERRATION_ENABLED);
                 ImGui::Checkbox("Vignette", &config::postprocess::VIGNETTE_ENABLED);
                 ImGui::Checkbox("Heat Distortion", &config::postprocess::HEAT_DISTORTION_ENABLED);

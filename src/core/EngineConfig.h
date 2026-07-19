@@ -273,10 +273,28 @@ inline float BLOOM_SOFT_KNEE = 0.5f;
 inline float BLOOM_INTENSITY = 1.0f;
 inline float BLOOM_UPSAMPLE_RADIUS = 1.0f;
 
-// Lens Flare (procedural radial ghosts, no texture asset)
+// Lens Flare (procedural radial ghosts, no texture asset). Shares BLOOM_THRESHOLD as its own
+// bright-pass threshold rather than a separate knob -- the ghost chain samples
+// renderer::BloomPass's own downsample chain (kFlareSourceMip), the SAME already-thresholded
+// bright-pass BLOOM_THRESHOLD produces, so a second threshold would just re-extract brights the
+// pass already extracted once (see BloomPass.h's own class comment for why that double work is
+// deliberately avoided).
 inline float LENS_FLARE_GHOST_INTENSITY = 0.3f;
 inline uint32_t LENS_FLARE_GHOST_COUNT = 4u;
 inline float LENS_FLARE_GHOST_SPACING = 1.0f;
+
+// Halo: a single fixed-radius ring sample along the same source-to-center line the ghost chain
+// walks (see BloomUpsampleComposite.comp's own SampleHalo comment) -- the other classic image-
+// based lens-flare element alongside the ghost chain (UE5.8's own Bloom settings expose "Ghosts"
+// and "Halo" as two distinct knobs; this project's single dual-filter mip chain produces both).
+inline float HALO_INTENSITY = 0.12f;
+inline float HALO_WIDTH = 0.45f;  // UV-space radius from screen center, opposite side from the source.
+
+// Per-ghost/halo chromatic shift: a small per-channel RADIAL UV split applied at each ghost/halo
+// sample (real lens ghosting separates color slightly per internal reflection/incidence angle) --
+// distinct from CHROMATIC_ABERRATION_INTENSITY below, which aberrates the base scene capture
+// itself, not the flare/ghost samples.
+inline float LENS_FLARE_CHROMATIC_SHIFT = 0.008f;
 
 // Anamorphic Lens Flare (procedural horizontal streak, no texture asset)
 inline float ANAMORPHIC_FLARE_INTENSITY = 0.15f;
@@ -373,6 +391,13 @@ inline float FILM_GRAIN_RESPONSE_MIDPOINT = 0.5f;
 // every shader with a redundant enabled/disabled branch. Not wired into ApplyProfile() (these are
 // live debug/comparison switches, not a hardware-quality tier).
 inline bool BLOOM_ENABLED = true;
+// Separate from BLOOM_ENABLED: zeroes only the ghost/halo/anamorphic-streak terms at the
+// RecordGenerate call site (ClusterRenderPipeline.cpp), leaving the base bloom glow itself under
+// BLOOM_ENABLED's own independent control -- matches UE5.8, where "Lens Flares" is its own Bloom
+// sub-toggle distinct from the base bloom bleed. Lens Dirt needs no separate gate here: its own
+// mask (BloomUpsampleComposite.comp) only ever attenuates the ghost+streak+halo term, so it is
+// already a visual no-op once this toggle zeroes that term.
+inline bool LENS_FLARE_ENABLED = true;
 inline bool CHROMATIC_ABERRATION_ENABLED = true;
 inline bool VIGNETTE_ENABLED = true;
 inline bool HEAT_DISTORTION_ENABLED = true;

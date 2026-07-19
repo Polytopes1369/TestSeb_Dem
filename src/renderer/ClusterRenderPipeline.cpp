@@ -3603,10 +3603,18 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
       bloomSettings.threshold = config::postprocess::BLOOM_THRESHOLD;
       bloomSettings.softKnee = config::postprocess::BLOOM_SOFT_KNEE;
       bloomSettings.upsampleRadius = config::postprocess::BLOOM_UPSAMPLE_RADIUS;
-      bloomSettings.ghostIntensity = config::postprocess::LENS_FLARE_GHOST_INTENSITY;
+      // LENS_FLARE_ENABLED gates only the ghost/halo/anamorphic-streak terms (real-time "Post FX"
+      // toggle, ImGui, main.cpp) -- independent of BLOOM_ENABLED's own base-glow gate below. Lens
+      // Dirt needs no separate gate: BloomUpsampleComposite.comp's own dirt mask only ever
+      // attenuates this same ghost+streak+halo term, so it is already a no-op once zeroed here.
+      const bool lensFlareOn = config::postprocess::LENS_FLARE_ENABLED;
+      bloomSettings.ghostIntensity = lensFlareOn ? config::postprocess::LENS_FLARE_GHOST_INTENSITY : 0.0f;
       bloomSettings.ghostCount = config::postprocess::LENS_FLARE_GHOST_COUNT;
       bloomSettings.ghostSpacing = config::postprocess::LENS_FLARE_GHOST_SPACING;
-      bloomSettings.anamorphicIntensity = config::postprocess::ANAMORPHIC_FLARE_INTENSITY;
+      bloomSettings.haloIntensity = lensFlareOn ? config::postprocess::HALO_INTENSITY : 0.0f;
+      bloomSettings.haloWidth = config::postprocess::HALO_WIDTH;
+      bloomSettings.chromaticShift = config::postprocess::LENS_FLARE_CHROMATIC_SHIFT;
+      bloomSettings.anamorphicIntensity = lensFlareOn ? config::postprocess::ANAMORPHIC_FLARE_INTENSITY : 0.0f;
       bloomSettings.anamorphicStretch = config::postprocess::ANAMORPHIC_FLARE_STRETCH;
       bloomSettings.dirtIntensity = config::postprocess::LENS_DIRT_INTENSITY;
       bloomSettings.dirtScale = config::postprocess::LENS_DIRT_SCALE;
