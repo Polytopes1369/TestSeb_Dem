@@ -406,6 +406,19 @@ int main(int argc, char** argv) {
         return -1;
     }
 
+    // F2 frame-pacing fix: query the primary monitor's actual refresh rate once at startup so the
+    // CPU-side frame capper further down the main loop can tell whether it is redundant with the
+    // swapchain's VK_PRESENT_MODE_FIFO_KHR vsync block (see the capper site for the full beat-
+    // frequency rationale). A monitor reporting <=0 Hz (rare, but seen on some virtual/RDP displays)
+    // is treated as "unknown" and the capper falls back to its original always-on behavior.
+    int monitorRefreshHz = 0;
+    if (GLFWmonitor* primaryMonitor = glfwGetPrimaryMonitor()) {
+        if (const GLFWvidmode* videoMode = glfwGetVideoMode(primaryMonitor)) {
+            monitorRefreshHz = videoMode->refreshRate;
+            LOG_INFO(std::format("[Main] Primary monitor refresh rate: {} Hz (TARGET_FPS = {})", monitorRefreshHz, config::TARGET_FPS));
+        }
+    }
+
 #ifndef NDEBUG
     glfwSetKeyCallback(window, KeyCallback);
 #endif
@@ -2293,13 +2306,36 @@ int main(int argc, char** argv) {
 
         vkQueuePresentKHR(vkContext.GetGraphicsQueue(), &presentInfo);
 
-        // High-precision frame rate capper to enforce TARGET_FPS
+        // High-precision frame rate capper to enforce TARGET_FPS.
+        //
+        // F2 double-pacing fix: VulkanContext creates the swapchain with VK_PRESENT_MODE_FIFO_KHR
+        // (VulkanContext.cpp, ~line 1217), which already blocks vkQueuePresentKHR until the next
+        // vblank -- FIFO is itself a complete frame-pacing mechanism tied to the display's true
+        // refresh cadence. Also running this CPU-side sleep on top of that is harmless only when
+        // the two clocks share a frequency; when TARGET_FPS does not evenly divide the monitor's
+        // actual refresh rate (e.g. the common default: a 60fps target on a 144Hz panel, where
+        // 144/60 = 2.4, not integral) the two independent clocks beat against each other and
+        // produce irregular, jittery present intervals instead of the intended steady cadence.
+        //
+        // Fix: when TARGET_FPS is already at or above the display's own natural cap
+        // (monitorRefreshHz queried once at startup near window creation), FIFO vsync alone is
+        // sufficient pacing -- skip the CPU sleep entirely for this frame. This is the common case:
+        // the default Medium/High/Extrem profiles all target 60fps, and the overwhelming majority
+        // of displays are >=60Hz. When TARGET_FPS is intentionally BELOW the display's refresh rate
+        // (the Low tier's deliberate 30fps throttle on a 60Hz+ display), FIFO alone cannot reach
+        // that lower rate -- vsync would happily present at the full 60Hz -- so the CPU capper is
+        // still required there and its behavior is left completely unchanged. An unknown refresh
+        // rate (monitorRefreshHz <= 0) conservatively keeps the capper active, matching the
+        // pre-existing always-on behavior.
         static double lastFrameTime = glfwGetTime();
-        double targetFrameTime = 1.0 / static_cast<double>(config::TARGET_FPS);
-        while (glfwGetTime() - lastFrameTime < targetFrameTime) {
-            double remaining = targetFrameTime - (glfwGetTime() - lastFrameTime);
-            if (remaining > 0.002) {
-                std::this_thread::sleep_for(std::chrono::microseconds(static_cast<int64_t>((remaining - 0.001) * 1000000.0)));
+        const bool needsCpuCapper = (monitorRefreshHz <= 0) || (static_cast<int>(config::TARGET_FPS) < monitorRefreshHz);
+        if (needsCpuCapper) {
+            double targetFrameTime = 1.0 / static_cast<double>(config::TARGET_FPS);
+            while (glfwGetTime() - lastFrameTime < targetFrameTime) {
+                double remaining = targetFrameTime - (glfwGetTime() - lastFrameTime);
+                if (remaining > 0.002) {
+                    std::this_thread::sleep_for(std::chrono::microseconds(static_cast<int64_t>((remaining - 0.001) * 1000000.0)));
+                }
             }
         }
         lastFrameTime = glfwGetTime();
