@@ -12,6 +12,7 @@
 #include "geometry/ClusterFormat.h"
 #include "geometry/EntityMaterialTable.h" // geometry::GetEntityMaterialProperties -- Feature 1's per-entity CPU precompute.
 #include "io/CacheFileManager.h"
+#include "renderer/passes/ParticleSystemPass.h" // Feature F7 (shadow-casting particles) -- SetParticleSystem()/RecordParticleShadows() call its public accessors.
 #include "renderer/vulkan/VulkanPipeline.h"
 
 namespace renderer {
@@ -57,6 +58,31 @@ namespace renderer {
 
         constexpr float kHalfPi = 1.57079632679489661923f;
 
+        // Feature F14 (sun clipmap camera re-centering): CPU-side mirror of shadow_sun_sampling
+        // .glsl's ShadowSunLevelsUBO -- byte-for-byte std140 layout (mat4[N] followed by ivec4[N],
+        // both already naturally 16-byte-strided, so no explicit padding fields are needed between
+        // or within them). windowStartPage[level].xy is this level's window-start page-grid
+        // coordinate (see VirtualShadowMapPass.h's own class comment); .zw is unused (std140 pads
+        // every array element of a 2-component integer type up to 16 bytes regardless, so an ivec4
+        // costs nothing extra over an ivec2 here while sidestepping any doubt about array-stride
+        // padding rules -- the same reasoning renderer::LightingTypes.h's own UBO mirrors already
+        // apply throughout this codebase).
+        struct SunLevelsUBOData {
+            maths::mat4 viewProj[VirtualShadowMapPass::kSunLevelCount];
+            int32_t windowStartPage[VirtualShadowMapPass::kSunLevelCount][4];
+        };
+
+        // Feature F14: wraps a page-grid coordinate into [0, kShadowPagesPerAxis) using floor-mod
+        // (always non-negative, unlike C++'s truncating % for a negative left operand) -- the exact
+        // CPU-side counterpart of shadow_page_table.glsl's ShadowWrapPageCoord; RenderPage() and
+        // ClassifyDynamicPages() both use this to convert between a sun level's WORLD-ANCHORED
+        // wrapped local page index and this frame's RASTER page position (see
+        // VirtualShadowMapPass.h's own class comment for the full wrapped<->raster contract).
+        int32_t WrapPageCoord(int32_t v) {
+            constexpr int32_t m = static_cast<int32_t>(kShadowPagesPerAxis);
+            return ((v % m) + m) % m;
+        }
+
         // Standard cubemap face directions/up-vectors (Vulkan/D3D convention: +X,-X,+Y,-Y,+Z,-Z),
         // consumed identically by shadow_point_sampling.glsl's ShadowCubeFaceIndex so a world
         // position's selected face here always matches the face a shadow lookup samples.
@@ -70,6 +96,32 @@ namespace renderer {
             { 0.0f,  0.0f, 1.0f }, { 0.0f,  0.0f, -1.0f },
             { 0.0f, -1.0f, 0.0f }, { 0.0f, -1.0f, 0.0f },
         };
+
+        // Feature F7 (shadow-casting particles): push constant for ParticleShadowCapture.vert -- flat
+        // floats, not vec3 (avoids vec3's implicit push-constant alignment padding surprises when
+        // reasoning about the byte layout by eye, same convention renderer::ParticleSystemPass::
+        // EmitterParams' own header comment establishes). 88 bytes, comfortably under the 128-byte
+        // guaranteed minimum push-constant size (same margin ShadowCaptureConstants above documents
+        // for its own 76 bytes).
+        struct ParticleShadowCaptureConstants {
+            maths::mat4 lightViewProj;
+            float lightRightX, lightRightY, lightRightZ;
+            float lightUpX, lightUpY, lightUpZ;
+        };
+        static_assert(sizeof(ParticleShadowCaptureConstants) == 88,
+            "ParticleShadowCaptureConstants must match ParticleShadowCapture.vert's push_constant block exactly");
+
+        // Feature F7: coarse, deliberately generous fixed-radius bound around a shadow-casting
+        // emitter's own (static) spawn position -- NOT a tight per-particle bound, which this CPU
+        // code has no cheap way to compute (a particle's actual dispersion depends on GPU-simulated
+        // gravity/wind/curl-noise/attractor forces this codebase deliberately never reads back to the
+        // CPU per frame, see e.g. ClusterOcclusionCullingPass's own "only ever exists on the GPU"
+        // comment on the identical principle for cluster visibility counts). Erring toward a larger
+        // bound only costs a few extra (cheap, per-particle-degenerate-rejected in the vertex shader)
+        // draw calls on pages that turn out to have no particle actually cross them -- it can never
+        // DROP a real shadow, matching EntityAABBOverlapsPageNDC's own documented "erring toward more
+        // redraws is always safe here" philosophy one level up.
+        constexpr float kEmitterShadowBoundsRadius = 6.0f;
 
     } // namespace
 
@@ -504,7 +556,10 @@ namespace renderer {
         // m_LightingUBO (no descriptor-set update needed after the initial bind, no barrier needed
         // since the host write always happens-before this frame's vkQueueSubmit).
         // =====================================================================================
-        m_SunLevelsUBO.Create(allocator, sizeof(m_SunLevelViewProj),
+        // Feature F14: sized for SunLevelsUBOData (viewProj[] + windowStartPage[]), not just the
+        // raw m_SunLevelViewProj array -- see that struct's own comment for the exact std140 shape
+        // shadow_sun_sampling.glsl's ShadowSunLevelsUBO now expects.
+        m_SunLevelsUBO.Create(allocator, sizeof(SunLevelsUBOData),
             VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, VMA_MEMORY_USAGE_CPU_TO_GPU, /*mapped=*/true);
         m_PointFacesUBO.Create(allocator, sizeof(m_PointFaceViewProj),
             VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, VMA_MEMORY_USAGE_CPU_TO_GPU, /*mapped=*/true);
@@ -521,6 +576,12 @@ namespace renderer {
             if (m_Pipeline != VK_NULL_HANDLE) vkDestroyPipeline(m_Device, m_Pipeline, nullptr);
             if (m_MaskedPipeline != VK_NULL_HANDLE) vkDestroyPipeline(m_Device, m_MaskedPipeline, nullptr);
             if (m_PipelineLayout != VK_NULL_HANDLE) vkDestroyPipelineLayout(m_Device, m_PipelineLayout, nullptr);
+            // Feature F7: no descriptor pool/set/layout of its own to destroy here -- SetParticleSystem()
+            // deliberately binds ParticleSystemPass's OWN descriptor set (GetSetLayout()/GetCurrentSet())
+            // directly, see that method's own comment, so only the pipeline/pipelineLayout are this
+            // pass' own resources to tear down.
+            if (m_ParticleShadowPipeline != VK_NULL_HANDLE) vkDestroyPipeline(m_Device, m_ParticleShadowPipeline, nullptr);
+            if (m_ParticleShadowPipelineLayout != VK_NULL_HANDLE) vkDestroyPipelineLayout(m_Device, m_ParticleShadowPipelineLayout, nullptr);
             if (m_DescriptorPool != VK_NULL_HANDLE) {
                 // Destroying the pool implicitly frees m_DescriptorSet -- not freed individually,
                 // same convention as ClusterHardwareRasterPass::Shutdown.
@@ -539,6 +600,9 @@ namespace renderer {
         m_Pipeline = VK_NULL_HANDLE;
         m_MaskedPipeline = VK_NULL_HANDLE;
         m_PipelineLayout = VK_NULL_HANDLE;
+        m_ParticleShadowPipeline = VK_NULL_HANDLE;
+        m_ParticleShadowPipelineLayout = VK_NULL_HANDLE;
+        m_PagesRenderedThisFrame.clear();
         m_DescriptorPool = VK_NULL_HANDLE;
         m_DescriptorSet = VK_NULL_HANDLE;
         m_DescriptorSetLayout = VK_NULL_HANDLE;
@@ -552,24 +616,46 @@ namespace renderer {
     void VirtualShadowMapPass::RecordBeginFrame(VkCommandBuffer cmd, const maths::vec3& sunDirection,
         const SceneLights& sceneLights, const maths::vec3& cameraPosition,
         const core::EntityTransformCPU* entityTransformsCPU) {
-        (void)cameraPosition; // Unused -- see class comment on why the sun clipmap windows are fixed, not camera-following.
-
-        // --- Recompute this frame's sun clipmap view-projection matrices (view depends on
-        // sunDirection; projection was fixed once at Init(), see class comment). ---
+        // --- Recompute this frame's sun clipmap view-projection matrices AND re-center each
+        // level's window on the camera (Feature F14 -- see class comment for the full toroidal
+        // wrap contract this drives). ---
         const maths::vec3 lightDir = sunDirection.Normalize();
         maths::vec3 up{ 0.0f, 1.0f, 0.0f };
         if (std::abs(lightDir.Dot(up)) > 0.999f) {
             up = maths::vec3{ 0.0f, 0.0f, 1.0f };
         }
+        // The exact s/u basis maths::mat4::LookAt derives internally -- recomputed explicitly here
+        // so this pass' page-grid axes exactly match the view matrix's real X/Y axes (see class
+        // comment). lightUpForPaging is `u` NEGATED: OrthoVulkan flips Y (Vulkan Y-down NDC, see
+        // that function's own comment), so a page's RASTER row index increases as world position
+        // moves along -u, not +u -- every CPU-side "up axis" scalar projection/reconstruction below
+        // uses this pre-flipped vector so the integers this pass stores/uploads as windowStartPage
+        // land in the exact same sign convention shadow_sun_sampling.glsl's rasterPageCoord does.
+        const maths::vec3 lightRight = lightDir.Cross(up).Normalize();
+        const maths::vec3 lightUpForPaging = (lightRight.Cross(lightDir)) * -1.0f;
+        // Feature F7 (shadow-casting particles): the TRUE (unflipped) sun basis for a light-facing
+        // particle billboard -- lightUpForPaging above is deliberately Y-flipped for page-grid
+        // arithmetic only (see this pass' own class comment), which must not leak into a billboard
+        // orientation. Shared by every sun level (same lightDir/up for the whole frame).
+        const maths::vec3 lightUpTrue = lightUpForPaging * -1.0f;
+
+        uint32_t invalidatedThisFrame = 0;
         for (uint32_t level = 0; level < kSunLevelCount; ++level) {
-            float radius = std::max(kSunBaseRadius * float(1u << level), 1.0e-3f);
-            float nearPlane = radius * kSunNearMarginFactor;
-            maths::vec3 eye = m_SceneBoundsCenter - lightDir * (radius + nearPlane);
-            maths::mat4 view = maths::mat4::LookAt(eye, m_SceneBoundsCenter, up);
-            m_SunLevelViewProj[level] = m_SunLevelProj[level] * view;
+            invalidatedThisFrame += RecenterSunLevel(cmd, level, cameraPosition, lightDir, lightRight, lightUpForPaging, up);
         }
 
-        // --- Recompute this frame's point light cube face view-projection matrices. ---
+        // --- Recompute this frame's point light cube face view-projection matrices. Unaffected by
+        // Feature F14 -- a point light's own frustum is anchored to the light, never re-centers. ---
+        // Feature F7: also precomputes each face's own TRUE right/up basis (the exact s/u pair
+        // maths::mat4::LookAt derives internally for that face's eye/center/up below) for a
+        // light-facing particle billboard drawn into that face's own pages -- cheap (6 cross
+        // products/frame) regardless of whether any castShadows emitter is even active this frame.
+        maths::vec3 pointFaceRight[6]{};
+        maths::vec3 pointFaceUpTrue[6]{};
+        for (uint32_t face = 0; face < 6; ++face) {
+            pointFaceRight[face] = kFaceDirs[face].Cross(kFaceUps[face]).Normalize();
+            pointFaceUpTrue[face] = pointFaceRight[face].Cross(kFaceDirs[face]);
+        }
         m_ActivePointLightCount = std::min(sceneLights.pointLightCount, kMaxPointLights);
         for (uint32_t slot = 0; slot < m_ActivePointLightCount; ++slot) {
             const PointLight& light = sceneLights.pointLights[slot];
@@ -582,7 +668,48 @@ namespace renderer {
             }
         }
 
-        std::memcpy(m_SunLevelsUBO.MappedData(), m_SunLevelViewProj, sizeof(m_SunLevelViewProj));
+        // Feature F7: cleared here, repopulated by every RenderPage() call this frame's two render
+        // loops below actually issue -- consumed once, later this same frame, by
+        // RecordParticleShadows() (called AFTER ParticleSystemPass's own simulate/sort dispatches,
+        // see that method's own comment for why it cannot simply run inline here).
+        m_PagesRenderedThisFrame.clear();
+        // Local helper (captures this frame's lightRight/lightUpTrue/pointFaceRight/pointFaceUpTrue
+        // above by reference) -- called once per RenderPage() invocation below to append that page's
+        // own PageRenderInfo + light-facing billboard basis into m_PagesRenderedThisFrame.
+        auto trackRenderedPage = [&](uint32_t vsmIndex, uint32_t physicalLayer, const maths::mat4& viewProj,
+            const PageRenderInfo& info) {
+            RenderedPageThisFrame tracked{};
+            tracked.physicalLayer = physicalLayer;
+            tracked.viewProj = viewProj;
+            tracked.viewport = info.viewport;
+            tracked.scissor = info.scissor;
+            tracked.ndcXMin = info.ndcXMin;
+            tracked.ndcXMax = info.ndcXMax;
+            tracked.ndcYMin = info.ndcYMin;
+            tracked.ndcYMax = info.ndcYMax;
+            if (vsmIndex < kSunLevelCount) {
+                tracked.lightRight = lightRight;
+                tracked.lightUp = lightUpTrue;
+            } else {
+                uint32_t face = (vsmIndex - kSunLevelCount) % 6u;
+                tracked.lightRight = pointFaceRight[face];
+                tracked.lightUp = pointFaceUpTrue[face];
+            }
+            m_PagesRenderedThisFrame.push_back(tracked);
+            };
+
+        // Feature F14: uploads both this frame's view-proj matrices AND each sun level's
+        // windowStartPage -- see SunLevelsUBOData's own comment for the exact std140-mirrored
+        // layout shadow_sun_sampling.glsl's ShadowSunLevelsUBO expects.
+        SunLevelsUBOData sunLevelsUpload{};
+        for (uint32_t level = 0; level < kSunLevelCount; ++level) {
+            sunLevelsUpload.viewProj[level] = m_SunLevelViewProj[level];
+            sunLevelsUpload.windowStartPage[level][0] = m_SunLevelWindowStartPage[level][0];
+            sunLevelsUpload.windowStartPage[level][1] = m_SunLevelWindowStartPage[level][1];
+            sunLevelsUpload.windowStartPage[level][2] = 0;
+            sunLevelsUpload.windowStartPage[level][3] = 0;
+        }
+        std::memcpy(m_SunLevelsUBO.MappedData(), &sunLevelsUpload, sizeof(sunLevelsUpload));
         std::memcpy(m_PointFacesUBO.MappedData(), m_PointFaceViewProj, sizeof(m_PointFaceViewProj));
 
         // --- Clear this frame's feedback counter before any consumer can write into it. ---
@@ -596,6 +723,7 @@ namespace renderer {
         // comment on this flag. m_SunLevelsUBO/m_PointFacesUBO above still get this frame's valid
         // view-projection matrices either way, so re-enabling this flag later needs no other change.
         bool renderedAnyPage = false;
+        uint32_t missPagesRenderedThisFrame = 0; // Feature F14 validation counter -- see this function's own trailing throttled log.
         if (config::lumen::BUILD_SHADOWS) {
             std::vector<uint32_t> missedPages = m_Feedback.ReadRequestedClusterIDs();
             // Priority = -(vsmIndex): sun clipmap levels are indexed finest-first (kSunLevelCount
@@ -639,8 +767,10 @@ namespace renderer {
                     continue;
                 }
 
-                RenderPage(cmd, vsmIndex, localPageIndex, physicalLayer, *viewProj);
+                PageRenderInfo info = RenderPage(cmd, vsmIndex, localPageIndex, physicalLayer, *viewProj);
+                trackRenderedPage(vsmIndex, physicalLayer, *viewProj, info);
                 renderedAnyPage = true;
+                ++missPagesRenderedThisFrame;
                 m_RequestQueue.MarkRequestCompleted(logicalPageID);
             }
         }
@@ -702,7 +832,8 @@ namespace renderer {
                     continue; // Defensive -- GetResidentDynamicPageIDs() only ever returns resident pages.
                 }
 
-                RenderPage(cmd, vsmIndex, localPageIndex, physicalLayer, *viewProj);
+                PageRenderInfo info = RenderPage(cmd, vsmIndex, localPageIndex, physicalLayer, *viewProj);
+                trackRenderedPage(vsmIndex, physicalLayer, *viewProj, info);
                 // Keeps an actively-redrawn dynamic page from ever looking idle to the LRU (it IS
                 // being used every frame, just not via the feedback/miss path) -- cheap (O(1)) and
                 // purely defensive, since whatever consumer still samples this page's content would
@@ -739,6 +870,22 @@ namespace renderer {
                     dynamicPageIDs.size(), m_Pool.GetResidentPageCount()));
             }
         }
+
+        // Feature F14 validation diagnostic: proves smooth camera motion re-centers the sun clipmap
+        // WITHOUT invalidating the whole pool every frame -- `invalidatedThisFrame` should stay a
+        // small fraction of m_Pool.GetResidentPageCount() (only the newly-revealed band per moved
+        // axis, see RecenterSunLevel/InvalidateSunWindowBand's own comments), not the whole
+        // resident set, under continuous flight. Logged whenever a re-center actually invalidated
+        // something (the interesting event) OR periodically otherwise, same throttle cadence as the
+        // Feature 2 diagnostic just above.
+        static uint32_t s_RecenterLogFrameCounter = 0;
+        bool shouldLogRecenter = invalidatedThisFrame > 0 || ((++s_RecenterLogFrameCounter % 300u) == 0u);
+        if (shouldLogRecenter) {
+            LOG_INFO(std::format(
+                "[VirtualShadowMapPass] Sun clipmap re-center: {} page(s) invalidated (band-only, not pool-wide), "
+                "{} page(s) miss-rendered, {} of {} physical page(s) resident.",
+                invalidatedThisFrame, missPagesRenderedThisFrame, m_Pool.GetResidentPageCount(), m_Pool.GetPhysicalCapacity()));
+        }
     }
 
     void VirtualShadowMapPass::RecordEndFrame(VkCommandBuffer cmd) {
@@ -748,11 +895,340 @@ namespace renderer {
         m_Feedback.RecordReadback(cmd);
     }
 
-    void VirtualShadowMapPass::RenderPage(VkCommandBuffer cmd, uint32_t vsmIndex, uint32_t localPageIndex,
+    void VirtualShadowMapPass::SetParticleSystem(const ParticleSystemPass& particles) {
+        if (m_ParticleShadowPipeline != VK_NULL_HANDLE) {
+            return; // Already built -- Init()-time idempotency convention this class doesn't otherwise need, but a caller mistakenly calling this twice must not leak a pipeline.
+        }
+
+        // Pipeline layout: ONE descriptor set -- `particles`' own set 0 (ParticleCommon.glsl's
+        // ParticleBuffer/DeadListBuffer/AliveListBuffer/CounterBuffer/EmitterParamsBuffer/
+        // PerEmitterAliveCountBuffer, the SAME layout every real particle shader binds, see that
+        // file's own header comment on why hardcoding set 0 there is correct) -- reused directly via
+        // GetSetLayout() rather than this pass building a second, redundant descriptor set/pool of
+        // its own for 3 of those same 6 buffers, plus this pipeline's own push constant range.
+        VkPushConstantRange pushConstantRange{};
+        pushConstantRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+        pushConstantRange.offset = 0;
+        pushConstantRange.size = sizeof(ParticleShadowCaptureConstants);
+
+        VkDescriptorSetLayout particleSetLayout = particles.GetSetLayout();
+        VkPipelineLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+        layoutInfo.setLayoutCount = 1;
+        layoutInfo.pSetLayouts = &particleSetLayout;
+        layoutInfo.pushConstantRangeCount = 1;
+        layoutInfo.pPushConstantRanges = &pushConstantRange;
+        VK_CHECK(vkCreatePipelineLayout(m_Device, &layoutInfo, nullptr, &m_ParticleShadowPipelineLayout));
+
+        VkShaderModule vertModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/ParticleShadowCapture.vert.spv");
+        VkShaderModule fragModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/ParticleShadowCapture.frag.spv");
+
+        VkPipelineShaderStageCreateInfo stages[2]{};
+        stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+        stages[0].module = vertModule;
+        stages[0].pName = "main";
+        stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+        stages[1].module = fragModule;
+        stages[1].pName = "main";
+
+        // No bound vertex/index buffer -- gl_VertexIndex (0-5) generates the quad corners in-shader,
+        // same "zero vertex input state" convention ParticleRender.vert's own pipeline already uses.
+        VkPipelineVertexInputStateCreateInfo vertexInput{ VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
+
+        VkPipelineInputAssemblyStateCreateInfo inputAssembly{ VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
+        inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+        VkPipelineViewportStateCreateInfo viewportState{ VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
+        viewportState.viewportCount = 1;
+        viewportState.scissorCount = 1;
+
+        VkPipelineRasterizationStateCreateInfo rasterizer{ VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
+        rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
+        rasterizer.lineWidth = 1.0f;
+        rasterizer.cullMode = VK_CULL_MODE_NONE; // A billboard quad's footprint must occlude the light regardless of winding.
+        rasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+
+        VkPipelineMultisampleStateCreateInfo multisampling{ VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
+        multisampling.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+        VkPipelineColorBlendStateCreateInfo colorBlending{ VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
+        colorBlending.attachmentCount = 0; // Depth-only, same as m_Pipeline/m_MaskedPipeline above.
+
+        std::vector<VkDynamicState> dynamicStates = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+        VkPipelineDynamicStateCreateInfo dynamicState{ VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
+        dynamicState.dynamicStateCount = static_cast<uint32_t>(dynamicStates.size());
+        dynamicState.pDynamicStates = dynamicStates.data();
+
+        VkPipelineRenderingCreateInfo pipelineRendering{ VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO };
+        pipelineRendering.colorAttachmentCount = 0;
+        pipelineRendering.depthAttachmentFormat = VK_FORMAT_D32_SFLOAT;
+
+        // depthWriteEnable=TRUE, VK_COMPARE_OP_LESS -- same convention as m_Pipeline/m_MaskedPipeline
+        // above: RecordParticleShadows() uses LOAD_OP_LOAD (preserving this frame's already-captured
+        // entity depth, see that method's own comment), so a particle's own depth only wins where it
+        // is genuinely nearer to the light than whatever entity geometry (if any) was already
+        // rasterized into that texel -- standard, correct depth-test behavior, nothing special-cased.
+        VkPipelineDepthStencilStateCreateInfo depthStencil{ VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
+        depthStencil.depthTestEnable = VK_TRUE;
+        depthStencil.depthWriteEnable = VK_TRUE;
+        depthStencil.depthCompareOp = VK_COMPARE_OP_LESS;
+
+        VkGraphicsPipelineCreateInfo pipelineInfo{ VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
+        pipelineInfo.stageCount = 2;
+        pipelineInfo.pStages = stages;
+        pipelineInfo.pVertexInputState = &vertexInput;
+        pipelineInfo.pInputAssemblyState = &inputAssembly;
+        pipelineInfo.pViewportState = &viewportState;
+        pipelineInfo.pRasterizationState = &rasterizer;
+        pipelineInfo.pMultisampleState = &multisampling;
+        pipelineInfo.pColorBlendState = &colorBlending;
+        pipelineInfo.pDepthStencilState = &depthStencil;
+        pipelineInfo.pDynamicState = &dynamicState;
+        pipelineInfo.layout = m_ParticleShadowPipelineLayout;
+        pipelineInfo.pNext = &pipelineRendering;
+        // Routed through the persisted VkPipelineCache (same convention m_Pipeline/m_MaskedPipeline
+        // above now use, landed on main concurrently with this feature) instead of VK_NULL_HANDLE.
+        VK_CHECK(vkCreateGraphicsPipelines(m_Device, VulkanPipeline::GetPipelineCache(), 1, &pipelineInfo, nullptr, &m_ParticleShadowPipeline));
+
+        vkDestroyShaderModule(m_Device, vertModule, nullptr);
+        vkDestroyShaderModule(m_Device, fragModule, nullptr);
+
+        LOG_INFO("[VirtualShadowMapPass] Feature F7: particle-shadow-capture pipeline built (bound to ParticleSystemPass's own descriptor set layout).");
+    }
+
+    void VirtualShadowMapPass::RecordParticleShadows(VkCommandBuffer cmd, const ParticleSystemPass& particles) {
+        if (m_ParticleShadowPipeline == VK_NULL_HANDLE || m_PagesRenderedThisFrame.empty()) {
+            return; // SetParticleSystem() not called yet, or RecordBeginFrame() rendered nothing this frame.
+        }
+
+        // Explicit barrier (CLAUDE.md's synchronization discipline): `particles`' own
+        // RecordSimulate()/RecordSort() compute dispatches (already recorded earlier THIS SAME
+        // command buffer -- see renderer::ClusterRenderPipeline::RecordFrameEarly's own call-ordering
+        // comment, and this method's own class-comment cross-reference for why RecordParticleShadows
+        // must run AFTER them) wrote ParticleBuffer/AliveListBuffer/CounterBuffer/EmitterParamsBuffer;
+        // make those writes visible to this call's own vertex-shader storage-buffer reads AND
+        // vkCmdDrawIndirect's own indirect-command read of the SAME m_IndirectDrawBuffer
+        // ParticleSystemPass::RecordDraw() also consumes, before any draw below issues.
+        VkMemoryBarrier2 particleBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+        particleBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        particleBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+        particleBarrier.dstStageMask = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT;
+        particleBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT;
+        VkDependencyInfo particleDepInfo{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+        particleDepInfo.memoryBarrierCount = 1;
+        particleDepInfo.pMemoryBarriers = &particleBarrier;
+        vkCmdPipelineBarrier2(cmd, &particleDepInfo);
+
+        VkDescriptorSet particleSet = particles.GetCurrentSet();
+        VkBuffer indirectDrawBuffer = particles.GetIndirectDrawBufferHandle();
+
+        bool boundPipelineThisCall = false;
+        uint32_t pagesTouched = 0;
+        for (const RenderedPageThisFrame& page : m_PagesRenderedThisFrame) {
+            // Page budget (this feature's own explicit requirement): skip any page whose frustum does
+            // not overlap ANY castShadows-enabled emitter's own bounds -- the common case once the
+            // scene has more than a handful of pages resident, see AnyShadowCastingEmitterOverlapsPageNDC's
+            // own comment for the overlap test itself.
+            if (!AnyShadowCastingEmitterOverlapsPageNDC(page.viewProj, page.ndcXMin, page.ndcXMax, page.ndcYMin, page.ndcYMax)) {
+                continue;
+            }
+
+            VkRenderingAttachmentInfo depthAttachment{ VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
+            depthAttachment.imageView = m_Pool.GetPhysicalLayerView(page.physicalLayer);
+            depthAttachment.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+            // LOAD, not CLEAR: this page's entity depth (RenderPage(), earlier THIS SAME frame) must
+            // survive -- a particle shadow is drawn ON TOP OF the static/dynamic scene's own shadow
+            // casters, not instead of them.
+            depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+            depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+
+            VkRenderingInfo renderingInfo{ VK_STRUCTURE_TYPE_RENDERING_INFO };
+            renderingInfo.renderArea = { { 0, 0 }, { kShadowPageTexels, kShadowPageTexels } };
+            renderingInfo.layerCount = 1;
+            renderingInfo.pDepthAttachment = &depthAttachment;
+            vkCmdBeginRendering(cmd, &renderingInfo);
+
+            vkCmdSetViewport(cmd, 0, 1, &page.viewport);
+            vkCmdSetScissor(cmd, 0, 1, &page.scissor);
+
+            if (!boundPipelineThisCall) {
+                // Bound once, reused for every touched page -- same "skip redundant rebinds" idiom
+                // RenderPage's own per-entity pipeline selection above already uses, just at the
+                // per-page granularity here instead (this pipeline never changes across pages).
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_ParticleShadowPipeline);
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_ParticleShadowPipelineLayout, 0, 1, &particleSet, 0, nullptr);
+                boundPipelineThisCall = true;
+            }
+
+            ParticleShadowCaptureConstants pc{};
+            pc.lightViewProj = page.viewProj;
+            pc.lightRightX = page.lightRight.x; pc.lightRightY = page.lightRight.y; pc.lightRightZ = page.lightRight.z;
+            pc.lightUpX = page.lightUp.x; pc.lightUpY = page.lightUp.y; pc.lightUpZ = page.lightUp.z;
+            vkCmdPushConstants(cmd, m_ParticleShadowPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(pc), &pc);
+
+            // Reuses the SAME indirect-draw args buffer ParticleSystemPass::RecordDraw() draws the
+            // color pass from (vertexCount=6, instanceCount=this frame's real alive-particle count --
+            // see that buffer's own declaration comment) -- every alive particle is instanced;
+            // ParticleShadowCapture.vert's own per-particle emitter check degenerates the vertex for
+            // any particle whose emitter does not have castShadows set, the same "cheap per-vertex
+            // reject, no separate compaction pass" convention ParticleRender.vert's own render-mode
+            // gating (B1/B2/B3) already established -- see that shader's own header comment.
+            vkCmdDrawIndirect(cmd, indirectDrawBuffer, 0, 1, sizeof(VkDrawIndirectCommand));
+
+            vkCmdEndRendering(cmd);
+            ++pagesTouched;
+        }
+
+        if (pagesTouched > 0) {
+            // Same barrier reasoning as RecordBeginFrame's own two trailing barriers -- a page's
+            // depth written THIS frame (here: a particle shadow layered on top) must be immediately
+            // visible to a later sampled read this same frame, not next frame.
+            VkMemoryBarrier2 barrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+            barrier.srcStageMask = VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
+            barrier.srcAccessMask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+            barrier.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+            barrier.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+            VkDependencyInfo depInfo{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+            depInfo.memoryBarrierCount = 1;
+            depInfo.pMemoryBarriers = &barrier;
+            vkCmdPipelineBarrier2(cmd, &depInfo);
+        }
+
+        // Validation diagnostic (this feature's own explicit ask: "measure the added VSM page
+        // cost"): how many of this frame's rendered pages actually got a particle-shadow draw call,
+        // out of how many were candidates -- proves the page-budget overlap test stays selective
+        // (a small fraction) rather than degenerating into "draw particles on every page".
+        static uint32_t s_ParticleShadowLogFrameCounter = 0;
+        if (pagesTouched > 0 && ((++s_ParticleShadowLogFrameCounter % 60u) == 0u)) {
+            LOG_INFO(std::format(
+                "[VirtualShadowMapPass] Particle shadows: {} of {} rendered page(s) this frame got a particle-shadow draw call.",
+                pagesTouched, m_PagesRenderedThisFrame.size()));
+        }
+    }
+
+    uint32_t VirtualShadowMapPass::RecenterSunLevel(VkCommandBuffer cmd, uint32_t level, const maths::vec3& cameraPosition,
+        const maths::vec3& lightDir, const maths::vec3& lightRight, const maths::vec3& lightUpForPaging,
+        const maths::vec3& up) {
+        float radius = std::max(kSunBaseRadius * float(1u << level), 1.0e-3f);
+        float nearPlane = radius * kSunNearMarginFactor;
+        // World units per page at this level -- the level's full covered width (2*radius) split
+        // into kShadowPagesPerAxis pages, same convention RenderPage's own virtual-viewport math
+        // assumes (kShadowPagesPerAxis pages spanning the level's whole [-radius, radius] extent).
+        float pageWorldSize = (2.0f * radius) / float(kShadowPagesPerAxis);
+
+        // Snap the camera's projection onto this axis down to whole kSunWindowSnapChunkPages-page
+        // steps -- exactly GlobalSDFPass::EnqueueDirtyRegionsForLevel's own snapAxis lambda,
+        // parameterized in pages instead of voxels (see class comment).
+        auto snapToPageChunk = [&](float axisWorldPos) -> int32_t {
+            int32_t pageIndex = static_cast<int32_t>(std::floor(axisWorldPos / pageWorldSize));
+            int32_t chunk = static_cast<int32_t>(kSunWindowSnapChunkPages);
+            int32_t chunkIndex = static_cast<int32_t>(std::floor(static_cast<float>(pageIndex) / static_cast<float>(chunk)));
+            return chunkIndex * chunk;
+            };
+
+        float camRight = cameraPosition.Dot(lightRight);
+        float camUpForPaging = cameraPosition.Dot(lightUpForPaging);
+        int32_t newCenterPage[2] = { snapToPageChunk(camRight), snapToPageChunk(camUpForPaging) };
+
+        constexpr int32_t kHalfPagesPerAxis = static_cast<int32_t>(kShadowPagesPerAxis) / 2; // 8.
+
+        SunClipmapWindow& window = m_SunWindows[level];
+        uint32_t invalidatedCount = 0;
+        if (!window.hasValidWindow) {
+            // First call for this level: nothing is resident yet (a freshly Init()'d pool, or a
+            // level that has simply never had a page requested) -- no stale content can possibly
+            // exist to invalidate, see class comment.
+            window.centerPage[0] = newCenterPage[0];
+            window.centerPage[1] = newCenterPage[1];
+            window.hasValidWindow = true;
+        } else {
+            for (int axis = 0; axis < 2; ++axis) {
+                int32_t delta = newCenterPage[axis] - window.centerPage[axis];
+                if (delta == 0) {
+                    continue;
+                }
+                if (std::abs(delta) >= static_cast<int32_t>(kShadowPagesPerAxis)) {
+                    // Moved farther than the whole covered window in one update (a large camera
+                    // jump/teleport) -- every wrapped index along this axis is stale; mirrors
+                    // GlobalSDFPass::EnqueueDirtyRegionsForLevel's identical large-jump case.
+                    invalidatedCount += InvalidateSunWindowBand(cmd, level, newCenterPage[axis] - kHalfPagesPerAxis,
+                        static_cast<int32_t>(kShadowPagesPerAxis), axis);
+                } else if (delta > 0) {
+                    invalidatedCount += InvalidateSunWindowBand(cmd, level, window.centerPage[axis] + kHalfPagesPerAxis, delta, axis);
+                } else {
+                    invalidatedCount += InvalidateSunWindowBand(cmd, level, newCenterPage[axis] - kHalfPagesPerAxis, -delta, axis);
+                }
+            }
+            window.centerPage[0] = newCenterPage[0];
+            window.centerPage[1] = newCenterPage[1];
+        }
+
+        m_SunLevelWindowStartPage[level][0] = window.centerPage[0] - kHalfPagesPerAxis;
+        m_SunLevelWindowStartPage[level][1] = window.centerPage[1] - kHalfPagesPerAxis;
+
+        // World-space window center: the camera's own position, with its light-right/
+        // light-up-for-paging components replaced by the snapped page-grid center (texel-stable
+        // across sub-chunk motion), keeping the light-DIRECTION component exactly at the camera's
+        // real position -- depth needs no snapping, only the two axes perpendicular to the light do
+        // (see class comment).
+        maths::vec3 windowCenterWorld = cameraPosition
+            - lightRight * camRight - lightUpForPaging * camUpForPaging
+            + lightRight * (static_cast<float>(window.centerPage[0]) * pageWorldSize)
+            + lightUpForPaging * (static_cast<float>(window.centerPage[1]) * pageWorldSize);
+
+        maths::vec3 eye = windowCenterWorld - lightDir * (radius + nearPlane);
+        maths::mat4 view = maths::mat4::LookAt(eye, windowCenterWorld, up);
+        m_SunLevelViewProj[level] = m_SunLevelProj[level] * view;
+
+        return invalidatedCount;
+    }
+
+    uint32_t VirtualShadowMapPass::InvalidateSunWindowBand(VkCommandBuffer cmd, uint32_t level,
+        int32_t bandStartWorldPage, int32_t bandCount, int32_t movedAxis) {
+        uint32_t invalidatedCount = 0;
+        for (int32_t i = 0; i < bandCount; ++i) {
+            int32_t worldCoord = bandStartWorldPage + i;
+            uint32_t wrapped = static_cast<uint32_t>(WrapPageCoord(worldCoord));
+            for (uint32_t other = 0; other < kShadowPagesPerAxis; ++other) {
+                // movedAxis 0 (light-right) is the local index's X component; movedAxis 1
+                // (light-up-for-paging) is its Y component -- matches ShadowLocalPageIndex's own
+                // `y * SHADOW_PAGES_PER_AXIS + x` flattening (shadow_page_table.glsl).
+                uint32_t localPageIndex = (movedAxis == 0)
+                    ? (other * kShadowPagesPerAxis + wrapped)
+                    : (wrapped * kShadowPagesPerAxis + other);
+                uint32_t logicalPageID = level * kShadowPagesPerVSM + localPageIndex;
+                bool wasResident = m_Pool.IsResident(logicalPageID);
+                m_Pool.InvalidatePage(cmd, logicalPageID);
+                if (wasResident) {
+                    ++invalidatedCount;
+                }
+            }
+        }
+        return invalidatedCount;
+    }
+
+    VirtualShadowMapPass::PageRenderInfo VirtualShadowMapPass::RenderPage(VkCommandBuffer cmd, uint32_t vsmIndex, uint32_t localPageIndex,
         uint32_t physicalLayer, const maths::mat4& viewProj) {
-        (void)vsmIndex; // Rendering itself is VSM-agnostic -- only `viewProj` (already resolved by the caller) matters.
-        uint32_t pageX = localPageIndex % kShadowPagesPerAxis;
-        uint32_t pageY = localPageIndex / kShadowPagesPerAxis;
+        uint32_t pageX = 0;
+        uint32_t pageY = 0;
+        if (vsmIndex < kSunLevelCount) {
+            // Sun clipmap (Feature F14): `localPageIndex` is the WORLD-ANCHORED wrapped page-table
+            // slot (stable across a window shift), not this frame's raster position -- recover the
+            // raster position (where in the current 2048x2048 virtual frustum this page's content
+            // actually belongs, for the virtual-viewport trick below) via the inverse of the wrap
+            // this level's CURRENT window applies. See class comment for the full wrapped<->raster
+            // derivation and shadow_sun_sampling.glsl's ShadowWrapPageCoord for the GPU-side
+            // forward direction of the exact same transform.
+            uint32_t wrappedX = localPageIndex % kShadowPagesPerAxis;
+            uint32_t wrappedY = localPageIndex / kShadowPagesPerAxis;
+            pageX = static_cast<uint32_t>(WrapPageCoord(static_cast<int32_t>(wrappedX) - m_SunLevelWindowStartPage[vsmIndex][0]));
+            pageY = static_cast<uint32_t>(WrapPageCoord(static_cast<int32_t>(wrappedY) - m_SunLevelWindowStartPage[vsmIndex][1]));
+        } else {
+            // Point light cube face -- unaffected by Feature F14, direct (unwrapped) mapping.
+            pageX = localPageIndex % kShadowPagesPerAxis;
+            pageY = localPageIndex / kShadowPagesPerAxis;
+        }
 
         VkRenderingAttachmentInfo depthAttachment{ VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
         depthAttachment.imageView = m_Pool.GetPhysicalLayerView(physicalLayer);
@@ -827,6 +1303,20 @@ namespace renderer {
         }
 
         vkCmdEndRendering(cmd);
+
+        // Feature F7 (shadow-casting particles): this page's own NDC sub-rectangle, same formula
+        // ClassifyDynamicPages uses to recover one from (pageX, pageY) -- returned (not just used
+        // internally) so RecordBeginFrame's own callers can register this page in
+        // m_PagesRenderedThisFrame for RecordParticleShadows()'s later per-page overlap test,
+        // without duplicating this derivation a second time at each call site.
+        PageRenderInfo info{};
+        info.viewport = viewport;
+        info.scissor = scissor;
+        info.ndcXMin = 2.0f * float(pageX) / float(kShadowPagesPerAxis) - 1.0f;
+        info.ndcXMax = 2.0f * float(pageX + 1) / float(kShadowPagesPerAxis) - 1.0f;
+        info.ndcYMin = 2.0f * float(pageY) / float(kShadowPagesPerAxis) - 1.0f;
+        info.ndcYMax = 2.0f * float(pageY + 1) / float(kShadowPagesPerAxis) - 1.0f;
+        return info;
     }
 
     void VirtualShadowMapPass::ClassifyDynamicPages(const core::EntityTransformCPU* entityTransformsCPU) {
@@ -854,8 +1344,19 @@ namespace renderer {
             // NDC [-1, 1] regardless of the specific negative-offset viewport trick RenderPage()
             // uses to get there (the viewport only rescales NDC to pixels, it does not change what
             // NDC itself means for a given clip-space position).
-            uint32_t pageX = localPageIndex % kShadowPagesPerAxis;
-            uint32_t pageY = localPageIndex / kShadowPagesPerAxis;
+            // Feature F14: for a sun level, `localPageIndex` is the wrapped (world-anchored) slot,
+            // not the raster position `viewProj` (THIS frame's re-centered matrix) actually implies
+            // -- same wrapped->raster conversion as RenderPage's own, see that function's comment.
+            uint32_t pageX, pageY;
+            if (vsmIndex < kSunLevelCount) {
+                uint32_t wrappedX = localPageIndex % kShadowPagesPerAxis;
+                uint32_t wrappedY = localPageIndex / kShadowPagesPerAxis;
+                pageX = static_cast<uint32_t>(WrapPageCoord(static_cast<int32_t>(wrappedX) - m_SunLevelWindowStartPage[vsmIndex][0]));
+                pageY = static_cast<uint32_t>(WrapPageCoord(static_cast<int32_t>(wrappedY) - m_SunLevelWindowStartPage[vsmIndex][1]));
+            } else {
+                pageX = localPageIndex % kShadowPagesPerAxis;
+                pageY = localPageIndex / kShadowPagesPerAxis;
+            }
             float ndcXMin = 2.0f * float(pageX) / float(kShadowPagesPerAxis) - 1.0f;
             float ndcXMax = 2.0f * float(pageX + 1) / float(kShadowPagesPerAxis) - 1.0f;
             float ndcYMin = 2.0f * float(pageY) / float(kShadowPagesPerAxis) - 1.0f;
@@ -871,8 +1372,77 @@ namespace renderer {
                     break;
                 }
             }
+            // Feature F7 (shadow-casting particles) extension: a page also counts as covering
+            // dynamic content if a shadow-casting emitter's own bounds overlap it -- see this
+            // method's own class-comment cross-reference for why this is required (without it, a
+            // page whose underlying entity geometry is static would only ever be classified dynamic
+            // via the entity test above, so RecordParticleShadows() would lose its chance to keep
+            // re-drawing a moving particle's shadow onto it after the very first frame).
+            if (!coversDynamic) {
+                coversDynamic = AnyShadowCastingEmitterOverlapsPageNDC(*viewProj, ndcXMin, ndcXMax, ndcYMin, ndcYMax);
+            }
             m_Pool.SetPageCoversDynamicContent(logicalPageID, coversDynamic);
         }
+    }
+
+    bool VirtualShadowMapPass::AnyShadowCastingEmitterOverlapsPageNDC(const maths::mat4& viewProj,
+        float ndcXMin, float ndcXMax, float ndcYMin, float ndcYMax) const {
+        for (uint32_t i = 0; i < config::particles::kMaxEmitters; ++i) {
+            const config::particles::EmitterConfig& emitter = config::particles::EMITTERS[i];
+            if (!emitter.active || !emitter.castShadows) {
+                continue;
+            }
+
+            maths::vec3 center{ emitter.positionX, emitter.positionY, emitter.positionZ };
+            maths::vec3 localMin = center - maths::vec3{ kEmitterShadowBoundsRadius, kEmitterShadowBoundsRadius, kEmitterShadowBoundsRadius };
+            maths::vec3 localMax = center + maths::vec3{ kEmitterShadowBoundsRadius, kEmitterShadowBoundsRadius, kEmitterShadowBoundsRadius };
+
+            float entityNdcXMin = std::numeric_limits<float>::max();
+            float entityNdcXMax = -std::numeric_limits<float>::max();
+            float entityNdcYMin = std::numeric_limits<float>::max();
+            float entityNdcYMax = -std::numeric_limits<float>::max();
+            const auto& vp = viewProj.m;
+            bool behindLight = false;
+
+            for (int corner = 0; corner < 8; ++corner) {
+                maths::vec3 worldPos{
+                    (corner & 1) ? localMax.x : localMin.x,
+                    (corner & 2) ? localMax.y : localMin.y,
+                    (corner & 4) ? localMax.z : localMin.z
+                };
+
+                // Manual clip-space projection -- same convention EntityAABBOverlapsPageNDC's own
+                // corner loop above (and PostProcessPass.cpp's god-rays sun projection) already
+                // establishes: maths::mat4 has no vec4 type/operator* to lean on.
+                float clipX = vp[0] * worldPos.x + vp[4] * worldPos.y + vp[8] * worldPos.z + vp[12];
+                float clipY = vp[1] * worldPos.x + vp[5] * worldPos.y + vp[9] * worldPos.z + vp[13];
+                float clipW = vp[3] * worldPos.x + vp[7] * worldPos.y + vp[11] * worldPos.z + vp[15];
+
+                if (clipW <= 1.0e-5f) {
+                    // Degenerate/behind-the-light corner (point light only, sun's ortho projection
+                    // always has w==1) -- conservatively treat this page as overlapping rather than
+                    // risk silently excluding a page that should get a particle-shadow draw, same
+                    // rationale as EntityAABBOverlapsPageNDC's own identical case.
+                    behindLight = true;
+                    break;
+                }
+                float ndcX = clipX / clipW;
+                float ndcY = clipY / clipW;
+                entityNdcXMin = std::min(entityNdcXMin, ndcX);
+                entityNdcXMax = std::max(entityNdcXMax, ndcX);
+                entityNdcYMin = std::min(entityNdcYMin, ndcY);
+                entityNdcYMax = std::max(entityNdcYMax, ndcY);
+            }
+
+            if (behindLight) {
+                return true;
+            }
+            if (entityNdcXMin <= ndcXMax && entityNdcXMax >= ndcXMin &&
+                entityNdcYMin <= ndcYMax && entityNdcYMax >= ndcYMin) {
+                return true;
+            }
+        }
+        return false;
     }
 
     bool VirtualShadowMapPass::EntityAABBOverlapsPageNDC(const EntityDrawRange& range, const core::EntityTransformCPU& xform,

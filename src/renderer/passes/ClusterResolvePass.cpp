@@ -107,13 +107,19 @@ namespace renderer {
         VkImageView swVisBufferAtomicView, const std::vector<VkDescriptorImageInfo>& maskImageInfos,
         VkBuffer wpoGlobalsBuffer, VkBuffer entityTransformBuffer, VkBuffer entityDataBuffer,
         const std::array<MaterialParameters, kMaxMaterials>& materialTable,
-        VkBuffer splineControlPointsBuffer, VkBuffer boneMatricesBuffer) {
+        VkBuffer splineControlPointsBuffer, VkBuffer boneMatricesBuffer,
+        const std::vector<VkDescriptorImageInfo>& lightFunctionImageInfos, const VkDescriptorImageInfo& causticsImageInfo) {
         Shutdown();
 
         m_Device = device;
         m_Allocator = allocator;
         m_RenderExtent = renderExtent;
         uint32_t maskTextureCount = static_cast<uint32_t>(maskImageInfos.size());
+        // F12: retained for InitBinnedResolve() below, same "no duplicate parameter" convention as
+        // m_MaskImageInfos (assigned a few lines below this one).
+        m_LightFunctionImageInfos = lightFunctionImageInfos;
+        m_CausticsImageInfo = causticsImageInfo;
+        uint32_t lightFunctionTextureCount = static_cast<uint32_t>(lightFunctionImageInfos.size());
 
         // Retained purely for InitBinnedResolve() (Phase 1b), called later once
         // renderer::ClusterShadingBinPass also exists -- see that method's own comment for why.
@@ -263,6 +269,52 @@ namespace renderer {
         m_VTVolumeUBO.Create(allocator, sizeof(VTVolumeParams),
             VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, VMA_MEMORY_USAGE_CPU_TO_GPU, /*mapped=*/true);
 
+        // F12: CausticsUBO -- persistently-mapped CPU_TO_GPU, filled once here (never re-uploaded
+        // per frame, same convention as m_VTVolumeUBO just above -- see caustics_projection.glsl's
+        // own CausticsUBO comment for why `timeSeconds` is a function parameter instead of a UBO
+        // field, which is what makes this buffer able to stay static in the first place).
+        // causticsProjection is a fixed world-space "drop Y, keep XZ" planar projection (column-
+        // major, matching maths::mat4's own GLSL-compatible layout): row0 = (1,0,0,0) so world X
+        // feeds output X unchanged, row1 = (0,0,1,0) so world Z feeds output Y (this is what
+        // "projects" a 3D world position down onto the water surface's own 2D UV plane -- there is
+        // no real camera/light involved, unlike a shadow-map-style projection), row3 = (0,0,0,1) so
+        // w stays 1 (an affine map, matching ComputeCausticsModulation's own `causticsCoord.xy /
+        // causticsCoord.w` divide). causticsScale.xy tiles the baked 256x256 caustics pattern every
+        // ~2.5 world units (kCausticsUVScale) -- tuned for this showcase scene's own water-plane
+        // scale, small enough that individual caustic cells read as a real pattern rather than one
+        // giant blurry blob. causticsAnimation.xy is a slow scroll (world-plane-space UV/second,
+        // scaled by the SAME kCausticsUVScale so the drift rate looks consistent regardless of the
+        // tiling frequency chosen above). causticsScale.w (intensity) and causticsAnimation.w (depth
+        // falloff distance) match procedural_light_modulation.glsl's own ComputeUnderwaterCaustics
+        // stand-in constants (kCausticsIntensity = 0.35, kCausticsFalloffDistance = 0.6) so this
+        // real texture-based replacement reads at a comparable strength, not a jarring jump.
+        m_CausticsUBO.Create(allocator, 96, // mat4 (64) + vec4 (16) + vec4 (16).
+            VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, VMA_MEMORY_USAGE_CPU_TO_GPU, /*mapped=*/true);
+        {
+            struct CausticsUBOData {
+                maths::mat4 causticsProjection;
+                float causticsScaleX = 0.0f, causticsScaleY = 0.0f, causticsScaleZ = 0.0f, causticsScaleW = 0.0f;
+                float causticsAnimX = 0.0f, causticsAnimY = 0.0f, causticsAnimZ = 0.0f, causticsAnimW = 0.0f;
+            };
+            static_assert(sizeof(CausticsUBOData) == 96, "CausticsUBOData must match CausticsUBO in caustics_projection.glsl exactly (std140 layout)");
+
+            CausticsUBOData causticsData{};
+            for (int i = 0; i < 16; ++i) causticsData.causticsProjection.m[i] = 0.0f;
+            causticsData.causticsProjection.m[0] = 1.0f;  // row0,col0: world X -> output X.
+            causticsData.causticsProjection.m[9] = 1.0f;  // row1,col2: world Z -> output Y.
+            causticsData.causticsProjection.m[15] = 1.0f; // row3,col3: w stays 1 (affine).
+
+            const float kCausticsUVScale = 1.0f / 2.5f; // Tile every ~2.5 world units.
+            causticsData.causticsScaleX = kCausticsUVScale;
+            causticsData.causticsScaleY = kCausticsUVScale;
+            causticsData.causticsScaleW = 0.35f; // Intensity -- matches ComputeUnderwaterCaustics's own kCausticsIntensity.
+            causticsData.causticsAnimX = 0.04f * kCausticsUVScale; // Slow scroll, world-plane-space UV/second.
+            causticsData.causticsAnimY = 0.025f * kCausticsUVScale;
+            causticsData.causticsAnimW = 0.6f; // Depth falloff distance -- matches ComputeUnderwaterCaustics's own kCausticsFalloffDistance.
+
+            std::memcpy(m_CausticsUBO.MappedData(), &causticsData, sizeof(causticsData));
+        }
+
         // --- Descriptor set layout: 27 bindings, matching ClusterResolve.comp's set = 0 bindings
         // 0..26 exactly (9..11 are the GBuffer outputs, 12 is the WPOGlobalsUBO this shader needs
         // to reapply the same sway deformation the rasterizers already applied, 13 is the material
@@ -272,7 +324,7 @@ namespace renderer {
         // Step 4's renderer::VirtualTextureManager resources -- see SetVirtualTexture()'s own
         // comment, 25 is Substrate's g_OutputMaterialID, 26 is Phase 1 Nanite advanced's
         // SplineControlPointsSSBO). ---
-        VkDescriptorSetLayoutBinding bindings[30]{};
+        VkDescriptorSetLayoutBinding bindings[33]{};
         bindings[0] = { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };         // ClusterCullMetadataSSBO
         bindings[1] = { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };         // CompressedClusterPoolSSBO
         bindings[2] = { 2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };          // g_HWClusterIDImage (r32ui)
@@ -309,17 +361,23 @@ namespace renderer {
         // Skeletal-animation feature: binding 29 -- the first free slot past this shader's full
         // 0-28 range. See ClusterRaster.vert's identical binding comment.
         bindings[29] = { 29, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };        // SkeletalBoneMatricesSSBO
+        // F12 (UE5.8 rendering-parity gap: Texture-based Light Functions + projected Caustics):
+        // bindings 30-32 -- the first free slots past this shader's full 0-29 range. See
+        // ClusterResolve.comp's own identical binding comment.
+        bindings[30] = { 30, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, lightFunctionTextureCount, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // g_LightFunctionTextures[]
+        bindings[31] = { 31, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // g_CausticsTexture
+        bindings[32] = { 32, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };         // CausticsUBO
 
         VkDescriptorSetLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-        layoutInfo.bindingCount = 30;
+        layoutInfo.bindingCount = 33;
         layoutInfo.pBindings = bindings;
         VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &layoutInfo, nullptr, &m_SetLayout));
 
         VkDescriptorPoolSize poolSizes[4]{};
         poolSizes[0] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 10 };  // + material params, shadow page table, shadow feedback, entity transform, entity data, VT feedback, spline control points, bone matrices.
         poolSizes[1] = { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 9 };   // + g_OutputMaterialID (Substrate integration).
-        poolSizes[2] = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 5 + maskTextureCount + kMaxPhysicalPools }; // + g_ShadowPhysicalAtlas, g_PageTable, g_PhysicalPools[], g_SkyViewLUT, g_CloudShadowMap.
-        poolSizes[3] = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 4 };  // + g_ShadowSunLevels, VirtualTextureVolumeUBO.
+        poolSizes[2] = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 6 + maskTextureCount + kMaxPhysicalPools + lightFunctionTextureCount }; // + g_ShadowPhysicalAtlas, g_PageTable, g_PhysicalPools[], g_SkyViewLUT, g_CloudShadowMap, g_CausticsTexture (F12), g_LightFunctionTextures[] (F12).
+        poolSizes[3] = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 5 };  // + g_ShadowSunLevels, VirtualTextureVolumeUBO, CausticsUBO (F12).
 
         VkDescriptorPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
         poolInfo.maxSets = 1;
@@ -396,7 +454,9 @@ namespace renderer {
         // Skeletal-animation feature: binding 29 -- see this shader's own binding comment above.
         VkDescriptorBufferInfo boneMatricesInfo{ boneMatricesBuffer, 0, VK_WHOLE_SIZE };
 
-        VkWriteDescriptorSet writes[20]{};
+        VkDescriptorBufferInfo causticsUBOInfo{ m_CausticsUBO.Handle(), 0, m_CausticsUBO.Size() };
+
+        VkWriteDescriptorSet writes[23]{};
         writes[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_DescriptorSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &clusterMetadataInfo, nullptr };
         writes[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_DescriptorSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &compressedPoolInfo, nullptr };
         writes[2] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_DescriptorSet, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &hwClusterIDInfo, nullptr, nullptr };
@@ -423,7 +483,11 @@ namespace renderer {
         writes[17] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_DescriptorSet, 25, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &outputMaterialIDInfo, nullptr, nullptr };
         writes[18] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_DescriptorSet, 26, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &splineControlPointsInfo, nullptr };
         writes[19] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_DescriptorSet, 29, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &boneMatricesInfo, nullptr };
-        vkUpdateDescriptorSets(m_Device, 20, writes, 0, nullptr);
+        // F12: bindings 30-32 -- see this shader's own binding comment above.
+        writes[20] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_DescriptorSet, 30, 0, lightFunctionTextureCount, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, lightFunctionImageInfos.data(), nullptr, nullptr };
+        writes[21] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_DescriptorSet, 31, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &causticsImageInfo, nullptr, nullptr };
+        writes[22] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_DescriptorSet, 32, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &causticsUBOInfo, nullptr };
+        vkUpdateDescriptorSets(m_Device, 23, writes, 0, nullptr);
 
         // --- Pipeline layout + pipeline ---
         VkPipelineLayoutCreateInfo pipelineLayoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
@@ -497,10 +561,13 @@ namespace renderer {
         m_EntityTransformBuffer = VK_NULL_HANDLE;
         m_EntityDataBuffer = VK_NULL_HANDLE;
         m_MaskImageInfos.clear();
+        m_LightFunctionImageInfos.clear(); // F12
+        m_CausticsImageInfo = VkDescriptorImageInfo{}; // F12
 
         m_ViewParamsBuffer.Destroy();
         m_VTVolumeUBO.Destroy();
         m_MaterialParamsBuffer.Destroy();
+        m_CausticsUBO.Destroy(); // F12
 
         // vmaDestroyImage tolerates VK_NULL_HANDLE for both handle arguments (no-op), matching
         // GpuBuffer::Destroy()'s own null-safe convention.
@@ -609,7 +676,8 @@ namespace renderer {
         // shadow bindings rather than renumbering them. Bindings 20-23 are Step 4's renderer::
         // VirtualTextureManager resources -- see SetVirtualTexture()'s own comment. Binding 24 is
         // Substrate's g_OutputMaterialID, 25 is Phase 1 Nanite advanced's SplineControlPointsSSBO. ---
-        std::array<VkDescriptorSetLayoutBinding, 29> bindings{};
+        uint32_t lightFunctionTextureCount = static_cast<uint32_t>(m_LightFunctionImageInfos.size());
+        std::array<VkDescriptorSetLayoutBinding, 32> bindings{};
         bindings[0] = { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };  // ClusterCullMetadataSSBO
         bindings[1] = { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };  // CompressedClusterPoolSSBO
         bindings[2] = { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };  // g_SortedPixelList
@@ -645,6 +713,12 @@ namespace renderer {
         // Skeletal-animation feature: binding 28 -- the first free slot past this shader's full
         // 0-27 range. See ClusterResolveBinned.comp's own identical binding comment.
         bindings[28] = { 28, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };        // SkeletalBoneMatricesSSBO
+        // F12 (UE5.8 rendering-parity gap: Texture-based Light Functions + projected Caustics):
+        // bindings 29-31 -- the first free slots past this shader's full 0-28 range. See
+        // ClusterResolveBinned.comp's own identical binding comment.
+        bindings[29] = { 29, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, lightFunctionTextureCount, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // g_LightFunctionTextures[]
+        bindings[30] = { 30, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // g_CausticsTexture
+        bindings[31] = { 31, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };         // CausticsUBO
 
         VkDescriptorSetLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
         layoutInfo.bindingCount = static_cast<uint32_t>(bindings.size());
@@ -654,8 +728,8 @@ namespace renderer {
         std::array<VkDescriptorPoolSize, 4> poolSizes{};
         poolSizes[0] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 13 }; // cluster metadata, compressed pool, sorted list, offsets, histogram, material params, shadow page table, shadow feedback, entity transform, entity data, VT feedback, spline control points, bone matrices
         poolSizes[1] = { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 6 };   // color, normal, depth, albedo, roughness-metallic, materialID
-        poolSizes[2] = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 4 };  // view params, WPO globals, shadow sun levels, VT volume
-        poolSizes[3] = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, maskTextureCount + 4 + kMaxPhysicalPools }; // + shadow physical atlas, g_PageTable, g_PhysicalPools[], g_SkyViewLUT, g_CloudShadowMap
+        poolSizes[2] = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 5 };  // view params, WPO globals, shadow sun levels, VT volume, CausticsUBO (F12)
+        poolSizes[3] = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, maskTextureCount + 5 + kMaxPhysicalPools + lightFunctionTextureCount }; // + shadow physical atlas, g_PageTable, g_PhysicalPools[], g_SkyViewLUT, g_CloudShadowMap, g_CausticsTexture (F12), g_LightFunctionTextures[] (F12)
 
         VkDescriptorPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
         poolInfo.maxSets = 1;
@@ -687,8 +761,9 @@ namespace renderer {
         VkDescriptorBufferInfo entityDataInfo{ m_EntityDataBuffer, 0, VK_WHOLE_SIZE };
         VkDescriptorBufferInfo splineControlPointsInfo{ m_SplineControlPointsBuffer, 0, VK_WHOLE_SIZE };
         VkDescriptorBufferInfo boneMatricesInfo{ m_BoneMatricesBuffer, 0, VK_WHOLE_SIZE };
+        VkDescriptorBufferInfo causticsUBOInfo{ m_CausticsUBO.Handle(), 0, m_CausticsUBO.Size() }; // F12
 
-        std::array<VkWriteDescriptorSet, 19> writes{};
+        std::array<VkWriteDescriptorSet, 22> writes{};
         writes[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ResolveBinnedSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &clusterMetaInfo, nullptr };
         writes[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ResolveBinnedSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &compressedPoolInfo, nullptr };
         writes[2] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ResolveBinnedSet, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &sortedListInfo, nullptr };
@@ -712,6 +787,10 @@ namespace renderer {
         writes[16] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ResolveBinnedSet, 24, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &outputMaterialIDInfo, nullptr, nullptr };
         writes[17] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ResolveBinnedSet, 25, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &splineControlPointsInfo, nullptr };
         writes[18] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ResolveBinnedSet, 28, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &boneMatricesInfo, nullptr };
+        // F12: bindings 29-31 -- see this shader's own binding comment above.
+        writes[19] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ResolveBinnedSet, 29, 0, lightFunctionTextureCount, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, m_LightFunctionImageInfos.data(), nullptr, nullptr };
+        writes[20] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ResolveBinnedSet, 30, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &m_CausticsImageInfo, nullptr, nullptr };
+        writes[21] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ResolveBinnedSet, 31, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &causticsUBOInfo, nullptr };
         vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
 
         VkPushConstantRange pushRange{ VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(uint32_t) }; // binIndex

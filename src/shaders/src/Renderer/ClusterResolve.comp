@@ -59,7 +59,24 @@
 #include "include/substrate_bsdf.glsl"
 #include "include/terrain_shading.glsl" // Phase 7b (UE5.8 parity roadmap, terrain heightfield)
 #include "include/water_params.glsl" // Wave 2: kWaterLevel, for the underwater-caustics gate below.
-#include "include/procedural_light_modulation.glsl" // Wave 2 (UE5.8 caustics/light-function parity)
+
+// F12 (UE5.8 rendering-parity gap: Texture-based Light Functions + projected Caustics): replaces
+// Wave 2's own procedural_light_modulation.glsl stand-ins (ComputeUnderwaterCaustics/
+// EvaluateSunLightFunction) with the real texture-backed implementations these two files always
+// intended to provide -- see each file's own F12 header comment for why they were 100% dead code
+// until this pipeline layout finally grew the bindings they need. procedural_light_modulation.glsl
+// itself is deliberately left in place, unmodified and un-#included (CLAUDE.md-adjacent "no file
+// deletion" convention already followed elsewhere in this codebase) -- it remains valid, self-
+// contained GLSL, simply no longer wired into this shader's own include chain.
+#define LIGHT_FUNCTIONS_SET 0
+#define LIGHT_FUNCTIONS_BINDING 30
+#include "include/light_functions.glsl"
+#define CAUSTICS_TEXTURE_SET 0
+#define CAUSTICS_TEXTURE_BINDING 31
+#define CAUSTICS_UBO_SET 0
+#define CAUSTICS_UBO_BINDING 32
+#include "include/caustics_projection.glsl"
+
 #include "include/visbuffer_arbitration.glsl"
 
 #define MASK_ARRAY_SET 0
@@ -512,13 +529,13 @@ void main() {
         // mixMaskSharpnessScale is the Debug-only live blend-sharpness knob (1.0 in Release).
         float mixMask = 0.0;
         mat = ApplySubstrateHorizontalMix(mat, worldPos, g_ViewParams.mixMaskSharpnessScale, mixMask);
-        // Wave 2 (UE5.8 water/caustics parity): submerged terrain only -- see
-        // ComputeUnderwaterCaustics's own comment for why this is a procedural, texture-free
-        // approximation. A no-op (1.0) everywhere else, incl. every non-terrain material. Reads
-        // cluster.materialID (the pre-mix identity), not `mat`, since mixing never changes what
-        // counts as "terrain" for this purpose.
+        // F12 (UE5.8 rendering-parity gap: projected Caustics): submerged terrain only -- real
+        // texture-based caustics (ComputeCausticsModulation, caustics_projection.glsl), replacing
+        // Wave 2's own procedural ComputeUnderwaterCaustics stand-in. A no-op (1.0) everywhere else,
+        // incl. every non-terrain material. Reads cluster.materialID (the pre-mix identity), not
+        // `mat`, since mixing never changes what counts as "terrain" for this purpose.
         float causticsModulation = (cluster.materialID == MATERIAL_ID_TERRAIN)
-            ? ComputeUnderwaterCaustics(worldPos, g_ViewParams.timeSeconds, kWaterLevel)
+            ? ComputeCausticsModulation(worldPos, normal, kWaterLevel, g_ViewParams.timeSeconds)
             : 1.0;
         gbufferMaterialID = materialSlot;
 
@@ -591,11 +608,22 @@ void main() {
         float glintFootprint = perspNorm / max(g_ViewParams.viewportSize.y, 1.0);
         vec3 glint = EvaluateSubstrateGlint(mat, normal, viewDir, lightDir, worldPos, glintFootprint,
             g_ViewParams.glintDensityScale, g_ViewParams.glintIntensityScale);
-        // Wave 2 (UE5.8 caustics/light-function parity): both are subtle direct-term modulations,
-        // multiplied together into a single factor -- causticsModulation is 1.0 (no-op) everywhere
-        // except submerged terrain (see its own computation above); the sun light function is a
-        // gentle always-on angular banding (see EvaluateSunLightFunction's own comment).
-        float sunLightFunction = EvaluateSunLightFunction(worldPos, g_ViewParams.sunDirection);
+        // F12 (UE5.8 rendering-parity gap: Texture-based Light Functions): both are subtle
+        // direct-term modulations, multiplied together into a single factor -- causticsModulation is
+        // 1.0 (no-op) everywhere except submerged terrain (see its own computation above); the sun's
+        // Light Function samples a REAL baked texture (kSunLightFunctionIndex == 0, the "Sunburst"
+        // pattern -- see GenerateLightFunctionTextures.comp's own PatternSunburst()) via a pseudo
+        // light position placed far along -sunDirection (a directional light has no real world
+        // position for EvaluateLightFunctionRadial's own angle-from-light computation to use --
+        // exactly the convention procedural_light_modulation.glsl's own EvaluateSunLightFunction,
+        // the stand-in this replaces, already established). Deliberately kept subtle (mix toward
+        // 1.0, never a hard gobo cutout across the whole scene's primary light) -- same rationale
+        // as that stand-in's own kIntensity comment.
+        const int kSunLightFunctionIndex = 0;
+        const float kSunLightFunctionIntensity = 0.35;
+        vec3 sunPseudoLightPos = worldPos - g_ViewParams.sunDirection * 1000.0;
+        float sunLightFunctionSample = EvaluateLightFunctionRadial(kSunLightFunctionIndex, worldPos, sunPseudoLightPos, 0.0, 0.6);
+        float sunLightFunction = mix(1.0, sunLightFunctionSample, kSunLightFunctionIntensity);
         float sunModulation = causticsModulation * sunLightFunction;
         // kEmissiveScale converts this codebase's existing artist-authored, unitless emissive
         // multiplier (renderer::MaterialParameters::emissive, authored in a small ~0-3 range across
@@ -741,8 +769,12 @@ void main() {
                 }
                 vec2 dbgPagePos = clamp((dbgNdc.xy * 0.5 + 0.5) * float(SHADOW_PAGES_PER_AXIS),
                     vec2(0.0), vec2(float(SHADOW_PAGES_PER_AXIS) - 1.0e-4));
-                uvec2 dbgPageCoord = uvec2(floor(dbgPagePos));
-                uint dbgLogicalPageID = ShadowLogicalPageID(level, dbgPageCoord);
+                uvec2 dbgRasterCoord = uvec2(floor(dbgPagePos));
+                // Feature F14: same raster->wrapped conversion SampleSunShadowVSM performs -- see
+                // that function's own comment (shadow_sun_sampling.glsl) -- so this debug view's
+                // residency check matches reality instead of reading a stale pre-recenter slot.
+                ivec2 dbgWrappedCoord = ShadowWrapPageCoord(ivec2(dbgRasterCoord) + g_ShadowSunLevels.windowStartPage[level].xy);
+                uint dbgLogicalPageID = ShadowLogicalPageID(level, uvec2(dbgWrappedCoord));
                 bool dbgResident = IsShadowPageResident(dbgLogicalPageID);
                 finalColor = kLevelColors[level] * (dbgResident ? 1.0 : 0.35);
                 break;

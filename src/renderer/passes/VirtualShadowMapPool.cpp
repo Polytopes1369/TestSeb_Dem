@@ -254,8 +254,18 @@ namespace renderer {
         if (m_LRULeastRecentPage == kInvalidShadowPhysicalPage) {
             return; // Nothing resident to evict.
         }
-        uint32_t physicalLayer = m_LRULeastRecentPage;
-        uint32_t logicalPageID = m_LRUNodes[physicalLayer].logicalPageID;
+        // Delegates to InvalidatePage (VSM re-centering, Feature F14) -- identical unlink/free/
+        // page-table-writeback body, just keyed by "whichever page is currently least-recently-
+        // used" instead of an explicit logicalPageID.
+        InvalidatePage(cmd, m_LRUNodes[m_LRULeastRecentPage].logicalPageID);
+    }
+
+    void VirtualShadowMapPool::InvalidatePage(VkCommandBuffer cmd, uint32_t logicalPageID) {
+        assert(logicalPageID < m_LogicalToPhysical.size());
+        uint32_t physicalLayer = m_LogicalToPhysical[logicalPageID];
+        if (physicalLayer == kInvalidShadowPhysicalPage) {
+            return; // Not resident -- nothing to invalidate.
+        }
 
         UnlinkFromLRUList(physicalLayer);
         m_LogicalToPhysical[logicalPageID] = kInvalidShadowPhysicalPage;

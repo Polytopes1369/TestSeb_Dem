@@ -11,6 +11,13 @@
 // front-layer specular reflection identical to hero/glass's own) -- set 0 is 7 bindings here versus
 // TessellationPass's 14.
 //
+// F2b (UE5.8 rendering-parity gap: Lighting Channels) verification note: this pass has no MegaLights
+// term to AND a channel mask against (see the paragraph above -- confirmed by re-reading WaterForward
+// .frag itself, which never selects a MegaLight at all). Lighting Channels are therefore a genuine
+// no-op here, not an unclosed gap -- TransparentForwardPass and MegaLightsFinalShade.comp are where
+// the F2b gate actually lives (see MegaLightChannelMask()/MaterialLightingChannelMask()'s own
+// comments, megalights_types.glsl / material_params.glsl).
+//
 // --- Refraction mechanism ---
 // This pipeline is forward-hybrid: the caller's own `colorImage` IS the final composited frame at
 // the point this pass runs (recorded LAST, after TransparentForwardPass/TessellationPass --

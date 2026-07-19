@@ -144,15 +144,21 @@ layout(std140, set = 0, binding = 3) uniform PostProcessParamsUBO {
 
     // Atmos weather system, Subtask 3: camera forward axis, see ViewZFromWorldPos()'s own comment.
     vec3 cameraForward;
-    float _padFog;
+    // F3 (Fog Screen Space Scattering): repurposes what was _padFog (no UBO-size change -- the
+    // PostProcessParamsUBO static_assert on the CPU side still checks 448 bytes). 1 (default,
+    // config::atmos::FOG_SCREEN_SPACE_SCATTERING_ENABLED) = ApplyVolumetricFog samples g_FogScattered
+    // (renderer::FogScreenSpaceScatteringPass's own depth-aware-blurred output) instead of directly
+    // re-sampling the raw g_VolumetricFog 3D texture -- see that function's own updated comment.
+    uint useFogScreenSpaceScattering;
 } g_Params;
 
 layout(set = 0, binding = 4) uniform sampler2D g_Bloom;
 layout(set = 0, binding = 5) uniform sampler2D g_Depth;             // renderer::ClusterResolvePass depth, render-res, bilinear-upsampled.
 layout(set = 0, binding = 6) uniform sampler2D g_RefractionOffset;  // renderer::TransparentForwardPass's own second attachment, render-res, bilinear-upsampled.
 layout(set = 0, binding = 7) uniform sampler2D g_SkyViewLUT;        // renderer::AtmosSkyPass's own Sky-View LUT (Atmos Subtask 2).
-layout(set = 0, binding = 8) uniform sampler3D g_VolumetricFog;     // renderer::AtmosVolumetricFogPass's own integrated fog grid (Atmos Subtask 3).
+layout(set = 0, binding = 8) uniform sampler3D g_VolumetricFog;     // renderer::AtmosVolumetricFogPass's own integrated fog grid (Atmos Subtask 3) -- F3's own disabled-fallback source.
 layout(set = 0, binding = 9) uniform sampler2D g_Clouds;            // renderer::AtmosCloudsPass's own half-resolution cloud buffer (Atmos Subtask 4).
+layout(set = 0, binding = 10) uniform sampler2D g_FogScattered;     // F3: renderer::FogScreenSpaceScatteringPass's own depth-aware-blurred fog buffer, display-res.
 
 // Radial per-channel UV offset -- red sampled slightly closer to center, blue slightly further out
 // (the classic lateral chromatic aberration look), scaled by distance-from-center squared so the
@@ -268,10 +274,25 @@ vec3 ApplyHeightFog(vec3 color, vec3 worldPos, vec3 cameraPos) {
 // must agree with (AtmosVolumetricFog.comp's own FroxelToWorld() is the writer-side counterpart).
 // `hitScene` misses clamp to the fog's own far distance (fully accumulated) rather than skip the
 // blend entirely -- even a sky pixel benefits from near-horizon god-ray-style in-scattering.
+//
+// F3 (Fog Screen Space Scattering): when g_Params.useFogScreenSpaceScattering is set (the default),
+// this samples g_FogScattered instead of re-deriving (viewZ, froxelW) and sampling g_VolumetricFog
+// directly -- renderer::FogScreenSpaceScatteringPass's own mode-0 dispatch already performed THIS
+// EXACT lookup per pixel (see FogScreenSpaceScattering.comp's own ExtractFogSample(), a byte-for-byte
+// copy of the math below) before depth-aware-bilaterally blurring it, so g_FogScattered already IS
+// "this pixel's fog sample, softened" -- a single 2D texture() fetch here, cheaper than the original
+// 3D lookup and visibly smoother across a light shaft. The original direct g_VolumetricFog path stays
+// available (Debug ImGui "Atmos" tab toggle, config::atmos::FOG_SCREEN_SPACE_SCATTERING_ENABLED) for
+// an A/B comparison against the pre-F3 crisp-froxel look.
 vec3 ApplyVolumetricFog(vec3 color, vec2 uv, vec3 worldPos, bool hitScene) {
-    float viewZ = hitScene ? dot(worldPos - g_Params.cameraPositionWorld, g_Params.cameraForward) : ATMOS_FOG_FAR_Z;
-    float froxelW = ViewZToFroxelW(viewZ);
-    vec4 fogSample = texture(g_VolumetricFog, vec3(uv, froxelW));
+    vec4 fogSample;
+    if (g_Params.useFogScreenSpaceScattering != 0u) {
+        fogSample = texture(g_FogScattered, uv);
+    } else {
+        float viewZ = hitScene ? dot(worldPos - g_Params.cameraPositionWorld, g_Params.cameraForward) : ATMOS_FOG_FAR_Z;
+        float froxelW = ViewZToFroxelW(viewZ);
+        fogSample = texture(g_VolumetricFog, vec3(uv, froxelW));
+    }
     // fogSample.a (transmittance) empirically confirmed ~1.0 across this scene (diagnostic false-
     // color pass during this bug's investigation, see this fix's own commit message) -- the froxel
     // grid's own extinction never gets thick enough here to meaningfully occlude the scene, so no

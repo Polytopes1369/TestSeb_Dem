@@ -170,6 +170,18 @@ inline bool SPOT_LIGHTS_ENABLED = true;
 inline bool RECT_LIGHTS_ENABLED = true;
 inline bool PHOTOMETRIC_LIGHTS_ENABLED = true;
 inline float TYPED_LIGHT_INTENSITY_SCALE = 1.0f;
+
+// F2b (UE5.8 rendering-parity gap: Lighting Channels) -- renderer::AtmosVolumetricFogPass::
+// RecordUpdate reads this every frame to fill AtmosVolumetricFog.comp's own
+// pc.fogLightingChannelMask (see that push-constant field's own comment). Bit 0/1/2 = channel 0/1/2.
+// Defaults to 0x7 (every channel) so a scene that never opens the Debug "MegaLights" ImGui tab's
+// "Fog Lighting Channels" checkboxes keeps its exact pre-F2b visuals (fog receives every light
+// regardless of that light's own channel, same as before this feature existed) -- toggling a bit off
+// live demonstrates the F2b masking mechanism end-to-end without touching any baked scene data (see
+// renderer::GenerateProceduralLights()/GenerateShowcaseMaterialTable()'s own per-light/per-entity
+// PackMegaLightChannelMask()/MaterialParameters::lightingChannelMask authoring API for the
+// non-debug, scene-authored equivalent of this same mask).
+inline uint32_t FOG_LIGHTING_CHANNEL_MASK = 0x7u;
 } // namespace megalights
 
 namespace postprocess {
@@ -583,6 +595,14 @@ inline float YEAR_LENGTH_SECONDS = 180.0f; // Simulated seconds per full seasona
 inline float SEASONAL_TEMPERATURE_AMPLITUDE_CELSIUS = 12.0f; // Peak-to-baseline swing the seasonal cycle adds/subtracts from TEMPERATURE_CELSIUS (summer = +amplitude, winter = -amplitude).
 inline float SEASONAL_PRECIP_AMPLITUDE = 0.35f; // Peak-to-baseline swing the seasonal cycle adds/subtracts from PRECIPITATION_INTENSITY's target (winter = wetter, summer = drier).
 inline float SEASONAL_SUN_ELEVATION_AMPLITUDE_DEGREES = 15.0f; // Peak seasonal sweep applied to the scene's fixed base sun elevation angle (see ClusterRenderPipeline::Init()'s own sun-direction comment) -- a modest elevation-only sweep, no azimuth/axial-tilt astronomy.
+
+// F3 (UE5.8 rendering-parity gap: Fog Screen Space Scattering) -- see renderer::
+// FogScreenSpaceScatteringPass's own class comment. Live, Debug-tunable (main.cpp's "Atmos" ImGui
+// tab); not mirrored into the per-hardware-tier EngineConfig_{Low,...}.h profiles (same rationale as
+// DYNAMIC_WEATHER_ENABLED above: an artistic/visual toggle, not a GPU performance/quality axis this
+// demo's fixed showcase scene needs to scale down for a lower-end profile).
+inline bool FOG_SCREEN_SPACE_SCATTERING_ENABLED = true; // Master toggle -- see renderer::PostProcessPass::Settings::fogScreenSpaceScatteringEnabled.
+inline float FOG_SCATTER_BLUR_RADIUS_PIXELS = 12.0f; // FogScreenSpaceScattering.comp's own Gaussian kernel half-width, in display-resolution pixels.
 } // namespace atmos
 
 // GPU particle system (particle_system_integration_plan.md, Subtask 6: Final Integration) -- live
@@ -653,6 +673,17 @@ struct EmitterConfig {
         { 1.0f, 1.0f, 1.0f, 1.0f }, { 1.0f, 1.0f, 1.0f, 1.0f }
     };
     float sizeCurve[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+
+    // Feature F7 (UE5.7/5.8 Niagara parity: shadow-casting particles) -- deliberately inserted HERE,
+    // right after sizeCurve, rather than appended at this struct's very end like every other trailing
+    // field below: EMITTERS[0]/[1]'s own positional aggregate initializers (below) already list
+    // values through sizeCurve and stop there, so a field inserted immediately after it can still be
+    // explicitly set to `true` for exactly those two emitters by appending one more trailing value to
+    // their existing initializer lists, with zero risk of silently reinterpreting any later field's
+    // position (no existing initializer lists anything past sizeCurve today). See renderer::
+    // ParticleSystemPass::EmitterParams::castShadows's own declaration comment for the full contract
+    // -- mirrored 1:1 here, just under this config-authoring struct's own name.
+    bool castShadows = false;
 
     // Subtask C2 (Niagara-parity roadmap: screen-space depth-buffer collision) -- deliberately added
     // at the END of this struct (same convention module-stack roadmap subtask A3's own trailing
@@ -732,7 +763,7 @@ inline EmitterConfig EMITTERS[kMaxEmitters] = {
             { 0.55f, 0.15f, 0.05f, 0.8f }, // Age 0.67 -- cooling into a dim, dark red ember.
             { 0.0f, 0.0f, 0.0f, 0.0f }     // Age 1.00 -- fully extinguished/transparent at death.
         },
-        /*sizeCurve*/ { 0.6f, 1.0f, 0.8f, 0.0f } },
+        /*sizeCurve*/ { 0.6f, 1.0f, 0.8f, 0.0f }, /*castShadows*/ true },
     // Ambient Dust keeps an explicit FLAT curve matching its own Base Color exactly (rather than
     // relying on EmitterConfig's own in-class default, which only matches the DEFAULT Base Color
     // (1,1,1,1), not this emitter's actual dusty blue-gray one) -- see EmitterConfig::colorCurve's own
@@ -750,7 +781,7 @@ inline EmitterConfig EMITTERS[kMaxEmitters] = {
             { 0.6f, 0.7f, 0.85f, 0.5f }, { 0.6f, 0.7f, 0.85f, 0.5f },
             { 0.6f, 0.7f, 0.85f, 0.5f }, { 0.6f, 0.7f, 0.85f, 0.5f }
         },
-        /*sizeCurve*/ { 1.0f, 1.0f, 1.0f, 1.0f } },
+        /*sizeCurve*/ { 1.0f, 1.0f, 1.0f, 1.0f }, /*castShadows*/ true },
     EmitterConfig{},
     EmitterConfig{ /*active*/ true, /*position*/ 12.0f, -0.6f, 12.0f, /*spawnRate*/ 60.0f,
         /*color*/ 0.85f, 0.92f, 1.0f, 0.65f, /*size*/ 0.18f, 0.40f, /*lifetime*/ 0.8f, 1.7f,

@@ -404,6 +404,13 @@ bool ClusterRenderPipeline::Init(
   m_MaskGenerator.Init(createInfo.device, createInfo.allocator,
                        createInfo.commandPool, createInfo.queue);
 
+  // F12 (UE5.8 rendering-parity gap: Texture-based Light Functions + projected Caustics):
+  // procedurally generates the Light Function gobo array + caustics texture once, before m_Resolve
+  // below (its sole consumer) is initialized -- same "producer generator Init's before any pass
+  // binds its output" convention as m_MaskGenerator just above.
+  m_LightFunctionGenerator.Init(createInfo.device, createInfo.allocator,
+                                createInfo.commandPool, createInfo.queue);
+
   std::array<VkFormat, 2> visBufferFormats{createInfo.visBufferFormat,
                                            createInfo.visBufferFormat};
   m_HardwareRaster.Init(createInfo.device,
@@ -444,7 +451,9 @@ bool ClusterRenderPipeline::Init(
       createInfo.entityDataBuffer,
       createInfo.materialTable.params,
       m_SplineControlPointsBuffer.Handle(),
-      m_SkeletalAnimator.GetBoneMatricesBuffer());
+      m_SkeletalAnimator.GetBoneMatricesBuffer(),
+      m_LightFunctionGenerator.GetLightFunctionImageInfos(),
+      m_LightFunctionGenerator.GetCausticsImageInfo());
 
   // Phase 1b: the shading-bin sort pass needs m_Resolve's own 5 output image views (its Classify
   // stage writes background pixels directly into them, see ClusterShadingBinPass's own class
@@ -896,6 +905,13 @@ bool ClusterRenderPipeline::Init(
     return false;
   }
 
+  // Feature F7 (shadow-casting particles): one-time deferred wiring -- m_VirtualShadowMap.Init()
+  // (much earlier above) could not take m_ParticleSystem's buffers as an Init() parameter the way
+  // entityTransformBuffer/entityDataBuffer above are, since m_ParticleSystem itself did not exist
+  // yet at that point -- see VirtualShadowMapPass::SetParticleSystem's own comment for the full
+  // "deferred binding, same pattern as SetVirtualShadowMap" rationale.
+  m_VirtualShadowMap.SetParticleSystem(m_ParticleSystem);
+
   // GPU-instanced procedural vegetation scatter (UE5.8 rendering-parity gap G2) -- grass/shrub/rock
   // instances across the terrain. Depends on m_VirtualShadowMap + m_WorldProbes (forward lighting,
   // both Init'd just above) and m_HZB (per-instance occlusion cull, Init'd far earlier). Draws onto
@@ -1016,10 +1032,19 @@ bool ClusterRenderPipeline::Init(
   // exists), not just bound once here. `depthView`/`refractionOffsetView` (Phase PP3) ARE just
   // bound once here -- both keep a fixed identity for this pipeline's entire lifetime (see
   // PostProcessPass::Init's own comment).
+  // F3 (UE5.8 rendering-parity gap: Fog Screen Space Scattering) -- must Init before m_PostProcess so
+  // its own GetOutputView() already exists for m_PostProcess.Init's own g_FogScattered binding (same
+  // "producer Init's before consumer Init's" convention as m_DepthOfField/m_Bloom above). Reads
+  // m_Resolve's depth (its only other input besides m_AtmosFog's own 3D texture/sampler, already
+  // Init'd -- see ClusterRenderPipeline.h's own m_AtmosFog placement comment).
+  m_FogScatter.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
+      m_DisplayExtent, m_Resolve.GetOutputDepthView(), m_AtmosFog.GetIntegratedFogView(), m_AtmosFog.GetFogSampler());
+
   m_PostProcess.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
       m_DisplayExtent, m_DepthOfField.GetOutputView(), m_Bloom.GetOutputView(),
       m_Resolve.GetOutputDepthView(), m_TransparentForward.GetRefractionOffsetView(),
-      m_AtmosSky.GetSkyViewLUTView(), m_AtmosFog.GetIntegratedFogView(), m_AtmosClouds.GetCloudView());
+      m_AtmosSky.GetSkyViewLUTView(), m_AtmosFog.GetIntegratedFogView(), m_AtmosClouds.GetCloudView(),
+      m_FogScatter.GetOutputView());
 
 #ifndef NDEBUG
   // Two-tier SDF ray march DEBUG VISUALIZATION (see ClusterRenderPipeline.h's own comment on
@@ -1432,6 +1457,7 @@ void ClusterRenderPipeline::Shutdown() {
   // top-of-function Shutdown() call, never explicitly on a real pipeline teardown) -- fixed here
   // alongside adding m_Bloom's own equivalent call.
   m_PostProcess.Shutdown();
+  m_FogScatter.Shutdown(); // F3 -- Init'd right before m_PostProcess above, shut down right after it (reverse order).
   m_Bloom.Shutdown();
   m_DepthOfField.Shutdown();
   m_DepthOfFieldAccumulation.Shutdown();
@@ -1479,6 +1505,7 @@ void ClusterRenderPipeline::Shutdown() {
   m_SoftwareRaster.Shutdown();
   m_HardwareRaster.Shutdown();
   m_MaskGenerator.Shutdown();
+  m_LightFunctionGenerator.Shutdown(); // F12
   m_OcclusionCulling.Shutdown();
   m_Streaming.Shutdown();
   m_LODSelection.Shutdown();
@@ -2097,6 +2124,10 @@ void ClusterRenderPipeline::RecordFrameEarly(VkCommandBuffer cmdEarly,
         gpu.spriteOrientationMode = cfg.spriteOrientationMode;
         gpu.subVariationStrength = cfg.subVariationStrength;
 
+        // Feature F7 (shadow-casting particles): same "copy the live ImGui-edited config value into
+        // this frame's GPU struct" pattern as every field above.
+        gpu.castShadows = cfg.castShadows ? 1u : 0u;
+
         if (cfg.active) {
           m_ParticleSpawnAccumulator[i] += cfg.spawnRate * particleDeltaTimeSeconds;
         }
@@ -2175,6 +2206,19 @@ void ClusterRenderPipeline::RecordFrameEarly(VkCommandBuffer cmdEarly,
 #ifndef NDEBUG
       m_GpuProfiler.EndZone(cmdEarly);
 #endif
+
+      // Feature F7 (shadow-casting particles): must run AFTER RecordSimulate/RecordSort just above
+      // (records its own explicit VkBarrier2 between their compute-shader writes and this call's own
+      // vertex-shader reads, see VirtualShadowMapPass::RecordParticleShadows' own comment) so this
+      // frame's freshly-simulated alive-particle positions/alive-list/indirect-draw-args are what get
+      // rendered into whichever VSM pages m_VirtualShadowMap.RecordBeginFrame() (much earlier this
+      // same frame, see [1] above) already rendered entity geometry into -- layers a light-facing,
+      // alpha-tested particle-shadow footprint on top of those pages' own depth, LOAD_OP_LOAD (never
+      // erasing what RecordBeginFrame already captured). Deliberately NOT wrapped in its own
+      // GpuProfiler zone (unlike every RecordXxx() call above) -- this codebase's Debug-only
+      // per-pass GPU timestamp profiler is being rolled out by a concurrent effort; leaving this one
+      // call unzoned avoids colliding with that in-flight work.
+      m_VirtualShadowMap.RecordParticleShadows(cmdEarly, m_ParticleSystem);
     }
 
     // 4. Secondary-bounce injection into m_SurfaceCache's own radiance atlas + the TLAS refit that
@@ -3787,6 +3831,7 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
       ppSettings.fogHeightOffset = config::postprocess::FOG_HEIGHT_OFFSET;
       ppSettings.fogStartDistance = config::postprocess::FOG_START_DISTANCE;
       ppSettings.fogMaxOpacity = config::postprocess::FOG_MAX_OPACITY;
+      ppSettings.fogScreenSpaceScatteringEnabled = config::atmos::FOG_SCREEN_SPACE_SCATTERING_ENABLED;
       ppSettings.godRaysIntensity = config::postprocess::GOD_RAYS_ENABLED ? config::postprocess::GOD_RAYS_INTENSITY : 0.0f;
       ppSettings.godRaysDecay = config::postprocess::GOD_RAYS_DECAY;
       ppSettings.godRaysDensity = config::postprocess::GOD_RAYS_DENSITY;
@@ -3814,6 +3859,16 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
       m_AtmosFog.RecordUpdate(cmdLate, cameraPositionWorld, cameraFrameInfo.forward, maths::vec3{0.0f, 1.0f, 0.0f},
           cameraFrameInfo.fovYRadians, cameraFrameInfo.aspectRatio,
           m_SceneLights.sun.direction, m_SceneLights.sun.color, m_SceneLights.sun.intensity, m_FrameIndex);
+
+      // F3 (Fog Screen Space Scattering): refresh immediately after its one producer (m_AtmosFog,
+      // just above) and before its one consumer (m_PostProcess.RecordComposite, below) -- same
+      // producer/consumer-adjacency convention m_AtmosFog's own RecordUpdate call site already
+      // documents. blurRadiusPixels forced to 0 when the master toggle is off, which makes
+      // FogScreenSpaceScattering.comp's own per-pixel work degenerate to a pure passthrough of the
+      // freshly-extracted (unblurred) fog sample -- see FogScreenSpaceScatteringPass::RecordScatter's
+      // own comment for why this pass is always recorded rather than conditionally skipped.
+      m_FogScatter.RecordScatter(cmdLate, invViewProj, cameraPositionWorld, cameraFrameInfo.forward,
+          config::atmos::FOG_SCREEN_SPACE_SCATTERING_ENABLED ? config::atmos::FOG_SCATTER_BLUR_RADIUS_PIXELS : 0.0f);
 
       // Atmos weather system, Subtask 4: refresh the half-res cloud raymarch immediately alongside
       // the fog update above -- same producer/consumer-adjacency reasoning.

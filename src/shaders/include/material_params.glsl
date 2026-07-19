@@ -103,9 +103,28 @@ struct MaterialParams {
     // substrate_bsdf.glsl's EvaluateSubstrateMaterial via include/iridescence_bsdf.glsl.
     float iridescenceAmount;
     float iridescenceThickness;
-    float _padIridescence0;
+    // F2b (UE5.8 rendering-parity gap: Lighting Channels) -- this entity/material's OWN 3-bit
+    // reception mask (channels 0/1/2), repurposing what was _padIridescence0 (no struct-size change,
+    // same "occupy a spare pad float" convention SubstrateSlab::sssProfileScale/glintDensity/
+    // glintIntensity already established -- see renderer::MaterialParameters::lightingChannelMask's
+    // own comment, MaterialParameterTable.h). Stored as a plain float-encoded small integer (0-7,
+    // decoded via MaterialLightingChannelMask() below), NOT a bitfield packed into an existing float
+    // the way MegaLight::iesProfileAndFlags packs its channel mask into spare integer bits -- this
+    // struct has no integer field to steal bits from, and a whole 32-bit float slot was already free.
+    float lightingChannelMask;
     float _padIridescence1;
 };
+
+// F2b: decodes MaterialParams::lightingChannelMask into the 3-bit mask MegaLightChannelMask()
+// (megalights_types.glsl) is ANDed against. Raw-zero (every material authored before F2b existed,
+// e.g. every GenerateShowcaseMaterialTable() recipe that never touches this field) decodes as
+// channel-0-ONLY -- matching MegaLightChannelMask()'s own identical "raw zero == channel 0" default,
+// so a scene that never assigns either mask keeps its exact pre-F2b behavior (every light on channel
+// 0 AND-ed against every entity on channel 0 -- always non-zero, never gated).
+uint MaterialLightingChannelMask(MaterialParams mat) {
+    uint raw = uint(round(mat.lightingChannelMask)) & 0x7u;
+    return (raw == 0u) ? 1u : raw;
+}
 
 // Phase 7b (UE5.8 parity roadmap, terrain heightfield): mirror of renderer::kTerrainMaterialID
 // (MaterialParameterTable.h) -- keep in sync.

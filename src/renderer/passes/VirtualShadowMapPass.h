@@ -11,17 +11,36 @@
 //     "done exactly as in UE 5.8" scope decision even though this demo authors only one
 //     point light for verification.
 //
-// --- Why the sun's clipmap windows never move (deliberate simplification vs. real UE5.8) ---
-// A real VSM clipmap re-centers its levels on the CAMERA every frame (renderer::GlobalSDFPass's own
-// SDF clipmap does exactly this, toroidally). This pass does not: this engine's scene is static and
-// bounded (a single ~6.4m-radius sphere, see the scene-bounds read in Init()) and the demo camera
-// only ever orbits it, so a level whose FIXED radius already covers the whole bounding sphere never
-// needs to move to keep up with the camera -- there is nothing outside it to ever come into view.
-// Each level's projection is therefore computed ONCE at Init() (only the VIEW half, which depends
-// on the sun's current direction, is recomputed every RecordBeginFrame() call). This is a
-// deliberate, documented scope trim for THIS bounded demo scene, not an oversight -- see this
-// phase's own plan for the full rationale, and Phase 4 (dynamic scenes) as the natural place to
-// revisit camera-following if this engine ever grows an unbounded/open scene.
+// --- Sun clipmap camera re-centering (Feature F14) ---
+// Each sun level's projection HALF-EXTENT (radius_L = kSunBaseRadius * 2^L) is still fixed for this
+// pass' entire lifetime (computed once at Init(), see m_SunLevelProj), but the window it covers now
+// re-centers on the CAMERA every RecordBeginFrame() call -- mirroring renderer::GlobalSDFPass's own
+// toroidal clipmap streaming (see that class' own header comment for the general technique) and
+// renderer::WorldProbeGridPass's identical camera-snapped grid, adapted from a directly-addressed
+// wrapped 3D image (GlobalSDF) to this pass' page-TABLE-indirected pool (VirtualShadowMapPool):
+//   - Per level, per frame: project the camera onto the light's own (right, up) basis (the exact
+//     s/u vectors maths::mat4::LookAt derives internally -- recomputed explicitly here so this
+//     pass' own page-grid axes exactly match the view matrix's real X/Y axes, not an approximation
+//     of them), then snap each axis down to whole kSunWindowSnapChunkPages-page-sized world steps
+//     (RecordBeginFrame's own snapToPageChunk lambda) -- exactly GlobalSDFPass::
+//     EnqueueDirtyRegionsForLevel's snapAxis lambda, just parameterized in PAGES instead of voxels.
+//     Depth (the light-direction axis) is NOT snapped -- texel stability only matters for the two
+//     axes perpendicular to the light, unlike GlobalSDF's isotropic 3D voxel grid.
+//   - A level's local page-table index (localPageIndex, see VirtualShadowMapPool.h) is the WORLD-
+//     ANCHORED page-grid coordinate WRAPPED modulo kShadowPagesPerAxis (a true toroidal address,
+//     matching shadow_page_table.glsl's ShadowWrapPageCoord) -- NOT the page's RASTER position
+//     within the level's current 2048x2048 virtual frustum (which shifts every time the window
+//     re-centers). RenderPage()/ClassifyDynamicPages() convert wrapped<->raster using this frame's
+//     m_SunLevelWindowStartPage (uploaded to shaders alongside m_SunLevelViewProj so
+//     shadow_sun_sampling.glsl's SampleSunShadowVSM performs the identical raster->wrapped
+//     conversion before ever touching the page table) -- see RenderPage's own comment for the
+//     wrap-coordinate derivation. Because the window's width equals the wrap period exactly
+//     (kShadowPagesPerAxis pages both ways), a page-aligned window shift invalidates ONLY the
+//     newly-revealed band of local indices along the axis that moved (RecenterSunLevel's own
+//     InvalidateSunWindowBand calls) -- the rest of the window's already-resident pages keep
+//     resolving to the exact same physical layer/content they held before the shift, no re-render
+//     needed. Point-light cube VSMs are entirely unaffected by any of this -- a point light's own
+//     frustum is anchored to the LIGHT, not the camera, so it never needs to re-center.
 //
 // --- Why a page is rendered by redrawing the WHOLE scene, clipped by viewport+scissor ---
 // Exactly like the pre-Phase-3 ShadowMapPass: entities are static, so one light view-projection
@@ -66,6 +85,8 @@
 
 namespace renderer {
 
+    class ParticleSystemPass; // Feature F7 (shadow-casting particles) -- SetParticleSystem()/RecordParticleShadows() borrow its buffer handles/layout, see those methods' own comments.
+
     class VirtualShadowMapPass {
     public:
         VirtualShadowMapPass() = default;
@@ -77,6 +98,12 @@ namespace renderer {
         static inline float kSunBaseRadius = 2.0f; // Level 0's ortho half-extent; level L = kSunBaseRadius * 2^L.
         static constexpr float kSunNearMarginFactor = 0.05f; // Matches ShadowMapPass's own convention.
         static constexpr float kSunFarMarginFactor = 2.0f;
+        // Feature F14 (sun clipmap camera re-centering): a level's covered window snaps to whole
+        // multiples of this many PAGES (not world units -- page size itself scales per level, see
+        // class comment) as the camera moves, so it does not re-center (and thus invalidate a
+        // band) on every single frame of continuous camera motion -- exactly
+        // GlobalSDFPass::kSnapChunkVoxels's own rationale, parameterized in pages instead of voxels.
+        static constexpr uint32_t kSunWindowSnapChunkPages = 2u;
 
         static constexpr uint32_t kMaxPointLightVSMs = kMaxPointLights * 6u; // 48.
         static constexpr uint32_t kTotalVSMCount = kSunLevelCount + kMaxPointLightVSMs;
@@ -181,6 +208,39 @@ namespace renderer {
 
         void RecordEndFrame(VkCommandBuffer cmd);
 
+        // --- Feature F7 (UE5.7/5.8 Niagara parity: shadow-casting particles) ---
+        // ParticleSystemPass initializes AFTER this pass (renderer::ClusterRenderPipeline::Init's own
+        // call order: m_VirtualShadowMap.Init() long precedes m_ParticleSystem.Init()), so this pass
+        // cannot take particle buffers as an Init() parameter the way entityTransformBuffer/
+        // entityDataBuffer above are -- SetParticleSystem() is the same DEFERRED one-time wiring
+        // pattern renderer::TransparentForwardPass::SetVirtualShadowMap/renderer::SurfaceCachePass::
+        // SetVirtualShadowMap already establish for an analogous "the pass I need data from
+        // initializes later" ordering constraint: builds this pass' own particle-shadow-capture
+        // pipeline (depth-only, alpha-tested light-facing billboard quads -- ParticleShadowCapture
+        // .vert/.frag) against `particles.GetSetLayout()` directly (the SAME descriptor set layout
+        // every real particle shader binds, see ParticleCommon.glsl's own header comment) rather than
+        // building a second, redundant descriptor set here -- RecordParticleShadows() below binds
+        // `particles.GetCurrentSet()` at draw time. Call once, after ParticleSystemPass::Init() has
+        // returned, before the first RecordParticleShadows() call.
+        void SetParticleSystem(const ParticleSystemPass& particles);
+
+        // Renders every alive particle belonging to a castShadows-enabled emitter (EmitterParams::
+        // castShadows, ParticleSystemPass.h) depth-only into every VSM page this SAME frame's
+        // RecordBeginFrame() call already rendered (miss-driven OR Feature 2 dynamic-redraw), whose
+        // frustum overlaps that emitter's own (coarse, fixed-radius) world bounds -- see
+        // AnyShadowCastingEmitterOverlapsPageNDC's own comment for the overlap test and
+        // ClassifyDynamicPages' own extension (same function) for why a page near a shadow-casting
+        // emitter keeps getting included in that set every frame, not just the one frame it was first
+        // requested. Must be called AFTER `particles`' own RecordSimulate()/RecordSort() this SAME
+        // frame (renderer::ClusterRenderPipeline::RecordFrameEarly's own call-ordering comment) --
+        // records an explicit VkMemoryBarrier2 (compute-shader-write -> vertex-shader-read +
+        // indirect-command-read) between those writes and this call's own reads before issuing any
+        // draw, exactly the "explicit barrier, no shortcuts" discipline CLAUDE.md requires. A no-op
+        // (returns immediately) if SetParticleSystem() was never called or RecordBeginFrame() rendered
+        // no pages at all this frame (the common case once streaming has settled -- see that method's
+        // own trailing log for typical per-frame page-render counts).
+        void RecordParticleShadows(VkCommandBuffer cmd, const ParticleSystemPass& particles);
+
         // Wiring accessors for consumer descriptor sets (SurfaceCachePass, ClusterResolvePass) --
         // see shadow_page_table.glsl / shadow_feedback.glsl / shadow_atlas_sampling.glsl /
         // shadow_sun_sampling.glsl / shadow_point_sampling.glsl for the exact binding contract each
@@ -201,14 +261,45 @@ namespace renderer {
         uint32_t GetPhysicalPageCapacity() const { return m_Pool.GetPhysicalCapacity(); }
 
     private:
+        // Feature F7 (shadow-casting particles): everything RecordBeginFrame's own render loops
+        // already compute for one rendered page that RecordParticleShadows() later needs to draw a
+        // particle-shadow pass on TOP of that same page's entity depth -- viewport/scissor (avoids
+        // re-deriving the wrapped<->raster conversion a second time outside RenderPage) and this
+        // page's own NDC sub-rectangle (for the per-emitter overlap test).
+        struct PageRenderInfo {
+            VkViewport viewport{};
+            VkRect2D scissor{};
+            float ndcXMin = 0.0f, ndcXMax = 0.0f, ndcYMin = 0.0f, ndcYMax = 0.0f;
+        };
+
+        // Feature F7: one page RecordBeginFrame() actually rendered (miss-driven OR Feature 2
+        // dynamic-redraw) THIS frame -- physicalLayer/viewProj/viewport/scissor/NDC bounds, everything
+        // RecordParticleShadows() needs to revisit it (LOAD_OP_LOAD, not CLEAR) without recomputing
+        // any of RenderPage's own wrapped<->raster derivation. `lightRight`/`lightUp` are this page's
+        // own TRUE (unflipped -- see class comment on lightUpForPaging's deliberate Y-flip, which is
+        // page-grid-arithmetic-only and must NOT leak into a billboard basis) light-facing basis:
+        // shared across every sun level (same lightDir every level, see RecordBeginFrame), computed
+        // per-face for a point light cube (kFaceDirs[face]/kFaceUps[face], own basis per face).
+        struct RenderedPageThisFrame {
+            uint32_t physicalLayer = 0;
+            maths::mat4 viewProj{};
+            VkViewport viewport{};
+            VkRect2D scissor{};
+            float ndcXMin = 0.0f, ndcXMax = 0.0f, ndcYMin = 0.0f, ndcYMax = 0.0f;
+            maths::vec3 lightRight{};
+            maths::vec3 lightUp{};
+        };
+
         // Feature 1 (live per-entity transforms): renders EVERY entity's Fallback Mesh range into
         // this page (one vkCmdDrawIndexed per entity, opaque or masked pipeline selected per
         // entity's own precomputed maskTextureIndex -- Feature 3), instead of the old single
         // monolithic draw. Still "redraw the whole (tiny) scene per page, clipped by viewport/
         // scissor" -- see this class' own header comment -- just per-entity now instead of merged
         // into one draw call, which is what actually lets each entity's CURRENT (deformed/rotated)
-        // geometry reach the shadow page instead of a frozen rest-pose snapshot.
-        void RenderPage(VkCommandBuffer cmd, uint32_t vsmIndex, uint32_t localPageIndex, uint32_t physicalLayer,
+        // geometry reach the shadow page instead of a frozen rest-pose snapshot. Returns this page's
+        // own PageRenderInfo (Feature F7) so the caller can register it for a later particle-shadow
+        // pass without re-deriving the wrapped<->raster conversion this function already performs.
+        PageRenderInfo RenderPage(VkCommandBuffer cmd, uint32_t vsmIndex, uint32_t localPageIndex, uint32_t physicalLayer,
             const maths::mat4& viewProj);
 
         // Feature 2 (real static-vs-dynamic page invalidation): re-tests EVERY currently-resident
@@ -216,8 +307,23 @@ namespace renderer {
         // entity's CURRENT world-space AABB, writing the verdict into m_Pool via
         // SetPageCoversDynamicContent(). Called once per RecordBeginFrame() call, before that
         // method's own dynamic-page re-render block reads m_Pool.GetResidentDynamicPageIDs(). See
-        // the .cpp for the full NDC-overlap derivation.
+        // the .cpp for the full NDC-overlap derivation. Feature F7 extension: a page ALSO classifies
+        // dynamic if it overlaps a shadow-casting emitter's own bounds (AnyShadowCastingEmitterOverlapsPageNDC)
+        // -- without this, a page whose underlying entity geometry is static would only ever be
+        // rendered once (the initial miss), so RecordParticleShadows() would only get a chance to
+        // draw a particle shadow onto it that ONE frame; classifying it dynamic keeps it in every
+        // frame's re-render set for as long as a shadow-casting emitter remains nearby.
         void ClassifyDynamicPages(const core::EntityTransformCPU* entityTransformsCPU);
+
+        // Feature F7: true if ANY active, castShadows-enabled emitter (config::particles::EMITTERS[])
+        // has its own coarse, fixed-radius world bounds (centered on the emitter's own spawn
+        // position -- see the .cpp definition for why a tight per-particle bound is neither cheap nor
+        // necessary) overlapping the page NDC sub-rectangle [ndcXMin,ndcXMax] x [ndcYMin,ndcYMax]
+        // under `viewProj`. Used both by ClassifyDynamicPages (above) and RecordParticleShadows
+        // (public) to gate which pages actually get a particle-shadow draw call -- "respect the
+        // existing page budget" per this feature's own task description.
+        bool AnyShadowCastingEmitterOverlapsPageNDC(const maths::mat4& viewProj,
+            float ndcXMin, float ndcXMax, float ndcYMin, float ndcYMax) const;
 
         // True if `range`'s current (rotated about its own EntityTransformCPU pivot, deformation-
         // inflated) world-space AABB overlaps the page NDC sub-rectangle [ndcXMin,ndcXMax] x
@@ -227,6 +333,30 @@ namespace renderer {
         // maths::mat4 has no vec4 type/operator* to lean on -- see that file's own comment).
         bool EntityAABBOverlapsPageNDC(const EntityDrawRange& range, const core::EntityTransformCPU& xform,
             const maths::mat4& viewProj, float ndcXMin, float ndcXMax, float ndcYMin, float ndcYMax) const;
+
+        // Feature F14 (sun clipmap camera re-centering): recomputes level `level`'s chunk-snapped
+        // window center from `cameraPosition` (projected onto `lightRight`/`lightUpForPaging` --
+        // see class comment on why the Y-axis projection direction is pre-flipped to match
+        // OrthoVulkan's own NDC.y sign convention), invalidates (via m_Pool.InvalidatePage) exactly
+        // the newly-revealed band of local page indices if the window moved since the last call,
+        // recomputes this level's m_SunLevelViewProj[level] centered on the new window, and updates
+        // m_SunLevelWindowStartPage[level] for both RenderPage()/ClassifyDynamicPages() and this
+        // frame's GPU upload. Returns how many resident pages were invalidated this call (purely
+        // for RecordBeginFrame's own validation logging).
+        uint32_t RecenterSunLevel(VkCommandBuffer cmd, uint32_t level, const maths::vec3& cameraPosition,
+            const maths::vec3& lightDir, const maths::vec3& lightRight, const maths::vec3& lightUpForPaging,
+            const maths::vec3& up);
+
+        // Feature F14: invalidates every (vsmIndex=level, wrapped local page index) whose moved-axis
+        // wrapped coordinate falls in [bandStartWorldPage, bandStartWorldPage + bandCount), for
+        // EVERY local index along the other (untouched) axis -- the exact per-axis slab shape
+        // GlobalSDFPass::EnqueueDirtyRegionsForLevel enqueues as a dirty compositing region, here
+        // applied directly as an eviction (VSM pages regenerate lazily via the existing feedback/
+        // miss path -- no eager refill needed, unlike GlobalSDF's clipmap texels). `movedAxis` is 0
+        // for the light-right axis, 1 for the light-up(-for-paging) axis. Returns how many
+        // (already-resident) pages were actually invalidated.
+        uint32_t InvalidateSunWindowBand(VkCommandBuffer cmd, uint32_t level, int32_t bandStartWorldPage,
+            int32_t bandCount, int32_t movedAxis);
 
         VkDevice m_Device = VK_NULL_HANDLE;
         VmaAllocator m_Allocator = VK_NULL_HANDLE;
@@ -264,12 +394,45 @@ namespace renderer {
         // consumed both by RenderPage() (for whatever pages get (re)rendered this frame) and
         // uploaded verbatim into m_SunLevelsUBO/m_PointFacesUBO for every consumer shader to read.
         maths::mat4 m_SunLevelProj[kSunLevelCount]{};      // Fixed at Init() (radius never changes, see class comment).
-        maths::mat4 m_SunLevelViewProj[kSunLevelCount]{};  // proj * view(sunDirection), recomputed every frame.
+        maths::mat4 m_SunLevelViewProj[kSunLevelCount]{};  // proj * view(sunDirection, camera-recentered window), recomputed every frame.
         maths::mat4 m_PointFaceViewProj[kMaxPointLightVSMs]{}; // Recomputed every frame from SceneLights::pointLights.
         uint32_t m_ActivePointLightCount = 0;
 
-        GpuBuffer m_SunLevelsUBO;   // mat4[kSunLevelCount], CPU_TO_GPU mapped.
+        // Feature F14 (sun clipmap camera re-centering): one level's chunk-snapped window-center
+        // page-grid coordinate (world-anchored, see class comment) -- persists across frames so
+        // RecenterSunLevel() can detect a shift and invalidate only the newly-revealed band.
+        struct SunClipmapWindow {
+            bool hasValidWindow = false;
+            int32_t centerPage[2] = { 0, 0 }; // [0]=light-right axis, [1]=light-up(-for-paging) axis.
+        };
+        SunClipmapWindow m_SunWindows[kSunLevelCount]{};
+
+        // Feature F14: this frame's window-start page-grid coordinate per sun level (== centerPage
+        // - kShadowPagesPerAxis/2), i.e. the world-page-grid coordinate that raster index 0 along
+        // that axis currently resolves to -- consumed by RenderPage()/ClassifyDynamicPages() to
+        // convert a wrapped local page index back to this frame's raster position, AND uploaded
+        // into m_SunLevelsUBO so shadow_sun_sampling.glsl's SampleSunShadowVSM can perform the
+        // identical raster->wrapped conversion GPU-side before ever touching the page table.
+        int32_t m_SunLevelWindowStartPage[kSunLevelCount][2]{};
+
+        GpuBuffer m_SunLevelsUBO;   // See SunLevelsUBOData (VirtualShadowMapPass.cpp) for the exact std140-mirrored layout uploaded here.
         GpuBuffer m_PointFacesUBO; // mat4[kMaxPointLightVSMs], CPU_TO_GPU mapped.
+
+        // Feature F7 (shadow-casting particles): pipeline layout/pipeline built lazily by
+        // SetParticleSystem() (see that method's own comment for why this cannot happen at Init()
+        // time) -- both stay VK_NULL_HANDLE, and RecordParticleShadows() is a no-op, until that call
+        // has run. Depth-only (0 color attachments, same D32_SFLOAT target as m_Pipeline/
+        // m_MaskedPipeline above), alpha-tested via ParticleShadowCapture.frag's own discard (no
+        // depthCompareOp/blend difference from m_Pipeline otherwise needed).
+        VkPipelineLayout m_ParticleShadowPipelineLayout = VK_NULL_HANDLE;
+        VkPipeline m_ParticleShadowPipeline = VK_NULL_HANDLE;
+
+        // Feature F7: every page RecordBeginFrame()'s own render loops actually rendered THIS frame
+        // (miss-driven + Feature 2 dynamic-redraw combined) -- cleared at the top of every
+        // RecordBeginFrame() call, consumed once by the LATER RecordParticleShadows() call this same
+        // frame (see that method's own comment on why it must run after ParticleSystemPass's own
+        // simulate/sort dispatches, i.e. cannot simply be folded into RenderPage() itself).
+        std::vector<RenderedPageThisFrame> m_PagesRenderedThisFrame;
     };
 
 }

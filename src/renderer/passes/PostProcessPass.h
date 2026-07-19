@@ -144,6 +144,13 @@ namespace renderer {
             float fogStartDistance = 5.0f;
             float fogMaxOpacity = 0.85f;
 
+            // F3 (UE5.8 rendering-parity gap: Fog Screen Space Scattering) -- see
+            // PostProcessParamsUBO::useFogScreenSpaceScattering's own comment. Mirrors
+            // config::atmos::FOG_SCREEN_SPACE_SCATTERING_ENABLED (live-tunable via the Debug ImGui
+            // "Atmos" tab); true by default, matching every other feature-complete post-process
+            // stage in this Settings struct.
+            bool fogScreenSpaceScatteringEnabled = true;
+
             // Phase PP4: Volumetric Light Shafts / God Rays (Crepuscular Rays) -- radial screen-
             // space raymarch of this pass' own HDR input toward the sun's screen-projected position
             // (see RecordComposite's own `sunDirection`/`viewProj` parameters).
@@ -176,14 +183,20 @@ namespace renderer {
         // pipeline has no display-resolution depth anywhere -- see DepthOfField.comp's own comment).
         // `skyViewLUTView` (Atmos weather system, Subtask 2): renderer::AtmosSkyPass's own Sky-View
         // LUT view. `volumetricFogView` (Atmos Subtask 3): renderer::AtmosVolumetricFogPass's own
-        // integrated fog 3D texture. `cloudsView` (Atmos Subtask 4): renderer::AtmosCloudsPass's own
-        // half-resolution cloud buffer. All sampled read-only through this pass' own m_LinearSampler
-        // -- fixed identity for this pipeline's entire lifetime (no producer pass ever recreates its
-        // own images after Init()), same convention as `depthView`/`refractionOffsetView` below.
+        // integrated fog 3D texture -- kept bound even though F3 (below) usually supersedes it, as
+        // the config::atmos::FOG_SCREEN_SPACE_SCATTERING_ENABLED=false fallback source. `cloudsView`
+        // (Atmos Subtask 4): renderer::AtmosCloudsPass's own half-resolution cloud buffer.
+        // `fogScatteredView` (F3, Fog Screen Space Scattering): renderer::
+        // FogScreenSpaceScatteringPass::GetOutputView() -- this frame's depth-aware-blurred 2D fog
+        // buffer, ApplyVolumetricFog's preferred source (see PostProcessParamsUBO::
+        // useFogScreenSpaceScattering's own comment). All sampled read-only through this pass' own
+        // m_LinearSampler -- fixed identity for this pipeline's entire lifetime (no producer pass
+        // ever recreates its own images after Init()), same convention as `depthView`/
+        // `refractionOffsetView` below.
         void Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
             VkExtent2D displayExtent, VkImageView hdrColorView, VkImageView bloomView,
             VkImageView depthView, VkImageView refractionOffsetView, VkImageView skyViewLUTView,
-            VkImageView volumetricFogView, VkImageView cloudsView);
+            VkImageView volumetricFogView, VkImageView cloudsView, VkImageView fogScatteredView);
 
         void Shutdown();
 
@@ -320,7 +333,19 @@ namespace renderer {
             // PostProcessComposite.comp recover each pixel's view-space depth (distance along this
             // axis, NOT Euclidean ray length) to look up renderer::AtmosVolumetricFogPass's own
             // froxel grid via atmos_volumetric_fog_mapping.glsl's ViewZToFroxelW().
-            float cameraForwardX = 0.0f, cameraForwardY = 0.0f, cameraForwardZ = 0.0f, _padFog = 0.0f;
+            // F3 (Fog Screen Space Scattering): useFogScreenSpaceScattering repurposes what was
+            // _padFog (no struct-size change, static_assert below still 448 bytes -- same "occupy a
+            // spare pad slot" convention this codebase already established, see e.g. renderer::
+            // MaterialParameters::lightingChannelMask's own comment). 1 = ApplyVolumetricFog samples
+            // g_FogScattered (renderer::FogScreenSpaceScatteringPass::GetOutputView(), this frame's
+            // depth-aware-blurred fog); 0 = falls back to the original direct g_VolumetricFog 3D
+            // lookup, unblurred -- config::atmos::FOG_SCREEN_SPACE_SCATTERING_ENABLED's live default
+            // is 1, so Release visuals include F3 by default; the Debug ImGui toggle can flip it back
+            // to the pre-F3 lookup for an A/B comparison at zero extra pipeline cost (both bindings
+            // stay populated every frame either way -- see FogScreenSpaceScatteringPass's own class
+            // comment for why this pass is never fully skipped).
+            float cameraForwardX = 0.0f, cameraForwardY = 0.0f, cameraForwardZ = 0.0f;
+            uint32_t useFogScreenSpaceScattering = 1u;
         };
         static_assert(sizeof(PostProcessParamsUBO) == 448,
             "PostProcessParamsUBO must match PostProcessComposite.comp's PostProcessParamsUBO exactly (std140 layout)");

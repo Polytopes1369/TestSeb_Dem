@@ -231,7 +231,11 @@ void main() {
     // makes SelectLightRIS fall back to its original full-population draw unchanged, exactly the
     // "no regression" behavior that function's own comment documents for this case.
     uint noSpatialPool[kMegaLightsSpatialPoolCapacity];
-    if (SelectLightRIS(inWorldPos, n, pixelSeed, pc.frameIndex, noSpatialPool, 0u, selectedIndex, invPdf)) {
+    if (SelectLightRIS(inWorldPos, n, pixelSeed, pc.frameIndex, noSpatialPool, 0u, selectedIndex, invPdf)
+        && (MegaLightChannelMask(g_Lights.lights[selectedIndex]) & MaterialLightingChannelMask(mat)) != 0u) {
+        // F2b (UE5.8 Lighting Channels): the second AND-ed condition gates the whole contribution --
+        // see MegaLightsFinalShade.comp's own identical gate for the "raw zero == channel 0" default
+        // rationale that keeps every pre-F2b scene visually unchanged.
         MegaLight light = g_Lights.lights[selectedIndex];
         vec3 toLight = light.position - inWorldPos;
         float dist = length(toLight);

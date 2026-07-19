@@ -161,7 +161,18 @@ namespace renderer {
         // to a [10,500]nm film thickness (see EvaluateIridescence's own comment).
         float iridescenceAmount = 0.0f;
         float iridescenceThickness = 0.5f;
-        float _padIridescence0 = 0.0f;
+        // F2b (UE5.8 rendering-parity gap: Lighting Channels) -- this entity's own 3-bit UE-style
+        // reception mask (channels 0/1/2), repurposing what was _padIridescence0 (no struct-size
+        // change -- static_assert below still 336 bytes -- same "occupy a spare pad float" convention
+        // SubstrateSlab::sssProfileScale/glintDensity/glintIntensity already established above).
+        // Stored as a small integer encoded in a float (0 = default/unset, decodes as channel 0 --
+        // see material_params.glsl's own MaterialLightingChannelMask() for the exact decode rule
+        // mirrored here); a nonzero value is a bitmask (bit0 = channel 0, bit1 = channel 1, bit2 =
+        // channel 2), e.g. 0x3 = channels 0+1. AND-tested against MegaLightChannelMask()
+        // (megalights_types.glsl) in MegaLightsFinalShade.comp/TransparentForward.frag before a light
+        // is allowed to contribute -- see MaterialLightingChannelMask()'s own comment for the
+        // "default: everything on channel 0" backward-compatibility rationale.
+        float lightingChannelMask = 0.0f;
         float _padIridescence1 = 0.0f;
     };
     static_assert(sizeof(MaterialParameters) == 336,
