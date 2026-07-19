@@ -157,6 +157,7 @@
 #include "renderer/passes/TAATSRPass.h"
 #include "renderer/passes/DepthOfFieldPass.h"
 #include "renderer/passes/BloomPass.h"
+#include "renderer/passes/FogScreenSpaceScatteringPass.h"
 #include "renderer/passes/PostProcessPass.h"
 #include "renderer/passes/ScreenTracePass.h"
 #include "renderer/passes/GICompositePass.h"
@@ -1254,6 +1255,11 @@ namespace renderer {
         // own class comment. Recorded before m_PostProcess (below), whose composite shader samples
         // its GetOutputView() and adds it into the scene color.
         BloomPass m_Bloom;
+        // F3 (UE5.8 rendering-parity gap: Fog Screen Space Scattering): depth-aware bilateral spread
+        // of m_AtmosFog's own per-pixel in-scattered radiance, recorded immediately before
+        // m_PostProcess (below) -- see FogScreenSpaceScatteringPass's own class comment for why it
+        // must run adjacent to its one producer (m_AtmosFog) and one consumer (m_PostProcess).
+        FogScreenSpaceScatteringPass m_FogScatter;
         // Phase PP1 (post-process stack roadmap): Physical Camera / Auto Exposure / White Balance /
         // Color Correction / ACES Tone Mapping / Gamma Correction -- the normal-view-path blit
         // source instead of m_TAATSR's own raw HDR output directly (see PostProcessPass's own class

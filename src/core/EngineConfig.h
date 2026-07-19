@@ -528,6 +528,14 @@ inline float YEAR_LENGTH_SECONDS = 180.0f; // Simulated seconds per full seasona
 inline float SEASONAL_TEMPERATURE_AMPLITUDE_CELSIUS = 12.0f; // Peak-to-baseline swing the seasonal cycle adds/subtracts from TEMPERATURE_CELSIUS (summer = +amplitude, winter = -amplitude).
 inline float SEASONAL_PRECIP_AMPLITUDE = 0.35f; // Peak-to-baseline swing the seasonal cycle adds/subtracts from PRECIPITATION_INTENSITY's target (winter = wetter, summer = drier).
 inline float SEASONAL_SUN_ELEVATION_AMPLITUDE_DEGREES = 15.0f; // Peak seasonal sweep applied to the scene's fixed base sun elevation angle (see ClusterRenderPipeline::Init()'s own sun-direction comment) -- a modest elevation-only sweep, no azimuth/axial-tilt astronomy.
+
+// F3 (UE5.8 rendering-parity gap: Fog Screen Space Scattering) -- see renderer::
+// FogScreenSpaceScatteringPass's own class comment. Live, Debug-tunable (main.cpp's "Atmos" ImGui
+// tab); not mirrored into the per-hardware-tier EngineConfig_{Low,...}.h profiles (same rationale as
+// DYNAMIC_WEATHER_ENABLED above: an artistic/visual toggle, not a GPU performance/quality axis this
+// demo's fixed showcase scene needs to scale down for a lower-end profile).
+inline bool FOG_SCREEN_SPACE_SCATTERING_ENABLED = true; // Master toggle -- see renderer::PostProcessPass::Settings::fogScreenSpaceScatteringEnabled.
+inline float FOG_SCATTER_BLUR_RADIUS_PIXELS = 12.0f; // FogScreenSpaceScattering.comp's own Gaussian kernel half-width, in display-resolution pixels.
 } // namespace atmos
 
 // GPU particle system (particle_system_integration_plan.md, Subtask 6: Final Integration) -- live

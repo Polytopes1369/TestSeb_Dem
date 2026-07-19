@@ -990,10 +990,19 @@ bool ClusterRenderPipeline::Init(
   // exists), not just bound once here. `depthView`/`refractionOffsetView` (Phase PP3) ARE just
   // bound once here -- both keep a fixed identity for this pipeline's entire lifetime (see
   // PostProcessPass::Init's own comment).
+  // F3 (UE5.8 rendering-parity gap: Fog Screen Space Scattering) -- must Init before m_PostProcess so
+  // its own GetOutputView() already exists for m_PostProcess.Init's own g_FogScattered binding (same
+  // "producer Init's before consumer Init's" convention as m_DepthOfField/m_Bloom above). Reads
+  // m_Resolve's depth (its only other input besides m_AtmosFog's own 3D texture/sampler, already
+  // Init'd -- see ClusterRenderPipeline.h's own m_AtmosFog placement comment).
+  m_FogScatter.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
+      m_DisplayExtent, m_Resolve.GetOutputDepthView(), m_AtmosFog.GetIntegratedFogView(), m_AtmosFog.GetFogSampler());
+
   m_PostProcess.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
       m_DisplayExtent, m_DepthOfField.GetOutputView(), m_Bloom.GetOutputView(),
       m_Resolve.GetOutputDepthView(), m_TransparentForward.GetRefractionOffsetView(),
-      m_AtmosSky.GetSkyViewLUTView(), m_AtmosFog.GetIntegratedFogView(), m_AtmosClouds.GetCloudView());
+      m_AtmosSky.GetSkyViewLUTView(), m_AtmosFog.GetIntegratedFogView(), m_AtmosClouds.GetCloudView(),
+      m_FogScatter.GetOutputView());
 
 #ifndef NDEBUG
   // Two-tier SDF ray march DEBUG VISUALIZATION (see ClusterRenderPipeline.h's own comment on
@@ -1382,6 +1391,7 @@ void ClusterRenderPipeline::Shutdown() {
   // top-of-function Shutdown() call, never explicitly on a real pipeline teardown) -- fixed here
   // alongside adding m_Bloom's own equivalent call.
   m_PostProcess.Shutdown();
+  m_FogScatter.Shutdown(); // F3 -- Init'd right before m_PostProcess above, shut down right after it (reverse order).
   m_Bloom.Shutdown();
   m_DepthOfField.Shutdown();
   m_TAATSR.Shutdown();
@@ -3357,6 +3367,7 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
       ppSettings.fogHeightOffset = config::postprocess::FOG_HEIGHT_OFFSET;
       ppSettings.fogStartDistance = config::postprocess::FOG_START_DISTANCE;
       ppSettings.fogMaxOpacity = config::postprocess::FOG_MAX_OPACITY;
+      ppSettings.fogScreenSpaceScatteringEnabled = config::atmos::FOG_SCREEN_SPACE_SCATTERING_ENABLED;
       ppSettings.godRaysIntensity = config::postprocess::GOD_RAYS_ENABLED ? config::postprocess::GOD_RAYS_INTENSITY : 0.0f;
       ppSettings.godRaysDecay = config::postprocess::GOD_RAYS_DECAY;
       ppSettings.godRaysDensity = config::postprocess::GOD_RAYS_DENSITY;
@@ -3381,6 +3392,16 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
       m_AtmosFog.RecordUpdate(cmdLate, cameraPositionWorld, cameraFrameInfo.forward, maths::vec3{0.0f, 1.0f, 0.0f},
           cameraFrameInfo.fovYRadians, cameraFrameInfo.aspectRatio,
           m_SceneLights.sun.direction, m_SceneLights.sun.color, m_SceneLights.sun.intensity, m_FrameIndex);
+
+      // F3 (Fog Screen Space Scattering): refresh immediately after its one producer (m_AtmosFog,
+      // just above) and before its one consumer (m_PostProcess.RecordComposite, below) -- same
+      // producer/consumer-adjacency convention m_AtmosFog's own RecordUpdate call site already
+      // documents. blurRadiusPixels forced to 0 when the master toggle is off, which makes
+      // FogScreenSpaceScattering.comp's own per-pixel work degenerate to a pure passthrough of the
+      // freshly-extracted (unblurred) fog sample -- see FogScreenSpaceScatteringPass::RecordScatter's
+      // own comment for why this pass is always recorded rather than conditionally skipped.
+      m_FogScatter.RecordScatter(cmdLate, invViewProj, cameraPositionWorld, cameraFrameInfo.forward,
+          config::atmos::FOG_SCREEN_SPACE_SCATTERING_ENABLED ? config::atmos::FOG_SCATTER_BLUR_RADIUS_PIXELS : 0.0f);
 
       // Atmos weather system, Subtask 4: refresh the half-res cloud raymarch immediately alongside
       // the fog update above -- same producer/consumer-adjacency reasoning.

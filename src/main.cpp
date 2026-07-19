@@ -1330,6 +1330,15 @@ int main(int argc, char** argv) {
                 ImGui::DragFloat("Wind Turbulence Roughness", &config::atmos::WIND_TURBULENCE_ROUGHNESS, 0.01f, 0.0f, 1.0f);
                 ImGui::DragFloat("Cloud Density Target", &config::atmos::CLOUD_DENSITY_TARGET, 0.01f, 0.0f, 1.0f);
                 ImGui::DragFloat("Fog Density Target", &config::atmos::FOG_DENSITY_TARGET, 0.01f, 0.0f, 1.0f);
+
+                // F3 (UE5.8 rendering-parity gap: Fog Screen Space Scattering) -- see renderer::
+                // FogScreenSpaceScatteringPass's own class comment. Unchecking this live A/B-compares
+                // against the pre-F3 crisp-froxel lookup at zero extra pipeline cost (the pass itself
+                // always runs -- see FogScreenSpaceScatteringPass::RecordScatter's own comment for why
+                // -- only PostProcessComposite.comp's own sample source branches).
+                ImGui::Separator();
+                ImGui::Checkbox("Fog Screen Space Scattering (F3)", &config::atmos::FOG_SCREEN_SPACE_SCATTERING_ENABLED);
+                ImGui::DragFloat("Fog Scatter Blur Radius (px)", &config::atmos::FOG_SCATTER_BLUR_RADIUS_PIXELS, 0.25f, 0.0f, 64.0f);
                 ImGui::TextDisabled("Dew Point: %.2f C", clusterPipeline.GetAtmosClimate().GetLastDewPointCelsius());
                 ImGui::TextDisabled("LCL Height: %.1f m", clusterPipeline.GetAtmosClimate().GetLastLCLHeightMeters());
 

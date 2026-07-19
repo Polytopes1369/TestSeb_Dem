@@ -32,7 +32,7 @@ namespace renderer {
     void PostProcessPass::Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
         VkExtent2D displayExtent, VkImageView hdrColorView, VkImageView bloomView,
         VkImageView depthView, VkImageView refractionOffsetView, VkImageView skyViewLUTView,
-        VkImageView volumetricFogView, VkImageView cloudsView) {
+        VkImageView volumetricFogView, VkImageView cloudsView, VkImageView fogScatteredView) {
         Shutdown();
         m_Device = device;
         m_Allocator = allocator;
@@ -210,7 +210,7 @@ namespace renderer {
 
         // --- Stage 3: PostProcessComposite.comp ---
         {
-            std::array<VkDescriptorSetLayoutBinding, 10> bindings{ {
+            std::array<VkDescriptorSetLayoutBinding, 11> bindings{ {
                 { 0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // g_HDRColor
                 { 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },          // g_Output
                 { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },         // ExposureStateSSBO
@@ -221,6 +221,7 @@ namespace renderer {
                 { 7, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // g_SkyViewLUT (Atmos Subtask 2)
                 { 8, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // g_VolumetricFog (Atmos Subtask 3)
                 { 9, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // g_Clouds (Atmos Subtask 4)
+                { 10, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // g_FogScattered (F3)
             } };
             VkDescriptorSetLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
             layoutInfo.bindingCount = static_cast<uint32_t>(bindings.size());
@@ -256,12 +257,18 @@ namespace renderer {
             VkDescriptorImageInfo skyViewInfo{ m_LinearSampler, skyViewLUTView, VK_IMAGE_LAYOUT_GENERAL };
             VkDescriptorImageInfo volumetricFogInfo{ m_LinearSampler, volumetricFogView, VK_IMAGE_LAYOUT_GENERAL };
             VkDescriptorImageInfo cloudsInfo{ m_LinearSampler, cloudsView, VK_IMAGE_LAYOUT_GENERAL };
-            std::array<VkWriteDescriptorSet, 5> writes{ {
+            // F3: renderer::FogScreenSpaceScatteringPass's own owned output image keeps a fixed
+            // identity for this pipeline's entire lifetime too (same "no producer pass ever recreates
+            // its own images after Init()" convention as depthView/refractionOffsetView/
+            // volumetricFogView above), so it is likewise bound once here rather than every frame.
+            VkDescriptorImageInfo fogScatteredInfo{ m_LinearSampler, fogScatteredView, VK_IMAGE_LAYOUT_GENERAL };
+            std::array<VkWriteDescriptorSet, 6> writes{ {
                 { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_CompositeSet, 5, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &depthInfo, nullptr, nullptr },
                 { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_CompositeSet, 6, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &refractionInfo, nullptr, nullptr },
                 { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_CompositeSet, 7, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &skyViewInfo, nullptr, nullptr },
                 { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_CompositeSet, 8, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &volumetricFogInfo, nullptr, nullptr },
                 { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_CompositeSet, 9, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &cloudsInfo, nullptr, nullptr },
+                { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_CompositeSet, 10, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &fogScatteredInfo, nullptr, nullptr },
             } };
             vkUpdateDescriptorSets(m_Device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
         }
@@ -419,6 +426,9 @@ namespace renderer {
         params.cameraForwardX = cameraForward.x;
         params.cameraForwardY = cameraForward.y;
         params.cameraForwardZ = cameraForward.z;
+        // F3 (Fog Screen Space Scattering) -- see PostProcessParamsUBO::useFogScreenSpaceScattering's
+        // own comment.
+        params.useFogScreenSpaceScattering = settings.fogScreenSpaceScatteringEnabled ? 1u : 0u;
 
         // Phase PP5: Panini Projection -- half-FOV tangents drive the tangent-space UV remap (see
         // PostProcessComposite.comp's own ApplyPaniniProjection comment). Matches maths::mat4::
