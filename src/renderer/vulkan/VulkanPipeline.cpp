@@ -153,7 +153,7 @@ VkPipeline VulkanPipeline::CreateGraphicsPipeline(VkDevice device, VkPipelineLay
     pipelineInfo.pNext = &pipelineRendering;
 
     VkPipeline pipeline;
-    VK_CHECK(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &pipeline));
+    VK_CHECK(vkCreateGraphicsPipelines(device, s_PipelineCache, 1, &pipelineInfo, nullptr, &pipeline));
     return pipeline;
 }
 
@@ -167,7 +167,7 @@ VkPipeline VulkanPipeline::CreateComputePipeline(VkDevice device, VkPipelineLayo
     computeInfo.stage.pName = "main";
 
     VkPipeline pipeline;
-    VK_CHECK(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &computeInfo, nullptr, &pipeline));
+    VK_CHECK(vkCreateComputePipelines(device, s_PipelineCache, 1, &computeInfo, nullptr, &pipeline));
     return pipeline;
 }
 

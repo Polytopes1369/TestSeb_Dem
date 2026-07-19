@@ -1,4 +1,4 @@
-#include "renderer/passes/SurfaceCacheRayTracingPass.h"
+﻿#include "renderer/passes/SurfaceCacheRayTracingPass.h"
 
 #include <algorithm>
 #include <cstring>
@@ -251,7 +251,7 @@ namespace renderer {
             skinningPipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
             skinningPipelineInfo.stage.module = skinningModule;
             skinningPipelineInfo.stage.pName = "main";
-            VK_CHECK(vkCreateComputePipelines(m_Device, VK_NULL_HANDLE, 1, &skinningPipelineInfo, nullptr, &m_SkinningPipeline));
+            VK_CHECK(vkCreateComputePipelines(m_Device, VulkanPipeline::GetPipelineCache(), 1, &skinningPipelineInfo, nullptr, &m_SkinningPipeline));
             vkDestroyShaderModule(m_Device, skinningModule, nullptr);
 
             LOG_INFO(std::format("[SurfaceCacheRayTracingPass] Skeletal-animation feature: creature entityID={} BLAS is per-frame UPDATE-refit ({} vertices, {} triangles).",
@@ -449,7 +449,7 @@ namespace renderer {
         // and cheapest legal value.
         rtPipelineInfo.maxPipelineRayRecursionDepth = 1;
         rtPipelineInfo.layout = m_PipelineLayout;
-        VK_CHECK(g_RTFunctions.vkCreateRayTracingPipelinesKHR(m_Device, VK_NULL_HANDLE, VK_NULL_HANDLE, 1, &rtPipelineInfo, nullptr, &m_Pipeline));
+        VK_CHECK(g_RTFunctions.vkCreateRayTracingPipelinesKHR(m_Device, VK_NULL_HANDLE, VulkanPipeline::GetPipelineCache(), 1, &rtPipelineInfo, nullptr, &m_Pipeline));
 
         vkDestroyShaderModule(m_Device, rgenModule, nullptr);
         vkDestroyShaderModule(m_Device, missModule, nullptr);

@@ -3,21 +3,31 @@
 
 // Screen-Space Ray Tracing (SSRT), Lumen-style "Screen Trace" -- see renderer::ScreenTracePass's
 // own class comment for the full design rationale (why a plain linear march, why the World Probe
-// grid fallback). One invocation per output pixel: reconstructs this pixel's world-space position
-// from the depth buffer + this frame's inverse view-projection, marches kScreenTraceSteps fixed
-// steps along a cosine-weighted hemisphere direction (oriented by this pixel's own G-buffer
-// normal) up to kScreenTraceMaxDistance world units, and at each step re-projects the marched
-// world position back to screen space to compare against the depth buffer (a classic linear SSR-
-// style march). A hit samples the direct-lit color at the hit pixel; a miss (ray escapes the
-// screen, or exhausts its step budget without ever crossing the depth buffer) falls back to
-// world_probe_sampling.glsl's SampleWorldProbeGrid at this pixel's own world position.
+// grid fallback, and F1's own giMode switch). One invocation per output pixel: reconstructs this
+// pixel's world-space position from the depth buffer + this frame's inverse view-projection.
+//
+// In GIMode::HighQuality (g_ViewParams.giMode == 0u), marches kScreenTraceSteps fixed steps along a
+// cosine-weighted hemisphere direction (oriented by this pixel's own G-buffer normal) up to
+// kScreenTraceMaxDistance world units, re-projecting the marched world position back to screen
+// space at each step to compare against the depth buffer (a classic linear SSR-style march). A hit
+// samples the direct-lit color at the hit pixel; a miss (ray escapes the screen, or exhausts its
+// step budget without ever crossing the depth buffer) falls back to world_probe_sampling.glsl's
+// SampleWorldProbeGrid at this pixel's own world position.
+//
+// F1 ("Lumen Lite", UE5.8 parity roadmap): in GIMode::Lite (giMode == 1u), the march above is
+// skipped ENTIRELY -- this pixel goes straight to SampleWorldProbeGrid, treating the (now
+// multi-level, occlusion-weighted) World Probe grid as the PRIMARY GI term instead of a rare
+// fallback. This is the actual cost saving real Lumen's own "Lite" quality tier banks on: no
+// per-pixel iterative march, no direct-color re-fetch chain, just a handful of texelFetch calls
+// against a coarse, already-resident probe grid.
 
 #include "include/math_utils.glsl"
 #include "include/octahedral.glsl"
 
 #define WORLD_PROBE_GRID_SET 0
 #define WORLD_PROBE_GRID_BINDING 5
-#define WORLD_PROBE_GRID_PARAMS_BINDING 6
+#define WORLD_PROBE_GRID_OCCLUSION_BINDING 6
+#define WORLD_PROBE_GRID_PARAMS_BINDING 7
 #include "include/world_probe_sampling.glsl"
 
 layout(local_size_x = 8, local_size_y = 8) in;
@@ -33,11 +43,12 @@ layout(std140, set = 0, binding = 4) uniform ScreenTraceViewParamsUBO {
     vec3 cameraPos;
     uint frameIndex;
     vec2 viewportSize;
-    float _pad0;
+    uint giMode; // F1: config::lumen::GIMode -- 0 = HighQuality (march, as before), 1 = Lite (skip march).
     float _pad1;
 } g_ViewParams;
 
-// set 0 bindings 5/6 (g_WorldProbeGrid, WorldProbeGridParamsUBO) declared by world_probe_sampling.glsl.
+// set 0 bindings 5/6/7 (g_WorldProbeGrid[], g_WorldProbeOcclusion[], WorldProbeGridParamsUBO)
+// declared by world_probe_sampling.glsl.
 
 const uint kScreenTraceSteps = 24u;
 const float kScreenTraceMaxDistance = 3.0;
@@ -87,47 +98,52 @@ void main() {
 
     float ndcDepth = texelFetch(g_Depth, pixel, 0).r;
     vec3 worldPos = ReconstructWorldPos(pixel, ndcDepth);
-    // Bias along the normal so the very first marched step does not immediately re-intersect this
-    // pixel's own surface -- same rationale as SurfaceCacheGIInject.comp's own biasedOrigin.
-    vec3 biasedOrigin = worldPos + normal * 1.0e-2;
-
-    vec2 xi = Halton23(g_ViewParams.frameIndex + 1u);
-    vec3 rayDir = CosineWeightedHemisphereSample(xi, normal);
-    float stepSize = kScreenTraceMaxDistance / float(kScreenTraceSteps);
 
     vec3 result = vec3(0.0);
     bool hit = false;
-    for (uint step = 1u; step <= kScreenTraceSteps && !hit; ++step) {
-        vec3 marchedPos = biasedOrigin + rayDir * (stepSize * float(step));
 
-        vec4 marchedClip = g_ViewParams.viewProj * vec4(marchedPos, 1.0);
-        if (marchedClip.w <= 0.0) {
-            break; // Marched behind the camera -- the screen trace cannot possibly see this sample.
-        }
-        vec3 marchedNdc = marchedClip.xyz / marchedClip.w;
-        if (abs(marchedNdc.x) > 1.0 || abs(marchedNdc.y) > 1.0 || marchedNdc.z < 0.0 || marchedNdc.z > 1.0) {
-            break; // Marched off-screen -- no further step can re-enter the visible frame.
-        }
+    // F1: GIMode::Lite skips the per-pixel march entirely -- see this file's own header comment.
+    if (g_ViewParams.giMode == 0u) {
+        // Bias along the normal so the very first marched step does not immediately re-intersect
+        // this pixel's own surface -- same rationale as SurfaceCacheGIInject.comp's own biasedOrigin.
+        vec3 biasedOrigin = worldPos + normal * 1.0e-2;
 
-        ivec2 marchedPixel = ivec2((marchedNdc.xy * 0.5 + 0.5) * g_ViewParams.viewportSize);
-        float bufferedDepth = texelFetch(g_Depth, marchedPixel, 0).r;
+        vec2 xi = Halton23(g_ViewParams.frameIndex + 1u);
+        vec3 rayDir = CosineWeightedHemisphereSample(xi, normal);
+        float stepSize = kScreenTraceMaxDistance / float(kScreenTraceSteps);
 
-        // A hit: the marched sample's own NDC depth is AT OR BEHIND the depth buffer's stored
-        // value at that screen pixel (i.e. the march has just passed behind existing geometry),
-        // within kDepthThicknessNDC of it (rejects a march that has gone so far behind that it is
-        // now behind some entirely different, much farther surface -- see kDepthThicknessNDC's own
-        // comment).
-        if (marchedNdc.z >= bufferedDepth && marchedNdc.z - bufferedDepth < kDepthThicknessNDC) {
-            result = texelFetch(g_DirectColor, marchedPixel, 0).rgb;
-            hit = true;
+        for (uint step = 1u; step <= kScreenTraceSteps && !hit; ++step) {
+            vec3 marchedPos = biasedOrigin + rayDir * (stepSize * float(step));
+
+            vec4 marchedClip = g_ViewParams.viewProj * vec4(marchedPos, 1.0);
+            if (marchedClip.w <= 0.0) {
+                break; // Marched behind the camera -- the screen trace cannot possibly see this sample.
+            }
+            vec3 marchedNdc = marchedClip.xyz / marchedClip.w;
+            if (abs(marchedNdc.x) > 1.0 || abs(marchedNdc.y) > 1.0 || marchedNdc.z < 0.0 || marchedNdc.z > 1.0) {
+                break; // Marched off-screen -- no further step can re-enter the visible frame.
+            }
+
+            ivec2 marchedPixel = ivec2((marchedNdc.xy * 0.5 + 0.5) * g_ViewParams.viewportSize);
+            float bufferedDepth = texelFetch(g_Depth, marchedPixel, 0).r;
+
+            // A hit: the marched sample's own NDC depth is AT OR BEHIND the depth buffer's stored
+            // value at that screen pixel (i.e. the march has just passed behind existing geometry),
+            // within kDepthThicknessNDC of it (rejects a march that has gone so far behind that it is
+            // now behind some entirely different, much farther surface -- see kDepthThicknessNDC's own
+            // comment).
+            if (marchedNdc.z >= bufferedDepth && marchedNdc.z - bufferedDepth < kDepthThicknessNDC) {
+                result = texelFetch(g_DirectColor, marchedPixel, 0).rgb;
+                hit = true;
+            }
         }
     }
 
     if (!hit) {
-        // Tiered fallback: no near-field screen hit -- sample the low-resolution World Probe grid
-        // at this pixel's own (unbiased) world position instead ("merge this result with the
-        // lighting of the global probes").
-        result = SampleWorldProbeGrid(worldPos);
+        // Tiered fallback (GIMode::HighQuality) or primary term (GIMode::Lite): sample the
+        // multi-level World Probe grid at this pixel's own (unbiased) world position instead
+        // ("merge this result with the lighting of the global probes").
+        result = SampleWorldProbeGrid(worldPos, g_ViewParams.cameraPos);
     }
 
     imageStore(g_NoisyGIOutput, pixel, vec4(result, hit ? 1.0 : 0.0));

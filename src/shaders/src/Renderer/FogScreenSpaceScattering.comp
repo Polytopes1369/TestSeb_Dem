@@ -1,0 +1,159 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+
+// F3 (UE5.8 rendering-parity gap: Fog Screen Space Scattering) -- a depth-aware bilateral spread of
+// renderer::AtmosVolumetricFogPass's own per-pixel in-scattered radiance, approximating multiple
+// scattering: real fog/smoke/dust does not stay crisply confined to a single froxel cell the way this
+// engine's raw 160x90x64 grid (bilinearly bloomable only within its own coarse 3D texture, effectively
+// a low-res blur already) reads on screen -- a bright, thin shaft of in-scattered light should visibly
+// bleed into its neighbors (UE5.8's own "Fog Screen Space Scattering" feature note: "better light
+// scattering in fog/smoke/dust"). Runs as two separable passes (mode 0 horizontal, mode 1 vertical),
+// same "one file, mode branches in main()" convention AtmosVolumetricFog.comp / AtmosSkyLUTs.comp
+// already establish -- unlike those two, mode 0 and mode 1 here are NOT symmetric (mode 0 both
+// EXTRACTS the per-pixel fog sample from renderer::AtmosVolumetricFogPass's own 3D froxel texture --
+// the same (uv, froxelW) lookup PostProcessComposite.comp's own ApplyVolumetricFog performs -- AND
+// blurs horizontally in one pass; mode 1 only blurs the already-extracted 2D scratch buffer
+// vertically, no 3D texture access needed there at all), so both are handled explicitly rather than
+// factored into one shared per-tap function the way SubsurfaceScattering.comp's H/V passes are (that
+// pass' two directions really are symmetric -- both read an already-2D scene-color image).
+//
+// --- Why bilateral (depth-aware), not a naive blur ---
+// A dumb screen-space blur would bleed a bright fog-lit region ACROSS a foreground silhouette (a wall,
+// a tree trunk standing between the camera and a distant light shaft) onto geometry that is not
+// actually behind that fog at all -- the classic post-process-blur halo. Each tap here is weighted down
+// whenever its own reconstructed NDC depth diverges from the center pixel's, same depth-bilateral
+// discipline (and the SAME kSigmaDepth convention/units) SubsurfaceScattering.comp and
+// ATrousDenoise.comp already use -- so the spread stays confined to depth-coherent regions (the sky/far
+// background behind a light shaft, or the shaft's own near-uniform-depth atmosphere) and stops sharply
+// at any real occluder's edge, exactly the "without haloing across depth discontinuities" requirement.
+//
+// Consumed by PostProcessComposite.comp's own ApplyVolumetricFog, which now samples THIS pass' own 2D
+// output (a plain texture() 2D fetch) instead of directly re-sampling the raw 3D froxel texture --
+// see that function's own updated comment. renderer::EngineConfig's
+// config::atmos::FOG_SCREEN_SPACE_SCATTERING_ENABLED (Debug-tunable, default true) lets
+// PostProcessComposite.comp fall back to the original unblurred 3D lookup at zero cost when off (both
+// this pass' g_VolumetricFog 3D binding AND its own 2D output stay available to that shader either
+// way -- see PostProcessPass::Init's own comment for why both bindings are kept).
+
+#include "include/math_utils.glsl"
+#include "include/atmos_volumetric_fog_mapping.glsl"
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform sampler2D g_Depth;          // renderer::ClusterResolvePass depth, render-res, bilinear-upsampled (matches PostProcessComposite.comp's own g_Depth convention).
+layout(set = 0, binding = 1) uniform sampler3D g_VolumetricFog;  // renderer::AtmosVolumetricFogPass's own integrated froxel grid -- mode 0 only.
+layout(set = 0, binding = 2) uniform sampler2D g_ScatterInput;   // Mode 0: unused (still bound, see this file's own header comment). Mode 1: mode 0's own output (this pass' scratch image).
+layout(rgba16f, set = 0, binding = 3) uniform writeonly image2D g_Output;
+
+layout(push_constant) uniform FogScatterPC {
+    // Reconstructs a pixel's world position from its NDC + depth -- the SAME inverse combined
+    // view-projection PostProcessComposite.comp's own ReconstructWorldPos/ApplyVolumetricFog already
+    // use, passed straight through (mode 0 only; mode 1 never reconstructs a world position).
+    mat4 invViewProj;
+    float cameraPosX, cameraPosY, cameraPosZ;
+    // config::atmos::FOG_SCATTER_BLUR_RADIUS_PIXELS -- the Gaussian kernel's screen-space half-width
+    // in PIXELS at this pass' own render extent. A fixed screen-space radius (unlike
+    // SubsurfaceScattering.comp's world-space-radius-over-camera-distance scaling): fog scattering is
+    // an atmospheric/lens-like bloom of the LIGHT SHAFT ITSELF, not a material property attached to a
+    // specific world-space surface point, so there is no "real" world radius to preserve across
+    // distance the way a material's subsurface scattering profile has.
+    float blurRadiusPixels;
+    float cameraForwardX, cameraForwardY, cameraForwardZ;
+    float _pad0;
+    float viewportWidth, viewportHeight;
+    uint mode; // 0 = extract (3D fog lookup) + blur horizontal; 1 = blur vertical (2D scratch only).
+    float _pad1;
+} pc;
+
+vec3 GetCameraPosition() { return vec3(pc.cameraPosX, pc.cameraPosY, pc.cameraPosZ); }
+vec3 GetCameraForward() { return vec3(pc.cameraForwardX, pc.cameraForwardY, pc.cameraForwardZ); }
+
+// Mode 0 only: identical (uv, viewZ, froxelW) derivation to PostProcessComposite.comp's own
+// ReconstructWorldPos + ApplyVolumetricFog -- see atmos_volumetric_fog_mapping.glsl's own header
+// comment for why this exact formula must match AtmosVolumetricFog.comp's writer-side FroxelToWorld().
+// A background/sky pixel (NDC depth at the far clip) clamps to ATMOS_FOG_FAR_Z (fully accumulated)
+// rather than being skipped -- matches ApplyVolumetricFog's own "even a sky pixel benefits from
+// near-horizon god-ray-style in-scattering" rationale exactly (this pass must reproduce that same
+// per-pixel value before it can usefully blur it).
+vec4 ExtractFogSample(vec2 uv) {
+    float ndcDepth = texture(g_Depth, uv).r;
+    float viewZ = ATMOS_FOG_FAR_Z;
+    if (ndcDepth < 1.0) {
+        vec2 ndcXY = uv * 2.0 - 1.0;
+        vec4 worldPos4 = pc.invViewProj * vec4(ndcXY, ndcDepth, 1.0);
+        vec3 worldPos = worldPos4.xyz / worldPos4.w;
+        viewZ = dot(worldPos - GetCameraPosition(), GetCameraForward());
+    }
+    float froxelW = ViewZToFroxelW(viewZ);
+    return texture(g_VolumetricFog, vec3(uv, froxelW));
+}
+
+// Fixed tap count per side -- 6 (13 taps total incl. center), spread with a wider spacing toward the
+// kernel's own edge (matches SubsurfaceScattering.comp's own "spread uniformly across
+// [-radiusPixels, +radiusPixels]" shape) so a modest tap budget still covers a visually meaningful
+// bloom radius instead of over-sampling the kernel's own near-center taps.
+const int kHalfSamples = 6;
+// Same NDC-depth bilateral sigma ATrousDenoise.comp/SubsurfaceScattering.comp both already use --
+// this codebase's established "how close in NDC depth counts as the same surface" convention.
+const float kSigmaDepth = 0.002;
+
+// Gaussian falloff over the normalized tap offset u = tapOffsetPixels / blurRadiusPixels in [0, 1] --
+// a plain single-lobe kernel (unlike SubsurfaceScattering.comp's stylized 3-Gaussian skin profile:
+// fog scattering has no per-channel diffusion-depth asymmetry to model, just an isotropic light bloom).
+float GaussianWeight(float u) {
+    return exp(-(u * u) * 4.0); // exp(-4) at u=1 -- effectively zero at the kernel's own edge.
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 res = ivec2(pc.viewportWidth, pc.viewportHeight);
+    if (pixel.x >= res.x || pixel.y >= res.y) {
+        return;
+    }
+
+    vec2 pixelCenter = vec2(pixel) + 0.5;
+    vec2 uv = pixelCenter / vec2(pc.viewportWidth, pc.viewportHeight);
+    float centerDepth = texture(g_Depth, uv).r;
+
+    vec4 centerSample = (pc.mode == 0u) ? ExtractFogSample(uv) : texelFetch(g_ScatterInput, pixel, 0);
+
+    float radiusPixels = max(pc.blurRadiusPixels, 0.0);
+    if (radiusPixels < 0.5) {
+        // Sub-pixel radius (or the Debug/config toggle dialed to 0): no meaningful blur, pass the
+        // extracted/already-blurred sample straight through -- mode 0 still performs the mandatory 3D
+        // extraction (mode 1's input depends on it), it just adds no spatial spread on top.
+        imageStore(g_Output, pixel, centerSample);
+        return;
+    }
+
+    ivec2 stepDir = (pc.mode == 0u) ? ivec2(1, 0) : ivec2(0, 1);
+    vec2 uvStep = (pc.mode == 0u) ? vec2(1.0 / pc.viewportWidth, 0.0) : vec2(0.0, 1.0 / pc.viewportHeight);
+
+    vec4 weightSum = vec4(GaussianWeight(0.0));
+    vec4 colorSum = centerSample * weightSum;
+
+    for (int i = 1; i <= kHalfSamples; ++i) {
+        float offsetPixels = (float(i) / float(kHalfSamples)) * radiusPixels;
+        float u = float(i) / float(kHalfSamples);
+        float gauss = GaussianWeight(u);
+
+        for (int s = -1; s <= 1; s += 2) {
+            ivec2 tapPixel = pixel + stepDir * int(round(offsetPixels)) * s;
+            if (tapPixel.x < 0 || tapPixel.y < 0 || tapPixel.x >= res.x || tapPixel.y >= res.y) {
+                continue;
+            }
+            vec2 tapUV = uv + uvStep * offsetPixels * float(s);
+
+            float tapDepth = texture(g_Depth, tapUV).r;
+            float depthWeight = exp(-abs(centerDepth - tapDepth) / kSigmaDepth);
+            float w = gauss * depthWeight;
+
+            vec4 tapSample = (pc.mode == 0u) ? ExtractFogSample(tapUV) : texelFetch(g_ScatterInput, tapPixel, 0);
+            colorSum += tapSample * w;
+            weightSum += vec4(w);
+        }
+    }
+
+    vec4 result = colorSum / max(weightSum, vec4(1.0e-6));
+    imageStore(g_Output, pixel, result);
+}

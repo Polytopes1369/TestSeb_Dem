@@ -1,4 +1,4 @@
-#ifndef NDEBUG
+﻿#ifndef NDEBUG
 
 #include "renderer/debug/DebugTextOverlay.h"
 
@@ -11,6 +11,7 @@
 #include "renderer/debug/BitmapFont8x8.h"
 
 #include "core/EngineConfig.h"
+#include "renderer/passes/WorldProbeGridPass.h"
 
 namespace renderer::debug {
 
@@ -208,11 +209,11 @@ namespace renderer::debug {
         pipelineInfo.layout = m_PipelineLayout;
         pipelineInfo.pNext = &pipelineRendering;
 
-        VK_CHECK(vkCreateGraphicsPipelines(m_Device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_Pipeline));
+        VK_CHECK(vkCreateGraphicsPipelines(m_Device, VulkanPipeline::GetPipelineCache(), 1, &pipelineInfo, nullptr, &m_Pipeline));
 
         VkFormat hdrFormat = kHdrTargetFormat;
         pipelineRendering.pColorAttachmentFormats = &hdrFormat;
-        VK_CHECK(vkCreateGraphicsPipelines(m_Device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_PipelineHDR));
+        VK_CHECK(vkCreateGraphicsPipelines(m_Device, VulkanPipeline::GetPipelineCache(), 1, &pipelineInfo, nullptr, &m_PipelineHDR));
 
         vkDestroyShaderModule(m_Device, vertModule, nullptr);
         vkDestroyShaderModule(m_Device, fragModule, nullptr);
@@ -263,7 +264,7 @@ namespace renderer::debug {
 
     void DebugTextOverlay::BuildFrameText(float gpuMemUsedMB, uint32_t pendingPageLoads, float bytesPerSecond,
         uint32_t hwTriangleCount, uint32_t swTriangleCount, float fps, float viewportWidthPixels, float viewportHeightPixels,
-        bool radiosityEnabled, bool ssrtEnabled, uint32_t traceMode, bool worldProbesEnabled,
+        bool radiosityEnabled, bool ssrtEnabled, uint32_t traceMode, bool worldProbesEnabled, uint32_t giMode,
         uint32_t aliveParticleCount, uint32_t maxParticleCount) {
         m_PendingGlyphs.clear();
 
@@ -277,14 +278,15 @@ namespace renderer::debug {
         AppendLine(std::format("READ: {:.1f} KB/S", bytesPerSecond / 1024.0f), kMarginX, y); y += kLineHeight;
         AppendLine(std::format("HW TRIS: {}", hwTriangleCount), kMarginX, y); y += kLineHeight;
         AppendLine(std::format("SW TRIS: {}", swTriangleCount), kMarginX, y); y += kLineHeight;
-        AppendLine(std::format("GI: RADIOSITY={} SSRT={} TRACE={}",
-            radiosityEnabled ? "ON" : "OFF", ssrtEnabled ? "ON" : "OFF", traceMode == 0u ? "SWRT" : "HWRT"),
+        AppendLine(std::format("GI: RADIOSITY={} SSRT={} TRACE={} MODE={}",
+            radiosityEnabled ? "ON" : "OFF", ssrtEnabled ? "ON" : "OFF", traceMode == 0u ? "SWRT" : "HWRT",
+            giMode == 0u ? "HQ" : "LITE"),
             kMarginX, y); y += kLineHeight;
-        // Unlike the RADIOSITY/SSRT/TRACE line above (all real, consumed GI terms), WORLDPROBES
-        // reflects a system that is computed but has no live consumer yet -- see
-        // ClusterRenderPipeline::m_DebugWorldProbesEnabled's own comment. Shown on its own line so
-        // that fact stays visible instead of implying parity with the other three.
-        AppendLine(std::format("WORLDPROBES={} (not yet sampled)", worldProbesEnabled ? "ON" : "OFF"),
+        // F1 ("Lumen Lite", UE5.8 parity roadmap): WORLDPROBES is now a live, load-bearing consumer
+        // in BOTH GI modes (Lite mode's own PRIMARY term, HighQuality mode's own screen-trace-miss
+        // fallback) -- see renderer::WorldProbeGridPass.h's own class comment. No longer "not yet
+        // sampled" (that was true pre-F1, before the ScreenTracePass/GICompositePass integration).
+        AppendLine(std::format("WORLDPROBES={} ({} levels)", worldProbesEnabled ? "ON" : "OFF", renderer::WorldProbeGridPass::kLevelCount),
             kMarginX, y); y += kLineHeight;
         AppendLine(std::format("GPU PARTICLES: {}/{}", aliveParticleCount, maxParticleCount), kMarginX, y); y += kLineHeight;
 

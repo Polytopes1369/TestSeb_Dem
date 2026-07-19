@@ -1,4 +1,4 @@
-#include "renderer/debug/DebugBufferViewPass.h"
+﻿#include "renderer/debug/DebugBufferViewPass.h"
 #ifndef NDEBUG
 
 #include "core/Logger.h"
@@ -7,7 +7,7 @@
 
 namespace renderer::debug {
 
-    void DebugBufferViewPass::Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue, VkExtent2D outputExtent) {
+    void DebugBufferViewPass::Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue, VkExtent2D outputExtent, VkBuffer exposureStateBuffer) {
         Shutdown();
         m_Device = device;
         m_Allocator = allocator;
@@ -80,21 +80,23 @@ namespace renderer::debug {
         VK_CHECK(vkCreateSampler(m_Device, &samplerInfo, nullptr, &m_LinearSampler));
 
         // =====================================================================================
-        // Pipeline: set 0 (2 bindings). g_Source (rewritten every RecordView() call) / g_Output.
+        // Pipeline: set 0 (3 bindings). g_Source (rewritten every RecordView() call) / g_Output /
+        // g_Exposure (fixed identity, bound once here -- see Init()'s own header comment).
         // =====================================================================================
-        VkDescriptorSetLayoutBinding bindings[2]{};
+        VkDescriptorSetLayoutBinding bindings[3]{};
         bindings[0] = { 0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
         bindings[1] = { 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+        bindings[2] = { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
 
         VkDescriptorSetLayoutCreateInfo setLayoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-        setLayoutInfo.bindingCount = 2;
+        setLayoutInfo.bindingCount = 3;
         setLayoutInfo.pBindings = bindings;
         VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &setLayoutInfo, nullptr, &m_SetLayout));
 
-        VkDescriptorPoolSize poolSizes[2] = { { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1 }, { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1 } };
+        VkDescriptorPoolSize poolSizes[3] = { { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1 }, { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1 }, { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1 } };
         VkDescriptorPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
         poolInfo.maxSets = 1;
-        poolInfo.poolSizeCount = 2;
+        poolInfo.poolSizeCount = 3;
         poolInfo.pPoolSizes = poolSizes;
         VK_CHECK(vkCreateDescriptorPool(m_Device, &poolInfo, nullptr, &m_DescriptorPool));
 
@@ -106,10 +108,12 @@ namespace renderer::debug {
 
         VkDescriptorImageInfo sourceInfo{ m_LinearSampler, m_DummyView, VK_IMAGE_LAYOUT_GENERAL };
         VkDescriptorImageInfo outputInfo{ VK_NULL_HANDLE, m_OutputView, VK_IMAGE_LAYOUT_GENERAL };
-        VkWriteDescriptorSet writes[2]{};
+        VkDescriptorBufferInfo exposureInfo{ exposureStateBuffer, 0, VK_WHOLE_SIZE };
+        VkWriteDescriptorSet writes[3]{};
         writes[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_Set, 0, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &sourceInfo, nullptr, nullptr };
         writes[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_Set, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &outputInfo, nullptr, nullptr };
-        vkUpdateDescriptorSets(m_Device, 2, writes, 0, nullptr);
+        writes[2] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_Set, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &exposureInfo, nullptr };
+        vkUpdateDescriptorSets(m_Device, 3, writes, 0, nullptr);
 
         VkPushConstantRange pushRange{ VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(uint32_t) };
         VkPipelineLayoutCreateInfo pipelineLayoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
@@ -126,7 +130,7 @@ namespace renderer::debug {
         pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
         pipelineInfo.stage.module = shaderModule;
         pipelineInfo.stage.pName = "main";
-        VK_CHECK(vkCreateComputePipelines(m_Device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_Pipeline));
+        VK_CHECK(vkCreateComputePipelines(m_Device, VulkanPipeline::GetPipelineCache(), 1, &pipelineInfo, nullptr, &m_Pipeline));
         vkDestroyShaderModule(m_Device, shaderModule, nullptr);
 
         LOG_INFO("[DebugBufferViewPass] Initialized.");

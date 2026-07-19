@@ -1,4 +1,4 @@
-#include "renderer/passes/FurStrandPass.h"
+﻿#include "renderer/passes/FurStrandPass.h"
 
 #include <algorithm>
 #include <array>
@@ -72,15 +72,19 @@ namespace renderer {
         };
         static_assert(sizeof(FurRenderParamsUBO) == 176, "FurRenderParamsUBO must match FurStrand.vert/.frag (std140).");
 
-        // Mirror of world_probe_sampling.glsl's WorldProbeGridParamsUBO (std140, 32 bytes) -- identical
-        // to VegetationScatterPass's own copy.
+        // Mirror of world_probe_sampling.glsl's WorldProbeGridParamsUBO (std140, 64 bytes -- F1,
+        // "Lumen Lite": one (origin, spacing) pair per renderer::WorldProbeGridPass::kLevelCount
+        // clipmap level) -- identical to VegetationScatterPass's own copy.
         struct WorldProbeGridParamsUBO {
-            float gridOriginX = 0.0f, gridOriginY = 0.0f, gridOriginZ = 0.0f;
-            float probeSpacing = 0.0f;
+            struct Level {
+                float originX = 0.0f, originY = 0.0f, originZ = 0.0f;
+                float spacing = 0.0f;
+            };
+            Level levels[3];
             float gridResolution = 0.0f;
             float _pad0 = 0.0f, _pad1 = 0.0f, _pad2 = 0.0f;
         };
-        static_assert(sizeof(WorldProbeGridParamsUBO) == 32, "WorldProbeGridParamsUBO must match world_probe_sampling.glsl (std140).");
+        static_assert(sizeof(WorldProbeGridParamsUBO) == 64, "WorldProbeGridParamsUBO must match world_probe_sampling.glsl (std140).");
 
     } // namespace
 
@@ -171,12 +175,14 @@ namespace renderer {
             { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr },          // shadow feedback
             { 2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr },  // shadow atlas
             { 3, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr },          // shadow sun levels
-            { 4, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr },  // world probe grid
+            { 4, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, WorldProbeGridPass::kLevelCount, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr },  // world probe grid (F1: multi-level)
             { 5, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr } });       // world probe grid params
 
         VkDescriptorPoolSize poolSizes[3] = {
             { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 16 },
-            { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 4 },
+            // F1 ("Lumen Lite"): +2 vs. pre-F1 (was 4: HZB + shadow atlas + 1 world probe grid sampler,
+            // now WorldProbeGridPass::kLevelCount=3 world probe grid samplers).
+            { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3 + WorldProbeGridPass::kLevelCount },
             { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 6 }
         };
         VkDescriptorPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
@@ -218,7 +224,12 @@ namespace renderer {
         VkDescriptorBufferInfo feedbackInfo{ vsm.GetFeedbackDeviceBuffer(), 0, VK_WHOLE_SIZE };
         VkDescriptorImageInfo atlasInfo{ vsm.GetPhysicalAtlasSampler(), vsm.GetPhysicalAtlasView(), VK_IMAGE_LAYOUT_GENERAL };
         VkDescriptorBufferInfo sunLevelsInfo{ vsm.GetSunLevelsBuffer(), 0, VK_WHOLE_SIZE };
-        VkDescriptorImageInfo probeGridInfo{ worldProbes.GetGridSampler(), worldProbes.GetGridView(), VK_IMAGE_LAYOUT_GENERAL };
+        // F1 ("Lumen Lite"): one VkDescriptorImageInfo per renderer::WorldProbeGridPass::kLevelCount
+        // clipmap level.
+        VkDescriptorImageInfo probeGridInfos[WorldProbeGridPass::kLevelCount]{};
+        for (uint32_t level = 0; level < WorldProbeGridPass::kLevelCount; ++level) {
+            probeGridInfos[level] = { worldProbes.GetGridSampler(), worldProbes.GetGridView(level), VK_IMAGE_LAYOUT_GENERAL };
+        }
         VkDescriptorBufferInfo gridParamsInfo{ m_WorldProbeGridParamsBuffer.Handle(), 0, VK_WHOLE_SIZE };
 
         auto bufWrite = [](VkDescriptorSet set, uint32_t binding, VkDescriptorType type, const VkDescriptorBufferInfo* bi) {
@@ -226,6 +237,9 @@ namespace renderer {
         };
         auto imgWrite = [](VkDescriptorSet set, uint32_t binding, const VkDescriptorImageInfo* ii) {
             return VkWriteDescriptorSet{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, set, binding, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, ii, nullptr, nullptr };
+        };
+        auto imgArrayWrite = [](VkDescriptorSet set, uint32_t binding, uint32_t count, const VkDescriptorImageInfo* ii) {
+            return VkWriteDescriptorSet{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, set, binding, 0, count, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, ii, nullptr, nullptr };
         };
 
         std::vector<VkWriteDescriptorSet> writes = {
@@ -252,7 +266,7 @@ namespace renderer {
             bufWrite(m_LightingSet, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, &feedbackInfo),
             imgWrite(m_LightingSet, 2, &atlasInfo),
             bufWrite(m_LightingSet, 3, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, &sunLevelsInfo),
-            imgWrite(m_LightingSet, 4, &probeGridInfo),
+            imgArrayWrite(m_LightingSet, 4, WorldProbeGridPass::kLevelCount, probeGridInfos),
             bufWrite(m_LightingSet, 5, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, &gridParamsInfo),
         };
         vkUpdateDescriptorSets(m_Device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
@@ -261,10 +275,13 @@ namespace renderer {
         // absolute-index addressing -- same static-upload simplification VegetationScatterPass uses).
         {
             WorldProbeGridParamsUBO gridParams{};
-            gridParams.gridOriginX = worldProbes.GetGridOriginWorld().x;
-            gridParams.gridOriginY = worldProbes.GetGridOriginWorld().y;
-            gridParams.gridOriginZ = worldProbes.GetGridOriginWorld().z;
-            gridParams.probeSpacing = WorldProbeGridPass::kProbeSpacing;
+            for (uint32_t level = 0; level < WorldProbeGridPass::kLevelCount; ++level) {
+                const maths::vec3& origin = worldProbes.GetGridOriginWorld(level);
+                gridParams.levels[level].originX = origin.x;
+                gridParams.levels[level].originY = origin.y;
+                gridParams.levels[level].originZ = origin.z;
+                gridParams.levels[level].spacing = WorldProbeGridPass::GetLevelSpacing(level);
+            }
             gridParams.gridResolution = static_cast<float>(WorldProbeGridPass::kGridResolution);
             VulkanUtils::ExecuteOneShotCommands(m_Device, commandPool, queue, [&](VkCommandBuffer cmd) {
                 vkCmdUpdateBuffer(cmd, m_WorldProbeGridParamsBuffer.Handle(), 0, sizeof(gridParams), &gridParams);
@@ -367,7 +384,7 @@ namespace renderer {
             pipelineInfo.pDepthStencilState = &depthStencil;
             pipelineInfo.pDynamicState = &dynamicState;
             pipelineInfo.layout = m_RenderPipelineLayout;
-            VK_CHECK(vkCreateGraphicsPipelines(m_Device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_RenderPipeline));
+            VK_CHECK(vkCreateGraphicsPipelines(m_Device, VulkanPipeline::GetPipelineCache(), 1, &pipelineInfo, nullptr, &m_RenderPipeline));
 
 #ifndef NDEBUG
             // Debug-only wireframe: same pipeline, VK_POLYGON_MODE_LINE, depth-write OFF so it overlays
@@ -379,7 +396,7 @@ namespace renderer {
             VkGraphicsPipelineCreateInfo wirePipelineInfo = pipelineInfo;
             wirePipelineInfo.pRasterizationState = &wireRaster;
             wirePipelineInfo.pDepthStencilState = &wireDepth;
-            VK_CHECK(vkCreateGraphicsPipelines(m_Device, VK_NULL_HANDLE, 1, &wirePipelineInfo, nullptr, &m_WireframePipeline));
+            VK_CHECK(vkCreateGraphicsPipelines(m_Device, VulkanPipeline::GetPipelineCache(), 1, &wirePipelineInfo, nullptr, &m_WireframePipeline));
 #endif
 
             vkDestroyShaderModule(m_Device, vertModule, nullptr);

@@ -1,4 +1,4 @@
-#include "renderer/passes/TessellationPass.h"
+﻿#include "renderer/passes/TessellationPass.h"
 
 #include <array>
 #include <cstring>
@@ -52,15 +52,19 @@ namespace renderer {
         static_assert(sizeof(TessellationLightingUBO) == 32,
             "TessellationLightingUBO must match Tessellation.frag's own TessellationLightingUBO exactly (std140 layout)");
 
-        // Byte-for-byte mirror of world_probe_sampling.glsl's WorldProbeGridParamsUBO (std140) --
-        // identical to renderer::TransparentForwardPass's own copy.
+        // Byte-for-byte mirror of world_probe_sampling.glsl's WorldProbeGridParamsUBO (std140, 64
+        // bytes -- F1, "Lumen Lite": one (origin, spacing) pair per
+        // renderer::WorldProbeGridPass::kLevelCount clipmap level).
         struct WorldProbeGridParamsUBO {
-            float gridOriginX = 0, gridOriginY = 0, gridOriginZ = 0;
-            float probeSpacing = 0;
+            struct Level {
+                float originX = 0, originY = 0, originZ = 0;
+                float spacing = 0;
+            };
+            Level levels[3];
             float gridResolution = 0;
             float _pad0 = 0, _pad1 = 0, _pad2 = 0;
         };
-        static_assert(sizeof(WorldProbeGridParamsUBO) == 32,
+        static_assert(sizeof(WorldProbeGridParamsUBO) == 64,
             "Must match world_probe_sampling.glsl's WorldProbeGridParamsUBO exactly (std140 layout)");
 
     } // namespace
@@ -101,7 +105,7 @@ namespace renderer {
         bindings[2] = { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr };         // g_ShadowPageTable
         bindings[3] = { 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr };         // g_ShadowFeedback
         bindings[4] = { 4, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr };         // g_ShadowSunLevels
-        bindings[5] = { 5, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr }; // g_WorldProbeGrid
+        bindings[5] = { 5, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, WorldProbeGridPass::kLevelCount, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr }; // g_WorldProbeGrid[] (F1: multi-level)
         bindings[6] = { 6, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr };         // WorldProbeGridParamsUBO
         bindings[7] = { 7, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr };         // MaterialParamsSSBO[kMaxMaterials]
         bindings[8] = { 8, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, nullptr };           // EntityTransformSSBO (vertex-stage only)
@@ -114,7 +118,7 @@ namespace renderer {
         VkDescriptorPoolSize poolSizes[4]{};
         poolSizes[0] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8 };             // bindings 2,3,7,8,10,11,12,13
         poolSizes[1] = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 3 };             // bindings 0,4,6
-        poolSizes[2] = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2 };     // bindings 1,5
+        poolSizes[2] = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1 + WorldProbeGridPass::kLevelCount }; // binding 1 + binding 5 (F1: multi-level, one sampler per level)
         poolSizes[3] = { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1 }; // binding 9
         auto descSet = VulkanUtils::CreateDescriptorSetLayoutPoolAndSet(m_Device,
             std::span{ bindings, 14 }, std::span{ poolSizes, 4 });
@@ -148,10 +152,14 @@ namespace renderer {
         VkDescriptorBufferInfo shadowFeedbackInfo{ vsm.GetFeedbackDeviceBuffer(), 0, VK_WHOLE_SIZE };
         VkDescriptorBufferInfo shadowSunLevelsInfo{ vsm.GetSunLevelsBuffer(), 0, VK_WHOLE_SIZE };
 
-        VkDescriptorImageInfo worldProbeGridInfo{};
-        worldProbeGridInfo.sampler = worldProbes.GetGridSampler();
-        worldProbeGridInfo.imageView = worldProbes.GetGridView();
-        worldProbeGridInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        // F1 ("Lumen Lite"): one VkDescriptorImageInfo per renderer::WorldProbeGridPass::kLevelCount
+        // clipmap level.
+        VkDescriptorImageInfo worldProbeGridInfos[WorldProbeGridPass::kLevelCount]{};
+        for (uint32_t level = 0; level < WorldProbeGridPass::kLevelCount; ++level) {
+            worldProbeGridInfos[level].sampler = worldProbes.GetGridSampler();
+            worldProbeGridInfos[level].imageView = worldProbes.GetGridView(level);
+            worldProbeGridInfos[level].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        }
 
         // world_probe_sampling.glsl's WorldProbeGridParamsUBO -- persistently mapped, refreshed
         // every RecordDraw() call (gridOrigin recenters every frame) -- see
@@ -194,7 +202,7 @@ namespace renderer {
         writes[2] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_Set, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &shadowPageTableInfo, nullptr };
         writes[3] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_Set, 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &shadowFeedbackInfo, nullptr };
         writes[4] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_Set, 4, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &shadowSunLevelsInfo, nullptr };
-        writes[5] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_Set, 5, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &worldProbeGridInfo, nullptr, nullptr };
+        writes[5] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_Set, 5, 0, WorldProbeGridPass::kLevelCount, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, worldProbeGridInfos, nullptr, nullptr };
         writes[6] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_Set, 6, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &worldProbeGridParamsInfo, nullptr };
         writes[7] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_Set, 7, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &materialParamsInfo, nullptr };
         writes[8] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_Set, 8, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &entityTransformInfo, nullptr };
@@ -359,7 +367,7 @@ namespace renderer {
         pipelineInfo.layout = m_PipelineLayout;
         pipelineInfo.pNext = &pipelineRendering;
 
-        VK_CHECK(vkCreateGraphicsPipelines(m_Device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_Pipeline));
+        VK_CHECK(vkCreateGraphicsPipelines(m_Device, VulkanPipeline::GetPipelineCache(), 1, &pipelineInfo, nullptr, &m_Pipeline));
         RegisterResource([this] { vkDestroyPipeline(m_Device, m_Pipeline, nullptr); m_Pipeline = VK_NULL_HANDLE; });
 
         vkDestroyShaderModule(m_Device, vertModule, nullptr);
@@ -404,14 +412,16 @@ namespace renderer {
         lightingUBO.sunColorB = sceneLights.sun.color.z;
         vkCmdUpdateBuffer(cmd, m_ViewParamsBuffer.Handle(), 0, sizeof(lightingUBO), &lightingUBO);
 
-        // Refresh the World Probe Grid params UBO's only per-frame-varying field (gridOrigin --
-        // see m_WorldProbeGridParamsBuffer's own header comment).
+        // Refresh the World Probe Grid params UBO's per-frame-varying fields (every level's own
+        // origin recenters every frame -- see m_WorldProbeGridParamsBuffer's own header comment).
         WorldProbeGridParamsUBO gridParams{};
-        const maths::vec3& gridOrigin = worldProbes.GetGridOriginWorld();
-        gridParams.gridOriginX = gridOrigin.x;
-        gridParams.gridOriginY = gridOrigin.y;
-        gridParams.gridOriginZ = gridOrigin.z;
-        gridParams.probeSpacing = WorldProbeGridPass::kProbeSpacing;
+        for (uint32_t level = 0; level < WorldProbeGridPass::kLevelCount; ++level) {
+            const maths::vec3& gridOrigin = worldProbes.GetGridOriginWorld(level);
+            gridParams.levels[level].originX = gridOrigin.x;
+            gridParams.levels[level].originY = gridOrigin.y;
+            gridParams.levels[level].originZ = gridOrigin.z;
+            gridParams.levels[level].spacing = WorldProbeGridPass::GetLevelSpacing(level);
+        }
         gridParams.gridResolution = static_cast<float>(WorldProbeGridPass::kGridResolution);
         std::memcpy(m_WorldProbeGridParamsBuffer.MappedData(), &gridParams, sizeof(gridParams));
 

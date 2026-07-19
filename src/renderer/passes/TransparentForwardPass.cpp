@@ -1,4 +1,4 @@
-#include "renderer/passes/TransparentForwardPass.h"
+﻿#include "renderer/passes/TransparentForwardPass.h"
 
 #include <cstring>
 #include <format>
@@ -151,11 +151,17 @@ namespace renderer {
         // One-time upload of the static entries list, the fixed draw count (see m_DrawCountBuffer's
         // own comment), and the World Probe Grid's static addressing -- mirrors every other pass's
         // own one-shot setup submit in this codebase.
+        // F1 ("Lumen Lite", UE5.8 parity roadmap): WorldProbeGridParams now carries one
+        // (origin, spacing) pair per renderer::WorldProbeGridPass::kLevelCount clipmap level -- see
+        // that struct's own comment.
         WorldProbeGridParams gridParams{};
-        gridParams.gridOriginX = worldProbes.GetGridOriginWorld().x;
-        gridParams.gridOriginY = worldProbes.GetGridOriginWorld().y;
-        gridParams.gridOriginZ = worldProbes.GetGridOriginWorld().z;
-        gridParams.probeSpacing = WorldProbeGridPass::kProbeSpacing;
+        for (uint32_t level = 0; level < WorldProbeGridPass::kLevelCount; ++level) {
+            const maths::vec3& origin = worldProbes.GetGridOriginWorld(level);
+            gridParams.levels[level].originX = origin.x;
+            gridParams.levels[level].originY = origin.y;
+            gridParams.levels[level].originZ = origin.z;
+            gridParams.levels[level].spacing = WorldProbeGridPass::GetLevelSpacing(level);
+        }
         gridParams.gridResolution = static_cast<float>(WorldProbeGridPass::kGridResolution);
         // m_ClusterEntriesBuffer's byte size scales with m_ClusterCount (scene-composition-
         // dependent -- every entity with an alpha < 1.0 material contributes its leaf clusters, see
@@ -214,7 +220,7 @@ namespace renderer {
         VkDescriptorPoolSize poolSizes[4]{};
         poolSizes[0] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 13 };           // Compact(3) + Forward(10: entries, pool, entityXform, entityData, materialParams, MegaLights g_Lights, fallbackVertex, fallbackIndex, drawRange, splineControlPoints -- Phase 1 Nanite advanced).
         poolSizes[1] = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 4 };            // Forward: WPOGlobals, ViewParams, g_ShadowSunLevels, WorldProbeGridParams.
-        poolSizes[2] = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2 };    // Forward: shadow physical atlas, World Probe Grid sampler.
+        poolSizes[2] = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1 + WorldProbeGridPass::kLevelCount }; // Forward: shadow physical atlas + World Probe Grid samplers (F1: one per level).
         poolSizes[3] = { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1 }; // Forward: shared g_TLAS.
 
         VkDescriptorPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
@@ -292,7 +298,7 @@ namespace renderer {
             bindings[11] = { 11, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr }; // g_TLAS (shared)
             bindings[12] = { 12, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr }; // MegaLightsSSBO (g_Lights)
             bindings[13] = { 13, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr }; // WorldProbeGridParamsUBO
-            bindings[14] = { 14, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr }; // g_WorldProbeGrid
+            bindings[14] = { 14, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, WorldProbeGridPass::kLevelCount, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr }; // g_WorldProbeGrid[] (F1: multi-level)
             bindings[15] = { 15, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr }; // FallbackVertexBuffer
             bindings[16] = { 16, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr }; // FallbackIndexBuffer
             bindings[17] = { 17, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr }; // EntityDrawRangeBuffer
@@ -334,7 +340,10 @@ namespace renderer {
             // World Probe Grid sampler + params (bindings 14, 13) -- static addressing/image handle,
             // written once here like every other Init()-time binding (only the grid's own texel
             // CONTENTS change frame to frame, sampled directly through this same view/sampler).
-            VkDescriptorImageInfo worldProbeGridInfo{ worldProbes.GetGridSampler(), worldProbes.GetGridView(), VK_IMAGE_LAYOUT_GENERAL };
+            VkDescriptorImageInfo worldProbeGridInfos[WorldProbeGridPass::kLevelCount]{};
+            for (uint32_t level = 0; level < WorldProbeGridPass::kLevelCount; ++level) {
+                worldProbeGridInfos[level] = { worldProbes.GetGridSampler(), worldProbes.GetGridView(level), VK_IMAGE_LAYOUT_GENERAL };
+            }
             VkDescriptorBufferInfo worldProbeGridParamsInfo{ m_WorldProbeGridParamsBuffer.Handle(), 0, m_WorldProbeGridParamsBuffer.Size() };
 
             // MegaLights light SSBO (binding 12).
@@ -354,7 +363,7 @@ namespace renderer {
             writes[6] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ForwardDescriptorSet, 6, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &materialParamsInfo, nullptr };
             writes[7] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ForwardDescriptorSet, 12, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &lightBufferInfo, nullptr };
             writes[8] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ForwardDescriptorSet, 13, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &worldProbeGridParamsInfo, nullptr };
-            writes[9] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ForwardDescriptorSet, 14, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &worldProbeGridInfo, nullptr, nullptr };
+            writes[9] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ForwardDescriptorSet, 14, 0, WorldProbeGridPass::kLevelCount, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, worldProbeGridInfos, nullptr, nullptr };
             writes[10] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ForwardDescriptorSet, 18, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &splineControlPointsInfo, nullptr };
             vkUpdateDescriptorSets(m_Device, 11, writes, 0, nullptr);
             // Bindings 7-10 (Phase 3's renderer::VirtualShadowMapPass resources) are intentionally
@@ -502,7 +511,7 @@ namespace renderer {
             pipelineInfo.pDynamicState = &dynamicState;
             pipelineInfo.layout = m_ForwardPipelineLayout;
 
-            VK_CHECK(vkCreateGraphicsPipelines(m_Device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_ForwardPipeline));
+            VK_CHECK(vkCreateGraphicsPipelines(m_Device, VulkanPipeline::GetPipelineCache(), 1, &pipelineInfo, nullptr, &m_ForwardPipeline));
 
             vkDestroyShaderModule(m_Device, vertModule, nullptr);
             vkDestroyShaderModule(m_Device, fragModule, nullptr);

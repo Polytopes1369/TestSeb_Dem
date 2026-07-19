@@ -30,7 +30,22 @@
 #include "include/substrate_bsdf.glsl"
 #include "include/terrain_shading.glsl" // Phase 7b (UE5.8 parity roadmap, terrain heightfield)
 #include "include/water_params.glsl" // Wave 2: kWaterLevel, for the underwater-caustics gate below.
-#include "include/procedural_light_modulation.glsl" // Wave 2 (UE5.8 caustics/light-function parity)
+
+// F12 (UE5.8 rendering-parity gap: Texture-based Light Functions + projected Caustics) -- see
+// ClusterResolve.comp's own identical include block comment for the full rationale (this shader
+// needs the exact same 2 real implementations replacing the same 2 procedural_light_modulation.glsl
+// stand-ins, just at different binding indices since its own binding numbering already differs from
+// ClusterResolve.comp's, same "MASK_ARRAY_BINDING differs per shader" precedent already established
+// two #include blocks above).
+#define LIGHT_FUNCTIONS_SET 0
+#define LIGHT_FUNCTIONS_BINDING 29
+#include "include/light_functions.glsl"
+#define CAUSTICS_TEXTURE_SET 0
+#define CAUSTICS_TEXTURE_BINDING 30
+#define CAUSTICS_UBO_SET 0
+#define CAUSTICS_UBO_BINDING 31
+#include "include/caustics_projection.glsl"
+
 #include "include/shading_bin_common.glsl"
 
 #define MASK_ARRAY_SET 0
@@ -362,10 +377,11 @@ void main() {
     // needs it -- Debug views never take this binned path, see this shader's own header comment).
     float mixMaskUnused = 0.0;
     mat = ApplySubstrateHorizontalMix(mat, worldPos, g_ViewParams.mixMaskSharpnessScale, mixMaskUnused);
-    // Wave 2 (UE5.8 water/caustics parity) -- see ClusterResolve.comp's own identical comment. Also
-    // a uniform branch across this dispatch, same reasoning as the terrain branch just above.
+    // F12 (UE5.8 rendering-parity gap: projected Caustics) -- see ClusterResolve.comp's own
+    // identical comment. Also a uniform branch across this dispatch, same reasoning as the terrain
+    // branch just above.
     float causticsModulation = (pc.binIndex == MATERIAL_ID_TERRAIN)
-        ? ComputeUnderwaterCaustics(worldPos, g_ViewParams.timeSeconds, kWaterLevel)
+        ? ComputeCausticsModulation(worldPos, normal, kWaterLevel, g_ViewParams.timeSeconds)
         : 1.0;
 
     // Step 4: Runtime Virtual Texture detail multiply -- see ClusterResolve.comp's own identical
@@ -435,9 +451,13 @@ void main() {
     float glintFootprint = perspNorm / max(g_ViewParams.viewportSize.y, 1.0);
     vec3 glint = EvaluateSubstrateGlint(mat, normal, viewDir, lightDir, worldPos, glintFootprint,
         g_ViewParams.glintDensityScale, g_ViewParams.glintIntensityScale);
-    // Wave 2 (UE5.8 caustics/light-function parity) -- see ClusterResolve.comp's own identical
-    // comment.
-    float sunLightFunction = EvaluateSunLightFunction(worldPos, g_ViewParams.sunDirection);
+    // F12 (UE5.8 rendering-parity gap: Texture-based Light Functions) -- see ClusterResolve.comp's
+    // own identical comment for the full rationale (real baked-texture sunburst gobo, kept subtle).
+    const int kSunLightFunctionIndex = 0;
+    const float kSunLightFunctionIntensity = 0.35;
+    vec3 sunPseudoLightPos = worldPos - g_ViewParams.sunDirection * 1000.0;
+    float sunLightFunctionSample = EvaluateLightFunctionRadial(kSunLightFunctionIndex, worldPos, sunPseudoLightPos, 0.0, 0.6);
+    float sunLightFunction = mix(1.0, sunLightFunctionSample, kSunLightFunctionIntensity);
     float sunModulation = causticsModulation * sunLightFunction;
     const float kEmissiveScale = 1500.0;
     vec3 finalColor = mat.base.diffuseAlbedo * skyAmbient

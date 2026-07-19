@@ -71,7 +71,7 @@ void main() {
     float sunVisibility = SampleSunShadowVSM(inWorldPos);
     float ndotl = max(dot(n, -g_Params.sunDirection), 0.0);
     vec3 sunRadiance = g_Params.sunColor * g_Params.sunIntensity * ndotl * sunVisibility;
-    vec3 indirectDiffuse = SampleWorldProbeGrid(inWorldPos);
+    vec3 indirectDiffuse = SampleWorldProbeGrid(inWorldPos, g_Params.cameraPosition);
     vec3 lighting = sunRadiance + indirectDiffuse + vec3(0.02); // Small constant floor -- see ParticleRender.frag's own identical rationale.
 
     // Fully opaque -- alpha is deliberately NOT taken from inColor.a (colorCurve's alpha channel is

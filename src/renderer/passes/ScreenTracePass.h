@@ -5,7 +5,7 @@
 // hemisphere direction around that pixel's own surface normal. On a hit, samples
 // renderer::ClusterResolvePass's own direct-lit color at the hit pixel as a cheap, correct-enough
 // near-field indirect contribution ("use the color of this pixel as near-field light contribution").
-// On a miss, falls back to renderer::WorldProbeGridPass's own low-resolution ambient
+// On a miss, falls back to renderer::WorldProbeGridPass's own multi-level ambient
 // grid ("merge this result with the lighting from the global probes") -- exactly Lumen's own tiered
 // Final Gather shape: cheap screen trace first, radiance-cache-style fallback second. The combined
 // (still noisy -- one ray per pixel per frame) result is what renderer::ATrousDenoisePass denoises
@@ -18,12 +18,22 @@
 // march against the existing hardware depth image (the same one renderer::HZBPass itself reduces
 // from, so this is consistent with this codebase's own existing "hardware depth only" scope
 // choice) is the simpler, still-correct approach this class implements.
+//
+// --- F1 ("Lumen Lite", UE5.8 parity roadmap): GI mode switch ---
+// In config::lumen::GIMode::HighQuality (the pre-F1 default and behavior), the march above always
+// runs, exactly as before. In GIMode::Lite, ScreenTrace.comp skips the march ENTIRELY (see that
+// shader's own giMode branch) and returns the World Probe grid's own multi-level, occlusion-weighted
+// irradiance directly -- Lite mode treats the probe grid as the PRIMARY GI term rather than a rare
+// fallback, matching real Lumen Lite's own "irradiance-field gather, minimal per-pixel work" design.
+// RecordTrace() takes the live `giMode` every call (not cached at Init()) so the Debug ImGui GI-mode
+// selector can flip it at runtime for A/B comparison.
 
 #include <cstdint>
 #include <vulkan/vulkan.h>
 #include <vk_mem_alloc.h>
 
 #include "core/Camera.h"
+#include "core/EngineConfig.h"
 #include "core/maths/Maths.h"
 #include "renderer/vulkan/GpuBuffer.h"
 
@@ -67,17 +77,19 @@ namespace renderer {
         void Shutdown();
 
         // Uploads this frame's view params (inverse view-projection reconstructed from `camera`,
-        // `cameraPositionWorld`, `frameIndex` for the Halton hemisphere jitter) and the World Probe
-        // grid's CURRENT origin (`worldProbeGridOrigin` -- recomputed every frame by
-        // renderer::WorldProbeGridPass::RecordUpdate, so this must be read fresh every call, not
-        // cached from Init()), then dispatches one invocation per output pixel. The depth image
-        // must already be in VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL (this function does
-        // not transition it); the World Probe grid must already be visible to a sampled read (the
-        // caller's barrier after renderer::WorldProbeGridPass::RecordUpdate). Caller owns every
-        // synchronization barrier before/after this call. Ends with a VkMemoryBarrier2 making
-        // GetOutputView() visible to renderer::ATrousDenoisePass's first read.
+        // `cameraPositionWorld`, `frameIndex` for the Halton hemisphere jitter, `giMode` -- F1's own
+        // live GI-mode switch, see the class comment) and every level's CURRENT origin/spacing (read
+        // fresh from `worldProbes` every call, not cached from Init() -- recomputed every frame by
+        // renderer::WorldProbeGridPass::RecordUpdate), then dispatches one invocation per output
+        // pixel. The depth image must already be in VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
+        // (this function does not transition it); the World Probe grid must already be visible to a
+        // sampled read (the caller's barrier after renderer::WorldProbeGridPass::RecordUpdate).
+        // Caller owns every synchronization barrier before/after this call. Ends with a
+        // VkMemoryBarrier2 making GetOutputView() visible to renderer::ATrousDenoisePass's first
+        // read.
         void RecordTrace(VkCommandBuffer cmd, const CameraPushConstants& camera,
-            const maths::vec3& cameraPositionWorld, const maths::vec3& worldProbeGridOrigin, uint32_t frameIndex);
+            const maths::vec3& cameraPositionWorld, const WorldProbeGridPass& worldProbes,
+            uint32_t frameIndex, config::lumen::GIMode giMode);
 
         VkImage GetOutputImage() const { return m_OutputImage; }
         VkImageView GetOutputView() const { return m_OutputView; }

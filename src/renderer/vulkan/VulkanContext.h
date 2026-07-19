@@ -30,6 +30,32 @@ public:
     void Init(std::string_view appName, GLFWwindow* window);
     void Shutdown();
 
+    // E1 (loading-time optimization): persisted VkPipelineCache -- see CreatePipelineCache()'s own
+    // comment for the load/validate logic and VulkanPipeline::SetPipelineCache()'s own comment for
+    // how every renderer:: pass' pipeline creation is routed through it.
+    VkPipelineCache GetPipelineCache() const { return m_PipelineCache; }
+    // Whether CreatePipelineCache() found and successfully validated an on-disk "pipeline.cache"
+    // blob for the CURRENT GPU/driver (matching VkPhysicalDeviceProperties exactly) -- false on
+    // first-ever launch, after a driver update, or after switching GPUs. Exposed so main.cpp's
+    // startup-phase timing log (E4) can report cache hit/miss without duplicating the validation
+    // logic here.
+    bool GetPipelineCacheWasHit() const { return m_PipelineCacheWasHit; }
+    // Byte size of the on-disk blob actually fed to vkCreatePipelineCache as pInitialData (0 if
+    // GetPipelineCacheWasHit() is false).
+    size_t GetPipelineCacheLoadedBytes() const { return m_PipelineCacheLoadedBytes; }
+    // Persists the CURRENT driver-side pipeline cache contents (vkGetPipelineCacheData) to
+    // "pipeline.cache" (exe-relative, see core::ResolveExeRelativePath), via a temp-file-then-rename
+    // so a crash or power-loss mid-write can never leave a half-written/corrupt file where a future
+    // launch's CreatePipelineCache() would try to load it (std::filesystem::rename is atomic on the
+    // same volume, and both paths here are the exe's own directory). Called (a) once, right after
+    // ClusterRenderPipeline::Init() succeeds in main.cpp -- the expensive first-run pipeline
+    // compiles just happened, so this is the earliest point their result can be captured -- and (b)
+    // again in Shutdown(), before the cache/device are destroyed, to also capture any pipeline
+    // created after that first save point. VkPipelineCache host access is internally synchronized
+    // per the Vulkan spec, so no extra locking is needed even if called while other threads are mid-
+    // vkCreate*Pipelines* against the same cache. A no-op if m_PipelineCache is VK_NULL_HANDLE.
+    void SavePipelineCache();
+
     VkDevice GetDevice() const { return m_Device; }
     // Needed by renderer::SurfaceCacheRayTracingPass::Init, which queries
     // VkPhysicalDeviceRayTracingPipelinePropertiesKHR (Shader Binding Table alignment) -- the one
@@ -345,6 +371,11 @@ private:
     VkSurfaceKHR m_Surface = VK_NULL_HANDLE;
     VkPhysicalDevice m_PhysicalDevice = VK_NULL_HANDLE;
     VkDevice m_Device = VK_NULL_HANDLE;
+
+    // E1 (loading-time optimization) -- see GetPipelineCache()/SavePipelineCache()'s own comments.
+    VkPipelineCache m_PipelineCache = VK_NULL_HANDLE;
+    bool m_PipelineCacheWasHit = false;
+    size_t m_PipelineCacheLoadedBytes = 0;
 
     VkQueue m_GraphicsQueue = VK_NULL_HANDLE;
     uint32_t m_GraphicsQueueFamilyIndex = 0;
@@ -712,6 +743,20 @@ private:
     void CreateSurface(GLFWwindow* window);
     void PickPhysicalDevice();
     void CreateLogicalDevice();
+    // E1 (loading-time optimization): loads + validates "pipeline.cache" (exe-relative) against
+    // this run's VkPhysicalDeviceProperties (vendorID/deviceID/pipelineCacheUUID, plus the
+    // VkPipelineCacheHeaderVersionOne prefix's own headerSize/headerVersion fields) before handing
+    // it to vkCreatePipelineCache as pInitialData -- a stale blob (different GPU, different driver
+    // version, truncated/corrupt file) is silently discarded in favor of an empty cache rather than
+    // risking vkCreatePipelineCache rejecting/ignoring bytes it cannot make sense of (the Vulkan
+    // spec permits an implementation to treat a non-matching blob as if initialDataSize were 0, but
+    // never requires it to -- validating ourselves first, with a clear logged reason, is more
+    // robust than relying on that permissive fallback). Called from Init(), right after
+    // CreateLogicalDevice() -- see that call site's own comment for why immediately after device
+    // creation is both necessary (needs m_Device for vkCreatePipelineCache) and sufficient (every
+    // renderer:: pass created afterward reads the resulting handle via
+    // VulkanPipeline::GetPipelineCache(), set here as the last step).
+    void CreatePipelineCache();
     void CreateCommandPool();
     void AllocateCommandBuffer();
     void CreateBindlessDescriptorSetLayout();

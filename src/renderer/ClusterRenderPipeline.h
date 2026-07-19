@@ -140,6 +140,7 @@
 #include "renderer/passes/FurStrandPass.h"
 #include "renderer/passes/HZBPass.h"
 #include "renderer/LightingTypes.h"
+#include "renderer/passes/ProceduralLightFunctionGenerator.h"
 #include "renderer/passes/ProceduralMaskGenerator.h"
 #include "renderer/passes/ReflectionPass.h"
 #include "renderer/passes/ScreenSpaceEffectsPass.h"
@@ -156,7 +157,9 @@
 #include "renderer/passes/WorldProbeGridPass.h"
 #include "renderer/passes/TAATSRPass.h"
 #include "renderer/passes/DepthOfFieldPass.h"
+#include "renderer/passes/DepthOfFieldAccumulationPass.h"
 #include "renderer/passes/BloomPass.h"
+#include "renderer/passes/FogScreenSpaceScatteringPass.h"
 #include "renderer/passes/PostProcessPass.h"
 #include "renderer/passes/ScreenTracePass.h"
 #include "renderer/passes/GICompositePass.h"
@@ -166,6 +169,7 @@
 #include "renderer/debug/ClusterTriangleStatsPass.h"
 #include "renderer/debug/DebugBufferViewPass.h"
 #include "renderer/debug/DebugTextOverlay.h"
+#include "renderer/debug/GpuTimestampProfiler.h"
 #include "renderer/debug/ParticleDebugViewPass.h"
 // PCG editor-tooling roadmap, Phase 7.2 ("PCG Point Cloud Debug Visualization"): draws
 // RunPcgFullPipelineSmokeTest()'s own point set as wireframe box gizmos -- see that class' own
@@ -306,6 +310,19 @@ namespace renderer {
         // anything handed this reference, exactly as m_LoadingManager's own comment already states.
         core::LoadingManager& GetLoadingManager() { return m_LoadingManager; }
 
+        // PCG roadmap Phase 6.3 ("Runtime Generator Hook") REAL wiring: the two pieces of this
+        // pipeline's private Vulkan/lighting state that a persistent, LIVE renderer::PcgInstanceDrawPass
+        // (owned by main.cpp, not a smoke-test-local) needs for its own Init() call but had no public
+        // accessor for before -- every OTHER Init() parameter (device/allocator/commandPool/queue/
+        // materialTable) is already reachable from main.cpp directly via VulkanContext's own public
+        // getters (GetDevice/GetAllocator/GetCommandPool/GetGraphicsQueue/GetMaterialTable); only the
+        // resident geometry page pool's physical buffer and the showcase scene's baked sun direction
+        // are private to THIS class. Mirrors exactly what RunPcgCellLoaderSmokeTest's own STEP 2 local
+        // setup already reads internally (m_PagePool.GetPhysicalPoolBuffer(), m_BaseSunDirection) --
+        // both cheap, read-only forwards, no new state or ownership transfer.
+        VkBuffer GetPagePoolPhysicalBuffer() const { return m_PagePool.GetPhysicalPoolBuffer(); }
+        maths::vec3 GetBaseSunDirection() const { return m_BaseSunDirection; }
+
         // Phase 2 (Lumen advanced roadmap) fix: the frame is now recorded across 4 calls instead of
         // one RecordFrame() -- see this class' own header comment ("Per-frame GPU work") for the
         // full root-cause/redesign explanation and main.cpp for the exact submit sequence each call
@@ -402,6 +419,15 @@ namespace renderer {
         // toggle. Plain accessor (the count itself is not debug-only data), same convention as
         // GetVegetationScatter().GetInstanceCount() above.
         uint32_t GetDecalCount() const { return m_Decals.GetDecalCount(); }
+
+        // UE5.8-parity "Accumulation Depth of Field": frames elapsed since m_DepthOfFieldAccumulation's
+        // own history last fully reset (first frame / a Gather -> Accumulation mode switch) -- read by
+        // main.cpp's own Debug "Post FX" ImGui tab for a live convergence readout next to the DOF Mode
+        // combo. Plain accessor (not debug-only data, same convention as GetDecalCount() above). Only
+        // advances while config::postprocess::DOF_MODE == 1 -- [13e] only dispatches whichever DOF
+        // sub-pass is actually selected each frame (not both), so this value simply freezes at its
+        // last count while Gather mode is active instead of ticking meaninglessly in the background.
+        uint32_t GetDOFAccumulationFramesSinceReset() const { return m_DepthOfFieldAccumulation.GetFramesSinceReset(); }
 
         // UE5.8 rendering-parity gap G10a: hair/fur strand pass (strand-count readout) -- same
         // "borrow a const ref" convention as GetVegetationScatter().
@@ -738,6 +764,29 @@ namespace renderer {
         // config::debugview::PCG_POINT_CLOUD_VIZ), main.cpp never touches the raw pcg::PcgPoint
         // data itself.
         uint32_t GetDebugPcgPointCloudCount() const { return m_PcgPointCloudDebugView.GetPointCount(); }
+
+        // B1 (audit-fix roadmap, per-pass GPU timestamp profiler): rolling-averaged GPU milliseconds
+        // for every graphics-queue pass zone recorded so far this session (RecordFrameEarly/
+        // RecordFrameMid/RecordFrameLate, all on the same queue -- see m_GpuProfiler's own
+        // declaration comment) -- read live by main.cpp's "GPU Profiler" ImGui section. Calling this
+        // mutates m_GpuProfiler's own internal rolling-average state (see
+        // debug::GpuTimestampProfiler::GetResults()'s own comment) -- callers should call it at most
+        // once per real frame.
+        std::vector<debug::GpuTimestampProfiler::ZoneResult> GetGpuProfilerResults() { return m_GpuProfiler.GetResults(); }
+
+        // Sum of m_GpuProfiler's own zone averages -- see GetTotalAvgMs()'s own comment for why this
+        // must be called AFTER GetGpuProfilerResults() within the same frame to reflect the results
+        // that call just produced, not a stale prior frame's sum.
+        float GetGpuProfilerTotalAvgMs() { return m_GpuProfiler.GetTotalAvgMs(); }
+
+        // Async-compute queue's own independent instance (RecordAsyncCompute()'s own separate
+        // command buffer/queue -- see m_GpuProfilerAsync's own declaration comment). Same
+        // once-per-frame mutation contract as GetGpuProfilerResults() above. Empty (not merely all-
+        // zero) every frame this session never once routed through the async-compute queue -- see
+        // RecordAsyncCompute()'s own early-return comment.
+        std::vector<debug::GpuTimestampProfiler::ZoneResult> GetGpuProfilerAsyncResults() { return m_GpuProfilerAsync.GetResults(); }
+
+        bool IsGpuProfilerSupported() const { return m_GpuProfiler.IsSupported(); }
 #endif
 
     private:
@@ -891,6 +940,13 @@ namespace renderer {
         // time, before any raster/resolve pass is initialized -- see ProceduralMaskGenerator's own
         // class comment. GetMaskImageInfos() is threaded into all three passes below.
         ProceduralMaskGenerator m_MaskGenerator;
+
+        // F12 (UE5.8 rendering-parity gap: Texture-based Light Functions + projected Caustics):
+        // generates the bindless Light Function gobo array (light_functions.glsl) + the caustics
+        // pattern texture (caustics_projection.glsl) once at Init() time, before m_Resolve below is
+        // initialized (its own sole consumer) -- see ProceduralLightFunctionGenerator's own class
+        // comment.
+        ProceduralLightFunctionGenerator m_LightFunctionGenerator;
 
         // Generic multithreaded background-job pool (hardware_concurrency worker threads) -- see
         // core::LoadingManager's own class comment. Currently consumed by m_GlobalSDF::Init() to
@@ -1249,11 +1305,22 @@ namespace renderer {
         // see DepthOfFieldPass's own class comment. m_Bloom and m_PostProcess both read ITS
         // GetOutputView() now, not m_TAATSR's directly.
         DepthOfFieldPass m_DepthOfField;
+        // UE5.8-parity "Accumulation Depth of Field" (config::postprocess::DOF_MODE == 1): alternative
+        // resolve technique reading the SAME m_TAATSR output as m_DepthOfField above -- see
+        // DepthOfFieldAccumulationPass's own class comment. Always Init'd alongside m_DepthOfField
+        // (both stay resident so the live ImGui toggle never needs a resize/recreate); RecordFrame's
+        // own [13e] picks whichever one's GetOutputView() feeds m_Bloom/m_PostProcess this frame.
+        DepthOfFieldAccumulationPass m_DepthOfFieldAccumulation;
         // Phase PP2 (post-process stack roadmap): Bloom / Lens Flare / Anamorphic Lens Flare / Lens
         // Dirt, all one dual-filter mip chain reading m_DepthOfField's own output -- see BloomPass's
         // own class comment. Recorded before m_PostProcess (below), whose composite shader samples
         // its GetOutputView() and adds it into the scene color.
         BloomPass m_Bloom;
+        // F3 (UE5.8 rendering-parity gap: Fog Screen Space Scattering): depth-aware bilateral spread
+        // of m_AtmosFog's own per-pixel in-scattered radiance, recorded immediately before
+        // m_PostProcess (below) -- see FogScreenSpaceScatteringPass's own class comment for why it
+        // must run adjacent to its one producer (m_AtmosFog) and one consumer (m_PostProcess).
+        FogScreenSpaceScatteringPass m_FogScatter;
         // Phase PP1 (post-process stack roadmap): Physical Camera / Auto Exposure / White Balance /
         // Color Correction / ACES Tone Mapping / Gamma Correction -- the normal-view-path blit
         // source instead of m_TAATSR's own raw HDR output directly (see PostProcessPass's own class
@@ -1268,6 +1335,12 @@ namespace renderer {
         // frame's" value has run.
         maths::mat4 m_PrevViewProj{};
         bool m_HasPrevViewProj = false;
+
+        // Whether m_DepthOfFieldAccumulation was the active DOF pass on the PREVIOUS frame --
+        // compared against config::postprocess::DOF_MODE each frame so a Gather -> Accumulation mode
+        // switch forces one full history reset (its ping-pong buffers may hold stale/never-written
+        // data while a different mode was active) -- see [13e]'s own resetHistory computation.
+        bool m_DOFAccumulationWasActive = false;
 
         // Advances once per RecordFrame() call -- ScreenProbeTrace.comp's own per-frame Fibonacci-
         // sphere jitter rotation (include/sh_probe.glsl's JitterDirection).
@@ -1400,6 +1473,28 @@ namespace renderer {
         PcgSmokeTestResult m_PcgFullPipelineSmokeTestResult;
         PcgSmokeTestResult m_Phase03DynamicLumenSmokeTestResult;
         PcgSmokeTestResult m_PcgCellLoaderSmokeTestResult;
+
+        // B1 (audit-fix roadmap, per-pass GPU timestamp profiler): instruments every major
+        // m_*.Record*() call across RecordFrameEarly()/RecordFrameMid()/RecordFrameLate() -- all
+        // three are recorded into cmdEarly/cmdMid/cmdLate, submitted IN THAT ORDER to the SAME
+        // graphics queue every frame (see this class' own header comment), so one shared query pool
+        // with BeginFrame() called once (at the very top of RecordFrameEarly(), before the first
+        // zone) and zones opened/closed across all three command buffers works exactly like
+        // ParticleSystemPass::m_TimestampQueryPool's own precedent of writing timestamps from two
+        // different command buffers into one pool.
+        debug::GpuTimestampProfiler m_GpuProfiler;
+
+        // RecordAsyncCompute()'s own separate async-compute queue command buffer needs its OWN pool
+        // (a query pool's reset/write/copy commands must all be recorded against command buffers
+        // whose queue family the pool doesn't otherwise care about, but the whole point of tracking
+        // this queue separately is that its GPU work runs CONCURRENTLY with cmdMid on the graphics
+        // queue -- folding it into m_GpuProfiler's own shared timeline would misrepresent overlapping
+        // work as serialized). Only ever written when m_FrameScratch.useAsyncCompute is true this
+        // frame (RecordAsyncCompute() returns immediately, recording nothing at all, otherwise) --
+        // see that method's own early-return comment. A session that never once routes through the
+        // async-compute queue simply never calls this instance's BeginFrame(), so
+        // GetGpuProfilerAsyncResults() stays empty rather than reporting misleading all-zero zones.
+        debug::GpuTimestampProfiler m_GpuProfilerAsync;
 #endif
     };
 

@@ -36,9 +36,8 @@ const float kSigmaNormal = 32.0;
 const float kSigmaDepth = 0.002;
 const float kSigmaLuminance = 4.0;
 
-float Luminance(vec3 c) {
-    return dot(c, vec3(0.2126, 0.7152, 0.0722));
-}
+// Luminance(vec3) now lives in math_utils.glsl (already included above) -- A5 cleanup, was
+// previously a local copy here.
 
 void main() {
     ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);

@@ -51,11 +51,28 @@ namespace renderer {
 
         static constexpr VkFormat kOutputFormat = VK_FORMAT_R8G8B8A8_UNORM;
         static constexpr uint32_t kHistogramBinCount = 256u;
-        // Log2-luminance range the histogram covers: roughly EV -10 (deep shadow) to EV +4 (bright
-        // sky/sun highlight) in raw linear luminance terms -- wide enough for both indoor-dark and
-        // outdoor-bright demoscene scenes without every sample collapsing into the two end bins.
-        static constexpr float kMinLogLuminance = -10.0f;
-        static constexpr float kLogLuminanceRange = 14.0f;
+        // Log2-luminance range the histogram covers, in the SAME raw linear g_HDRColor units the
+        // scene is actually lit in -- i.e. real photometric nits, not a normalized [0,1] "unitless"
+        // scale. Re-tuned 2026-07-19 (Task F11, enabling Auto Exposure): the OLD range here
+        // ([2^-10, 2^-10+2^14] = [~0.001, 16]) predates the 2026-07-17/18 lighting recalibration to
+        // real UE5.8 lux/candela values (world::DirectionalLight::intensity = 10,000 lux -- see that
+        // struct's own comment) and the matching manual Physical Camera re-tune (EXPOSURE_APERTURE's
+        // own comment: EV100 ~17.0, MaxLuminance = 1.2*2^EV100 ~= 153,600). Under that real-lux
+        // scale, a directly-sunlit mid-albedo diffuse surface alone already reads ~1,500-2,000 nits
+        // (irradiance*albedo/pi), with GGX specular highlights and the sky/sun disk itself reaching
+        // into the tens of thousands -- i.e. almost every non-black pixel in a real scene would have
+        // clamped into the histogram's single top bin (256) under the old range, collapsing Auto
+        // Exposure's weighted-mean luminance to a constant ~16 regardless of true scene content
+        // (targetEV100 = log2(16*100/12.5) ~= 7.0, a ~10-stop under-exposure vs the correct ~17.0 --
+        // a severe, constant blow-out, not oscillation, but just as wrong). New range covers
+        // [2^-6, 2^-6+2^24] = [~0.0156, ~262,144]: comfortably brackets the manual metering's own
+        // MaxLuminance ceiling with headroom for brighter specular fireflies (BloomUpsampleComposite
+        // .comp/PostProcessComposite.comp's own SanitizeHDR guards separately cap those at 50,000
+        // before they reach Bloom), while still resolving ~0.094 EV/bin (24 stops / 254 usable bins)
+        // -- plenty fine for a stable weighted-mean read. Sub-0.005 luminance is still routed to the
+        // dedicated bin 0 (see AutoExposureHistogram.comp's own ColorToBin()), unaffected by this.
+        static constexpr float kMinLogLuminance = -6.0f;
+        static constexpr float kLogLuminanceRange = 24.0f;
 
         // Physical Camera + White Balance + Color Correction, all user/scene tunable -- exposed as
         // one plain struct (not Debug-only: these are legitimate Release-time artistic controls,
@@ -70,6 +87,17 @@ namespace renderer {
             float exposureCompensationEV = 0.0f;
             float adaptationSpeedUpEVPerSec = 3.0f;   // Scene darkened -> exposure rising.
             float adaptationSpeedDownEVPerSec = 1.0f; // Scene brightened -> exposure falling.
+            // UE5.8's own Auto Exposure Histogram metering defaults: only the middle slice of the
+            // histogram's CUMULATIVE population (by pixel count, not by bin index) feeds the
+            // weighted-mean luminance -- the bottom `histogramLowPercent`% (deep shadow/near-black
+            // pixels, which would otherwise pull exposure up whenever a scene has a lot of shadow
+            // area on screen) and the top `100-histogramHighPercent`% (small, intense specular
+            // highlights/fireflies -- including MegaLights' own residual per-pixel ReSTIR noise,
+            // see EXPOSURE_USE_AUTO's own EngineConfig.h comment for why that mattered here
+            // specifically) are trimmed before averaging. See AutoExposureAdapt.comp's own comment
+            // for the exact trimmed-weighted-mean algorithm this drives.
+            float histogramLowPercent = 80.0f;
+            float histogramHighPercent = 98.3f;
 
             // White Balance
             float whiteBalanceTempKelvin = 6500.0f; // 6500 = neutral (D65).
@@ -116,6 +144,13 @@ namespace renderer {
             float fogStartDistance = 5.0f;
             float fogMaxOpacity = 0.85f;
 
+            // F3 (UE5.8 rendering-parity gap: Fog Screen Space Scattering) -- see
+            // PostProcessParamsUBO::useFogScreenSpaceScattering's own comment. Mirrors
+            // config::atmos::FOG_SCREEN_SPACE_SCATTERING_ENABLED (live-tunable via the Debug ImGui
+            // "Atmos" tab); true by default, matching every other feature-complete post-process
+            // stage in this Settings struct.
+            bool fogScreenSpaceScatteringEnabled = true;
+
             // Phase PP4: Volumetric Light Shafts / God Rays (Crepuscular Rays) -- radial screen-
             // space raymarch of this pass' own HDR input toward the sun's screen-projected position
             // (see RecordComposite's own `sunDirection`/`viewProj` parameters).
@@ -148,14 +183,20 @@ namespace renderer {
         // pipeline has no display-resolution depth anywhere -- see DepthOfField.comp's own comment).
         // `skyViewLUTView` (Atmos weather system, Subtask 2): renderer::AtmosSkyPass's own Sky-View
         // LUT view. `volumetricFogView` (Atmos Subtask 3): renderer::AtmosVolumetricFogPass's own
-        // integrated fog 3D texture. `cloudsView` (Atmos Subtask 4): renderer::AtmosCloudsPass's own
-        // half-resolution cloud buffer. All sampled read-only through this pass' own m_LinearSampler
-        // -- fixed identity for this pipeline's entire lifetime (no producer pass ever recreates its
-        // own images after Init()), same convention as `depthView`/`refractionOffsetView` below.
+        // integrated fog 3D texture -- kept bound even though F3 (below) usually supersedes it, as
+        // the config::atmos::FOG_SCREEN_SPACE_SCATTERING_ENABLED=false fallback source. `cloudsView`
+        // (Atmos Subtask 4): renderer::AtmosCloudsPass's own half-resolution cloud buffer.
+        // `fogScatteredView` (F3, Fog Screen Space Scattering): renderer::
+        // FogScreenSpaceScatteringPass::GetOutputView() -- this frame's depth-aware-blurred 2D fog
+        // buffer, ApplyVolumetricFog's preferred source (see PostProcessParamsUBO::
+        // useFogScreenSpaceScattering's own comment). All sampled read-only through this pass' own
+        // m_LinearSampler -- fixed identity for this pipeline's entire lifetime (no producer pass
+        // ever recreates its own images after Init()), same convention as `depthView`/
+        // `refractionOffsetView` below.
         void Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
             VkExtent2D displayExtent, VkImageView hdrColorView, VkImageView bloomView,
             VkImageView depthView, VkImageView refractionOffsetView, VkImageView skyViewLUTView,
-            VkImageView volumetricFogView, VkImageView cloudsView);
+            VkImageView volumetricFogView, VkImageView cloudsView, VkImageView fogScatteredView);
 
         void Shutdown();
 
@@ -195,6 +236,14 @@ namespace renderer {
 
         VkImage GetOutputImage() const { return m_OutputImage; }
         VkImageView GetOutputView() const { return m_OutputView; }
+
+        // Read-only access to the persistent { float currentEV100; float currentAvgLuminance; }
+        // SSBO (see m_ExposureStateBuffer's own comment) for other passes that need the SAME
+        // real, eye-adapted exposure this pass' own PostProcessComposite.comp reads -- currently
+        // only renderer::debug::DebugBufferViewPass (Debug-only), so its HDR buffer-viewer entries
+        // (Bloom, GI Composite, TAA/TSR output, etc.) tonemap with the same exposure normalization
+        // instead of feeding raw real-lux radiance straight into ACES (which saturates to white).
+        VkBuffer GetExposureStateBuffer() const { return m_ExposureStateBuffer.Handle(); }
 
     private:
         // Byte-for-byte mirror of PostProcessComposite.comp's PostProcessParamsUBO (std140).
@@ -284,7 +333,19 @@ namespace renderer {
             // PostProcessComposite.comp recover each pixel's view-space depth (distance along this
             // axis, NOT Euclidean ray length) to look up renderer::AtmosVolumetricFogPass's own
             // froxel grid via atmos_volumetric_fog_mapping.glsl's ViewZToFroxelW().
-            float cameraForwardX = 0.0f, cameraForwardY = 0.0f, cameraForwardZ = 0.0f, _padFog = 0.0f;
+            // F3 (Fog Screen Space Scattering): useFogScreenSpaceScattering repurposes what was
+            // _padFog (no struct-size change, static_assert below still 448 bytes -- same "occupy a
+            // spare pad slot" convention this codebase already established, see e.g. renderer::
+            // MaterialParameters::lightingChannelMask's own comment). 1 = ApplyVolumetricFog samples
+            // g_FogScattered (renderer::FogScreenSpaceScatteringPass::GetOutputView(), this frame's
+            // depth-aware-blurred fog); 0 = falls back to the original direct g_VolumetricFog 3D
+            // lookup, unblurred -- config::atmos::FOG_SCREEN_SPACE_SCATTERING_ENABLED's live default
+            // is 1, so Release visuals include F3 by default; the Debug ImGui toggle can flip it back
+            // to the pre-F3 lookup for an A/B comparison at zero extra pipeline cost (both bindings
+            // stay populated every frame either way -- see FogScreenSpaceScatteringPass's own class
+            // comment for why this pass is never fully skipped).
+            float cameraForwardX = 0.0f, cameraForwardY = 0.0f, cameraForwardZ = 0.0f;
+            uint32_t useFogScreenSpaceScattering = 1u;
         };
         static_assert(sizeof(PostProcessParamsUBO) == 448,
             "PostProcessParamsUBO must match PostProcessComposite.comp's PostProcessParamsUBO exactly (std140 layout)");
@@ -300,6 +361,8 @@ namespace renderer {
             float exposureCompensationEV = 0.0f;
             float manualEV100 = 0.0f;
             uint32_t useAutoExposure = 1u;
+            float histogramLowPercent = 80.0f;
+            float histogramHighPercent = 98.3f;
         };
 
         // Byte-for-byte mirror of AutoExposureHistogram.comp's push_constant block.
@@ -323,6 +386,21 @@ namespace renderer {
         GpuBuffer m_HistogramBuffer;      // 256 x uint, cleared by AutoExposureAdapt.comp every frame.
         GpuBuffer m_ExposureStateBuffer;  // { float currentEV100; float currentAvgLuminance; }, persistent.
         GpuBuffer m_ParamsBuffer;         // PostProcessParamsUBO, re-uploaded every frame.
+
+#ifndef NDEBUG
+        // Debug-only Auto Exposure telemetry (Task F11): a tiny persistently-mapped (CPU_ONLY,
+        // mapped=true) 1-frame-latent copy of m_ExposureStateBuffer, recorded at the tail of every
+        // RecordComposite() call and logged at the TOP of the next one -- same "record this frame,
+        // consume next frame after the frame-fence wait already guarantees completion" pattern as
+        // renderer::ClusterLODSelectionPass's own m_DebugDecisionReadbackBuffer/RecordDebugReadback
+        // (see that class's own comment for the full fence-ordering argument, which applies
+        // identically here since this pass also only ever runs on cmdLate). Exists purely so a
+        // Debug build can log currentEV100/currentAvgLuminance to demo_log.txt every few frames for
+        // empirical flicker validation (a raw scalar time series is far more reliable than diffing
+        // screenshots) -- zero Release footprint, matching CLAUDE.md's Debug/Release separation rule.
+        GpuBuffer m_DebugExposureReadbackBuffer;
+        uint32_t m_DebugExposureLogFrameCounter = 0u;
+#endif
 
         VkDescriptorPool m_DescriptorPool = VK_NULL_HANDLE;
 

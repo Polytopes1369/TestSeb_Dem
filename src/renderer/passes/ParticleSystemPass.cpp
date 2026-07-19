@@ -1,4 +1,4 @@
-#include "renderer/passes/ParticleSystemPass.h"
+﻿#include "renderer/passes/ParticleSystemPass.h"
 
 #include <cstring>
 #include <format>
@@ -127,15 +127,20 @@ namespace renderer {
         };
         static_assert(sizeof(ParticleRenderParamsUBO) == 256, "ParticleRenderParamsUBO must match ParticleRender.vert/.frag's own UBO exactly (std140 layout)");
 
-        // Byte-for-byte mirror of world_probe_sampling.glsl's WorldProbeGridParamsUBO (std140) --
-        // identical to renderer::TessellationPass's own copy (see that class' own comment).
+        // Byte-for-byte mirror of world_probe_sampling.glsl's WorldProbeGridParamsUBO (std140, 64
+        // bytes -- F1, "Lumen Lite": one (origin, spacing) pair per
+        // renderer::WorldProbeGridPass::kLevelCount clipmap level) -- identical to
+        // renderer::TessellationPass's own copy (see that class' own comment).
         struct WorldProbeGridParamsUBO {
-            float gridOriginX = 0.0f, gridOriginY = 0.0f, gridOriginZ = 0.0f;
-            float probeSpacing = 0.0f;
+            struct Level {
+                float originX = 0.0f, originY = 0.0f, originZ = 0.0f;
+                float spacing = 0.0f;
+            };
+            Level levels[3];
             float gridResolution = 0.0f;
             float _pad0 = 0.0f, _pad1 = 0.0f, _pad2 = 0.0f;
         };
-        static_assert(sizeof(WorldProbeGridParamsUBO) == 32, "WorldProbeGridParamsUBO must match world_probe_sampling.glsl's own UBO exactly (std140 layout)");
+        static_assert(sizeof(WorldProbeGridParamsUBO) == 64, "WorldProbeGridParamsUBO must match world_probe_sampling.glsl's own UBO exactly (std140 layout)");
 
         // D3 (point-light VSM shadows): byte-for-byte mirror of ParticleRender.frag's own
         // ParticlePointLightsUBO/ParticlePointLight (std140) -- flat scalars throughout, same
@@ -655,7 +660,7 @@ namespace renderer {
             simPipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
             simPipelineInfo.stage.module = shaderModule;
             simPipelineInfo.stage.pName = "main";
-            VK_CHECK(vkCreateComputePipelines(m_Device, VK_NULL_HANDLE, 1, &simPipelineInfo, nullptr, &m_SimPipeline));
+            VK_CHECK(vkCreateComputePipelines(m_Device, VulkanPipeline::GetPipelineCache(), 1, &simPipelineInfo, nullptr, &m_SimPipeline));
             vkDestroyShaderModule(m_Device, shaderModule, nullptr);
         }
 
@@ -718,7 +723,7 @@ namespace renderer {
             sortPipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
             sortPipelineInfo.stage.module = sortShaderModule;
             sortPipelineInfo.stage.pName = "main";
-            VK_CHECK(vkCreateComputePipelines(m_Device, VK_NULL_HANDLE, 1, &sortPipelineInfo, nullptr, &m_SortPipeline));
+            VK_CHECK(vkCreateComputePipelines(m_Device, VulkanPipeline::GetPipelineCache(), 1, &sortPipelineInfo, nullptr, &m_SortPipeline));
             vkDestroyShaderModule(m_Device, sortShaderModule, nullptr);
         }
 
@@ -810,7 +815,7 @@ namespace renderer {
             lightingBindings[1] = { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr };          // Shadow feedback.
             lightingBindings[2] = { 2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr };  // Shadow physical atlas.
             lightingBindings[3] = { 3, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr };         // Shadow sun clipmap levels.
-            lightingBindings[4] = { 4, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr }; // World Probe Grid.
+            lightingBindings[4] = { 4, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, WorldProbeGridPass::kLevelCount, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr }; // World Probe Grid (F1: multi-level).
             lightingBindings[5] = { 5, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr };         // World Probe Grid params.
             lightingBindings[6] = { 6, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr };         // D1: MegaLights SSBO.
             lightingBindings[7] = { 7, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr }; // D1: shared g_TLAS.
@@ -825,7 +830,8 @@ namespace renderer {
 
             VkDescriptorPoolSize lightingPoolSizes[4] = {
                 { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3 },              // Page table, feedback, D1 MegaLights SSBO.
-                { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3 },      // Atlas, World Probe Grid, D5 volumetric fog.
+                // Atlas, World Probe Grid (F1: kLevelCount samplers), D5 volumetric fog.
+                { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2 + WorldProbeGridPass::kLevelCount },
                 { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 4 },              // Sun levels, World Probe Grid params, D3 VSM point faces, D3 point-light UBO.
                 { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1 }   // D1 shared g_TLAS.
             };
@@ -845,7 +851,12 @@ namespace renderer {
             VkDescriptorBufferInfo feedbackInfo{ vsm.GetFeedbackDeviceBuffer(), 0, VK_WHOLE_SIZE };
             VkDescriptorImageInfo atlasInfo{ vsm.GetPhysicalAtlasSampler(), vsm.GetPhysicalAtlasView(), VK_IMAGE_LAYOUT_GENERAL };
             VkDescriptorBufferInfo sunLevelsInfo{ vsm.GetSunLevelsBuffer(), 0, VK_WHOLE_SIZE };
-            VkDescriptorImageInfo worldProbeGridInfo{ worldProbes.GetGridSampler(), worldProbes.GetGridView(), VK_IMAGE_LAYOUT_GENERAL };
+            // F1 ("Lumen Lite"): one VkDescriptorImageInfo per renderer::WorldProbeGridPass::kLevelCount
+            // clipmap level.
+            VkDescriptorImageInfo worldProbeGridInfos[WorldProbeGridPass::kLevelCount]{};
+            for (uint32_t level = 0; level < WorldProbeGridPass::kLevelCount; ++level) {
+                worldProbeGridInfos[level] = { worldProbes.GetGridSampler(), worldProbes.GetGridView(level), VK_IMAGE_LAYOUT_GENERAL };
+            }
             VkDescriptorBufferInfo worldProbeGridParamsInfo{ m_WorldProbeGridParamsBuffer.Handle(), 0, m_WorldProbeGridParamsBuffer.Size() };
             VkDescriptorBufferInfo megaLightsInfo{ megaLights.GetLightBufferHandle(), 0, megaLights.GetLightBufferSize() };
             VkDescriptorBufferInfo shadowPointFacesInfo{ vsm.GetPointFacesBuffer(), 0, VK_WHOLE_SIZE };
@@ -857,7 +868,7 @@ namespace renderer {
             lightingWrites[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_LightingSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &feedbackInfo, nullptr };
             lightingWrites[2] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_LightingSet, 2, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &atlasInfo, nullptr, nullptr };
             lightingWrites[3] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_LightingSet, 3, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &sunLevelsInfo, nullptr };
-            lightingWrites[4] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_LightingSet, 4, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &worldProbeGridInfo, nullptr, nullptr };
+            lightingWrites[4] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_LightingSet, 4, 0, WorldProbeGridPass::kLevelCount, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, worldProbeGridInfos, nullptr, nullptr };
             lightingWrites[5] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_LightingSet, 5, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &worldProbeGridParamsInfo, nullptr };
             lightingWrites[6] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_LightingSet, 6, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &megaLightsInfo, nullptr };
             lightingWrites[7] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_LightingSet, 8, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &shadowPointFacesInfo, nullptr };
@@ -936,7 +947,7 @@ namespace renderer {
             lightExtractPipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
             lightExtractPipelineInfo.stage.module = lightExtractShaderModule;
             lightExtractPipelineInfo.stage.pName = "main";
-            VK_CHECK(vkCreateComputePipelines(m_Device, VK_NULL_HANDLE, 1, &lightExtractPipelineInfo, nullptr, &m_LightExtractPipeline));
+            VK_CHECK(vkCreateComputePipelines(m_Device, VulkanPipeline::GetPipelineCache(), 1, &lightExtractPipelineInfo, nullptr, &m_LightExtractPipeline));
             vkDestroyShaderModule(m_Device, lightExtractShaderModule, nullptr);
         }
 
@@ -1061,7 +1072,7 @@ namespace renderer {
             pipelineInfo.pDynamicState = &dynamicState;
             pipelineInfo.layout = m_RenderPipelineLayout;
 
-            VK_CHECK(vkCreateGraphicsPipelines(m_Device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_RenderPipeline));
+            VK_CHECK(vkCreateGraphicsPipelines(m_Device, VulkanPipeline::GetPipelineCache(), 1, &pipelineInfo, nullptr, &m_RenderPipeline));
 
             vkDestroyShaderModule(m_Device, vertModule, nullptr);
             vkDestroyShaderModule(m_Device, fragModule, nullptr);
@@ -1255,7 +1266,7 @@ namespace renderer {
                 boxPipelineInfo.stage.module = boxModule;
                 boxPipelineInfo.stage.pName = "main";
                 boxPipelineInfo.stage.pSpecializationInfo = &specInfo;
-                VK_CHECK(vkCreateComputePipelines(m_Device, VK_NULL_HANDLE, 1, &boxPipelineInfo, nullptr, &boxFacePipelines[face]));
+                VK_CHECK(vkCreateComputePipelines(m_Device, VulkanPipeline::GetPipelineCache(), 1, &boxPipelineInfo, nullptr, &boxFacePipelines[face]));
             }
             vkDestroyShaderModule(m_Device, boxModule, nullptr);
 
@@ -1275,7 +1286,7 @@ namespace renderer {
             icospherePipelineInfo.stage.module = icosphereModule;
             icospherePipelineInfo.stage.pName = "main";
             VkPipeline icospherePipeline = VK_NULL_HANDLE;
-            VK_CHECK(vkCreateComputePipelines(m_Device, VK_NULL_HANDLE, 1, &icospherePipelineInfo, nullptr, &icospherePipeline));
+            VK_CHECK(vkCreateComputePipelines(m_Device, VulkanPipeline::GetPipelineCache(), 1, &icospherePipelineInfo, nullptr, &icospherePipeline));
             vkDestroyShaderModule(m_Device, icosphereModule, nullptr);
 
             // --- Record + submit every generation dispatch in one one-shot command buffer, seed
@@ -1434,7 +1445,7 @@ namespace renderer {
             meshPipelineInfo.pDepthStencilState = &meshDepthStencil;
             meshPipelineInfo.pDynamicState = &meshDynamicState;
             meshPipelineInfo.layout = m_RenderPipelineLayout;
-            VK_CHECK(vkCreateGraphicsPipelines(m_Device, VK_NULL_HANDLE, 1, &meshPipelineInfo, nullptr, &m_MeshPipeline));
+            VK_CHECK(vkCreateGraphicsPipelines(m_Device, VulkanPipeline::GetPipelineCache(), 1, &meshPipelineInfo, nullptr, &m_MeshPipeline));
 
             vkDestroyShaderModule(m_Device, meshVertModule, nullptr);
             vkDestroyShaderModule(m_Device, meshFragModule, nullptr);
@@ -1548,7 +1559,7 @@ namespace renderer {
             ribbonPipelineInfo.pDepthStencilState = &ribbonDepthStencil;
             ribbonPipelineInfo.pDynamicState = &ribbonDynamicState;
             ribbonPipelineInfo.layout = m_RibbonRenderPipelineLayout;
-            VK_CHECK(vkCreateGraphicsPipelines(m_Device, VK_NULL_HANDLE, 1, &ribbonPipelineInfo, nullptr, &m_RibbonPipeline));
+            VK_CHECK(vkCreateGraphicsPipelines(m_Device, VulkanPipeline::GetPipelineCache(), 1, &ribbonPipelineInfo, nullptr, &m_RibbonPipeline));
 
             vkDestroyShaderModule(m_Device, ribbonVertModule, nullptr);
             vkDestroyShaderModule(m_Device, ribbonFragModule, nullptr);
@@ -1969,7 +1980,7 @@ namespace renderer {
         const maths::mat4& viewProj, const maths::vec3& cameraPositionWorld,
         const maths::vec3& cameraRightWorld, const maths::vec3& cameraUpWorld, const maths::vec3& cameraForwardWorld,
         const maths::vec3& sunDirectionWorld, const maths::vec3& sunColor, float sunIntensity,
-        const SceneLights& sceneLights, const maths::vec3& worldProbeGridOrigin,
+        const SceneLights& sceneLights, const WorldProbeGridPass& worldProbes,
         float softFadeDistanceWorld, float heatShimmerStrength, float globalTimeSeconds, uint32_t frameIndex) {
 #ifndef NDEBUG
         // Subtask E2: DrawStart (query 4) -- this runs on cmdLate, a DIFFERENT primary command
@@ -2008,10 +2019,13 @@ namespace renderer {
         // class' own Init() comment (STEP 6b) and renderer::WorldProbeGridPass::GetGridOriginWorld()'s
         // own comment for why that origin is only valid "as of the most recent RecordUpdate() call".
         WorldProbeGridParamsUBO gridParams{};
-        gridParams.gridOriginX = worldProbeGridOrigin.x;
-        gridParams.gridOriginY = worldProbeGridOrigin.y;
-        gridParams.gridOriginZ = worldProbeGridOrigin.z;
-        gridParams.probeSpacing = WorldProbeGridPass::kProbeSpacing;
+        for (uint32_t level = 0; level < WorldProbeGridPass::kLevelCount; ++level) {
+            const maths::vec3& origin = worldProbes.GetGridOriginWorld(level);
+            gridParams.levels[level].originX = origin.x;
+            gridParams.levels[level].originY = origin.y;
+            gridParams.levels[level].originZ = origin.z;
+            gridParams.levels[level].spacing = WorldProbeGridPass::GetLevelSpacing(level);
+        }
         gridParams.gridResolution = static_cast<float>(WorldProbeGridPass::kGridResolution);
         vkCmdUpdateBuffer(cmd, m_WorldProbeGridParamsBuffer.Handle(), 0, sizeof(gridParams), &gridParams);
 

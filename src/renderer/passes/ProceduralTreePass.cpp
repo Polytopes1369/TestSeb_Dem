@@ -1,4 +1,4 @@
-#include "renderer/passes/ProceduralTreePass.h"
+﻿#include "renderer/passes/ProceduralTreePass.h"
 
 #include <cstring>
 #include <format>
@@ -197,7 +197,7 @@ namespace renderer {
             pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
             pipelineInfo.stage.module = shaderModule;
             pipelineInfo.stage.pName = "main";
-            VK_CHECK(vkCreateComputePipelines(m_Device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_BarkPipeline));
+            VK_CHECK(vkCreateComputePipelines(m_Device, VulkanPipeline::GetPipelineCache(), 1, &pipelineInfo, nullptr, &m_BarkPipeline));
             vkDestroyShaderModule(m_Device, shaderModule, nullptr);
         }
 
@@ -220,7 +220,7 @@ namespace renderer {
             pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
             pipelineInfo.stage.module = shaderModule;
             pipelineInfo.stage.pName = "main";
-            VK_CHECK(vkCreateComputePipelines(m_Device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_LeavesPipeline));
+            VK_CHECK(vkCreateComputePipelines(m_Device, VulkanPipeline::GetPipelineCache(), 1, &pipelineInfo, nullptr, &m_LeavesPipeline));
             vkDestroyShaderModule(m_Device, shaderModule, nullptr);
         }
 

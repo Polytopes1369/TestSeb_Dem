@@ -70,6 +70,20 @@ inline uint32_t PROBE_GRID_RESOLUTION = 64u;
 inline float PROBE_SPACING = 1.0f;
 inline uint32_t PROBE_SAMPLE_DIRECTIONS = 14u;
 
+// F1 ("Lumen Lite", UE5.8 parity roadmap): the GI quality mode ClusterRenderPipeline routes into
+// renderer::ScreenTracePass/renderer::GICompositePass (and, once wired -- see F9 -- renderer::
+// ScreenProbeGIPass) every frame. HighQuality is this codebase's pre-existing per-pixel Screen
+// Trace + probe-fallback path (F9: upgraded to real Lumen's own "Screen Probe Gather" near-field
+// term); Lite is the new probe-grid-PRIMARY irradiance-field gather (renderer::WorldProbeGridPass's
+// multi-level clipmap, sampled with DDGI-style probe-occlusion weighting -- see
+// world_probe_sampling.glsl's own SampleWorldProbeGrid) with the per-pixel screen march skipped
+// entirely (see ScreenTrace.comp's own giMode branch). Mutable (not `constexpr`): main.cpp's Debug
+// ImGui GI-mode selector flips this at runtime for A/B comparison; a Release build never exposes
+// the selector but still reads this same variable every frame, so its compile-time default
+// (HighQuality, matching this codebase's pre-F1 behavior exactly) is what Release always renders.
+enum class GIMode : uint32_t { HighQuality = 0u, Lite = 1u };
+inline GIMode GI_MODE = GIMode::HighQuality;
+
 inline uint32_t MAX_TRACED_ENTITIES = 128u;
 inline uint32_t RADIOSITY_BOUNCE_COUNT = 4u;
 inline uint32_t SURFACE_CACHE_GI_SAMPLE_COUNT = 64u;
@@ -156,6 +170,18 @@ inline bool SPOT_LIGHTS_ENABLED = true;
 inline bool RECT_LIGHTS_ENABLED = true;
 inline bool PHOTOMETRIC_LIGHTS_ENABLED = true;
 inline float TYPED_LIGHT_INTENSITY_SCALE = 1.0f;
+
+// F2b (UE5.8 rendering-parity gap: Lighting Channels) -- renderer::AtmosVolumetricFogPass::
+// RecordUpdate reads this every frame to fill AtmosVolumetricFog.comp's own
+// pc.fogLightingChannelMask (see that push-constant field's own comment). Bit 0/1/2 = channel 0/1/2.
+// Defaults to 0x7 (every channel) so a scene that never opens the Debug "MegaLights" ImGui tab's
+// "Fog Lighting Channels" checkboxes keeps its exact pre-F2b visuals (fog receives every light
+// regardless of that light's own channel, same as before this feature existed) -- toggling a bit off
+// live demonstrates the F2b masking mechanism end-to-end without touching any baked scene data (see
+// renderer::GenerateProceduralLights()/GenerateShowcaseMaterialTable()'s own per-light/per-entity
+// PackMegaLightChannelMask()/MaterialParameters::lightingChannelMask authoring API for the
+// non-debug, scene-authored equivalent of this same mask).
+inline uint32_t FOG_LIGHTING_CHANNEL_MASK = 0x7u;
 } // namespace megalights
 
 namespace postprocess {
@@ -195,18 +221,33 @@ inline float EXPOSURE_APERTURE = 4.0f;             // f-stop.
 // strength as a side effect); 1/8000s is a realistic, if fast, daylight electronic-shutter speed.
 inline float EXPOSURE_SHUTTER_SPEED_SECONDS = 1.0f / 8000.0f;
 inline float EXPOSURE_ISO = 100.0f;
-// Manual (not Auto) for now: renderer::MegaLightsPass (Phase A) has no temporal reservoir reuse
-// yet (per-frame RIS re-samples a different light, spatially but not temporally denoised -- see
-// that class' own header comment, "Phase B" is the planned fix) -- Auto Exposure's histogram
-// directly measures that per-frame luminance noise and reacts to it every frame, amplifying an
-// otherwise-subtle spatial grain into a visible global brightness flicker. Manual metering (a
-// fixed EV100 snapped instantly every frame, see AutoExposureAdapt.comp's own Auto/Manual branch)
-// removes that reactive amplification entirely; MegaLights' own residual per-pixel grain is a
-// separate, much smaller-magnitude cosmetic issue tracked against the Phase B temporal-reuse work.
-inline bool EXPOSURE_USE_AUTO = false;
+// Auto Exposure re-enabled (Task F11, 2026-07-19; UE5.8's own Post Process Volume default is Auto,
+// not Manual). Previously hardcoded Manual-only because renderer::MegaLightsPass's Phase A had no
+// temporal reservoir reuse (per-frame RIS re-sampled a different light, spatially but not
+// temporally denoised) -- Auto Exposure's histogram directly measures that per-frame luminance
+// noise and reacts to it every frame, amplifying an otherwise-subtle spatial grain into a visible
+// global brightness flicker. That gap is closed: MegaLightsPass's Phase 4 (see that class' own
+// header comment, "temporal ReSTIR ... folded directly into MegaLightsShade.comp") now temporally
+// accumulates reservoirs across frames, and renderer::TAATSRPass caps its own adaptive TAA alpha
+// at 0.5 (a second, independent smoothing layer over the same per-pixel noise). On top of both of
+// those, AutoExposureAdapt.comp's own histogram metering now also trims to the UE-style
+// [EXPOSURE_HISTOGRAM_LOW_PERCENT, EXPOSURE_HISTOGRAM_HIGH_PERCENT] cumulative-population slice
+// instead of averaging the WHOLE histogram (see that shader's own comment) -- any residual
+// per-pixel MegaLights noise or specular fireflies now has to be common to a wide swath of the
+// frame's pixel population, not just a handful of outliers, before it can move the metered
+// exposure at all. Also re-tuned this same pass, PostProcessPass::kMinLogLuminance/
+// kLogLuminanceRange (see that constant's own header comment): the histogram's luminance range
+// itself was still a pre-recalibration relic that clamped nearly this whole real-lux-scale scene
+// into its single top bin, which -- independent of any flicker question -- would have made Auto
+// Exposure compute a constant, badly WRONG exposure the moment it was ever turned on.
+inline bool EXPOSURE_USE_AUTO = true;
 inline float EXPOSURE_COMPENSATION_EV = 0.0f;
-inline float EXPOSURE_ADAPTATION_SPEED_UP_EV_PER_SEC = 3.0f;   // Scene darkened -> exposure rising.
-inline float EXPOSURE_ADAPTATION_SPEED_DOWN_EV_PER_SEC = 1.0f; // Scene brightened -> exposure falling.
+inline float EXPOSURE_ADAPTATION_SPEED_UP_EV_PER_SEC = 3.0f;   // Scene darkened -> exposure rising. (UE5.8 default.)
+inline float EXPOSURE_ADAPTATION_SPEED_DOWN_EV_PER_SEC = 1.0f; // Scene brightened -> exposure falling. (UE5.8 default.)
+// UE5.8's own Auto Exposure Histogram "Low Percent"/"High Percent" defaults -- see
+// AutoExposureAdapt.comp's own comment for exactly how these trim the metering average.
+inline float EXPOSURE_HISTOGRAM_LOW_PERCENT = 80.0f;
+inline float EXPOSURE_HISTOGRAM_HIGH_PERCENT = 98.3f;
 
 // White Balance
 inline float WHITE_BALANCE_TEMP_KELVIN = 6500.0f;  // 6500 = neutral (D65).
@@ -258,10 +299,28 @@ inline float BLOOM_SOFT_KNEE = 0.5f;
 inline float BLOOM_INTENSITY = 1.0f;
 inline float BLOOM_UPSAMPLE_RADIUS = 1.0f;
 
-// Lens Flare (procedural radial ghosts, no texture asset)
+// Lens Flare (procedural radial ghosts, no texture asset). Shares BLOOM_THRESHOLD as its own
+// bright-pass threshold rather than a separate knob -- the ghost chain samples
+// renderer::BloomPass's own downsample chain (kFlareSourceMip), the SAME already-thresholded
+// bright-pass BLOOM_THRESHOLD produces, so a second threshold would just re-extract brights the
+// pass already extracted once (see BloomPass.h's own class comment for why that double work is
+// deliberately avoided).
 inline float LENS_FLARE_GHOST_INTENSITY = 0.3f;
 inline uint32_t LENS_FLARE_GHOST_COUNT = 4u;
 inline float LENS_FLARE_GHOST_SPACING = 1.0f;
+
+// Halo: a single fixed-radius ring sample along the same source-to-center line the ghost chain
+// walks (see BloomUpsampleComposite.comp's own SampleHalo comment) -- the other classic image-
+// based lens-flare element alongside the ghost chain (UE5.8's own Bloom settings expose "Ghosts"
+// and "Halo" as two distinct knobs; this project's single dual-filter mip chain produces both).
+inline float HALO_INTENSITY = 0.12f;
+inline float HALO_WIDTH = 0.45f;  // UV-space radius from screen center, opposite side from the source.
+
+// Per-ghost/halo chromatic shift: a small per-channel RADIAL UV split applied at each ghost/halo
+// sample (real lens ghosting separates color slightly per internal reflection/incidence angle) --
+// distinct from CHROMATIC_ABERRATION_INTENSITY below, which aberrates the base scene capture
+// itself, not the flare/ghost samples.
+inline float LENS_FLARE_CHROMATIC_SHIFT = 0.008f;
 
 // Anamorphic Lens Flare (procedural horizontal streak, no texture asset)
 inline float ANAMORPHIC_FLARE_INTENSITY = 0.15f;
@@ -288,6 +347,19 @@ inline float VIGNETTE_COLOR_BLEED = 0.4f;
 inline float DOF_FOCAL_LENGTH_MM = 50.0f;
 inline float DOF_FOCUS_DISTANCE_WORLD_UNITS = 10.0f;
 inline float DOF_MAX_COC_RADIUS_PIXELS = 24.0f;
+// UE5.8-parity "Accumulation Depth of Field": 0 = Gather (DepthOfFieldPass, DepthOfField.comp's own
+// single-frame 16-tap Poisson gather -- the original/default mode), 1 = Accumulation
+// (DepthOfFieldAccumulationPass, DepthOfFieldAccumulation.comp's own per-frame single-lens-sample +
+// temporal-reprojection accumulation -- cinematic, path-tracer-like bokeh that converges over many
+// frames once the camera settles, at a fraction of Gather mode's per-frame tap cost). Both passes
+// share DOF_FOCAL_LENGTH_MM/DOF_FOCUS_DISTANCE_WORLD_UNITS/DOF_MAX_COC_RADIUS_PIXELS/DOF_ENABLED
+// above -- only the resolve technique differs. See renderer::ClusterRenderPipeline::RecordFrame's
+// own [13e] DOF call site for the branch.
+inline int DOF_MODE = 0;
+// Accumulation mode only: how many frames a stationary-camera pixel accumulates before the running
+// mean caps out into a fixed-window exponential moving average -- see
+// DepthOfFieldAccumulationPass::Settings::maxAccumulationSamples's own comment.
+inline float DOF_ACCUMULATION_MAX_SAMPLES = 64.0f;
 
 // Motion Blur (per-pixel velocity reconstructed from depth + view matrices, no stored velocity buffer)
 inline float MOTION_BLUR_INTENSITY = 0.5f;
@@ -358,6 +430,13 @@ inline float FILM_GRAIN_RESPONSE_MIDPOINT = 0.5f;
 // every shader with a redundant enabled/disabled branch. Not wired into ApplyProfile() (these are
 // live debug/comparison switches, not a hardware-quality tier).
 inline bool BLOOM_ENABLED = true;
+// Separate from BLOOM_ENABLED: zeroes only the ghost/halo/anamorphic-streak terms at the
+// RecordGenerate call site (ClusterRenderPipeline.cpp), leaving the base bloom glow itself under
+// BLOOM_ENABLED's own independent control -- matches UE5.8, where "Lens Flares" is its own Bloom
+// sub-toggle distinct from the base bloom bleed. Lens Dirt needs no separate gate here: its own
+// mask (BloomUpsampleComposite.comp) only ever attenuates the ghost+streak+halo term, so it is
+// already a visual no-op once this toggle zeroes that term.
+inline bool LENS_FLARE_ENABLED = true;
 inline bool CHROMATIC_ABERRATION_ENABLED = true;
 inline bool VIGNETTE_ENABLED = true;
 inline bool HEAT_DISTORTION_ENABLED = true;
@@ -516,6 +595,14 @@ inline float YEAR_LENGTH_SECONDS = 180.0f; // Simulated seconds per full seasona
 inline float SEASONAL_TEMPERATURE_AMPLITUDE_CELSIUS = 12.0f; // Peak-to-baseline swing the seasonal cycle adds/subtracts from TEMPERATURE_CELSIUS (summer = +amplitude, winter = -amplitude).
 inline float SEASONAL_PRECIP_AMPLITUDE = 0.35f; // Peak-to-baseline swing the seasonal cycle adds/subtracts from PRECIPITATION_INTENSITY's target (winter = wetter, summer = drier).
 inline float SEASONAL_SUN_ELEVATION_AMPLITUDE_DEGREES = 15.0f; // Peak seasonal sweep applied to the scene's fixed base sun elevation angle (see ClusterRenderPipeline::Init()'s own sun-direction comment) -- a modest elevation-only sweep, no azimuth/axial-tilt astronomy.
+
+// F3 (UE5.8 rendering-parity gap: Fog Screen Space Scattering) -- see renderer::
+// FogScreenSpaceScatteringPass's own class comment. Live, Debug-tunable (main.cpp's "Atmos" ImGui
+// tab); not mirrored into the per-hardware-tier EngineConfig_{Low,...}.h profiles (same rationale as
+// DYNAMIC_WEATHER_ENABLED above: an artistic/visual toggle, not a GPU performance/quality axis this
+// demo's fixed showcase scene needs to scale down for a lower-end profile).
+inline bool FOG_SCREEN_SPACE_SCATTERING_ENABLED = true; // Master toggle -- see renderer::PostProcessPass::Settings::fogScreenSpaceScatteringEnabled.
+inline float FOG_SCATTER_BLUR_RADIUS_PIXELS = 12.0f; // FogScreenSpaceScattering.comp's own Gaussian kernel half-width, in display-resolution pixels.
 } // namespace atmos
 
 // GPU particle system (particle_system_integration_plan.md, Subtask 6: Final Integration) -- live

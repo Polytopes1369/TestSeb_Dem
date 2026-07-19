@@ -69,8 +69,10 @@ namespace renderer {
         static constexpr VkFormat kOutputColorFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
         // Minimal GBuffer, written alongside the shaded color above from the exact same per-pixel
         // normal/albedo/depth this shader already reconstructs in its Step 2/3 (previously computed
-        // and discarded) -- consumed by renderer::ScreenProbeGIPass for probe placement/tracing,
-        // the bilateral gather reconstruction, and the ClusterResolve.comp debug view modes 12
+        // and discarded) -- consumed by this codebase's screen-space GI/lighting passes
+        // (renderer::ScreenTracePass for its per-pixel raymarch, renderer::ReflectionTrace /
+        // renderer::MegaLightsShade for their own imageLoad reads, renderer::ATrousDenoisePass as
+        // its edge-stopping guide), and the ClusterResolve.comp debug view modes 12
         // (motion vectors) / 14 (spatial probes).
         static constexpr VkFormat kOutputNormalFormat = VK_FORMAT_R16G16_SFLOAT;   // Octahedral-encoded world-space normal (include/octahedral.glsl).
         static constexpr VkFormat kOutputDepthFormat = VK_FORMAT_R32_SFLOAT;       // The winning (hw-vs-sw arbitrated) NDC depth -- not stored anywhere else.
@@ -124,13 +126,22 @@ namespace renderer {
         // bindings 27/28) so ClusterResolve.comp/ClusterResolveBinned.comp can re-derive the same
         // skinned triangle both rasterizers already drew. Same "retained, no duplicate parameter"
         // convention as splineControlPointsBuffer above.
+        // `lightFunctionImageInfos` (F12) is renderer::ProceduralLightFunctionGenerator::
+        // GetLightFunctionImageInfos() -- bound as the bindless g_LightFunctionTextures[] array
+        // (light_functions.glsl) at binding 30. `causticsImageInfo` is that same generator's
+        // GetCausticsImageInfo() -- bound as g_CausticsTexture (caustics_projection.glsl) at
+        // binding 31; this class also allocates its own CausticsUBO (binding 32), filled once here
+        // (a fixed world-XZ-to-UV projection matrix + tiling/animation constants -- see the .cpp's
+        // own comment), never re-uploaded per frame (same "static, not per-frame" convention as
+        // m_VTVolumeUBO/SetVirtualTexture()).
         void Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue, VkExtent2D renderExtent,
             VkBuffer clusterMetadataBuffer, VkBuffer compressedPhysicalPoolBuffer,
             VkImageView hwClusterIDView, VkImageView hwTriangleIDView, VkImageView hwDepthView,
             VkImageView swVisBufferAtomicView, const std::vector<VkDescriptorImageInfo>& maskImageInfos,
             VkBuffer wpoGlobalsBuffer, VkBuffer entityTransformBuffer, VkBuffer entityDataBuffer,
             const std::array<MaterialParameters, kMaxMaterials>& materialTable,
-            VkBuffer splineControlPointsBuffer, VkBuffer boneMatricesBuffer);
+            VkBuffer splineControlPointsBuffer, VkBuffer boneMatricesBuffer,
+            const std::vector<VkDescriptorImageInfo>& lightFunctionImageInfos, const VkDescriptorImageInfo& causticsImageInfo);
 
         void Shutdown();
 
@@ -170,11 +181,13 @@ namespace renderer {
         // substrate_bsdf.glsl's EvaluateSubstrateMixMask. Defaults to 1.0 (authored value unchanged);
         // Release passes 1.0 (no toggle exists there), driven in Debug by the Post FX "Mix Sharpness"
         // slider (renderer::ClusterRenderPipeline's own SetDebugMixMaskSharpnessScale setter).
-        // `globalTimeSeconds` (Wave 2, UE5.8 caustics/light-function parity): real elapsed time,
-        // threaded into ResolveViewParamsUBO.timeSeconds and consumed by ComputeUnderwaterCaustics's
-        // scroll animation (procedural_light_modulation.glsl) -- EvaluateSunLightFunction does not
-        // need it. Defaults to 0.0 (a static but still-correct caustics pattern) so every pre-Wave-2
-        // caller compiles unchanged.
+        // `globalTimeSeconds` (Wave 2 / F12, UE5.8 caustics/light-function parity): real elapsed
+        // time, threaded into ResolveViewParamsUBO.timeSeconds and consumed by
+        // ComputeCausticsModulation's own scroll animation (caustics_projection.glsl, F12's real
+        // texture-based replacement for Wave 2's own procedural ComputeUnderwaterCaustics stand-in)
+        // -- the sun's Light Function does not need it (its own gobo pattern is static, only spun/
+        // scaled by fixed constants, not time-animated). Defaults to 0.0 (a static but still-correct
+        // caustics pattern) so every pre-Wave-2 caller compiles unchanged.
         void RecordResolve(VkCommandBuffer cmd, const maths::mat4& viewProj, const maths::mat4& prevViewProj,
             const DirectionalLight& sun, const maths::vec3& cameraPositionWorld, float surfaceWetness, float snowCoverage,
             float glintDensityScale = 1.0f, float glintIntensityScale = 1.0f, float mixMaskSharpnessScale = 1.0f,
@@ -315,6 +328,9 @@ namespace renderer {
         // vkCmdUpdateBuffer from Init()'s own `materialTable` parameter -- not a per-frame upload
         // (unlike m_ViewParamsBuffer above).
         GpuBuffer m_MaterialParamsBuffer;
+        // F12: CausticsUBO (caustics_projection.glsl), std140, CPU_TO_GPU mapped -- filled once at
+        // Init() time (same "static, no per-frame re-upload" convention as m_VTVolumeUBO).
+        GpuBuffer m_CausticsUBO;
 
         VkDescriptorSetLayout m_SetLayout = VK_NULL_HANDLE;
         VkDescriptorPool m_DescriptorPool = VK_NULL_HANDLE;
@@ -333,6 +349,12 @@ namespace renderer {
         VkBuffer m_SplineControlPointsBuffer = VK_NULL_HANDLE; // Borrowed, same handle Init() received (Phase 1, Nanite advanced).
         VkBuffer m_BoneMatricesBuffer = VK_NULL_HANDLE;    // Borrowed, same handle Init() received (skeletal-animation feature).
         std::vector<VkDescriptorImageInfo> m_MaskImageInfos; // Copy of Init()'s own `maskImageInfos` parameter.
+        // F12: copies of Init()'s own `lightFunctionImageInfos`/`causticsImageInfo` parameters,
+        // retained (same "no duplicate parameter" convention as m_MaskImageInfos) so
+        // InitBinnedResolve() below can write the identical bindings into its own second descriptor
+        // set without the caller passing them twice.
+        std::vector<VkDescriptorImageInfo> m_LightFunctionImageInfos;
+        VkDescriptorImageInfo m_CausticsImageInfo{};
 
         VkDescriptorSetLayout m_ResolveBinnedSetLayout = VK_NULL_HANDLE;
         // Separate pool from m_DescriptorPool above (sized for exactly the 1 extra set below)

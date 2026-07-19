@@ -60,6 +60,46 @@ vec3 SampleLowResColorCatmullRom(vec2 uv) {
     return c0 + c1 + c2 + c3 + c4 + c5 + c6 + c7 + c8;
 }
 
+// 9-tap Catmull-Rom bicubic reconstruction of the temporal HISTORY buffer (as opposed to
+// SampleLowResColorCatmullRom above, which reconstructs the current-frame low-res input). This is
+// the single biggest visual delta between plain TAA (bilinear history) and UE5.8-style TSR: a
+// bilinear history sample blurs progressively every frame it gets re-accumulated through, while a
+// bicubic reconstruction preserves high-frequency detail across the temporal chain. The history
+// buffer is stored at DISPLAY resolution (see TAATSRPass.h: "ping-pong history images... display/
+// swapchain resolution"), so this samples against ubo.displayExtent, not ubo.renderExtent. The
+// "combined tap" trick used for the w12-weighted samples below relies on g_HistoryInput's bound
+// sampler using LINEAR filtering (TAATSRPass.cpp binds m_LinearSampler to the history-input slot),
+// so this is safe to use as-is with the existing descriptor setup.
+vec3 SampleHistoryCatmullRom(vec2 uv) {
+    vec2 texSize = ubo.displayExtent;
+    vec2 samplePos = uv * texSize;
+    vec2 texelPos1 = floor(samplePos - 0.5) + 0.5;
+    vec2 f = samplePos - texelPos1;
+
+    vec2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
+    vec2 w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
+    vec2 w2 = f * (0.5 + f * (2.0 - 1.5 * f));
+    vec2 w3 = f * f * (-0.5 + 0.5 * f);
+
+    vec2 w12 = w1 + w2;
+    vec2 tc12 = (texelPos1 + w2 / w12) / texSize;
+    vec2 tc0 = (texelPos1 - 1.0) / texSize;
+    vec2 tc3 = (texelPos1 + 2.0) / texSize;
+
+    vec3 c0 = textureLod(g_HistoryInput, vec2(tc12.x, tc0.y), 0.0).rgb * w12.x * w0.y;
+    vec3 c1 = textureLod(g_HistoryInput, vec2(tc0.x, tc12.y), 0.0).rgb * w0.x * w12.y;
+    vec3 c2 = textureLod(g_HistoryInput, vec2(tc12.x, tc12.y), 0.0).rgb * w12.x * w12.y;
+    vec3 c3 = textureLod(g_HistoryInput, vec2(tc3.x, tc12.y), 0.0).rgb * w3.x * w12.y;
+    vec3 c4 = textureLod(g_HistoryInput, vec2(tc12.x, tc3.y), 0.0).rgb * w12.x * w3.y;
+
+    vec3 c5 = textureLod(g_HistoryInput, vec2(tc0.x, tc0.y), 0.0).rgb * w0.x * w0.y;
+    vec3 c6 = textureLod(g_HistoryInput, vec2(tc3.x, tc0.y), 0.0).rgb * w3.x * w0.y;
+    vec3 c7 = textureLod(g_HistoryInput, vec2(tc0.x, tc3.y), 0.0).rgb * w0.x * w3.y;
+    vec3 c8 = textureLod(g_HistoryInput, vec2(tc3.x, tc3.y), 0.0).rgb * w3.x * w3.y;
+
+    return c0 + c1 + c2 + c3 + c4 + c5 + c6 + c7 + c8;
+}
+
 void main() {
     ivec2 displayCoords = ivec2(gl_GlobalInvocationID.xy);
     if (displayCoords.x >= int(ubo.displayExtent.x) || displayCoords.y >= int(ubo.displayExtent.y)) {
@@ -115,7 +155,39 @@ void main() {
     if (historyUV.x < 0.0 || historyUV.x > 1.0 || historyUV.y < 0.0 || historyUV.y > 1.0) {
         hasHistory = false;
     }
-    
+
+    // 2b. History resurrection. Without this, any pixel that fails the reprojection/disocclusion
+    // test above (off-screen reprojection, or the prevClip.w <= 0 behind-camera case) falls
+    // straight through to the "no history" branch below and outputs the raw current-frame sample,
+    // i.e. a full 1-frame history loss on every disocclusion edge -- this is the "known residual
+    // disocclusion flicker" this pass's own comments elsewhere already call out. Instead of giving
+    // up immediately, search a small 3x3 window of display texels around the (rejected) reprojected
+    // position for any neighbor that DOES land in bounds and therefore WOULD pass the same
+    // rejection test the center tap just failed. This codebase's rejection test for this pass is
+    // purely reprojection-validity (off-screen / behind-camera), not a separate depth/velocity
+    // G-buffer compare, so "passes the rejection test" reduces to "this neighbor UV is in [0,1]".
+    // A hit is used as a REDUCED-CONFIDENCE substitute (see kResurrectedHistoryAlpha below, applied
+    // at blend time): it comes from an adjacent texel rather than the true reprojected position, so
+    // it is trusted less than a normal accepted history sample, but still meaningfully reduces
+    // flicker versus discarding history outright.
+    bool historyResurrected = false;
+    if (!hasHistory && ubo.resetHistory == 0) {
+        vec2 displayTexelSize = 1.0 / ubo.displayExtent;
+        for (int y = -1; y <= 1 && !historyResurrected; ++y) {
+            for (int x = -1; x <= 1; ++x) {
+                if (x == 0 && y == 0) continue;
+                vec2 candidateUV = historyUV + vec2(x, y) * displayTexelSize;
+                if (candidateUV.x < 0.0 || candidateUV.x > 1.0 || candidateUV.y < 0.0 || candidateUV.y > 1.0) {
+                    continue;
+                }
+                historyUV = candidateUV;
+                hasHistory = true;
+                historyResurrected = true;
+                break;
+            }
+        }
+    }
+
     // 3. Compute 3x3 neighborhood statistics in YCoCg color space
     vec3 currentColorYCoCg = RGBToYCoCg(currentColorRGB);
     vec3 boxMin = currentColorYCoCg;
@@ -157,33 +229,50 @@ void main() {
     vec3 resolvedColorRGB;
     
     if (hasHistory && ubo.resetHistory == 0) {
-        vec3 historyColorRGB = textureLod(g_HistoryInput, historyUV, 0.0).rgb;
+        // Bicubic (Catmull-Rom) history reconstruction instead of a plain bilinear tap -- see
+        // SampleHistoryCatmullRom's header comment for why this is the single biggest lever for
+        // closing the TAA-vs-TSR sharpness gap.
+        vec3 historyColorRGB = SampleHistoryCatmullRom(historyUV);
         vec3 historyColorYCoCg = RGBToYCoCg(historyColorRGB);
-        
+
         // Clip history color to the AABB box
         vec3 clampedHistoryYCoCg = ClipToAABB(historyColorYCoCg, boxMin, boxMax);
         vec3 clampedHistoryRGB = YCoCgToRGB(clampedHistoryYCoCg);
-        
-        // Blend current frame and clamped history
-        float alpha = ubo.jitterOffset == vec2(0.0) ? ubo.blendAlphaStatic : ubo.blendAlpha;
 
-        // Adaptively reduce history contribution if the difference is very large. Real
-        // disocclusion (camera/object motion revealing new geometry) is already fully handled
-        // above via the depth-reprojection hasHistory check, which bypasses this blend entirely --
-        // so this heuristic only needs to catch smaller residual artifacts (e.g. a specular
-        // highlight sliding across a surface), not act as a second disocclusion detector.
-        // Letting it saturate to alpha=1.0 (full history discard) is actively harmful for
-        // MegaLightsShade.comp's 1-sample-per-pixel-per-frame RIS estimator (see
-        // megalights_ris.glsl's SelectLightRIS comment: "no cross-pixel/cross-frame state --
-        // temporal/spatial reuse is explicitly Phase B"): that noise alone produces a large
-        // frame-to-frame colorDiff on any multi-light surface even with a fully static camera,
-        // which would otherwise zero out history every frame and pass the raw per-pixel noise
-        // straight through as visible flicker. Capping the boost below 1.0 guarantees this pass
-        // always retains some history weight, so that stochastic noise still gets time-averaged
-        // instead of being thrown away and reintroduced every frame.
-        const float kMaxAdaptiveAlpha = 0.5;
-        float colorDiff = length(currentColorYCoCg - clampedHistoryYCoCg);
-        alpha = mix(alpha, kMaxAdaptiveAlpha, clamp(colorDiff * 2.0, 0.0, 1.0));
+        float alpha;
+        if (historyResurrected) {
+            // Resurrected history (see the "2b. History resurrection" block above): this sample
+            // came from a neighboring texel rather than the true reprojected position, so it is
+            // deliberately weighted MORE toward the current frame than a normal accepted history
+            // sample would be -- but still far short of the full 1.0 (100% current-frame) discard
+            // the "no history" branch below would otherwise apply. This constant is intentionally
+            // separate from kMaxAdaptiveAlpha below: it governs a distinct rejection path and does
+            // NOT change the existing adaptive-alpha cap or its behavior for normal, non-resurrected
+            // history (that 0.5 cap and its MegaLights-RIS-noise rationale are unchanged, see below).
+            const float kResurrectedHistoryAlpha = 0.65;
+            alpha = kResurrectedHistoryAlpha;
+        } else {
+            // Blend current frame and clamped history
+            alpha = ubo.jitterOffset == vec2(0.0) ? ubo.blendAlphaStatic : ubo.blendAlpha;
+
+            // Adaptively reduce history contribution if the difference is very large. Real
+            // disocclusion (camera/object motion revealing new geometry) is already fully handled
+            // above via the depth-reprojection hasHistory check, which bypasses this blend entirely --
+            // so this heuristic only needs to catch smaller residual artifacts (e.g. a specular
+            // highlight sliding across a surface), not act as a second disocclusion detector.
+            // Letting it saturate to alpha=1.0 (full history discard) is actively harmful for
+            // MegaLightsShade.comp's 1-sample-per-pixel-per-frame RIS estimator (see
+            // megalights_ris.glsl's SelectLightRIS comment: "no cross-pixel/cross-frame state --
+            // temporal/spatial reuse is explicitly Phase B"): that noise alone produces a large
+            // frame-to-frame colorDiff on any multi-light surface even with a fully static camera,
+            // which would otherwise zero out history every frame and pass the raw per-pixel noise
+            // straight through as visible flicker. Capping the boost below 1.0 guarantees this pass
+            // always retains some history weight, so that stochastic noise still gets time-averaged
+            // instead of being thrown away and reintroduced every frame.
+            const float kMaxAdaptiveAlpha = 0.5;
+            float colorDiff = length(currentColorYCoCg - clampedHistoryYCoCg);
+            alpha = mix(alpha, kMaxAdaptiveAlpha, clamp(colorDiff * 2.0, 0.0, 1.0));
+        }
 
         resolvedColorRGB = mix(clampedHistoryRGB, currentColorRGB, alpha);
     } else {
