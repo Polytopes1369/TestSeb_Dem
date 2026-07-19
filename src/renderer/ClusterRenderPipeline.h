@@ -140,6 +140,7 @@
 #include "renderer/passes/FurStrandPass.h"
 #include "renderer/passes/HZBPass.h"
 #include "renderer/LightingTypes.h"
+#include "renderer/passes/ProceduralLightFunctionGenerator.h"
 #include "renderer/passes/ProceduralMaskGenerator.h"
 #include "renderer/passes/ReflectionPass.h"
 #include "renderer/passes/ScreenSpaceEffectsPass.h"
@@ -916,6 +917,13 @@ namespace renderer {
         // time, before any raster/resolve pass is initialized -- see ProceduralMaskGenerator's own
         // class comment. GetMaskImageInfos() is threaded into all three passes below.
         ProceduralMaskGenerator m_MaskGenerator;
+
+        // F12 (UE5.8 rendering-parity gap: Texture-based Light Functions + projected Caustics):
+        // generates the bindless Light Function gobo array (light_functions.glsl) + the caustics
+        // pattern texture (caustics_projection.glsl) once at Init() time, before m_Resolve below is
+        // initialized (its own sole consumer) -- see ProceduralLightFunctionGenerator's own class
+        // comment.
+        ProceduralLightFunctionGenerator m_LightFunctionGenerator;
 
         // Generic multithreaded background-job pool (hardware_concurrency worker threads) -- see
         // core::LoadingManager's own class comment. Currently consumed by m_GlobalSDF::Init() to

@@ -404,6 +404,13 @@ bool ClusterRenderPipeline::Init(
   m_MaskGenerator.Init(createInfo.device, createInfo.allocator,
                        createInfo.commandPool, createInfo.queue);
 
+  // F12 (UE5.8 rendering-parity gap: Texture-based Light Functions + projected Caustics):
+  // procedurally generates the Light Function gobo array + caustics texture once, before m_Resolve
+  // below (its sole consumer) is initialized -- same "producer generator Init's before any pass
+  // binds its output" convention as m_MaskGenerator just above.
+  m_LightFunctionGenerator.Init(createInfo.device, createInfo.allocator,
+                                createInfo.commandPool, createInfo.queue);
+
   std::array<VkFormat, 2> visBufferFormats{createInfo.visBufferFormat,
                                            createInfo.visBufferFormat};
   m_HardwareRaster.Init(createInfo.device,
@@ -444,7 +451,9 @@ bool ClusterRenderPipeline::Init(
       createInfo.entityDataBuffer,
       createInfo.materialTable.params,
       m_SplineControlPointsBuffer.Handle(),
-      m_SkeletalAnimator.GetBoneMatricesBuffer());
+      m_SkeletalAnimator.GetBoneMatricesBuffer(),
+      m_LightFunctionGenerator.GetLightFunctionImageInfos(),
+      m_LightFunctionGenerator.GetCausticsImageInfo());
 
   // Phase 1b: the shading-bin sort pass needs m_Resolve's own 5 output image views (its Classify
   // stage writes background pixels directly into them, see ClusterShadingBinPass's own class
@@ -1458,6 +1467,7 @@ void ClusterRenderPipeline::Shutdown() {
   m_SoftwareRaster.Shutdown();
   m_HardwareRaster.Shutdown();
   m_MaskGenerator.Shutdown();
+  m_LightFunctionGenerator.Shutdown(); // F12
   m_OcclusionCulling.Shutdown();
   m_Streaming.Shutdown();
   m_LODSelection.Shutdown();
