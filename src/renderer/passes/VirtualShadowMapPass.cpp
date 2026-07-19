@@ -1,4 +1,4 @@
-#include "renderer/passes/VirtualShadowMapPass.h"
+﻿#include "renderer/passes/VirtualShadowMapPass.h"
 
 #include <algorithm>
 #include <cmath>
@@ -480,7 +480,7 @@ namespace renderer {
         pipelineInfo.pDynamicState = &dynamicState;
         pipelineInfo.layout = m_PipelineLayout;
         pipelineInfo.pNext = &pipelineRendering;
-        VK_CHECK(vkCreateGraphicsPipelines(m_Device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_Pipeline));
+        VK_CHECK(vkCreateGraphicsPipelines(m_Device, VulkanPipeline::GetPipelineCache(), 1, &pipelineInfo, nullptr, &m_Pipeline));
 
         // Masked pipeline (Feature 3): same state as above, just 2 stages (+ ShadowMapCaptureMasked
         // .frag) instead of 1 -- the frag shader's own `discard` statically disables hardware
@@ -489,7 +489,7 @@ namespace renderer {
         VkGraphicsPipelineCreateInfo maskedPipelineInfo = pipelineInfo;
         maskedPipelineInfo.stageCount = 2;
         maskedPipelineInfo.pStages = maskedStages;
-        VK_CHECK(vkCreateGraphicsPipelines(m_Device, VK_NULL_HANDLE, 1, &maskedPipelineInfo, nullptr, &m_MaskedPipeline));
+        VK_CHECK(vkCreateGraphicsPipelines(m_Device, VulkanPipeline::GetPipelineCache(), 1, &maskedPipelineInfo, nullptr, &m_MaskedPipeline));
 
         vkDestroyShaderModule(m_Device, vertModule, nullptr);
         vkDestroyShaderModule(m_Device, maskedFragModule, nullptr);

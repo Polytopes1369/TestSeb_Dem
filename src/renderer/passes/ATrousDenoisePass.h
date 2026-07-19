@@ -1,12 +1,12 @@
 #pragma once
 // À-Trous ("with holes") wavelet spatial denoiser: a generic, reusable `image in -> image out`
 // filter with no coupling to any specific producer -- renderer::ClusterRenderPipeline applies it
-// to renderer::ClusterResolvePass's fully composited output color image (direct light +
-// renderer::ScreenProbeGIPass's own temporally-accumulated indirect term, already blended in by
-// the time this pass runs) as a final spatial cleanup, guided by a depth image and an octahedral-
-// encoded normal image (the same G-buffer inputs renderer::ClusterResolvePass already produces).
-// This class itself knows nothing about Screen Probes, the World Probe grid, or Surface Cache
-// sampling; it just denoises whatever image it is given.
+// to renderer::ScreenTracePass's noisy screen-space/World-Probe-fallback indirect GI radiance,
+// BEFORE renderer::GICompositePass ever blends that denoised term with the direct-lit color (see
+// renderer::GICompositePass's own g_DenoisedGI input), as a spatial cleanup pass, guided by a depth
+// image and an octahedral-encoded normal image (the same G-buffer inputs renderer::
+// ClusterResolvePass already produces). This class itself knows nothing about Screen Trace, the
+// World Probe grid, or Surface Cache sampling; it just denoises whatever image it is given.
 //
 // --- Why À-Trous instead of a plain box/Gaussian blur ---
 // A dumb spatial blur would smear the denoised GI signal ACROSS a depth/material discontinuity

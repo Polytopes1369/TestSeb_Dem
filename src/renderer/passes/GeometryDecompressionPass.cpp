@@ -1,4 +1,4 @@
-#include "renderer/passes/GeometryDecompressionPass.h"
+﻿#include "renderer/passes/GeometryDecompressionPass.h"
 
 #include <cassert>
 #include <cstring>
@@ -141,7 +141,7 @@ namespace renderer {
         vertexPipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
         vertexPipelineInfo.stage.module = vertexShaderModule;
         vertexPipelineInfo.stage.pName = "main";
-        VK_CHECK(vkCreateComputePipelines(m_Device, VK_NULL_HANDLE, 1, &vertexPipelineInfo, nullptr, &m_Pipeline));
+        VK_CHECK(vkCreateComputePipelines(m_Device, VulkanPipeline::GetPipelineCache(), 1, &vertexPipelineInfo, nullptr, &m_Pipeline));
 
         vkDestroyShaderModule(m_Device, vertexShaderModule, nullptr);
 
@@ -153,7 +153,7 @@ namespace renderer {
         indexPipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
         indexPipelineInfo.stage.module = indexShaderModule;
         indexPipelineInfo.stage.pName = "main";
-        VK_CHECK(vkCreateComputePipelines(m_Device, VK_NULL_HANDLE, 1, &indexPipelineInfo, nullptr, &m_IndexPipeline));
+        VK_CHECK(vkCreateComputePipelines(m_Device, VulkanPipeline::GetPipelineCache(), 1, &indexPipelineInfo, nullptr, &m_IndexPipeline));
 
         vkDestroyShaderModule(m_Device, indexShaderModule, nullptr);
 

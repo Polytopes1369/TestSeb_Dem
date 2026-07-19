@@ -1,4 +1,4 @@
-#include "renderer/passes/SurfaceCachePass.h"
+﻿#include "renderer/passes/SurfaceCachePass.h"
 
 #include <algorithm>
 #include <cmath>
@@ -252,7 +252,8 @@ namespace renderer {
         // acceleration structure, because VulkanContext::CreateLogicalDevice enables
         // VK_KHR_acceleration_structure + bufferDeviceAddress unconditionally at device creation.
         // STORAGE_BUFFER_BIT: renderer::SurfaceCacheRayTracingPass's .rchit, SurfaceCacheGIInject
-        // .comp's TraceHWRT and renderer::ScreenProbeGIPass's own TraceHWRT (ScreenProbeTrace.comp)
+        // .comp's TraceHWRT, WorldProbeInject.comp's TraceHWRT, and renderer::ReflectionTrace's own
+        // TraceHWRT (the successor to the since-removed ScreenProbeGIPass's identical technique)
         // all bind these same buffers as a plain `readonly buffer` SSBO to re-fetch a hit
         // triangle's vertex positions -- required on top of VERTEX_BUFFER_BIT (which only covers
         // this pass' own vkCmdBindVertexBuffers capture-draw path, a completely different binding
@@ -639,7 +640,7 @@ namespace renderer {
         pipelineInfo.pDynamicState = &dynamicState;
         pipelineInfo.layout = m_PipelineLayout;
         pipelineInfo.pNext = &pipelineRendering;
-        VK_CHECK(vkCreateGraphicsPipelines(m_Device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_Pipeline));
+        VK_CHECK(vkCreateGraphicsPipelines(m_Device, VulkanPipeline::GetPipelineCache(), 1, &pipelineInfo, nullptr, &m_Pipeline));
 
         vkDestroyShaderModule(m_Device, vertModule, nullptr);
         vkDestroyShaderModule(m_Device, fragModule, nullptr);

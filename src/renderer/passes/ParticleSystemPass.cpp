@@ -1,4 +1,4 @@
-#include "renderer/passes/ParticleSystemPass.h"
+﻿#include "renderer/passes/ParticleSystemPass.h"
 
 #include <cstring>
 #include <format>
@@ -655,7 +655,7 @@ namespace renderer {
             simPipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
             simPipelineInfo.stage.module = shaderModule;
             simPipelineInfo.stage.pName = "main";
-            VK_CHECK(vkCreateComputePipelines(m_Device, VK_NULL_HANDLE, 1, &simPipelineInfo, nullptr, &m_SimPipeline));
+            VK_CHECK(vkCreateComputePipelines(m_Device, VulkanPipeline::GetPipelineCache(), 1, &simPipelineInfo, nullptr, &m_SimPipeline));
             vkDestroyShaderModule(m_Device, shaderModule, nullptr);
         }
 
@@ -718,7 +718,7 @@ namespace renderer {
             sortPipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
             sortPipelineInfo.stage.module = sortShaderModule;
             sortPipelineInfo.stage.pName = "main";
-            VK_CHECK(vkCreateComputePipelines(m_Device, VK_NULL_HANDLE, 1, &sortPipelineInfo, nullptr, &m_SortPipeline));
+            VK_CHECK(vkCreateComputePipelines(m_Device, VulkanPipeline::GetPipelineCache(), 1, &sortPipelineInfo, nullptr, &m_SortPipeline));
             vkDestroyShaderModule(m_Device, sortShaderModule, nullptr);
         }
 
@@ -936,7 +936,7 @@ namespace renderer {
             lightExtractPipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
             lightExtractPipelineInfo.stage.module = lightExtractShaderModule;
             lightExtractPipelineInfo.stage.pName = "main";
-            VK_CHECK(vkCreateComputePipelines(m_Device, VK_NULL_HANDLE, 1, &lightExtractPipelineInfo, nullptr, &m_LightExtractPipeline));
+            VK_CHECK(vkCreateComputePipelines(m_Device, VulkanPipeline::GetPipelineCache(), 1, &lightExtractPipelineInfo, nullptr, &m_LightExtractPipeline));
             vkDestroyShaderModule(m_Device, lightExtractShaderModule, nullptr);
         }
 
@@ -1061,7 +1061,7 @@ namespace renderer {
             pipelineInfo.pDynamicState = &dynamicState;
             pipelineInfo.layout = m_RenderPipelineLayout;
 
-            VK_CHECK(vkCreateGraphicsPipelines(m_Device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_RenderPipeline));
+            VK_CHECK(vkCreateGraphicsPipelines(m_Device, VulkanPipeline::GetPipelineCache(), 1, &pipelineInfo, nullptr, &m_RenderPipeline));
 
             vkDestroyShaderModule(m_Device, vertModule, nullptr);
             vkDestroyShaderModule(m_Device, fragModule, nullptr);
@@ -1255,7 +1255,7 @@ namespace renderer {
                 boxPipelineInfo.stage.module = boxModule;
                 boxPipelineInfo.stage.pName = "main";
                 boxPipelineInfo.stage.pSpecializationInfo = &specInfo;
-                VK_CHECK(vkCreateComputePipelines(m_Device, VK_NULL_HANDLE, 1, &boxPipelineInfo, nullptr, &boxFacePipelines[face]));
+                VK_CHECK(vkCreateComputePipelines(m_Device, VulkanPipeline::GetPipelineCache(), 1, &boxPipelineInfo, nullptr, &boxFacePipelines[face]));
             }
             vkDestroyShaderModule(m_Device, boxModule, nullptr);
 
@@ -1275,7 +1275,7 @@ namespace renderer {
             icospherePipelineInfo.stage.module = icosphereModule;
             icospherePipelineInfo.stage.pName = "main";
             VkPipeline icospherePipeline = VK_NULL_HANDLE;
-            VK_CHECK(vkCreateComputePipelines(m_Device, VK_NULL_HANDLE, 1, &icospherePipelineInfo, nullptr, &icospherePipeline));
+            VK_CHECK(vkCreateComputePipelines(m_Device, VulkanPipeline::GetPipelineCache(), 1, &icospherePipelineInfo, nullptr, &icospherePipeline));
             vkDestroyShaderModule(m_Device, icosphereModule, nullptr);
 
             // --- Record + submit every generation dispatch in one one-shot command buffer, seed
@@ -1434,7 +1434,7 @@ namespace renderer {
             meshPipelineInfo.pDepthStencilState = &meshDepthStencil;
             meshPipelineInfo.pDynamicState = &meshDynamicState;
             meshPipelineInfo.layout = m_RenderPipelineLayout;
-            VK_CHECK(vkCreateGraphicsPipelines(m_Device, VK_NULL_HANDLE, 1, &meshPipelineInfo, nullptr, &m_MeshPipeline));
+            VK_CHECK(vkCreateGraphicsPipelines(m_Device, VulkanPipeline::GetPipelineCache(), 1, &meshPipelineInfo, nullptr, &m_MeshPipeline));
 
             vkDestroyShaderModule(m_Device, meshVertModule, nullptr);
             vkDestroyShaderModule(m_Device, meshFragModule, nullptr);
@@ -1548,7 +1548,7 @@ namespace renderer {
             ribbonPipelineInfo.pDepthStencilState = &ribbonDepthStencil;
             ribbonPipelineInfo.pDynamicState = &ribbonDynamicState;
             ribbonPipelineInfo.layout = m_RibbonRenderPipelineLayout;
-            VK_CHECK(vkCreateGraphicsPipelines(m_Device, VK_NULL_HANDLE, 1, &ribbonPipelineInfo, nullptr, &m_RibbonPipeline));
+            VK_CHECK(vkCreateGraphicsPipelines(m_Device, VulkanPipeline::GetPipelineCache(), 1, &ribbonPipelineInfo, nullptr, &m_RibbonPipeline));
 
             vkDestroyShaderModule(m_Device, ribbonVertModule, nullptr);
             vkDestroyShaderModule(m_Device, ribbonFragModule, nullptr);

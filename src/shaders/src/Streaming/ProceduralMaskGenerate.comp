@@ -14,19 +14,11 @@
 
 #define K_MASK_TEXTURE_SIZE 128u
 #include "include/mask_texture_limits.glsl"
+#include "include/hash_utils.glsl"
 
 layout(r8, set = 0, binding = 0) uniform writeonly image2D g_MaskOutputs[K_MAX_MASK_TEXTURES];
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
-
-uint HashUint(uint x) {
-    x ^= x >> 16u;
-    x *= 0x7feb352du;
-    x ^= x >> 15u;
-    x *= 0x846ca68bu;
-    x ^= x >> 16u;
-    return x;
-}
 
 // Value noise at integer cell corners, hashed by (cellX, cellY, slot), bilinearly interpolated
 // with a smoothstep-shaped blend so adjacent cells join without hard seams.

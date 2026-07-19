@@ -1,4 +1,4 @@
-// PCG framework roadmap, Phase 5.3 ("GPU-Resident Node Execution"). See PcgGpuDensityNoiseNode.h
+﻿// PCG framework roadmap, Phase 5.3 ("GPU-Resident Node Execution"). See PcgGpuDensityNoiseNode.h
 // for the full design rationale.
 
 #include "pcg/PcgGpuDensityNoiseNode.h"
@@ -55,7 +55,7 @@ namespace pcg {
         pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
         pipelineInfo.stage.module = shaderModule;
         pipelineInfo.stage.pName = "main";
-        VK_CHECK(vkCreateComputePipelines(m_Device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_Pipeline));
+        VK_CHECK(vkCreateComputePipelines(m_Device, VulkanPipeline::GetPipelineCache(), 1, &pipelineInfo, nullptr, &m_Pipeline));
         vkDestroyShaderModule(m_Device, shaderModule, nullptr);
 
         LOG_INFO("[PcgGpuDensityNoiseNode] Initialized (typeId='pcg.gpu.density_noise').");
