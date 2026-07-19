@@ -122,8 +122,8 @@ namespace renderer {
 
         // One-time UNDEFINED -> GENERAL transition + neutral-default clear (this codebase's
         // established "give a ping-pong GI image a defined neutral starting value" idiom, see
-        // VulkanUtils::ClearComputeImageToGeneral's own comment -- originally established by the
-        // since-removed ScreenProbeGIPass::Init's own STEP 1): radiance/worldPos start at a=0
+        // VulkanUtils::ClearComputeImageToGeneral's own comment -- originally established by
+        // renderer::ScreenProbeGIPass::Init's own STEP 1): radiance/worldPos start at a=0
         // (never traced -- see kWorldPosFormat's own "validity" comment), normal = oct-encoded +Y
         // (an arbitrary but valid direction).
         VulkanUtils::ExecuteOneShotCommands(m_Device, commandPool, queue, [&](VkCommandBuffer cmd) {

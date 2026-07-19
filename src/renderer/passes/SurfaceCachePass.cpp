@@ -252,9 +252,10 @@ namespace renderer {
         // acceleration structure, because VulkanContext::CreateLogicalDevice enables
         // VK_KHR_acceleration_structure + bufferDeviceAddress unconditionally at device creation.
         // STORAGE_BUFFER_BIT: renderer::SurfaceCacheRayTracingPass's .rchit, SurfaceCacheGIInject
-        // .comp's TraceHWRT, WorldProbeInject.comp's TraceHWRT, and renderer::ReflectionTrace's own
-        // TraceHWRT (the successor to the since-removed ScreenProbeGIPass's identical technique)
-        // all bind these same buffers as a plain `readonly buffer` SSBO to re-fetch a hit
+        // .comp's TraceHWRT, WorldProbeInject.comp's TraceHWRT, renderer::ScreenProbeGIPass's own
+        // ScreenProbeTrace.comp TraceHWRT, and renderer::ReflectionTrace's own TraceHWRT (all
+        // independent copies of the same technique) all bind these same buffers as a plain
+        // `readonly buffer` SSBO to re-fetch a hit
         // triangle's vertex positions -- required on top of VERTEX_BUFFER_BIT (which only covers
         // this pass' own vkCmdBindVertexBuffers capture-draw path, a completely different binding
         // point) for that separate SSBO descriptor to be valid (VUID-VkWriteDescriptorSet-descriptorType-00331).

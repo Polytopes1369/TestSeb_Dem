@@ -954,21 +954,39 @@ bool ClusterRenderPipeline::Init(
     return false;
   }
 
-  // Screen Trace GI -- linear screen-space depth raymarching falling back to the World Probe grid.
+  // Screen Trace GI -- GIMode::HighQuality's own linear screen-space depth raymarch falling back to
+  // the World Probe grid, or GIMode::Lite's own (march-skipped) probe-grid-primary sample -- see
+  // ScreenTrace.comp's own giMode branch (F1).
   m_ScreenTrace.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
                      createInfo.renderExtent, m_Resolve.GetOutputDepthView(), m_Resolve.GetOutputNormalView(),
                      m_Resolve.GetOutputColorView(), m_WorldProbes);
 
+  // F9 (UE5.8 parity roadmap): Screen Space Probe GI -- GIMode::HighQuality's own near-field gather
+  // (real Lumen's "Screen Probe Gather"), restored from the tombstoned deletion this class' own
+  // header comment describes. Needs the same trace-scene resources m_ScreenTrace/m_GIInject/
+  // m_WorldProbes already share (m_TraceContext, m_SurfaceCache, m_SurfaceCacheRT), plus m_Resolve's
+  // GBuffer for its own probe placement/gather.
+  if (!m_ScreenProbeGI.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
+                            createInfo.renderExtent, m_TraceContext, m_SurfaceCache, m_SurfaceCacheRT, m_Resolve)) {
+    LOG_ERROR("[ClusterRenderPipeline] Failed to initialize ScreenProbeGIPass.");
+    return false;
+  }
+
   // Final spatial denoiser: denoises m_ScreenTrace's own output GI image, guided by
-  // m_Resolve's own G-buffer normal/depth -- both already Init'd (STEP 6 above).
+  // m_Resolve's own G-buffer normal/depth -- both already Init'd (STEP 6 above). Only feeds
+  // GIMode::Lite's own composite input (see m_GIComposite.Init's own comment); GIMode::HighQuality
+  // reads m_ScreenProbeGI's own output directly instead (that pass already temporally accumulates,
+  // see its own class comment on why it needs no separate spatial denoise pass).
   m_Denoiser.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
       createInfo.renderExtent, m_ScreenTrace.GetOutputView(), m_Resolve.GetOutputDepthView(),
       m_Resolve.GetOutputNormalView());
 
-  // GI Composite: blends m_Resolve's direct lighting / reflections with the denoised indirect GI.
+  // GI Composite: blends m_Resolve's direct lighting / reflections with [m_ScreenProbeGI |
+  // m_Denoiser]'s own indirect term, selected per frame by config::lumen::GI_MODE -- see
+  // GICompositePass's own class comment.
   m_GIComposite.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
       createInfo.renderExtent, m_Resolve.GetOutputColorView(), m_Denoiser.GetOutputView(),
-      m_ScreenSpaceEffects.GetAOView(), m_Resolve.GetOutputDepthView(), m_WorldProbes);
+      m_ScreenProbeGI.GetOutputView(), m_ScreenSpaceEffects.GetAOView(), m_Resolve.GetOutputDepthView(), m_WorldProbes);
 
   // Screen-space Subsurface Scattering (UE5.8 rendering-parity gap G4): a separable diffusion-profile
   // blur applied IN PLACE to m_GIComposite's fully-lit output image, gated per-pixel by each
@@ -1428,6 +1446,7 @@ void ClusterRenderPipeline::Shutdown() {
   m_ScreenSpaceEffects.Shutdown();
   m_Reflection.Shutdown();
   m_ScreenTrace.Shutdown();
+  m_ScreenProbeGI.Shutdown();
   m_GIComposite.Shutdown();
   m_Decals.Shutdown();
   m_SubsurfaceScattering.Shutdown();
@@ -3118,6 +3137,33 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
   }
 
   // =========================================================================================
+  // [12b1] F9 (UE5.8 parity roadmap): Screen Space Probe GI -- GIMode::HighQuality's own near-field
+  // gather (real Lumen's "Screen Probe Gather"), restored from the tombstoned deletion
+  // renderer::ScreenProbeGIPass's own header comment describes. Needs m_Resolve's GBuffer
+  // (already visible from [11]/[12]'s own barriers) and the same Surface Cache atlas + TLAS
+  // visibility [1z]'s m_GIInject already established this frame. Only actually re-dispatched
+  // while GIMode::HighQuality is active -- see this block's own `giModeIsHQ` gate and
+  // GICompositePass's own class comment for why leaving it un-re-traced in Lite mode is harmless
+  // (its own output image simply goes unsampled that frame).
+  // =========================================================================================
+  {
+    bool giModeIsHQ = (config::lumen::GI_MODE == config::lumen::GIMode::HighQuality);
+#ifndef NDEBUG
+    m_GpuProfiler.BeginZone(cmdLate, "ScreenProbeGI");
+#endif
+    if (giModeIsHQ) {
+      maths::mat4 prevViewProjForScreenProbeGI = m_HasPrevViewProj ? m_PrevViewProj : maths::mat4{};
+      m_ScreenProbeGI.RecordUpdateViewParams(cmdLate, viewProj, prevViewProjForScreenProbeGI);
+      m_ScreenProbeGI.RecordTrace(cmdLate, m_TraceContext, m_TraceContext.GetEntityCount(), traceMode, m_FrameIndex);
+      m_ScreenProbeGI.RecordTemporal(cmdLate);
+      m_ScreenProbeGI.RecordGather(cmdLate);
+    }
+#ifndef NDEBUG
+    m_GpuProfiler.EndZone(cmdLate);
+#endif
+  }
+
+  // =========================================================================================
   // [12b2] Phase 2 (UE5.8 parity roadmap): specular reflections -- trace -> temporal
   // reprojection/accumulation -> Fresnel-weighted gather, read-modify-writing m_Resolve's own
   // output color image directly, the exact same convention as [12b] above (see
@@ -3285,12 +3331,14 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
   }
 
   // =========================================================================================
-  // [12e] GI Composite: blends direct lit color/reflections with denoised indirect GI.
+  // [12e] GI Composite: blends direct lit color/reflections with [m_ScreenProbeGI |
+  // m_Denoiser]'s own indirect term, selected by config::lumen::GI_MODE -- see GICompositePass's
+  // own class comment.
   // =========================================================================================
 #ifndef NDEBUG
   m_GpuProfiler.BeginZone(cmdLate, "GIComposite");
 #endif
-  m_GIComposite.RecordComposite(cmdLate
+  m_GIComposite.RecordComposite(cmdLate, config::lumen::GI_MODE
 #ifndef NDEBUG
       , cameraCopy, cameraPositionWorld, m_WorldProbes
 #endif

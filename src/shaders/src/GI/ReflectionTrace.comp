@@ -4,9 +4,8 @@
 
 // Phase 2 (UE5.8 parity roadmap), stage A of 3 (Trace -> Temporal -> Gather -- see
 // renderer::ReflectionPass' own class comment for the full pipeline). One invocation PER PIXEL
-// (full resolution, unlike the codebase's since-removed ScreenProbeGIPass's former per-8x8-tile
-// probes -- a reflection must stay sharp at low roughness, which a coarse probe tile would
-// immediately blur away). Reads this
+// (full resolution, unlike renderer::ScreenProbeGIPass's own per-8x8-tile probes -- a reflection
+// must stay sharp at low roughness, which a coarse probe tile would immediately blur away). Reads this
 // pixel's normal/depth/roughness from renderer::ClusterResolvePass's GBuffer, GGX-VNDF-importance-
 // samples ONE reflection ray direction (roughness-weighted, not the cosine-weighted hemisphere
 // renderer::SurfaceCacheGIInjectPass's own diffuse injection uses), traces it via SWRT
@@ -46,7 +45,7 @@ layout(set = 0, binding = 4) uniform accelerationStructureEXT g_TLAS;
 
 // rgb = this pixel's own world position, a = validity (1.0 = geometry, 0.0 = background) -- same
 // {xyz, validity} convention as renderer::ReflectionPass::kWorldPosFormat itself (originally
-// modeled on the since-removed ScreenProbeGIPass::kWorldPosFormat).
+// modeled on renderer::ScreenProbeGIPass::kWorldPosFormat).
 layout(rgba32f, set = 0, binding = 9) uniform writeonly image2D g_ReflectionWorldPos;
 // This pixel's own octahedral-encoded normal (NOT the reflection ray's direction).
 layout(rg16f, set = 0, binding = 10) uniform writeonly image2D g_ReflectionNormal;

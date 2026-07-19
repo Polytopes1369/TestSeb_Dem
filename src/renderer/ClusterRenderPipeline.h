@@ -162,6 +162,7 @@
 #include "renderer/passes/FogScreenSpaceScatteringPass.h"
 #include "renderer/passes/PostProcessPass.h"
 #include "renderer/passes/ScreenTracePass.h"
+#include "renderer/passes/ScreenProbeGIPass.h"
 #include "renderer/passes/GICompositePass.h"
 #include "renderer/passes/SubsurfaceScatteringPass.h"
 #include "renderer/passes/DecalProjectionPass.h"
@@ -1218,16 +1219,21 @@ namespace renderer {
         // benefits from.
         SurfaceCacheGIInjectPass m_GIInject;
 
-        // NOTE: this class previously also owned a ScreenProbeGIPass ("Screen Space Probe GI" /
-        // Lumen "Screen Probe Gather") here -- a per-8x8-tile SH probe grid, temporally accumulated,
-        // gathered back into m_Resolve's output color image via read-modify-write. The
-        // ScreenTracePass/GICompositePass integration below replaced it as this codebase's near-
-        // field screen-space GI term (a plain per-pixel screen-space march instead of a per-tile
-        // probe grid); the instantiation was removed here to stop paying for its ~10 full-resolution
-        // images/3 pipelines every run. ScreenProbeGIPass.h/.cpp and its 4 shaders (ScreenProbeTrace/
-        // Temporal/Gather/Classify.comp, the last from Phase 6's hierarchical placement) were deleted
-        // outright -- zero remaining references anywhere in this codebase (confirmed via repo-wide
-        // grep before deletion), same as ShadowMapPass.h/.cpp above.
+        // F9 (UE5.8 parity roadmap): Screen Space Probe GI ("Screen Probe Gather" -- a per-8x8-tile
+        // SH probe grid, temporally accumulated, hierarchically classified into an always-on coarse
+        // grid + selectively-retraced fine grid, see that class' own header comment) -- RESTORED
+        // here as config::lumen::GIMode::HighQuality's own near-field gather, replacing the plain
+        // per-pixel m_ScreenTrace march that HighQuality used while this was deleted. This class had
+        // been removed outright by an earlier perf pass (own ~10 full-resolution-image /
+        // 3-pipeline cost concern, since disproven -- see this class' own restored header comment:
+        // its probe images were already sized at PROBE resolution, not full render resolution, even
+        // before deletion) once F1 ("Lumen Lite") gave GIMode::Lite its own cheap alternative via
+        // m_WorldProbes -- m_ScreenTrace now serves ONLY GIMode::Lite's per-pixel term (and, in
+        // HighQuality, nothing -- see RecordFrame()'s own [12b]/[12b1] comments), while this owns
+        // HighQuality's own indirect term. GICompositePass composites direct color + [this pass'
+        // GetOutputView() | m_Denoiser's ATrous-denoised m_ScreenTrace output] depending on
+        // config::lumen::GI_MODE.
+        ScreenProbeGIPass m_ScreenProbeGI;
 
         // Phase 2 (UE5.8 parity roadmap): specular reflections / GI -- traces ONE GGX-VNDF-
         // importance-sampled ray per pixel per frame (full resolution), sampling the same

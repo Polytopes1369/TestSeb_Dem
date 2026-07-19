@@ -3,7 +3,7 @@
 // entirely none of before this pass -- see this repo's own 2026-07-16 audit (grep for
 // GGX|BRDF|Fresnel|Schlick|NDF|ImportanceSample across src/shaders found zero real hits before
 // include/ggx_brdf.glsl was written). Structurally mirrors the 4-call contract of this codebase's
-// since-removed ScreenProbeGIPass tile-probe GI pass (RecordUpdateViewParams -> RecordTrace ->
+// renderer::ScreenProbeGIPass tile-probe GI pass (RecordUpdateViewParams -> RecordTrace ->
 // RecordTemporal -> RecordGather, double-buffered ping-pong, no copy pass) -- but differs in two
 // deliberate ways:
 //
@@ -12,10 +12,10 @@
 //      stage, dispatched (ceil(width/8), ceil(height/8), 1).
 //   2. RAW RGBA16F RADIANCE, not L1 spherical harmonics: an SH order-1 basis can only reconstruct a
 //      low-frequency cosine-lobe response -- physically incapable of representing a narrow specular
-//      lobe at low roughness. The since-removed ScreenProbeGIPass's SH storage was therefore never
+//      lobe at low roughness. renderer::ScreenProbeGIPass's own SH storage is therefore not
 //      reusable here; only its trace->temporal->gather CALL STRUCTURE was mirrored.
 //
-// --- Per-frame call order a caller must follow (identical shape to the removed ScreenProbeGIPass's
+// --- Per-frame call order a caller must follow (identical shape to renderer::ScreenProbeGIPass's
 // own) ---
 //   1. RecordUpdateViewParams(cmd, viewProj, prevViewProj, cameraPositionWorld) -- uploads the
 //      shared ReflectionViewParamsUBO every other call below reads; `prevViewProj` should be an
@@ -89,8 +89,8 @@ namespace renderer {
 
         // `traceContext`/`surfaceCache`/`rtPass`/`resolvePass` must all already be Init'd and must
         // outlive this pass -- their resources are bound into this pass' own descriptor sets
-        // unmodified (this codebase's established borrowed-resource convention, also used by the
-        // since-removed ScreenProbeGIPass).
+        // unmodified (this codebase's established borrowed-resource convention, also used by
+        // renderer::ScreenProbeGIPass).
         // Init(VkDevice, VmaAllocator, VkCommandPool, VkQueue, VkExtent2D,
         // const SurfaceCacheTraceContext&, const SurfaceCachePass&, const SurfaceCacheRayTracingPass&,
         // const ClusterResolvePass&) -> bool and Shutdown() are inherited from
@@ -101,8 +101,8 @@ namespace renderer {
         // inverse is computed here, CPU-side, via maths::mat4::Inverse()); `prevViewProj` is the
         // previous frame's own combined matrix (renderer::ClusterRenderPipeline's own
         // m_PrevViewProj); `cameraPositionWorld` is the eye point RecordTrace's view-dependent GGX-
-        // VNDF sampling needs (unlike the since-removed ScreenProbeGIPass's own full-sphere probe
-        // rays, a reflection ray direction depends on the view vector).
+        // VNDF sampling needs (unlike renderer::ScreenProbeGIPass's own full-sphere probe rays, a
+        // reflection ray direction depends on the view vector).
         void RecordUpdateViewParams(VkCommandBuffer cmd, const maths::mat4& viewProj,
             const maths::mat4& prevViewProj, const maths::vec3& cameraPositionWorld);
 
@@ -134,8 +134,8 @@ namespace renderer {
         VkImageView GetHitMaskView() const { return m_HitMaskView; }
 
     private:
-        // One ping-pong slot's 3 fields, all sized to `m_RenderExtent` (full resolution, unlike the
-        // since-removed ScreenProbeGIPass::ProbeSlot's coarser probe-grid sizing).
+        // One ping-pong slot's 3 fields, all sized to `m_RenderExtent` (full resolution, unlike
+        // renderer::ScreenProbeGIPass::ProbeSlot's coarser probe-grid sizing).
         struct ReflectionSlot {
             VkImage radianceImage = VK_NULL_HANDLE; VmaAllocation radianceAllocation = VK_NULL_HANDLE; VkImageView radianceView = VK_NULL_HANDLE;
             VkImage worldPosImage = VK_NULL_HANDLE; VmaAllocation worldPosAllocation = VK_NULL_HANDLE; VkImageView worldPosView = VK_NULL_HANDLE;
