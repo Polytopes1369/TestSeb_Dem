@@ -1,4 +1,4 @@
-#include "renderer/passes/FurStrandPass.h"
+﻿#include "renderer/passes/FurStrandPass.h"
 
 #include <algorithm>
 #include <array>
@@ -384,7 +384,7 @@ namespace renderer {
             pipelineInfo.pDepthStencilState = &depthStencil;
             pipelineInfo.pDynamicState = &dynamicState;
             pipelineInfo.layout = m_RenderPipelineLayout;
-            VK_CHECK(vkCreateGraphicsPipelines(m_Device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_RenderPipeline));
+            VK_CHECK(vkCreateGraphicsPipelines(m_Device, VulkanPipeline::GetPipelineCache(), 1, &pipelineInfo, nullptr, &m_RenderPipeline));
 
 #ifndef NDEBUG
             // Debug-only wireframe: same pipeline, VK_POLYGON_MODE_LINE, depth-write OFF so it overlays
@@ -396,7 +396,7 @@ namespace renderer {
             VkGraphicsPipelineCreateInfo wirePipelineInfo = pipelineInfo;
             wirePipelineInfo.pRasterizationState = &wireRaster;
             wirePipelineInfo.pDepthStencilState = &wireDepth;
-            VK_CHECK(vkCreateGraphicsPipelines(m_Device, VK_NULL_HANDLE, 1, &wirePipelineInfo, nullptr, &m_WireframePipeline));
+            VK_CHECK(vkCreateGraphicsPipelines(m_Device, VulkanPipeline::GetPipelineCache(), 1, &wirePipelineInfo, nullptr, &m_WireframePipeline));
 #endif
 
             vkDestroyShaderModule(m_Device, vertModule, nullptr);

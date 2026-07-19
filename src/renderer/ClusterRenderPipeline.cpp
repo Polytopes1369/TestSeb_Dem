@@ -974,6 +974,14 @@ bool ClusterRenderPipeline::Init(
   m_DepthOfField.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
       m_DisplayExtent, m_TAATSR.GetOutputView(), m_Resolve.GetOutputDepthView());
 
+  // UE5.8-parity "Accumulation Depth of Field" (config::postprocess::DOF_MODE == 1): same inputs as
+  // m_DepthOfField just above (both read m_TAATSR's own HDR output + m_Resolve's own depth) -- always
+  // Init'd alongside it so the live ImGui mode toggle never needs a resize/recreate, only a history
+  // reset (see [13e]'s own resetHistory computation below). Must also Init before m_Bloom, same
+  // reason as m_DepthOfField.
+  m_DepthOfFieldAccumulation.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
+      m_DisplayExtent, m_TAATSR.GetOutputView(), m_Resolve.GetOutputDepthView());
+
   // Phase PP2 (post-process stack roadmap): Bloom/Lens Flare/Anamorphic Flare/Lens Dirt, reading
   // m_DepthOfField's own output -- must Init before m_PostProcess so its own GetOutputView()
   // already exists for m_PostProcess.Init's own g_Bloom binding.
@@ -1059,6 +1067,25 @@ bool ClusterRenderPipeline::Init(
   m_DebugOverlay.Init(createInfo.device, createInfo.allocator,
                       createInfo.commandPool, createInfo.queue,
                       SDFRayMarchPass::kOutputFormat);
+
+  // B1 (audit-fix roadmap, per-pass GPU timestamp profiler): see m_GpuProfiler/m_GpuProfilerAsync's
+  // own declaration comments for the full per-queue split rationale. `timestampPeriod` is queried
+  // here (not cached anywhere else on this class) purely for this feature -- mirrors
+  // ParticleSystemPass::Init()'s own identical VkPhysicalDeviceProperties query for the same field.
+  // kMaxGraphicsZones/kMaxAsyncZones both comfortably exceed this pipeline's own actual zone count
+  // (see RecordFrameEarly/RecordFrameMid/RecordFrameLate/RecordAsyncCompute's own BeginZone call
+  // sites) with headroom for future passes to add their own zones without hitting
+  // GetOrRegisterZoneId's own cap.
+  {
+    VkPhysicalDeviceProperties deviceProperties{};
+    vkGetPhysicalDeviceProperties(createInfo.physicalDevice, &deviceProperties);
+    constexpr uint32_t kMaxGraphicsZones = 48;
+    constexpr uint32_t kMaxAsyncZones = 8;
+    m_GpuProfiler.Init(createInfo.device, createInfo.allocator,
+        deviceProperties.limits.timestampPeriod, kMaxGraphicsZones);
+    m_GpuProfilerAsync.Init(createInfo.device, createInfo.allocator,
+        deviceProperties.limits.timestampPeriod, kMaxAsyncZones);
+  }
 #endif
 
 #ifndef NDEBUG
@@ -1365,6 +1392,8 @@ void ClusterRenderPipeline::Shutdown() {
   m_ParticleDebugView.Shutdown();
   m_PcgPointCloudDebugView.Shutdown();
   m_PathTracer.Shutdown(); // UE5.8 gap G10b reference Path Tracer (Debug-only).
+  m_GpuProfiler.Shutdown();
+  m_GpuProfilerAsync.Shutdown();
 #endif
   m_AtmosClouds.Shutdown();
   m_AtmosFog.Shutdown();
@@ -1384,6 +1413,7 @@ void ClusterRenderPipeline::Shutdown() {
   m_PostProcess.Shutdown();
   m_Bloom.Shutdown();
   m_DepthOfField.Shutdown();
+  m_DepthOfFieldAccumulation.Shutdown();
   m_TAATSR.Shutdown();
   m_WorldProbes.Shutdown();
   m_GIInject.Shutdown();
@@ -1411,6 +1441,7 @@ void ClusterRenderPipeline::Shutdown() {
   m_VTManager.Shutdown();
   m_PrevViewProj = maths::mat4{};
   m_HasPrevViewProj = false;
+  m_DOFAccumulationWasActive = false;
   m_FrameIndex = 0;
 #ifndef NDEBUG
   m_DebugTraceMode = 0;
@@ -1510,7 +1541,11 @@ void ClusterRenderPipeline::RecordDebugBufferView(VkCommandBuffer cmd) {
         case 7: sourceView = m_ScreenSpaceEffects.GetAOView(); mode = debug::DebugBufferViewPass::VisualizationMode::kGrayscale; break;
         case 8: sourceView = m_Bloom.GetOutputView(); mode = debug::DebugBufferViewPass::VisualizationMode::kTonemap; break;
         case 9: sourceView = m_TAATSR.GetOutputView(); mode = debug::DebugBufferViewPass::VisualizationMode::kTonemap; break;
-        case 10: sourceView = m_DepthOfField.GetOutputView(); mode = debug::DebugBufferViewPass::VisualizationMode::kTonemap; break;
+        // Shows whichever DOF sub-pass config::postprocess::DOF_MODE actually ran this frame (see
+        // RecordFrame's own [13e] for the identical branch) -- the OTHER one's own output view would
+        // be frozen/stale since only the active pass is dispatched each frame.
+        case 10: sourceView = (config::postprocess::DOF_MODE != 0) ? m_DepthOfFieldAccumulation.GetOutputView() : m_DepthOfField.GetOutputView();
+                 mode = debug::DebugBufferViewPass::VisualizationMode::kTonemap; break;
         case 11: sourceView = m_ScreenTrace.GetOutputView(); mode = debug::DebugBufferViewPass::VisualizationMode::kTonemap; break;
         case 12: sourceView = m_Denoiser.GetOutputView(); mode = debug::DebugBufferViewPass::VisualizationMode::kTonemap; break;
         case 13: sourceView = m_GIComposite.GetOutputView(); mode = debug::DebugBufferViewPass::VisualizationMode::kTonemap; break;
@@ -1801,6 +1836,13 @@ void ClusterRenderPipeline::RecordFrameEarly(VkCommandBuffer cmdEarly,
   m_FrameScratch.useAsyncCompute = useAsyncCompute;
   m_FrameScratch.radiosityEnabled = radiosityEnabled;
 
+#ifndef NDEBUG
+  // B1 (audit-fix roadmap): ONE call per real frame, at the very top of the very first command
+  // buffer this frame's zones are recorded into -- see m_GpuProfiler's own declaration comment for
+  // why cmdEarly/cmdMid/cmdLate (all 3 later this same frame) safely share this single pool.
+  m_GpuProfiler.BeginFrame(cmdEarly);
+#endif
+
   // =========================================================================================
   // [1a-skel] Skeletal-animation feature: recompute the procedural creature's bone matrices from
   // this frame's globalTimeSeconds and re-upload the SkeletalBoneMatricesSSBO. MOVED here (used to
@@ -1815,7 +1857,13 @@ void ClusterRenderPipeline::RecordFrameEarly(VkCommandBuffer cmdEarly,
   // RecordUpdate's own header comment) -- RecordBoneMatricesOwnershipTransfer below additionally
   // covers the async-compute-queue case specifically, which that barrier cannot reach on its own.
   // =========================================================================================
+#ifndef NDEBUG
+  m_GpuProfiler.BeginZone(cmdEarly, "SkeletalAnimator");
+#endif
   m_SkeletalAnimator.RecordUpdate(cmdEarly, globalTimeSeconds);
+#ifndef NDEBUG
+  m_GpuProfiler.EndZone(cmdEarly);
+#endif
 
   // =========================================================================================
   // [1y] Atmos weather system, Subtask 1: refresh AtmosGlobalsUBO (wind, Magnus-Tetens dew point /
@@ -1823,7 +1871,13 @@ void ClusterRenderPipeline::RecordFrameEarly(VkCommandBuffer cmdEarly,
   // AtmosClimatePass.h's own class comment); placed immediately before [1z] so a future Fog/Cloud
   // consumer added inside that same block always sees an already-current buffer this frame.
   // =========================================================================================
+#ifndef NDEBUG
+  m_GpuProfiler.BeginZone(cmdEarly, "AtmosClimate");
+#endif
   m_AtmosClimate.RecordUpdate(cmdEarly, globalTimeSeconds);
+#ifndef NDEBUG
+  m_GpuProfiler.EndZone(cmdEarly);
+#endif
 
   // Dynamic Weather Simulation, seasonal cycle: rotate this frame's sun ELEVATION angle away from
   // m_BaseSunDirection (Init()'s own fixed default, see that call site's comment) by
@@ -1860,7 +1914,13 @@ void ClusterRenderPipeline::RecordFrameEarly(VkCommandBuffer cmdEarly,
   // comment for the Transmittance/Multi-Scattering dirty-tracking policy. Sun direction/intensity
   // sourced the same way m_Resolve's own sun uniform below is (m_SceneLights.sun) -- already
   // reflects this frame's seasonal elevation offset, applied immediately above.
+#ifndef NDEBUG
+  m_GpuProfiler.BeginZone(cmdEarly, "AtmosSky");
+#endif
   m_AtmosSky.RecordUpdate(cmdEarly, m_SceneLights.sun.direction, m_SceneLights.sun.intensity);
+#ifndef NDEBUG
+  m_GpuProfiler.EndZone(cmdEarly);
+#endif
 
   // =========================================================================================
   // [1z] Lumen-style GI infrastructure: Virtual Shadow Map page requests/renders (Phase 3) ->
@@ -1891,7 +1951,13 @@ void ClusterRenderPipeline::RecordFrameEarly(VkCommandBuffer cmdEarly,
     // [12]) need THIS frame's VSM view-projection matrices + any pages rendered this frame already
     // visible -- RecordBeginFrame()'s own trailing barrier (when it renders any page) covers that.
     // See VirtualShadowMapPass's own class comment for the full one-frame-lag feedback contract.
+#ifndef NDEBUG
+    m_GpuProfiler.BeginZone(cmdEarly, "VirtualShadowMap_Begin");
+#endif
     m_VirtualShadowMap.RecordBeginFrame(cmdEarly, sunDirection, m_SceneLights, cameraFrameInfo.position, entityTransformsCPU);
+#ifndef NDEBUG
+    m_GpuProfiler.EndZone(cmdEarly);
+#endif
 
     // 1b. Virtual Texture streaming: reads back LAST frame's page-miss feedback (m_Resolve's own
     // ClusterResolve.comp/ClusterResolveBinned.comp VT sampling call, see SetVirtualTexture()'s own
@@ -1899,7 +1965,13 @@ void ClusterRenderPipeline::RecordFrameEarly(VkCommandBuffer cmdEarly,
     // m_Resolve's own dispatch in RecordFrameMid() (same one-frame-lag contract as
     // VirtualShadowMapPass's own RecordBeginFrame, see VirtualTextureStreamingCoordinator's own
     // class comment).
+#ifndef NDEBUG
+    m_GpuProfiler.BeginZone(cmdEarly, "VTStreaming_Begin");
+#endif
     m_VTStreaming.RecordBeginFrame(cmdEarly);
+#ifndef NDEBUG
+    m_GpuProfiler.EndZone(cmdEarly);
+#endif
 
     // 2. Surface Cache: feed this frame's light data before the visibility-driven capture draws --
     // shadow lookups now read renderer::VirtualShadowMapPass's own UBOs directly (bound once via
@@ -1912,12 +1984,24 @@ void ClusterRenderPipeline::RecordFrameEarly(VkCommandBuffer cmdEarly,
                                     maths::vec3{0.0f, 1.0f, 0.0f}, cameraFrameInfo.fovYRadians,
                                     cameraFrameInfo.aspectRatio, cameraFrameInfo.nearZ,
                                     cameraFrameInfo.farZ);
+#ifndef NDEBUG
+    m_GpuProfiler.BeginZone(cmdEarly, "SurfaceCache_Capture");
+#endif
     m_SurfaceCache.RecordCapture(cmdEarly, cameraFrameInfo.position, entityTransformsCPU);
+#ifndef NDEBUG
+    m_GpuProfiler.EndZone(cmdEarly);
+#endif
 
     // 3. Global SDF clipmap streaming, from this frame's camera position. STAYS on the graphics
     // queue (Feature 1's plan explicitly excludes it -- GIInject's HWRT path, the only mode ever
     // moved to async, does not sample the Global SDF at all).
+#ifndef NDEBUG
+    m_GpuProfiler.BeginZone(cmdEarly, "GlobalSDF_Update");
+#endif
     m_GlobalSDF.RecordUpdate(cmdEarly, cameraFrameInfo.position, entityTransformsCPU);
+#ifndef NDEBUG
+    m_GpuProfiler.EndZone(cmdEarly);
+#endif
 
     // 3b. GPU particle system, Subtask 6: simulate + sort this frame's particles. Must run after
     // m_GlobalSDF's own update just above (ParticleSimulation.comp's collision response samples
@@ -2031,6 +2115,9 @@ void ClusterRenderPipeline::RecordFrameEarly(VkCommandBuffer cmdEarly,
       // (see this function's own earlier "Every stage of this frame consumes the SAME combined
       // matrix" comment) -- reused here unmodified so ParticleSimulation.comp's forward screen-space
       // projection matches exactly what produced m_Resolve's own depth copy this frame.
+#ifndef NDEBUG
+      m_GpuProfiler.BeginZone(cmdEarly, "ParticleSystem_Simulate");
+#endif
       m_ParticleSystem.RecordSimulate(cmdEarly, m_GlobalSDF, particleDeltaTimeSeconds, globalTimeSeconds,
           viewProj, invViewProj, m_RenderExtent,
           particleEmitters, particleSpawnCounts,
@@ -2039,10 +2126,19 @@ void ClusterRenderPipeline::RecordFrameEarly(VkCommandBuffer cmdEarly,
           config::atmos::PRECIPITATION_SPAWN_BAND_THICKNESS_METERS, config::atmos::PRECIPITATION_FLOOR_BELOW_CAMERA_METERS,
           config::atmos::PRECIPITATION_RAIN_FALL_SPEED_MPS, config::atmos::PRECIPITATION_SNOW_FALL_SPEED_MPS,
           config::atmos::PRECIPITATION_SNOW_WOBBLE_STRENGTH);
+#ifndef NDEBUG
+      m_GpuProfiler.EndZone(cmdEarly);
+#endif
 
       float particleCameraPosition[3] = { cameraFrameInfo.position.x, cameraFrameInfo.position.y, cameraFrameInfo.position.z };
       float particleCameraForward[3] = { cameraFrameInfo.forward.x, cameraFrameInfo.forward.y, cameraFrameInfo.forward.z };
+#ifndef NDEBUG
+      m_GpuProfiler.BeginZone(cmdEarly, "ParticleSystem_Sort");
+#endif
       m_ParticleSystem.RecordSort(cmdEarly, particleCameraPosition, particleCameraForward);
+#ifndef NDEBUG
+      m_GpuProfiler.EndZone(cmdEarly);
+#endif
 
       // Niagara-parity render-integration roadmap, D4 (particles as light emitters): samples this
       // frame's freshly-rebuilt alive list into m_MegaLights' own reserved particle-derived light
@@ -2051,7 +2147,13 @@ void ClusterRenderPipeline::RecordFrameEarly(VkCommandBuffer cmdEarly,
       // anyway (one obvious call-site location, same command buffer). m_MegaLights.RecordShade
       // (RecordFrameLate, later this same frame) reads the result via same-queue submission
       // ordering -- see that method's own comment.
+#ifndef NDEBUG
+      m_GpuProfiler.BeginZone(cmdEarly, "ParticleSystem_ExtractLights");
+#endif
       m_ParticleSystem.RecordExtractLights(cmdEarly);
+#ifndef NDEBUG
+      m_GpuProfiler.EndZone(cmdEarly);
+#endif
     }
 
     // 4. Secondary-bounce injection into m_SurfaceCache's own radiance atlas + the TLAS refit that
@@ -2071,16 +2173,31 @@ void ClusterRenderPipeline::RecordFrameEarly(VkCommandBuffer cmdEarly,
       // everything (skinning compute write -> BLAS UPDATE -> TLAS refit read) stays on the SAME
       // cmdEarly/graphics-queue command buffer, so no cross-queue hazard to manage here (contrast
       // the useAsyncCompute branch below, and RecordAsyncCompute()'s own mirrored call).
+#ifndef NDEBUG
+      m_GpuProfiler.BeginZone(cmdEarly, "SurfaceCacheRT_BlasUpdate");
+#endif
       m_SurfaceCacheRT.RecordCreatureBlasUpdate(cmdEarly, entityTransformsCPU);
+#ifndef NDEBUG
+      m_GpuProfiler.EndZone(cmdEarly);
+#endif
 
       // Phase 4 integration (UE5.8 parity roadmap, dynamic scenes onto main): per-frame TLAS
       // refit so ray-traced GI/reflections see this frame's entity rotations -- must run before
       // anything below traces against m_SurfaceCacheRT's TLAS (radiosity injection right below,
       // and any later HWRT consumer this same frame). A no-op rebuild (identity transforms)
       // whenever config::ENTITY_SELF_ROTATION_ENABLED is off -- see RecordRefreshTLAS's own comment.
+#ifndef NDEBUG
+      m_GpuProfiler.BeginZone(cmdEarly, "SurfaceCacheRT_RefreshTLAS");
+#endif
       m_SurfaceCacheRT.RecordRefreshTLAS(cmdEarly, entityTransformsCPU);
+#ifndef NDEBUG
+      m_GpuProfiler.EndZone(cmdEarly);
+#endif
 
       if (radiosityEnabled) {
+#ifndef NDEBUG
+        m_GpuProfiler.BeginZone(cmdEarly, "GIInject_Radiosity");
+#endif
         for (uint32_t bounce = 0; bounce < kRadiosityBounceCount; ++bounce) {
           m_GIInject.RecordInject(cmdEarly, m_TraceContext, m_SurfaceCache, traceMode, m_SceneLights.sun.direction);
 
@@ -2102,6 +2219,9 @@ void ClusterRenderPipeline::RecordFrameEarly(VkCommandBuffer cmdEarly,
           giInjectDepInfo.pMemoryBarriers = &giInjectBarrier;
           vkCmdPipelineBarrier2(cmdEarly, &giInjectDepInfo);
         }
+#ifndef NDEBUG
+        m_GpuProfiler.EndZone(cmdEarly);
+#endif
       }
     } else {
       // RELEASE (graphics -> async-compute), moved HERE by the Phase 2 fix -- see this block's own
@@ -2155,10 +2275,12 @@ void ClusterRenderPipeline::RecordFrameEarly(VkCommandBuffer cmdEarly,
     // SDFRayMarch.comp's own comment on why that's a distinct, useful signal from the full two-tier
     // march); any other view mode gets the normal full march, which costs nothing extra since this
     // dispatch runs either way.
+    m_GpuProfiler.BeginZone(cmdEarly, "SDFRayMarch_Debug");
     m_SDFRayMarch.RecordRayMarch(cmdEarly, m_GlobalSDF, cameraFrameInfo.position, cameraFrameInfo.forward,
                                  maths::vec3{0.0f, 1.0f, 0.0f}, cameraFrameInfo.fovYRadians,
                                  cameraFrameInfo.aspectRatio, cameraFrameInfo.nearZ, cameraFrameInfo.farZ,
                                  cameraCopy.debugViewMode == DEBUG_VIEW_GLOBAL_SDF, m_SceneLights.sun.direction);
+    m_GpuProfiler.EndZone(cmdEarly);
 #endif
   }
 }
@@ -2174,6 +2296,14 @@ void ClusterRenderPipeline::RecordAsyncCompute(VkCommandBuffer asyncComputeCmd) 
   if (!m_FrameScratch.useAsyncCompute) {
     return; // Fallback path already ran fully graphics-queue-serialized in RecordFrameEarly().
   }
+
+#ifndef NDEBUG
+  // B1 (audit-fix roadmap): m_GpuProfilerAsync's OWN pool/timeline (see its own declaration
+  // comment for why this queue needs a separate instance from m_GpuProfiler) -- BeginFrame() is
+  // only ever reached when this method actually records real GPU work (the early-return above),
+  // so a session that never routes through the async-compute queue never calls it at all.
+  m_GpuProfilerAsync.BeginFrame(asyncComputeCmd);
+#endif
 
   const uint32_t traceMode = m_FrameScratch.traceMode;
   const bool radiosityEnabled = m_FrameScratch.radiosityEnabled;
@@ -2205,14 +2335,29 @@ void ClusterRenderPipeline::RecordAsyncCompute(VkCommandBuffer asyncComputeCmd) 
   // RecordCreatureBlasUpdate's own comment (SurfaceCacheRayTracingPass.h) for the full ordering
   // contract. A no-op if Init() found no skeletally-animated entity. Mirrors the fallback path's
   // own identical call in RecordFrameEarly()'s cmdEarly branch.
+#ifndef NDEBUG
+  m_GpuProfilerAsync.BeginZone(asyncComputeCmd, "Async_BlasUpdate");
+#endif
   m_SurfaceCacheRT.RecordCreatureBlasUpdate(asyncComputeCmd, entityTransformsCPU);
+#ifndef NDEBUG
+  m_GpuProfilerAsync.EndZone(asyncComputeCmd);
+#endif
 
   // Phase 4 integration (UE5.8 parity roadmap, dynamic scenes onto main): per-frame TLAS refit,
   // forced HWRT-only here (traceMode == 1u whenever useAsyncCompute, see RecordFrameEarly()'s own
   // useAsyncCompute derivation) -- must run before the bounce loop below traces against it.
+#ifndef NDEBUG
+  m_GpuProfilerAsync.BeginZone(asyncComputeCmd, "Async_RefreshTLAS");
+#endif
   m_SurfaceCacheRT.RecordRefreshTLAS(asyncComputeCmd, entityTransformsCPU);
+#ifndef NDEBUG
+  m_GpuProfilerAsync.EndZone(asyncComputeCmd);
+#endif
 
   if (radiosityEnabled) {
+#ifndef NDEBUG
+    m_GpuProfilerAsync.BeginZone(asyncComputeCmd, "Async_Radiosity");
+#endif
     for (uint32_t bounce = 0; bounce < kRadiosityBounceCount; ++bounce) {
       m_GIInject.RecordInject(asyncComputeCmd, m_TraceContext, m_SurfaceCache, traceMode, m_SceneLights.sun.direction);
 
@@ -2229,6 +2374,9 @@ void ClusterRenderPipeline::RecordAsyncCompute(VkCommandBuffer asyncComputeCmd) 
       giInjectDepInfo.pMemoryBarriers = &giInjectBarrier;
       vkCmdPipelineBarrier2(asyncComputeCmd, &giInjectDepInfo);
     }
+#ifndef NDEBUG
+    m_GpuProfilerAsync.EndZone(asyncComputeCmd);
+#endif
   }
 
   // RELEASE (async-compute -> graphics): makes the bounce loop's Radiance writes + the TLAS
@@ -2270,9 +2418,15 @@ void ClusterRenderPipeline::RecordFrameMid(VkCommandBuffer cmdMid, VkCommandBuff
   // CLEAR->COMPUTE barrier, so the culling/raster dispatches below can never
   // read a stale counter.
   // =========================================================================================
+#ifndef NDEBUG
+  m_GpuProfiler.BeginZone(cmdMid, "FrameClears");
+#endif
   m_OcclusionCulling.RecordClearFrame(cmdMid);
   m_SoftwareRaster.RecordClear(cmdMid);
   m_LODSelection.RecordClear(cmdMid);
+#ifndef NDEBUG
+  m_GpuProfiler.EndZone(cmdMid);
+#endif
 
   // =========================================================================================
   // [1a] Async streaming triage: read back LAST frame's residency misses (captured by this
@@ -2293,8 +2447,14 @@ void ClusterRenderPipeline::RecordFrameMid(VkCommandBuffer cmdMid, VkCommandBuff
   // touches page-pool data at all -- is the one that must wait for the transfer queue's release +
   // copy to have completed first.
   // =========================================================================================
+#ifndef NDEBUG
+  m_GpuProfiler.BeginZone(cmdMid, "GeometryStreaming");
+#endif
   m_Streaming.ProcessFeedbackAndDrainCompletions(cmdMid, transferCmd, m_LODSelection.GetFeedbackBuffer(),
                                                  m_PagePool, m_Decompression);
+#ifndef NDEBUG
+  m_GpuProfiler.EndZone(cmdMid);
+#endif
 
   // =========================================================================================
   // [1b] Per-frame GPU-driven LOD DAG cut: evaluate every DAG node's screen-space error against
@@ -2316,6 +2476,9 @@ void ClusterRenderPipeline::RecordFrameMid(VkCommandBuffer cmdMid, VkCommandBuff
     lodViewParams.viewportHeight = static_cast<float>(m_RenderExtent.height);
     lodViewParams.aspectRatio = static_cast<float>(m_RenderExtent.width) / static_cast<float>(m_RenderExtent.height);
 
+#ifndef NDEBUG
+    m_GpuProfiler.BeginZone(cmdMid, "LODSelection");
+#endif
     m_LODSelection.RecordEvaluateAndCompact(cmdMid, lodViewParams);
 
 #ifndef NDEBUG
@@ -2337,6 +2500,9 @@ void ClusterRenderPipeline::RecordFrameMid(VkCommandBuffer cmdMid, VkCommandBuff
     m_LODSelection.GetFeedbackBuffer().RecordReadback(cmdMid);
 
     m_LODSelection.RecordBuildEarlyDispatchArgs(cmdMid);
+#ifndef NDEBUG
+    m_GpuProfiler.EndZone(cmdMid);
+#endif
   }
 
   // =========================================================================================
@@ -2388,6 +2554,9 @@ void ClusterRenderPipeline::RecordFrameMid(VkCommandBuffer cmdMid, VkCommandBuff
   // depth). Its trailing barrier makes the early draw list/count visible to
   // DRAW_INDIRECT and the pending + software lists visible to later COMPUTE.
   // =========================================================================================
+#ifndef NDEBUG
+  m_GpuProfiler.BeginZone(cmdMid, "OcclusionCulling_Early");
+#endif
   m_OcclusionCulling.RecordEarlyPass(cmdMid, viewParams, viewProj, projScaleY,
                                      m_LODSelection.GetEarlyDispatchArgsBuffer(),
                                      kSoftwareRasterThresholdPixels
@@ -2395,6 +2564,9 @@ void ClusterRenderPipeline::RecordFrameMid(VkCommandBuffer cmdMid, VkCommandBuff
                                      , cameraCopy.disableOcclusionCulling
 #endif
                                      );
+#ifndef NDEBUG
+  m_GpuProfiler.EndZone(cmdMid);
+#endif
 
   // =========================================================================================
   // [3] Attachment layout acquisition. All three images are re-acquired with
@@ -2456,6 +2628,9 @@ void ClusterRenderPipeline::RecordFrameMid(VkCommandBuffer cmdMid, VkCommandBuff
   // is a perf-only ordering choice (lets the masked pipeline's depth test reject more fragments
   // before running its non-early-Z frag shader); final depth/VisBuffer content is order-independent.
   // =========================================================================================
+#ifndef NDEBUG
+  m_GpuProfiler.BeginZone(cmdMid, "HardwareRaster_Early");
+#endif
   BeginVisBufferRendering(cmdMid, /*clearAttachments=*/true);
   m_HardwareRaster.RecordDraw(
       cmdMid, camera, m_RenderExtent,
@@ -2468,6 +2643,9 @@ void ClusterRenderPipeline::RecordFrameMid(VkCommandBuffer cmdMid, VkCommandBuff
       m_OcclusionCulling.GetEarlyIndirectCommandBuffer(),
       m_OcclusionCulling.GetEarlyDrawCountBuffer(), m_ClusterCount, /*opaque=*/false);
   vkCmdEndRendering(cmdMid);
+#ifndef NDEBUG
+  m_GpuProfiler.EndZone(cmdMid);
+#endif
 
   // =========================================================================================
   // [5] Depth -> sampled-readable for the HZB rebuild: the early pass's depth
@@ -2505,6 +2683,9 @@ void ClusterRenderPipeline::RecordFrameMid(VkCommandBuffer cmdMid, VkCommandBuff
   // (textureLod through a combined image sampler) -- the exact contract
   // documented on ClusterOcclusionCullingPass step 5.
   // =========================================================================================
+#ifndef NDEBUG
+  m_GpuProfiler.BeginZone(cmdMid, "HZB_Mid");
+#endif
   m_HZB.Generate(cmdMid);
   {
     VkMemoryBarrier2 barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
@@ -2518,6 +2699,9 @@ void ClusterRenderPipeline::RecordFrameMid(VkCommandBuffer cmdMid, VkCommandBuff
     depInfo.pMemoryBarriers = &barrier;
     vkCmdPipelineBarrier2(cmdMid, &depInfo);
   }
+#ifndef NDEBUG
+  m_GpuProfiler.EndZone(cmdMid);
+#endif
 
   // =========================================================================================
   // [7] LATE cull: GPU-sized indirect dispatch over exactly the pending list,
@@ -2527,6 +2711,9 @@ void ClusterRenderPipeline::RecordFrameMid(VkCommandBuffer cmdMid, VkCommandBuff
   // dispatch-args build + raster reads), which that trailing barrier does not
   // cover.
   // =========================================================================================
+#ifndef NDEBUG
+  m_GpuProfiler.BeginZone(cmdMid, "OcclusionCulling_Late");
+#endif
   m_OcclusionCulling.RecordBuildLateDispatchArgs(cmdMid);
   m_OcclusionCulling.RecordLatePass(cmdMid
 #ifndef NDEBUG
@@ -2545,6 +2732,9 @@ void ClusterRenderPipeline::RecordFrameMid(VkCommandBuffer cmdMid, VkCommandBuff
     depInfo.pMemoryBarriers = &barrier;
     vkCmdPipelineBarrier2(cmdMid, &depInfo);
   }
+#ifndef NDEBUG
+  m_GpuProfiler.EndZone(cmdMid);
+#endif
 
   // =========================================================================================
   // [8] Re-arm the attachments for the LATE raster: depth returns to attachment
@@ -2601,6 +2791,9 @@ void ClusterRenderPipeline::RecordFrameMid(VkCommandBuffer cmdMid, VkCommandBuff
   // early pass could not confirm, on top of the early output. Opaque first, same rationale as
   // the early pass above.
   // =========================================================================================
+#ifndef NDEBUG
+  m_GpuProfiler.BeginZone(cmdMid, "HardwareRaster_Late");
+#endif
   BeginVisBufferRendering(cmdMid, /*clearAttachments=*/false);
   m_HardwareRaster.RecordDraw(cmdMid, camera, m_RenderExtent,
                               m_Decompression.GetDecompressedIndexPoolBuffer(),
@@ -2613,6 +2806,9 @@ void ClusterRenderPipeline::RecordFrameMid(VkCommandBuffer cmdMid, VkCommandBuff
                               m_OcclusionCulling.GetLateDrawCountBuffer(),
                               m_ClusterCount, /*opaque=*/false);
   vkCmdEndRendering(cmdMid);
+#ifndef NDEBUG
+  m_GpuProfiler.EndZone(cmdMid);
+#endif
 
   // =========================================================================================
   // [10] Software raster of every micro-triangle cluster (early- and
@@ -2621,7 +2817,13 @@ void ClusterRenderPipeline::RecordFrameMid(VkCommandBuffer cmdMid, VkCommandBuff
   // ordering against [9] is required beyond what its own internal barriers
   // already record.
   // =========================================================================================
+#ifndef NDEBUG
+  m_GpuProfiler.BeginZone(cmdMid, "SoftwareRaster");
+#endif
   m_SoftwareRaster.RecordRaster(cmdMid, viewProj);
+#ifndef NDEBUG
+  m_GpuProfiler.EndZone(cmdMid);
+#endif
 
   // =========================================================================================
   // [11] Hand the hardware VisBuffer + depth to the resolve pass: color
@@ -2692,6 +2894,7 @@ void ClusterRenderPipeline::RecordFrameMid(VkCommandBuffer cmdMid, VkCommandBuff
   float surfaceWetness = m_AtmosClimate.GetSurfaceWetness();
   float snowCoverage = m_AtmosClimate.GetSnowCoverage();
 #ifndef NDEBUG
+  m_GpuProfiler.BeginZone(cmdMid, "ShadingBinAndResolve");
   if (cameraCopy.debugViewMode == DEBUG_VIEW_NORMAL) {
     m_ShadingBin.RecordClassifyAndSort(cmdMid, m_RenderExtent);
     // Glint / sparkle (UE5.8 rendering-parity gap G5) + Substrate horizontal mixing (gap G6):
@@ -2707,6 +2910,7 @@ void ClusterRenderPipeline::RecordFrameMid(VkCommandBuffer cmdMid, VkCommandBuff
     m_Resolve.RecordResolve(cmdMid, viewProj, prevViewProjForResolve, m_SceneLights.sun, cameraPositionWorld, surfaceWetness, snowCoverage,
         m_DebugGlintDensityScale, m_DebugGlintIntensityScale, m_DebugMixMaskSharpnessScale, m_FrameScratch.globalTimeSeconds, cameraCopy.debugViewMode);
   }
+  m_GpuProfiler.EndZone(cmdMid);
 #else
   m_ShadingBin.RecordClassifyAndSort(cmdMid, m_RenderExtent);
   // Glint / sparkle (UE5.8 rendering-parity gap G5) + Substrate horizontal mixing (gap G6): the
@@ -2782,11 +2986,17 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
   // Contact Shadows, [12b] Screen Trace, [12b2] Reflections, [12b3] MegaLights, [12e] GI Composite)
   // therefore operates on the decaled GBuffer; the pass's own trailing barrier makes that visible.
   // =========================================================================================
+#ifndef NDEBUG
+  m_GpuProfiler.BeginZone(cmdLate, "Decals");
+#endif
   m_Decals.RecordDecals(cmdLate, invViewProj, cameraPositionWorld, globalTimeSeconds
 #ifndef NDEBUG
       , m_DebugShowDecalBounds
 #endif
   );
+#ifndef NDEBUG
+  m_GpuProfiler.EndZone(cmdLate);
+#endif
 
   // =========================================================================================
   // [12a] Phase PP4 (post-process stack roadmap): GTAO + Screen-Space Contact Shadows.
@@ -2808,8 +3018,14 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
     ssfxSettings.ssrFallbackThicknessWorld = config::postprocess::SSR_FALLBACK_THICKNESS_WORLD;
     ssfxSettings.ssrFallbackIntensity = config::postprocess::SSR_FALLBACK_INTENSITY;
 
+#ifndef NDEBUG
+    m_GpuProfiler.BeginZone(cmdLate, "ScreenSpaceEffects_AOAndContactShadows");
+#endif
     m_ScreenSpaceEffects.RecordAmbientOcclusion(cmdLate, viewProj, cameraPositionWorld, cameraFrameInfo.fovYRadians, ssfxSettings);
     m_ScreenSpaceEffects.RecordContactShadows(cmdLate, viewProj, cameraPositionWorld, m_SceneLights.sun.direction, ssfxSettings);
+#ifndef NDEBUG
+    m_GpuProfiler.EndZone(cmdLate);
+#endif
   }
 
   // Captures THIS frame's shadow-page miss reports (written by SurfaceCacheCapture.frag at [1z]
@@ -2837,6 +3053,9 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
 #else
     bool ssrtEnabled = true;
 #endif
+#ifndef NDEBUG
+    m_GpuProfiler.BeginZone(cmdLate, "ScreenTrace");
+#endif
     if (ssrtEnabled) {
       m_ScreenTrace.RecordTrace(cmdLate, cameraCopy, cameraPositionWorld, m_WorldProbes, m_FrameIndex, config::lumen::GI_MODE);
     } else {
@@ -2847,6 +3066,9 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
       blackClear.float32[3] = 0.0f;
       VulkanUtils::ClearComputeImageToGeneral(cmdLate, m_ScreenTrace.GetOutputImage(), blackClear);
     }
+#ifndef NDEBUG
+    m_GpuProfiler.EndZone(cmdLate);
+#endif
   }
 
   // =========================================================================================
@@ -2865,6 +3087,9 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
   // SetDebugReflectionsEnabled()'s own comment for why this differs from worldProbesEnabled).
   // =========================================================================================
   {
+#ifndef NDEBUG
+    m_GpuProfiler.BeginZone(cmdLate, "Reflection");
+#endif
     maths::mat4 prevViewProjForReflection = m_HasPrevViewProj ? m_PrevViewProj : maths::mat4{};
     m_Reflection.RecordUpdateViewParams(cmdLate, viewProj, prevViewProjForReflection, cameraPositionWorld);
 
@@ -2888,6 +3113,9 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
       ssrFallbackSettings.ssrFallbackIntensity = config::postprocess::SSR_FALLBACK_ENABLED ? config::postprocess::SSR_FALLBACK_INTENSITY : 0.0f;
       m_ScreenSpaceEffects.RecordSSRFallback(cmdLate, viewProj, cameraPositionWorld, m_SceneLights.sun.direction, ssrFallbackSettings);
     }
+#ifndef NDEBUG
+    m_GpuProfiler.EndZone(cmdLate);
+#endif
   }
 
   // =========================================================================================
@@ -2931,8 +3159,14 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
     bool megaLightsEnabled = config::lumen::_MEGALIGHTS_ENABLE;
 #endif
     if (megaLightsEnabled) {
+#ifndef NDEBUG
+      m_GpuProfiler.BeginZone(cmdLate, "MegaLights");
+#endif
       maths::mat4 prevViewProjForMegaLights = m_HasPrevViewProj ? m_PrevViewProj : maths::mat4{};
       m_MegaLights.RecordShade(cmdLate, viewProj, prevViewProjForMegaLights, cameraPositionWorld, m_FrameIndex);
+#ifndef NDEBUG
+      m_GpuProfiler.EndZone(cmdLate);
+#endif
     }
   }
 
@@ -2957,6 +3191,9 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
   bool worldProbesEnabled = true;
 #endif
   if (worldProbesEnabled) {
+#ifndef NDEBUG
+    m_GpuProfiler.BeginZone(cmdLate, "WorldProbes");
+#endif
     m_WorldProbes.RecordUpdate(cmdLate, cameraFrameInfo.position, m_TraceContext, traceMode, m_SceneLights.sun.direction);
     {
       VkMemoryBarrier2 barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
@@ -2970,6 +3207,9 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
       depInfo.pMemoryBarriers = &barrier;
       vkCmdPipelineBarrier2(cmdLate, &depInfo);
     }
+#ifndef NDEBUG
+    m_GpuProfiler.EndZone(cmdLate);
+#endif
   }
 
   // =========================================================================================
@@ -2989,17 +3229,29 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
   bool applyDenoise = true;
 #endif
   if (applyDenoise) {
+#ifndef NDEBUG
+    m_GpuProfiler.BeginZone(cmdLate, "Denoiser");
+#endif
     m_Denoiser.RecordDenoise(cmdLate);
+#ifndef NDEBUG
+    m_GpuProfiler.EndZone(cmdLate);
+#endif
   }
 
   // =========================================================================================
   // [12e] GI Composite: blends direct lit color/reflections with denoised indirect GI.
   // =========================================================================================
+#ifndef NDEBUG
+  m_GpuProfiler.BeginZone(cmdLate, "GIComposite");
+#endif
   m_GIComposite.RecordComposite(cmdLate
 #ifndef NDEBUG
       , cameraCopy, cameraPositionWorld, m_WorldProbes
 #endif
   );
+#ifndef NDEBUG
+  m_GpuProfiler.EndZone(cmdLate);
+#endif
 
   // Barrier from GIComposite compute writes to TAA/TSR sampled reads
   {
@@ -3045,8 +3297,14 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
     const bool sssEnabled = true;
     const float sssRadiusScale = 1.0f;
 #endif
+#ifndef NDEBUG
+    m_GpuProfiler.BeginZone(cmdLate, "SubsurfaceScattering");
+#endif
     m_SubsurfaceScattering.RecordUpdate(cmdLate, invViewProj, cameraPositionWorld, sssProjScaleY,
         sssRadiusScale, sssEnabled);
+#ifndef NDEBUG
+    m_GpuProfiler.EndZone(cmdLate);
+#endif
   }
 
   // =========================================================================================
@@ -3071,6 +3329,9 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
     depInfo.pMemoryBarriers = &barrier;
     vkCmdPipelineBarrier2(cmdLate, &depInfo);
   }
+#ifndef NDEBUG
+  m_GpuProfiler.BeginZone(cmdLate, "HZB_Late");
+#endif
   m_HZB.Generate(cmdLate);
   {
     // Next frame's early cull samples the pyramid; same STORAGE_WRITE ->
@@ -3094,6 +3355,9 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
     depInfo.pMemoryBarriers = &barrier;
     vkCmdPipelineBarrier2(cmdLate, &depInfo);
   }
+#ifndef NDEBUG
+  m_GpuProfiler.EndZone(cmdLate);
+#endif
 
   // =========================================================================================
   // [13c] Forward-rendered translucent/transparent materials -- drawn directly onto
@@ -3112,9 +3376,15 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
     // own subsequent depth test correctly occludes against every tessellated entity's real
     // (displaced) surface. See TessellationPass's own class comment for the widened
     // synchronization scope this write requires on exit.
+#ifndef NDEBUG
+    m_GpuProfiler.BeginZone(cmdLate, "Tessellation");
+#endif
     m_Tessellation.RecordDraw(cmdLate, viewProj, cameraFrameInfo.position,
         transparentTargetImage, transparentTargetView, m_DepthImage, m_DepthImageView,
         m_RenderExtent, traceMode, m_FrameIndex, m_TraceContext, m_WorldProbes, m_SceneLights);
+#ifndef NDEBUG
+    m_GpuProfiler.EndZone(cmdLate);
+#endif
 
     // GPU-instanced vegetation scatter (UE5.8 rendering-parity gap G2): recorded right after
     // m_Tessellation (both are opaque, depth-WRITING forward passes leaving depth in READ_ONLY on
@@ -3124,6 +3394,13 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
     // HZB (the [13] Second HZB rebuild above), then the indirect instanced draw. Gated by the live
     // master toggle + a nonzero scattered-instance count (a zero-instance scene skips both entirely).
     if (config::vegetation::ENABLED && m_VegetationScatter.GetInstanceCount() > 0) {
+#ifndef NDEBUG
+      // Distinct zone name from FurStrand below (NOT a shared "VegetationAndFur" name) --
+      // GpuTimestampProfiler assigns one persistent query-slot pair PER NAME (see its own class
+      // comment), so two independently-gated passes sharing one name would have the second one's
+      // BeginZone/EndZone silently overwrite the first's timestamps whenever both run the same frame.
+      m_GpuProfiler.BeginZone(cmdLate, "VegetationScatter");
+#endif
       m_VegetationScatter.RecordCull(cmdLate, viewProj, cameraFrameInfo.position,
           config::vegetation::OCCLUSION_CULL_ENABLED);
       bool vegetationWireframe = false;
@@ -3134,6 +3411,9 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
           m_DepthImage, m_DepthImageView, m_RenderExtent, viewProj, cameraFrameInfo.position,
           m_SceneLights.sun.direction, m_SceneLights.sun.color, m_SceneLights.sun.intensity,
           vegetationWireframe);
+#ifndef NDEBUG
+      m_GpuProfiler.EndZone(cmdLate);
+#endif
     }
 
     // Hair/Fur strands (UE5.8 rendering-parity gap G10a): recorded right after m_VegetationScatter
@@ -3145,6 +3425,9 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
     // already covering COMPUTE), then the single indirect instanced draw. Gated by the live master
     // toggle + a nonzero strand count.
     if (config::fur::ENABLED && m_FurStrand.GetStrandCount() > 0) {
+#ifndef NDEBUG
+      m_GpuProfiler.BeginZone(cmdLate, "FurStrand");
+#endif
       m_FurStrand.RecordCull(cmdLate, viewProj, cameraFrameInfo.position,
           config::fur::OCCLUSION_CULL_ENABLED);
       bool furWireframe = false;
@@ -3155,19 +3438,34 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
           m_DepthImage, m_DepthImageView, m_RenderExtent, viewProj, cameraFrameInfo.position,
           m_SceneLights.sun.direction, m_SceneLights.sun.color, m_SceneLights.sun.intensity,
           globalTimeSeconds, furWireframe);
+#ifndef NDEBUG
+      m_GpuProfiler.EndZone(cmdLate);
+#endif
     }
 
+#ifndef NDEBUG
+    m_GpuProfiler.BeginZone(cmdLate, "TransparentForward");
+#endif
     m_TransparentForward.RecordDraw(cmdLate, transparentTargetImage, transparentTargetView, m_DepthImageView,
         m_RenderExtent, cameraCopy.view, cameraCopy.proj, m_Decompression.GetDecompressedIndexPoolBuffer(),
         cameraFrameInfo.position, m_SceneLights, globalTimeSeconds, m_TraceContext, traceMode, m_FrameIndex);
+#ifndef NDEBUG
+    m_GpuProfiler.EndZone(cmdLate);
+#endif
 
     // Phase 7c (UE5.8 parity roadmap, water/erosion): recorded LAST among the forward passes --
     // see ClusterRenderPipeline.h's own comment on m_WaterForward for why (it snapshots the
     // already fully-composited frame, including the glass/translucent draw just above, for its
     // own refraction term).
+#ifndef NDEBUG
+    m_GpuProfiler.BeginZone(cmdLate, "WaterForward");
+#endif
     m_WaterForward.RecordDraw(cmdLate, viewProj, cameraFrameInfo.position,
         transparentTargetImage, transparentTargetView, m_DepthImage, m_DepthImageView,
         m_RenderExtent, traceMode, m_FrameIndex, globalTimeSeconds, m_TraceContext);
+#ifndef NDEBUG
+    m_GpuProfiler.EndZone(cmdLate);
+#endif
 
     // GPU particle system, Subtask 6: recorded LAST among the forward passes (even after
     // m_WaterForward) -- particles are the plan doc's own "after opaque Nanite + transparent,
@@ -3191,12 +3489,18 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
       const maths::vec3 particleCameraRight = cameraFrameInfo.forward.Cross(worldUpHint).Normalize();
       const maths::vec3 particleCameraUp = particleCameraRight.Cross(cameraFrameInfo.forward);
       float particleHeatShimmerStrength = config::particles::HEAT_SHIMMER_ENABLED ? config::particles::HEAT_SHIMMER_STRENGTH : 0.0f;
+#ifndef NDEBUG
+      m_GpuProfiler.BeginZone(cmdLate, "ParticleSystem_Draw");
+#endif
       m_ParticleSystem.RecordDraw(cmdLate, transparentTargetImage, transparentTargetView, m_DepthImageView,
           m_TransparentForward.GetRefractionOffsetView(), m_RenderExtent,
           viewProj, cameraFrameInfo.position, particleCameraRight, particleCameraUp, cameraFrameInfo.forward,
           m_SceneLights.sun.direction, m_SceneLights.sun.color, m_SceneLights.sun.intensity,
           m_SceneLights, m_WorldProbes,
           config::particles::SOFT_FADE_DISTANCE, particleHeatShimmerStrength, globalTimeSeconds, m_FrameIndex);
+#ifndef NDEBUG
+      m_GpuProfiler.EndZone(cmdLate);
+#endif
     }
 
 #ifndef NDEBUG
@@ -3239,18 +3543,39 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
       VkImageView currentLowResColorView = m_GIComposite.GetOutputView();
       m_TAATSR.UpdateDescriptorSets(currentLowResColorView, m_Resolve.GetOutputDepthView());
 
+#ifndef NDEBUG
+      m_GpuProfiler.BeginZone(cmdLate, "TAATSR");
+#endif
       m_TAATSR.RecordPass(cmdLate, viewProj, prevViewProjForTAA, invViewProj, passJitterX, passJitterY, m_FrameIndex, resetHistory);
+#ifndef NDEBUG
+      m_GpuProfiler.EndZone(cmdLate);
+#endif
   }
 
   // =========================================================================================
-  // [13e] Phase PP3: physically-derived Depth of Field over m_TAATSR's own freshly-written HDR
-  // output -- must run before [13f]'s Bloom (see DepthOfFieldPass's own class comment for why: an
-  // out-of-focus highlight should itself bloom into a soft disc, which only happens if DOF's own
-  // blur runs first). m_TAATSR.GetOutputView() ping-pongs between 2 images every RecordPass() call
-  // (just above), so m_DepthOfField's own source descriptor must be re-written every frame too.
+  // [13e] Phase PP3: Depth of Field over m_TAATSR's own freshly-written HDR output -- must run
+  // before [13f]'s Bloom (see DepthOfFieldPass's own class comment for why: an out-of-focus
+  // highlight should itself bloom into a soft disc, which only happens if DOF's own blur runs
+  // first). m_TAATSR.GetOutputView() ping-pongs between 2 images every RecordPass() call (just
+  // above), so whichever DOF sub-pass is active below must have its own source descriptor
+  // re-written every frame too.
+  //
+  // config::postprocess::DOF_MODE picks which of two resolve techniques actually runs this frame:
+  // 0 (Gather, default) = m_DepthOfField's own single-frame 16-tap Poisson gather; 1 (Accumulation,
+  // UE5.8-parity) = m_DepthOfFieldAccumulation's own per-frame single-lens-sample + temporal-
+  // reprojection accumulation (see that class' own header comment for the full technique). Only the
+  // ACTIVE pass is dispatched this frame -- the inactive one is simply left untouched (its own
+  // ping-pong history stops advancing) rather than wastefully running two full-screen compute passes
+  // every frame. Switching INTO Accumulation forces one history reset on m_DepthOfFieldAccumulation
+  // the frame it (re-)becomes active (m_DOFAccumulationWasActive tracks this), since its ping-pong
+  // buffers may hold stale/never-written-this-session data from the last time it ran (or none at
+  // all); ordinary camera motion while it stays active is instead handled PER-PIXEL by
+  // DepthOfFieldAccumulation.comp's own reprojection/disocclusion test, exactly like m_TAATSR's own
+  // resetHistory above only covers the first-frame/toggle-off case, not everyday camera movement.
   // =========================================================================================
+  VkImageView dofOutputView = VK_NULL_HANDLE;
   {
-      m_DepthOfField.UpdateSourceDescriptor(m_TAATSR.GetOutputView());
+      bool useAccumulationDOF = (config::postprocess::DOF_MODE != 0);
 
       // m_TAATSR's own output image's last writer is always its own compute dispatch -- re-stated
       // here explicitly rather than relying on m_TAATSR::RecordPass' own trailing barrier (which
@@ -3265,11 +3590,49 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
       taatsrToDofDep.pMemoryBarriers = &taatsrToDofBarrier;
       vkCmdPipelineBarrier2(cmdLate, &taatsrToDofDep);
 
-      DepthOfFieldPass::Settings dofSettings{};
-      dofSettings.focalLengthMM = config::postprocess::DOF_FOCAL_LENGTH_MM;
-      dofSettings.focusDistanceWorldUnits = config::postprocess::DOF_FOCUS_DISTANCE_WORLD_UNITS;
-      dofSettings.maxCoCRadiusPixels = config::postprocess::DOF_ENABLED ? config::postprocess::DOF_MAX_COC_RADIUS_PIXELS : 0.0f;
-      m_DepthOfField.RecordGenerate(cmdLate, invViewProj, cameraPositionWorld, config::postprocess::EXPOSURE_APERTURE, dofSettings);
+      if (useAccumulationDOF) {
+          m_DepthOfFieldAccumulation.UpdateSourceDescriptor(m_TAATSR.GetOutputView());
+
+          // Full history reset only on the first frame ever or the frame this mode is
+          // (re-)selected -- ordinary camera motion is handled per-pixel inside the shader instead
+          // (see this block's own header comment).
+          bool dofResetHistory = !m_HasPrevViewProj || !m_DOFAccumulationWasActive;
+          maths::mat4 prevViewProjForDOF = m_HasPrevViewProj ? m_PrevViewProj : viewProj;
+
+          DepthOfFieldAccumulationPass::Settings dofAccumSettings{};
+          dofAccumSettings.focalLengthMM = config::postprocess::DOF_FOCAL_LENGTH_MM;
+          dofAccumSettings.focusDistanceWorldUnits = config::postprocess::DOF_FOCUS_DISTANCE_WORLD_UNITS;
+          dofAccumSettings.maxCoCRadiusPixels = config::postprocess::DOF_ENABLED ? config::postprocess::DOF_MAX_COC_RADIUS_PIXELS : 0.0f;
+          dofAccumSettings.maxAccumulationSamples = config::postprocess::DOF_ACCUMULATION_MAX_SAMPLES;
+#ifndef NDEBUG
+          m_GpuProfiler.BeginZone(cmdLate, "DepthOfFieldAccumulation");
+#endif
+          m_DepthOfFieldAccumulation.RecordGenerate(cmdLate, invViewProj, prevViewProjForDOF, cameraPositionWorld,
+              config::postprocess::EXPOSURE_APERTURE, m_FrameIndex, dofResetHistory, dofAccumSettings);
+#ifndef NDEBUG
+          m_GpuProfiler.EndZone(cmdLate);
+#endif
+
+          dofOutputView = m_DepthOfFieldAccumulation.GetOutputView();
+      } else {
+          m_DepthOfField.UpdateSourceDescriptor(m_TAATSR.GetOutputView());
+
+          DepthOfFieldPass::Settings dofSettings{};
+          dofSettings.focalLengthMM = config::postprocess::DOF_FOCAL_LENGTH_MM;
+          dofSettings.focusDistanceWorldUnits = config::postprocess::DOF_FOCUS_DISTANCE_WORLD_UNITS;
+          dofSettings.maxCoCRadiusPixels = config::postprocess::DOF_ENABLED ? config::postprocess::DOF_MAX_COC_RADIUS_PIXELS : 0.0f;
+#ifndef NDEBUG
+          m_GpuProfiler.BeginZone(cmdLate, "DepthOfField");
+#endif
+          m_DepthOfField.RecordGenerate(cmdLate, invViewProj, cameraPositionWorld, config::postprocess::EXPOSURE_APERTURE, dofSettings);
+#ifndef NDEBUG
+          m_GpuProfiler.EndZone(cmdLate);
+#endif
+
+          dofOutputView = m_DepthOfField.GetOutputView();
+      }
+
+      m_DOFAccumulationWasActive = useAccumulationDOF;
   }
 
   // =========================================================================================
@@ -3277,38 +3640,53 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
   // then Phase PP1's Physical Camera auto-exposure -> White Balance -> Color Correction -> ACES
   // Tone Mapping -> Gamma Correction composite (also folding in Phase PP3's Motion Blur / Height
   // Fog / Heat Distortion -- see PostProcessComposite.comp's own comment) -- both reading
-  // m_DepthOfField's own freshly-written output -- see BloomPass's and PostProcessPass's own class
-  // comments for why m_PostProcess must be the very last compute step before [14]'s blit (and
-  // before [13b]'s Debug-only stat overlay below, which now draws onto ITS output instead of
-  // m_TAATSR's raw HDR buffer). m_DepthOfField's own output view identity is effectively "per-
-  // frame" too (it wraps m_TAATSR's own ping-ponged source), so both passes' own descriptor sets
-  // pointing at it must be re-written every frame, exactly like m_TAATSR.UpdateDescriptorSets()
-  // itself is called every frame above. Both run unconditionally every frame, exactly like [13d]'s
-  // own TAA/TSR pass -- the debug views that substitute a different, deliberately-untonemapped
-  // diagnostic image as the blit source instead (m_GIComposite/m_SDFRayMarch/m_Resolve, see [14]'s
-  // own blitSourceImage swap below) simply never read either pass' output, same as how those views
-  // already ignore m_TAATSR's own output today.
+  // [13e]'s own `dofOutputView` (whichever DOF sub-pass was actually active this frame) -- see
+  // BloomPass's and PostProcessPass's own class comments for why m_PostProcess must be the very
+  // last compute step before [14]'s blit (and before [13b]'s Debug-only stat overlay below, which
+  // now draws onto ITS output instead of m_TAATSR's raw HDR buffer). `dofOutputView`'s own identity
+  // is effectively "per-frame" too (it wraps m_TAATSR's own ping-ponged source, and may itself
+  // alternate between two ping-pong images when Accumulation mode is active), so both passes' own
+  // descriptor sets pointing at it must be re-written every frame, exactly like
+  // m_TAATSR.UpdateDescriptorSets() itself is called every frame above. Both run unconditionally
+  // every frame, exactly like [13d]'s own TAA/TSR pass -- the debug views that substitute a
+  // different, deliberately-untonemapped diagnostic image as the blit source instead
+  // (m_GIComposite/m_SDFRayMarch/m_Resolve, see [14]'s own blitSourceImage swap below) simply never
+  // read either pass' output, same as how those views already ignore m_TAATSR's own output today.
   // =========================================================================================
   {
-      m_Bloom.UpdateSourceDescriptor(m_DepthOfField.GetOutputView());
-      m_PostProcess.UpdateDescriptorSets(m_DepthOfField.GetOutputView(), m_Bloom.GetOutputView());
+      m_Bloom.UpdateSourceDescriptor(dofOutputView);
+      m_PostProcess.UpdateDescriptorSets(dofOutputView, m_Bloom.GetOutputView());
 
-      // m_DepthOfField's own trailing barrier (inside RecordGenerate) already makes its output
-      // visible to COMPUTE_SHADER/SHADER_SAMPLED_READ -- no further barrier needed before m_Bloom/
-      // m_PostProcess read it here.
+      // [13e]'s own active DOF sub-pass already ends its RecordGenerate() with a trailing barrier
+      // making `dofOutputView` visible to COMPUTE_SHADER/SHADER_SAMPLED_READ -- no further barrier
+      // needed before m_Bloom/m_PostProcess read it here.
 
       BloomPass::Settings bloomSettings{};
       bloomSettings.threshold = config::postprocess::BLOOM_THRESHOLD;
       bloomSettings.softKnee = config::postprocess::BLOOM_SOFT_KNEE;
       bloomSettings.upsampleRadius = config::postprocess::BLOOM_UPSAMPLE_RADIUS;
-      bloomSettings.ghostIntensity = config::postprocess::LENS_FLARE_GHOST_INTENSITY;
+      // LENS_FLARE_ENABLED gates only the ghost/halo/anamorphic-streak terms (real-time "Post FX"
+      // toggle, ImGui, main.cpp) -- independent of BLOOM_ENABLED's own base-glow gate below. Lens
+      // Dirt needs no separate gate: BloomUpsampleComposite.comp's own dirt mask only ever
+      // attenuates this same ghost+streak+halo term, so it is already a no-op once zeroed here.
+      const bool lensFlareOn = config::postprocess::LENS_FLARE_ENABLED;
+      bloomSettings.ghostIntensity = lensFlareOn ? config::postprocess::LENS_FLARE_GHOST_INTENSITY : 0.0f;
       bloomSettings.ghostCount = config::postprocess::LENS_FLARE_GHOST_COUNT;
       bloomSettings.ghostSpacing = config::postprocess::LENS_FLARE_GHOST_SPACING;
-      bloomSettings.anamorphicIntensity = config::postprocess::ANAMORPHIC_FLARE_INTENSITY;
+      bloomSettings.haloIntensity = lensFlareOn ? config::postprocess::HALO_INTENSITY : 0.0f;
+      bloomSettings.haloWidth = config::postprocess::HALO_WIDTH;
+      bloomSettings.chromaticShift = config::postprocess::LENS_FLARE_CHROMATIC_SHIFT;
+      bloomSettings.anamorphicIntensity = lensFlareOn ? config::postprocess::ANAMORPHIC_FLARE_INTENSITY : 0.0f;
       bloomSettings.anamorphicStretch = config::postprocess::ANAMORPHIC_FLARE_STRETCH;
       bloomSettings.dirtIntensity = config::postprocess::LENS_DIRT_INTENSITY;
       bloomSettings.dirtScale = config::postprocess::LENS_DIRT_SCALE;
+#ifndef NDEBUG
+      m_GpuProfiler.BeginZone(cmdLate, "Bloom");
+#endif
       m_Bloom.RecordGenerate(cmdLate, bloomSettings);
+#ifndef NDEBUG
+      m_GpuProfiler.EndZone(cmdLate);
+#endif
 
       float deltaTimeSeconds = m_HasLastFrameTime ? (globalTimeSeconds - m_LastFrameTimeSeconds) : (1.0f / 60.0f);
       deltaTimeSeconds = std::clamp(deltaTimeSeconds, 0.0f, 0.25f); // Guard against alt-tab/breakpoint stalls.
@@ -3323,6 +3701,8 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
       ppSettings.exposureCompensationEV = config::postprocess::EXPOSURE_COMPENSATION_EV;
       ppSettings.adaptationSpeedUpEVPerSec = config::postprocess::EXPOSURE_ADAPTATION_SPEED_UP_EV_PER_SEC;
       ppSettings.adaptationSpeedDownEVPerSec = config::postprocess::EXPOSURE_ADAPTATION_SPEED_DOWN_EV_PER_SEC;
+      ppSettings.histogramLowPercent = config::postprocess::EXPOSURE_HISTOGRAM_LOW_PERCENT;
+      ppSettings.histogramHighPercent = config::postprocess::EXPOSURE_HISTOGRAM_HIGH_PERCENT;
       // Real-time "Post FX" toggles (ImGui, main.cpp): every effect below already has its own
       // zero-is-off strength knob (see config::postprocess's own comment on its *_ENABLED block)
       // -- White Balance/Color Correction are the two exceptions with no natural zero, so they
@@ -3378,6 +3758,9 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
       // adjacent in the frame graph, and guarantees renderer::VirtualShadowMapPass's shadow pages
       // (captured earlier, in [1z]) are this frame's freshest state by the time InjectLight samples
       // them.
+#ifndef NDEBUG
+      m_GpuProfiler.BeginZone(cmdLate, "AtmosFogAndClouds");
+#endif
       m_AtmosFog.RecordUpdate(cmdLate, cameraPositionWorld, cameraFrameInfo.forward, maths::vec3{0.0f, 1.0f, 0.0f},
           cameraFrameInfo.fovYRadians, cameraFrameInfo.aspectRatio,
           m_SceneLights.sun.direction, m_SceneLights.sun.color, m_SceneLights.sun.intensity, m_FrameIndex);
@@ -3387,10 +3770,19 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
       m_AtmosClouds.RecordUpdate(cmdLate, cameraPositionWorld, cameraFrameInfo.forward, maths::vec3{0.0f, 1.0f, 0.0f},
           cameraFrameInfo.fovYRadians, cameraFrameInfo.aspectRatio,
           m_SceneLights.sun.direction, m_SceneLights.sun.color, m_SceneLights.sun.intensity);
+#ifndef NDEBUG
+      m_GpuProfiler.EndZone(cmdLate);
+#endif
 
+#ifndef NDEBUG
+      m_GpuProfiler.BeginZone(cmdLate, "PostProcessComposite");
+#endif
       m_PostProcess.RecordComposite(cmdLate, deltaTimeSeconds, ppSettings, invViewProj, prevViewProjForPostProcess, cameraPositionWorld,
           viewProj, m_SceneLights.sun.direction, cameraFrameInfo.forward,
           cameraFrameInfo.fovYRadians, cameraFrameInfo.aspectRatio, m_FrameIndex);
+#ifndef NDEBUG
+      m_GpuProfiler.EndZone(cmdLate);
+#endif
   }
 
 #ifndef NDEBUG

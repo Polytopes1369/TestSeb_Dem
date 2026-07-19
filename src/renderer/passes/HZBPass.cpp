@@ -1,4 +1,4 @@
-#include "renderer/passes/HZBPass.h"
+﻿#include "renderer/passes/HZBPass.h"
 
 #include <algorithm>
 #include <cassert>
@@ -310,7 +310,7 @@ namespace renderer {
         initPipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
         initPipelineInfo.stage.module = initShaderModule;
         initPipelineInfo.stage.pName = "main";
-        VK_CHECK(vkCreateComputePipelines(m_Device, VK_NULL_HANDLE, 1, &initPipelineInfo, nullptr, &m_InitPipeline));
+        VK_CHECK(vkCreateComputePipelines(m_Device, VulkanPipeline::GetPipelineCache(), 1, &initPipelineInfo, nullptr, &m_InitPipeline));
         vkDestroyShaderModule(m_Device, initShaderModule, nullptr);
 
         VkShaderModule reduceShaderModule = VulkanPipeline::LoadShaderModule(m_Device, "shaders/HZBReduce.comp.spv");
@@ -322,7 +322,7 @@ namespace renderer {
         reducePipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
         reducePipelineInfo.stage.module = reduceShaderModule;
         reducePipelineInfo.stage.pName = "main";
-        VK_CHECK(vkCreateComputePipelines(m_Device, VK_NULL_HANDLE, 1, &reducePipelineInfo, nullptr, &m_ReducePipeline));
+        VK_CHECK(vkCreateComputePipelines(m_Device, VulkanPipeline::GetPipelineCache(), 1, &reducePipelineInfo, nullptr, &m_ReducePipeline));
         vkDestroyShaderModule(m_Device, reduceShaderModule, nullptr);
 
         LOG_INFO(std::format("[HZBPass] Initialized HZB pass: sourceDepth={}x{}, mip0={}x{}, mipCount={}",

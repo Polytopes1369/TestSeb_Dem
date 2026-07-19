@@ -1,4 +1,4 @@
-#include "renderer/passes/ClusterOcclusionCullingPass.h"
+﻿#include "renderer/passes/ClusterOcclusionCullingPass.h"
 
 #include <format>
 #include <stdexcept>
@@ -307,7 +307,7 @@ namespace renderer {
         occlusionPipelineInfos[1].stage.pSpecializationInfo = &lateSpecInfo;
 
         VkPipeline occlusionPipelines[2]{};
-        VK_CHECK(vkCreateComputePipelines(m_Device, VK_NULL_HANDLE, 2, occlusionPipelineInfos, nullptr, occlusionPipelines));
+        VK_CHECK(vkCreateComputePipelines(m_Device, VulkanPipeline::GetPipelineCache(), 2, occlusionPipelineInfos, nullptr, occlusionPipelines));
         m_EarlyPipeline = occlusionPipelines[0];
         m_LatePipeline = occlusionPipelines[1];
 

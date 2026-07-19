@@ -26,6 +26,8 @@
 #include <cmath>
 #include <atomic>
 #include <string>
+#include <functional>
+#include <array>
 
 #ifndef NDEBUG
 #include "core/debug/DebugTestPipeline.h"
@@ -367,7 +369,79 @@ static void KeyCallback(GLFWwindow* window, int key, int scancode, int action, i
 }
 #endif
 
+// A6 (loading-time cleanup): shared implementation of the "run a slow, self-contained, blocking
+// call on a worker thread while THIS thread keeps pumping GLFW's message queue" pattern. Both the
+// scene.cache build/load wait and the ClusterRenderPipeline::Init wait below need this: calling
+// either slow, synchronous, single-function call (geometry::RunVirtualGeometryCacheTest,
+// ClusterRenderPipeline::Init) directly on the thread that owns the GLFW window would stop
+// glfwPollEvents() from running for the whole duration (seconds to 20-30+ seconds), so Win32 never
+// services this window's message queue and the OS ghosts it as "Not Responding" (its standard hung-
+// window detection) even though the engine is working correctly -- the title bar couldn't even be
+// dragged. Neither call has an incremental-progress hook to poll (each is one monolithic function),
+// so the whole call is moved onto a worker thread while this thread keeps polling, plus a small
+// animated window-title cue so the user has some sign of life, until the worker thread finishes.
+//
+// `waitTitlePrefix`/`waitTitleSuffix` are concatenated around the current spinner frame ("|/-\\",
+// cycling every 100ms, identical cadence to the pre-dedup blocks) to form the animated title, e.g.
+// prefix="...Building geometry cache ", suffix=" (first run / scene change, please wait)" reproduces
+// that call site's exact original title text byte-for-byte; `doneTitle` replaces it once `job`
+// finishes. `jobName` is used only for the LOG_CRITICAL message if `job` throws (Debug/Release log
+// text, not user-visible window chrome), so the two call sites can still be told apart in
+// demo_log.txt despite sharing this one implementation. Mirrors the pre-dedup blocks' own try/catch
+// exactly: a thrown std::exception is caught, logged via LOG_CRITICAL, and treated as job failure
+// (returns false) rather than propagating past this function and crashing the process.
+static bool RunOnWorkerWithMessagePump(
+    GLFWwindow* window,
+    const char* jobName,
+    const char* waitTitlePrefix,
+    const char* waitTitleSuffix,
+    const char* doneTitle,
+    std::function<bool()> job)
+{
+    std::atomic<bool> jobDone{ false };
+    bool jobResult = false;
+    std::thread workerThread([&]() {
+        try {
+            jobResult = job();
+        }
+        catch (const std::exception& e) {
+            LOG_CRITICAL(std::format("[Main] {} threw: {}", jobName, e.what()));
+            jobResult = false;
+        }
+        // Release-store: publishes jobResult to the polling loop's acquire-load below before that
+        // loop can stop and join this thread.
+        jobDone.store(true, std::memory_order_release);
+    });
+
+    // Minimal "please wait" pump -- deliberately not a loading screen (out of scope): it only keeps
+    // Win32 message processing alive, which is both what stops the OS from considering the window
+    // hung AND what a title-bar drag needs to actually track the mouse. No frame is presented here.
+    static const char* kSpinnerFrames[] = { "|", "/", "-", "\\" };
+    uint32_t spinnerIndex = 0;
+    while (!jobDone.load(std::memory_order_acquire)) {
+        glfwPollEvents();
+        std::string waitTitle = std::string(waitTitlePrefix) + kSpinnerFrames[spinnerIndex] + waitTitleSuffix;
+        glfwSetWindowTitle(window, waitTitle.c_str());
+        spinnerIndex = (spinnerIndex + 1) % 4;
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    workerThread.join();
+    glfwSetWindowTitle(window, doneTitle);
+
+    return jobResult;
+}
+
 int main(int argc, char** argv) {
+    // E4 (startup-phase timing): captured as literally the first statement in main() so the
+    // "GLFW/window creation" phase below (and the final "total time to entering the main loop" log
+    // right before the frame loop starts) both measure from true process/engine start. Every
+    // `tStartupCheckpoint` reassignment below marks the END of one phase and the START of the next,
+    // so each phase's own logged duration always excludes whatever ran immediately before it --
+    // Debug-only phases (e.g. ImGui init) that don't exist in a Release build simply never advance
+    // the checkpoint, so the following phase's Release timing correctly has nothing to subtract out.
+    const auto tStartupBegin = std::chrono::steady_clock::now();
+    auto tStartupCheckpoint = tStartupBegin;
+
 #ifndef NDEBUG
     // --test-pipeline: replaces the interactive loop below with DebugTestPipeline::RunAll (see
     // that class's own comment) -- Debug-only, matching every other automated-validation feature
@@ -406,11 +480,32 @@ int main(int argc, char** argv) {
         return -1;
     }
 
+    // F2 frame-pacing fix: query the primary monitor's actual refresh rate once at startup so the
+    // CPU-side frame capper further down the main loop can tell whether it is redundant with the
+    // swapchain's VK_PRESENT_MODE_FIFO_KHR vsync block (see the capper site for the full beat-
+    // frequency rationale). A monitor reporting <=0 Hz (rare, but seen on some virtual/RDP displays)
+    // is treated as "unknown" and the capper falls back to its original always-on behavior.
+    int monitorRefreshHz = 0;
+    if (GLFWmonitor* primaryMonitor = glfwGetPrimaryMonitor()) {
+        if (const GLFWvidmode* videoMode = glfwGetVideoMode(primaryMonitor)) {
+            monitorRefreshHz = videoMode->refreshRate;
+            LOG_INFO(std::format("[Main] Primary monitor refresh rate: {} Hz (TARGET_FPS = {})", monitorRefreshHz, config::TARGET_FPS));
+        }
+    }
+
 #ifndef NDEBUG
     glfwSetKeyCallback(window, KeyCallback);
 #endif
     // Fly-camera wheel-speed adjustment: core navigation feature, wired in both Debug and Release.
     glfwSetScrollCallback(window, ScrollCallback);
+
+    // E4 (startup-phase timing): "GLFW/window creation" phase -- glfwInit() + window/callback setup.
+    {
+        const auto tAfterWindow = std::chrono::steady_clock::now();
+        LOG_INFO(std::format("[Main] Startup phase 'GLFW window creation': {} ms.",
+            std::chrono::duration_cast<std::chrono::milliseconds>(tAfterWindow - tStartupCheckpoint).count()));
+        tStartupCheckpoint = tAfterWindow;
+    }
 
     VulkanContext vkContext;
     // Mirrors ClusterRenderPipeline::Init's own try/catch below: an exception escaping Init()
@@ -425,6 +520,16 @@ int main(int argc, char** argv) {
         glfwDestroyWindow(window);
         glfwTerminate();
         return -1;
+    }
+
+    // E4 (startup-phase timing): "VulkanContext::Init" phase -- instance/device/swapchain creation,
+    // procedural geometry compute dispatch, entity buffer upload (see VulkanContext::Init's own
+    // sequencing comment for the full list of what runs inside this call).
+    {
+        const auto tAfterVulkanInit = std::chrono::steady_clock::now();
+        LOG_INFO(std::format("[Main] Startup phase 'VulkanContext::Init': {} ms.",
+            std::chrono::duration_cast<std::chrono::milliseconds>(tAfterVulkanInit - tStartupCheckpoint).count()));
+        tStartupCheckpoint = tAfterVulkanInit;
     }
 
 #ifndef NDEBUG
@@ -510,6 +615,18 @@ int main(int argc, char** argv) {
     // (falling back to 3 synthetic in-memory demo volumes if none exist yet) -- see
     // g_PcgVolumeInspector's own declaration-site comment.
     g_PcgVolumeInspector.Init();
+
+    // E4 (startup-phase timing): "ImGui init" phase -- covers ImGui context/backend bring-up plus
+    // every Debug-only editor panel constructed above (PcgGraphEditorPanel, the Node Data Inspector's
+    // demo graph, PcgVolumeInspector). Whole phase (timing included) does not exist in Release, so
+    // Release's own "VulkanContext::Init" -> "scene.cache build/load wait" phase timing correctly has
+    // nothing to subtract out for it.
+    {
+        const auto tAfterImGuiInit = std::chrono::steady_clock::now();
+        LOG_INFO(std::format("[Main] Startup phase 'ImGui + debug panel init': {} ms.",
+            std::chrono::duration_cast<std::chrono::milliseconds>(tAfterImGuiInit - tStartupCheckpoint).count()));
+        tStartupCheckpoint = tAfterImGuiInit;
+    }
 #endif
 
     // Builds the consolidated virtual geometry .cache file (scene.cache): reads back the spawned
@@ -524,56 +641,35 @@ int main(int argc, char** argv) {
         LOG_INFO("[Main] scene.cache is missing or out of date. Rebuilding geometry cache...");
         // RunVirtualGeometryCacheTest is one monolithic, synchronous call (full GPU geometry
         // readback + a per-entity cluster DAG build -- see ClusterDAG.h/VirtualGeometryCacheTest.h's
-        // own comments) that can block for minutes on a cold/mismatched cache. Calling it directly
-        // on this thread -- the same thread that owns the GLFW window -- would stop glfwPollEvents()
-        // from running for that whole time, so Win32 never services this window's message queue and
-        // the OS ghosts it as "Not Responding" (its standard hung-window detection) even though the
-        // engine is working correctly; the title bar can't even be dragged. There is no incremental-
-        // progress hook to poll here (it is a single function, not something restructured for this
-        // fix), so instead the whole call is moved onto a worker thread while this thread keeps
-        // pumping GLFW's message queue -- plus a small animated window-title cue so the user has
-        // some sign of life -- until the worker thread finishes.
-        std::atomic<bool> cacheBuildDone{ false };
-        bool cacheBuildResult = false;
-        std::thread cacheBuildThread([&]() {
-            try {
-                cacheBuildResult = geometry::RunVirtualGeometryCacheTest(
+        // own comments) that can block for minutes on a cold/mismatched cache -- see
+        // RunOnWorkerWithMessagePump's own comment (above main()) for why this runs on a worker
+        // thread with a message-pump spinner instead of directly on this (GLFW window-owning) thread.
+        const bool cacheBuildResult = RunOnWorkerWithMessagePump(
+            window, "RunVirtualGeometryCacheTest",
+            "Vulkan 1.3 Bindless Demoscene - Building geometry cache ",
+            " (first run / scene change, please wait)",
+            "Vulkan 1.3 Bindless Demoscene",
+            [&]() {
+                return geometry::RunVirtualGeometryCacheTest(
                     vkContext.GetDevice(), vkContext.GetAllocator(), vkContext.GetGraphicsQueue(), vkContext.GetCommandPool(),
                     vkContext.GetVertexBuffer(), vkContext.GetIndexBuffer(), vkContext.GetVertexSkinBuffer(),
                     vkContext.GetTotalVertexCount(), vkContext.GetTotalIndexCount(),
                     vkContext.GetEntityData(), vkContext.GetEntityCount());
-            }
-            catch (const std::exception& e) {
-                LOG_CRITICAL(std::format("[Main] RunVirtualGeometryCacheTest threw: {}", e.what()));
-                cacheBuildResult = false;
-            }
-            // Release-store: publishes cacheBuildResult to the polling loop's acquire-load below
-            // before that loop can stop and join this thread.
-            cacheBuildDone.store(true, std::memory_order_release);
-        });
-
-        // Minimal "please wait" pump -- deliberately not a loading screen (out of scope for this
-        // fix): it only keeps Win32 message processing alive, which is both what stops the OS from
-        // considering the window hung AND what a title-bar drag needs to actually track the mouse.
-        // No frame is presented here: the swapchain exists, but ClusterRenderPipeline (the only
-        // thing that knows how to record a frame) isn't built until after the cache is ready.
-        static const char* kSpinnerFrames[] = { "|", "/", "-", "\\" };
-        uint32_t spinnerIndex = 0;
-        while (!cacheBuildDone.load(std::memory_order_acquire)) {
-            glfwPollEvents();
-            std::string waitTitle = std::string("Vulkan 1.3 Bindless Demoscene - Building geometry cache ")
-                + kSpinnerFrames[spinnerIndex] + " (first run / scene change, please wait)";
-            glfwSetWindowTitle(window, waitTitle.c_str());
-            spinnerIndex = (spinnerIndex + 1) % 4;
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        }
-        cacheBuildThread.join();
-        glfwSetWindowTitle(window, "Vulkan 1.3 Bindless Demoscene");
+            });
 
         geometryCacheTestPassed = cacheBuildResult;
         if (geometryCacheTestPassed) {
             geometry::SaveCacheConfig(vkContext.GetTotalVertexCount(), vkContext.GetTotalIndexCount(), vkContext.GetEntityCount());
         }
+    }
+    // E4 (startup-phase timing): "scene.cache build/load wait" phase -- covers both the up-to-date
+    // (near-instant IsCacheUpToDate check) and rebuild (worker-thread RunVirtualGeometryCacheTest,
+    // possibly minutes) branches above alike, so this one log always reflects whichever actually ran.
+    {
+        const auto tAfterSceneCache = std::chrono::steady_clock::now();
+        LOG_INFO(std::format("[Main] Startup phase 'scene.cache build/load wait': {} ms.",
+            std::chrono::duration_cast<std::chrono::milliseconds>(tAfterSceneCache - tStartupCheckpoint).count()));
+        tStartupCheckpoint = tAfterSceneCache;
     }
     if (!geometryCacheTestPassed) {
         LOG_CRITICAL("[Main] Virtual geometry cache build FAILED — the clustered pipeline cannot run without scene.cache.");
@@ -641,46 +737,35 @@ int main(int argc, char** argv) {
         vkContext.GetEntityData()[vkContext.GetCreatureEntityIndex()].meshID;
 
     // ClusterRenderPipeline::Init() sequentially creates ~40 render passes' worth of GPU buffers/
-    // images/pipelines (many involving first-time driver-side SPIR-V pipeline compilation -- there
-    // is no persisted VkPipelineCache anywhere in this codebase, so this cost is paid fresh on
-    // EVERY launch, not just a cold scene.cache) plus several one-shot staged uploads, all on
-    // whichever thread calls it. It has no GLFW dependency of its own (every handle it touches --
-    // device/allocator/queue/commandPool/images -- was already created by VulkanContext::Init()
-    // above) and, like geometry::RunVirtualGeometryCacheTest() before it, is a single self-contained
-    // call that returns a bool. Calling it directly here -- right after the cache-build wait, which
-    // already had this exact problem -- would again stop glfwPollEvents() from running for the
-    // whole 20-30+ second duration, so Win32 ghosts the window as "Not Responding" a second time.
-    // Same worker-thread + polling-pump pattern as the cache-build wait above, reused verbatim
-    // (including the try/catch, since GpuBuffer allocation failures/missing SPIR-V files can still
-    // throw std::runtime_error here).
+    // images/pipelines (many involving first-time driver-side SPIR-V pipeline compilation -- E1
+    // (loading-time optimization) now routes every one of those through VulkanContext's persisted
+    // "pipeline.cache" (see VulkanContext::CreatePipelineCache()/VulkanPipeline::GetPipelineCache()'s
+    // own comments), so on a warm cache the driver can reuse already-compiled SPIR-V->ISA
+    // translations instead of paying the full compile cost fresh on every launch -- but a cold/
+    // first-ever/post-driver-update run still compiles everything, so this can still take seconds)
+    // plus several one-shot staged uploads, all on whichever thread calls it. It has no GLFW
+    // dependency of its own (every handle it touches -- device/allocator/queue/commandPool/images --
+    // was already created by VulkanContext::Init() above) and, like
+    // geometry::RunVirtualGeometryCacheTest() before it, is a single self-contained call that
+    // returns a bool -- see RunOnWorkerWithMessagePump's own comment (above main()) for why this
+    // runs on a worker thread with a message-pump spinner instead of directly on this thread.
     renderer::ClusterRenderPipeline clusterPipeline;
-    std::atomic<bool> pipelineInitDone{ false };
-    bool pipelineInitOk = false;
-    std::thread pipelineInitThread([&]() {
-        try {
-            pipelineInitOk = clusterPipeline.Init(pipelineInfo);
-        }
-        catch (const std::exception& e) {
-            LOG_CRITICAL(std::format("[Main] ClusterRenderPipeline::Init threw: {}", e.what()));
-            pipelineInitOk = false;
-        }
-        // Release-store: publishes pipelineInitOk to the polling loop's acquire-load below before
-        // that loop can stop and join this thread.
-        pipelineInitDone.store(true, std::memory_order_release);
-    });
+    const bool pipelineInitOk = RunOnWorkerWithMessagePump(
+        window, "ClusterRenderPipeline::Init",
+        "Vulkan 1.3 Bindless Demoscene - Initializing render pipeline ",
+        " (please wait)",
+        "Vulkan 1.3 Bindless Demoscene",
+        [&]() {
+            return clusterPipeline.Init(pipelineInfo);
+        });
 
-    static const char* kPipelineInitSpinnerFrames[] = { "|", "/", "-", "\\" };
-    uint32_t pipelineInitSpinnerIndex = 0;
-    while (!pipelineInitDone.load(std::memory_order_acquire)) {
-        glfwPollEvents();
-        std::string waitTitle = std::string("Vulkan 1.3 Bindless Demoscene - Initializing render pipeline ")
-            + kPipelineInitSpinnerFrames[pipelineInitSpinnerIndex] + " (please wait)";
-        glfwSetWindowTitle(window, waitTitle.c_str());
-        pipelineInitSpinnerIndex = (pipelineInitSpinnerIndex + 1) % 4;
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    // E4 (startup-phase timing): "ClusterRenderPipeline::Init" phase.
+    {
+        const auto tAfterPipelineInit = std::chrono::steady_clock::now();
+        LOG_INFO(std::format("[Main] Startup phase 'ClusterRenderPipeline::Init': {} ms.",
+            std::chrono::duration_cast<std::chrono::milliseconds>(tAfterPipelineInit - tStartupCheckpoint).count()));
+        tStartupCheckpoint = tAfterPipelineInit;
     }
-    pipelineInitThread.join();
-    glfwSetWindowTitle(window, "Vulkan 1.3 Bindless Demoscene");
 
     if (!pipelineInitOk) {
         LOG_CRITICAL("[Main] ClusterRenderPipeline initialization FAILED.");
@@ -691,6 +776,19 @@ int main(int argc, char** argv) {
         LOG_SHUTDOWN();
         return -1;
     }
+
+    // E1 (loading-time optimization): persist the pipeline cache immediately after the expensive
+    // first-run pipeline compiles above succeeded -- crash-safety: if anything later in startup
+    // throws or crashes, this run's newly-compiled pipelines are not lost, and the NEXT launch still
+    // benefits from them. See VulkanContext::SavePipelineCache()'s own comment; also called again in
+    // VulkanContext::Shutdown() to additionally capture any pipeline created after this point.
+    vkContext.SavePipelineCache();
+    // E4: also log pipeline-cache hit/miss here, alongside the phase timings above -- the actual
+    // hit/miss decision + loaded-byte-count logging already happened inside
+    // VulkanContext::CreatePipelineCache() itself (much earlier, right after device creation); this
+    // is a convenience summary line placed next to the rest of this startup timing report.
+    LOG_INFO(std::format("[Main] Pipeline cache: {} ({} bytes loaded at startup).",
+        vkContext.GetPipelineCacheWasHit() ? "HIT" : "MISS", vkContext.GetPipelineCacheLoadedBytes()));
 
 #ifndef NDEBUG
     // Phase 0.2 (UE5.8-parity PCG roadmap, "PCG Instance Draw Path"): proves renderer::
@@ -816,6 +914,12 @@ int main(int argc, char** argv) {
     // previous submission hasn't retired.
     VkFence asyncComputeFence = VK_NULL_HANDLE;
     VK_CHECK(vkCreateFence(vkContext.GetDevice(), &fenceInfo, nullptr, &asyncComputeFence));
+
+    // E4 (startup-phase timing): total time from process/engine start (tStartupBegin, captured as
+    // literally the first statement in main()) to right here, immediately before the frame loop
+    // starts -- the single top-level number the other per-phase logs above break down.
+    LOG_INFO(std::format("[Main] Total startup time (process start to main loop): {} ms.",
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - tStartupBegin).count()));
 
     LOG_INFO("Entering main loop.");
 
@@ -1183,6 +1287,28 @@ int main(int argc, char** argv) {
             // own *_ENABLED block comment for how each toggle actually takes effect) ---
             if (ImGui::BeginTabItem("Post FX")) {
                 ImGui::Checkbox("Bloom", &config::postprocess::BLOOM_ENABLED);
+                // F13: Lens Flare (Ghosts + Halo) + Anamorphic Streak -- independent of the "Bloom"
+                // checkbox above (BLOOM_ENABLED gates only the base glow bleed; this gates only the
+                // ghost/halo/streak terms baked into the same renderer::BloomPass output -- see
+                // config::postprocess::LENS_FLARE_ENABLED's own comment). Toggling this off alone
+                // still leaves plain bloom visible; toggling "Bloom" off removes everything
+                // (including flares) since the whole shared mip-chain output is zeroed downstream.
+                ImGui::Checkbox("Lens Flare (Ghosts/Halo)", &config::postprocess::LENS_FLARE_ENABLED);
+                if (config::postprocess::LENS_FLARE_ENABLED) {
+                    ImGui::Indent();
+                    ImGui::SliderFloat("Ghost Intensity", &config::postprocess::LENS_FLARE_GHOST_INTENSITY, 0.0f, 2.0f);
+                    int ghostCount = static_cast<int>(config::postprocess::LENS_FLARE_GHOST_COUNT);
+                    if (ImGui::SliderInt("Ghost Count", &ghostCount, 1, 8)) {
+                        config::postprocess::LENS_FLARE_GHOST_COUNT = static_cast<uint32_t>(ghostCount);
+                    }
+                    ImGui::SliderFloat("Ghost Spacing", &config::postprocess::LENS_FLARE_GHOST_SPACING, 0.0f, 2.0f);
+                    ImGui::SliderFloat("Halo Intensity", &config::postprocess::HALO_INTENSITY, 0.0f, 2.0f);
+                    ImGui::SliderFloat("Halo Width", &config::postprocess::HALO_WIDTH, 0.0f, 1.0f);
+                    ImGui::SliderFloat("Chromatic Shift", &config::postprocess::LENS_FLARE_CHROMATIC_SHIFT, 0.0f, 0.05f);
+                    ImGui::SliderFloat("Anamorphic Streak Intensity", &config::postprocess::ANAMORPHIC_FLARE_INTENSITY, 0.0f, 1.0f);
+                    ImGui::SliderFloat("Anamorphic Streak Stretch", &config::postprocess::ANAMORPHIC_FLARE_STRETCH, 0.0f, 0.5f);
+                    ImGui::Unindent();
+                }
                 ImGui::Checkbox("Chromatic Aberration", &config::postprocess::CHROMATIC_ABERRATION_ENABLED);
                 ImGui::Checkbox("Vignette", &config::postprocess::VIGNETTE_ENABLED);
                 ImGui::Checkbox("Heat Distortion", &config::postprocess::HEAT_DISTORTION_ENABLED);
@@ -1195,6 +1321,21 @@ int main(int argc, char** argv) {
                 ImGui::Checkbox("White Balance", &config::postprocess::WHITE_BALANCE_ENABLED);
                 ImGui::Checkbox("Color Correction", &config::postprocess::COLOR_CORRECTION_ENABLED);
                 ImGui::Checkbox("Depth of Field", &config::postprocess::DOF_ENABLED);
+                // UE5.8-parity "Accumulation Depth of Field" -- live A/B toggle between the original
+                // single-frame 16-tap Poisson gather (DepthOfFieldPass) and the new cinematic,
+                // path-tracer-like per-frame single-lens-sample temporal accumulation
+                // (DepthOfFieldAccumulationPass) -- see that class' own header comment. Only
+                // meaningful while "Depth of Field" above is checked (DOF_ENABLED zeroes the CoC for
+                // whichever mode is active, same convention as every other *_ENABLED toggle here).
+                ImGui::Indent();
+                ImGui::Combo("DOF Mode", &config::postprocess::DOF_MODE, "Gather\0Accumulation (UE5.8)\0\0");
+                if (config::postprocess::DOF_MODE != 0) {
+                    ImGui::SliderFloat("Accumulation Max Samples", &config::postprocess::DOF_ACCUMULATION_MAX_SAMPLES, 4.0f, 256.0f);
+                    ImGui::TextDisabled("Frames since last reset: %u", clusterPipeline.GetDOFAccumulationFramesSinceReset());
+                    ImGui::TextWrapped("Converges toward path-traced-quality bokeh while the camera is stationary; "
+                        "falls back toward Gather-mode quality under motion/disocclusion.");
+                }
+                ImGui::Unindent();
                 ImGui::Checkbox("Ambient Occlusion (GTAO)", &config::postprocess::AO_ENABLED);
                 ImGui::Checkbox("Contact Shadows", &config::postprocess::CONTACT_SHADOW_ENABLED);
                 ImGui::Checkbox("SSR Fallback", &config::postprocess::SSR_FALLBACK_ENABLED);
@@ -1252,6 +1393,147 @@ int main(int argc, char** argv) {
                 };
                 ImGui::Combo("Buffer", &config::debugview::SELECTED_BUFFER_INDEX, kBufferNames, IM_ARRAYSIZE(kBufferNames));
                 ImGui::TextWrapped("Shows the selected buffer instead of the normal final image. Not tied to the Numpad debug-view-mode keys.");
+                ImGui::EndTabItem();
+            }
+
+            // --- Tab Profiler (audit-fix roadmap B1/D2) -- per-pass GPU timestamp profiler +
+            // VMA heap budget overlay, both Debug-only per CLAUDE.md rule 8. Neither reads/writes
+            // any live rendering state -- both are pure observability over data the engine already
+            // produces every frame (renderer::debug::GpuTimestampProfiler's own rolling averages,
+            // VMA's own vmaGetHeapBudgets()/vmaCalculateStatistics()). ---
+            if (ImGui::BeginTabItem("Profiler")) {
+                // B1: per-pass GPU timestamp profiler (renderer::debug::GpuTimestampProfiler).
+                if (ImGui::CollapsingHeader("GPU Profiler", ImGuiTreeNodeFlags_DefaultOpen)) {
+                    if (!clusterPipeline.IsGpuProfilerSupported()) {
+                        ImGui::TextDisabled("Timestamp queries unsupported on this GPU/driver -- profiler disabled.");
+                    } else {
+                        // GetGpuProfilerResults()/GetGpuProfilerAsyncResults() both mutate their own
+                        // profiler's rolling-average state as a side effect (see
+                        // debug::GpuTimestampProfiler::GetResults()'s own comment) -- called exactly
+                        // once per real frame here, matching that contract. GetGpuProfilerTotalAvgMs()
+                        // is called AFTER GetGpuProfilerResults() so it reflects the same averages the
+                        // table below just displayed, not a stale prior frame's sum (see that
+                        // accessor's own comment).
+                        std::vector<renderer::debug::GpuTimestampProfiler::ZoneResult> zones = clusterPipeline.GetGpuProfilerResults();
+                        float totalMs = clusterPipeline.GetGpuProfilerTotalAvgMs();
+                        std::vector<renderer::debug::GpuTimestampProfiler::ZoneResult> asyncZones = clusterPipeline.GetGpuProfilerAsyncResults();
+
+                        ImGui::Text("Graphics queue total (sum of zone averages): %.3f ms", totalMs);
+                        ImGui::TextWrapped("Not a true whole-frame GPU time: async-compute-queue work runs concurrently "
+                            "(see the separate table below) and any un-instrumented GPU work is simply absent.");
+
+                        if (ImGui::BeginTable("GpuProfilerTable", 3, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
+                            ImGui::TableSetupColumn("Pass (graphics queue)");
+                            ImGui::TableSetupColumn("Avg ms (~30-frame)");
+                            ImGui::TableSetupColumn("Last ms");
+                            ImGui::TableHeadersRow();
+                            for (const renderer::debug::GpuTimestampProfiler::ZoneResult& zone : zones) {
+                                ImGui::TableNextRow();
+                                ImGui::TableSetColumnIndex(0);
+                                ImGui::TextUnformatted(zone.name.c_str());
+                                ImGui::TableSetColumnIndex(1);
+                                ImGui::Text("%.3f", zone.avgGpuMs);
+                                ImGui::TableSetColumnIndex(2);
+                                ImGui::Text("%.3f", zone.lastGpuMs);
+                            }
+                            ImGui::EndTable();
+                        }
+
+                        if (!asyncZones.empty()) {
+                            ImGui::Separator();
+                            ImGui::TextWrapped("Async-compute queue (runs concurrently with the graphics-queue "
+                                "'FrameMid' work above -- these durations are NOT additive with the total above):");
+                            if (ImGui::BeginTable("GpuProfilerAsyncTable", 3, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
+                                ImGui::TableSetupColumn("Pass (async-compute queue)");
+                                ImGui::TableSetupColumn("Avg ms (~30-frame)");
+                                ImGui::TableSetupColumn("Last ms");
+                                ImGui::TableHeadersRow();
+                                for (const renderer::debug::GpuTimestampProfiler::ZoneResult& zone : asyncZones) {
+                                    ImGui::TableNextRow();
+                                    ImGui::TableSetColumnIndex(0);
+                                    ImGui::TextUnformatted(zone.name.c_str());
+                                    ImGui::TableSetColumnIndex(1);
+                                    ImGui::Text("%.3f", zone.avgGpuMs);
+                                    ImGui::TableSetColumnIndex(2);
+                                    ImGui::Text("%.3f", zone.lastGpuMs);
+                                }
+                                ImGui::EndTable();
+                            }
+                        }
+
+                        if (ImGui::Button("Log Snapshot")) {
+                            LOG_INFO(std::format("[GPU Profiler] Snapshot -- graphics queue total: {:.3f} ms", totalMs));
+                            for (const renderer::debug::GpuTimestampProfiler::ZoneResult& zone : zones) {
+                                LOG_INFO(std::format("[GPU Profiler]   {} : avg {:.3f} ms, last {:.3f} ms", zone.name, zone.avgGpuMs, zone.lastGpuMs));
+                            }
+                            for (const renderer::debug::GpuTimestampProfiler::ZoneResult& zone : asyncZones) {
+                                LOG_INFO(std::format("[GPU Profiler]   (async) {} : avg {:.3f} ms, last {:.3f} ms", zone.name, zone.avgGpuMs, zone.lastGpuMs));
+                            }
+                        }
+                    }
+                }
+
+                // D2: VRAM budget overlay -- vmaGetHeapBudgets() every ~60 frames (cheap, see
+                // VMA's own doc comment: "can be called every frame or even before every
+                // allocation"), vmaCalculateStatistics() only on demand (the button below) since VMA's
+                // own docs describe it as "intended to be used rarely, once in a while".
+                if (ImGui::CollapsingHeader("VRAM", ImGuiTreeNodeFlags_DefaultOpen)) {
+                    static uint32_t vramFrameCounter = 0;
+                    static std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> cachedHeapBudgets{};
+                    static uint32_t cachedHeapCount = 0;
+                    // Shared by the "Calculate Detailed Statistics" button below and the popup body
+                    // that displays its result -- MUST be declared once, here, at this enclosing
+                    // scope (not as two separate `static` locals inside the button/popup blocks
+                    // below, which -- despite both being `static` -- are two DISTINCT objects since
+                    // C++ function-local statics are scoped to their own lexical block).
+                    static VmaTotalStatistics s_LastDetailedStats{};
+                    ++vramFrameCounter;
+                    if (vramFrameCounter == 1 || (vramFrameCounter % 60) == 0) {
+                        const VkPhysicalDeviceMemoryProperties* memProps = nullptr;
+                        vmaGetMemoryProperties(vkContext.GetAllocator(), &memProps);
+                        cachedHeapCount = memProps->memoryHeapCount;
+                        vmaGetHeapBudgets(vkContext.GetAllocator(), cachedHeapBudgets.data());
+                    }
+
+                    VkDeviceSize totalUsageBytes = 0;
+                    VkDeviceSize totalBudgetBytes = 0;
+                    if (ImGui::BeginTable("VramHeapTable", 3, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
+                        ImGui::TableSetupColumn("Heap");
+                        ImGui::TableSetupColumn("Usage (MiB)");
+                        ImGui::TableSetupColumn("Budget (MiB)");
+                        ImGui::TableHeadersRow();
+                        for (uint32_t heap = 0; heap < cachedHeapCount; ++heap) {
+                            totalUsageBytes += cachedHeapBudgets[heap].usage;
+                            totalBudgetBytes += cachedHeapBudgets[heap].budget;
+                            ImGui::TableNextRow();
+                            ImGui::TableSetColumnIndex(0);
+                            ImGui::Text("Heap %u", heap);
+                            ImGui::TableSetColumnIndex(1);
+                            ImGui::Text("%.1f", static_cast<double>(cachedHeapBudgets[heap].usage) / (1024.0 * 1024.0));
+                            ImGui::TableSetColumnIndex(2);
+                            ImGui::Text("%.1f", static_cast<double>(cachedHeapBudgets[heap].budget) / (1024.0 * 1024.0));
+                        }
+                        ImGui::EndTable();
+                    }
+                    ImGui::Text("Total: %.1f MiB used / %.1f MiB budget",
+                        static_cast<double>(totalUsageBytes) / (1024.0 * 1024.0),
+                        static_cast<double>(totalBudgetBytes) / (1024.0 * 1024.0));
+
+                    if (ImGui::Button("Calculate Detailed Statistics")) {
+                        // vmaCalculateStatistics() walks every block/allocation -- deliberately only
+                        // run here, on demand (VMA's own docs describe it as "intended to be used
+                        // rarely, once in a while"), never per-frame like vmaGetHeapBudgets() above.
+                        vmaCalculateStatistics(vkContext.GetAllocator(), &s_LastDetailedStats);
+                        ImGui::OpenPopup("VramDetailedStatsPopup");
+                    }
+                    if (ImGui::BeginPopup("VramDetailedStatsPopup")) {
+                        ImGui::Text("Blocks: %u", s_LastDetailedStats.total.statistics.blockCount);
+                        ImGui::Text("Allocations: %u", s_LastDetailedStats.total.statistics.allocationCount);
+                        ImGui::Text("Block bytes: %.1f MiB", static_cast<double>(s_LastDetailedStats.total.statistics.blockBytes) / (1024.0 * 1024.0));
+                        ImGui::Text("Allocation bytes: %.1f MiB", static_cast<double>(s_LastDetailedStats.total.statistics.allocationBytes) / (1024.0 * 1024.0));
+                        ImGui::EndPopup();
+                    }
+                }
                 ImGui::EndTabItem();
             }
 
@@ -2306,13 +2588,36 @@ int main(int argc, char** argv) {
 
         vkQueuePresentKHR(vkContext.GetGraphicsQueue(), &presentInfo);
 
-        // High-precision frame rate capper to enforce TARGET_FPS
+        // High-precision frame rate capper to enforce TARGET_FPS.
+        //
+        // F2 double-pacing fix: VulkanContext creates the swapchain with VK_PRESENT_MODE_FIFO_KHR
+        // (VulkanContext.cpp, ~line 1217), which already blocks vkQueuePresentKHR until the next
+        // vblank -- FIFO is itself a complete frame-pacing mechanism tied to the display's true
+        // refresh cadence. Also running this CPU-side sleep on top of that is harmless only when
+        // the two clocks share a frequency; when TARGET_FPS does not evenly divide the monitor's
+        // actual refresh rate (e.g. the common default: a 60fps target on a 144Hz panel, where
+        // 144/60 = 2.4, not integral) the two independent clocks beat against each other and
+        // produce irregular, jittery present intervals instead of the intended steady cadence.
+        //
+        // Fix: when TARGET_FPS is already at or above the display's own natural cap
+        // (monitorRefreshHz queried once at startup near window creation), FIFO vsync alone is
+        // sufficient pacing -- skip the CPU sleep entirely for this frame. This is the common case:
+        // the default Medium/High/Extrem profiles all target 60fps, and the overwhelming majority
+        // of displays are >=60Hz. When TARGET_FPS is intentionally BELOW the display's refresh rate
+        // (the Low tier's deliberate 30fps throttle on a 60Hz+ display), FIFO alone cannot reach
+        // that lower rate -- vsync would happily present at the full 60Hz -- so the CPU capper is
+        // still required there and its behavior is left completely unchanged. An unknown refresh
+        // rate (monitorRefreshHz <= 0) conservatively keeps the capper active, matching the
+        // pre-existing always-on behavior.
         static double lastFrameTime = glfwGetTime();
-        double targetFrameTime = 1.0 / static_cast<double>(config::TARGET_FPS);
-        while (glfwGetTime() - lastFrameTime < targetFrameTime) {
-            double remaining = targetFrameTime - (glfwGetTime() - lastFrameTime);
-            if (remaining > 0.002) {
-                std::this_thread::sleep_for(std::chrono::microseconds(static_cast<int64_t>((remaining - 0.001) * 1000000.0)));
+        const bool needsCpuCapper = (monitorRefreshHz <= 0) || (static_cast<int>(config::TARGET_FPS) < monitorRefreshHz);
+        if (needsCpuCapper) {
+            double targetFrameTime = 1.0 / static_cast<double>(config::TARGET_FPS);
+            while (glfwGetTime() - lastFrameTime < targetFrameTime) {
+                double remaining = targetFrameTime - (glfwGetTime() - lastFrameTime);
+                if (remaining > 0.002) {
+                    std::this_thread::sleep_for(std::chrono::microseconds(static_cast<int64_t>((remaining - 0.001) * 1000000.0)));
+                }
             }
         }
         lastFrameTime = glfwGetTime();

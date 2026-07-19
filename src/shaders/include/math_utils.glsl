@@ -156,4 +156,13 @@ vec2 Halton23(uint index) {
 bool AABBOverlapsAABB(vec3 aMin, vec3 aMax, vec3 bMin, vec3 bMax) {
     return all(lessThanEqual(aMin, bMax)) && all(lessThanEqual(bMin, aMax));
 }
+
+// Rec.709 luma weights -- standard perceptual-luminance dot product used to derive an edge-stopping
+// weight from an HDR color (A5 cleanup: canonical home for what was a local copy in
+// src/shaders/src/GI/ATrousDenoise.comp; other shaders such as AutoExposureHistogram.comp and
+// color_grading.glsl inline the identical coefficients under their own local names for their own
+// unrelated purposes -- left as-is rather than forced onto this helper).
+float Luminance(vec3 c) {
+    return dot(c, vec3(0.2126, 0.7152, 0.0722));
+}
 #endif

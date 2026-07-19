@@ -1,4 +1,4 @@
-#ifndef NDEBUG
+﻿#ifndef NDEBUG
 
 #include "renderer/debug/PcgPointCloudDebugView.h"
 
@@ -157,7 +157,7 @@ namespace renderer::debug {
         pipelineInfo.layout = m_PipelineLayout;
         pipelineInfo.pNext = &pipelineRendering;
 
-        VK_CHECK(vkCreateGraphicsPipelines(m_Device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_Pipeline));
+        VK_CHECK(vkCreateGraphicsPipelines(m_Device, VulkanPipeline::GetPipelineCache(), 1, &pipelineInfo, nullptr, &m_Pipeline));
 
         vkDestroyShaderModule(m_Device, vertModule, nullptr);
         vkDestroyShaderModule(m_Device, fragModule, nullptr);

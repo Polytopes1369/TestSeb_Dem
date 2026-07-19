@@ -92,7 +92,7 @@ namespace renderer {
         // Writes 4 consecutive bindings -- TLAS at `baseBinding`, then the SurfaceCachePass vertex
         // buffer, index buffer, and SurfaceCacheRayTracingPass draw-range buffer at
         // baseBinding+1/+2/+3 -- shared by every GI pass that ray/SDF-traces the scene's HWRT
-        // fallback geometry (SurfaceCacheGIInjectPass, WorldProbeGridPass, ScreenProbeGIPass,
+        // fallback geometry (SurfaceCacheGIInjectPass, WorldProbeGridPass, MegaLightsPass,
         // ReflectionPass). Issued as its own vkUpdateDescriptorSets call, independent of whatever
         // other bindings the caller writes to the same set, so callers can freely interleave this
         // with their own pass-specific writes in any order.
@@ -137,8 +137,8 @@ namespace renderer {
         // Allocates a single-mip, single-layer, 2D GPU-only image (STORAGE_BIT for compute
         // imageLoad/imageStore | SAMPLED_BIT for a later sampled read, e.g. history reprojection |
         // TRANSFER_DST_BIT for a one-time neutral-default clear) plus its matching 2D view -- the
-        // "ping-pong GI field" convention shared by ScreenProbeGIPass's probe images and
-        // ReflectionPass's reflection images.
+        // "ping-pong GI field" convention this codebase's GI passes use, e.g. renderer::
+        // ReflectionPass's own double-buffered radiance/world-position/normal images.
         static void CreateStorageSampledImage2D(
             VmaAllocator allocator,
             VkDevice device,
@@ -153,7 +153,8 @@ namespace renderer {
         // TRANSFER_DST_OPTIMAL -> GENERAL (leaving the image ready for a compute shader to both
         // imageLoad and sample it) for a single mip/layer color image. The one-time
         // "give this ping-pong GI field image a defined neutral starting value" idiom shared by
-        // ScreenProbeGIPass and ReflectionPass's own Init()-time clear loops.
+        // renderer::ReflectionPass's own Init()-time clear loops (and this codebase's other GI
+        // passes with a similar ping-pong image lifetime).
         static void ClearComputeImageToGeneral(
             VkCommandBuffer cmd,
             VkImage image,

@@ -1,4 +1,4 @@
-#ifndef NDEBUG
+﻿#ifndef NDEBUG
 
 #include "renderer/debug/DebugTextOverlay.h"
 
@@ -209,11 +209,11 @@ namespace renderer::debug {
         pipelineInfo.layout = m_PipelineLayout;
         pipelineInfo.pNext = &pipelineRendering;
 
-        VK_CHECK(vkCreateGraphicsPipelines(m_Device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_Pipeline));
+        VK_CHECK(vkCreateGraphicsPipelines(m_Device, VulkanPipeline::GetPipelineCache(), 1, &pipelineInfo, nullptr, &m_Pipeline));
 
         VkFormat hdrFormat = kHdrTargetFormat;
         pipelineRendering.pColorAttachmentFormats = &hdrFormat;
-        VK_CHECK(vkCreateGraphicsPipelines(m_Device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_PipelineHDR));
+        VK_CHECK(vkCreateGraphicsPipelines(m_Device, VulkanPipeline::GetPipelineCache(), 1, &pipelineInfo, nullptr, &m_PipelineHDR));
 
         vkDestroyShaderModule(m_Device, vertModule, nullptr);
         vkDestroyShaderModule(m_Device, fragModule, nullptr);

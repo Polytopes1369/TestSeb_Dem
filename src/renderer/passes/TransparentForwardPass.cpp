@@ -1,4 +1,4 @@
-#include "renderer/passes/TransparentForwardPass.h"
+﻿#include "renderer/passes/TransparentForwardPass.h"
 
 #include <cstring>
 #include <format>
@@ -511,7 +511,7 @@ namespace renderer {
             pipelineInfo.pDynamicState = &dynamicState;
             pipelineInfo.layout = m_ForwardPipelineLayout;
 
-            VK_CHECK(vkCreateGraphicsPipelines(m_Device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_ForwardPipeline));
+            VK_CHECK(vkCreateGraphicsPipelines(m_Device, VulkanPipeline::GetPipelineCache(), 1, &pipelineInfo, nullptr, &m_ForwardPipeline));
 
             vkDestroyShaderModule(m_Device, vertModule, nullptr);
             vkDestroyShaderModule(m_Device, fragModule, nullptr);

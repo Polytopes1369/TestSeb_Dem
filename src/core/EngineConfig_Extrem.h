@@ -28,7 +28,9 @@ constexpr uint64_t INDEX_BUFFER_BYTES = 1ULL * 1024 * 1024 * 1024;
 
 namespace temporal {
 // Internal render scale (1440p internally, reconstructed to 4K via TSR)
-constexpr float RENDER_SCALE = 0.667f;
+// Extrem tier has GPU headroom for near-native TSR input resolution (user-validated audit
+// decision 2026-07-19).
+constexpr float RENDER_SCALE = 0.85f;
 constexpr float BLEND_ALPHA = 0.08f;
 constexpr float BLEND_ALPHA_STATIC = 0.20f;
 constexpr float VARIANCE_CLAMP_FACTOR = 1.5f;

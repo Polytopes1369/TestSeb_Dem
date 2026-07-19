@@ -53,6 +53,7 @@
 // next frame (e.g. temperature crossing the snow threshold mid-fall) -- UpdateParticle reads the
 // PARTICLE's own stored kind, not this frame's pc.precipKind, for exactly this reason.
 
+#include "include/hash_utils.glsl"
 #include "include/ParticleCommon.glsl"
 #include "include/AtmosNoiseCommon.glsl"
 // Niagara-parity roadmap, subtask B2 (Ribbon/Trail render mode) -- set 2 here (after this shader's
@@ -237,13 +238,9 @@ float SampleGlobalSDF(vec3 p) {
 }
 
 // Cheap integer hash (Wang-style, same "no texture lookups" procedural-noise discipline as
-// AtmosNoiseCommon.glsl's own AtmosHash33) -- decorrelates one uint seed into another.
-uint HashUint(uint x) {
-    x ^= x >> 16u; x *= 0x7feb352du;
-    x ^= x >> 15u; x *= 0x846ca68bu;
-    x ^= x >> 16u;
-    return x;
-}
+// AtmosNoiseCommon.glsl's own AtmosHash33) -- decorrelates one uint seed into another. Canonical
+// definition now lives in hash_utils.glsl (A5 cleanup: was previously duplicated here and in
+// ProceduralMaskGenerate.comp).
 
 // Advances `seed` in place and returns a uniform float in [0, 1) -- the standard "seed doubles as
 // PRNG state" idiom, matching this file's own per-particle randomSeed field's purpose.

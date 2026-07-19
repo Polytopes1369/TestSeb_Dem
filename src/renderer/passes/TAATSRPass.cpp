@@ -1,4 +1,4 @@
-#include "renderer/passes/TAATSRPass.h"
+﻿#include "renderer/passes/TAATSRPass.h"
 
 #include "core/Logger.h"
 #include "renderer/vulkan/VulkanPipeline.h"
@@ -150,7 +150,7 @@ namespace renderer {
         computePipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
         computePipelineInfo.stage.module = shaderModule;
         computePipelineInfo.stage.pName = "main";
-        VK_CHECK(vkCreateComputePipelines(m_Device, VK_NULL_HANDLE, 1, &computePipelineInfo, nullptr, &m_Pipeline));
+        VK_CHECK(vkCreateComputePipelines(m_Device, VulkanPipeline::GetPipelineCache(), 1, &computePipelineInfo, nullptr, &m_Pipeline));
         vkDestroyShaderModule(m_Device, shaderModule, nullptr);
     }
 
