@@ -288,6 +288,19 @@ inline float VIGNETTE_COLOR_BLEED = 0.4f;
 inline float DOF_FOCAL_LENGTH_MM = 50.0f;
 inline float DOF_FOCUS_DISTANCE_WORLD_UNITS = 10.0f;
 inline float DOF_MAX_COC_RADIUS_PIXELS = 24.0f;
+// UE5.8-parity "Accumulation Depth of Field": 0 = Gather (DepthOfFieldPass, DepthOfField.comp's own
+// single-frame 16-tap Poisson gather -- the original/default mode), 1 = Accumulation
+// (DepthOfFieldAccumulationPass, DepthOfFieldAccumulation.comp's own per-frame single-lens-sample +
+// temporal-reprojection accumulation -- cinematic, path-tracer-like bokeh that converges over many
+// frames once the camera settles, at a fraction of Gather mode's per-frame tap cost). Both passes
+// share DOF_FOCAL_LENGTH_MM/DOF_FOCUS_DISTANCE_WORLD_UNITS/DOF_MAX_COC_RADIUS_PIXELS/DOF_ENABLED
+// above -- only the resolve technique differs. See renderer::ClusterRenderPipeline::RecordFrame's
+// own [13e] DOF call site for the branch.
+inline int DOF_MODE = 0;
+// Accumulation mode only: how many frames a stationary-camera pixel accumulates before the running
+// mean caps out into a fixed-window exponential moving average -- see
+// DepthOfFieldAccumulationPass::Settings::maxAccumulationSamples's own comment.
+inline float DOF_ACCUMULATION_MAX_SAMPLES = 64.0f;
 
 // Motion Blur (per-pixel velocity reconstructed from depth + view matrices, no stored velocity buffer)
 inline float MOTION_BLUR_INTENSITY = 0.5f;

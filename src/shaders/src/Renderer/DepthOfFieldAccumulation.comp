@@ -1,0 +1,197 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+
+// renderer::DepthOfFieldAccumulationPass (UE5.8-parity "Accumulation Depth of Field"): a cinematic,
+// path-tracer-like bokeh mode, alternative to DepthOfField.comp's own single-frame 16-tap Poisson
+// gather. Selected live via config::postprocess::DOF_MODE == 1.
+//
+// Technique: instead of gathering many taps in ONE frame, this shader draws exactly ONE stochastic
+// sample from the thin-lens aperture disk THIS frame (a low-discrepancy Halton(2,3) position, re-
+// seeded every frame by g_Params.frameIndex -- the same "seeded by frameIndex" idiom
+// PostProcessComposite.comp's own ApplyFilmGrain already establishes), reprojects last frame's
+// accumulated result into this frame via the SAME world-space depth reprojection TAATSR.comp's own
+// main() uses (invViewProj -> world position -> prevViewProj -> previous-frame UV), and blends the
+// new sample into a running per-pixel mean. Held stationary, the camera sweeps the ENTIRE aperture
+// disk over many frames -- exactly the Monte-Carlo estimator a real path-traced thin-lens camera
+// uses for defocus blur, just spread across frames instead of taps, so it converges toward the same
+// noise-free result PathTracerPass's own reference view would produce for out-of-focus regions, at a
+// fraction of the per-frame cost.
+//
+// Disocclusion / camera-cut invalidation mirrors TAATSR.comp exactly: a reprojected UV that lands
+// outside [0,1] (or a whole-frame `resetHistory` from a mode switch/first frame) drops that pixel's
+// accumulated weight back to 0, which in turn maximizes `fallbackBlend` below -- so a freshly
+// disoccluded/reset pixel is NOT a single raw noisy sample, it gracefully falls back to a cheap
+// multi-tap gather (the SAME quality DepthOfField.comp's own Gather mode produces) until enough
+// frames of stable history rebuild the accumulation.
+//
+// Depth/CoC math is kept byte-for-byte identical to DepthOfField.comp (both modes must agree on what
+// "in focus" means) -- see that shader's own header comment for the physical thin-lens derivation.
+
+#include "include/math_utils.glsl"
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform sampler2D g_HDRColor;      // renderer::TAATSRPass output, display-res.
+layout(set = 0, binding = 1) uniform sampler2D g_Depth;         // renderer::ClusterResolvePass depth, render-res, LINEAR-sampled.
+layout(set = 0, binding = 2) uniform sampler2D g_HistoryInput;  // Last frame's accumulated result (RGB = mean color, A = sample weight).
+layout(rgba16f, set = 0, binding = 3) uniform writeonly image2D g_HistoryOutput;
+
+layout(std140, set = 0, binding = 4) uniform DepthOfFieldAccumulationParamsUBO {
+    mat4 invViewProj;
+    mat4 prevViewProj;
+    vec3 cameraPositionWorld;
+    float _pad0;
+    float aperture;          // f-stop -- same value as PostProcessPass::Settings::aperture.
+    float focalLengthMM;
+    float focusDistanceWorldUnits;
+    float maxCoCRadiusPixels;
+    uint frameIndex;
+    uint resetHistory;
+    float maxAccumulationSamples;
+    float _pad1;
+} g_Params;
+
+// PBRT's concentric square-to-disk mapping: a uniform-density unit-disk sample from a uniform
+// unit-square sample, with far better stratification than the naive polar mapping
+// (r=sqrt(u),theta=2*PI*v) DepthOfField.comp's own VogelDiskSample effectively performs per-tap.
+// Paired with the low-discrepancy Halton23 input below (not per-pixel random), this sweeps the
+// aperture disk evenly across the accumulation window instead of clustering.
+vec2 ConcentricSampleDisk(vec2 u) {
+    vec2 uOffset = 2.0 * u - vec2(1.0);
+    if (uOffset.x == 0.0 && uOffset.y == 0.0) {
+        return vec2(0.0);
+    }
+    float theta, r;
+    if (abs(uOffset.x) > abs(uOffset.y)) {
+        r = uOffset.x;
+        theta = (PI / 4.0) * (uOffset.y / uOffset.x);
+    } else {
+        r = uOffset.y;
+        theta = (PI / 2.0) - (PI / 4.0) * (uOffset.x / uOffset.y);
+    }
+    return r * vec2(cos(theta), sin(theta));
+}
+
+// Same 16-tap-capable Vogel disk (Vogel spiral, golden-angle distributed) DepthOfField.comp's own
+// gather uses, kept local here (not shared) for the SAME reason DepthOfField.comp keeps its own copy
+// local -- a small, shader-specific tap pattern, not generically reusable math. Used only by the
+// cheap fallback gather below (8 taps -- enough to stay smooth while this pixel's own accumulated
+// history is still cold, without doubling this shader's worst-case cost every frame).
+vec2 VogelDiskSample(int index, int count, float phi) {
+    const float goldenAngle = 2.399963f;
+    float r = sqrt((float(index) + 0.5) / float(count));
+    float theta = float(index) * goldenAngle + phi;
+    return r * vec2(cos(theta), sin(theta));
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 res = textureSize(g_HDRColor, 0);
+    if (pixel.x >= res.x || pixel.y >= res.y) {
+        return;
+    }
+
+    vec2 uv = (vec2(pixel) + 0.5) / vec2(res);
+    vec3 baseColor = textureLod(g_HDRColor, uv, 0.0).rgb;
+
+    // --- Reconstruct this pixel's linear scene distance from the (bilinear-upsampled) depth buffer. ---
+    float ndcDepth = textureLod(g_Depth, uv, 0.0).r;
+    if (ndcDepth >= 1.0) {
+        // Sky/background -- no CoC, no blur, no accumulation needed (weight 0: see the in-focus
+        // early-out below for why a trivially-resolved pixel must NOT be stamped with a high weight).
+        imageStore(g_HistoryOutput, pixel, vec4(baseColor, 0.0));
+        return;
+    }
+    vec2 ndcXY = uv * 2.0 - 1.0;
+    vec4 clip = vec4(ndcXY, ndcDepth, 1.0);
+    vec4 worldPos4 = g_Params.invViewProj * clip;
+    vec3 worldPos = worldPos4.xyz / worldPos4.w;
+    float sceneDistance = distance(g_Params.cameraPositionWorld, worldPos);
+
+    // --- Thin-lens Circle of Confusion, in millimeters, converted to a pixel radius. Byte-for-byte
+    // identical to DepthOfField.comp's own derivation -- see that shader's own comment for the full
+    // physical explanation. ---
+    float focusDistanceMM = max(g_Params.focusDistanceWorldUnits * 1000.0, g_Params.focalLengthMM + 1.0);
+    float sceneDistanceMM = max(sceneDistance * 1000.0, 1.0);
+    float cocMM = g_Params.aperture * g_Params.focalLengthMM * abs(sceneDistanceMM - focusDistanceMM)
+        / (sceneDistanceMM * max(focusDistanceMM - g_Params.focalLengthMM, 1.0));
+    float pixelsPerMM = float(res.y) / 24.0;
+    float cocPixels = clamp(cocMM * pixelsPerMM, 0.0, g_Params.maxCoCRadiusPixels);
+
+    if (cocPixels < 0.6) {
+        // In-focus (sub-pixel CoC): the current-frame color IS already the correct answer, no
+        // accumulation needed. Weight is stamped at 0 (NOT maxAccumulationSamples) so that if this
+        // same pixel later becomes defocused (camera moves, focus distance changes), it does not
+        // inherit a falsely-high "fully converged" weight that would otherwise suppress the
+        // graceful fallback below and leave a newly-blurred region looking sharp for tens of frames.
+        imageStore(g_HistoryOutput, pixel, vec4(baseColor, 0.0));
+        return;
+    }
+
+    vec2 texelSize = 1.0 / vec2(res);
+
+    // --- Reproject into last frame's accumulated result (same technique TAATSR.comp's own main()
+    // establishes: world-space reprojection through prevViewProj, bounds-tested for disocclusion). ---
+    vec4 prevClip = g_Params.prevViewProj * vec4(worldPos, 1.0);
+    bool hasHistory = prevClip.w > 0.0;
+    vec2 historyUV = uv;
+    if (hasHistory) {
+        vec2 prevNDC = prevClip.xy / prevClip.w;
+        historyUV = prevNDC * 0.5 + 0.5;
+        if (historyUV.x < 0.0 || historyUV.x > 1.0 || historyUV.y < 0.0 || historyUV.y > 1.0) {
+            hasHistory = false; // Disocclusion / off-screen last frame.
+        }
+    }
+    if (g_Params.resetHistory != 0u) {
+        hasHistory = false; // Whole-frame reset: first frame ever, or this mode was just (re-)selected.
+    }
+
+    vec4 history = hasHistory ? textureLod(g_HistoryInput, historyUV, 0.0) : vec4(0.0);
+    float historyWeight = hasHistory ? clamp(history.a, 0.0, g_Params.maxAccumulationSamples) : 0.0;
+
+    // --- This frame's single stochastic thin-lens sample. ---
+    const uint kHaltonPeriod = 256u; // Long enough not to visibly repeat within one convergence window.
+    vec2 haltonXi = Halton23(g_Params.frameIndex % kHaltonPeriod);
+    vec2 diskSample = ConcentricSampleDisk(haltonXi);
+    // Per-pixel rotation so neighboring pixels don't all sample the exact same lens position each
+    // frame (which would look like a coherent moving grid instead of fine converging bokeh grain).
+    float pixelPhi = Hash(uv * vec2(res)) * TAU;
+    float cosPhi = cos(pixelPhi), sinPhi = sin(pixelPhi);
+    vec2 rotatedDisk = vec2(diskSample.x * cosPhi - diskSample.y * sinPhi,
+                             diskSample.x * sinPhi + diskSample.y * cosPhi);
+    vec2 lensOffset = rotatedDisk * cocPixels * texelSize;
+    vec3 newSample = textureLod(g_HDRColor, uv + lensOffset, 0.0).rgb;
+
+    // --- Graceful motion/disocclusion fallback: while historyWeight is still low (just reset, or
+    // repeatedly disoccluded by fast motion), blend in a cheap multi-tap gather so the visible image
+    // is never a single raw noisy sample -- matches DepthOfField.comp's own Gather-mode quality under
+    // motion. Once several frames of stable history have accumulated, this fades to 0 and the pass
+    // relies purely on the (by then well-averaged) single-sample-per-frame accumulation. ---
+    const float kFallbackFadeSamples = 8.0;
+    float fallbackBlend = clamp(1.0 - historyWeight / kFallbackFadeSamples, 0.0, 1.0);
+    vec3 thisFrameEstimate = newSample;
+    if (fallbackBlend > 0.0) {
+        float gatherPhi = Hash(uv * vec2(res) + 17.0) * TAU; // Different seed than pixelPhi above.
+        const int kFallbackTapCount = 8;
+        vec3 gatherAccum = baseColor;
+        float gatherWeight = 1.0;
+        for (int i = 0; i < kFallbackTapCount; ++i) {
+            vec2 offset = VogelDiskSample(i, kFallbackTapCount, gatherPhi) * cocPixels * texelSize;
+            gatherAccum += textureLod(g_HDRColor, uv + offset, 0.0).rgb;
+            gatherWeight += 1.0;
+        }
+        gatherAccum /= gatherWeight;
+        thisFrameEstimate = mix(newSample, gatherAccum, fallbackBlend);
+    }
+
+    // --- Running-mean accumulation: new_mean = old_mean + (x - old_mean) / n, i.e.
+    // mix(old_mean, x, 1/n) -- converges toward the true thin-lens integral as n grows, capped at
+    // maxAccumulationSamples (beyond which it becomes a fixed-window exponential moving average so
+    // the image can still adapt to slow changes, e.g. focus distance drifting, without a hard stop). ---
+    float newWeight = min(historyWeight + 1.0, g_Params.maxAccumulationSamples);
+    float blendAlpha = hasHistory ? (1.0 / newWeight) : 1.0;
+    vec3 historyColor = hasHistory ? history.rgb : thisFrameEstimate;
+    vec3 resolved = mix(historyColor, thisFrameEstimate, blendAlpha);
+
+    imageStore(g_HistoryOutput, pixel, vec4(resolved, newWeight));
+}
