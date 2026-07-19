@@ -49,7 +49,15 @@ namespace renderer::debug {
         // The descriptor's own combined-image-sampler binding is left pointing at a 1x1 dummy
         // image at Init() time (never actually sampled from before the first real RecordView()
         // call rewrites it) purely so the descriptor set starts in a valid, fully-bound state.
-        void Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue, VkExtent2D outputExtent);
+        // `exposureStateBuffer` is renderer::PostProcessPass::GetExposureStateBuffer() -- the SAME
+        // persistent { float currentEV100; float currentAvgLuminance; } SSBO PostProcessComposite.
+        // comp reads, bound ONCE here (never rewritten, unlike g_Source) since it's a fixed-identity
+        // buffer for this pipeline's entire lifetime. DebugBufferView.comp's kModeTonemap path
+        // reads it to apply the same exposure normalization PostProcessComposite.comp applies,
+        // instead of feeding raw real-lux HDR radiance straight into ACES (which saturates to
+        // white -- see this class' caller in ClusterRenderPipeline::Init for Init ordering: the
+        // caller MUST call m_PostProcess.Init() before this, so the buffer already exists).
+        void Init(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue, VkExtent2D outputExtent, VkBuffer exposureStateBuffer);
 
         void Shutdown();
 
