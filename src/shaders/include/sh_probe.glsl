@@ -3,11 +3,14 @@
 
 #include "include/math_utils.glsl"
 
-// Shared L1 spherical-harmonics probe helpers for renderer::ScreenProbeGIPass -- see that class'
-// own comment for why L1 SH (4 coefficients per color channel) was chosen over a raw per-ray
-// octahedral radiance atlas: it makes both the gather pass' bilateral 4-probe blend and the
-// temporal pass' exponential blend a trivial per-coefficient mix(), with no resampling between
-// mismatched octahedral grids.
+// Shared L1 spherical-harmonics probe helpers, originally written for renderer::ScreenProbeGIPass
+// (that tile-probe screen-space GI pass has since been removed and replaced by the full-resolution
+// renderer::ScreenTracePass -- see this repo's own project memory). L1 SH (4 coefficients per color
+// channel) was chosen over a raw per-ray octahedral radiance atlas because it made both the gather
+// pass' bilateral 4-probe blend and the temporal pass' exponential blend a trivial per-coefficient
+// mix(), with no resampling between mismatched octahedral grids. NOTE: as of this cleanup pass, no
+// shader in this codebase includes this file any longer (ScreenProbeGIPass was its only consumer);
+// retained rather than deleted since removing it is outside a comment-only cleanup's scope.
 //
 // Coefficient order (matches the 4 channels of one rgba16f probe atlas texel, one texel per color
 // channel): c0 = Y00 (constant term), c1 = Y1,-1, c2 = Y1,0, c3 = Y1,1 -- the standard real SH
@@ -28,11 +31,11 @@ vec4 SHBasis4(vec3 d) {
 }
 
 // Fibonacci sphere distribution: kProbeRayCount points quasi-uniformly covering the FULL sphere
-// (not just a hemisphere -- see renderer::ScreenProbeGIPass's own class comment on why: this
-// engine's probes are placed exactly on a visible surface, so roughly half of every probe's own
-// rays self-occlude against its own local geometry on the very first sphere-trace/ray-query step;
-// this is the same trade-off DDGI-style volumetric probes accept in exchange for the simpler,
-// receiver-normal-independent ray set the task spec calls for).
+// (not just a hemisphere -- the since-removed ScreenProbeGIPass's probes were placed exactly on a
+// visible surface, so roughly half of every probe's own rays would self-occlude against its own
+// local geometry on the very first sphere-trace/ray-query step; this was the same trade-off
+// DDGI-style volumetric probes accept in exchange for the simpler, receiver-normal-independent ray
+// set that pass' task spec called for).
 vec3 FibonacciSphereDirection(uint i, uint n) {
     float y = 1.0 - (2.0 * float(i) + 1.0) / float(n);
     float radius = sqrt(max(0.0, 1.0 - y * y));

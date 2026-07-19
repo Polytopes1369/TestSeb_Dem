@@ -189,8 +189,9 @@ layout(std140, set = 0, binding = 7) uniform ResolveViewParamsUBO {
 
 // Minimal GBuffer (renderer::ClusterResolvePass -- see its own class comment): written alongside
 // g_OutputColor from the same per-pixel normal/albedo/depth this shader already reconstructs
-// below, consumed by renderer::ScreenProbeGIPass and this shader's own DEBUG_VIEW_MOTION_VECTORS /
-// DEBUG_VIEW_SPATIAL_PROBES modes.
+// below, consumed by this codebase's screen-space GI/lighting passes (renderer::ScreenTracePass,
+// renderer::ReflectionTrace, renderer::MegaLightsShade, et al.) and this shader's own
+// DEBUG_VIEW_MOTION_VECTORS / DEBUG_VIEW_SPATIAL_PROBES modes.
 layout(rg16f, set = 0, binding = 9) uniform writeonly image2D g_OutputNormal;
 layout(r32f, set = 0, binding = 10) uniform writeonly image2D g_OutputDepth;
 layout(rgba8, set = 0, binding = 11) uniform writeonly image2D g_OutputAlbedo;
@@ -319,9 +320,10 @@ void main() {
 
     vec3 finalColor = vec3(0.05, 0.05, 0.1);
     // GBuffer defaults for a background (no-geometry) pixel: depth = 0.0 (the far plane, reversed-Z
-    // -- see maths::mat4::PerspectiveVulkan's own comment, "LARGER is nearer" now) is renderer::
-    // ScreenProbeGIPass's validity sentinel for "do not place/gather a probe against this pixel" --
-    // mirrors renderer::SurfaceCachePass's own worldPosClear alpha=0 "never captured" convention.
+    // -- see maths::mat4::PerspectiveVulkan's own comment, "LARGER is nearer" now) is this
+    // codebase's shared "no geometry here" sentinel, read by every GI/lighting pass that samples
+    // this GBuffer (e.g. renderer::ReflectionTrace's own background-pixel check) -- mirrors
+    // renderer::SurfaceCachePass's own worldPosClear alpha=0 "never captured" convention.
     float gbufferDepth = 0.0;
     vec3 gbufferNormal = vec3(0.0, 1.0, 0.0);
     vec3 gbufferAlbedo = vec3(0.0);
@@ -698,10 +700,10 @@ void main() {
             finalColor = normal * 0.5 + 0.5;
         } else if (pc.viewMode == 12) { // DEBUG_VIEW_MOTION_VECTORS
             // Reconstruct this pixel's world position from its own NDC + the winning depth (the
-            // exact same unproject renderer::ScreenProbeGIPass's temporal pass performs for a
-            // probe's world position), then reproject with the PREVIOUS frame's viewProj to see
-            // where this same (static -- see ClusterRenderPipeline.h's own "Entity self-rotation"
-            // scope note) world point was on screen last frame.
+            // exact same unproject renderer::ReflectionTemporal.comp's own disocclusion test
+            // performs for its reprojected world position), then reproject with the PREVIOUS
+            // frame's viewProj to see where this same (static -- see ClusterRenderPipeline.h's own
+            // "Entity self-rotation" scope note) world point was on screen last frame.
             vec2 ndcXY = (pixelCenter / g_ViewParams.viewportSize) * 2.0 - 1.0;
             vec4 clipPos = vec4(ndcXY, gbufferDepth, 1.0);
             vec4 worldPos4 = inverse(g_ViewParams.viewProj) * clipPos;

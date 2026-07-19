@@ -161,7 +161,7 @@ namespace renderer {
         // (the winning hw-vs-sw arbitrated NDC depth, not a real depth-attachment image), kept in
         // VK_IMAGE_LAYOUT_GENERAL for its entire lifetime -- same convention every other consumer
         // of this exact image already follows (renderer::ATrousDenoisePass, renderer::
-        // ReflectionPass, renderer::ScreenProbeGIPass, renderer::MegaLightsPass). Binding it with a
+        // ReflectionPass, renderer::ScreenTracePass, renderer::MegaLightsPass). Binding it with a
         // real depth-attachment layout here mismatched the image's actual COLOR aspectMask and
         // produced a VUID-VkDescriptorImageInfo-imageLayout-09426 validation error (plus a cascade
         // of downstream errors once the shader actually sampled it) on every Debug run.
