@@ -224,6 +224,14 @@ namespace renderer {
         VkImage GetOutputImage() const { return m_OutputImage; }
         VkImageView GetOutputView() const { return m_OutputView; }
 
+        // Read-only access to the persistent { float currentEV100; float currentAvgLuminance; }
+        // SSBO (see m_ExposureStateBuffer's own comment) for other passes that need the SAME
+        // real, eye-adapted exposure this pass' own PostProcessComposite.comp reads -- currently
+        // only renderer::debug::DebugBufferViewPass (Debug-only), so its HDR buffer-viewer entries
+        // (Bloom, GI Composite, TAA/TSR output, etc.) tonemap with the same exposure normalization
+        // instead of feeding raw real-lux radiance straight into ACES (which saturates to white).
+        VkBuffer GetExposureStateBuffer() const { return m_ExposureStateBuffer.Handle(); }
+
     private:
         // Byte-for-byte mirror of PostProcessComposite.comp's PostProcessParamsUBO (std140).
         struct PostProcessParamsUBO {
