@@ -1,4 +1,4 @@
-#include "renderer/passes/ReflectionPass.h"
+﻿#include "renderer/passes/ReflectionPass.h"
 
 #include <format>
 #include <fstream>
@@ -242,7 +242,7 @@ namespace renderer {
             pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
             pipelineInfo.stage.module = shaderModule;
             pipelineInfo.stage.pName = "main";
-            VK_CHECK(vkCreateComputePipelines(m_Device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_TracePipeline));
+            VK_CHECK(vkCreateComputePipelines(m_Device, VulkanPipeline::GetPipelineCache(), 1, &pipelineInfo, nullptr, &m_TracePipeline));
             vkDestroyShaderModule(m_Device, shaderModule, nullptr);
             RegisterResource([this] { vkDestroyPipeline(m_Device, m_TracePipeline, nullptr); m_TracePipeline = VK_NULL_HANDLE; });
         }
@@ -343,7 +343,7 @@ namespace renderer {
             pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
             pipelineInfo.stage.module = shaderModule;
             pipelineInfo.stage.pName = "main";
-            VK_CHECK(vkCreateComputePipelines(m_Device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_TemporalPipeline));
+            VK_CHECK(vkCreateComputePipelines(m_Device, VulkanPipeline::GetPipelineCache(), 1, &pipelineInfo, nullptr, &m_TemporalPipeline));
             vkDestroyShaderModule(m_Device, shaderModule, nullptr);
             RegisterResource([this] { vkDestroyPipeline(m_Device, m_TemporalPipeline, nullptr); m_TemporalPipeline = VK_NULL_HANDLE; });
         }
@@ -444,7 +444,7 @@ namespace renderer {
             pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
             pipelineInfo.stage.module = shaderModule;
             pipelineInfo.stage.pName = "main";
-            VK_CHECK(vkCreateComputePipelines(m_Device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_GatherPipeline));
+            VK_CHECK(vkCreateComputePipelines(m_Device, VulkanPipeline::GetPipelineCache(), 1, &pipelineInfo, nullptr, &m_GatherPipeline));
             vkDestroyShaderModule(m_Device, shaderModule, nullptr);
             RegisterResource([this] { vkDestroyPipeline(m_Device, m_GatherPipeline, nullptr); m_GatherPipeline = VK_NULL_HANDLE; });
         }

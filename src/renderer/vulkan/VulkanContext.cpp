@@ -24,10 +24,12 @@
 #include <cmath>
 #include <cstddef>
 #include <cstring>
+#include <filesystem>
 #include <format>
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
+#include <system_error>
 #include <vector>
 
 
@@ -381,6 +383,12 @@ void VulkanContext::Init(std::string_view appName, GLFWwindow *window) {
   m_IndexBufferBytes = config::nanite::INDEX_BUFFER_BYTES;
 
   CreateLogicalDevice();
+
+  // E1 (loading-time optimization): must run right after the device exists (vkCreatePipelineCache
+  // needs m_Device) and before ANY renderer:: pass is constructed (every pass reads the resulting
+  // handle via VulkanPipeline::GetPipelineCache() at its own pipeline-creation call site) -- see
+  // CreatePipelineCache()'s own header comment for the full load/validate contract.
+  CreatePipelineCache();
 
   CreateCommandPool();
   AllocateCommandBuffer();
@@ -1021,6 +1029,135 @@ void VulkanContext::CreateLogicalDevice() {
   renderer::LoadRayTracingFunctions(m_Device, renderer::g_RTFunctions);
 }
 
+void VulkanContext::CreatePipelineCache() {
+  // E1 (loading-time optimization): "pipeline.cache" persists the driver's own compiled-pipeline
+  // blob across runs. Every VkPipeline in this codebase (~58 vkCreateComputePipelines/
+  // vkCreateGraphicsPipelines/vkCreateRayTracingPipelinesKHR call sites across ~35 files) is
+  // routed through the handle created here via VulkanPipeline::GetPipelineCache() -- see that
+  // static accessor's own header comment. Resolved exe-relative (core::ResolveExeRelativePath),
+  // same convention as scene.cache/gpu_profile.cfg.
+  const std::filesystem::path cachePath = core::ResolveExeRelativePath("pipeline.cache");
+
+  VkPhysicalDeviceProperties deviceProperties{};
+  vkGetPhysicalDeviceProperties(m_PhysicalDevice, &deviceProperties);
+
+  std::vector<char> cacheBlob;
+  bool blobValid = false;
+
+  std::ifstream inFile(cachePath, std::ios::binary | std::ios::ate);
+  if (inFile.is_open()) {
+    const std::streamsize fileSize = inFile.tellg();
+    if (fileSize >= static_cast<std::streamsize>(sizeof(VkPipelineCacheHeaderVersionOne))) {
+      cacheBlob.resize(static_cast<size_t>(fileSize));
+      inFile.seekg(0);
+      inFile.read(cacheBlob.data(), fileSize);
+      if (inFile.good() || inFile.eof()) {
+        // Validate the VkPipelineCacheHeaderVersionOne prefix ourselves (rather than only relying
+        // on vkCreatePipelineCache to reject/ignore a non-matching blob -- the spec permits that
+        // fallback but never requires it) so a mismatch can be logged with the SPECIFIC reason
+        // (stale GPU/driver vs. truncated/corrupt file) instead of failing silently. This prefix is
+        // the one portable part of an otherwise fully driver-defined, non-portable cache blob.
+        VkPipelineCacheHeaderVersionOne header{};
+        std::memcpy(&header, cacheBlob.data(), sizeof(header));
+        const bool headerSizeOk = header.headerSize == sizeof(VkPipelineCacheHeaderVersionOne);
+        const bool versionOk = header.headerVersion == VK_PIPELINE_CACHE_HEADER_VERSION_ONE;
+        const bool vendorOk = header.vendorID == deviceProperties.vendorID;
+        const bool deviceOk = header.deviceID == deviceProperties.deviceID;
+        const bool uuidOk = std::memcmp(header.pipelineCacheUUID, deviceProperties.pipelineCacheUUID, VK_UUID_SIZE) == 0;
+        blobValid = headerSizeOk && versionOk && vendorOk && deviceOk && uuidOk;
+        if (!blobValid) {
+          LOG_INFO(std::format(
+              "[VulkanContext] pipeline.cache header mismatch (headerSize {}=={}: {}, headerVersion "
+              "{}=={}: {}, vendorID 0x{:X}==0x{:X}: {}, deviceID 0x{:X}==0x{:X}: {}, "
+              "pipelineCacheUUID: {}) -- discarding, starting from an empty cache.",
+              header.headerSize, sizeof(VkPipelineCacheHeaderVersionOne), headerSizeOk,
+              static_cast<uint32_t>(header.headerVersion), static_cast<uint32_t>(VK_PIPELINE_CACHE_HEADER_VERSION_ONE), versionOk,
+              header.vendorID, deviceProperties.vendorID, vendorOk,
+              header.deviceID, deviceProperties.deviceID, deviceOk,
+              uuidOk ? "match" : "mismatch"));
+        }
+      }
+    } else if (fileSize >= 0) {
+      LOG_INFO(std::format("[VulkanContext] pipeline.cache is too small to contain a valid header "
+                           "({} bytes) -- discarding, starting from an empty cache.",
+                           static_cast<long long>(fileSize)));
+    }
+  } else {
+    LOG_INFO("[VulkanContext] No pipeline.cache found on disk (expected on first launch, or after a "
+             "driver/GPU change) -- starting from an empty cache.");
+  }
+
+  VkPipelineCacheCreateInfo cacheInfo{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+  if (blobValid) {
+    cacheInfo.initialDataSize = cacheBlob.size();
+    cacheInfo.pInitialData = cacheBlob.data();
+  }
+
+  VK_CHECK(vkCreatePipelineCache(m_Device, &cacheInfo, nullptr, &m_PipelineCache));
+
+  m_PipelineCacheWasHit = blobValid;
+  m_PipelineCacheLoadedBytes = blobValid ? cacheBlob.size() : 0;
+  LOG_INFO(std::format("[VulkanContext] Pipeline cache {}: {} bytes loaded from '{}'.",
+                       blobValid ? "HIT" : "MISS", m_PipelineCacheLoadedBytes, cachePath.string()));
+
+  // Publish the handle for every renderer:: pass' own pipeline-creation call site -- see
+  // VulkanPipeline::SetPipelineCache()'s own comment for why a static accessor is used here instead
+  // of threading a VkPipelineCache parameter through every pass' constructor/Init() signature.
+  VulkanPipeline::SetPipelineCache(m_PipelineCache);
+}
+
+void VulkanContext::SavePipelineCache() {
+  if (m_PipelineCache == VK_NULL_HANDLE) {
+    return;
+  }
+
+  size_t dataSize = 0;
+  VK_CHECK(vkGetPipelineCacheData(m_Device, m_PipelineCache, &dataSize, nullptr));
+  if (dataSize == 0) {
+    LOG_INFO("[VulkanContext] SavePipelineCache: driver reports 0 bytes of pipeline cache data -- "
+             "nothing to save.");
+    return;
+  }
+
+  std::vector<char> data(dataSize);
+  VK_CHECK(vkGetPipelineCacheData(m_Device, m_PipelineCache, &dataSize, data.data()));
+  // vkGetPipelineCacheData permits the second call to report a SMALLER size than the first query
+  // (e.g. a concurrent vkCreate*Pipelines* call shrinking the serialized form) -- trim to what was
+  // actually written so the saved file's own size always matches its real content.
+  data.resize(dataSize);
+
+  const std::filesystem::path finalPath = core::ResolveExeRelativePath("pipeline.cache");
+  const std::filesystem::path tempPath = core::ResolveExeRelativePath("pipeline.cache.tmp");
+
+  std::ofstream outFile(tempPath, std::ios::binary | std::ios::trunc);
+  if (!outFile.is_open()) {
+    LOG_WARNING(std::format("[VulkanContext] SavePipelineCache: failed to open '{}' for writing.", tempPath.string()));
+    return;
+  }
+  outFile.write(data.data(), static_cast<std::streamsize>(data.size()));
+  outFile.close();
+  if (!outFile) {
+    LOG_WARNING(std::format("[VulkanContext] SavePipelineCache: write to '{}' failed.", tempPath.string()));
+    std::error_code removeEc;
+    std::filesystem::remove(tempPath, removeEc);
+    return;
+  }
+
+  // Atomic on the same volume (both paths are the exe's own directory): a crash or power-loss
+  // between the write above and this rename can never leave pipeline.cache itself half-written --
+  // the OS either completes the rename or leaves the OLD pipeline.cache untouched, so a future
+  // launch's CreatePipelineCache() only ever sees a fully-written file (or none at all).
+  std::error_code renameEc;
+  std::filesystem::rename(tempPath, finalPath, renameEc);
+  if (renameEc) {
+    LOG_WARNING(std::format("[VulkanContext] SavePipelineCache: rename '{}' -> '{}' failed: {}",
+                            tempPath.string(), finalPath.string(), renameEc.message()));
+    return;
+  }
+
+  LOG_INFO(std::format("[VulkanContext] Saved pipeline cache: {} bytes to '{}'.", data.size(), finalPath.string()));
+}
+
 void VulkanContext::CreateCommandPool() {
   VkCommandPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
   poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
@@ -1474,7 +1611,7 @@ void VulkanContext::CreatePipelinesAndDescriptors() {
     pipelineInfo.stage.module = module;
     pipelineInfo.stage.pName = "main";
 
-    if (vkCreateComputePipelines(m_Device, VK_NULL_HANDLE, 1, &pipelineInfo,
+    if (vkCreateComputePipelines(m_Device, VulkanPipeline::GetPipelineCache(), 1, &pipelineInfo,
                                  nullptr, desc.outPipeline) != VK_SUCCESS) {
       throw std::runtime_error(
           std::string("Failed to create compute pipeline for ") +
@@ -1518,7 +1655,7 @@ void VulkanContext::CreatePipelinesAndDescriptors() {
       pipelineInfo.stage.pName = "main";
       pipelineInfo.stage.pSpecializationInfo = &specInfo;
 
-      if (vkCreateComputePipelines(m_Device, VK_NULL_HANDLE, 1, &pipelineInfo,
+      if (vkCreateComputePipelines(m_Device, VulkanPipeline::GetPipelineCache(), 1, &pipelineInfo,
                                    nullptr,
                                    &m_BoxFacePipelines[face]) != VK_SUCCESS) {
         throw std::runtime_error("Failed to create Box face compute pipeline!");
@@ -4204,6 +4341,20 @@ void VulkanContext::Shutdown() {
 
   if (m_Allocator != VK_NULL_HANDLE) {
     vmaDestroyAllocator(m_Allocator);
+  }
+
+  // E1 (loading-time optimization): persist this run's final pipeline-cache contents -- captures
+  // any pipeline created after main.cpp's own post-ClusterRenderPipeline::Init() save point (e.g. a
+  // Debug-only pass constructed later) -- before the cache and device are destroyed. Must run before
+  // vkDestroyDevice below: SavePipelineCache()'s vkGetPipelineCacheData call needs a live device.
+  SavePipelineCache();
+  // Clear the static accessor before destroying the handle it points at, so no dangling call
+  // (there should be none left at shutdown, but this keeps VulkanPipeline::GetPipelineCache() safe
+  // -- VK_NULL_HANDLE is always a legal "no cache" argument -- rather than a stale/destroyed one).
+  VulkanPipeline::SetPipelineCache(VK_NULL_HANDLE);
+  if (m_PipelineCache != VK_NULL_HANDLE) {
+    vkDestroyPipelineCache(m_Device, m_PipelineCache, nullptr);
+    m_PipelineCache = VK_NULL_HANDLE;
   }
 
   if (m_Device != VK_NULL_HANDLE) {

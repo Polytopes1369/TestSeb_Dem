@@ -26,6 +26,7 @@
 #include <cmath>
 #include <atomic>
 #include <string>
+#include <functional>
 
 #ifndef NDEBUG
 #include "core/debug/DebugTestPipeline.h"
@@ -367,7 +368,79 @@ static void KeyCallback(GLFWwindow* window, int key, int scancode, int action, i
 }
 #endif
 
+// A6 (loading-time cleanup): shared implementation of the "run a slow, self-contained, blocking
+// call on a worker thread while THIS thread keeps pumping GLFW's message queue" pattern. Both the
+// scene.cache build/load wait and the ClusterRenderPipeline::Init wait below need this: calling
+// either slow, synchronous, single-function call (geometry::RunVirtualGeometryCacheTest,
+// ClusterRenderPipeline::Init) directly on the thread that owns the GLFW window would stop
+// glfwPollEvents() from running for the whole duration (seconds to 20-30+ seconds), so Win32 never
+// services this window's message queue and the OS ghosts it as "Not Responding" (its standard hung-
+// window detection) even though the engine is working correctly -- the title bar couldn't even be
+// dragged. Neither call has an incremental-progress hook to poll (each is one monolithic function),
+// so the whole call is moved onto a worker thread while this thread keeps polling, plus a small
+// animated window-title cue so the user has some sign of life, until the worker thread finishes.
+//
+// `waitTitlePrefix`/`waitTitleSuffix` are concatenated around the current spinner frame ("|/-\\",
+// cycling every 100ms, identical cadence to the pre-dedup blocks) to form the animated title, e.g.
+// prefix="...Building geometry cache ", suffix=" (first run / scene change, please wait)" reproduces
+// that call site's exact original title text byte-for-byte; `doneTitle` replaces it once `job`
+// finishes. `jobName` is used only for the LOG_CRITICAL message if `job` throws (Debug/Release log
+// text, not user-visible window chrome), so the two call sites can still be told apart in
+// demo_log.txt despite sharing this one implementation. Mirrors the pre-dedup blocks' own try/catch
+// exactly: a thrown std::exception is caught, logged via LOG_CRITICAL, and treated as job failure
+// (returns false) rather than propagating past this function and crashing the process.
+static bool RunOnWorkerWithMessagePump(
+    GLFWwindow* window,
+    const char* jobName,
+    const char* waitTitlePrefix,
+    const char* waitTitleSuffix,
+    const char* doneTitle,
+    std::function<bool()> job)
+{
+    std::atomic<bool> jobDone{ false };
+    bool jobResult = false;
+    std::thread workerThread([&]() {
+        try {
+            jobResult = job();
+        }
+        catch (const std::exception& e) {
+            LOG_CRITICAL(std::format("[Main] {} threw: {}", jobName, e.what()));
+            jobResult = false;
+        }
+        // Release-store: publishes jobResult to the polling loop's acquire-load below before that
+        // loop can stop and join this thread.
+        jobDone.store(true, std::memory_order_release);
+    });
+
+    // Minimal "please wait" pump -- deliberately not a loading screen (out of scope): it only keeps
+    // Win32 message processing alive, which is both what stops the OS from considering the window
+    // hung AND what a title-bar drag needs to actually track the mouse. No frame is presented here.
+    static const char* kSpinnerFrames[] = { "|", "/", "-", "\\" };
+    uint32_t spinnerIndex = 0;
+    while (!jobDone.load(std::memory_order_acquire)) {
+        glfwPollEvents();
+        std::string waitTitle = std::string(waitTitlePrefix) + kSpinnerFrames[spinnerIndex] + waitTitleSuffix;
+        glfwSetWindowTitle(window, waitTitle.c_str());
+        spinnerIndex = (spinnerIndex + 1) % 4;
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    workerThread.join();
+    glfwSetWindowTitle(window, doneTitle);
+
+    return jobResult;
+}
+
 int main(int argc, char** argv) {
+    // E4 (startup-phase timing): captured as literally the first statement in main() so the
+    // "GLFW/window creation" phase below (and the final "total time to entering the main loop" log
+    // right before the frame loop starts) both measure from true process/engine start. Every
+    // `tStartupCheckpoint` reassignment below marks the END of one phase and the START of the next,
+    // so each phase's own logged duration always excludes whatever ran immediately before it --
+    // Debug-only phases (e.g. ImGui init) that don't exist in a Release build simply never advance
+    // the checkpoint, so the following phase's Release timing correctly has nothing to subtract out.
+    const auto tStartupBegin = std::chrono::steady_clock::now();
+    auto tStartupCheckpoint = tStartupBegin;
+
 #ifndef NDEBUG
     // --test-pipeline: replaces the interactive loop below with DebugTestPipeline::RunAll (see
     // that class's own comment) -- Debug-only, matching every other automated-validation feature
@@ -412,6 +485,14 @@ int main(int argc, char** argv) {
     // Fly-camera wheel-speed adjustment: core navigation feature, wired in both Debug and Release.
     glfwSetScrollCallback(window, ScrollCallback);
 
+    // E4 (startup-phase timing): "GLFW/window creation" phase -- glfwInit() + window/callback setup.
+    {
+        const auto tAfterWindow = std::chrono::steady_clock::now();
+        LOG_INFO(std::format("[Main] Startup phase 'GLFW window creation': {} ms.",
+            std::chrono::duration_cast<std::chrono::milliseconds>(tAfterWindow - tStartupCheckpoint).count()));
+        tStartupCheckpoint = tAfterWindow;
+    }
+
     VulkanContext vkContext;
     // Mirrors ClusterRenderPipeline::Init's own try/catch below: an exception escaping Init()
     // (bad SPIR-V, VkResult failure, unsupported surface config, ...) otherwise unwinds straight
@@ -425,6 +506,16 @@ int main(int argc, char** argv) {
         glfwDestroyWindow(window);
         glfwTerminate();
         return -1;
+    }
+
+    // E4 (startup-phase timing): "VulkanContext::Init" phase -- instance/device/swapchain creation,
+    // procedural geometry compute dispatch, entity buffer upload (see VulkanContext::Init's own
+    // sequencing comment for the full list of what runs inside this call).
+    {
+        const auto tAfterVulkanInit = std::chrono::steady_clock::now();
+        LOG_INFO(std::format("[Main] Startup phase 'VulkanContext::Init': {} ms.",
+            std::chrono::duration_cast<std::chrono::milliseconds>(tAfterVulkanInit - tStartupCheckpoint).count()));
+        tStartupCheckpoint = tAfterVulkanInit;
     }
 
 #ifndef NDEBUG
@@ -510,6 +601,18 @@ int main(int argc, char** argv) {
     // (falling back to 3 synthetic in-memory demo volumes if none exist yet) -- see
     // g_PcgVolumeInspector's own declaration-site comment.
     g_PcgVolumeInspector.Init();
+
+    // E4 (startup-phase timing): "ImGui init" phase -- covers ImGui context/backend bring-up plus
+    // every Debug-only editor panel constructed above (PcgGraphEditorPanel, the Node Data Inspector's
+    // demo graph, PcgVolumeInspector). Whole phase (timing included) does not exist in Release, so
+    // Release's own "VulkanContext::Init" -> "scene.cache build/load wait" phase timing correctly has
+    // nothing to subtract out for it.
+    {
+        const auto tAfterImGuiInit = std::chrono::steady_clock::now();
+        LOG_INFO(std::format("[Main] Startup phase 'ImGui + debug panel init': {} ms.",
+            std::chrono::duration_cast<std::chrono::milliseconds>(tAfterImGuiInit - tStartupCheckpoint).count()));
+        tStartupCheckpoint = tAfterImGuiInit;
+    }
 #endif
 
     // Builds the consolidated virtual geometry .cache file (scene.cache): reads back the spawned
@@ -524,56 +627,35 @@ int main(int argc, char** argv) {
         LOG_INFO("[Main] scene.cache is missing or out of date. Rebuilding geometry cache...");
         // RunVirtualGeometryCacheTest is one monolithic, synchronous call (full GPU geometry
         // readback + a per-entity cluster DAG build -- see ClusterDAG.h/VirtualGeometryCacheTest.h's
-        // own comments) that can block for minutes on a cold/mismatched cache. Calling it directly
-        // on this thread -- the same thread that owns the GLFW window -- would stop glfwPollEvents()
-        // from running for that whole time, so Win32 never services this window's message queue and
-        // the OS ghosts it as "Not Responding" (its standard hung-window detection) even though the
-        // engine is working correctly; the title bar can't even be dragged. There is no incremental-
-        // progress hook to poll here (it is a single function, not something restructured for this
-        // fix), so instead the whole call is moved onto a worker thread while this thread keeps
-        // pumping GLFW's message queue -- plus a small animated window-title cue so the user has
-        // some sign of life -- until the worker thread finishes.
-        std::atomic<bool> cacheBuildDone{ false };
-        bool cacheBuildResult = false;
-        std::thread cacheBuildThread([&]() {
-            try {
-                cacheBuildResult = geometry::RunVirtualGeometryCacheTest(
+        // own comments) that can block for minutes on a cold/mismatched cache -- see
+        // RunOnWorkerWithMessagePump's own comment (above main()) for why this runs on a worker
+        // thread with a message-pump spinner instead of directly on this (GLFW window-owning) thread.
+        const bool cacheBuildResult = RunOnWorkerWithMessagePump(
+            window, "RunVirtualGeometryCacheTest",
+            "Vulkan 1.3 Bindless Demoscene - Building geometry cache ",
+            " (first run / scene change, please wait)",
+            "Vulkan 1.3 Bindless Demoscene",
+            [&]() {
+                return geometry::RunVirtualGeometryCacheTest(
                     vkContext.GetDevice(), vkContext.GetAllocator(), vkContext.GetGraphicsQueue(), vkContext.GetCommandPool(),
                     vkContext.GetVertexBuffer(), vkContext.GetIndexBuffer(), vkContext.GetVertexSkinBuffer(),
                     vkContext.GetTotalVertexCount(), vkContext.GetTotalIndexCount(),
                     vkContext.GetEntityData(), vkContext.GetEntityCount());
-            }
-            catch (const std::exception& e) {
-                LOG_CRITICAL(std::format("[Main] RunVirtualGeometryCacheTest threw: {}", e.what()));
-                cacheBuildResult = false;
-            }
-            // Release-store: publishes cacheBuildResult to the polling loop's acquire-load below
-            // before that loop can stop and join this thread.
-            cacheBuildDone.store(true, std::memory_order_release);
-        });
-
-        // Minimal "please wait" pump -- deliberately not a loading screen (out of scope for this
-        // fix): it only keeps Win32 message processing alive, which is both what stops the OS from
-        // considering the window hung AND what a title-bar drag needs to actually track the mouse.
-        // No frame is presented here: the swapchain exists, but ClusterRenderPipeline (the only
-        // thing that knows how to record a frame) isn't built until after the cache is ready.
-        static const char* kSpinnerFrames[] = { "|", "/", "-", "\\" };
-        uint32_t spinnerIndex = 0;
-        while (!cacheBuildDone.load(std::memory_order_acquire)) {
-            glfwPollEvents();
-            std::string waitTitle = std::string("Vulkan 1.3 Bindless Demoscene - Building geometry cache ")
-                + kSpinnerFrames[spinnerIndex] + " (first run / scene change, please wait)";
-            glfwSetWindowTitle(window, waitTitle.c_str());
-            spinnerIndex = (spinnerIndex + 1) % 4;
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        }
-        cacheBuildThread.join();
-        glfwSetWindowTitle(window, "Vulkan 1.3 Bindless Demoscene");
+            });
 
         geometryCacheTestPassed = cacheBuildResult;
         if (geometryCacheTestPassed) {
             geometry::SaveCacheConfig(vkContext.GetTotalVertexCount(), vkContext.GetTotalIndexCount(), vkContext.GetEntityCount());
         }
+    }
+    // E4 (startup-phase timing): "scene.cache build/load wait" phase -- covers both the up-to-date
+    // (near-instant IsCacheUpToDate check) and rebuild (worker-thread RunVirtualGeometryCacheTest,
+    // possibly minutes) branches above alike, so this one log always reflects whichever actually ran.
+    {
+        const auto tAfterSceneCache = std::chrono::steady_clock::now();
+        LOG_INFO(std::format("[Main] Startup phase 'scene.cache build/load wait': {} ms.",
+            std::chrono::duration_cast<std::chrono::milliseconds>(tAfterSceneCache - tStartupCheckpoint).count()));
+        tStartupCheckpoint = tAfterSceneCache;
     }
     if (!geometryCacheTestPassed) {
         LOG_CRITICAL("[Main] Virtual geometry cache build FAILED — the clustered pipeline cannot run without scene.cache.");
@@ -641,46 +723,35 @@ int main(int argc, char** argv) {
         vkContext.GetEntityData()[vkContext.GetCreatureEntityIndex()].meshID;
 
     // ClusterRenderPipeline::Init() sequentially creates ~40 render passes' worth of GPU buffers/
-    // images/pipelines (many involving first-time driver-side SPIR-V pipeline compilation -- there
-    // is no persisted VkPipelineCache anywhere in this codebase, so this cost is paid fresh on
-    // EVERY launch, not just a cold scene.cache) plus several one-shot staged uploads, all on
-    // whichever thread calls it. It has no GLFW dependency of its own (every handle it touches --
-    // device/allocator/queue/commandPool/images -- was already created by VulkanContext::Init()
-    // above) and, like geometry::RunVirtualGeometryCacheTest() before it, is a single self-contained
-    // call that returns a bool. Calling it directly here -- right after the cache-build wait, which
-    // already had this exact problem -- would again stop glfwPollEvents() from running for the
-    // whole 20-30+ second duration, so Win32 ghosts the window as "Not Responding" a second time.
-    // Same worker-thread + polling-pump pattern as the cache-build wait above, reused verbatim
-    // (including the try/catch, since GpuBuffer allocation failures/missing SPIR-V files can still
-    // throw std::runtime_error here).
+    // images/pipelines (many involving first-time driver-side SPIR-V pipeline compilation -- E1
+    // (loading-time optimization) now routes every one of those through VulkanContext's persisted
+    // "pipeline.cache" (see VulkanContext::CreatePipelineCache()/VulkanPipeline::GetPipelineCache()'s
+    // own comments), so on a warm cache the driver can reuse already-compiled SPIR-V->ISA
+    // translations instead of paying the full compile cost fresh on every launch -- but a cold/
+    // first-ever/post-driver-update run still compiles everything, so this can still take seconds)
+    // plus several one-shot staged uploads, all on whichever thread calls it. It has no GLFW
+    // dependency of its own (every handle it touches -- device/allocator/queue/commandPool/images --
+    // was already created by VulkanContext::Init() above) and, like
+    // geometry::RunVirtualGeometryCacheTest() before it, is a single self-contained call that
+    // returns a bool -- see RunOnWorkerWithMessagePump's own comment (above main()) for why this
+    // runs on a worker thread with a message-pump spinner instead of directly on this thread.
     renderer::ClusterRenderPipeline clusterPipeline;
-    std::atomic<bool> pipelineInitDone{ false };
-    bool pipelineInitOk = false;
-    std::thread pipelineInitThread([&]() {
-        try {
-            pipelineInitOk = clusterPipeline.Init(pipelineInfo);
-        }
-        catch (const std::exception& e) {
-            LOG_CRITICAL(std::format("[Main] ClusterRenderPipeline::Init threw: {}", e.what()));
-            pipelineInitOk = false;
-        }
-        // Release-store: publishes pipelineInitOk to the polling loop's acquire-load below before
-        // that loop can stop and join this thread.
-        pipelineInitDone.store(true, std::memory_order_release);
-    });
+    const bool pipelineInitOk = RunOnWorkerWithMessagePump(
+        window, "ClusterRenderPipeline::Init",
+        "Vulkan 1.3 Bindless Demoscene - Initializing render pipeline ",
+        " (please wait)",
+        "Vulkan 1.3 Bindless Demoscene",
+        [&]() {
+            return clusterPipeline.Init(pipelineInfo);
+        });
 
-    static const char* kPipelineInitSpinnerFrames[] = { "|", "/", "-", "\\" };
-    uint32_t pipelineInitSpinnerIndex = 0;
-    while (!pipelineInitDone.load(std::memory_order_acquire)) {
-        glfwPollEvents();
-        std::string waitTitle = std::string("Vulkan 1.3 Bindless Demoscene - Initializing render pipeline ")
-            + kPipelineInitSpinnerFrames[pipelineInitSpinnerIndex] + " (please wait)";
-        glfwSetWindowTitle(window, waitTitle.c_str());
-        pipelineInitSpinnerIndex = (pipelineInitSpinnerIndex + 1) % 4;
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    // E4 (startup-phase timing): "ClusterRenderPipeline::Init" phase.
+    {
+        const auto tAfterPipelineInit = std::chrono::steady_clock::now();
+        LOG_INFO(std::format("[Main] Startup phase 'ClusterRenderPipeline::Init': {} ms.",
+            std::chrono::duration_cast<std::chrono::milliseconds>(tAfterPipelineInit - tStartupCheckpoint).count()));
+        tStartupCheckpoint = tAfterPipelineInit;
     }
-    pipelineInitThread.join();
-    glfwSetWindowTitle(window, "Vulkan 1.3 Bindless Demoscene");
 
     if (!pipelineInitOk) {
         LOG_CRITICAL("[Main] ClusterRenderPipeline initialization FAILED.");
@@ -691,6 +762,19 @@ int main(int argc, char** argv) {
         LOG_SHUTDOWN();
         return -1;
     }
+
+    // E1 (loading-time optimization): persist the pipeline cache immediately after the expensive
+    // first-run pipeline compiles above succeeded -- crash-safety: if anything later in startup
+    // throws or crashes, this run's newly-compiled pipelines are not lost, and the NEXT launch still
+    // benefits from them. See VulkanContext::SavePipelineCache()'s own comment; also called again in
+    // VulkanContext::Shutdown() to additionally capture any pipeline created after this point.
+    vkContext.SavePipelineCache();
+    // E4: also log pipeline-cache hit/miss here, alongside the phase timings above -- the actual
+    // hit/miss decision + loaded-byte-count logging already happened inside
+    // VulkanContext::CreatePipelineCache() itself (much earlier, right after device creation); this
+    // is a convenience summary line placed next to the rest of this startup timing report.
+    LOG_INFO(std::format("[Main] Pipeline cache: {} ({} bytes loaded at startup).",
+        vkContext.GetPipelineCacheWasHit() ? "HIT" : "MISS", vkContext.GetPipelineCacheLoadedBytes()));
 
 #ifndef NDEBUG
     // Phase 0.2 (UE5.8-parity PCG roadmap, "PCG Instance Draw Path"): proves renderer::
@@ -816,6 +900,12 @@ int main(int argc, char** argv) {
     // previous submission hasn't retired.
     VkFence asyncComputeFence = VK_NULL_HANDLE;
     VK_CHECK(vkCreateFence(vkContext.GetDevice(), &fenceInfo, nullptr, &asyncComputeFence));
+
+    // E4 (startup-phase timing): total time from process/engine start (tStartupBegin, captured as
+    // literally the first statement in main()) to right here, immediately before the frame loop
+    // starts -- the single top-level number the other per-phase logs above break down.
+    LOG_INFO(std::format("[Main] Total startup time (process start to main loop): {} ms.",
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - tStartupBegin).count()));
 
     LOG_INFO("Entering main loop.");
 
