@@ -3323,6 +3323,8 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
       ppSettings.exposureCompensationEV = config::postprocess::EXPOSURE_COMPENSATION_EV;
       ppSettings.adaptationSpeedUpEVPerSec = config::postprocess::EXPOSURE_ADAPTATION_SPEED_UP_EV_PER_SEC;
       ppSettings.adaptationSpeedDownEVPerSec = config::postprocess::EXPOSURE_ADAPTATION_SPEED_DOWN_EV_PER_SEC;
+      ppSettings.histogramLowPercent = config::postprocess::EXPOSURE_HISTOGRAM_LOW_PERCENT;
+      ppSettings.histogramHighPercent = config::postprocess::EXPOSURE_HISTOGRAM_HIGH_PERCENT;
       // Real-time "Post FX" toggles (ImGui, main.cpp): every effect below already has its own
       // zero-is-off strength knob (see config::postprocess's own comment on its *_ENABLED block)
       // -- White Balance/Color Correction are the two exceptions with no natural zero, so they
