@@ -11,6 +11,9 @@
 // channel blend mask) -- see that file's own header comment for why SampleTerrainHeight below is
 // one of its three required call sites.
 #include "river_spline.glsl"
+// Terrain hydrology feature: continental macro-relief band radii/amplitudes (gallery -> plains ->
+// mountains -> coast -> sea) shared with the erosion simulation -- see that file's own comment.
+#include "terrain_hydrology_params.glsl"
 
 // Kept low enough that the HIGHEST octave's wavelength still comfortably exceeds the terrain
 // entity's own vertex spacing (VulkanContext::GenerateGeometry()'s terrain call site uses
@@ -109,8 +112,48 @@ float TerrainHeightFbm(vec2 xz) {
 // rather than a one-sided "carve down only" clamp, since the spring's own authored height (2.2)
 // sits well above the ambient terrain there -- see river_spline.glsl's own kRiverControlHeight
 // comment.
+// Terrain hydrology feature: continental macro relief. Radial bands from the world origin
+// (radius jittered by a low-frequency angular noise so no band reads as a perfect circle):
+// the showcase gallery keeps the pre-existing small-amplitude look untouched, then rolling
+// plains rise into a mountain ring, then a coastal shelf falls to a sea floor well below
+// kHydroSeaLevelLocal -- the map becomes an island with beaches at the waterline. Every band is
+// built from C1-smooth fbm only (NO ridged folding -- RidgedNoiseOctave's C0 creases reproducibly
+// blow up ClusterDAG's simplifier at this mesh's coarse vertex spacing regardless of frequency,
+// see kTerrainRidgeWeight's own comment). Mountain sharpness comes from squaring a smooth fbm
+// ("billow" shaping, C1 everywhere) instead.
+float TerrainMacroRelief(vec2 xz) {
+    float r = length(xz);
+    // +/-14 world-unit radial jitter, ~0.013 angular frequency: coastline/mountain-ring wobble.
+    float wobble = (ValueNoise3D(vec3(xz.x * 0.013, 29.0, xz.y * 0.013)) * 2.0 - 1.0) * 14.0;
+    float rw = r + wobble;
+
+    // Band weights.
+    float plainsW   = smoothstep(kHydroGalleryRadius, kHydroPlainsEnd, rw);
+    float mountainW = smoothstep(kHydroPlainsEnd, kHydroMountainPeakIn, rw)
+                    * (1.0 - smoothstep(kHydroMountainPeakOut, kHydroCoastStart, rw));
+    float coastW    = smoothstep(kHydroCoastStart, kHydroCoastEnd, rw);
+
+    // Plains: gentle extra swell on top of the ambient fbm.
+    float plainsSwell = (ValueNoise3D(vec3(xz.x * 0.02, 47.0, xz.y * 0.02)) * 2.0 - 1.0)
+                      * kHydroPlainsSwell * plainsW;
+
+    // Mountains: billow-shaped smooth fbm (squared -> sharp-looking but C1-smooth peaks) plus a
+    // base uplift so valleys between peaks still sit above the plains.
+    float mfbm = ValueNoise3D(vec3(xz.x * 0.045, 71.0, xz.y * 0.045)) * 0.65
+               + ValueNoise3D(vec3(xz.x * 0.09,  83.0, xz.y * 0.09)) * 0.35;
+    float peaks = mfbm * mfbm; // Billow shaping, [0,1).
+    float mountains = (kHydroMountainUplift + peaks * kHydroMountainAmplitude) * mountainW;
+
+    // Coastal shelf: pulls everything down toward the sea floor past the mountain ring.
+    float coastDrop = (kHydroSeaFloorLocal) * coastW;
+
+    // The coastal drop REPLACES the inland relief rather than adding to it (a mountain shouldn't
+    // poke out of the open sea): cross-fade inland terms out as coastW rises.
+    return (plainsSwell + mountains) * (1.0 - coastW) + coastDrop;
+}
+
 float SampleTerrainHeight(vec2 xz) {
-    float ambient = TerrainHeightFbm(xz) * kTerrainAmplitude;
+    float ambient = TerrainHeightFbm(xz) * kTerrainAmplitude + TerrainMacroRelief(xz);
     float mask = RiverChannelMask(xz);
     if (mask <= 0.0) {
         return ambient;

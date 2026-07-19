@@ -274,6 +274,13 @@ namespace renderer {
         void SetAtmosCloudLighting(VkSampler skyViewLUTSampler, VkImageView skyViewLUTView,
             VkSampler cloudShadowSampler, VkImageView cloudShadowView);
 
+        // Terrain hydrology feature: binds renderer::TerrainHydrologySim's attributes texture
+        // (height, waterDepth, flow, moisture) into BOTH descriptor sets -- terrain_shading.glsl's
+        // biome blend samples it for wetness darkening / flow channels / beach placement that
+        // tracks the ERODED terrain instead of the analytic pre-erosion heights. Same two-set
+        // pattern and ordering contract as SetAtmosCloudLighting above.
+        void SetTerrainHydrology(VkSampler hydrologySampler, VkImageView hydrologyAttributesView);
+
         VkImage GetOutputColorImage() const { return m_OutputColorImage; }
         VkImageView GetOutputColorView() const { return m_OutputColorView; }
         VkImageView GetOutputNormalView() const { return m_OutputNormalView; }

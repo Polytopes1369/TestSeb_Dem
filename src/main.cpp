@@ -757,6 +757,12 @@ int main(int argc, char** argv) {
     pipelineInfo.creatureFurGeometry.creatureMeshID =
         vkContext.GetEntityData()[vkContext.GetCreatureEntityIndex()].meshID;
 
+    // Terrain hydrology feature: the erosion bake's attributes texture (height, waterDepth, flow,
+    // moisture) -- sampled every frame by the terrain biome shading (ClusterResolvePass) and the
+    // water fragment shader (WaterForwardPass), see those passes' own comments.
+    pipelineInfo.terrainHydrologyAttributesView = vkContext.GetTerrainHydrologyAttributesView();
+    pipelineInfo.terrainHydrologySampler = vkContext.GetTerrainHydrologySampler();
+
     // ClusterRenderPipeline::Init() sequentially creates ~40 render passes' worth of GPU buffers/
     // images/pipelines (many involving first-time driver-side SPIR-V pipeline compilation -- E1
     // (loading-time optimization) now routes every one of those through VulkanContext's persisted
@@ -1811,6 +1817,27 @@ int main(int argc, char** argv) {
                 ImGui::Separator();
                 ImGui::Checkbox("Fog Screen Space Scattering (F3)", &config::atmos::FOG_SCREEN_SPACE_SCATTERING_ENABLED);
                 ImGui::DragFloat("Fog Scatter Blur Radius (px)", &config::atmos::FOG_SCATTER_BLUR_RADIUS_PIXELS, 0.25f, 0.0f, 64.0f);
+
+                // --- Analytic Exponential Height Fog (PostProcessComposite.comp's ApplyHeightFog,
+                // UE5.8's own "Exponential Height Fog" closed form) -- distinct from the froxel
+                // volumetric fog above: this is the flat distance-fog tint every frame re-reads
+                // from config::postprocess:: (ClusterRenderPipeline's ppSettings), so every knob
+                // here is live. The on/off toggle itself lives in the Post FX tab (HEIGHT_FOG_ENABLED)
+                // next to its 15 sibling effect toggles; the TUNING lives here with the rest of the
+                // weather/atmosphere dials. ---
+                ImGui::Separator();
+                ImGui::TextUnformatted("Height Fog (analytic)");
+                ImGui::DragFloat("Fog Density", &config::postprocess::FOG_DENSITY, 0.001f, 0.0f, 0.5f, "%.4f");
+                float fogColor[3] = { config::postprocess::FOG_COLOR_R, config::postprocess::FOG_COLOR_G, config::postprocess::FOG_COLOR_B };
+                if (ImGui::ColorEdit3("Fog Color", fogColor)) {
+                    config::postprocess::FOG_COLOR_R = fogColor[0];
+                    config::postprocess::FOG_COLOR_G = fogColor[1];
+                    config::postprocess::FOG_COLOR_B = fogColor[2];
+                }
+                ImGui::DragFloat("Fog Height Falloff", &config::postprocess::FOG_HEIGHT_FALLOFF, 0.005f, 0.001f, 2.0f);
+                ImGui::DragFloat("Fog Height Offset", &config::postprocess::FOG_HEIGHT_OFFSET, 0.1f, -20.0f, 50.0f);
+                ImGui::DragFloat("Fog Start Distance", &config::postprocess::FOG_START_DISTANCE, 0.25f, 0.0f, 100.0f);
+                ImGui::DragFloat("Fog Max Opacity", &config::postprocess::FOG_MAX_OPACITY, 0.01f, 0.0f, 1.0f);
                 ImGui::TextDisabled("Dew Point: %.2f C", clusterPipeline.GetAtmosClimate().GetLastDewPointCelsius());
                 ImGui::TextDisabled("LCL Height: %.1f m", clusterPipeline.GetAtmosClimate().GetLastLCLHeightMeters());
 

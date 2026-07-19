@@ -9,6 +9,9 @@
 #include "core/IDManager.h"
 #include "core/InstanceRegistry.h"
 #include "renderer/MaterialParameterTable.h"
+// Terrain hydrology feature: the GPU water & erosion bake run before geometry generation -- see
+// m_TerrainHydrology's own member comment.
+#include "renderer/TerrainHydrologySim.h"
 // Phase 5 (Streaming & Monde roadmap, Part 2, Gap 3): world::CellManifest/world::CellCoord --
 // VulkanContext::GenerateGeometry() reads the same offline-baked world_data/cellmanifest.bin
 // main.cpp's own world::CellManifest instance loads, to bake each authored cell's real HLOD proxy
@@ -223,6 +226,15 @@ public:
     // influence" -- harmless since it is only ever consumed for entities carrying
     // core::EntityFlags::IsSkeletallyAnimated.
     VkBuffer GetVertexSkinBuffer() const { return m_VertexSkinBuffer; }
+
+    // Terrain hydrology feature: the erosion bake's sampled outputs (renderer::TerrainHydrologySim,
+    // run once at CreatePipelinesAndDescriptors() time, BEFORE any geometry generation). The
+    // attributes texture (height, waterDepth, flow, moisture) + sampler feed
+    // ClusterRenderPipelineCreateInfo so ClusterResolvePass (terrain biome shading) and
+    // WaterForwardPass (water fragment discard/tint) can sample the same bake every frame.
+    VkImageView GetTerrainHydrologyAttributesView() const { return m_TerrainHydrology.GetAttributesView(); }
+    VkSampler GetTerrainHydrologySampler() const { return m_TerrainHydrology.GetLinearSampler(); }
+
     const core::EntityData* GetEntityData() const { return m_InstanceRegistry.Data(); }
     // Returns the TOTAL entity count including the streaming pool (kTotalEntityCount), not just
     // the fixed showcase gallery -- every existing "iterate every entity" consumer (GlobalSDFPass's
@@ -481,6 +493,11 @@ private:
     // Rivers/waterfalls feature: geom_river.comp -- same shared Params UBO / DispatchGeometryCompute
     // path, own RiverParams struct (see GenerateRiver()'s own comment).
     VkPipeline m_RiverPipeline = VK_NULL_HANDLE;
+    // Terrain hydrology feature: geom_water_surface.comp -- the simulated sea/lakes/rivers water
+    // surface (see GenerateWaterSurface()'s own comment). Same shared Params UBO path as
+    // geom_plane.comp (byte-identical PlaneParams), but dispatched with
+    // m_GeometryDescriptorSetWaterSurface (binding 6 = the bake's water-surface texture).
+    VkPipeline m_WaterSurfacePipeline = VK_NULL_HANDLE;
     // Skeletal-animation feature: geom_creature.comp -- same shared Params UBO /
     // DispatchGeometryCompute path, own CreatureParams struct (see GenerateCreature()'s own
     // comment). Generates the procedural skinned creature's bind-pose mesh + per-vertex bone
@@ -499,6 +516,20 @@ private:
     VkDescriptorPool m_GeometryDescriptorPool = VK_NULL_HANDLE;
     VkDescriptorSetLayout m_GeometryLayout = VK_NULL_HANDLE;
     VkDescriptorSet m_GeometryDescriptorSet = VK_NULL_HANDLE;
+    // Terrain hydrology feature: a SECOND set from the same m_GeometryLayout, identical except
+    // binding 6 points at the bake's WATER-SURFACE texture instead of the mesh-height texture --
+    // geom_water_surface.comp's dispatch binds this one (see GenerateWaterSurface()). Two static
+    // sets rather than a vkUpdateDescriptorSets between the two dispatches: GenerateGeometry()
+    // batches every dispatch into ONE command buffer submitted at the end, so a mid-recording
+    // descriptor update would only take effect for the LAST rewrite, silently feeding both
+    // dispatches the same texture.
+    VkDescriptorSet m_GeometryDescriptorSetWaterSurface = VK_NULL_HANDLE;
+
+    // Terrain hydrology feature: the GPU water & erosion bake itself -- see
+    // renderer::TerrainHydrologySim's own header comment. Initialized at the top of
+    // CreatePipelinesAndDescriptors() (before the geometry descriptor sets that reference its
+    // output textures are written, and before any geometry generation samples them).
+    renderer::TerrainHydrologySim m_TerrainHydrology;
 
     VkPipelineLayout m_ComputePipelineLayout = VK_NULL_HANDLE;
     VkPipelineLayout m_GraphicsPipelineLayout = VK_NULL_HANDLE;
@@ -852,6 +883,19 @@ private:
         uint32_t meshID, maths::vec2 slot, float worldOffsetY,
         uint32_t& runningVertexOffset, uint32_t& runningIndexOffset);
 
+    // Terrain hydrology feature: dispatches m_WaterSurfacePipeline (geom_water_surface.comp) --
+    // the simulated water surface (sea + lakes + eroded river channels in one grid, vertex Y
+    // sampled from renderer::TerrainHydrologySim's water-surface texture, tucked under the
+    // terrain where dry -- see that shader's own header comment). Replaces GenerateWaterPlane()'s
+    // flat lake quad at the water entity; `worldOffsetY` must be the TERRAIN's own anchor (the
+    // sampled surface heights are terrain-local), NOT a fixed water level. Reuses PlaneParams
+    // (byte-identical Params UBO, same convention GenerateTerrain() established).
+    void GenerateWaterSurface(
+        VkCommandBuffer cmd,
+        float Span, uint32_t Segments,
+        uint32_t meshID, maths::vec2 slot, float worldOffsetY,
+        uint32_t& runningVertexOffset, uint32_t& runningIndexOffset);
+
     void GenerateCapsule(
         VkCommandBuffer cmd,
         float Radius, float Height,
@@ -988,6 +1032,10 @@ private:
     // is allowed to overwrite the same bytes (write-after-read; needs only the execution ordering a
     // barrier already provides, so it is folded into this same barrier rather than issuing a second
     // one).
+    // `descriptorSetOverride` (terrain hydrology feature): binds that set instead of
+    // m_GeometryDescriptorSet when non-null -- geom_water_surface.comp's dispatch passes
+    // m_GeometryDescriptorSetWaterSurface (see that member's own comment for why a second static
+    // set, not a mid-recording descriptor update). Every other caller leaves the default.
     void DispatchGeometryCompute(
         VkCommandBuffer cmd,
         VkPipeline pipeline,
@@ -998,7 +1046,8 @@ private:
         size_t pushConstantSize,
         uint32_t groupCountX,
         uint32_t groupCountY,
-        uint32_t groupCountZ);
+        uint32_t groupCountZ,
+        VkDescriptorSet descriptorSetOverride = VK_NULL_HANDLE);
 
     // DEBUG: copies back a small sample of the generated vertex/index SSBOs to host memory
     // and logs it via Logger, to verify the compute dispatch actually produced valid geometry.

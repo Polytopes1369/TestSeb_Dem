@@ -43,7 +43,8 @@ namespace renderer {
         VkBuffer fallbackVertexBuffer, VkBuffer fallbackIndexBuffer,
         const SurfaceCachePass::EntityDrawRange& waterEntityDrawRange, uint32_t waterEntityID,
         VkAccelerationStructureKHR tlasHandle, VkBuffer drawRangeBuffer,
-        const SurfaceCacheTraceContext& traceContext, VkExtent2D renderExtent) {
+        const SurfaceCacheTraceContext& traceContext, VkExtent2D renderExtent,
+        VkImageView hydrologyAttributesView, VkSampler hydrologySampler) {
         // Self-reinit (see ShadowMapPass's own migration comment for the identical pattern):
         // Shutdown() clears m_Device/m_Allocator, which RenderPass<WaterForwardPass>::Init() already
         // set to this call's values just before invoking this function -- restore them.
@@ -140,11 +141,14 @@ namespace renderer {
         RegisterResource([this] { vkDestroySampler(m_Device, m_BackgroundSnapshotSampler, nullptr); m_BackgroundSnapshotSampler = VK_NULL_HANDLE; });
 
         // =====================================================================================
-        // STEP 1 -- set 0 layout: 8 bindings (no shadow/World-Probe-Grid/MegaLights resources --
+        // STEP 1 -- set 0 layout: 9 bindings (no shadow/World-Probe-Grid/MegaLights resources --
         // water has no diffuse/shadowed term, see this class' own header comment). Binding 7 (Wave
         // 2, UE5.8 water/foam parity): FoamUBO, see include/foam_generation.glsl's own comment.
+        // Binding 8 (terrain hydrology feature): the erosion bake's attributes texture (height,
+        // waterDepth, flow, moisture) -- drives the dry-fragment discard, the depth-based
+        // absorption tint and the flow-driven foam boost, see WaterForward.frag.
         // =====================================================================================
-        VkDescriptorSetLayoutBinding bindings[8]{};
+        VkDescriptorSetLayoutBinding bindings[9]{};
         bindings[0] = { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr };         // MaterialParamsSSBO
         bindings[1] = { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, nullptr };           // EntityTransformSSBO (vertex-stage only)
         bindings[2] = { 2, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr }; // g_TLAS
@@ -153,14 +157,15 @@ namespace renderer {
         bindings[5] = { 5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr };         // EntityDrawRangeBuffer (HWRT)
         bindings[6] = { 6, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr }; // g_BackgroundSnapshot
         bindings[7] = { 7, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr };         // FoamUBO (Wave 2)
+        bindings[8] = { 8, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr }; // g_HydroAttributes (terrain hydrology)
 
         VkDescriptorPoolSize poolSizes[4]{};
         poolSizes[0] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 5 };             // bindings 0,1,3,4,5
         poolSizes[1] = { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1 }; // binding 2
-        poolSizes[2] = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1 };     // binding 6
+        poolSizes[2] = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2 };     // bindings 6, 8
         poolSizes[3] = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 };             // binding 7 (Wave 2)
         auto descSet = VulkanUtils::CreateDescriptorSetLayoutPoolAndSet(m_Device,
-            std::span{ bindings, 8 }, std::span{ poolSizes, 4 });
+            std::span{ bindings, 9 }, std::span{ poolSizes, 4 });
         m_SetLayout = descSet.layout;
         m_DescriptorPool = descSet.pool;
         m_Set = descSet.set;
@@ -212,7 +217,14 @@ namespace renderer {
         backgroundSnapshotInfo.imageView = m_BackgroundSnapshotView;
         backgroundSnapshotInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
-        VkWriteDescriptorSet writes[8]{};
+        // Terrain hydrology feature: the bake's attributes texture lives in GENERAL for its whole
+        // lifetime (TerrainHydrologySim's own storage-image convention), sampled read-only here.
+        VkDescriptorImageInfo hydroAttributesInfo{};
+        hydroAttributesInfo.sampler = hydrologySampler;
+        hydroAttributesInfo.imageView = hydrologyAttributesView;
+        hydroAttributesInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+        VkWriteDescriptorSet writes[9]{};
         writes[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_Set, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &materialParamsInfo, nullptr };
         writes[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_Set, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &entityTransformInfo, nullptr };
         writes[2] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_Set, 2, 0, 1, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, nullptr, nullptr, nullptr };
@@ -222,8 +234,9 @@ namespace renderer {
         writes[5] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_Set, 5, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &drawRangeInfo, nullptr };
         writes[6] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_Set, 6, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &backgroundSnapshotInfo, nullptr, nullptr };
         writes[7] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_Set, 7, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &foamParamsInfo, nullptr };
+        writes[8] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_Set, 8, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &hydroAttributesInfo, nullptr, nullptr };
 
-        vkUpdateDescriptorSets(m_Device, 8, writes, 0, nullptr);
+        vkUpdateDescriptorSets(m_Device, 9, writes, 0, nullptr);
 
         // =====================================================================================
         // STEP 3 -- pipeline layout: 3 sets (own set 0 above, plus SurfaceCacheTraceContext's set

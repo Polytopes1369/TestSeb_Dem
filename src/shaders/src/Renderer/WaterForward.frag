@@ -57,6 +57,13 @@ layout(std430, set = 0, binding = 5) readonly buffer EntityDrawRangeBuffer { Ent
 
 layout(set = 0, binding = 6) uniform sampler2D g_BackgroundSnapshot;
 
+// Terrain hydrology feature: the erosion bake's (height, waterDepth, flow, moisture) attributes
+// texture (renderer::TerrainHydrologySim). Drives the dry-fragment discard (the water-surface
+// mesh spans the whole map, tucking dry vertices under the terrain -- fragments that still
+// survive the depth test discard here), the depth-based absorption (real ERODED seabed depth,
+// consistent with the carved terrain mesh) and a flow-driven foam boost on simulated rivers.
+layout(set = 0, binding = 8) uniform sampler2D g_HydroAttributes;
+
 #include "include/mesh_sdf_trace.glsl"        // set 1
 #include "include/surface_cache_sampling.glsl" // set 2
 
@@ -157,6 +164,18 @@ void main() {
     float riverMask = 1.0 - smoothstep(kRiverBandInnerHalfWidth, kRiverBandOuterHalfWidth, riverDistance);
     float riverSlope = riverMask > 0.0 ? RiverSlopeAtT(riverT) : 0.0;
 
+    // --- Terrain hydrology feature: simulated water state at this fragment. The CLAMP in UV space
+    // makes everything past the simulated footprint read the border ring's open-sea texels (the
+    // oversized sea mesh, see geom_water_surface.comp). Dry fragments discard -- EXCEPT on the
+    // authored river/waterfall ribbon (riverMask > 0), which runs its own course above the
+    // simulation's water table and must never be trimmed by it. ---
+    vec4 hydro = texture(g_HydroAttributes, clamp(HydroUVFromLocalXZ(inWorldPos.xz), vec2(0.0), vec2(1.0)));
+    float hydroWaterDepth = hydro.g;
+    float hydroFlow = hydro.b;
+    if (hydroWaterDepth < kHydroMinWaterDepth && riverMask <= 0.0) {
+        discard;
+    }
+
     // Flow-mapped UV scroll: shifts the sampling coordinate upstream over time (so the noise
     // pattern itself appears to travel downstream, along riverTangentXZ) -- scaled by riverMask so
     // this is an exact no-op on the open lake (mask == 0, sampleXZ == inWorldPos.xz unchanged).
@@ -189,12 +208,17 @@ void main() {
     // repurposed as the maximum absorption blend strength (NOT a fixed-function blend alpha --
     // this shader composes manually, see this file's own header comment). ---
     vec2 screenUV = gl_FragCoord.xy / vec2(pc.viewportWidth, pc.viewportHeight);
-    // Depth reference is THIS fragment's own rasterized surface height (inWorldPos.y), not the
-    // flat-lake-only kWaterLevel constant: exactly equal to kWaterLevel on the lake (a flat plane,
-    // so this is a no-op there), but correctly follows the river ribbon's own authored, non-flat
-    // surface height upstream of the lake (see river_spline.glsl's own kRiverControlHeight comment
-    // for why a river's water surface is not a single fixed Y the way the lake's is).
-    float waterDepth = max(inWorldPos.y - SampleTerrainHeight(inWorldPos.xz), 0.0);
+    // Depth reference (terrain hydrology feature): the fragment's rasterized surface height minus
+    // the ERODED seabed (hydro.r is terrain-local -- anchor it to world with
+    // kHydroTerrainAnchorWorldY), so absorption tracks the same carved terrain the mesh shows. On
+    // the authored river/waterfall ribbon (which runs above the simulation's water table), fall
+    // back to the pre-hydrology analytic formula so the ribbon keeps its original shading.
+    float erodedSeabedWorldY = hydro.r + kHydroTerrainAnchorWorldY;
+    float waterDepth = max(inWorldPos.y - erodedSeabedWorldY, 0.0);
+    if (riverMask > 0.0) {
+        waterDepth = max(waterDepth * (1.0 - riverMask),
+                         riverMask * max(inWorldPos.y - SampleTerrainHeight(inWorldPos.xz), 0.0));
+    }
     // Attenuate the UV offset near the shore (shallow water) so the refraction distortion doesn't
     // visibly displace the shoreline itself -- same smoothstep-taper idiom terrain_shading.glsl's
     // own beach band already uses.
@@ -258,7 +282,11 @@ void main() {
     // to riverMask (am I on the channel at all) times riverSlope (how steep, unsigned m/m), so the
     // calm upstream reach stays a normal tinted-water look while the waterfall segment and any
     // sharp rapids read as visibly foamy, without needing a separate foam texture/material. ---
-    float whitewater = riverMask * clamp(riverSlope * 0.5, 0.0, 1.0);
+    // Terrain hydrology feature: SIMULATED river channels foam by their own flow speed too --
+    // the fast eroded runs light up with the same whitewater the authored ribbon gets from its
+    // slope, one shared brightening path for both.
+    float whitewater = max(riverMask * clamp(riverSlope * 0.5, 0.0, 1.0),
+                           clamp(hydroFlow * 0.4 - 0.15, 0.0, 1.0));
     outRGB = mix(outRGB, vec3(0.90, 0.95, 1.0), whitewater * 0.6);
 
     // --- Wave 2 (UE5.8 water/foam parity): wave-breaking foam on the OPEN LAKE -- distinct from the

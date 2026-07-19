@@ -324,7 +324,7 @@ namespace renderer {
         // Step 4's renderer::VirtualTextureManager resources -- see SetVirtualTexture()'s own
         // comment, 25 is Substrate's g_OutputMaterialID, 26 is Phase 1 Nanite advanced's
         // SplineControlPointsSSBO). ---
-        VkDescriptorSetLayoutBinding bindings[33]{};
+        VkDescriptorSetLayoutBinding bindings[34]{};
         bindings[0] = { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };         // ClusterCullMetadataSSBO
         bindings[1] = { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };         // CompressedClusterPoolSSBO
         bindings[2] = { 2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };          // g_HWClusterIDImage (r32ui)
@@ -367,16 +367,19 @@ namespace renderer {
         bindings[30] = { 30, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, lightFunctionTextureCount, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // g_LightFunctionTextures[]
         bindings[31] = { 31, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // g_CausticsTexture
         bindings[32] = { 32, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };         // CausticsUBO
+        // Terrain hydrology feature: binding 33 -- the first free slot past this shader's full
+        // 0-32 range. See SetTerrainHydrology()'s own comment.
+        bindings[33] = { 33, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // g_HydroAttributes
 
         VkDescriptorSetLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-        layoutInfo.bindingCount = 33;
+        layoutInfo.bindingCount = 34;
         layoutInfo.pBindings = bindings;
         VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &layoutInfo, nullptr, &m_SetLayout));
 
         VkDescriptorPoolSize poolSizes[4]{};
         poolSizes[0] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 10 };  // + material params, shadow page table, shadow feedback, entity transform, entity data, VT feedback, spline control points, bone matrices.
         poolSizes[1] = { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 9 };   // + g_OutputMaterialID (Substrate integration).
-        poolSizes[2] = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 6 + maskTextureCount + kMaxPhysicalPools + lightFunctionTextureCount }; // + g_ShadowPhysicalAtlas, g_PageTable, g_PhysicalPools[], g_SkyViewLUT, g_CloudShadowMap, g_CausticsTexture (F12), g_LightFunctionTextures[] (F12).
+        poolSizes[2] = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 7 + maskTextureCount + kMaxPhysicalPools + lightFunctionTextureCount }; // + g_ShadowPhysicalAtlas, g_PageTable, g_PhysicalPools[], g_SkyViewLUT, g_CloudShadowMap, g_CausticsTexture (F12), g_LightFunctionTextures[] (F12), g_HydroAttributes (terrain hydrology).
         poolSizes[3] = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 5 };  // + g_ShadowSunLevels, VirtualTextureVolumeUBO, CausticsUBO (F12).
 
         VkDescriptorPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
@@ -677,7 +680,7 @@ namespace renderer {
         // VirtualTextureManager resources -- see SetVirtualTexture()'s own comment. Binding 24 is
         // Substrate's g_OutputMaterialID, 25 is Phase 1 Nanite advanced's SplineControlPointsSSBO. ---
         uint32_t lightFunctionTextureCount = static_cast<uint32_t>(m_LightFunctionImageInfos.size());
-        std::array<VkDescriptorSetLayoutBinding, 32> bindings{};
+        std::array<VkDescriptorSetLayoutBinding, 33> bindings{};
         bindings[0] = { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };  // ClusterCullMetadataSSBO
         bindings[1] = { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };  // CompressedClusterPoolSSBO
         bindings[2] = { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };  // g_SortedPixelList
@@ -719,6 +722,9 @@ namespace renderer {
         bindings[29] = { 29, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, lightFunctionTextureCount, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // g_LightFunctionTextures[]
         bindings[30] = { 30, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // g_CausticsTexture
         bindings[31] = { 31, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };         // CausticsUBO
+        // Terrain hydrology feature: binding 32 -- the first free slot past this shader's full
+        // 0-31 range. See SetTerrainHydrology()'s own comment.
+        bindings[32] = { 32, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }; // g_HydroAttributes
 
         VkDescriptorSetLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
         layoutInfo.bindingCount = static_cast<uint32_t>(bindings.size());
@@ -729,7 +735,7 @@ namespace renderer {
         poolSizes[0] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 13 }; // cluster metadata, compressed pool, sorted list, offsets, histogram, material params, shadow page table, shadow feedback, entity transform, entity data, VT feedback, spline control points, bone matrices
         poolSizes[1] = { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 6 };   // color, normal, depth, albedo, roughness-metallic, materialID
         poolSizes[2] = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 5 };  // view params, WPO globals, shadow sun levels, VT volume, CausticsUBO (F12)
-        poolSizes[3] = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, maskTextureCount + 5 + kMaxPhysicalPools + lightFunctionTextureCount }; // + shadow physical atlas, g_PageTable, g_PhysicalPools[], g_SkyViewLUT, g_CloudShadowMap, g_CausticsTexture (F12), g_LightFunctionTextures[] (F12)
+        poolSizes[3] = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, maskTextureCount + 6 + kMaxPhysicalPools + lightFunctionTextureCount }; // + shadow physical atlas, g_PageTable, g_PhysicalPools[], g_SkyViewLUT, g_CloudShadowMap, g_CausticsTexture (F12), g_LightFunctionTextures[] (F12), g_HydroAttributes (terrain hydrology)
 
         VkDescriptorPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
         poolInfo.maxSets = 1;
@@ -910,6 +916,18 @@ namespace renderer {
         writes[2] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ResolveBinnedSet, 26, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &skyViewInfo, nullptr, nullptr };
         writes[3] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ResolveBinnedSet, 27, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &cloudShadowInfo, nullptr, nullptr };
         vkUpdateDescriptorSets(m_Device, 4, writes, 0, nullptr);
+    }
+
+    void ClusterResolvePass::SetTerrainHydrology(VkSampler hydrologySampler, VkImageView hydrologyAttributesView) {
+        VkDescriptorImageInfo hydroInfo{ hydrologySampler, hydrologyAttributesView, VK_IMAGE_LAYOUT_GENERAL };
+
+        // Same "both descriptor sets, different binding indices" convention as
+        // SetAtmosCloudLighting above (33 in m_DescriptorSet, 32 in m_ResolveBinnedSet -- see each
+        // set's own layout comment for why the numbering differs).
+        VkWriteDescriptorSet writes[2]{};
+        writes[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_DescriptorSet, 33, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &hydroInfo, nullptr, nullptr };
+        writes[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_ResolveBinnedSet, 32, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &hydroInfo, nullptr, nullptr };
+        vkUpdateDescriptorSets(m_Device, 2, writes, 0, nullptr);
     }
 
     void ClusterResolvePass::SetVirtualTexture(const VirtualTextureManager& vt, const maths::vec2& worldMinXZ,

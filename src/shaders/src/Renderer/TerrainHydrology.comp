@@ -1,0 +1,290 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+
+// Terrain hydrology feature: GPU pipe-model water & hydraulic erosion simulation, baked ONCE at
+// startup by renderer::TerrainHydrologySim (deterministic -- fixed iteration count, no RNG state,
+// no time input -- so the geometry cache built from its output stays valid across runs). Classic
+// virtual-pipes scheme (Mei/Decaudin/Hu 2007): rain falls, water exchanges between 4-neighbor
+// cells through virtual pipes proportionally to hydraulic head difference, flowing water erodes
+// height into suspended sediment up to a slope-and-speed-dependent capacity, excess sediment
+// deposits back, sediment advects with the flow (semi-Lagrangian), standing water evaporates.
+// The sea is an open boundary: a border ring is re-filled to sea level every iteration, so the
+// ocean never drains and coastal cells below sea level flood into beaches/bays.
+//
+// Single shader, mode branches in main() (same convention AtmosSkyLUTs.comp / GlobalSDFComposite
+// .comp establish). One iteration = modes 1 -> 2 -> 3 -> 4 in order, with a full memory barrier
+// between each (owned by TerrainHydrologySim::Run). After the loop: a separable Gaussian blur
+// (modes 5/6) produces the LOW-PASSED mesh height (the 4-world-unit-spacing terrain mesh must
+// never sample sub-vertex-wavelength erosion detail -- ClusterDAG's simplifier blows up on
+// per-vertex-aliased curvature, see terrain_noise.glsl's kTerrainRidgeWeight comment; the
+// full-resolution field goes to SHADING instead, where no such constraint exists) and the
+// moisture mask, then mode 7 packs the sampled output textures.
+//
+// All grids are kHydroResolution^2 storage images in VK_IMAGE_LAYOUT_GENERAL for the whole bake.
+
+#include "include/terrain_noise.glsl" // SampleTerrainHeight -- the SAME function the mesh used pre-hydrology.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(r32f,    binding = 0) uniform image2D g_Height;      // Terrain height, local units. Eroded in place.
+layout(r32f,    binding = 1) uniform image2D g_BaseHeight;  // Initial (pre-erosion) height -- carve/deposit clamp reference.
+layout(r32f,    binding = 2) uniform image2D g_Water;       // Standing water depth.
+layout(rgba32f, binding = 3) uniform image2D g_Flux;        // Outflow flux (L, R, T, B) -- persistent, damped.
+layout(rg32f,   binding = 4) uniform image2D g_Velocity;    // Depth-averaged water velocity (cells/iteration).
+layout(r32f,    binding = 5) uniform image2D g_SedimentA;   // Suspended sediment (ping).
+layout(r32f,    binding = 6) uniform image2D g_SedimentB;   // Suspended sediment (pong -- advection target).
+layout(r32f,    binding = 7) uniform image2D g_TempA;       // Blur scratch (mesh height / moisture chains).
+layout(r32f,    binding = 8) uniform image2D g_TempB;       // Blur scratch.
+// Sampled outputs (written by the finalize/blur modes, consumed by geom_terrain.comp,
+// geom_water_surface.comp, ClusterResolve*.comp and WaterForward.frag):
+layout(r32f,    binding = 9)  uniform image2D g_MeshHeightOut;   // Low-passed eroded height (mesh-safe).
+layout(rgba16f, binding = 10) uniform image2D g_AttributesOut;   // (height, waterDepth, flow, moisture).
+layout(r32f,    binding = 11) uniform image2D g_WaterSurfaceOut; // Water surface Y (local), tucked under terrain where dry.
+
+layout(push_constant) uniform HydrologyPC {
+    int mode;
+    // Blur modes (5/6): which scratch pair to convolve and the source selector -- see
+    // TerrainHydrologySim::Run's own blur-chain comments.
+    int blurSource; // 0: g_Height -> g_TempA (mesh-height chain seed). 1: water mask -> g_TempA (moisture seed). 2: g_TempA <-> g_TempB pass.
+    int blurHorizontal; // 1 = horizontal pass, 0 = vertical.
+    int _pad0;
+} pc;
+
+const int kModeInit         = 0;
+const int kModeFlux         = 1;
+const int kModeWater        = 2;
+const int kModeErodeDeposit = 3;
+const int kModeAdvect       = 4;
+const int kModeBlurSeed     = 5; // Seeds g_TempA from pc.blurSource (no convolution).
+const int kModeBlurPass     = 6; // One separable Gaussian pass g_TempA -> g_TempB (or back).
+const int kModeFinalizeMesh = 7; // g_TempB -> g_MeshHeightOut.
+const int kModeFinalize     = 8; // Packs g_AttributesOut (moisture from g_TempB) + g_WaterSurfaceOut.
+
+ivec2 ClampCoord(ivec2 c) {
+    return clamp(c, ivec2(0), ivec2(kHydroResolution - 1));
+}
+
+// Hydraulic head (terrain + water) at a clamped coordinate -- what the pipe flux responds to.
+float HeadAt(ivec2 c) {
+    c = ClampCoord(c);
+    return imageLoad(g_Height, c).r + imageLoad(g_Water, c).r;
+}
+
+// The showcase gallery keeps its authored floor: erosion strength fades to zero inside
+// kHydroGalleryRadius (with a soft shoulder), exactly matching the macro-relief band layout.
+float ErosionStrengthAt(vec2 localXZ) {
+    return smoothstep(kHydroGalleryRadius * 0.8, kHydroGalleryRadius * 1.25, length(localXZ));
+}
+
+vec2 LocalXZFromCoord(ivec2 c) {
+    return (vec2(c) + 0.5) / float(kHydroResolution) * kHydroFootprint - kHydroFootprint * 0.5;
+}
+
+// True while `c` sits in the open-boundary border ring (outermost 2 texels): re-filled to sea
+// level every iteration so the ocean acts as an infinite reservoir instead of draining.
+bool IsOceanBoundary(ivec2 c) {
+    return c.x < 2 || c.y < 2 || c.x >= kHydroResolution - 2 || c.y >= kHydroResolution - 2;
+}
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    if (coord.x >= kHydroResolution || coord.y >= kHydroResolution) {
+        return;
+    }
+    vec2 localXZ = LocalXZFromCoord(coord);
+
+    if (pc.mode == kModeInit) {
+        // Base terrain from the SAME analytic function the mesh generator used pre-hydrology
+        // (terrain_noise.glsl, now including the continental macro relief) -- the simulation's
+        // starting point is bit-exact with what the mesh would have been without erosion.
+        float h = SampleTerrainHeight(localXZ);
+        imageStore(g_Height, coord, vec4(h));
+        imageStore(g_BaseHeight, coord, vec4(h));
+        // Initial flood: everything below sea level starts submerged (the sea, coastal bays).
+        imageStore(g_Water, coord, vec4(max(0.0, kHydroSeaLevelLocal - h)));
+        imageStore(g_Flux, coord, vec4(0.0));
+        imageStore(g_Velocity, coord, vec4(0.0));
+        imageStore(g_SedimentA, coord, vec4(0.0));
+        imageStore(g_SedimentB, coord, vec4(0.0));
+        return;
+    }
+
+    if (pc.mode == kModeFlux) {
+        // Pipe flux update: outflow toward each lower-head neighbor grows proportionally to the
+        // head difference; damped so standing waves settle. Scaled afterward so a cell can never
+        // push out more water than it holds (the standard virtual-pipes non-negativity fix).
+        float head = HeadAt(coord);
+        float water = imageLoad(g_Water, coord).r;
+        vec4 flux = imageLoad(g_Flux, coord) * kHydroFluxDamping;
+
+        flux.x = max(0.0, flux.x + kHydroPipeK * (head - HeadAt(coord + ivec2(-1, 0))));
+        flux.y = max(0.0, flux.y + kHydroPipeK * (head - HeadAt(coord + ivec2( 1, 0))));
+        flux.z = max(0.0, flux.z + kHydroPipeK * (head - HeadAt(coord + ivec2( 0,-1))));
+        flux.w = max(0.0, flux.w + kHydroPipeK * (head - HeadAt(coord + ivec2( 0, 1))));
+
+        float totalOut = flux.x + flux.y + flux.z + flux.w;
+        if (totalOut > water && totalOut > 1e-6) {
+            flux *= water / totalOut;
+        }
+        imageStore(g_Flux, coord, flux);
+        return;
+    }
+
+    if (pc.mode == kModeWater) {
+        // Water depth from flux divergence, then depth-averaged velocity from the net through-flow
+        // (the erosion step's speed term). Neighbor INFLOW is the neighbor's outflow toward us.
+        vec4 fluxOut = imageLoad(g_Flux, coord);
+        float inL = imageLoad(g_Flux, ClampCoord(coord + ivec2(-1, 0))).y; // Left neighbor's rightward flux.
+        float inR = imageLoad(g_Flux, ClampCoord(coord + ivec2( 1, 0))).x;
+        float inT = imageLoad(g_Flux, ClampCoord(coord + ivec2( 0,-1))).w; // Top neighbor's downward flux.
+        float inB = imageLoad(g_Flux, ClampCoord(coord + ivec2( 0, 1))).z;
+
+        float water = imageLoad(g_Water, coord).r;
+        float totalIn  = inL + inR + inT + inB;
+        float totalOut = fluxOut.x + fluxOut.y + fluxOut.z + fluxOut.w;
+        float waterNew = max(0.0, water + totalIn - totalOut);
+        imageStore(g_Water, coord, vec4(waterNew));
+
+        // Net directional through-flow -> velocity (cells/iteration), normalized by mean depth so
+        // shallow fast sheets erode like they should. Clamped: the erosion capacity term only
+        // needs relative magnitude, not physically-calibrated speed.
+        float meanDepth = max(0.5 * (water + waterNew), 1e-4);
+        vec2 v = vec2((inL - fluxOut.x) + (fluxOut.y - inR),
+                      (inT - fluxOut.z) + (fluxOut.w - inB)) * (0.5 / meanDepth);
+        v = clamp(v, vec2(-4.0), vec2(4.0));
+        imageStore(g_Velocity, coord, vec4(v, 0.0, 0.0));
+        return;
+    }
+
+    if (pc.mode == kModeErodeDeposit) {
+        float h = imageLoad(g_Height, coord).r;
+        float base = imageLoad(g_BaseHeight, coord).r;
+        float water = imageLoad(g_Water, coord).r;
+        float sediment = imageLoad(g_SedimentA, coord).r;
+        vec2 v = imageLoad(g_Velocity, coord).rg;
+
+        // Local slope from the height gradient (central differences, in height-units per cell).
+        float hL = imageLoad(g_Height, ClampCoord(coord + ivec2(-1, 0))).r;
+        float hR = imageLoad(g_Height, ClampCoord(coord + ivec2( 1, 0))).r;
+        float hT = imageLoad(g_Height, ClampCoord(coord + ivec2( 0,-1))).r;
+        float hB = imageLoad(g_Height, ClampCoord(coord + ivec2( 0, 1))).r;
+        vec2 grad = vec2(hR - hL, hB - hT) * 0.5;
+        float slope = length(grad) / kHydroCellSize;
+        float sinAlpha = slope / sqrt(1.0 + slope * slope);
+
+        // Capacity: slope- and speed-proportional, gated by actual water presence (a dry cell
+        // carries nothing) and by the gallery-protection mask.
+        float strength = ErosionStrengthAt(localXZ);
+        float capacity = kHydroCapacityK * max(sinAlpha, 0.02) * length(v)
+                       * clamp(water * 4.0, 0.0, 1.0) * strength;
+
+        if (sediment < capacity) {
+            // Erode height into suspension -- clamped so the sim can never dig more than
+            // kHydroMaxCarve below the pre-erosion terrain.
+            float erode = min(kHydroErodeRate * (capacity - sediment), max(0.0, h - (base - kHydroMaxCarve)));
+            h -= erode;
+            sediment += erode;
+        } else {
+            // Deposit excess suspension -- clamped symmetrically against over-burial.
+            float deposit = min(kHydroDepositRate * (sediment - capacity), max(0.0, (base + kHydroMaxDeposit) - h));
+            h += deposit;
+            sediment -= deposit;
+        }
+
+        // Rain + evaporation close the iteration's water budget; the ocean border ring is
+        // re-filled to sea level (open boundary -- the sea never drains, bays flood back in).
+        water = max(0.0, water * (1.0 - kHydroEvaporation) + kHydroRainPerIteration);
+        if (IsOceanBoundary(coord)) {
+            water = max(water, kHydroSeaLevelLocal - h);
+        }
+
+        imageStore(g_Height, coord, vec4(h));
+        imageStore(g_Water, coord, vec4(water));
+        imageStore(g_SedimentA, coord, vec4(sediment));
+        return;
+    }
+
+    if (pc.mode == kModeAdvect) {
+        // Semi-Lagrangian sediment advection: sample the sediment field at the back-traced
+        // position (manual bilinear over imageLoad -- storage images have no sampler here).
+        vec2 v = imageLoad(g_Velocity, coord).rg;
+        vec2 src = vec2(coord) - v;
+        vec2 f = fract(src);
+        ivec2 i0 = ivec2(floor(src));
+        float s00 = imageLoad(g_SedimentA, ClampCoord(i0 + ivec2(0, 0))).r;
+        float s10 = imageLoad(g_SedimentA, ClampCoord(i0 + ivec2(1, 0))).r;
+        float s01 = imageLoad(g_SedimentA, ClampCoord(i0 + ivec2(0, 1))).r;
+        float s11 = imageLoad(g_SedimentA, ClampCoord(i0 + ivec2(1, 1))).r;
+        float advected = mix(mix(s00, s10, f.x), mix(s01, s11, f.x), f.y);
+        imageStore(g_SedimentB, coord, vec4(advected));
+        return;
+    }
+
+    if (pc.mode == kModeBlurSeed) {
+        // Seeds the blur scratch chain. blurSource 0: raw eroded height (mesh-height chain).
+        // blurSource 1: water-presence mask (moisture chain -- wetness spreads a few meters past
+        // the actual waterline, driving the shading's damp-ground darkening).
+        float value;
+        if (pc.blurSource == 0) {
+            value = imageLoad(g_Height, coord).r;
+        } else {
+            float water = imageLoad(g_Water, coord).r;
+            float flow = length(imageLoad(g_Velocity, coord).rg) * clamp(water * 8.0, 0.0, 1.0);
+            value = clamp(water * 6.0 + flow * 0.75, 0.0, 1.0);
+        }
+        imageStore(g_TempA, coord, vec4(value));
+        return;
+    }
+
+    if (pc.mode == kModeBlurPass) {
+        // One separable 9-tap Gaussian pass. Horizontal reads g_TempA -> writes g_TempB; vertical
+        // reads g_TempB -> writes g_TempA -- TerrainHydrologySim::Run always issues them in pairs,
+        // so the chain's result is back in g_TempA after each full (H+V) blur.
+        const float w[5] = float[5](0.2270270, 0.1945946, 0.1216216, 0.0540540, 0.0162162);
+        ivec2 axis = (pc.blurHorizontal != 0) ? ivec2(1, 0) : ivec2(0, 1);
+        float sum;
+        if (pc.blurHorizontal != 0) {
+            sum = imageLoad(g_TempA, coord).r * w[0];
+            for (int i = 1; i < 5; ++i) {
+                sum += imageLoad(g_TempA, ClampCoord(coord + axis * i)).r * w[i];
+                sum += imageLoad(g_TempA, ClampCoord(coord - axis * i)).r * w[i];
+            }
+            imageStore(g_TempB, coord, vec4(sum));
+        } else {
+            sum = imageLoad(g_TempB, coord).r * w[0];
+            for (int i = 1; i < 5; ++i) {
+                sum += imageLoad(g_TempB, ClampCoord(coord + axis * i)).r * w[i];
+                sum += imageLoad(g_TempB, ClampCoord(coord - axis * i)).r * w[i];
+            }
+            imageStore(g_TempA, coord, vec4(sum));
+        }
+        return;
+    }
+
+    if (pc.mode == kModeFinalizeMesh) {
+        // The blurred height chain result (g_TempA after the H+V pairs) becomes the mesh height:
+        // low-passed to >= ~8 world-unit wavelengths, safe for the 4-unit-spacing terrain mesh
+        // (see this file's own header comment on the ClusterDAG constraint).
+        imageStore(g_MeshHeightOut, coord, vec4(imageLoad(g_TempA, coord).r));
+        return;
+    }
+
+    if (pc.mode == kModeFinalize) {
+        float h = imageLoad(g_Height, coord).r;
+        float water = imageLoad(g_Water, coord).r;
+        vec2 v = imageLoad(g_Velocity, coord).rg;
+        // Flow signal: speed where there is actually water -- rivers/streams light up, still
+        // lakes/sea stay near zero (they get their look from depth instead).
+        float flow = clamp(length(v) * clamp(water * 8.0, 0.0, 1.0), 0.0, 4.0);
+        // Moisture: the blurred water/flow mask left in g_TempA by the moisture blur chain.
+        float moisture = clamp(imageLoad(g_TempA, coord).r, 0.0, 1.0);
+        imageStore(g_AttributesOut, coord, vec4(h, water, flow, moisture));
+
+        // Water surface: real surface where submerged, tucked UNDER the terrain where dry (the
+        // water-surface mesh's dry vertices hide below ground, double-guarded by the fragment
+        // discard -- see geom_water_surface.comp / WaterForward.frag).
+        float surface = (water > kHydroMinWaterDepth) ? (h + water) : (h - 0.08);
+        imageStore(g_WaterSurfaceOut, coord, vec4(surface));
+        return;
+    }
+}

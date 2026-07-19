@@ -18,6 +18,28 @@ layout(local_size_x = 8, local_size_y = 8) in;
 layout(std430, binding = 0) writeonly buffer VertexBuffer { Vertex vertices[]; };
 layout(std430, binding = 1) writeonly buffer IndexBuffer  { uint indices[]; };
 
+// Terrain hydrology feature: the ERODED, LOW-PASSED mesh height baked by renderer::
+// TerrainHydrologySim (TerrainHydrology.comp's g_MeshHeightOut) before any geometry generation
+// runs -- carved river valleys / deposited sediment now shape the actual mesh silhouette. Binding
+// 6 of the shared geometry descriptor set (see VulkanContext's m_GeometryLayout comment: unused
+// bindings in this shared-set design are an established harmless pattern -- only this shader and
+// geom_water_surface.comp declare it). The texture is deliberately the BLURRED height (>= ~8
+// world-unit wavelengths): this mesh's 4-unit vertex spacing must never sample sub-vertex erosion
+// detail (ClusterDAG simplifier blowup, see terrain_noise.glsl's kTerrainRidgeWeight comment) --
+// full-resolution detail reaches the screen through shading (terrain_shading.glsl) instead.
+layout(binding = 6) uniform sampler2D g_HydroMeshHeight;
+
+// Mesh height: hydrology texture inside the simulated footprint, analytic fallback outside (the
+// mesh and the sim share the same 300x300 footprint exactly, so the fallback only guards edge
+// interpolation). The blend near the border keeps the last texel row from smearing.
+float SampleMeshHeight(vec2 xz) {
+    vec2 uv = HydroUVFromLocalXZ(xz);
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
+        return SampleTerrainHeight(xz);
+    }
+    return textureLod(g_HydroMeshHeight, uv, 0.0).r;
+}
+
 layout(std140, binding = 2) uniform Params
 {
     float width;
@@ -54,15 +76,15 @@ void main()
     uint vIdx = x + z * widthSegments;
 
     Vertex v;
-    v.position   = vec3(xPos, SampleTerrainHeight(vec2(xPos, zPos)), zPos);
+    v.position   = vec3(xPos, SampleMeshHeight(vec2(xPos, zPos)), zPos);
 
     // Analytic central-difference normal: one grid cell's world-space width as the epsilon, tangents
     // along local X/Z (valid since a heightfield's base normal is always +Y).
     float eps = width / float(widthSegments);
-    float hL = SampleTerrainHeight(vec2(xPos - eps, zPos));
-    float hR = SampleTerrainHeight(vec2(xPos + eps, zPos));
-    float hD = SampleTerrainHeight(vec2(xPos, zPos - eps));
-    float hU = SampleTerrainHeight(vec2(xPos, zPos + eps));
+    float hL = SampleMeshHeight(vec2(xPos - eps, zPos));
+    float hR = SampleMeshHeight(vec2(xPos + eps, zPos));
+    float hD = SampleMeshHeight(vec2(xPos, zPos - eps));
+    float hU = SampleMeshHeight(vec2(xPos, zPos + eps));
     vec3 tangentX = vec3(2.0 * eps, hR - hL, 0.0);
     vec3 tangentZ = vec3(0.0, hU - hD, 2.0 * eps);
     v.normal     = normalize(cross(tangentZ, tangentX));
