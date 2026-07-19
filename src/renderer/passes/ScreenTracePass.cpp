@@ -1,4 +1,4 @@
-#include "renderer/passes/ScreenTracePass.h"
+﻿#include "renderer/passes/ScreenTracePass.h"
 
 #include "core/Logger.h"
 #include "renderer/vulkan/VulkanPipeline.h"
@@ -52,7 +52,7 @@ namespace renderer {
         // vkCmdClearColorImage (transfer-stage clear through VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
         // not a compute imageStore despite the helper's name) -- without this flag that call is a
         // validation-layer error (missing VK_IMAGE_USAGE_TRANSFER_DST_BIT), exactly as every other
-        // caller of that same helper (ReflectionPass/ScreenProbeGIPass, via
+        // caller of that same helper (e.g. renderer::ReflectionPass, via
         // VulkanUtils::CreateStorageSampledImage2D) already includes it for.
         imageInfo.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
         imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
@@ -136,8 +136,8 @@ namespace renderer {
         // (the winning hw-vs-sw arbitrated NDC depth, not a real depth-attachment image), kept in
         // VK_IMAGE_LAYOUT_GENERAL for its entire lifetime -- same convention every other consumer of
         // this exact image already follows (renderer::ATrousDenoisePass, renderer::ReflectionPass,
-        // renderer::ScreenProbeGIPass, renderer::MegaLightsPass, renderer::GICompositePass -- see
-        // that class' own identical fix). Same VUID-VkDescriptorImageInfo-imageLayout-09426
+        // renderer::MegaLightsPass, renderer::GICompositePass -- see that class' own identical fix).
+        // Same VUID-VkDescriptorImageInfo-imageLayout-09426
         // validation error (plus its downstream vkCmdDispatch cascade) as GICompositePass had.
         VkDescriptorImageInfo depthInfo{ m_NearestSampler, depthView, VK_IMAGE_LAYOUT_GENERAL };
         VkDescriptorImageInfo normalInfo{ m_NearestSampler, normalView, VK_IMAGE_LAYOUT_GENERAL };
@@ -168,7 +168,7 @@ namespace renderer {
         pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
         pipelineInfo.stage.module = shaderModule;
         pipelineInfo.stage.pName = "main";
-        VK_CHECK(vkCreateComputePipelines(m_Device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_Pipeline));
+        VK_CHECK(vkCreateComputePipelines(m_Device, VulkanPipeline::GetPipelineCache(), 1, &pipelineInfo, nullptr, &m_Pipeline));
         vkDestroyShaderModule(m_Device, shaderModule, nullptr);
 
         LOG_INFO("[ScreenTracePass] Initialized SSRT + World Probe fallback pipeline.");

@@ -46,4 +46,28 @@ public:
         VkPipelineLayout& outPipelineLayout,
         VkPipeline& outPipeline
     );
+
+    // E1 (loading-time optimization): persisted VkPipelineCache, set once by VulkanContext::
+    // CreatePipelineCache() (right after vkCreatePipelineCache succeeds) and reset to VK_NULL_HANDLE
+    // by VulkanContext::Shutdown() (right before the cache itself is destroyed) -- see
+    // VulkanContext.cpp's own CreatePipelineCache()/Shutdown() for the create/destroy lifecycle.
+    // Every renderer:: pass creates its own pipeline(s) via a direct vkCreateComputePipelines/
+    // vkCreateGraphicsPipelines/vkCreateRayTracingPipelinesKHR call (not through this class), so
+    // routing ALL of them through one shared cache without threading a VkPipelineCache parameter
+    // through every pass' constructor/Init() signature (a large, purely mechanical signature change
+    // across ~30 files) is done via this static accessor instead. Acceptable as an exception to this
+    // codebase's usual "no globals" preference for the same reason the existing renderer::
+    // g_RTFunctions loader-style global is: there is exactly ONE VulkanContext/VkDevice/
+    // VkPipelineCache alive at a time for this process's entire lifetime (never multiple concurrent
+    // instances, never re-created mid-run), so a static's usual "hidden shared mutable state" risk
+    // does not apply here -- every call site just wants "the one cache for the one device". Every
+    // vkCreate*Pipelines* function accepts VK_NULL_HANDLE (the default, and the value during the
+    // brief window before VulkanContext::CreatePipelineCache() has run, or after Shutdown() has
+    // cleared it) as "no cache", so every call site stays correct in that window too -- in practice
+    // VulkanContext::Init() creates the cache before any renderer:: pass exists.
+    static void SetPipelineCache(VkPipelineCache cache) { s_PipelineCache = cache; }
+    static VkPipelineCache GetPipelineCache() { return s_PipelineCache; }
+
+private:
+    static inline VkPipelineCache s_PipelineCache = VK_NULL_HANDLE;
 };

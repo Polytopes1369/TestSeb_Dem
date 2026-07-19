@@ -1,4 +1,4 @@
-#include "renderer/passes/ReflectionPass.h"
+﻿#include "renderer/passes/ReflectionPass.h"
 
 #include <format>
 #include <fstream>
@@ -120,10 +120,12 @@ namespace renderer {
             VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
         RegisterResource([this] { m_ViewParamsBuffer.Destroy(); });
 
-        // One-time UNDEFINED -> GENERAL transition + neutral-default clear, mirrors
-        // ScreenProbeGIPass::Init's own STEP 1 pattern: radiance/worldPos start at a=0 (never
-        // traced -- see kWorldPosFormat's own "validity" comment), normal = oct-encoded +Y (an
-        // arbitrary but valid direction).
+        // One-time UNDEFINED -> GENERAL transition + neutral-default clear (this codebase's
+        // established "give a ping-pong GI image a defined neutral starting value" idiom, see
+        // VulkanUtils::ClearComputeImageToGeneral's own comment -- originally established by the
+        // since-removed ScreenProbeGIPass::Init's own STEP 1): radiance/worldPos start at a=0
+        // (never traced -- see kWorldPosFormat's own "validity" comment), normal = oct-encoded +Y
+        // (an arbitrary but valid direction).
         VulkanUtils::ExecuteOneShotCommands(m_Device, commandPool, queue, [&](VkCommandBuffer cmd) {
             VkClearColorValue zeroClear{}; zeroClear.float32[0] = 0.0f; zeroClear.float32[1] = 0.0f; zeroClear.float32[2] = 0.0f; zeroClear.float32[3] = 0.0f;
             VkClearColorValue normalClear{}; normalClear.float32[0] = 0.5f; normalClear.float32[1] = 0.5f; normalClear.float32[2] = 0.0f; normalClear.float32[3] = 0.0f;
@@ -242,7 +244,7 @@ namespace renderer {
             pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
             pipelineInfo.stage.module = shaderModule;
             pipelineInfo.stage.pName = "main";
-            VK_CHECK(vkCreateComputePipelines(m_Device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_TracePipeline));
+            VK_CHECK(vkCreateComputePipelines(m_Device, VulkanPipeline::GetPipelineCache(), 1, &pipelineInfo, nullptr, &m_TracePipeline));
             vkDestroyShaderModule(m_Device, shaderModule, nullptr);
             RegisterResource([this] { vkDestroyPipeline(m_Device, m_TracePipeline, nullptr); m_TracePipeline = VK_NULL_HANDLE; });
         }
@@ -343,7 +345,7 @@ namespace renderer {
             pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
             pipelineInfo.stage.module = shaderModule;
             pipelineInfo.stage.pName = "main";
-            VK_CHECK(vkCreateComputePipelines(m_Device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_TemporalPipeline));
+            VK_CHECK(vkCreateComputePipelines(m_Device, VulkanPipeline::GetPipelineCache(), 1, &pipelineInfo, nullptr, &m_TemporalPipeline));
             vkDestroyShaderModule(m_Device, shaderModule, nullptr);
             RegisterResource([this] { vkDestroyPipeline(m_Device, m_TemporalPipeline, nullptr); m_TemporalPipeline = VK_NULL_HANDLE; });
         }
@@ -444,7 +446,7 @@ namespace renderer {
             pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
             pipelineInfo.stage.module = shaderModule;
             pipelineInfo.stage.pName = "main";
-            VK_CHECK(vkCreateComputePipelines(m_Device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_GatherPipeline));
+            VK_CHECK(vkCreateComputePipelines(m_Device, VulkanPipeline::GetPipelineCache(), 1, &pipelineInfo, nullptr, &m_GatherPipeline));
             vkDestroyShaderModule(m_Device, shaderModule, nullptr);
             RegisterResource([this] { vkDestroyPipeline(m_Device, m_GatherPipeline, nullptr); m_GatherPipeline = VK_NULL_HANDLE; });
         }

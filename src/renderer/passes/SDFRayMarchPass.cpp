@@ -1,4 +1,4 @@
-// Debug-only (whole file compiled out in Release) -- see SDFRayMarchPass.h's own guard comment.
+﻿// Debug-only (whole file compiled out in Release) -- see SDFRayMarchPass.h's own guard comment.
 #ifndef NDEBUG
 
 #include "renderer/passes/SDFRayMarchPass.h"
@@ -537,7 +537,7 @@ namespace renderer {
         VkComputePipelineCreateInfo pipelineInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
         pipelineInfo.stage = stage;
         pipelineInfo.layout = m_PipelineLayout;
-        VK_CHECK(vkCreateComputePipelines(m_Device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_Pipeline));
+        VK_CHECK(vkCreateComputePipelines(m_Device, VulkanPipeline::GetPipelineCache(), 1, &pipelineInfo, nullptr, &m_Pipeline));
         RegisterResource([this] { vkDestroyPipeline(m_Device, m_Pipeline, nullptr); m_Pipeline = VK_NULL_HANDLE; });
 
         vkDestroyShaderModule(m_Device, compModule, nullptr);

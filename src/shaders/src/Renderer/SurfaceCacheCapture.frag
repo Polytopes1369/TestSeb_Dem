@@ -195,7 +195,8 @@ void main() {
     // position" header comment) -- the combined, GI-ready outgoing radiance for this texel.
     // Physically-based Lambertian normalization (2026-07-17 recalibration, see ClusterResolve.comp's
     // own identical comment): directLighting is now real illuminance in LUX, so the GI capture this
-    // feeds (renderer::WorldProbeGridPass/ScreenProbeGIPass) stays on the SAME physical radiance
+    // feeds (renderer::WorldProbeGridPass/renderer::ReflectionPass, both of which sample this Surface
+    // Cache radiance via surface_cache_sampling.glsl) stays on the SAME physical radiance
     // scale the direct-lit opaque/transparent passes use, instead of the indirect bounce reading
     // ~1000x brighter or dimmer than the direct light that produced it.
     const float kPI = 3.14159265359;

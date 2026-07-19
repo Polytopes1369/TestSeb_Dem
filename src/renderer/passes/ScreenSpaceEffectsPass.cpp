@@ -1,4 +1,4 @@
-#include "renderer/passes/ScreenSpaceEffectsPass.h"
+﻿#include "renderer/passes/ScreenSpaceEffectsPass.h"
 
 #include <cmath>
 #include <format>
@@ -64,7 +64,7 @@ namespace renderer {
             pipelineInfo.stage.module = shaderModule;
             pipelineInfo.stage.pName = "main";
             VkPipeline pipeline = VK_NULL_HANDLE;
-            VK_CHECK(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &pipeline));
+            VK_CHECK(vkCreateComputePipelines(device, VulkanPipeline::GetPipelineCache(), 1, &pipelineInfo, nullptr, &pipeline));
             vkDestroyShaderModule(device, shaderModule, nullptr);
             return pipeline;
         }

@@ -3,6 +3,7 @@
 #include <array>
 #include <cmath>
 #include <cstring>
+#include <format>
 
 #include "core/Logger.h"
 #include "renderer/vulkan/VulkanPipeline.h"
@@ -99,19 +100,38 @@ namespace renderer {
         // --- GPU-owned buffers ---
         m_HistogramBuffer.Create(allocator, kHistogramBinCount * sizeof(uint32_t),
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
-        m_ExposureStateBuffer.Create(allocator, sizeof(ExposureState),
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
+
+        // TRANSFER_SRC_BIT is only ever needed by the Debug-only exposure-telemetry readback below
+        // (see m_DebugExposureReadbackBuffer's own header comment) -- kept Debug-gated at the
+        // bit-flag level too, matching this codebase's "zero debug footprint in Release" rule (same
+        // convention as renderer::ClusterLODSelectionPass::Init()'s own m_DAGDecisionBuffer).
+        VkBufferUsageFlags exposureStateUsage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+#ifndef NDEBUG
+        exposureStateUsage |= VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+#endif
+        m_ExposureStateBuffer.Create(allocator, sizeof(ExposureState), exposureStateUsage, VMA_MEMORY_USAGE_GPU_ONLY);
         m_ParamsBuffer.Create(allocator, sizeof(PostProcessParamsUBO),
             VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
 
+#ifndef NDEBUG
+        m_DebugExposureReadbackBuffer.Create(allocator, sizeof(ExposureState),
+            VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_CPU_ONLY, /*mapped=*/true);
+#endif
+
         // One-shot clear of the histogram (bins start life referenced by AutoExposureHistogram.comp
         // before AutoExposureAdapt.comp has ever run once to clear them itself) and a sane initial
-        // exposure state (the manual EV100 for this pass' own Settings{} defaults -- aperture 4,
-        // 1/60s, ISO 100 -- so the very first frame isn't a jarring black-to-correct pop even before
-        // Auto Exposure's own histogram has converged).
+        // exposure state -- the manual EV100 for aperture 4 / 1/8000s / ISO 100 (this pass' own
+        // Settings{} defaults no longer apply here directly, but this matches the real-lux-
+        // calibrated EXPOSURE_* defaults in config::postprocess, see EXPOSURE_APERTURE's own
+        // EngineConfig.h comment), so the very first frame isn't a jarring black-to-correct pop
+        // while Auto Exposure's own histogram converges. (Task F11, 2026-07-19: previously hardcoded
+        // 1/60s here, a stale pre-recalibration value that no longer matches this scene's real-lux
+        // brightness -- harmless under Manual metering, which snaps instantly every frame regardless
+        // of this seed, but would have caused an unnecessary multi-second ramp on the very first
+        // frame now that Auto Exposure is enabled by default.)
         ExposureState initialState{};
-        initialState.currentEV100 = ComputeManualEV100(4.0f, 1.0f / 60.0f, 100.0f);
-        initialState.currentAvgLuminance = 0.18f;
+        initialState.currentEV100 = ComputeManualEV100(4.0f, 1.0f / 8000.0f, 100.0f);
+        initialState.currentAvgLuminance = 16000.0f; // 0.125 * 2^EV100 for the EV100 computed above.
 
         VulkanUtils::ExecuteOneShotCommands(m_Device, commandPool, queue, [&](VkCommandBuffer cmd) {
             vkCmdFillBuffer(cmd, m_HistogramBuffer.Handle(), 0, VK_WHOLE_SIZE, 0);
@@ -324,6 +344,10 @@ namespace renderer {
         m_HistogramBuffer.Destroy();
         m_ExposureStateBuffer.Destroy();
         m_ParamsBuffer.Destroy();
+#ifndef NDEBUG
+        m_DebugExposureReadbackBuffer.Destroy();
+        m_DebugExposureLogFrameCounter = 0u;
+#endif
 
         m_HistogramPipeline = VK_NULL_HANDLE; m_HistogramPipelineLayout = VK_NULL_HANDLE; m_HistogramSetLayout = VK_NULL_HANDLE; m_HistogramSet = VK_NULL_HANDLE;
         m_AdaptPipeline = VK_NULL_HANDLE; m_AdaptPipelineLayout = VK_NULL_HANDLE; m_AdaptSetLayout = VK_NULL_HANDLE; m_AdaptSet = VK_NULL_HANDLE;
@@ -343,6 +367,27 @@ namespace renderer {
         const maths::mat4& invViewProj, const maths::mat4& prevViewProj, const maths::vec3& cameraPositionWorld,
         const maths::mat4& viewProj, const maths::vec3& sunDirection, const maths::vec3& cameraForward,
         float fovYRadians, float aspectRatio, uint32_t frameIndex) {
+#ifndef NDEBUG
+        // Debug-only Auto Exposure telemetry (Task F11): the PREVIOUS frame's tail (below) recorded
+        // a copy of m_ExposureStateBuffer into m_DebugExposureReadbackBuffer on cmdLate; that
+        // cmdLate submission's frameFence is waited on at the top of every main.cpp loop iteration
+        // BEFORE RecordFrame() (and transitively this function) is ever called again -- see
+        // m_DebugExposureReadbackBuffer's own header comment for the full ordering argument -- so
+        // reading it here, before this frame's own copy overwrites it, is always safe and always
+        // exactly 1 frame stale. Throttled to ~10 Hz regardless of framerate so a multi-second
+        // validation capture stays readable instead of one line per rendered frame.
+        if (m_DebugExposureReadbackBuffer.MappedData() != nullptr) {
+            ++m_DebugExposureLogFrameCounter;
+            if (m_DebugExposureLogFrameCounter >= 6u) {
+                m_DebugExposureLogFrameCounter = 0u;
+                const ExposureState* readback = static_cast<const ExposureState*>(m_DebugExposureReadbackBuffer.MappedData());
+                LOG_INFO(std::format("[AutoExposure] frame={} EV100={:.4f} avgLuminance={:.2f} auto={}",
+                    frameIndex, readback->currentEV100, readback->currentAvgLuminance,
+                    settings.useAutoExposure ? "true" : "false"));
+            }
+        }
+#endif
+
         // --- Upload this frame's params UBO ---
         PostProcessParamsUBO params{};
         params.aperture = settings.aperture;
@@ -483,6 +528,8 @@ namespace renderer {
         adaptPC.exposureCompensationEV = settings.exposureCompensationEV;
         adaptPC.manualEV100 = ComputeManualEV100(settings.aperture, settings.shutterSpeedSeconds, settings.isoSensitivity);
         adaptPC.useAutoExposure = settings.useAutoExposure ? 1u : 0u;
+        adaptPC.histogramLowPercent = settings.histogramLowPercent;
+        adaptPC.histogramHighPercent = settings.histogramHighPercent;
 
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_AdaptPipeline);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_AdaptPipelineLayout, 0, 1, &m_AdaptSet, 0, nullptr);
@@ -515,6 +562,26 @@ namespace renderer {
         outputDep.memoryBarrierCount = 1;
         outputDep.pMemoryBarriers = &outputBarrier;
         vkCmdPipelineBarrier2(cmd, &outputDep);
+
+#ifndef NDEBUG
+        // Debug-only Auto Exposure telemetry (Task F11): copy this frame's freshly-written
+        // m_ExposureStateBuffer into the persistently-mapped readback buffer, consumed at the TOP
+        // of this same function next frame (see this function's own opening comment, and
+        // m_DebugExposureReadbackBuffer's header comment, for the full fence-ordering argument).
+        // Exactly renderer::ClusterLODSelectionPass::RecordDebugReadback()'s own 2-barrier pattern:
+        // #1 makes the Adapt stage's SHADER_STORAGE_WRITE visible to the copy, #2 makes the copy's
+        // TRANSFER_WRITE visible to a host read (HOST_COHERENT memory still requires this per spec).
+        VulkanUtils::RecordMemoryBarrier(cmd,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+
+        VkBufferCopy exposureCopyRegion{ 0, 0, sizeof(ExposureState) };
+        vkCmdCopyBuffer(cmd, m_ExposureStateBuffer.Handle(), m_DebugExposureReadbackBuffer.Handle(), 1, &exposureCopyRegion);
+
+        VulkanUtils::RecordMemoryBarrier(cmd,
+            VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_READ_BIT);
+#endif
     }
 
 }
