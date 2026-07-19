@@ -140,6 +140,7 @@
 #include "renderer/passes/FurStrandPass.h"
 #include "renderer/passes/HZBPass.h"
 #include "renderer/LightingTypes.h"
+#include "renderer/passes/ProceduralLightFunctionGenerator.h"
 #include "renderer/passes/ProceduralMaskGenerator.h"
 #include "renderer/passes/ReflectionPass.h"
 #include "renderer/passes/ScreenSpaceEffectsPass.h"
@@ -158,6 +159,7 @@
 #include "renderer/passes/DepthOfFieldPass.h"
 #include "renderer/passes/DepthOfFieldAccumulationPass.h"
 #include "renderer/passes/BloomPass.h"
+#include "renderer/passes/FogScreenSpaceScatteringPass.h"
 #include "renderer/passes/PostProcessPass.h"
 #include "renderer/passes/ScreenTracePass.h"
 #include "renderer/passes/GICompositePass.h"
@@ -939,6 +941,13 @@ namespace renderer {
         // class comment. GetMaskImageInfos() is threaded into all three passes below.
         ProceduralMaskGenerator m_MaskGenerator;
 
+        // F12 (UE5.8 rendering-parity gap: Texture-based Light Functions + projected Caustics):
+        // generates the bindless Light Function gobo array (light_functions.glsl) + the caustics
+        // pattern texture (caustics_projection.glsl) once at Init() time, before m_Resolve below is
+        // initialized (its own sole consumer) -- see ProceduralLightFunctionGenerator's own class
+        // comment.
+        ProceduralLightFunctionGenerator m_LightFunctionGenerator;
+
         // Generic multithreaded background-job pool (hardware_concurrency worker threads) -- see
         // core::LoadingManager's own class comment. Currently consumed by m_GlobalSDF::Init() to
         // fan its per-entity Mesh SDF bake out across every core instead of a single-threaded loop
@@ -1307,6 +1316,11 @@ namespace renderer {
         // own class comment. Recorded before m_PostProcess (below), whose composite shader samples
         // its GetOutputView() and adds it into the scene color.
         BloomPass m_Bloom;
+        // F3 (UE5.8 rendering-parity gap: Fog Screen Space Scattering): depth-aware bilateral spread
+        // of m_AtmosFog's own per-pixel in-scattered radiance, recorded immediately before
+        // m_PostProcess (below) -- see FogScreenSpaceScatteringPass's own class comment for why it
+        // must run adjacent to its one producer (m_AtmosFog) and one consumer (m_PostProcess).
+        FogScreenSpaceScatteringPass m_FogScatter;
         // Phase PP1 (post-process stack roadmap): Physical Camera / Auto Exposure / White Balance /
         // Color Correction / ACES Tone Mapping / Gamma Correction -- the normal-view-path blit
         // source instead of m_TAATSR's own raw HDR output directly (see PostProcessPass's own class

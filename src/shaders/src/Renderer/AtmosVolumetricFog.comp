@@ -86,6 +86,15 @@ layout(push_constant) uniform AtmosVolumetricFogPC {
     uint frameIndex;
     uint localFogVolumeCount; // Local Fog Volumes (G8): number of valid entries in g_LocalFogVolumes (0 = feature off).
     uint debugVizBounds;      // Debug-only bounds visualization (always 0 in Release -- see AtmosVolumetricFogPass::RecordUpdate).
+    // F2b (UE5.8 Lighting Channels): this froxel volume's OWN reception mask, ANDed against each
+    // candidate MegaLight's own MegaLightChannelMask() (megalights_types.glsl) in both the RIS target
+    // weight (MegaLightVolumeWeight below -- so an off-channel light is never even worth selecting)
+    // and the final in-scatter contribution. Defaults to 0x7u (every channel) so a scene that never
+    // touches config::megalights::FOG_LIGHTING_CHANNEL_MASK keeps its exact pre-F2b behavior: fog is a
+    // global atmospheric medium, not a channel-restricted gameplay actor, so by default it receives
+    // every light regardless of that light's own channel -- see AtmosVolumetricFogPass::RecordUpdate's
+    // own comment for the full rationale and how a designer can narrow it.
+    uint fogLightingChannelMask;
 } pc;
 
 vec3 GetCameraPosition() { return vec3(pc.cameraPositionX, pc.cameraPositionY, pc.cameraPositionZ); }
@@ -223,16 +232,6 @@ void InjectMediaProps(ivec3 coord) {
 
 // --- mode 1: InjectLight -------------------------------------------------------------------------
 
-// Isotropic (no surface normal -- a froxel is a point in a participating medium, not a surface)
-// single-sample RIS reservoir over g_Lights.lightCount MegaLights point lights -- same textbook WRS
-// algorithm shape as megalights_ris.glsl's own SelectLightRIS, but the target-weight proxy drops the
-// NdotL cosine term entirely (replaced with nothing -- there is no "facing direction" for a volume
-// sample point) since that term has no physical meaning here; kept as a SEPARATE function rather than
-// generalizing SelectLightRIS itself, matching this codebase's own established "duplicate small
-// per-shader weighting/trace functions rather than force a shared abstraction" convention (see
-// megalights_ris.glsl's own header comment).
-const uint kVolumeLightCandidateCount = 16u;
-
 // Calibrates this froxel fog's total in-scattered radiance (sun + point + local-volume contributions
 // below) against the engine's real-photometric-lux sun (renderer::LightingTypes.h's own
 // DirectionalLight::intensity = 10,000 lux, "2026-07-17 recalibration" -- see that struct's own
@@ -262,21 +261,72 @@ const uint kVolumeLightCandidateCount = 16u;
 // not a bug to delete -- see local_fog_volumes.glsl's own header comment), not overwhelming the scene.
 const float ATMOS_FOG_INSCATTER_INTENSITY_SCALE = 0.001;
 
-float MegaLightVolumeWeight(MegaLight light, vec3 worldPos) {
+// F2a (UE5.8 MegaLights "production-ready" pack: N-light volumetric fog): per-candidate RIS target
+// weight, now phase-function-weighted instead of the old distance/window/angular-only proxy -- a
+// froxel sample has no surface to apply NdotL/a BRDF to (see this file's own class comment), but it
+// DOES have a preferred scattering DIRECTION (the camera ray), so the Henyey-Greenstein phase
+// evaluated at THIS candidate's own arrival direction is this proxy's equivalent directional term,
+// biasing the reservoir draw toward lights whose scattering direction lines up with the froxel's own
+// forward-scattering lobe. The RIS estimator stays unbiased regardless of how well this proxy tracks
+// the true per-light contribution (see SelectVolumeLightRIS's own comment) -- phase is strictly
+// positive everywhere (HGPhase never returns exactly 0), so it never zeroes out a candidate that
+// legitimately contributes. F2b: ANDed with the fog's own reception mask (pc.fogLightingChannelMask)
+// against this light's MegaLightChannelMask() -- an off-channel light is weighted to exactly 0 so RIS
+// never wastes one of its few (~4-8) candidate draws selecting a light this fog volume must not
+// receive at all (see pc.fogLightingChannelMask's own comment for the default-all-channels rationale).
+float MegaLightVolumeWeight(MegaLight light, vec3 worldPos, vec3 viewDir) {
+    if ((MegaLightChannelMask(light) & pc.fogLightingChannelMask) == 0u) {
+        return 0.0;
+    }
+
     vec3 toLight = light.position - worldPos;
     float distSq = max(dot(toLight, toLight), 1.0e-4);
     float dist = sqrt(distSq);
+    vec3 toLightDir = toLight / dist;
     float normalizedDist = saturate(dist / max(light.radius, 1.0e-4));
     float nd2 = normalizedDist * normalizedDist;
     float window = saturate((1.0 - nd2 * nd2) * (1.0 - nd2 * nd2));
     // G3: per-type angular shaping (1 for a POINT light) so the fog's own RIS draw is biased away
     // from a spot/photometric light whose cone/profile barely reaches this froxel, exactly as the
     // surface RIS proxy (megalights_ris.glsl's MegaLightTargetWeight) is.
-    float w = light.intensity / distSq * window * MegaLightAngularShaping(light, toLight / dist);
+    vec3 arrivalDir = -toLightDir; // light -> froxel, matches GetSunDirection()'s own convention.
+    float phase = HGPhase(dot(arrivalDir, viewDir), ATMOS_FOG_PHASE_G);
+    float w = light.intensity / distSq * window * MegaLightAngularShaping(light, toLightDir) * phase;
     return min(w, 50.0);
 }
 
-bool SelectVolumeLightRIS(vec3 worldPos, uint seed, uint frameIndex, out uint outLightIndex, out float outInvPdf) {
+// F2a: per-reservoir candidate count -- ~4-8 TOTAL candidates across the kVolumeLightReservoirCount
+// independent reservoirs below (not megalights_ris.glsl's kMegaLightsCandidateCount == 16): this pass
+// runs one thread per FROXEL across the whole 3D grid (ATMOS_FOG_GRID_WIDTH * HEIGHT * DEPTH
+// invocations for InjectLight alone), so RIS candidate cost multiplies far faster here than a
+// full-resolution screen-space shader's per-PIXEL cost -- UE5.8's own bar for volumetric multi-light
+// is "plausible, converges over a few frames", not surface-shading-grade single-frame convergence
+// (this fog's existing temporal integration in AccumulateFog, plus the per-frame Halton jitter below,
+// is what converges the coarser per-frame estimate across time).
+const uint kVolumeLightReservoirCandidateCount = 4u;
+// F2a: select up to 2 lights per froxel by running kVolumeLightReservoirCount INDEPENDENT single-
+// sample RIS reservoirs (different jitter salt per reservoir, so they rarely draw the same candidate
+// set) rather than one k=2 reservoir -- each independent draw is itself an unbiased estimator of the
+// SAME full multi-light in-scatter sum (see megalights_ris.glsl's own SelectLightRIS comment for why
+// `radiance(selected) * outInvPdf` estimates the FULL sum, not just the drawn candidate's own
+// contribution), so averaging kVolumeLightReservoirCount of them (InjectLight below) is a standard
+// Monte-Carlo variance reduction: still unbiased, lower noise than a single draw, at a small multiple
+// of the cost instead of widening one reservoir's own candidate count.
+const uint kVolumeLightReservoirCount = 2u;
+
+// Isotropic (no surface normal -- a froxel is a point in a participating medium, not a surface),
+// phase-weighted (F2a) single-sample RIS reservoir over g_Lights.lightCount MegaLights of every type
+// (point/spot/rect/photometric, via MegaLightAngularShaping -- see MegaLightVolumeWeight's own
+// comment) -- same textbook WRS algorithm shape as megalights_ris.glsl's own SelectLightRIS, but the
+// target-weight proxy above replaces the surface-shading NdotL/BRDF term with the volume-appropriate
+// HG phase term, kept as a SEPARATE function rather than generalizing SelectLightRIS itself, matching
+// this codebase's own established "duplicate small per-shader weighting/trace functions rather than
+// force a shared abstraction" convention (see megalights_ris.glsl's own header comment).
+// `reservoirSalt` decorrelates the kVolumeLightReservoirCount independent calls InjectLight makes
+// below from each other (distinct Halton offset per reservoir, on top of the existing per-froxel seed
+// and per-frame jitter) so they do not all just re-select the exact same winning candidate.
+bool SelectVolumeLightRIS(vec3 worldPos, vec3 viewDir, uint seed, uint reservoirSalt, uint frameIndex,
+    out uint outLightIndex, out float outInvPdf) {
     if (g_Lights.lightCount == 0u) {
         outLightIndex = 0u;
         outInvPdf = 0.0;
@@ -287,13 +337,13 @@ bool SelectVolumeLightRIS(vec3 worldPos, uint seed, uint frameIndex, out uint ou
     uint selected = 0xFFFFFFFFu;
     float selectedTargetWeight = 0.0;
 
-    uint baseIndex = seed * kVolumeLightCandidateCount + frameIndex * 9781u;
-    for (uint i = 0u; i < kVolumeLightCandidateCount; ++i) {
+    uint baseIndex = seed * kVolumeLightReservoirCandidateCount + frameIndex * 9781u + reservoirSalt * 104729u;
+    for (uint i = 0u; i < kVolumeLightReservoirCandidateCount; ++i) {
         vec2 h = Halton23(baseIndex + i);
         uint candidateIndex = min(uint(h.x * float(g_Lights.lightCount)), g_Lights.lightCount - 1u);
         MegaLight candidate = g_Lights.lights[candidateIndex];
 
-        float w = MegaLightVolumeWeight(candidate, worldPos);
+        float w = MegaLightVolumeWeight(candidate, worldPos, viewDir);
         totalWeight += w;
         float acceptProb = (totalWeight > 0.0) ? (w / totalWeight) : 0.0;
         if (h.y < acceptProb) {
@@ -309,7 +359,7 @@ bool SelectVolumeLightRIS(vec3 worldPos, uint seed, uint frameIndex, out uint ou
     }
 
     outLightIndex = selected;
-    outInvPdf = (totalWeight / float(kVolumeLightCandidateCount)) / selectedTargetWeight;
+    outInvPdf = (totalWeight / float(kVolumeLightReservoirCandidateCount)) / selectedTargetWeight;
     return true;
 }
 
@@ -324,15 +374,31 @@ void InjectLight(ivec3 coord) {
     float phaseSun = HGPhase(cosThetaSun, ATMOS_FOG_PHASE_G);
     vec3 sunContribution = vec3(scatteringCoeff * sunVisibility * phaseSun * pc.sunIlluminance) * GetSunColor();
 
-    // --- One stochastic MegaLights point light ---
+    // --- F2a: up to kVolumeLightReservoirCount (2) stochastic MegaLights, of ANY type ---
     // `pointRadiance` is the in-scattered radiance PER UNIT scattering coefficient (i.e. with the
-    // scatteringCoeff factor pulled out), so the SAME sampled point light can light both the global
-    // fog (below) and every local fog volume (further below), each scaled by its own scattering.
+    // scatteringCoeff factor pulled out), so the SAME sampled light(s) can light both the global fog
+    // (below) and every local fog volume (further below), each scaled by its own scattering. Each of
+    // the kVolumeLightReservoirCount independent reservoir draws is itself an unbiased estimator of
+    // the FULL multi-light in-scatter sum (see SelectVolumeLightRIS's own comment) -- averaging their
+    // contributions (the "/ float(kVolumeLightReservoirCount)" below) is a variance reduction, not a
+    // double-count: with 0 lights selected this froxel simply stays dark for this frame (the fog's own
+    // temporal integration in AccumulateFog converges the result across several frames), with 1 or 2
+    // it is lit by that many independently-drawn candidates -- exactly the task's own "select 1-2
+    // lights per froxel" bar.
     uint seed = uint(coord.x) + uint(coord.y) * uint(ATMOS_FOG_GRID_WIDTH) + uint(coord.z) * uint(ATMOS_FOG_GRID_WIDTH * ATMOS_FOG_GRID_HEIGHT);
-    uint lightIndex; float invPdf;
     vec3 pointRadiance = vec3(0.0);
-    if (SelectVolumeLightRIS(worldPos, seed, pc.frameIndex, lightIndex, invPdf)) {
+    for (uint r = 0u; r < kVolumeLightReservoirCount; ++r) {
+        uint lightIndex; float invPdf;
+        if (!SelectVolumeLightRIS(worldPos, viewDir, seed, r, pc.frameIndex, lightIndex, invPdf)) {
+            continue;
+        }
         MegaLight light = g_Lights.lights[lightIndex];
+        if ((MegaLightChannelMask(light) & pc.fogLightingChannelMask) == 0u) {
+            // F2b: belt-and-suspenders -- MegaLightVolumeWeight already zeroes an off-channel
+            // candidate's RIS weight (so it is vanishingly unlikely to ever be `selected`), this is
+            // the hard correctness gate: an off-channel light contributes exactly zero regardless.
+            continue;
+        }
         vec3 toLight = light.position - worldPos;
         float distSq = max(dot(toLight, toLight), 1.0e-4);
         vec3 arrivalDir = -toLight / sqrt(distSq); // Direction FROM the light TOWARD worldPos -- matches GetSunDirection()'s own convention.
@@ -344,7 +410,8 @@ void InjectLight(ivec3 coord) {
 
         // G3: per-type angular shaping -- `arrivalDir` is light->froxel (-L), so the surface->light
         // direction MegaLightAngularShaping expects is -arrivalDir. 1 for a POINT light (unchanged).
-        pointRadiance = light.color * (light.intensity / distSq) * window * MegaLightAngularShaping(light, -arrivalDir) * phasePoint * invPdf;
+        pointRadiance += light.color * (light.intensity / distSq) * window * MegaLightAngularShaping(light, -arrivalDir) * phasePoint * invPdf
+            / float(kVolumeLightReservoirCount);
     }
     vec3 pointContribution = scatteringCoeff * pointRadiance; // Global fog's point-light in-scatter (unchanged).
 

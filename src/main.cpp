@@ -1350,6 +1350,37 @@ int main(int argc, char** argv) {
                 ImGui::TextWrapped("RIS / spatial reuse (shared with point lights):");
                 ImGui::DragFloat("Spatial Bias Radius (world)", &config::megalights::SPATIAL_BIAS_RADIUS, 0.05f, 0.0f, 16.0f);
                 ImGui::DragFloat("Spatial Reuse Radius (px)", &config::megalights::SPATIAL_REUSE_RADIUS_PIXELS, 0.5f, 0.0f, 128.0f);
+
+                // F2b (UE5.8 Lighting Channels): every light/entity defaults to channel 0 (bit 0) --
+                // see renderer::MegaLightChannelMask()/MaterialLightingChannelMask()'s own comment
+                // (megalights_types.glsl / material_params.glsl) for the exact "raw zero == channel 0"
+                // convention. These 3 checkboxes drive ONLY the volumetric fog's own reception mask
+                // (config::megalights::FOG_LIGHTING_CHANNEL_MASK, threaded by renderer::
+                // AtmosVolumetricFogPass::RecordUpdate into AtmosVolumetricFog.comp's own
+                // pc.fogLightingChannelMask) -- a live, zero-scene-data-risk way to verify the F2b
+                // gating mechanism end-to-end: unchecking "Channel 0" here makes the fog stop
+                // responding to every default-authored light instantly. Per-light/per-entity channel
+                // authoring itself is a scene-setup-time API (renderer::PackMegaLightChannelMask() /
+                // MaterialParameters::lightingChannelMask), not a per-object runtime UI -- the same
+                // "scene setup authors it, Debug ImGui verifies it live" split this codebase already
+                // uses for e.g. Local Fog Volumes (config::localfog::VOLUMES vs. its own bounds-viz
+                // toggle above).
+                ImGui::Separator();
+                ImGui::TextWrapped("Lighting Channels (F2b) -- fog reception mask:");
+                bool fogCh0 = (config::megalights::FOG_LIGHTING_CHANNEL_MASK & 0x1u) != 0u;
+                bool fogCh1 = (config::megalights::FOG_LIGHTING_CHANNEL_MASK & 0x2u) != 0u;
+                bool fogCh2 = (config::megalights::FOG_LIGHTING_CHANNEL_MASK & 0x4u) != 0u;
+                if (ImGui::Checkbox("Fog Channel 0 (default)", &fogCh0)) {
+                    config::megalights::FOG_LIGHTING_CHANNEL_MASK = (config::megalights::FOG_LIGHTING_CHANNEL_MASK & ~0x1u) | (fogCh0 ? 0x1u : 0u);
+                }
+                ImGui::SameLine();
+                if (ImGui::Checkbox("Channel 1", &fogCh1)) {
+                    config::megalights::FOG_LIGHTING_CHANNEL_MASK = (config::megalights::FOG_LIGHTING_CHANNEL_MASK & ~0x2u) | (fogCh1 ? 0x2u : 0u);
+                }
+                ImGui::SameLine();
+                if (ImGui::Checkbox("Channel 2", &fogCh2)) {
+                    config::megalights::FOG_LIGHTING_CHANNEL_MASK = (config::megalights::FOG_LIGHTING_CHANNEL_MASK & ~0x4u) | (fogCh2 ? 0x4u : 0u);
+                }
                 ImGui::EndTabItem();
             }
 
@@ -1673,6 +1704,15 @@ int main(int argc, char** argv) {
                 ImGui::DragFloat("Wind Turbulence Roughness", &config::atmos::WIND_TURBULENCE_ROUGHNESS, 0.01f, 0.0f, 1.0f);
                 ImGui::DragFloat("Cloud Density Target", &config::atmos::CLOUD_DENSITY_TARGET, 0.01f, 0.0f, 1.0f);
                 ImGui::DragFloat("Fog Density Target", &config::atmos::FOG_DENSITY_TARGET, 0.01f, 0.0f, 1.0f);
+
+                // F3 (UE5.8 rendering-parity gap: Fog Screen Space Scattering) -- see renderer::
+                // FogScreenSpaceScatteringPass's own class comment. Unchecking this live A/B-compares
+                // against the pre-F3 crisp-froxel lookup at zero extra pipeline cost (the pass itself
+                // always runs -- see FogScreenSpaceScatteringPass::RecordScatter's own comment for why
+                // -- only PostProcessComposite.comp's own sample source branches).
+                ImGui::Separator();
+                ImGui::Checkbox("Fog Screen Space Scattering (F3)", &config::atmos::FOG_SCREEN_SPACE_SCATTERING_ENABLED);
+                ImGui::DragFloat("Fog Scatter Blur Radius (px)", &config::atmos::FOG_SCATTER_BLUR_RADIUS_PIXELS, 0.25f, 0.0f, 64.0f);
                 ImGui::TextDisabled("Dew Point: %.2f C", clusterPipeline.GetAtmosClimate().GetLastDewPointCelsius());
                 ImGui::TextDisabled("LCL Height: %.1f m", clusterPipeline.GetAtmosClimate().GetLastLCLHeightMeters());
 

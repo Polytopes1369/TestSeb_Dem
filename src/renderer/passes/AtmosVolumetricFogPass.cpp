@@ -35,8 +35,9 @@ namespace renderer {
             uint32_t frameIndex = 0u;
             uint32_t localFogVolumeCount = 0u; // Local Fog Volumes (G8): count injected this frame (0 = feature off).
             uint32_t debugVizBounds = 0u;      // Debug-only bounds visualization flag (always 0 in Release).
+            uint32_t fogLightingChannelMask = 0x7u; // F2b: fog's own reception mask (default: every channel).
         };
-        static_assert(sizeof(AtmosVolumetricFogPC) == 100,
+        static_assert(sizeof(AtmosVolumetricFogPC) == 104,
             "AtmosVolumetricFogPC must match AtmosVolumetricFog.comp's own push_constant block exactly");
 
         // std430 mirror of local_fog_volumes.glsl's LocalFogVolume (6 x vec4 == 96 bytes, natural
@@ -302,6 +303,13 @@ namespace renderer {
         // Local Fog Volumes (G8): inject the uploaded volumes unless the master runtime toggle is
         // off (which zeroes the injected count for this frame -- the SSBO itself stays untouched).
         pc.localFogVolumeCount = config::localfog::ENABLE ? m_LocalFogVolumeCount : 0u;
+
+        // F2b (UE5.8 Lighting Channels): the fog's own reception mask -- see AtmosVolumetricFog.comp's
+        // own pc.fogLightingChannelMask comment. Read live (not cached) every frame, same convention
+        // as every other config::megalights::* Debug-tunable already threaded per-frame elsewhere in
+        // this codebase (e.g. config::megalights::SPATIAL_BIAS_RADIUS into MegaLightsPass), masked to
+        // the 3 valid bits so a stray value can never disable every channel by accident.
+        pc.fogLightingChannelMask = config::megalights::FOG_LIGHTING_CHANNEL_MASK & 0x7u;
 
         // Debug-only bounds visualization: the config read that drives the shader flag is compiled
         // ONLY into a Debug build (CLAUDE.md rule 8 -- visualization modes must generate no Release
