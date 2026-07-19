@@ -71,7 +71,7 @@ namespace renderer {
         void RecordComposite(VkCommandBuffer cmd
 #ifndef NDEBUG
             , const CameraPushConstants& camera, const maths::vec3& cameraPositionWorld,
-            const maths::vec3& worldProbeGridOrigin
+            const WorldProbeGridPass& worldProbes
 #endif
         );
 

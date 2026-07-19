@@ -983,6 +983,14 @@ bool ClusterRenderPipeline::Init(
   m_DepthOfField.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
       m_DisplayExtent, m_TAATSR.GetOutputView(), m_Resolve.GetOutputDepthView());
 
+  // UE5.8-parity "Accumulation Depth of Field" (config::postprocess::DOF_MODE == 1): same inputs as
+  // m_DepthOfField just above (both read m_TAATSR's own HDR output + m_Resolve's own depth) -- always
+  // Init'd alongside it so the live ImGui mode toggle never needs a resize/recreate, only a history
+  // reset (see [13e]'s own resetHistory computation below). Must also Init before m_Bloom, same
+  // reason as m_DepthOfField.
+  m_DepthOfFieldAccumulation.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,
+      m_DisplayExtent, m_TAATSR.GetOutputView(), m_Resolve.GetOutputDepthView());
+
   // Phase PP2 (post-process stack roadmap): Bloom/Lens Flare/Anamorphic Flare/Lens Dirt, reading
   // m_DepthOfField's own output -- must Init before m_PostProcess so its own GetOutputView()
   // already exists for m_PostProcess.Init's own g_Bloom binding.
@@ -1034,7 +1042,9 @@ bool ClusterRenderPipeline::Init(
   // Backs the ImGui "Buffer Viewer" dropdown -- see debug::DebugBufferViewPass's own class
   // comment. Sized to m_DisplayExtent (it's blitted to the swapchain the same way
   // m_PostProcess's own output is, not sized to any one candidate buffer's own resolution).
-  m_DebugBufferView.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue, m_DisplayExtent);
+  // `m_PostProcess.GetExposureStateBuffer()` requires m_PostProcess.Init() (above) to have already
+  // run -- see DebugBufferViewPass::Init's own header comment.
+  m_DebugBufferView.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue, m_DisplayExtent, m_PostProcess.GetExposureStateBuffer());
 
   // Subtask E3 (Debug Buffer Viewer extension): backs Buffer Viewer index 15 -- see
   // debug::ParticleDebugViewPass's own class comment. Sized to its own fixed 256x256 grid, not
@@ -1424,6 +1434,7 @@ void ClusterRenderPipeline::Shutdown() {
   m_FogScatter.Shutdown(); // F3 -- Init'd right before m_PostProcess above, shut down right after it (reverse order).
   m_Bloom.Shutdown();
   m_DepthOfField.Shutdown();
+  m_DepthOfFieldAccumulation.Shutdown();
   m_TAATSR.Shutdown();
   m_WorldProbes.Shutdown();
   m_GIInject.Shutdown();
@@ -1451,6 +1462,7 @@ void ClusterRenderPipeline::Shutdown() {
   m_VTManager.Shutdown();
   m_PrevViewProj = maths::mat4{};
   m_HasPrevViewProj = false;
+  m_DOFAccumulationWasActive = false;
   m_FrameIndex = 0;
 #ifndef NDEBUG
   m_DebugTraceMode = 0;
@@ -1551,7 +1563,11 @@ void ClusterRenderPipeline::RecordDebugBufferView(VkCommandBuffer cmd) {
         case 7: sourceView = m_ScreenSpaceEffects.GetAOView(); mode = debug::DebugBufferViewPass::VisualizationMode::kGrayscale; break;
         case 8: sourceView = m_Bloom.GetOutputView(); mode = debug::DebugBufferViewPass::VisualizationMode::kTonemap; break;
         case 9: sourceView = m_TAATSR.GetOutputView(); mode = debug::DebugBufferViewPass::VisualizationMode::kTonemap; break;
-        case 10: sourceView = m_DepthOfField.GetOutputView(); mode = debug::DebugBufferViewPass::VisualizationMode::kTonemap; break;
+        // Shows whichever DOF sub-pass config::postprocess::DOF_MODE actually ran this frame (see
+        // RecordFrame's own [13e] for the identical branch) -- the OTHER one's own output view would
+        // be frozen/stale since only the active pass is dispatched each frame.
+        case 10: sourceView = (config::postprocess::DOF_MODE != 0) ? m_DepthOfFieldAccumulation.GetOutputView() : m_DepthOfField.GetOutputView();
+                 mode = debug::DebugBufferViewPass::VisualizationMode::kTonemap; break;
         case 11: sourceView = m_ScreenTrace.GetOutputView(); mode = debug::DebugBufferViewPass::VisualizationMode::kTonemap; break;
         case 12: sourceView = m_Denoiser.GetOutputView(); mode = debug::DebugBufferViewPass::VisualizationMode::kTonemap; break;
         case 13: sourceView = m_GIComposite.GetOutputView(); mode = debug::DebugBufferViewPass::VisualizationMode::kTonemap; break;
@@ -3047,9 +3063,11 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
   // next frame -- identical one-frame-lag placement to m_VirtualShadowMap.RecordEndFrame() above.
   m_VTStreaming.RecordEndFrame(cmdLate);
 
-  // [12b] Screen Trace GI (Lumen Screen Trace + World Probe fallback): traces linear screen-space
-  // rays against the GBuffer depth/normal, falling back to the 3D world probe grid on miss.
-  // Writes to its own dedicated output image (m_ScreenTrace.GetOutputImage()).
+  // [12b] Screen Trace GI (Lumen Screen Trace + World Probe fallback/primary -- see F1's own
+  // GIMode switch): in GIMode::HighQuality, traces linear screen-space rays against the GBuffer
+  // depth/normal, falling back to the multi-level world probe grid on miss; in GIMode::Lite, skips
+  // the march and samples the probe grid directly as this pixel's own GI term. Writes to its own
+  // dedicated output image (m_ScreenTrace.GetOutputImage()).
   // =========================================================================================
   {
 #ifndef NDEBUG
@@ -3061,7 +3079,7 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
     m_GpuProfiler.BeginZone(cmdLate, "ScreenTrace");
 #endif
     if (ssrtEnabled) {
-      m_ScreenTrace.RecordTrace(cmdLate, cameraCopy, cameraPositionWorld, m_WorldProbes.GetGridOriginWorld(), m_FrameIndex);
+      m_ScreenTrace.RecordTrace(cmdLate, cameraCopy, cameraPositionWorld, m_WorldProbes, m_FrameIndex, config::lumen::GI_MODE);
     } else {
       VkClearColorValue blackClear{};
       blackClear.float32[0] = 0.0f;
@@ -3175,22 +3193,19 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
   }
 
   // =========================================================================================
-  // [12c] World Probe grid: fully rebuilt every frame from the Surface Cache radiance atlas
-  // [1z] already re-injected into this frame ("Propagate Surface Cache lighting directly
-  // into this 3D grid at each frame") -- INTENDED as what dynamic/off-screen objects would
-  // sample for indirect light (world_probe_sampling.glsl's SampleWorldProbeGrid) -- also the
-  // fallback m_ScreenTrace itself samples on a screen-space march miss, since a screen-space march
-  // only ever sees on-screen pixels. Independent GPU work
-  // from [12b] above (no data dependency either way), just recorded after it for locality with
-  // the rest of this frame's GI additions.
+  // [12c] World Probe grid: F1's own multi-level clipmap (renderer::WorldProbeGridPass::kLevelCount
+  // levels), incrementally streamed every frame from the Surface Cache radiance atlas [1z] already
+  // re-injected this frame -- sampled every frame by m_ScreenTrace, either as its screen-space
+  // march's miss fallback (config::lumen::GIMode::HighQuality) or as the PRIMARY GI term with the
+  // march skipped entirely (GIMode::Lite -- see ScreenTrace.comp's own giMode branch), plus,
+  // Debug-only, m_GIComposite's DEBUG_VIEW_SPATIAL_PROBES visualization. Independent GPU work from
+  // [12b] above (no data dependency either way), just recorded after it for locality with the rest
+  // of this frame's GI additions.
   //
   // `worldProbesEnabled` (debug-only toggle, main.cpp's 'H' key) gates this dispatch entirely --
-  // see SetDebugWorldProbesEnabled()'s own comment. UNLIKE radiosityEnabled/ssrtEnabled above,
-  // this system has no live consumer yet (SampleWorldProbeGrid() is called only by the dead
-  // ScreenTracePass/GICompositePass, per the 2026-07-16 UE5.8-parity audit) -- so Release
-  // hardcodes this OFF instead of ON, skipping the dispatch (and its trailing barrier, since
-  // nothing this frame reads the grid either way) rather than paying its GPU cost for zero visual
-  // effect. Flip Release's hardcoded default once a real consumer samples this grid.
+  // see SetDebugWorldProbesEnabled()'s own comment. This system is a live, load-bearing consumer in
+  // BOTH GI modes (Lite mode's own primary GI term, HighQuality mode's own fallback) -- Release
+  // hardcodes this ON unconditionally, matching that.
   // =========================================================================================
 #ifndef NDEBUG
   bool worldProbesEnabled = m_DebugWorldProbesEnabled;
@@ -3253,7 +3268,7 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
 #endif
   m_GIComposite.RecordComposite(cmdLate
 #ifndef NDEBUG
-      , cameraCopy, cameraPositionWorld, m_WorldProbes.GetGridOriginWorld()
+      , cameraCopy, cameraPositionWorld, m_WorldProbes
 #endif
   );
 #ifndef NDEBUG
@@ -3485,11 +3500,12 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
     // SDFRayMarchPass::RecordRayMarch already use; forward (D5) is simply cameraFrameInfo.forward
     // itself, already tracked.
     //
-    // Niagara-parity render-integration roadmap: `m_SceneLights` (D3 point lights) and
-    // `m_WorldProbes.GetGridOriginWorld()` (D6 fix -- this frame's CURRENT toroidal-recenter origin,
-    // not a stale Init()-time snapshot) and `m_FrameIndex` (D1 MegaLights RIS decorrelation) are all
-    // already tracked/available at this call site, same values every other consumer below/above
-    // already reads.
+    // Niagara-parity render-integration roadmap: `m_SceneLights` (D3 point lights) and `m_WorldProbes`
+    // itself (D6 fix -- F1 "Lumen Lite" passes the whole pass now, not a single stale-snapshot
+    // origin, so ParticleSystemPass::RecordDraw can read every clipmap level's own CURRENT
+    // toroidal-recenter origin) and `m_FrameIndex` (D1 MegaLights RIS decorrelation) are all already
+    // tracked/available at this call site, same values every other consumer below/above already
+    // reads.
     {
       const maths::vec3 worldUpHint{0.0f, 1.0f, 0.0f};
       const maths::vec3 particleCameraRight = cameraFrameInfo.forward.Cross(worldUpHint).Normalize();
@@ -3502,7 +3518,7 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
           m_TransparentForward.GetRefractionOffsetView(), m_RenderExtent,
           viewProj, cameraFrameInfo.position, particleCameraRight, particleCameraUp, cameraFrameInfo.forward,
           m_SceneLights.sun.direction, m_SceneLights.sun.color, m_SceneLights.sun.intensity,
-          m_SceneLights, m_WorldProbes.GetGridOriginWorld(),
+          m_SceneLights, m_WorldProbes,
           config::particles::SOFT_FADE_DISTANCE, particleHeatShimmerStrength, globalTimeSeconds, m_FrameIndex);
 #ifndef NDEBUG
       m_GpuProfiler.EndZone(cmdLate);
@@ -3559,14 +3575,29 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
   }
 
   // =========================================================================================
-  // [13e] Phase PP3: physically-derived Depth of Field over m_TAATSR's own freshly-written HDR
-  // output -- must run before [13f]'s Bloom (see DepthOfFieldPass's own class comment for why: an
-  // out-of-focus highlight should itself bloom into a soft disc, which only happens if DOF's own
-  // blur runs first). m_TAATSR.GetOutputView() ping-pongs between 2 images every RecordPass() call
-  // (just above), so m_DepthOfField's own source descriptor must be re-written every frame too.
+  // [13e] Phase PP3: Depth of Field over m_TAATSR's own freshly-written HDR output -- must run
+  // before [13f]'s Bloom (see DepthOfFieldPass's own class comment for why: an out-of-focus
+  // highlight should itself bloom into a soft disc, which only happens if DOF's own blur runs
+  // first). m_TAATSR.GetOutputView() ping-pongs between 2 images every RecordPass() call (just
+  // above), so whichever DOF sub-pass is active below must have its own source descriptor
+  // re-written every frame too.
+  //
+  // config::postprocess::DOF_MODE picks which of two resolve techniques actually runs this frame:
+  // 0 (Gather, default) = m_DepthOfField's own single-frame 16-tap Poisson gather; 1 (Accumulation,
+  // UE5.8-parity) = m_DepthOfFieldAccumulation's own per-frame single-lens-sample + temporal-
+  // reprojection accumulation (see that class' own header comment for the full technique). Only the
+  // ACTIVE pass is dispatched this frame -- the inactive one is simply left untouched (its own
+  // ping-pong history stops advancing) rather than wastefully running two full-screen compute passes
+  // every frame. Switching INTO Accumulation forces one history reset on m_DepthOfFieldAccumulation
+  // the frame it (re-)becomes active (m_DOFAccumulationWasActive tracks this), since its ping-pong
+  // buffers may hold stale/never-written-this-session data from the last time it ran (or none at
+  // all); ordinary camera motion while it stays active is instead handled PER-PIXEL by
+  // DepthOfFieldAccumulation.comp's own reprojection/disocclusion test, exactly like m_TAATSR's own
+  // resetHistory above only covers the first-frame/toggle-off case, not everyday camera movement.
   // =========================================================================================
+  VkImageView dofOutputView = VK_NULL_HANDLE;
   {
-      m_DepthOfField.UpdateSourceDescriptor(m_TAATSR.GetOutputView());
+      bool useAccumulationDOF = (config::postprocess::DOF_MODE != 0);
 
       // m_TAATSR's own output image's last writer is always its own compute dispatch -- re-stated
       // here explicitly rather than relying on m_TAATSR::RecordPass' own trailing barrier (which
@@ -3581,17 +3612,49 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
       taatsrToDofDep.pMemoryBarriers = &taatsrToDofBarrier;
       vkCmdPipelineBarrier2(cmdLate, &taatsrToDofDep);
 
-      DepthOfFieldPass::Settings dofSettings{};
-      dofSettings.focalLengthMM = config::postprocess::DOF_FOCAL_LENGTH_MM;
-      dofSettings.focusDistanceWorldUnits = config::postprocess::DOF_FOCUS_DISTANCE_WORLD_UNITS;
-      dofSettings.maxCoCRadiusPixels = config::postprocess::DOF_ENABLED ? config::postprocess::DOF_MAX_COC_RADIUS_PIXELS : 0.0f;
+      if (useAccumulationDOF) {
+          m_DepthOfFieldAccumulation.UpdateSourceDescriptor(m_TAATSR.GetOutputView());
+
+          // Full history reset only on the first frame ever or the frame this mode is
+          // (re-)selected -- ordinary camera motion is handled per-pixel inside the shader instead
+          // (see this block's own header comment).
+          bool dofResetHistory = !m_HasPrevViewProj || !m_DOFAccumulationWasActive;
+          maths::mat4 prevViewProjForDOF = m_HasPrevViewProj ? m_PrevViewProj : viewProj;
+
+          DepthOfFieldAccumulationPass::Settings dofAccumSettings{};
+          dofAccumSettings.focalLengthMM = config::postprocess::DOF_FOCAL_LENGTH_MM;
+          dofAccumSettings.focusDistanceWorldUnits = config::postprocess::DOF_FOCUS_DISTANCE_WORLD_UNITS;
+          dofAccumSettings.maxCoCRadiusPixels = config::postprocess::DOF_ENABLED ? config::postprocess::DOF_MAX_COC_RADIUS_PIXELS : 0.0f;
+          dofAccumSettings.maxAccumulationSamples = config::postprocess::DOF_ACCUMULATION_MAX_SAMPLES;
 #ifndef NDEBUG
-      m_GpuProfiler.BeginZone(cmdLate, "DepthOfField");
+          m_GpuProfiler.BeginZone(cmdLate, "DepthOfFieldAccumulation");
 #endif
-      m_DepthOfField.RecordGenerate(cmdLate, invViewProj, cameraPositionWorld, config::postprocess::EXPOSURE_APERTURE, dofSettings);
+          m_DepthOfFieldAccumulation.RecordGenerate(cmdLate, invViewProj, prevViewProjForDOF, cameraPositionWorld,
+              config::postprocess::EXPOSURE_APERTURE, m_FrameIndex, dofResetHistory, dofAccumSettings);
 #ifndef NDEBUG
-      m_GpuProfiler.EndZone(cmdLate);
+          m_GpuProfiler.EndZone(cmdLate);
 #endif
+
+          dofOutputView = m_DepthOfFieldAccumulation.GetOutputView();
+      } else {
+          m_DepthOfField.UpdateSourceDescriptor(m_TAATSR.GetOutputView());
+
+          DepthOfFieldPass::Settings dofSettings{};
+          dofSettings.focalLengthMM = config::postprocess::DOF_FOCAL_LENGTH_MM;
+          dofSettings.focusDistanceWorldUnits = config::postprocess::DOF_FOCUS_DISTANCE_WORLD_UNITS;
+          dofSettings.maxCoCRadiusPixels = config::postprocess::DOF_ENABLED ? config::postprocess::DOF_MAX_COC_RADIUS_PIXELS : 0.0f;
+#ifndef NDEBUG
+          m_GpuProfiler.BeginZone(cmdLate, "DepthOfField");
+#endif
+          m_DepthOfField.RecordGenerate(cmdLate, invViewProj, cameraPositionWorld, config::postprocess::EXPOSURE_APERTURE, dofSettings);
+#ifndef NDEBUG
+          m_GpuProfiler.EndZone(cmdLate);
+#endif
+
+          dofOutputView = m_DepthOfField.GetOutputView();
+      }
+
+      m_DOFAccumulationWasActive = useAccumulationDOF;
   }
 
   // =========================================================================================
@@ -3599,25 +3662,26 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
   // then Phase PP1's Physical Camera auto-exposure -> White Balance -> Color Correction -> ACES
   // Tone Mapping -> Gamma Correction composite (also folding in Phase PP3's Motion Blur / Height
   // Fog / Heat Distortion -- see PostProcessComposite.comp's own comment) -- both reading
-  // m_DepthOfField's own freshly-written output -- see BloomPass's and PostProcessPass's own class
-  // comments for why m_PostProcess must be the very last compute step before [14]'s blit (and
-  // before [13b]'s Debug-only stat overlay below, which now draws onto ITS output instead of
-  // m_TAATSR's raw HDR buffer). m_DepthOfField's own output view identity is effectively "per-
-  // frame" too (it wraps m_TAATSR's own ping-ponged source), so both passes' own descriptor sets
-  // pointing at it must be re-written every frame, exactly like m_TAATSR.UpdateDescriptorSets()
-  // itself is called every frame above. Both run unconditionally every frame, exactly like [13d]'s
-  // own TAA/TSR pass -- the debug views that substitute a different, deliberately-untonemapped
-  // diagnostic image as the blit source instead (m_GIComposite/m_SDFRayMarch/m_Resolve, see [14]'s
-  // own blitSourceImage swap below) simply never read either pass' output, same as how those views
-  // already ignore m_TAATSR's own output today.
+  // [13e]'s own `dofOutputView` (whichever DOF sub-pass was actually active this frame) -- see
+  // BloomPass's and PostProcessPass's own class comments for why m_PostProcess must be the very
+  // last compute step before [14]'s blit (and before [13b]'s Debug-only stat overlay below, which
+  // now draws onto ITS output instead of m_TAATSR's raw HDR buffer). `dofOutputView`'s own identity
+  // is effectively "per-frame" too (it wraps m_TAATSR's own ping-ponged source, and may itself
+  // alternate between two ping-pong images when Accumulation mode is active), so both passes' own
+  // descriptor sets pointing at it must be re-written every frame, exactly like
+  // m_TAATSR.UpdateDescriptorSets() itself is called every frame above. Both run unconditionally
+  // every frame, exactly like [13d]'s own TAA/TSR pass -- the debug views that substitute a
+  // different, deliberately-untonemapped diagnostic image as the blit source instead
+  // (m_GIComposite/m_SDFRayMarch/m_Resolve, see [14]'s own blitSourceImage swap below) simply never
+  // read either pass' output, same as how those views already ignore m_TAATSR's own output today.
   // =========================================================================================
   {
-      m_Bloom.UpdateSourceDescriptor(m_DepthOfField.GetOutputView());
-      m_PostProcess.UpdateDescriptorSets(m_DepthOfField.GetOutputView(), m_Bloom.GetOutputView());
+      m_Bloom.UpdateSourceDescriptor(dofOutputView);
+      m_PostProcess.UpdateDescriptorSets(dofOutputView, m_Bloom.GetOutputView());
 
-      // m_DepthOfField's own trailing barrier (inside RecordGenerate) already makes its output
-      // visible to COMPUTE_SHADER/SHADER_SAMPLED_READ -- no further barrier needed before m_Bloom/
-      // m_PostProcess read it here.
+      // [13e]'s own active DOF sub-pass already ends its RecordGenerate() with a trailing barrier
+      // making `dofOutputView` visible to COMPUTE_SHADER/SHADER_SAMPLED_READ -- no further barrier
+      // needed before m_Bloom/m_PostProcess read it here.
 
       BloomPass::Settings bloomSettings{};
       bloomSettings.threshold = config::postprocess::BLOOM_THRESHOLD;
@@ -3810,6 +3874,7 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
     m_DebugOverlay.BuildFrameText(gpuMemUsedMB, pendingPageLoads, bytesPerSecond, hwTriangleCount, swTriangleCount,
         fps, static_cast<float>(m_RenderExtent.width), static_cast<float>(m_RenderExtent.height),
         m_DebugRadiosityEnabled, m_DebugSSRTEnabled, traceMode, m_DebugWorldProbesEnabled,
+        static_cast<uint32_t>(config::lumen::GI_MODE),
         m_ParticleSystem.GetLastAliveCountApprox(), ParticleSystemPass::kMaxParticles);
 
     // Determine blitSourceImage early to draw HUD directly onto it -- m_PostProcess's own output

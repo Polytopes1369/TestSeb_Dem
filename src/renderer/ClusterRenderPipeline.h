@@ -157,6 +157,7 @@
 #include "renderer/passes/WorldProbeGridPass.h"
 #include "renderer/passes/TAATSRPass.h"
 #include "renderer/passes/DepthOfFieldPass.h"
+#include "renderer/passes/DepthOfFieldAccumulationPass.h"
 #include "renderer/passes/BloomPass.h"
 #include "renderer/passes/FogScreenSpaceScatteringPass.h"
 #include "renderer/passes/PostProcessPass.h"
@@ -309,6 +310,19 @@ namespace renderer {
         // anything handed this reference, exactly as m_LoadingManager's own comment already states.
         core::LoadingManager& GetLoadingManager() { return m_LoadingManager; }
 
+        // PCG roadmap Phase 6.3 ("Runtime Generator Hook") REAL wiring: the two pieces of this
+        // pipeline's private Vulkan/lighting state that a persistent, LIVE renderer::PcgInstanceDrawPass
+        // (owned by main.cpp, not a smoke-test-local) needs for its own Init() call but had no public
+        // accessor for before -- every OTHER Init() parameter (device/allocator/commandPool/queue/
+        // materialTable) is already reachable from main.cpp directly via VulkanContext's own public
+        // getters (GetDevice/GetAllocator/GetCommandPool/GetGraphicsQueue/GetMaterialTable); only the
+        // resident geometry page pool's physical buffer and the showcase scene's baked sun direction
+        // are private to THIS class. Mirrors exactly what RunPcgCellLoaderSmokeTest's own STEP 2 local
+        // setup already reads internally (m_PagePool.GetPhysicalPoolBuffer(), m_BaseSunDirection) --
+        // both cheap, read-only forwards, no new state or ownership transfer.
+        VkBuffer GetPagePoolPhysicalBuffer() const { return m_PagePool.GetPhysicalPoolBuffer(); }
+        maths::vec3 GetBaseSunDirection() const { return m_BaseSunDirection; }
+
         // Phase 2 (Lumen advanced roadmap) fix: the frame is now recorded across 4 calls instead of
         // one RecordFrame() -- see this class' own header comment ("Per-frame GPU work") for the
         // full root-cause/redesign explanation and main.cpp for the exact submit sequence each call
@@ -405,6 +419,15 @@ namespace renderer {
         // toggle. Plain accessor (the count itself is not debug-only data), same convention as
         // GetVegetationScatter().GetInstanceCount() above.
         uint32_t GetDecalCount() const { return m_Decals.GetDecalCount(); }
+
+        // UE5.8-parity "Accumulation Depth of Field": frames elapsed since m_DepthOfFieldAccumulation's
+        // own history last fully reset (first frame / a Gather -> Accumulation mode switch) -- read by
+        // main.cpp's own Debug "Post FX" ImGui tab for a live convergence readout next to the DOF Mode
+        // combo. Plain accessor (not debug-only data, same convention as GetDecalCount() above). Only
+        // advances while config::postprocess::DOF_MODE == 1 -- [13e] only dispatches whichever DOF
+        // sub-pass is actually selected each frame (not both), so this value simply freezes at its
+        // last count while Gather mode is active instead of ticking meaninglessly in the background.
+        uint32_t GetDOFAccumulationFramesSinceReset() const { return m_DepthOfFieldAccumulation.GetFramesSinceReset(); }
 
         // UE5.8 rendering-parity gap G10a: hair/fur strand pass (strand-count readout) -- same
         // "borrow a const ref" convention as GetVegetationScatter().
@@ -1282,6 +1305,12 @@ namespace renderer {
         // see DepthOfFieldPass's own class comment. m_Bloom and m_PostProcess both read ITS
         // GetOutputView() now, not m_TAATSR's directly.
         DepthOfFieldPass m_DepthOfField;
+        // UE5.8-parity "Accumulation Depth of Field" (config::postprocess::DOF_MODE == 1): alternative
+        // resolve technique reading the SAME m_TAATSR output as m_DepthOfField above -- see
+        // DepthOfFieldAccumulationPass's own class comment. Always Init'd alongside m_DepthOfField
+        // (both stay resident so the live ImGui toggle never needs a resize/recreate); RecordFrame's
+        // own [13e] picks whichever one's GetOutputView() feeds m_Bloom/m_PostProcess this frame.
+        DepthOfFieldAccumulationPass m_DepthOfFieldAccumulation;
         // Phase PP2 (post-process stack roadmap): Bloom / Lens Flare / Anamorphic Lens Flare / Lens
         // Dirt, all one dual-filter mip chain reading m_DepthOfField's own output -- see BloomPass's
         // own class comment. Recorded before m_PostProcess (below), whose composite shader samples
@@ -1306,6 +1335,12 @@ namespace renderer {
         // frame's" value has run.
         maths::mat4 m_PrevViewProj{};
         bool m_HasPrevViewProj = false;
+
+        // Whether m_DepthOfFieldAccumulation was the active DOF pass on the PREVIOUS frame --
+        // compared against config::postprocess::DOF_MODE each frame so a Gather -> Accumulation mode
+        // switch forces one full history reset (its ping-pong buffers may hold stale/never-written
+        // data while a different mode was active) -- see [13e]'s own resetHistory computation.
+        bool m_DOFAccumulationWasActive = false;
 
         // Advances once per RecordFrame() call -- ScreenProbeTrace.comp's own per-frame Fibonacci-
         // sphere jitter rotation (include/sh_probe.glsl's JitterDirection).

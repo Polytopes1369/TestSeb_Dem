@@ -70,6 +70,20 @@ inline uint32_t PROBE_GRID_RESOLUTION = 64u;
 inline float PROBE_SPACING = 1.0f;
 inline uint32_t PROBE_SAMPLE_DIRECTIONS = 14u;
 
+// F1 ("Lumen Lite", UE5.8 parity roadmap): the GI quality mode ClusterRenderPipeline routes into
+// renderer::ScreenTracePass/renderer::GICompositePass (and, once wired -- see F9 -- renderer::
+// ScreenProbeGIPass) every frame. HighQuality is this codebase's pre-existing per-pixel Screen
+// Trace + probe-fallback path (F9: upgraded to real Lumen's own "Screen Probe Gather" near-field
+// term); Lite is the new probe-grid-PRIMARY irradiance-field gather (renderer::WorldProbeGridPass's
+// multi-level clipmap, sampled with DDGI-style probe-occlusion weighting -- see
+// world_probe_sampling.glsl's own SampleWorldProbeGrid) with the per-pixel screen march skipped
+// entirely (see ScreenTrace.comp's own giMode branch). Mutable (not `constexpr`): main.cpp's Debug
+// ImGui GI-mode selector flips this at runtime for A/B comparison; a Release build never exposes
+// the selector but still reads this same variable every frame, so its compile-time default
+// (HighQuality, matching this codebase's pre-F1 behavior exactly) is what Release always renders.
+enum class GIMode : uint32_t { HighQuality = 0u, Lite = 1u };
+inline GIMode GI_MODE = GIMode::HighQuality;
+
 inline uint32_t MAX_TRACED_ENTITIES = 128u;
 inline uint32_t RADIOSITY_BOUNCE_COUNT = 4u;
 inline uint32_t SURFACE_CACHE_GI_SAMPLE_COUNT = 64u;
@@ -333,6 +347,19 @@ inline float VIGNETTE_COLOR_BLEED = 0.4f;
 inline float DOF_FOCAL_LENGTH_MM = 50.0f;
 inline float DOF_FOCUS_DISTANCE_WORLD_UNITS = 10.0f;
 inline float DOF_MAX_COC_RADIUS_PIXELS = 24.0f;
+// UE5.8-parity "Accumulation Depth of Field": 0 = Gather (DepthOfFieldPass, DepthOfField.comp's own
+// single-frame 16-tap Poisson gather -- the original/default mode), 1 = Accumulation
+// (DepthOfFieldAccumulationPass, DepthOfFieldAccumulation.comp's own per-frame single-lens-sample +
+// temporal-reprojection accumulation -- cinematic, path-tracer-like bokeh that converges over many
+// frames once the camera settles, at a fraction of Gather mode's per-frame tap cost). Both passes
+// share DOF_FOCAL_LENGTH_MM/DOF_FOCUS_DISTANCE_WORLD_UNITS/DOF_MAX_COC_RADIUS_PIXELS/DOF_ENABLED
+// above -- only the resolve technique differs. See renderer::ClusterRenderPipeline::RecordFrame's
+// own [13e] DOF call site for the branch.
+inline int DOF_MODE = 0;
+// Accumulation mode only: how many frames a stationary-camera pixel accumulates before the running
+// mean caps out into a fixed-window exponential moving average -- see
+// DepthOfFieldAccumulationPass::Settings::maxAccumulationSamples's own comment.
+inline float DOF_ACCUMULATION_MAX_SAMPLES = 64.0f;
 
 // Motion Blur (per-pixel velocity reconstructed from depth + view matrices, no stored velocity buffer)
 inline float MOTION_BLUR_INTENSITY = 0.5f;

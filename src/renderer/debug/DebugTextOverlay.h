@@ -75,12 +75,15 @@ namespace renderer::debug {
         // (the render extent's width, needed to right-align the FPS text) drive the top-right
         // counter; `radiosityEnabled`/`ssrtEnabled`/`traceMode` (0 = SWRT, 1 = HWRT)/
         // `worldProbesEnabled` mirror ClusterRenderPipeline's own current debug-toggle state exactly.
+        // `giMode` (F1, "Lumen Lite"): config::lumen::GI_MODE cast to uint32_t (0 = HighQuality,
+        // 1 = Lite) -- shown alongside the FPS counter so an A/B GI-mode comparison has its own
+        // on-screen timing evidence without needing a separate profiling tool.
         // `aliveParticleCount`/`maxParticleCount` (particle system Subtask 6): renderer::
         // ParticleSystemPass::GetLastAliveCountApprox()/kMaxParticles -- the former is a 1-2-frame-
         // stale GPU->CPU readback, see that method's own comment.
         void BuildFrameText(float gpuMemUsedMB, uint32_t pendingPageLoads, float bytesPerSecond,
             uint32_t hwTriangleCount, uint32_t swTriangleCount, float fps, float viewportWidthPixels, float viewportHeightPixels,
-            bool radiosityEnabled, bool ssrtEnabled, uint32_t traceMode, bool worldProbesEnabled,
+            bool radiosityEnabled, bool ssrtEnabled, uint32_t traceMode, bool worldProbesEnabled, uint32_t giMode,
             uint32_t aliveParticleCount, uint32_t maxParticleCount);
 
         // `outputColorFormat` must be the ACTUAL format of `outputColorView`'s underlying image --
