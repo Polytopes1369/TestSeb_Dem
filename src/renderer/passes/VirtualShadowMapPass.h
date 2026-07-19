@@ -85,6 +85,8 @@
 
 namespace renderer {
 
+    class ParticleSystemPass; // Feature F7 (shadow-casting particles) -- SetParticleSystem()/RecordParticleShadows() borrow its buffer handles/layout, see those methods' own comments.
+
     class VirtualShadowMapPass {
     public:
         VirtualShadowMapPass() = default;
@@ -206,6 +208,39 @@ namespace renderer {
 
         void RecordEndFrame(VkCommandBuffer cmd);
 
+        // --- Feature F7 (UE5.7/5.8 Niagara parity: shadow-casting particles) ---
+        // ParticleSystemPass initializes AFTER this pass (renderer::ClusterRenderPipeline::Init's own
+        // call order: m_VirtualShadowMap.Init() long precedes m_ParticleSystem.Init()), so this pass
+        // cannot take particle buffers as an Init() parameter the way entityTransformBuffer/
+        // entityDataBuffer above are -- SetParticleSystem() is the same DEFERRED one-time wiring
+        // pattern renderer::TransparentForwardPass::SetVirtualShadowMap/renderer::SurfaceCachePass::
+        // SetVirtualShadowMap already establish for an analogous "the pass I need data from
+        // initializes later" ordering constraint: builds this pass' own particle-shadow-capture
+        // pipeline (depth-only, alpha-tested light-facing billboard quads -- ParticleShadowCapture
+        // .vert/.frag) against `particles.GetSetLayout()` directly (the SAME descriptor set layout
+        // every real particle shader binds, see ParticleCommon.glsl's own header comment) rather than
+        // building a second, redundant descriptor set here -- RecordParticleShadows() below binds
+        // `particles.GetCurrentSet()` at draw time. Call once, after ParticleSystemPass::Init() has
+        // returned, before the first RecordParticleShadows() call.
+        void SetParticleSystem(const ParticleSystemPass& particles);
+
+        // Renders every alive particle belonging to a castShadows-enabled emitter (EmitterParams::
+        // castShadows, ParticleSystemPass.h) depth-only into every VSM page this SAME frame's
+        // RecordBeginFrame() call already rendered (miss-driven OR Feature 2 dynamic-redraw), whose
+        // frustum overlaps that emitter's own (coarse, fixed-radius) world bounds -- see
+        // AnyShadowCastingEmitterOverlapsPageNDC's own comment for the overlap test and
+        // ClassifyDynamicPages' own extension (same function) for why a page near a shadow-casting
+        // emitter keeps getting included in that set every frame, not just the one frame it was first
+        // requested. Must be called AFTER `particles`' own RecordSimulate()/RecordSort() this SAME
+        // frame (renderer::ClusterRenderPipeline::RecordFrameEarly's own call-ordering comment) --
+        // records an explicit VkMemoryBarrier2 (compute-shader-write -> vertex-shader-read +
+        // indirect-command-read) between those writes and this call's own reads before issuing any
+        // draw, exactly the "explicit barrier, no shortcuts" discipline CLAUDE.md requires. A no-op
+        // (returns immediately) if SetParticleSystem() was never called or RecordBeginFrame() rendered
+        // no pages at all this frame (the common case once streaming has settled -- see that method's
+        // own trailing log for typical per-frame page-render counts).
+        void RecordParticleShadows(VkCommandBuffer cmd, const ParticleSystemPass& particles);
+
         // Wiring accessors for consumer descriptor sets (SurfaceCachePass, ClusterResolvePass) --
         // see shadow_page_table.glsl / shadow_feedback.glsl / shadow_atlas_sampling.glsl /
         // shadow_sun_sampling.glsl / shadow_point_sampling.glsl for the exact binding contract each
@@ -226,14 +261,45 @@ namespace renderer {
         uint32_t GetPhysicalPageCapacity() const { return m_Pool.GetPhysicalCapacity(); }
 
     private:
+        // Feature F7 (shadow-casting particles): everything RecordBeginFrame's own render loops
+        // already compute for one rendered page that RecordParticleShadows() later needs to draw a
+        // particle-shadow pass on TOP of that same page's entity depth -- viewport/scissor (avoids
+        // re-deriving the wrapped<->raster conversion a second time outside RenderPage) and this
+        // page's own NDC sub-rectangle (for the per-emitter overlap test).
+        struct PageRenderInfo {
+            VkViewport viewport{};
+            VkRect2D scissor{};
+            float ndcXMin = 0.0f, ndcXMax = 0.0f, ndcYMin = 0.0f, ndcYMax = 0.0f;
+        };
+
+        // Feature F7: one page RecordBeginFrame() actually rendered (miss-driven OR Feature 2
+        // dynamic-redraw) THIS frame -- physicalLayer/viewProj/viewport/scissor/NDC bounds, everything
+        // RecordParticleShadows() needs to revisit it (LOAD_OP_LOAD, not CLEAR) without recomputing
+        // any of RenderPage's own wrapped<->raster derivation. `lightRight`/`lightUp` are this page's
+        // own TRUE (unflipped -- see class comment on lightUpForPaging's deliberate Y-flip, which is
+        // page-grid-arithmetic-only and must NOT leak into a billboard basis) light-facing basis:
+        // shared across every sun level (same lightDir every level, see RecordBeginFrame), computed
+        // per-face for a point light cube (kFaceDirs[face]/kFaceUps[face], own basis per face).
+        struct RenderedPageThisFrame {
+            uint32_t physicalLayer = 0;
+            maths::mat4 viewProj{};
+            VkViewport viewport{};
+            VkRect2D scissor{};
+            float ndcXMin = 0.0f, ndcXMax = 0.0f, ndcYMin = 0.0f, ndcYMax = 0.0f;
+            maths::vec3 lightRight{};
+            maths::vec3 lightUp{};
+        };
+
         // Feature 1 (live per-entity transforms): renders EVERY entity's Fallback Mesh range into
         // this page (one vkCmdDrawIndexed per entity, opaque or masked pipeline selected per
         // entity's own precomputed maskTextureIndex -- Feature 3), instead of the old single
         // monolithic draw. Still "redraw the whole (tiny) scene per page, clipped by viewport/
         // scissor" -- see this class' own header comment -- just per-entity now instead of merged
         // into one draw call, which is what actually lets each entity's CURRENT (deformed/rotated)
-        // geometry reach the shadow page instead of a frozen rest-pose snapshot.
-        void RenderPage(VkCommandBuffer cmd, uint32_t vsmIndex, uint32_t localPageIndex, uint32_t physicalLayer,
+        // geometry reach the shadow page instead of a frozen rest-pose snapshot. Returns this page's
+        // own PageRenderInfo (Feature F7) so the caller can register it for a later particle-shadow
+        // pass without re-deriving the wrapped<->raster conversion this function already performs.
+        PageRenderInfo RenderPage(VkCommandBuffer cmd, uint32_t vsmIndex, uint32_t localPageIndex, uint32_t physicalLayer,
             const maths::mat4& viewProj);
 
         // Feature 2 (real static-vs-dynamic page invalidation): re-tests EVERY currently-resident
@@ -241,8 +307,23 @@ namespace renderer {
         // entity's CURRENT world-space AABB, writing the verdict into m_Pool via
         // SetPageCoversDynamicContent(). Called once per RecordBeginFrame() call, before that
         // method's own dynamic-page re-render block reads m_Pool.GetResidentDynamicPageIDs(). See
-        // the .cpp for the full NDC-overlap derivation.
+        // the .cpp for the full NDC-overlap derivation. Feature F7 extension: a page ALSO classifies
+        // dynamic if it overlaps a shadow-casting emitter's own bounds (AnyShadowCastingEmitterOverlapsPageNDC)
+        // -- without this, a page whose underlying entity geometry is static would only ever be
+        // rendered once (the initial miss), so RecordParticleShadows() would only get a chance to
+        // draw a particle shadow onto it that ONE frame; classifying it dynamic keeps it in every
+        // frame's re-render set for as long as a shadow-casting emitter remains nearby.
         void ClassifyDynamicPages(const core::EntityTransformCPU* entityTransformsCPU);
+
+        // Feature F7: true if ANY active, castShadows-enabled emitter (config::particles::EMITTERS[])
+        // has its own coarse, fixed-radius world bounds (centered on the emitter's own spawn
+        // position -- see the .cpp definition for why a tight per-particle bound is neither cheap nor
+        // necessary) overlapping the page NDC sub-rectangle [ndcXMin,ndcXMax] x [ndcYMin,ndcYMax]
+        // under `viewProj`. Used both by ClassifyDynamicPages (above) and RecordParticleShadows
+        // (public) to gate which pages actually get a particle-shadow draw call -- "respect the
+        // existing page budget" per this feature's own task description.
+        bool AnyShadowCastingEmitterOverlapsPageNDC(const maths::mat4& viewProj,
+            float ndcXMin, float ndcXMax, float ndcYMin, float ndcYMax) const;
 
         // True if `range`'s current (rotated about its own EntityTransformCPU pivot, deformation-
         // inflated) world-space AABB overlaps the page NDC sub-rectangle [ndcXMin,ndcXMax] x
@@ -336,6 +417,22 @@ namespace renderer {
 
         GpuBuffer m_SunLevelsUBO;   // See SunLevelsUBOData (VirtualShadowMapPass.cpp) for the exact std140-mirrored layout uploaded here.
         GpuBuffer m_PointFacesUBO; // mat4[kMaxPointLightVSMs], CPU_TO_GPU mapped.
+
+        // Feature F7 (shadow-casting particles): pipeline layout/pipeline built lazily by
+        // SetParticleSystem() (see that method's own comment for why this cannot happen at Init()
+        // time) -- both stay VK_NULL_HANDLE, and RecordParticleShadows() is a no-op, until that call
+        // has run. Depth-only (0 color attachments, same D32_SFLOAT target as m_Pipeline/
+        // m_MaskedPipeline above), alpha-tested via ParticleShadowCapture.frag's own discard (no
+        // depthCompareOp/blend difference from m_Pipeline otherwise needed).
+        VkPipelineLayout m_ParticleShadowPipelineLayout = VK_NULL_HANDLE;
+        VkPipeline m_ParticleShadowPipeline = VK_NULL_HANDLE;
+
+        // Feature F7: every page RecordBeginFrame()'s own render loops actually rendered THIS frame
+        // (miss-driven + Feature 2 dynamic-redraw combined) -- cleared at the top of every
+        // RecordBeginFrame() call, consumed once by the LATER RecordParticleShadows() call this same
+        // frame (see that method's own comment on why it must run after ParticleSystemPass's own
+        // simulate/sort dispatches, i.e. cannot simply be folded into RenderPage() itself).
+        std::vector<RenderedPageThisFrame> m_PagesRenderedThisFrame;
     };
 
 }

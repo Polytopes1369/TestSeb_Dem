@@ -148,7 +148,11 @@ struct EmitterParams {
     float ribbonWidth;          // Render mode 2 only -- half-width, world units, of the trail's cross-section quad-strip.
     uint spriteOrientationMode; // Render mode 0 only -- 0 = camera-facing (original default), 1 = velocity-aligned (B3).
     float subVariationStrength; // Render mode 0 only -- [0,1], B3's procedural per-particle shape perturbation strength (0.0 = pixel-identical to pre-B3).
-    float _pad2, _pad3, _pad4;
+    // Feature F7 (shadow-casting particles) -- mirrors renderer::ParticleSystemPass::EmitterParams::
+    // castShadows byte-for-byte, repurposing what was `_pad2` (no struct-size change) -- see that
+    // field's own declaration comment for the full contract. Read by ParticleShadowCapture.vert.
+    uint castShadows;
+    float _pad3, _pad4;
 };
 
 // Particle "kind" tag, packed into Particle.randomSeed's top 2 bits (see that field's own comment).

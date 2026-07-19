@@ -1493,6 +1493,10 @@ int main(int argc, char** argv) {
                             ImGui::SliderFloat("Shape Sub-Variation", &cfg.subVariationStrength, 0.0f, 1.0f);
                         }
 
+                        // Feature F7 (UE5.7/5.8 Niagara parity: shadow-casting particles). See
+                        // config::particles::EmitterConfig::castShadows's own declaration comment.
+                        ImGui::Checkbox("Cast Shadows (VSM)", &cfg.castShadows);
+
                         // Multi-emitter roadmap (subtask A1) validation/debug instrumentation: proves
                         // this emitter is independently alive/producing particles, not just that the
                         // aggregate total below is nonzero.

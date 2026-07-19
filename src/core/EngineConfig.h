@@ -587,6 +587,17 @@ struct EmitterConfig {
     };
     float sizeCurve[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
 
+    // Feature F7 (UE5.7/5.8 Niagara parity: shadow-casting particles) -- deliberately inserted HERE,
+    // right after sizeCurve, rather than appended at this struct's very end like every other trailing
+    // field below: EMITTERS[0]/[1]'s own positional aggregate initializers (below) already list
+    // values through sizeCurve and stop there, so a field inserted immediately after it can still be
+    // explicitly set to `true` for exactly those two emitters by appending one more trailing value to
+    // their existing initializer lists, with zero risk of silently reinterpreting any later field's
+    // position (no existing initializer lists anything past sizeCurve today). See renderer::
+    // ParticleSystemPass::EmitterParams::castShadows's own declaration comment for the full contract
+    // -- mirrored 1:1 here, just under this config-authoring struct's own name.
+    bool castShadows = false;
+
     // Subtask C2 (Niagara-parity roadmap: screen-space depth-buffer collision) -- deliberately added
     // at the END of this struct (same convention module-stack roadmap subtask A3's own trailing
     // fields already established, see that comment above) so every existing positional
@@ -665,7 +676,7 @@ inline EmitterConfig EMITTERS[kMaxEmitters] = {
             { 0.55f, 0.15f, 0.05f, 0.8f }, // Age 0.67 -- cooling into a dim, dark red ember.
             { 0.0f, 0.0f, 0.0f, 0.0f }     // Age 1.00 -- fully extinguished/transparent at death.
         },
-        /*sizeCurve*/ { 0.6f, 1.0f, 0.8f, 0.0f } },
+        /*sizeCurve*/ { 0.6f, 1.0f, 0.8f, 0.0f }, /*castShadows*/ true },
     // Ambient Dust keeps an explicit FLAT curve matching its own Base Color exactly (rather than
     // relying on EmitterConfig's own in-class default, which only matches the DEFAULT Base Color
     // (1,1,1,1), not this emitter's actual dusty blue-gray one) -- see EmitterConfig::colorCurve's own
@@ -683,7 +694,7 @@ inline EmitterConfig EMITTERS[kMaxEmitters] = {
             { 0.6f, 0.7f, 0.85f, 0.5f }, { 0.6f, 0.7f, 0.85f, 0.5f },
             { 0.6f, 0.7f, 0.85f, 0.5f }, { 0.6f, 0.7f, 0.85f, 0.5f }
         },
-        /*sizeCurve*/ { 1.0f, 1.0f, 1.0f, 1.0f } },
+        /*sizeCurve*/ { 1.0f, 1.0f, 1.0f, 1.0f }, /*castShadows*/ true },
     EmitterConfig{},
     EmitterConfig{ /*active*/ true, /*position*/ 12.0f, -0.6f, 12.0f, /*spawnRate*/ 60.0f,
         /*color*/ 0.85f, 0.92f, 1.0f, 0.65f, /*size*/ 0.18f, 0.40f, /*lifetime*/ 0.8f, 1.7f,
