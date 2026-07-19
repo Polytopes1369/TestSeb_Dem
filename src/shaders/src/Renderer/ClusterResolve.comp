@@ -739,8 +739,12 @@ void main() {
                 }
                 vec2 dbgPagePos = clamp((dbgNdc.xy * 0.5 + 0.5) * float(SHADOW_PAGES_PER_AXIS),
                     vec2(0.0), vec2(float(SHADOW_PAGES_PER_AXIS) - 1.0e-4));
-                uvec2 dbgPageCoord = uvec2(floor(dbgPagePos));
-                uint dbgLogicalPageID = ShadowLogicalPageID(level, dbgPageCoord);
+                uvec2 dbgRasterCoord = uvec2(floor(dbgPagePos));
+                // Feature F14: same raster->wrapped conversion SampleSunShadowVSM performs -- see
+                // that function's own comment (shadow_sun_sampling.glsl) -- so this debug view's
+                // residency check matches reality instead of reading a stale pre-recenter slot.
+                ivec2 dbgWrappedCoord = ShadowWrapPageCoord(ivec2(dbgRasterCoord) + g_ShadowSunLevels.windowStartPage[level].xy);
+                uint dbgLogicalPageID = ShadowLogicalPageID(level, uvec2(dbgWrappedCoord));
                 bool dbgResident = IsShadowPageResident(dbgLogicalPageID);
                 finalColor = kLevelColors[level] * (dbgResident ? 1.0 : 0.35);
                 break;
