@@ -905,6 +905,13 @@ bool ClusterRenderPipeline::Init(
     return false;
   }
 
+  // Feature F7 (shadow-casting particles): one-time deferred wiring -- m_VirtualShadowMap.Init()
+  // (much earlier above) could not take m_ParticleSystem's buffers as an Init() parameter the way
+  // entityTransformBuffer/entityDataBuffer above are, since m_ParticleSystem itself did not exist
+  // yet at that point -- see VirtualShadowMapPass::SetParticleSystem's own comment for the full
+  // "deferred binding, same pattern as SetVirtualShadowMap" rationale.
+  m_VirtualShadowMap.SetParticleSystem(m_ParticleSystem);
+
   // GPU-instanced procedural vegetation scatter (UE5.8 rendering-parity gap G2) -- grass/shrub/rock
   // instances across the terrain. Depends on m_VirtualShadowMap + m_WorldProbes (forward lighting,
   // both Init'd just above) and m_HZB (per-instance occlusion cull, Init'd far earlier). Draws onto
@@ -2098,6 +2105,10 @@ void ClusterRenderPipeline::RecordFrameEarly(VkCommandBuffer cmdEarly,
         gpu.spriteOrientationMode = cfg.spriteOrientationMode;
         gpu.subVariationStrength = cfg.subVariationStrength;
 
+        // Feature F7 (shadow-casting particles): same "copy the live ImGui-edited config value into
+        // this frame's GPU struct" pattern as every field above.
+        gpu.castShadows = cfg.castShadows ? 1u : 0u;
+
         if (cfg.active) {
           m_ParticleSpawnAccumulator[i] += cfg.spawnRate * particleDeltaTimeSeconds;
         }
@@ -2176,6 +2187,19 @@ void ClusterRenderPipeline::RecordFrameEarly(VkCommandBuffer cmdEarly,
 #ifndef NDEBUG
       m_GpuProfiler.EndZone(cmdEarly);
 #endif
+
+      // Feature F7 (shadow-casting particles): must run AFTER RecordSimulate/RecordSort just above
+      // (records its own explicit VkBarrier2 between their compute-shader writes and this call's own
+      // vertex-shader reads, see VirtualShadowMapPass::RecordParticleShadows' own comment) so this
+      // frame's freshly-simulated alive-particle positions/alive-list/indirect-draw-args are what get
+      // rendered into whichever VSM pages m_VirtualShadowMap.RecordBeginFrame() (much earlier this
+      // same frame, see [1] above) already rendered entity geometry into -- layers a light-facing,
+      // alpha-tested particle-shadow footprint on top of those pages' own depth, LOAD_OP_LOAD (never
+      // erasing what RecordBeginFrame already captured). Deliberately NOT wrapped in its own
+      // GpuProfiler zone (unlike every RecordXxx() call above) -- this codebase's Debug-only
+      // per-pass GPU timestamp profiler is being rolled out by a concurrent effort; leaving this one
+      // call unzoned avoids colliding with that in-flight work.
+      m_VirtualShadowMap.RecordParticleShadows(cmdEarly, m_ParticleSystem);
     }
 
     // 4. Secondary-bounce injection into m_SurfaceCache's own radiance atlas + the TLAS refit that
