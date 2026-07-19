@@ -156,6 +156,18 @@ inline bool SPOT_LIGHTS_ENABLED = true;
 inline bool RECT_LIGHTS_ENABLED = true;
 inline bool PHOTOMETRIC_LIGHTS_ENABLED = true;
 inline float TYPED_LIGHT_INTENSITY_SCALE = 1.0f;
+
+// F2b (UE5.8 rendering-parity gap: Lighting Channels) -- renderer::AtmosVolumetricFogPass::
+// RecordUpdate reads this every frame to fill AtmosVolumetricFog.comp's own
+// pc.fogLightingChannelMask (see that push-constant field's own comment). Bit 0/1/2 = channel 0/1/2.
+// Defaults to 0x7 (every channel) so a scene that never opens the Debug "MegaLights" ImGui tab's
+// "Fog Lighting Channels" checkboxes keeps its exact pre-F2b visuals (fog receives every light
+// regardless of that light's own channel, same as before this feature existed) -- toggling a bit off
+// live demonstrates the F2b masking mechanism end-to-end without touching any baked scene data (see
+// renderer::GenerateProceduralLights()/GenerateShowcaseMaterialTable()'s own per-light/per-entity
+// PackMegaLightChannelMask()/MaterialParameters::lightingChannelMask authoring API for the
+// non-debug, scene-authored equivalent of this same mask).
+inline uint32_t FOG_LIGHTING_CHANNEL_MASK = 0x7u;
 } // namespace megalights
 
 namespace postprocess {

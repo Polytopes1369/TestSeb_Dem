@@ -16,6 +16,26 @@
 // Consumed by ClusterResolve(Binned).comp (direct sun term) and SurfaceCacheCapture.frag (indirect
 // bounce direct-light injection), both sampling this map via atmos_clouds_density.glsl's own
 // AtmosCloudShadowUVFromWorldXZ(worldPos.xz) -- the single shared mapping every consumer must use.
+//
+// --- F2d verification (2026-07-19, UE5.8 MegaLights "production-ready" pack): sun-only by design,
+// not an unclosed gap ---
+// Evaluated whether this shadow map should also attenuate MegaLights local point/spot/rect lights.
+// It cannot, meaningfully: `ro` above is a fixed height in the km-scale planet-local vertical frame
+// (ATMOS_CLOUDS_GROUND_RADIUS_KM + ATMOS_CLOUDS_CAMERA_HEIGHT_KM) and the raymarch direction is
+// hardcoded `towardSun` -- this bakes ONE specific projection (straight up, toward one specific
+// distant/celestial direction shared by the whole scene) into a single 512x512 map indexed purely by
+// world XZ. A MegaLights local light is a scene-embedded prop (a street lamp, an accent light inside
+// the showcase Cylinder zone) at human/prop scale with its own arbitrary position and, for spot/rect
+// types, its own arbitrary emission direction -- there is no "straight up toward this light" ray for
+// clouds (which sit far above the whole scene) to plausibly occlude, unlike the sun's genuinely
+// planet-spanning, effectively-parallel ray bundle. Re-deriving a correct per-local-light cloud
+// occlusion term would mean either a full per-light shadow-map bake (expensive, and still physically
+// odd for a light shining sideways out of a wall fixture) or reusing this SAME top-down sun-oriented
+// map as a lazy stand-in for an unrelated light direction, which would be visibly wrong (a light
+// pointing away from the sky would still "flicker" with passing clouds it has no relationship to).
+// Conclusion: cloud shadows stay sun-only in this engine's architecture, matching the task's own
+// explicit "if the mapping is genuinely sun-only, document that decision and move on" guidance --
+// no code change made. Documented here so a future session does not re-open this investigation.
 
 #include "include/atmos_clouds_density.glsl"
 

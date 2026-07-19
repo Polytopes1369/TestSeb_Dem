@@ -65,6 +65,23 @@ namespace renderer {
     // clear.
     constexpr uint32_t kMegaLightFlagRectTwoSided = 1u << 8;
 
+    // F2b (UE5.8 rendering-parity gap: Lighting Channels) -- bits 9-11 of MegaLight::
+    // iesProfileAndFlags, a UE-style 3-bit channel mask (channels 0/1/2). Mirrored value-for-value by
+    // megalights_types.glsl's own MEGALIGHT_CHANNEL_MASK_SHIFT/BITS and MegaLightChannelMask() -- see
+    // that function's own comment for the "raw zero decodes as channel-0-only" default convention
+    // this helper matches exactly, so every light ever constructed before F2b (leaving
+    // iesProfileAndFlags's these bits at their default 0) keeps its exact pre-F2b behavior.
+    constexpr uint32_t kMegaLightChannelMaskShift = 9u;
+    constexpr uint32_t kMegaLightChannelMaskBits = 0x7u;
+
+    // Packs `channelMask` (a 3-bit UE-style Lighting Channel selection, e.g. 0x1 = channel 0 only,
+    // 0x3 = channels 0+1) into a light's iesProfileAndFlags, preserving the low IES-profile byte and
+    // the rect two-sided flag already present in `existing`.
+    constexpr uint32_t PackMegaLightChannelMask(uint32_t existing, uint32_t channelMask) {
+        return (existing & ~(kMegaLightChannelMaskBits << kMegaLightChannelMaskShift))
+            | ((channelMask & kMegaLightChannelMaskBits) << kMegaLightChannelMaskShift);
+    }
+
     // GLSL-friendly, std430-compatible mirror of MegaLight in
     // src/shaders/include/megalights_types.glsl -- 80 bytes, five {vec3, scalar} blocks, same
     // field-ordering convention as renderer::MaterialParameters (every vec3 immediately followed by
@@ -85,7 +102,8 @@ namespace renderer {
     //   rectHalfExtentX/rectHalfExtentY -- rect half-width along tangentU / half-height along the
     //                  derived second axis.
     //   iesProfileAndFlags -- MegaLightIESProfile in the low byte, feature flags (kMegaLightFlag*) in
-    //                  the high bits.
+    //                  the high bits, plus (F2b) a 3-bit Lighting Channel mask in bits 9-11
+    //                  (kMegaLightChannelMaskShift/Bits, PackMegaLightChannelMask()).
     struct MegaLight {
         maths::vec3 position{};
         float radius = 1.0f;   // Distance at which the smooth windowed attenuation reaches zero.
@@ -119,7 +137,12 @@ namespace renderer {
     // accent count each. The floor and the 2 static Lumen-corner walls intentionally get none --
     // they're lit by the scene's own sun instead. Deterministic, fixed-seed (never
     // std::random_device) -- matches GenerateShowcaseMaterialTable's own "a demo must look
-    // identical every playback" rationale.
+    // identical every playback" rationale. Every light this function authors leaves
+    // MegaLight::iesProfileAndFlags's channel bits at their default 0 (decodes to Lighting Channel 0
+    // -- see MegaLightChannelMask()'s own comment, megalights_types.glsl), so F2b's per-light
+    // authoring capability (PackMegaLightChannelMask() above) is available to any FUTURE scene-setup
+    // code that wants to assign a light to a non-default channel, without this function's own current
+    // output changing at all.
     MegaLightsData GenerateProceduralLights(uint32_t seed);
 
 }

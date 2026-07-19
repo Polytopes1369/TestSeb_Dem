@@ -28,6 +28,25 @@
 // silhouette), and -- like that pass -- keeps every image permanently in VK_IMAGE_LAYOUT_GENERAL and
 // synchronizes with plain VkMemoryBarrier2 global barriers (all producers/consumers here are compute
 // storage writes / sampled reads, no layout transition ever needed).
+//
+// --- F2c verification (2026-07-19, UE5.8 MegaLights "production-ready" pack): MegaLights local
+// lights already feed BOTH Substrate SSS terms, no gap found ---
+// Re-checked both mechanisms this class' own SubstrateSlab comment distinguishes (sssAmount
+// analytic wrap-diffuse vs. this pass' own screen-space diffusion):
+//   1. sssAmount wrap-diffuse (EvaluateSlabDiffuse, substrate_bsdf.glsl) is evaluated INSIDE
+//      EvaluateSubstrateMaterial(mat, N, V, L) for an arbitrary light direction L -- the opaque
+//      MegaLights path (MegaLightsFinalShade.comp) and the forward/translucent path
+//      (TransparentForward.frag) both call that SAME function for their own selected MegaLight,
+//      exactly like ClusterResolve.comp calls it for the sun. There is no separate "is this the sun"
+//      branch anywhere in EvaluateSlabDiffuse -- a local light's wrap-diffuse response is therefore
+//      byte-for-byte the same code path as the sun's, already correct with zero changes needed.
+//   2. This pass' own screen-space diffusion (see class comment above) operates on GICompositePass's
+//      FINAL composited radiance, which already includes MegaLights' contribution by the time this
+//      pass runs (see the "direct sun + MegaLights + reflections + denoised indirect GI" ordering
+//      note two paragraphs up) -- the blur is entirely source-agnostic, so it diffuses whatever
+//      radiance MegaLights contributed exactly as it diffuses the sun's.
+// Conclusion: no code change was needed for F2c. Documented here (rather than silently closing the
+// task item) so a future session does not re-open this investigation.
 
 #include <cstdint>
 #include <vulkan/vulkan.h>
