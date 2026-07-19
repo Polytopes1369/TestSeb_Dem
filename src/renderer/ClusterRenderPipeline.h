@@ -263,6 +263,14 @@ namespace renderer {
         // if fur is never used -- the pass still Init's harmlessly, just placing roots on a default
         // creature footprint.
         CreatureFurGeometry creatureFurGeometry{};
+
+        // Terrain hydrology feature: the erosion bake's attributes texture (height, waterDepth,
+        // flow, moisture) + its sampler -- VulkanContext::GetTerrainHydrologyAttributesView()/
+        // Sampler(), filled by main.cpp. Sampled every frame by ClusterResolvePass (terrain biome
+        // shading: wetness/beach/flow detail, see terrain_shading.glsl) and WaterForwardPass (the
+        // water fragment discard/tint, see WaterForward.frag).
+        VkImageView terrainHydrologyAttributesView = VK_NULL_HANDLE;
+        VkSampler terrainHydrologySampler = VK_NULL_HANDLE;
     };
 
     class ClusterRenderPipeline {

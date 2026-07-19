@@ -1438,19 +1438,28 @@ void VulkanContext::CreateSyncObjects() {
 }
 
 void VulkanContext::CreatePipelinesAndDescriptors() {
-  VkDescriptorPoolSize poolSizes[] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 5},
-                                      {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1}};
+  // Terrain hydrology feature: run the GPU water & erosion bake FIRST -- the geometry descriptor
+  // sets written below reference its output textures (binding 6), and GenerateGeometry() (called
+  // right after this function) samples them from geom_terrain.comp / geom_water_surface.comp.
+  // Blocking/synchronous by design, see TerrainHydrologySim::Init's own comment.
+  m_TerrainHydrology.Init(m_Device, m_Allocator, m_CommandPool, m_GraphicsQueue);
+
+  // maxSets 2: the main geometry set + the water-surface variant (binding 6 differs -- see
+  // m_GeometryDescriptorSetWaterSurface's own header comment). Pool sizes doubled to match.
+  VkDescriptorPoolSize poolSizes[] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 10},
+                                      {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2},
+                                      {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2}};
   VkDescriptorPoolCreateInfo poolInfo{
       VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-  poolInfo.maxSets = 1;
-  poolInfo.poolSizeCount = 2;
+  poolInfo.maxSets = 2;
+  poolInfo.poolSizeCount = 3;
   poolInfo.pPoolSizes = poolSizes;
   if (vkCreateDescriptorPool(m_Device, &poolInfo, nullptr,
                              &m_GeometryDescriptorPool) != VK_SUCCESS) {
     throw std::runtime_error("Failed to create Geometry Descriptor Pool!");
   }
 
-  VkDescriptorSetLayoutBinding bindings[6] = {};
+  VkDescriptorSetLayoutBinding bindings[7] = {};
   bindings[0].binding = 0; // Vertices SSBO
   bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
   bindings[0].descriptorCount = 1;
@@ -1493,24 +1502,36 @@ void VulkanContext::CreatePipelinesAndDescriptors() {
   bindings[5].descriptorCount = 1;
   bindings[5].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
+  // Terrain hydrology feature: the erosion bake's sampled height texture -- referenced only by
+  // geom_terrain.comp (mesh height) and geom_water_surface.comp (water-surface height, via the
+  // second set below), the same "declared in the shared layout, referenced by few shaders"
+  // pattern binding 5 already establishes.
+  bindings[6].binding = 6;
+  bindings[6].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+  bindings[6].descriptorCount = 1;
+  bindings[6].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
   VkDescriptorSetLayoutCreateInfo layoutInfo{
       VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-  layoutInfo.bindingCount = 6;
+  layoutInfo.bindingCount = 7;
   layoutInfo.pBindings = bindings;
   if (vkCreateDescriptorSetLayout(m_Device, &layoutInfo, nullptr,
                                   &m_GeometryLayout) != VK_SUCCESS) {
     throw std::runtime_error("Failed to create Geometry Descriptor Layout!");
   }
 
+  VkDescriptorSetLayout setLayouts[2] = {m_GeometryLayout, m_GeometryLayout};
+  VkDescriptorSet geometrySets[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
   VkDescriptorSetAllocateInfo allocInfo{
       VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
   allocInfo.descriptorPool = m_GeometryDescriptorPool;
-  allocInfo.descriptorSetCount = 1;
-  allocInfo.pSetLayouts = &m_GeometryLayout;
-  if (vkAllocateDescriptorSets(m_Device, &allocInfo,
-                               &m_GeometryDescriptorSet) != VK_SUCCESS) {
-    throw std::runtime_error("Failed to allocate Geometry Descriptor Set!");
+  allocInfo.descriptorSetCount = 2;
+  allocInfo.pSetLayouts = setLayouts;
+  if (vkAllocateDescriptorSets(m_Device, &allocInfo, geometrySets) != VK_SUCCESS) {
+    throw std::runtime_error("Failed to allocate Geometry Descriptor Sets!");
   }
+  m_GeometryDescriptorSet = geometrySets[0];
+  m_GeometryDescriptorSetWaterSurface = geometrySets[1];
 
   VkDescriptorBufferInfo vertInfo{m_VertexBuffer, 0, VK_WHOLE_SIZE};
   VkDescriptorBufferInfo indexInfo{m_IndexBuffer, 0, VK_WHOLE_SIZE};
@@ -1519,28 +1540,41 @@ void VulkanContext::CreatePipelinesAndDescriptors() {
                                              VK_WHOLE_SIZE};
   VkDescriptorBufferInfo entityDataInfo{m_EntityBuffer, 0, VK_WHOLE_SIZE};
   VkDescriptorBufferInfo vertexSkinInfo{m_VertexSkinBuffer, 0, VK_WHOLE_SIZE};
+  // Binding 6 differs between the two sets: mesh height for every ordinary primitive dispatch
+  // (only geom_terrain.comp actually reads it), water surface for geom_water_surface.comp's.
+  VkDescriptorImageInfo hydroMeshHeightInfo{m_TerrainHydrology.GetLinearSampler(),
+                                            m_TerrainHydrology.GetMeshHeightView(),
+                                            VK_IMAGE_LAYOUT_GENERAL};
+  VkDescriptorImageInfo hydroWaterSurfaceInfo{m_TerrainHydrology.GetLinearSampler(),
+                                              m_TerrainHydrology.GetWaterSurfaceView(),
+                                              VK_IMAGE_LAYOUT_GENERAL};
 
-  VkWriteDescriptorSet writes[6] = {};
-  for (int i = 0; i < 6; i++) {
-    writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[i].dstSet = m_GeometryDescriptorSet;
-    writes[i].dstBinding = i;
-    writes[i].descriptorCount = 1;
-  }
-  writes[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-  writes[0].pBufferInfo = &vertInfo;
-  writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-  writes[1].pBufferInfo = &indexInfo;
-  writes[2].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-  writes[2].pBufferInfo = &paramsInfo;
-  writes[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-  writes[3].pBufferInfo = &entityTransformInfo;
-  writes[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-  writes[4].pBufferInfo = &entityDataInfo;
-  writes[5].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-  writes[5].pBufferInfo = &vertexSkinInfo;
-
-  vkUpdateDescriptorSets(m_Device, 6, writes, 0, nullptr);
+  auto writeGeometrySet = [&](VkDescriptorSet set, const VkDescriptorImageInfo* hydroInfo) {
+    VkWriteDescriptorSet writes[7] = {};
+    for (int i = 0; i < 7; i++) {
+      writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+      writes[i].dstSet = set;
+      writes[i].dstBinding = i;
+      writes[i].descriptorCount = 1;
+    }
+    writes[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[0].pBufferInfo = &vertInfo;
+    writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[1].pBufferInfo = &indexInfo;
+    writes[2].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    writes[2].pBufferInfo = &paramsInfo;
+    writes[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[3].pBufferInfo = &entityTransformInfo;
+    writes[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[4].pBufferInfo = &entityDataInfo;
+    writes[5].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[5].pBufferInfo = &vertexSkinInfo;
+    writes[6].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    writes[6].pImageInfo = hydroInfo;
+    vkUpdateDescriptorSets(m_Device, 7, writes, 0, nullptr);
+  };
+  writeGeometrySet(m_GeometryDescriptorSet, &hydroMeshHeightInfo);
+  writeGeometrySet(m_GeometryDescriptorSetWaterSurface, &hydroWaterSurfaceInfo);
 
   // Compute layout setup: shared by all non-box primitive generators, which
   // read their per-dispatch parameters from the Params UBO (binding = 2) bound
@@ -1595,6 +1629,7 @@ void VulkanContext::CreatePipelinesAndDescriptors() {
       {"shaders/geom_chamferBox.comp.spv", &m_ChamferBoxPipeline},
       {"shaders/geom_terrain.comp.spv", &m_TerrainPipeline},
       {"shaders/geom_river.comp.spv", &m_RiverPipeline},
+      {"shaders/geom_water_surface.comp.spv", &m_WaterSurfacePipeline},
       {"shaders/geom_creature.comp.spv", &m_CreaturePipeline},
       {"shaders/autosmooth.comp.spv", &m_AutosmoothPipeline},
   };
@@ -1706,7 +1741,8 @@ void VulkanContext::DispatchGeometryCompute(
     VkCommandBuffer cmd,
     VkPipeline pipeline, VkPipelineLayout layout, const void *uboParamsData,
     size_t uboParamsSize, const void *pushConstantData, size_t pushConstantSize,
-    uint32_t groupCountX, uint32_t groupCountY, uint32_t groupCountZ) {
+    uint32_t groupCountX, uint32_t groupCountY, uint32_t groupCountZ,
+    VkDescriptorSet descriptorSetOverride) {
   // Every primitive except the box drives geom_*.comp through the shared Params UBO (binding = 2):
   // overwrite it with this dispatch's parameters before recording the dispatch that reads it.
   //
@@ -1740,8 +1776,11 @@ void VulkanContext::DispatchGeometryCompute(
   }
 
   vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+  VkDescriptorSet set = (descriptorSetOverride != VK_NULL_HANDLE)
+                            ? descriptorSetOverride
+                            : m_GeometryDescriptorSet;
   vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1,
-                          &m_GeometryDescriptorSet, 0, nullptr);
+                          &set, 0, nullptr);
 
   if (pushConstantData != nullptr) {
     vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
@@ -2601,6 +2640,47 @@ void VulkanContext::GenerateWaterPlane(
   runningIndexOffset += 6u * (params.widthSegments - 1u) * (params.lengthSegments - 1u);
 }
 
+void VulkanContext::GenerateWaterSurface(
+    VkCommandBuffer cmd,
+    float Span, uint32_t Segments,
+    uint32_t meshID, maths::vec2 slot, float worldOffsetY,
+    uint32_t& runningVertexOffset, uint32_t& runningIndexOffset) {
+  assert(Span > 0.0f);
+  assert(Segments >= 2u);
+
+  // geom_water_surface.comp's Params UBO is byte-identical to PlaneParams -- reused directly,
+  // same convention as GenerateTerrain().
+  PlaneParams params{};
+  params.width = Span;
+  params.length_ = Span;
+  params.widthSegments = Segments;
+  params.lengthSegments = Segments;
+  params.meshID = meshID;
+  params.materialID = 0.0f; // See GenerateTerrain()'s own identical comment on this field.
+  params.vertexOffset = runningVertexOffset;
+  params.indexOffset = runningIndexOffset;
+  params.worldOffsetX = slot.x;
+  // The TERRAIN's anchor, not a fixed water level: vertex Y comes from the hydrology bake's
+  // water-surface texture, which lives in terrain-local height space (see this function's own
+  // header comment in VulkanContext.h).
+  params.worldOffsetY = worldOffsetY;
+  params.worldOffsetZ = slot.y;
+
+  uint32_t totalVerts = params.widthSegments * params.lengthSegments;
+  constexpr uint32_t kLocalSizeXY = 8u; // geom_water_surface.comp local_size = (8, 8, 1)
+  uint32_t groupCountX = (params.widthSegments + kLocalSizeXY - 1u) / kLocalSizeXY;
+  uint32_t groupCountY = (params.lengthSegments + kLocalSizeXY - 1u) / kLocalSizeXY;
+
+  // The one caller of the descriptor-set override: binding 6 must be the WATER-SURFACE texture
+  // here (see m_GeometryDescriptorSetWaterSurface's own header comment).
+  DispatchGeometryCompute(cmd, m_WaterSurfacePipeline, m_ComputePipelineLayout, &params,
+                          sizeof(params), nullptr, 0, groupCountX, groupCountY, 1,
+                          m_GeometryDescriptorSetWaterSurface);
+
+  runningVertexOffset += totalVerts;
+  runningIndexOffset += 6u * (params.widthSegments - 1u) * (params.lengthSegments - 1u);
+}
+
 void VulkanContext::GenerateRiver(
     uint32_t meshID, uint32_t segmentsAlong, uint32_t segmentsAcross,
     uint32_t& runningVertexOffset, uint32_t& runningIndexOffset) {
@@ -3226,10 +3306,20 @@ void VulkanContext::GenerateGeometry() {
   // -------------------------------------------------------------------------
   {
     maths::vec2 slot = {0.0f, 0.0f}; // centered at the world origin, same as the terrain itself
-    constexpr float kWaterPlaneSpan = 24.0f; // Mirrors the zone-grid's own ~16-unit extent with margin.
-    constexpr float kWaterLevel = -1.0f; // Mirrors water_params.glsl's kWaterLevel -- keep in sync.
-    GenerateWaterPlane(cmd, kWaterPlaneSpan, kWaterPlaneSpan, 2u, 2u, m_InstanceRegistry[kWaterEntityIndex].meshID, slot,
-                       kWaterLevel, runningVertexOffset, runningIndexOffset);
+    // Terrain hydrology feature: the old flat 24x24 lake quad (GenerateWaterPlane) is replaced by
+    // the SIMULATED water surface -- sea + lakes + eroded river channels in one 600x600 grid
+    // (kHydroWaterMeshSpan: wider than the terrain so the ocean extends toward the horizon), Y
+    // sampled from the erosion bake's water-surface texture and anchored at the TERRAIN's own
+    // worldOffsetY (-0.8, matching GenerateTerrain's call above -- the surface heights are
+    // terrain-local). 128x128 segments (~4.7-unit spacing): enough to follow coastlines/lake
+    // shores; the open sea between them is flat, which QEM simplifies for free. The authored
+    // river ribbon (GenerateRiver below) still chains onto this same entity unchanged.
+    constexpr float kWaterSurfaceSpan = 600.0f;   // Mirrors terrain_hydrology_params.glsl's kHydroWaterMeshSpan.
+    constexpr uint32_t kWaterSurfaceSegments = 128u;
+    constexpr float kTerrainAnchorY = -0.8f;      // Mirrors GenerateTerrain's own call-site worldOffsetY.
+    GenerateWaterSurface(cmd, kWaterSurfaceSpan, kWaterSurfaceSegments,
+                         m_InstanceRegistry[kWaterEntityIndex].meshID, slot,
+                         kTerrainAnchorY, runningVertexOffset, runningIndexOffset);
     GenerateRiver(m_InstanceRegistry[kWaterEntityIndex].meshID, 96u, 10u, runningVertexOffset, runningIndexOffset);
   }
 
@@ -4277,7 +4367,8 @@ void VulkanContext::Shutdown() {
        {m_ConePipeline, m_IcospherePipeline, m_PlanePipeline, m_SpherePipeline,
         m_TorusPipeline, m_TubePipeline, m_CapsulePipeline, m_CylinderPipeline,
         m_PyramidPipeline, m_TorusKnotPipeline, m_ChamferBoxPipeline,
-        m_TerrainPipeline, m_RiverPipeline, m_CreaturePipeline, m_AutosmoothPipeline}) {
+        m_TerrainPipeline, m_RiverPipeline, m_WaterSurfacePipeline,
+        m_CreaturePipeline, m_AutosmoothPipeline}) {
     if (pipeline != VK_NULL_HANDLE) {
       vkDestroyPipeline(m_Device, pipeline, nullptr);
     }
@@ -4319,6 +4410,10 @@ void VulkanContext::Shutdown() {
   if (m_GeometryLayout != VK_NULL_HANDLE) {
     vkDestroyDescriptorSetLayout(m_Device, m_GeometryLayout, nullptr);
   }
+
+  // Terrain hydrology feature: destroys the bake's images/pipeline/sampler -- must run while the
+  // device and allocator are both still live (it uses both).
+  m_TerrainHydrology.Shutdown();
 
   if (m_DescriptorPool != VK_NULL_HANDLE) {
     vkDestroyDescriptorPool(m_Device, m_DescriptorPool, nullptr);

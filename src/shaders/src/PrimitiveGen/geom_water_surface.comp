@@ -1,0 +1,110 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+
+// Terrain hydrology feature: the water-surface mesh -- sea, lakes and simulated river channels in
+// ONE grid, replacing the old flat 24x24 lake quad (GenerateWaterPlane's dispatch of
+// geom_plane.comp). Same dispatch shape / Vertex layout / Params UBO as geom_plane.comp (the UBO
+// is byte-identical -- VulkanContext::GenerateWaterSurface reuses PlaneParams directly), but the
+// vertex Y comes from TerrainHydrology.comp's baked water-surface texture (g_WaterSurfaceOut):
+// - Submerged texels carry the real simulated surface (terrain height + water depth): the sea
+//   sits at sea level, mountain lakes sit at THEIR OWN basin's level, rivers slope downhill.
+// - Dry texels carry terrain height - 0.08: those vertices tuck UNDER the ground, so dry spans of
+//   this grid hide behind the depth test (double-guarded by WaterForward.frag's depth discard).
+// The grid spans kHydroWaterMeshSpan (600) -- WIDER than the 300-unit simulated footprint -- and
+// the sampler's CLAMP_TO_EDGE border serves open-sea texels there, extending the ocean toward the
+// horizon past the island's coast.
+//
+// The vertices are DISPLACED AT GENERATION TIME (not in the water vertex shader) deliberately:
+// the water entity's forward draw uses the QEM-simplified Fallback Mesh
+// (geometry::BuildFallbackMesh), and QEM preserves what it can SEE -- a pre-displaced surface
+// keeps its lake/river shape through simplification, whereas a flat grid displaced later in the
+// vertex shader would first be collapsed to a handful of giant triangles (zero curvature = zero
+// QEM error) that no later per-vertex displacement could meaningfully bend.
+
+#include "include/struct_custo.glsl"
+#include "include/terrain_hydrology_params.glsl"
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(std430, binding = 0) writeonly buffer VertexBuffer { Vertex vertices[]; };
+layout(std430, binding = 1) writeonly buffer IndexBuffer  { uint indices[]; };
+
+layout(std140, binding = 2) uniform Params
+{
+    float width;
+    float length_;
+    uint  widthSegments;
+    uint  lengthSegments;
+    uint  meshID;
+    float materialID;
+    uint  vertexOffset;
+    uint  indexOffset;
+    float worldOffsetX;
+    float worldOffsetY;
+    float worldOffsetZ;
+};
+
+// Same binding as geom_terrain.comp's g_HydroMeshHeight slot in the shared geometry descriptor
+// set -- but this shader wants the WATER SURFACE, so VulkanContext rewrites binding 6 to
+// g_WaterSurfaceOut's view right before this dispatch (and back for any later terrain dispatch;
+// in practice GenerateGeometry orders terrain first, then this).
+layout(binding = 6) uniform sampler2D g_HydroWaterSurface;
+
+float SampleWaterSurface(vec2 xz) {
+    // CLAMP_TO_EDGE beyond the simulated footprint = the border ring's open-sea surface.
+    vec2 uv = HydroUVFromLocalXZ(xz);
+    return textureLod(g_HydroWaterSurface, uv, 0.0).r;
+}
+
+void main()
+{
+    if (width <= 0.0 || length_ <= 0.0 || widthSegments == 0 || lengthSegments == 0)
+    {
+        return;
+    }
+
+    uint x = gl_GlobalInvocationID.x;
+    uint z = gl_GlobalInvocationID.y;
+    if (x >= widthSegments || z >= lengthSegments) return;
+
+    float xPos = (float(x) / float(widthSegments - 1u) - 0.5) * width;
+    float zPos = (float(z) / float(lengthSegments - 1u) - 0.5) * length_;
+
+    uint vIdx = x + z * widthSegments;
+
+    Vertex v;
+    v.position = vec3(xPos, SampleWaterSurface(vec2(xPos, zPos)), zPos);
+
+    // Central-difference normal, same scheme as geom_terrain.comp -- lakes/sea are near-flat
+    // (normal ~ +Y), river runs pick up their downhill tilt.
+    float eps = width / float(widthSegments);
+    float hL = SampleWaterSurface(vec2(xPos - eps, zPos));
+    float hR = SampleWaterSurface(vec2(xPos + eps, zPos));
+    float hD = SampleWaterSurface(vec2(xPos, zPos - eps));
+    float hU = SampleWaterSurface(vec2(xPos, zPos + eps));
+    vec3 tangentX = vec3(2.0 * eps, hR - hL, 0.0);
+    vec3 tangentZ = vec3(0.0, hU - hD, 2.0 * eps);
+    v.normal = normalize(cross(tangentZ, tangentX));
+
+    v.uv         = vec2(float(x) / float(widthSegments - 1u), float(z) / float(lengthSegments - 1u));
+    v.uv2        = v.uv;
+    v.meshID     = meshID;
+    v.materialID = materialID;
+
+    v.position += vec3(worldOffsetX, worldOffsetY, worldOffsetZ);
+    vertices[vertexOffset + vIdx] = v;
+
+    if (x < widthSegments - 1u && z < lengthSegments - 1u)
+    {
+        uint i = vIdx;
+        uint t = indexOffset + (z * (widthSegments - 1u) + x) * 6u;
+
+        indices[t + 0u] = vertexOffset + i + widthSegments;
+        indices[t + 1u] = vertexOffset + i + 1u;
+        indices[t + 2u] = vertexOffset + i;
+
+        indices[t + 3u] = vertexOffset + i + widthSegments;
+        indices[t + 4u] = vertexOffset + i + widthSegments + 1u;
+        indices[t + 5u] = vertexOffset + i + 1u;
+    }
+}

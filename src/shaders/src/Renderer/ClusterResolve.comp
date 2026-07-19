@@ -266,6 +266,12 @@ layout(std430, set = 0, binding = 29) readonly buffer SkeletalBoneMatricesSSBO {
     mat4 boneMatrices[SKELETAL_MAX_BONES];
 };
 
+// Terrain hydrology feature: binding 33 -- the first free slot past this shader's full 0-32 range
+// (30-32 are F12's light-function/caustics bindings, declared in their own includes). The erosion
+// bake's (height, waterDepth, flow, moisture) attributes -- see ClusterResolvePass::
+// SetTerrainHydrology and terrain_shading.glsl's ComputeTerrainAlbedo.
+layout(set = 0, binding = 33) uniform sampler2D g_HydroAttributes;
+
 #ifdef _DEBUG
 layout(push_constant) uniform DebugPC {
     uint viewMode;
@@ -511,12 +517,14 @@ void main() {
         // back to the table's last slot instead of indexing past g_MaterialParams' real allocation.
         uint materialSlot = min(cluster.materialID, MATERIAL_TABLE_SIZE - 1u);
         MaterialParams mat = g_MaterialParams.params[materialSlot];
-        // Phase 7b (UE5.8 parity roadmap, terrain heightfield): override the flat fallback
-        // diffuseAlbedo with a procedural height/slope biome blend (grass/rock/snow) for the terrain
-        // material -- worldPos/normal are already available here (this step's barycentric
-        // reconstruction above), no new binding needed.
+        // Phase 7b (UE5.8 parity roadmap, terrain heightfield) + terrain hydrology feature:
+        // override the flat fallback diffuseAlbedo with a procedural height/slope/moisture biome
+        // blend for the terrain material -- worldPos/normal are already available here (this
+        // step's barycentric reconstruction above); the erosion bake's attributes texture
+        // (binding 33) adds full-resolution wetness/flow/beach detail the coarse mesh can't carry.
         if (cluster.materialID == MATERIAL_ID_TERRAIN) {
-            mat.base.diffuseAlbedo = ComputeTerrainAlbedo(worldPos, normal, mat.base.diffuseAlbedo);
+            vec4 hydro = texture(g_HydroAttributes, clamp(HydroUVFromLocalXZ(worldPos.xz), vec2(0.0), vec2(1.0)));
+            mat.base.diffuseAlbedo = ComputeTerrainAlbedo(worldPos, normal, mat.base.diffuseAlbedo, hydro);
         }
         // Substrate horizontal material mixing (UE5.8 rendering-parity gap G6): resolve the base (A)
         // and mixB (B) Slabs into ONE effective base by a per-pixel world-space procedural mask, right

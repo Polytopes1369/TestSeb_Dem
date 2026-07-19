@@ -755,6 +755,10 @@ bool ClusterRenderPipeline::Init(
   m_SurfaceCache.SetAtmosCloudShadow(m_AtmosClouds.GetCloudShadowMapView(), m_AtmosClouds.GetCloudShadowMapSampler());
   m_Resolve.SetAtmosCloudLighting(m_AtmosSky.GetLUTSampler(), m_AtmosSky.GetSkyViewLUTView(),
                                   m_AtmosClouds.GetCloudShadowMapSampler(), m_AtmosClouds.GetCloudShadowMapView());
+  // Terrain hydrology feature: same one-time wiring convention as SetAtmosCloudLighting above --
+  // the bake's attributes texture/sampler (VulkanContext-owned, created before this pipeline)
+  // never change after their own Init, so this binding is never refreshed again.
+  m_Resolve.SetTerrainHydrology(createInfo.terrainHydrologySampler, createInfo.terrainHydrologyAttributesView);
 
   // World Probe grid (Lumen "Translucency Volume") -- reuses the same shared trace-scene sets and
   // HWRT/BLAS/TLAS as every other GI consumer above; see ClusterRenderPipeline.h's own comment on
@@ -868,7 +872,8 @@ bool ClusterRenderPipeline::Init(
                             m_SurfaceCache.GetVertexBuffer(), m_SurfaceCache.GetIndexBuffer(),
                             waterRangeIt->second, kWaterEntityID,
                             m_SurfaceCacheRT.GetTLASHandle(), m_SurfaceCacheRT.GetDrawRangeBuffer(),
-                            m_TraceContext, createInfo.renderExtent)) {
+                            m_TraceContext, createInfo.renderExtent,
+                            createInfo.terrainHydrologyAttributesView, createInfo.terrainHydrologySampler)) {
       LOG_ERROR("[ClusterRenderPipeline] Failed to initialize WaterForwardPass.");
       return false;
     }

@@ -70,7 +70,13 @@ namespace geometry {
     // -----------------------------------------------------------------------------------------
     struct CacheFileHeader {
         static constexpr uint32_t kMagic = 0x4F45474Cu;   // "LGEO" little-endian ("Local GEOmetry cache")
-        static constexpr uint32_t kVersion = 8u;           // Bumped: ClusterData now carries a trailing
+        static constexpr uint32_t kVersion = 9u;           // Bumped (terrain hydrology feature): the
+                                                            // terrain entity's mesh now samples the eroded
+                                                            // heightfield (continental relief + erosion
+                                                            // carve) and the water entity's mesh is the
+                                                            // simulated water surface -- a version-8 cache
+                                                            // holds the pre-hydrology geometry for both.
+                                                            // Version 8 bumped for: ClusterData's trailing
                                                             // ClusterVertexSkin[kMaxClusterVertices] block
                                                             // (skeletal-animation feature) -- see that
                                                             // struct's own comment. Version 7 bumped for:

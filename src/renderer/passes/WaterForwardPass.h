@@ -77,11 +77,15 @@ namespace renderer {
         // established. `fallbackVertexBuffer`/`fallbackIndexBuffer`, `waterEntityDrawRange`/
         // `waterEntityID`, `tlasHandle`/`drawRangeBuffer`, `traceContext` -- identical borrowed-
         // resource contract to TessellationPass::Init's own parameters of the same name.
+        // `hydrologyAttributesView`/`hydrologySampler` (terrain hydrology feature):
+        // VulkanContext::GetTerrainHydrologyAttributesView()/Sampler() -- the erosion bake's
+        // (height, waterDepth, flow, moisture) texture, sampled by WaterForward.frag for the
+        // dry-fragment discard / depth tint / flow foam (see that shader's own comment).
         // Init(VkDevice, VmaAllocator, VkCommandPool, VkQueue, VkFormat, VkFormat, VkBuffer,
         // const MaterialParameters&, VkBuffer, VkBuffer, const SurfaceCachePass::EntityDrawRange&,
         // uint32_t, VkAccelerationStructureKHR, VkBuffer, const SurfaceCacheTraceContext&,
-        // VkExtent2D) -> bool and Shutdown() are inherited from RenderPass<WaterForwardPass>; see
-        // InitImpl() below.
+        // VkExtent2D, VkImageView, VkSampler) -> bool and Shutdown() are inherited from
+        // RenderPass<WaterForwardPass>; see InitImpl() below.
 
         // Records the water entity's single indexed draw. Same layout contract as
         // TessellationPass::RecordDraw (color: GENERAL on entry/exit, depth:
@@ -103,7 +107,8 @@ namespace renderer {
             VkBuffer fallbackVertexBuffer, VkBuffer fallbackIndexBuffer,
             const SurfaceCachePass::EntityDrawRange& waterEntityDrawRange, uint32_t waterEntityID,
             VkAccelerationStructureKHR tlasHandle, VkBuffer drawRangeBuffer,
-            const SurfaceCacheTraceContext& traceContext, VkExtent2D renderExtent);
+            const SurfaceCacheTraceContext& traceContext, VkExtent2D renderExtent,
+            VkImageView hydrologyAttributesView, VkSampler hydrologySampler);
 
         // m_Device / m_Allocator are inherited (protected) from RenderPass<WaterForwardPass>.
 

@@ -211,6 +211,11 @@ layout(std430, set = 0, binding = 28) readonly buffer SkeletalBoneMatricesSSBO {
     mat4 boneMatrices[SKELETAL_MAX_BONES];
 };
 
+// Terrain hydrology feature: binding 32 -- the first free slot past this shader's full 0-31 range
+// (29-31 are F12's light-function/caustics bindings, declared in their own includes). Same
+// texture ClusterResolve.comp binds at ITS index 33 -- see ClusterResolvePass::SetTerrainHydrology.
+layout(set = 0, binding = 32) uniform sampler2D g_HydroAttributes;
+
 layout(push_constant) uniform BinIndexPC {
     uint binIndex;
 } pc;
@@ -364,7 +369,9 @@ void main() {
     // materialSlot already, so this is a UNIFORM branch (zero warp divergence) -- every thread in
     // a terrain-bin dispatch takes it, every thread in any other bin's dispatch skips it entirely.
     if (pc.binIndex == MATERIAL_ID_TERRAIN) {
-        mat.base.diffuseAlbedo = ComputeTerrainAlbedo(worldPos, normal, mat.base.diffuseAlbedo);
+        // Terrain hydrology feature: see ClusterResolve.comp's own identical call-site comment.
+        vec4 hydro = texture(g_HydroAttributes, clamp(HydroUVFromLocalXZ(worldPos.xz), vec2(0.0), vec2(1.0)));
+        mat.base.diffuseAlbedo = ComputeTerrainAlbedo(worldPos, normal, mat.base.diffuseAlbedo, hydro);
     }
     // Substrate horizontal material mixing (UE5.8 rendering-parity gap G6): resolve base (A) + mixB
     // (B) into one effective base by the per-pixel world-space procedural mask, right after the
