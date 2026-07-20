@@ -58,7 +58,11 @@ namespace renderer {
         // instead clamps the ACTUAL traced-entity count to min(config::lumen::MAX_TRACED_ENTITIES,
         // kMaxTracedEntities), so quality tiers still scale GI trace cost down as intended without
         // ever resizing this fixed pool/layout/array.
-        static constexpr uint32_t kMaxTracedEntities = 128u;
+        // 128 -> 160 (10-tree-species scene): VulkanContext::kEntityCount grew to 37 (17 fixed +
+        // 10 trees * 2 bark/leaf entities), pushing kTotalEntityCount to 37 + 50*2 = 137 past the
+        // old 128 ceiling -- which would have silently truncated the last 9 streaming-pool slots
+        // out of GI/SDF tracing (see VulkanContext::kStreamingUnitCount's own ceiling comment).
+        static constexpr uint32_t kMaxTracedEntities = 160u;
         // Sentinel SDF value the unused (>= entityCount) g_EntitySDF array slots are filled with --
         // matches GlobalSDFPass::kFarValue's role (always farther than kSphereTraceEpsilon, so a
         // ray that reaches an unused slot's dummy volume can never register a false hit).

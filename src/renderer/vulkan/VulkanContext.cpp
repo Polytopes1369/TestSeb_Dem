@@ -1861,6 +1861,83 @@ maths::vec2 VulkanContext::GridSlot(int slotIndex) const {
   return maths::vec2{z.col * kZonePitch + z.pairOffset, z.row * kZonePitch};
 }
 
+namespace {
+
+// ---------------------------------------------------------------------------------------------
+// 10-tree-species recipe table (renderer::ProceduralTreePass) -- one distinct L-system
+// parameterization per species, shared by BuildEntityData() (per-entity bark/leaf materialID
+// assignment) and GenerateGeometry()'s TREES block (shape parameters + grove placement), so the
+// two can never drift apart. Every numeric field must respect geom_tree_bark.comp/
+// geom_tree_leaves.comp's shared validity guard (trunkHeight/trunkRadius/leafSize > 0,
+// lengthTaper/radiusTaper strictly inside (0, 1), branchFactor >= 2, 1 <= depth <=
+// tree_lsystem.glsl's TREE_MAX_DEPTH) -- a violating recipe doesn't crash, the dispatch just
+// silently generates nothing, which is far worse to diagnose.
+//
+// Species silhouettes come purely from the recipe (see tree_lsystem.glsl's transform model --
+// note every level-1 branch fans out from the trunk's single tip, so a species' character is
+// its CROWN shape + trunk proportions):
+//   oak:    broad spreading crown (branchFactor 4, wide angle, low damping).
+//   pine:   tall trunk, compact drooping conifer crown (short branches, steep angle + damping).
+//   birch:  slender white trunk, small light foliage (its own bark/leaf material variants).
+//   willow: trailing cascade (high pitchDamping accumulates pitch past horizontal -> droop).
+//   poplar: tight columnar crown (near-vertical branch angle, short branches).
+//   maple:  round crown, autumn orange-red foliage variant.
+//   baobab: squat massive trunk (largest trunkRadius, shallow depth, 5-way branching).
+//   palm:   bare tall trunk + one tier of 7 huge leaf cards (depth 1 -- the crown IS the
+//           leaf tier, the closest this L-system gets to fronds).
+//   shrub:  no real trunk (0.55 tall), dense 5-way ball of foliage at ground level.
+//   dead:   gnarled near-bare snag (binary branching, depth 5, gray wood, tiny dry remnants).
+// ---------------------------------------------------------------------------------------------
+struct TreeSpeciesRecipe {
+  uint32_t depth;            // L-system recursion levels past the trunk.
+  uint32_t branchFactor;     // Children per branching node.
+  float trunkHeight;
+  float trunkRadius;
+  float lengthTaper;         // Per-level segment-length multiplier, strictly (0, 1).
+  float radiusTaper;         // Per-level segment-radius multiplier, strictly (0, 1).
+  float branchAngleRadians;  // Cone half-angle added away from vertical per level.
+  float pitchDamping;        // Parent pitch carry-over factor, [0, 1].
+  uint32_t sides;            // Bark cylinder cross-section side count.
+  float leafSize;            // Leaf cross-quad half-extent, world units.
+  uint32_t barkMaterialID;   // renderer::kTreeBark*MaterialID family.
+  uint32_t leafMaterialID;   // renderer::kTreeLeaf*MaterialID family.
+  float groveOffsetX;        // Placement inside the grove clearing, relative to its anchor.
+  float groveOffsetZ;
+};
+
+// Grove layout: two staggered columns (quincunx) at grove-local X = 0 and 4.5, marching SOUTH
+// (-Z) from the clearing anchor. Deliberately z <= 0 only: the terrain-hydrology river runs down
+// the x == z diagonal from (30, 30) to its lake mouth at (6, 6) with a 5-unit-half-width carved
+// channel (see river_spline.glsl's kRiverControlXZ/kRiverBandInnerHalfWidth), so the old 4-tree
+// row's northern positions (x = 10, z up to +6, as close as 2.8 units from the channel
+// centerline) were already brushing the carve band -- every position below keeps >= 7 units of
+// clearance from the river centerline.
+constexpr std::array<TreeSpeciesRecipe, 10> kTreeSpecies = {{
+    // depth bF  trunkH trunkR lenTap radTap angle  damp  sides leafSz barkMat                              leafMat                               offX  offZ
+    {  4u,   4u, 2.6f,  0.22f, 0.70f, 0.62f, 0.85f, 0.45f, 7u, 0.26f, renderer::kTreeBarkMaterialID,      renderer::kTreeLeafMaterialID,        0.0f,   0.0f }, // oak
+    {  4u,   3u, 3.6f,  0.15f, 0.50f, 0.58f, 1.25f, 0.35f, 6u, 0.20f, renderer::kTreeBarkMaterialID,      renderer::kTreeLeafPineMaterialID,    0.0f,  -4.0f }, // pine
+    {  4u,   3u, 3.2f,  0.10f, 0.66f, 0.55f, 0.42f, 0.55f, 5u, 0.16f, renderer::kTreeBarkBirchMaterialID, renderer::kTreeLeafBirchMaterialID,   0.0f,  -8.0f }, // birch
+    {  5u,   3u, 2.4f,  0.17f, 0.78f, 0.55f, 0.55f, 0.95f, 6u, 0.18f, renderer::kTreeBarkMaterialID,      renderer::kTreeLeafWillowMaterialID,  0.0f, -12.0f }, // willow
+    {  4u,   3u, 3.8f,  0.13f, 0.58f, 0.60f, 0.20f, 0.30f, 6u, 0.17f, renderer::kTreeBarkMaterialID,      renderer::kTreeLeafMaterialID,        0.0f, -16.0f }, // poplar
+    {  4u,   4u, 2.2f,  0.16f, 0.72f, 0.62f, 0.65f, 0.50f, 6u, 0.24f, renderer::kTreeBarkMaterialID,      renderer::kTreeLeafAutumnMaterialID,  4.5f,  -2.0f }, // autumn maple
+    {  3u,   5u, 1.9f,  0.45f, 0.55f, 0.48f, 0.75f, 0.40f, 8u, 0.18f, renderer::kTreeBarkMaterialID,      renderer::kTreeLeafMaterialID,        4.5f,  -6.0f }, // baobab
+    {  1u,   7u, 3.4f,  0.14f, 0.35f, 0.30f, 1.05f, 0.00f, 6u, 0.45f, renderer::kTreeBarkMaterialID,      renderer::kTreeLeafMaterialID,        4.5f, -10.0f }, // palm
+    {  3u,   5u, 0.55f, 0.07f, 0.75f, 0.60f, 0.90f, 0.60f, 5u, 0.20f, renderer::kTreeBarkMaterialID,      renderer::kTreeLeafBirchMaterialID,   4.5f, -14.0f }, // shrub
+    {  5u,   2u, 2.9f,  0.18f, 0.76f, 0.66f, 0.70f, 0.85f, 5u, 0.055f, renderer::kTreeBarkDeadMaterialID, renderer::kTreeLeafDeadMaterialID,    4.5f, -18.0f }, // dead tree
+}};
+
+#ifndef NDEBUG
+// Log labels only -- kept OUT of TreeSpeciesRecipe itself so Release builds embed no species
+// string literals at all (CLAUDE.md's zero-debug-string rule), rather than relying on the
+// optimizer to dead-strip an unused const char* field.
+constexpr std::array<const char*, 10> kTreeSpeciesNames = {
+    "oak", "pine", "birch", "willow", "poplar",
+    "autumn maple", "baobab", "palm", "shrub", "dead tree",
+};
+#endif
+
+} // namespace
+
 void VulkanContext::BuildEntityData() {
   // Context 0: this is currently the only "factory" allocating entity IDs in
   // the engine. Sequence starts at 0, so the 12 sequential GetNextID() calls
@@ -1913,8 +1990,13 @@ void VulkanContext::BuildEntityData() {
     // GenerateShowcaseMaterialTable()'s own zone-layout comment); every entity beyond that
     // (procedural trees, walls, floor, water, ...) gets its real materialID (and, from it,
     // isTransparent) from an explicit override further below instead -- this default is only ever
-    // actually consumed by the 12 showcase primitives.
-    bool isTransparent = m_MaterialTable.isTransparent[i];
+    // actually consumed by the 12 showcase primitives. The bounds guard is NOT decorative:
+    // kEntityCount (37 since the 10-tree-species scene) now exceeds renderer::kMaxMaterials (32),
+    // so the tail entity indices (creature/walls/floor/water, 32..36) would read past the
+    // 32-element isTransparent array here -- an MSVC-debug std::array assertion abort at startup
+    // -- if this default were still read unconditionally. Every one of those tail entities takes
+    // one of the explicit overrides below, so the placeholder `false` is never actually consumed.
+    bool isTransparent = (i < renderer::kMaxMaterials) ? m_MaterialTable.isTransparent[i] : false;
     // Generalized Nanite Tessellation (renderer::TessellationPass -- see kTessellatedEntityIndices'
     // own comment for the full generalization rationale and exact entity choices): every entity
     // index in kTessellatedEntityIndices is rendered ONLY by renderer::TessellationPass -- never by
@@ -1947,11 +2029,19 @@ void VulkanContext::BuildEntityData() {
     // comment) -- even local offset = bark (opaque solid cylinder mesh), odd local offset = leaves
     // (opaque base material too: the leaf cards use an opacity-CUTOUT mask, not alpha-blend
     // transparency, see MaterialParameterTable.h's own kTreeLeafMaterialID comment for why
-    // isTransparent correctly stays false for it).
+    // isTransparent correctly stays false for it). 10-tree-species scene: bark/leaf materialIDs
+    // now come from the species recipe table (kTreeSpecies above) instead of one shared pair, so
+    // e.g. the birch gets its white bark and the maple its autumn foliage -- every one of these
+    // material slots is a hand-authored opaque recipe, so isTransparent stays false throughout.
     if (i >= kTreeEntityIndexBase && i < kTreeEntityIndexBase + kTreeEntityCount) {
+      static_assert(kTreeSpecies.size() == kTreeVisualCount,
+                    "kTreeSpecies (VulkanContext.cpp) and kTreeVisualCount (VulkanContext.h) must "
+                    "describe the same number of trees -- update both together.");
       uint32_t localIdx = i - kTreeEntityIndexBase;
+      uint32_t speciesIdx = localIdx / 2u;
       bool isLeafPart = (localIdx % 2u) == 1u;
-      entity.materialID = isLeafPart ? renderer::kTreeLeafMaterialID : renderer::kTreeBarkMaterialID;
+      const TreeSpeciesRecipe& species = kTreeSpecies[speciesIdx];
+      entity.materialID = isLeafPart ? species.leafMaterialID : species.barkMaterialID;
       isTransparent = m_MaterialTable.isTransparent[entity.materialID];
     }
     // Lumen/GI showcase corner walls -- see kWallMaterialIDA/B's own comment above for why this
@@ -3135,45 +3225,64 @@ void VulkanContext::GenerateGeometry() {
     treePass.Init(m_Device, m_CommandPool, m_GraphicsQueue, m_VertexBuffer, m_IndexBuffer);
 
     constexpr float kTreeClearingX = 10.0f;  // One zone-pitch step past the gallery's own col=1 (x=4).
-    constexpr float kTreeRowSpacing = 4.0f;
     // Matches the terrain/floor's own worldOffsetY (GenerateTerrain()'s -0.8f call-site argument
     // below) -- trees are planted AT ground level, unlike the showcase primitives above (which
     // deliberately float at the gallery's own y=0 "display stage" height, see GridSlot()'s header
     // comment).
     constexpr float kTreeGroundY = -0.8f;
 
-    LOG_INFO(std::format("[GenerateGeometry] Generating {} procedural trees (renderer::ProceduralTreePass)...",
+    LOG_INFO(std::format("[GenerateGeometry] Generating {} procedural trees, one per species "
+                         "(renderer::ProceduralTreePass, see kTreeSpecies)...",
                           kTreeVisualCount));
 
+    // 10-tree-species scene: shape/material/placement all come from the kTreeSpecies recipe table
+    // (see its own header comment above BuildEntityData() for the per-species silhouette design
+    // and the river-avoiding grove layout) -- this loop only contributes what the table cannot
+    // know at namespace scope: the per-tree deterministic seed, the registry-assigned mesh/
+    // material IDs, and the grove's world-space anchor.
     for (uint32_t t = 0; t < kTreeVisualCount; ++t) {
+      const TreeSpeciesRecipe& species = kTreeSpecies[t];
       uint32_t barkEntityIndex = kTreeEntityIndexBase + t * 2u;
       uint32_t leafEntityIndex = barkEntityIndex + 1u;
 
       renderer::ProceduralTreePass::TreeParams params{};
       // Deterministic per-tree seed (see tree_lsystem.glsl's own "fully deterministic" comment --
       // this demo must play back identically every run) -- an arbitrary odd multiplier spreads the
-      // low tree index `t` across the hash's full bit range rather than leaving 4 seeds that only
-      // differ in their low 2 bits.
+      // low tree index `t` across the hash's full bit range rather than leaving seeds that only
+      // differ in their low bits.
       params.seed = 0x5EED0000u + t * 0x1000193u;
-      params.depth = 4;
-      params.branchFactor = 3;
-      params.trunkHeight = 2.0f + 0.35f * float(t % 3u);
-      params.trunkRadius = 0.13f + 0.015f * float(t % 2u);
-      params.lengthTaper = 0.72f;
-      params.radiusTaper = 0.62f;
-      params.branchAngleRadians = 0.55f;
-      params.pitchDamping = 0.6f;
-      params.sides = 6;
-      params.leafSize = 0.22f;
+      params.depth = species.depth;
+      params.branchFactor = species.branchFactor;
+      params.trunkHeight = species.trunkHeight;
+      params.trunkRadius = species.trunkRadius;
+      params.lengthTaper = species.lengthTaper;
+      params.radiusTaper = species.radiusTaper;
+      params.branchAngleRadians = species.branchAngleRadians;
+      params.pitchDamping = species.pitchDamping;
+      params.sides = species.sides;
+      params.leafSize = species.leafSize;
 
+      // BuildEntityData() already assigned each bark/leaf entity its species materialID from this
+      // SAME kTreeSpecies row (see its own tree block), so reading the registry back here keeps
+      // the vertex-stamped materialID and the entity's own materialID in guaranteed agreement.
       params.barkMeshID = m_InstanceRegistry[barkEntityIndex].meshID;
       params.barkMaterialID = static_cast<float>(m_InstanceRegistry[barkEntityIndex].materialID);
       params.leafMeshID = m_InstanceRegistry[leafEntityIndex].meshID;
       params.leafMaterialID = static_cast<float>(m_InstanceRegistry[leafEntityIndex].materialID);
 
-      params.worldOffsetX = kTreeClearingX;
+      params.worldOffsetX = kTreeClearingX + species.groveOffsetX;
       params.worldOffsetY = kTreeGroundY;
-      params.worldOffsetZ = (float(t) - 0.5f * float(kTreeVisualCount - 1u)) * kTreeRowSpacing;
+      params.worldOffsetZ = species.groveOffsetZ;
+
+#ifndef NDEBUG
+      renderer::ProceduralTreePass::GeometryFootprint fp =
+          renderer::ProceduralTreePass::ComputeFootprint(params);
+      LOG_INFO(std::format("[GenerateGeometry]   Tree {}/{} '{}': depth={} branchFactor={} at "
+                           "({:.1f}, {:.1f}) -- {} bark verts + {} leaf verts.",
+                           t + 1u, kTreeVisualCount, kTreeSpeciesNames[t], species.depth,
+                           species.branchFactor, params.worldOffsetX, params.worldOffsetZ,
+                           fp.barkVertexCount, fp.leafVertexCount));
+#endif
 
       treePass.RecordGenerate(params, runningVertexOffset, runningIndexOffset);
     }

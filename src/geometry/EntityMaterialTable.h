@@ -50,6 +50,18 @@ namespace geometry {
             // the strongest sway in this table (a leaf cluster is the most wind-responsive part of a
             // tree).
             case renderer::kTreeLeafMaterialID: return EntityMaterialProperties{ 0.35f, 0u };
+            // 10-tree-species scene: per-species foliage variants -- same cutout mask slot 0 +
+            // wind-sway mechanism as kTreeLeafMaterialID above, with per-species sway amplitude
+            // (a willow's trailing fronds move the most, a dead tree's dry remnants barely at all).
+            case renderer::kTreeLeafPineMaterialID: return EntityMaterialProperties{ 0.25f, 0u };
+            case renderer::kTreeLeafBirchMaterialID: return EntityMaterialProperties{ 0.40f, 0u };
+            case renderer::kTreeLeafAutumnMaterialID: return EntityMaterialProperties{ 0.40f, 0u };
+            case renderer::kTreeLeafWillowMaterialID: return EntityMaterialProperties{ 0.50f, 0u };
+            case renderer::kTreeLeafDeadMaterialID: return EntityMaterialProperties{ 0.15f, 0u };
+            // Per-species bark variants -- solid cylinder geometry like kTreeBarkMaterialID above
+            // (no cutout mask); dead wood is stiffer than living bark, so it sways even less.
+            case renderer::kTreeBarkBirchMaterialID: return EntityMaterialProperties{ 0.06f, kInvalidMaskTextureIndex };
+            case renderer::kTreeBarkDeadMaterialID: return EntityMaterialProperties{ 0.03f, kInvalidMaskTextureIndex };
             default: return EntityMaterialProperties{ 0.0f, kInvalidMaskTextureIndex };
         }
     }

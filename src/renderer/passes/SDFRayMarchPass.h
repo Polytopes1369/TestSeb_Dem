@@ -82,7 +82,10 @@ namespace renderer {
 
         // Upper bound on entities this pass can sample per ray march -- see the class comment's
         // "fixed-size entity sampler array" note.
-        static constexpr uint32_t kMaxEntitySDFs = 128u;
+        // 128 -> 160: keeps this debug pass's entity coverage in lockstep with the production GI
+        // ceiling (SurfaceCacheTraceContext::kMaxTracedEntities, same 10-tree-species growth).
+        // Must match SDFRayMarch.comp's own uEntitySDFs[] compile-time array size exactly.
+        static constexpr uint32_t kMaxEntitySDFs = 160u;
 
         static constexpr VkFormat kOutputFormat = VK_FORMAT_R8G8B8A8_UNORM;
 

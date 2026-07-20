@@ -240,6 +240,22 @@ namespace renderer {
     // -- assigned explicitly to exactly one entity (VulkanContext::kCreatureEntityIndex).
     inline constexpr uint32_t kCreatureMaterialID = 24u;
 
+    // 10-tree-species scene (renderer::ProceduralTreePass): per-species look variants, reserved
+    // past kCreatureMaterialID, same "never collides with a real entity's showcase material"
+    // convention. The original kTreeBarkMaterialID/kTreeLeafMaterialID (22/23) stay the DEFAULT
+    // bark/foliage look most species share; these slots add the few visibly distinct variants the
+    // species table (VulkanContext.cpp's kTreeSpecies) actually assigns -- 5 foliage tints (same
+    // opacity-cutout + wind-sway mechanism as kTreeLeafMaterialID, see geometry::
+    // EntityMaterialTable.h's matching cases) and 2 bark variants (solid geometry, no cutout,
+    // same as kTreeBarkMaterialID). Occupies 25..31 -- exactly fills kMaxMaterials (32).
+    inline constexpr uint32_t kTreeLeafPineMaterialID = 25u;   // Conifer: dark blue-green needles.
+    inline constexpr uint32_t kTreeLeafBirchMaterialID = 26u;  // Birch/shrub: light yellow-green.
+    inline constexpr uint32_t kTreeLeafAutumnMaterialID = 27u; // Autumn maple: orange-red.
+    inline constexpr uint32_t kTreeLeafWillowMaterialID = 28u; // Willow: pale silvery green.
+    inline constexpr uint32_t kTreeLeafDeadMaterialID = 29u;   // Dead tree: dry brown remnants.
+    inline constexpr uint32_t kTreeBarkBirchMaterialID = 30u;  // Birch: papery white bark.
+    inline constexpr uint32_t kTreeBarkDeadMaterialID = 31u;   // Dead tree: weathered gray wood.
+
     // One generated table: the PBR parameters themselves, plus a parallel convenience flag so
     // callers (VulkanContext::BuildEntityData, deciding each entity's core::EntityFlags::
     // IsTransparent bit) don't need to re-derive "alpha < 1.0" themselves.
@@ -511,6 +527,26 @@ namespace renderer {
         table.params[kCreatureMaterialID].topWeight = 0.20f;
         table.params[kCreatureMaterialID].top.roughness = 0.30f;
         table.params[kCreatureMaterialID].top.f0 = maths::vec3(0.03f, 0.03f, 0.03f);
+
+        // 10-tree-species scene: per-species foliage/bark variants (slots 25..31, see the
+        // kTreeLeaf*/kTreeBark* constants' own declaration comment). All matte, non-metal, fully
+        // opaque -- every foliage slot relies on the same opacity-CUTOUT mask (not alpha-blend)
+        // mechanism kTreeLeafMaterialID's own recipe comment above documents, so isTransparent
+        // correctly stays false for all of them and they stay on the opaque VisBuffer path.
+        table.params[kTreeLeafPineMaterialID].base =
+            MakeBaseSlab(maths::vec3(0.07f, 0.24f, 0.10f), 0.80f, maths::vec3(0.0f, 0.0f, 0.0f), 0.0f); // Dark blue-green conifer needles.
+        table.params[kTreeLeafBirchMaterialID].base =
+            MakeBaseSlab(maths::vec3(0.34f, 0.50f, 0.16f), 0.75f, maths::vec3(0.0f, 0.0f, 0.0f), 0.0f); // Light yellow-green.
+        table.params[kTreeLeafAutumnMaterialID].base =
+            MakeBaseSlab(maths::vec3(0.60f, 0.26f, 0.06f), 0.72f, maths::vec3(0.0f, 0.0f, 0.0f), 0.0f); // Autumn orange-red.
+        table.params[kTreeLeafWillowMaterialID].base =
+            MakeBaseSlab(maths::vec3(0.30f, 0.44f, 0.26f), 0.78f, maths::vec3(0.0f, 0.0f, 0.0f), 0.0f); // Pale silvery green.
+        table.params[kTreeLeafDeadMaterialID].base =
+            MakeBaseSlab(maths::vec3(0.28f, 0.20f, 0.11f), 0.85f, maths::vec3(0.0f, 0.0f, 0.0f), 0.0f); // Dry dead-leaf brown.
+        table.params[kTreeBarkBirchMaterialID].base =
+            MakeBaseSlab(maths::vec3(0.68f, 0.66f, 0.60f), 0.80f, maths::vec3(0.0f, 0.0f, 0.0f), 0.0f); // Papery white birch bark.
+        table.params[kTreeBarkDeadMaterialID].base =
+            MakeBaseSlab(maths::vec3(0.34f, 0.32f, 0.29f), 0.90f, maths::vec3(0.0f, 0.0f, 0.0f), 0.0f); // Weathered gray dead wood.
 
         return table;
     }
