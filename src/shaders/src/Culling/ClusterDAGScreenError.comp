@@ -171,12 +171,27 @@ void main() {
     uint entityFlags = entityData[node.entityID].flags;
     float displacementBound = InflateDisplacementBound(node.maxWPOAmplitude, entityFlags);
 
-    // Inflate both error terms by the same amount before projection: this preserves the required
-    // strict parentError > clusterError ordering (ClusterDAG.cpp's ValidateClusterDAG invariant --
-    // adding the same constant to both sides of a strict inequality cannot flip it) while
-    // conservatively biasing the cut toward finer detail for a swaying cluster, exactly mirroring
-    // cluster_culling_tests.glsl's InflateBoundsForWPO used by the occlusion/frustum culling pass.
-    float clusterError = node.clusterError + displacementBound;
+    // Inflate ONLY parentError, not clusterError, by displacementBound: the goal is to bias the cut
+    // AWAY from deferring to a coarser ancestor for a swaying cluster (a real Nanite-parity concern
+    // -- an ancestor's own baked error says nothing about how far ITS sway can additionally throw
+    // its silhouette off), which inflating parentError alone already achieves (parentPixelError
+    // stays >= threshold more readily, discouraging DAG_DECISION_SKIP) while still trivially
+    // preserving the required strict parentError > clusterError ordering (ClusterDAG.cpp's
+    // ValidateClusterDAG invariant -- adding a positive constant to the side that was already
+    // larger cannot un-order it). Previously this ALSO added displacementBound to clusterError,
+    // which for any entity whose sway amplitude alone (in world units) projects past pixelThreshold
+    // at typical viewing distance -- e.g. tree foliage/bark, EntityMaterialTable.h's 0.06-0.50 world
+    // units, ~5-28px at this scene's ~24-unit grove distance vs. a 1px pixelThreshold -- makes
+    // `localPixelError < pixelThreshold` FALSE at every single DAG level including the leaf (clusterError
+    // exactly 0.0 pre-inflation), so DAG_DECISION_DRAW could never be reached anywhere on the
+    // leaf-to-root path for that entity: a real, observed bug (all 20 procedural tree entities'
+    // clusters stuck at DAG_DECISION_SUBDIVIDE forever, RequestClusterResidency() never called,
+    // nothing ever rendered, regardless of camera framing -- see project memory
+    // project_hydrology_ambient_flooding_fixed_trees_still_invisible.md for the investigation this
+    // fix concludes). Frustum/occlusion cull safety margins for a swaying cluster are unaffected --
+    // those come from the SEPARATE cluster_culling_tests.glsl InflateBoundsForWPO mechanism this
+    // shader's own comment already pointed to, not from this local clusterError inflation.
+    float clusterError = node.clusterError;
     float parentError = node.parentError + displacementBound;
 
     // Rotate the rest-pose sphere centers into their current world positions before projecting: a
