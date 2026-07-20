@@ -54,11 +54,12 @@ const int kModeInit         = 0;
 const int kModeFlux         = 1;
 const int kModeWater        = 2;
 const int kModeErodeDeposit = 3;
-const int kModeAdvect       = 4;
-const int kModeBlurSeed     = 5; // Seeds g_TempA from pc.blurSource (no convolution).
-const int kModeBlurPass     = 6; // One separable Gaussian pass g_TempA -> g_TempB (or back).
-const int kModeFinalizeMesh = 7; // g_TempB -> g_MeshHeightOut.
-const int kModeFinalize     = 8; // Packs g_AttributesOut (moisture from g_TempB) + g_WaterSurfaceOut.
+const int kModeCommitHeight = 4; // g_TempA -> g_Height (see kModeErodeDeposit's own comment).
+const int kModeAdvect       = 5;
+const int kModeBlurSeed     = 6; // Seeds g_TempA from pc.blurSource (no convolution).
+const int kModeBlurPass     = 7; // One separable Gaussian pass g_TempA -> g_TempB (or back).
+const int kModeFinalizeMesh = 8; // g_TempB -> g_MeshHeightOut.
+const int kModeFinalize     = 9; // Packs g_AttributesOut (moisture from g_TempB) + g_WaterSurfaceOut.
 
 ivec2 ClampCoord(ivec2 c) {
     return clamp(c, ivec2(0), ivec2(kHydroResolution - 1));
@@ -157,6 +158,21 @@ void main() {
     }
 
     if (pc.mode == kModeErodeDeposit) {
+        // Reads a 5-point stencil of g_Height (self + 4 neighbors) for the slope gradient below
+        // -- writing the new eroded height BACK into g_Height in this same pass (as this shader
+        // used to do) is a genuine cross-invocation race: neighboring invocations run in
+        // parallel with no ordering guarantee within one dispatch, so invocation (x+1,y) reading
+        // hL from (x,y) could see EITHER (x,y)'s pre-erosion or already-eroded height depending
+        // on GPU scheduling -- a classic Jacobi-vs-Gauss-Seidel hazard. That scheduling order is
+        // not guaranteed identical across separate runs of the same shader on the same hardware,
+        // so it silently produced run-to-run non-deterministic terrain/water geometry (caught by
+        // geometry::MeshBakeCache's content-hash cache: the persisted DAG rebuilt from
+        // byte-identical bark/tree geometry every run, but the eroded terrain/water meshes never
+        // hashed the same twice). Fixed the same way kModeAdvect already avoids this for
+        // sediment: write the new height into g_TempA (fully unused during the erosion loop --
+        // only the post-loop blur chain touches it) instead of g_Height in place, then
+        // kModeCommitHeight (self-only copy, no neighbor reads, race-free) commits it to
+        // g_Height right after, before any other invocation could read it as a neighbor.
         float h = imageLoad(g_Height, coord).r;
         float base = imageLoad(g_BaseHeight, coord).r;
         float water = imageLoad(g_Water, coord).r;
@@ -198,9 +214,17 @@ void main() {
             water = max(water, kHydroSeaLevelLocal - h);
         }
 
-        imageStore(g_Height, coord, vec4(h));
+        // NOT imageStore(g_Height, ...) -- see this mode's own comment above.
+        imageStore(g_TempA, coord, vec4(h));
         imageStore(g_Water, coord, vec4(water));
         imageStore(g_SedimentA, coord, vec4(sediment));
+        return;
+    }
+
+    if (pc.mode == kModeCommitHeight) {
+        // Self-only copy, no neighbor reads -- race-free by construction. See
+        // kModeErodeDeposit's own comment for why this extra pass exists.
+        imageStore(g_Height, coord, vec4(imageLoad(g_TempA, coord).r));
         return;
     }
 

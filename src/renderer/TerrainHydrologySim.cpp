@@ -24,11 +24,12 @@ namespace renderer {
         constexpr int32_t kModeFlux         = 1;
         constexpr int32_t kModeWater        = 2;
         constexpr int32_t kModeErodeDeposit = 3;
-        constexpr int32_t kModeAdvect       = 4;
-        constexpr int32_t kModeBlurSeed     = 5;
-        constexpr int32_t kModeBlurPass     = 6;
-        constexpr int32_t kModeFinalizeMesh = 7;
-        constexpr int32_t kModeFinalize     = 8;
+        constexpr int32_t kModeCommitHeight = 4;
+        constexpr int32_t kModeAdvect       = 5;
+        constexpr int32_t kModeBlurSeed     = 6;
+        constexpr int32_t kModeBlurPass     = 7;
+        constexpr int32_t kModeFinalizeMesh = 8;
+        constexpr int32_t kModeFinalize     = 9;
 
         constexpr uint32_t kBindingCount = 12;
 
@@ -254,13 +255,17 @@ namespace renderer {
 
         // --- Init, then the erosion loop (see TerrainHydrology.comp's header for the scheme).
         // The descriptor set alternates per iteration so kModeAdvect's ping-pong output becomes
-        // the next iteration's input without any image copy. ---
+        // the next iteration's input without any image copy. kModeCommitHeight immediately
+        // follows kModeErodeDeposit -- see that shader mode's own comment for why the height
+        // update can no longer write g_Height in place (a cross-invocation race that made the
+        // eroded terrain/water geometry non-deterministic run-to-run). ---
         dispatch(m_SetEven, kModeInit, 0, 0);
         for (int32_t iter = 0; iter < kIterations; ++iter) {
             VkDescriptorSet set = (iter % 2 == 0) ? m_SetEven : m_SetOdd;
             dispatch(set, kModeFlux, 0, 0);
             dispatch(set, kModeWater, 0, 0);
             dispatch(set, kModeErodeDeposit, 0, 0);
+            dispatch(set, kModeCommitHeight, 0, 0);
             dispatch(set, kModeAdvect, 0, 0);
         }
 

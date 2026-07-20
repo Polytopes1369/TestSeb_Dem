@@ -35,7 +35,13 @@ namespace geometry {
     // placement all changed (kTreeSpecies recipe table), which the entity-count check would ALSO
     // catch (kEntityCount 25 -> 37), but the explicit bump keeps this key honest about the
     // generated geometry actually differing.
-    constexpr uint32_t kGeometryGenerationVersion = 3;
+    // Bumped 3 -> 4: fixed a cross-invocation race in TerrainHydrology.comp's kModeErodeDeposit
+    // (see that shader mode's own comment) that made the eroded terrain/water height fields
+    // non-deterministic run-to-run -- entity/vertex/index counts are UNCHANGED by this fix (same
+    // mesh topology every time now, just numerically different from any pre-fix bake), so only
+    // this explicit bump invalidates a stale pre-fix scene.cache; the count-based checks below
+    // would otherwise wrongly call it up to date.
+    constexpr uint32_t kGeometryGenerationVersion = 4;
 
     // Must be called after VulkanContext::GenerateGeometry() has completed (i.e. any time after
     // VulkanContext::Init() returns) so the Vertex/Index SSBOs already hold the live scene's
