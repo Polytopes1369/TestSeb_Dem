@@ -31,7 +31,11 @@ namespace geometry {
     // Bumped 1 -> 2: added renderer::ProceduralTreePass's TREES block to GenerateGeometry() (new
     // GenerateX()-equivalent generation step, plus the pre-existing entity-count check below also
     // independently invalidates any pre-tree-feature scene.cache since kEntityCount itself grew).
-    constexpr uint32_t kGeometryGenerationVersion = 2;
+    // Bumped 2 -> 3: 10-tree-species scene -- the TREES block's per-tree shape parameters and
+    // placement all changed (kTreeSpecies recipe table), which the entity-count check would ALSO
+    // catch (kEntityCount 25 -> 37), but the explicit bump keeps this key honest about the
+    // generated geometry actually differing.
+    constexpr uint32_t kGeometryGenerationVersion = 3;
 
     // Must be called after VulkanContext::GenerateGeometry() has completed (i.e. any time after
     // VulkanContext::Init() returns) so the Vertex/Index SSBOs already hold the live scene's

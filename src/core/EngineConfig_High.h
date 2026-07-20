@@ -52,7 +52,7 @@ constexpr uint32_t PROBE_GRID_RESOLUTION = 64u;
 constexpr float PROBE_SPACING = 1.0f;
 constexpr uint32_t PROBE_SAMPLE_DIRECTIONS = 14u;
 
-constexpr uint32_t MAX_TRACED_ENTITIES = 128u;
+constexpr uint32_t MAX_TRACED_ENTITIES = 160u; // Tracks SurfaceCacheTraceContext::kMaxTracedEntities (128 -> 160, 10-tree-species scene): High traces the full scene, matching the pre-tiering baseline.
 constexpr uint32_t RADIOSITY_BOUNCE_COUNT = 4u;
 constexpr uint32_t SURFACE_CACHE_GI_SAMPLE_COUNT = 64u;
 

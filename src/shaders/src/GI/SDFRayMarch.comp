@@ -57,8 +57,9 @@ struct EntitySDFParams {
 layout(std430, set = 0, binding = 2) readonly buffer EntityParamsBuffer {
     EntitySDFParams entityParams[];
 };
-// Must match renderer::SDFRayMarchPass::kMaxEntitySDFs exactly.
-layout(set = 0, binding = 3) uniform sampler3D uEntitySDFs[128];
+// Must match renderer::SDFRayMarchPass::kMaxEntitySDFs exactly (128 -> 160, 10-tree-species
+// entity-count growth -- see SurfaceCacheTraceContext::kMaxTracedEntities' own comment).
+layout(set = 0, binding = 3) uniform sampler3D uEntitySDFs[160];
 
 // --- Set 1: Global SDF clipmap levels + output image. ---
 // Must match renderer::GlobalSDFPass::kLevelCount exactly.
@@ -83,7 +84,7 @@ layout(push_constant) uniform SDFRayMarchPC {
     int levelCenterVoxel[12]; // 4 levels * (x,y,z), flattened.
     int clipmapResolution;
     int rootNodeIndex;        // -1 if the scene has zero entities (BVH is empty).
-    int entitySamplerCount;   // How many of uEntitySDFs' 128 slots are real entities (rest are the far-value placeholder).
+    int entitySamplerCount;   // How many of uEntitySDFs' 160 slots are real entities (rest are the far-value placeholder).
     int coarseOnly;           // 0 = normal two-tier march (DEBUG_VIEW_LUMEN); 1 = coarse-clipmap-only (DEBUG_VIEW_GLOBAL_SDF), skips Stage 2+3 entirely.
     float sunDirection[3];    // Points FROM the light TOWARD the scene (renderer::ClusterResolvePass's own convention).
     float _pad0;

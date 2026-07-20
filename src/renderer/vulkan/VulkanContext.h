@@ -555,7 +555,10 @@ private:
     // to make room for the tree entities automatically shifts those to the new end without any
     // other change -- exactly the same "keyed by absolute index, not distance from the start"
     // mechanism GenerateShowcaseMaterialTable()/GridSlot() already rely on for the first 12.
-    static constexpr uint32_t kTreeVisualCount = 4;
+    // 4 -> 10 (10-tree-species scene): one tree per distinct species recipe in VulkanContext.cpp's
+    // kTreeSpecies table (oak/pine/birch/willow/poplar/autumn-maple/baobab/palm/shrub/dead-tree) --
+    // the recipe table and this count must stay in exact agreement (static_assert'd at the table).
+    static constexpr uint32_t kTreeVisualCount = 10;
     static constexpr uint32_t kTreeEntityIndexBase = 12;
     static constexpr uint32_t kTreeEntityCount = kTreeVisualCount * 2u; // bark + leaves per tree.
 
@@ -656,13 +659,16 @@ private:
     // rotation pool) to 50, so GenerateGeometry() can dedicate one real, individually-baked unit to
     // every one of BakeDemoWorld.cpp's 49 authored demo-grid cells (7x7, see that tool's own
     // kGridRadiusCells) with one spare unit left over for the shared-archetype fallback pool (see
-    // main.cpp's own freeStreamingUnits comment). Ceiling verified, not guessed: kEntityCount (16) +
+    // main.cpp's own freeStreamingUnits comment). Ceiling verified, not guessed: kEntityCount +
     // kStreamingUnitCount*kStreamingSlotsPerUnit must stay <= SurfaceCacheTraceContext::
-    // kMaxTracedEntities (128, mesh_sdf_trace.glsl's own compile-time array size -- exceeding it
+    // kMaxTracedEntities (mesh_sdf_trace.glsl's own compile-time array size -- exceeding it
     // doesn't crash, GlobalSDFPass/SurfaceCacheTraceContext just silently truncate the overflow
-    // entities out of GI/SDF tracing, see that constant's own comment) -- 16 + 50*2 = 116, leaving
-    // 12 of headroom. A prior attempt at 64 units (16 + 64*2 = 144) confirmed this ceiling by
-    // exceeding it by exactly 16 entities.
+    // entities out of GI/SDF tracing, see that constant's own comment). The 10-tree-species scene
+    // grew kEntityCount to 37 (17 + 10 trees * 2), pushing the total to 37 + 50*2 = 137 past the
+    // original 128-slot ceiling, so kMaxTracedEntities was raised 128 -> 160 in the same change --
+    // 137 <= 160, leaving 23 of headroom. A prior attempt at 64 units (16 + 64*2 = 144, against
+    // the then-128 ceiling) confirmed the truncation behavior by exceeding it by exactly 16
+    // entities.
     static constexpr uint32_t kStreamingUnitCount = 50;
     static constexpr uint32_t kStreamingSlotsPerUnit = 2; // 0 = coarse (HLOD), 1 = fine (FullDetail).
     static constexpr uint32_t kStreamingSlotCount = kStreamingUnitCount * kStreamingSlotsPerUnit;

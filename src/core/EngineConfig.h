@@ -84,7 +84,7 @@ inline uint32_t PROBE_SAMPLE_DIRECTIONS = 14u;
 enum class GIMode : uint32_t { HighQuality = 0u, Lite = 1u };
 inline GIMode GI_MODE = GIMode::HighQuality;
 
-inline uint32_t MAX_TRACED_ENTITIES = 128u;
+inline uint32_t MAX_TRACED_ENTITIES = 160u; // Tracks SurfaceCacheTraceContext::kMaxTracedEntities (128 -> 160, 10-tree-species scene).
 inline uint32_t RADIOSITY_BOUNCE_COUNT = 4u;
 inline uint32_t SURFACE_CACHE_GI_SAMPLE_COUNT = 64u;
 
