@@ -37,10 +37,13 @@ namespace renderer::debug {
         // Mirrors DebugBufferView.comp's own `visualizationMode` push constant values exactly --
         // see that shader's own header comment for what each mode does to the raw sampled texel.
         enum class VisualizationMode : uint32_t {
-            kPassthrough = 0, // Already display-ready (e.g. albedo, rgba8).
-            kGrayscale = 1,   // Single-channel scalar (depth/AO/roughness-metallic/hit-mask).
-            kOctNormal = 2,   // 2-channel octahedral-encoded world-space normal.
-            kTonemap = 3,     // Linear HDR color -- needs ACES tonemap to stay visible/unclipped.
+            kPassthrough = 0,    // Already display-ready (e.g. albedo, rgba8).
+            kGrayscale = 1,      // Single-channel scalar (depth/AO/roughness-metallic/hit-mask).
+            kOctNormal = 2,      // 2-channel octahedral-encoded world-space normal.
+            kTonemap = 3,        // Linear HDR color -- needs ACES tonemap to stay visible/unclipped.
+            kAlphaGrayscale = 4, // Scalar carried in the ALPHA channel of an otherwise-HDR image
+                                 // (MegaLights raw radiance's Debug-only shadow-ray verdict -- see
+                                 // MegaLightsFinalShade.comp's own debugShadowOcclusion comment).
         };
 
         // Allocates the owned rgba8 output image (sized to `outputExtent`, this pipeline's own

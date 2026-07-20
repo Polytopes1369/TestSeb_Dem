@@ -19,6 +19,7 @@
 #include <unordered_map>
 #include <vector>
 #include <format>
+#include <cstdlib>
 #include <cstring>
 #include <thread>
 #include <chrono>
@@ -473,6 +474,15 @@ int main(int argc, char** argv) {
         if (std::strcmp(argv[i], "--test-pipeline") == 0) {
             runTestPipeline = true;
             break;
+        }
+        // --buffer-view=N: starts the interactive session with Buffer Viewer entry N already
+        // selected (config::debugview::SELECTED_BUFFER_INDEX -- see ClusterRenderPipeline::
+        // RecordDebugBufferView's own index table). Debug-only automation/verification hook: lets
+        // a headless capture script screenshot any debug buffer without needing to drive the ImGui
+        // combos with synthetic mouse input first.
+        if (std::strncmp(argv[i], "--buffer-view=", 14) == 0) {
+            config::debugview::SELECTED_BUFFER_INDEX = std::atoi(argv[i] + 14);
+            LOG_INFO(std::format("[Main] --buffer-view: starting with Buffer Viewer index {} selected.", config::debugview::SELECTED_BUFFER_INDEX));
         }
     }
 #endif
@@ -1576,6 +1586,190 @@ int main(int argc, char** argv) {
                 ImGui::EndTabItem();
             }
 
+            // --- Tab View Modes -- UE5.8 viewport "View Mode" dropdown + "Lumen"/"MegaLights"
+            // debug-visualization submenu parity (see the approved View Modes plan). Three combos,
+            // each driving the SAME two underlying mechanisms every existing debug view already
+            // uses: g_DebugState.viewMode (the ClusterResolve.comp/GIComposite.comp push-constant
+            // branches, same state the Numpad keys write) and config::debugview::
+            // SELECTED_BUFFER_INDEX (the generic Buffer Viewer, which already takes final blit
+            // priority over viewMode -- see ClusterRenderPipeline::RecordFrame's own [14] routing).
+            // The 3 combos are mutually exclusive by construction: changing any one resets the
+            // other two to their neutral entry before applying its own mapping. Keyboard shortcuts
+            // (Numpad et al.) still work independently -- they bypass these combos' own static
+            // selection state, which then simply no longer reflects the active view until the next
+            // combo interaction (deliberate: no per-frame reverse-mapping bookkeeping for a debug
+            // panel).
+            if (ImGui::BeginTabItem("View Modes")) {
+                static int s_ViewModeSel = 0;     // Index into kViewModeItems below.
+                static int s_LumenSel = 0;        // Index into kLumenItems below.
+                static int s_SurfaceCacheSel = 0; // Index into kSurfaceCacheItems below (17 + this = buffer index).
+                static int s_MegaLightsSel = 0;   // Index into kMegaLightsItems below.
+
+                auto applySelection = [](uint32_t viewMode, int bufferIndex) {
+                    g_DebugState.viewMode = viewMode;
+                    config::debugview::SELECTED_BUFFER_INDEX = bufferIndex;
+                };
+
+                // --- Section 1: View Mode (screenshot 1 -- Lit/Unlit/Wireframe/Detail Lighting/
+                // Lighting Only/Reflections). "Reflections" maps to Buffer Viewer entry 16 (the
+                // ReflectionPass radiance image, exposure-normalized + tonemapped) rather than a
+                // viewMode branch -- see DebugViewMode's own enum comment (Camera.h) for why a raw
+                // blit of that real-lux HDR image would just clip to white. ---
+                ImGui::SeparatorText("View Mode");
+                static const char* kViewModeItems[] = {
+                    "Lit", "Unlit", "Wireframe only", "Detail Lighting", "Lighting Only", "Reflections",
+                };
+                if (ImGui::Combo("View Mode", &s_ViewModeSel, kViewModeItems, IM_ARRAYSIZE(kViewModeItems))) {
+                    s_LumenSel = 0;
+                    s_MegaLightsSel = 0;
+                    switch (s_ViewModeSel) {
+                        case 1: applySelection(DEBUG_VIEW_UNLIT, 0); break;
+                        case 2: applySelection(DEBUG_VIEW_WIREFRAME, 0); break;
+                        case 3: applySelection(DEBUG_VIEW_DETAIL_LIGHTING, 0); break;
+                        case 4: applySelection(DEBUG_VIEW_LIGHTING_ONLY, 0); break;
+                        case 5: applySelection(DEBUG_VIEW_NORMAL, 16); break; // Reflections -- Buffer Viewer 16.
+                        default: applySelection(DEBUG_VIEW_NORMAL, 0); break; // Lit.
+                    }
+                }
+                if (s_ViewModeSel == 3) {
+                    ImGui::TextWrapped("Detail Lighting: neutral 18%% gray albedo + flattened roughness. This engine has no separate "
+                        "detail-normal-map layer to isolate the way UE does -- best-effort approximation.");
+                }
+
+                // --- Section 2: Lumen (screenshot 2). Entries map onto whichever existing
+                // mechanism already visualizes that data -- see each case's own comment. ---
+                ImGui::SeparatorText("Lumen");
+                static const char* kLumenItems[] = {
+                    "None (Lit)",
+                    "Overview (Indirect GI)",       // DEBUG_VIEW_LUMEN -- the selected indirect term alone.
+                    "Performance Overview",         // Text panel below -- GpuTimestampProfiler zones, Lumen subset.
+                    "Lumen Scene (Global SDF)",     // DEBUG_VIEW_GLOBAL_SDF -- the SDF ray-march scene proxy.
+                    "Geometry Normals",             // DEBUG_VIEW_NORMALS.
+                    "Reflection View",              // Buffer Viewer 16 -- ReflectionPass radiance.
+                    "Surface Cache",                // Buffer Viewer 17-21 -- atlas channel sub-combo below.
+                    "Dedicated Reflection Rays",    // Text panel below -- trace back-end status (best-effort).
+                };
+                if (ImGui::Combo("Lumen View", &s_LumenSel, kLumenItems, IM_ARRAYSIZE(kLumenItems))) {
+                    s_ViewModeSel = 0;
+                    s_MegaLightsSel = 0;
+                    switch (s_LumenSel) {
+                        case 1: applySelection(DEBUG_VIEW_LUMEN, 0); break;
+                        case 2: applySelection(DEBUG_VIEW_NORMAL, 0); break; // Performance Overview -- normal image + panel.
+                        case 3: applySelection(DEBUG_VIEW_GLOBAL_SDF, 0); break;
+                        case 4: applySelection(DEBUG_VIEW_NORMALS, 0); break;
+                        case 5: applySelection(DEBUG_VIEW_NORMAL, 16); break;
+                        case 6: applySelection(DEBUG_VIEW_NORMAL, 17 + s_SurfaceCacheSel); break;
+                        case 7: applySelection(DEBUG_VIEW_NORMAL, 0); break; // Dedicated Rays -- normal image + panel.
+                        default: applySelection(DEBUG_VIEW_NORMAL, 0); break;
+                    }
+                }
+                if (s_LumenSel == 6) {
+                    // Surface Cache atlas channel picker -- indices here are offsets onto Buffer
+                    // Viewer entry 17 (see RecordDebugBufferView's own 17-21 table).
+                    static const char* kSurfaceCacheItems[] = {
+                        "Albedo", "Normal (raw Oct RG)", "Emissive", "Direct Lighting", "Radiance (GI source)",
+                    };
+                    if (ImGui::Combo("Atlas Channel", &s_SurfaceCacheSel, kSurfaceCacheItems, IM_ARRAYSIZE(kSurfaceCacheItems))) {
+                        config::debugview::SELECTED_BUFFER_INDEX = 17 + s_SurfaceCacheSel;
+                    }
+                }
+                if (s_LumenSel == 2) {
+                    // Lumen Performance Overview: the SAME GetGpuProfilerResults() contract as the
+                    // Profiler tab (rolling-average mutation, at most once per real frame) -- safe
+                    // because only ONE tab of this tab bar renders per frame, so the two call sites
+                    // can never both run in the same frame.
+                    if (!clusterPipeline.IsGpuProfilerSupported()) {
+                        ImGui::TextDisabled("Timestamp queries unsupported on this GPU/driver.");
+                    } else {
+                        static const char* kLumenZoneNames[] = {
+                            "SurfaceCache_Capture", "GlobalSDF_Update", "SurfaceCacheRT_BlasUpdate",
+                            "SurfaceCacheRT_RefreshTLAS", "GIInject_Radiosity", "ScreenTrace",
+                            "ScreenProbeGI", "Reflection", "WorldProbes", "Denoiser", "GIComposite",
+                            "SDFRayMarch_Debug",
+                        };
+                        std::vector<renderer::debug::GpuTimestampProfiler::ZoneResult> zones = clusterPipeline.GetGpuProfilerResults();
+                        std::vector<renderer::debug::GpuTimestampProfiler::ZoneResult> asyncZones = clusterPipeline.GetGpuProfilerAsyncResults();
+                        float lumenTotalMs = 0.0f;
+                        if (ImGui::BeginTable("LumenPerfTable", 2, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
+                            ImGui::TableSetupColumn("Lumen pass");
+                            ImGui::TableSetupColumn("Avg ms (~30-frame)");
+                            ImGui::TableHeadersRow();
+                            auto emitLumenRows = [&](const std::vector<renderer::debug::GpuTimestampProfiler::ZoneResult>& list, bool async) {
+                                for (const renderer::debug::GpuTimestampProfiler::ZoneResult& zone : list) {
+                                    bool isLumen = false;
+                                    for (const char* name : kLumenZoneNames) {
+                                        if (zone.name == name) { isLumen = true; break; }
+                                    }
+                                    if (!isLumen) continue;
+                                    lumenTotalMs += zone.avgGpuMs;
+                                    ImGui::TableNextRow();
+                                    ImGui::TableSetColumnIndex(0);
+                                    if (async) ImGui::Text("%s (async)", zone.name.c_str());
+                                    else ImGui::TextUnformatted(zone.name.c_str());
+                                    ImGui::TableSetColumnIndex(1);
+                                    ImGui::Text("%.3f", zone.avgGpuMs);
+                                }
+                            };
+                            emitLumenRows(zones, false);
+                            emitLumenRows(asyncZones, true);
+                            ImGui::EndTable();
+                        }
+                        ImGui::Text("Lumen zones total: %.3f ms", lumenTotalMs);
+                        ImGui::TextWrapped("Async-queue zones overlap the graphics queue -- the total is an upper bound, not wall time.");
+                    }
+                }
+                if (s_LumenSel == 7) {
+                    // Best-effort per the approved plan: this engine traces exactly one reflection
+                    // ray per pixel per frame through a single shared back-end choice -- there is
+                    // no separate dedicated-ray budget to visualize the way UE5.8's own item does.
+                    ImGui::Text("Reflection trace back-end: %s", g_DebugState.traceMode == 1u ? "HWRT (rayQueryEXT)" : "SWRT (mesh SDF)");
+                    ImGui::TextWrapped("Fixed 1 GGX-VNDF reflection ray/pixel/frame (ReflectionTrace.comp), temporally accumulated. "
+                        "No dedicated-ray budget separate from the shared GI trace back-end exists in this engine -- "
+                        "switch back-ends live with the 'T'/'Y' keys or the Lumen tab's own combo.");
+                }
+
+                // --- Section 3: MegaLights (screenshot 3). All four entries read REAL pass data
+                // via Buffer Viewer entries 22-24 -- see RecordDebugBufferView's own table. ---
+                ImGui::SeparatorText("MegaLights");
+                if (!config::lumen::_MEGALIGHTS_ENABLE) {
+                    ImGui::TextDisabled("MegaLights is disabled on this quality tier -- views fall back to the lit image.");
+                }
+                static const char* kMegaLightsItems[] = {
+                    "None (Lit)",
+                    "Overview (Direct Radiance)",   // Buffer Viewer 22 -- denoised pre-Composite radiance.
+                    "Shadow Casters",               // Buffer Viewer 23 -- per-pixel shadow-ray verdict.
+                    "Shadow Caster Quality",        // Buffer Viewer 23 too -- see the note below.
+                    "Light Complexity",             // Buffer Viewer 24 -- lights-per-pixel heatmap.
+                };
+                if (ImGui::Combo("MegaLights View", &s_MegaLightsSel, kMegaLightsItems, IM_ARRAYSIZE(kMegaLightsItems))) {
+                    s_ViewModeSel = 0;
+                    s_LumenSel = 0;
+                    switch (s_MegaLightsSel) {
+                        case 1: applySelection(DEBUG_VIEW_NORMAL, 22); break;
+                        case 2: applySelection(DEBUG_VIEW_NORMAL, 23); break;
+                        case 3: applySelection(DEBUG_VIEW_NORMAL, 23); break; // Same data as Shadow Casters -- see note below.
+                        case 4: applySelection(DEBUG_VIEW_NORMAL, 24); break;
+                        default: applySelection(DEBUG_VIEW_NORMAL, 0); break;
+                    }
+                }
+                if (s_MegaLightsSel == 2 || s_MegaLightsSel == 3) {
+                    ImGui::TextWrapped("White = pixel occluded by a shadow caster (the one mandatory ray-traced "
+                        "visibility ray/pixel/frame, MegaLightsFinalShade.comp).");
+                }
+                if (s_MegaLightsSel == 3) {
+                    // Best-effort per the approved plan: no tiered shadow-quality system exists.
+                    ImGui::TextWrapped("Note: this engine shades every pixel with a single fixed shadow quality "
+                        "(exactly 1 ray-traced visibility ray toward the ReSTIR-winning light) -- there are no "
+                        "per-caster quality tiers to color-code the way UE5.8's own view does, so this shows the "
+                        "same shadow-verdict data as Shadow Casters.");
+                }
+                if (s_MegaLightsSel == 4) {
+                    ImGui::TextWrapped("Lights-per-pixel overlap count (falloff radius + spot cone / IES profile / "
+                        "rect facing tests against the full light population): blue = 1, green = ~4, red = 8+.");
+                }
+                ImGui::EndTabItem();
+            }
+
             // --- Tab Buffer Viewer -- index order here MUST match
             // renderer::ClusterRenderPipeline::RecordDebugBufferView's own switch statement
             // exactly (see that function's own header comment, the single source of truth both
@@ -1604,6 +1798,18 @@ int main(int argc, char** argv) {
                     // spawned them and brightness-faded by remaining life. See
                     // renderer::debug::ParticleDebugViewPass's own class comment.
                     "Particles: Alive/Emitter Heatmap",
+                    // UE5.8 "View Modes" tab entries (16-24) -- also driven indirectly by that
+                    // tab's own Lumen/MegaLights combos, which write these same indices; see
+                    // RecordDebugBufferView's own 16-24 table for what each shows.
+                    "Lumen: Reflection Radiance",
+                    "Lumen: Surface Cache Albedo",
+                    "Lumen: Surface Cache Normal (Oct RG)",
+                    "Lumen: Surface Cache Emissive",
+                    "Lumen: Surface Cache Direct Lighting",
+                    "Lumen: Surface Cache Radiance",
+                    "MegaLights: Overview (Denoised)",
+                    "MegaLights: Shadow Casters",
+                    "MegaLights: Light Complexity",
                 };
                 ImGui::Combo("Buffer", &config::debugview::SELECTED_BUFFER_INDEX, kBufferNames, IM_ARRAYSIZE(kBufferNames));
                 ImGui::TextWrapped("Shows the selected buffer instead of the normal final image. Not tied to the Numpad debug-view-mode keys.");

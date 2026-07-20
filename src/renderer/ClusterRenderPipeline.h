@@ -171,6 +171,7 @@
 #include "renderer/debug/DebugBufferViewPass.h"
 #include "renderer/debug/DebugTextOverlay.h"
 #include "renderer/debug/GpuTimestampProfiler.h"
+#include "renderer/debug/MegaLightsComplexityViewPass.h"
 #include "renderer/debug/ParticleDebugViewPass.h"
 // PCG editor-tooling roadmap, Phase 7.2 ("PCG Point Cloud Debug Visualization"): draws
 // RunPcgFullPipelineSmokeTest()'s own point set as wireframe box gizmos -- see that class' own
@@ -1478,6 +1479,12 @@ namespace renderer {
         // own case 15) when that specific index is selected, same "additive, only-when-selected"
         // convention as m_DebugBufferView itself.
         debug::ParticleDebugViewPass m_ParticleDebugView;
+
+        // UE5.8 "MegaLights > Light Complexity" view (ImGui "View Modes" tab): backs Buffer Viewer
+        // index 24 (see debug::MegaLightsComplexityViewPass's own class comment) -- only baked
+        // (RecordDebugBufferView's own case 24) when that specific index is selected, same
+        // "additive, only-when-selected" convention as m_ParticleDebugView above.
+        debug::MegaLightsComplexityViewPass m_MegaLightsComplexityView;
 
         // PCG editor-tooling roadmap, Phase 7.2 ("PCG Point Cloud Debug Visualization"): draws
         // RunPcgFullPipelineSmokeTest()'s own sampler->filter point set as wireframe box gizmos in

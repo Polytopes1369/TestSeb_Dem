@@ -579,6 +579,26 @@ void main() {
         // ApplySurfaceWeather comment for the exact formula.
         mat = ApplySurfaceWeather(mat, normal, g_ViewParams.surfaceWetness, g_ViewParams.snowCoverage);
 
+#ifdef _DEBUG
+        // DEBUG_VIEW_LIGHTING_ONLY (21) / DEBUG_VIEW_DETAIL_LIGHTING (20), UE5.8 View Mode parity
+        // (ImGui "View Modes" tab): neutralize the material BEFORE any lighting term runs, so the
+        // full chain below (sun BSDF + sky ambient + shadows -- and every downstream GBuffer
+        // consumer too: Screen Trace GI, MegaLights, reflections all shade from the gbufferAlbedo
+        // written from this same `mat`) responds over a uniform 18% gray surface. Emissive is
+        // zeroed (authored surface glow, not a lighting response). DETAIL_LIGHTING additionally
+        // flattens roughness so the two modes stay visually distinguishable -- this engine has no
+        // separate detail-normal-map layer to isolate the way UE's own Detail Lighting does
+        // (documented best-effort approximation, per the approved View Modes plan).
+        if (pc.viewMode == 20 || pc.viewMode == 21) {
+            mat.base.diffuseAlbedo = vec3(0.18);
+            mat.base.emissive = vec3(0.0);
+            mat.top.emissive = vec3(0.0);
+            if (pc.viewMode == 20) {
+                mat.base.roughness = 0.4;
+            }
+        }
+#endif
+
         // Substrate: full Slab BSDF response (diffuse + anisotropic specular + second lobe/Haze +
         // fuzz, vertically layered with the Top slab if any -- see substrate_bsdf.glsl's own
         // EvaluateSubstrateMaterial comment) to the sun's direction, shadowed by sunVisibility.
@@ -811,6 +831,44 @@ void main() {
             // directly proves the blend is a non-uniform procedural gradient (the rusting-metal
             // Pyramid, slot 9), not a flat average or a hard seam.
             finalColor = mix(vec3(0.1, 0.2, 0.9), vec3(0.9, 0.25, 0.1), mixMask);
+        } else if (pc.viewMode == 18) { // DEBUG_VIEW_UNLIT
+            // UE5.8 "Unlit" View Mode: the raw authored surface color, no lighting response at
+            // all. diffuseAlbedo + F0, not diffuseAlbedo alone: a Substrate metal's color lives
+            // entirely in F0 with its diffuseAlbedo authored black (see substrate_bsdf.glsl's own
+            // header comment), so without the F0 term every metal would read as a pure black hole.
+            // A dielectric's ~0.04 F0 baseline adds a negligible uniform lift. Every lighting RMW
+            // pass that would otherwise composite radiance on top of this image afterwards
+            // (ScreenProbeGI/reflections/MegaLights) is skipped by ClusterRenderPipeline while
+            // this mode is active -- see that file's debugViewSuppressesLighting gate.
+            finalColor = clamp(mat.base.diffuseAlbedo + mat.base.f0, 0.0, 1.0);
+        } else if (pc.viewMode == 19) { // DEBUG_VIEW_WIREFRAME
+            // UE5.8 "Wireframe" View Mode: no fixed-function line rasterizer exists anywhere in
+            // this VisBuffer pipeline (hardware raster writes cluster/triangle IDs, software
+            // raster is a compute shader), so triangle edges are detected in image space instead:
+            // re-arbitrate the 4 direct neighbors' VisBuffer entries (ArbitrateVisibility, the
+            // exact same helper Step 1 already used for this pixel) and mark this pixel as an edge
+            // when ANY neighbor resolved to a different triangle -- or to background, which also
+            // draws every silhouette edge from the geometry side. Viewport-edge pixels clamp onto
+            // themselves and correctly compare equal (no false border outline).
+            bool wireEdge = false;
+            ivec2 wireMax = ivec2(g_ViewParams.viewportSize) - ivec2(1);
+            const ivec2 kWireOffsets[4] = ivec2[4](ivec2(1, 0), ivec2(-1, 0), ivec2(0, 1), ivec2(0, -1));
+            for (int wi = 0; wi < 4; ++wi) {
+                ivec2 np = clamp(pixel + kWireOffsets[wi], ivec2(0), wireMax);
+                VisibilityArbitration nvis = ArbitrateVisibility(np);
+                if (!nvis.hasAnyData || nvis.clusterSlotIndex != clusterSlotIndex
+                    || nvis.triangleOrdinal != triangleOrdinal) {
+                    wireEdge = true;
+                    break;
+                }
+            }
+            finalColor = wireEdge ? vec3(0.75, 0.85, 1.0) : vec3(0.02, 0.02, 0.03);
+        } else if (pc.viewMode == 20 || pc.viewMode == 21) {
+            // DEBUG_VIEW_DETAIL_LIGHTING / DEBUG_VIEW_LIGHTING_ONLY: finalColor already IS the
+            // visualization -- the material was neutralized to 18% gray before the lighting chain
+            // above (see the viewMode block right after ApplySurfaceWeather) -- this branch only
+            // opts out of the "unhandled view mode" magenta placeholder below, same pattern as
+            // viewMode 14.
         } else if (pc.viewMode != 0 && pc.viewMode != 9 && pc.viewMode != 13) {
             // Placeholders (Global SDF / Lumen visualizations not implemented by this shader).
             finalColor = vec3(1.0, 0.0, 1.0);
@@ -827,11 +885,18 @@ void main() {
         } else if (pc.viewMode == 15) {
             // DEBUG_VIEW_SHADOW_CASCADES: no world position exists for a background pixel -- leave
             // finalColor at the plain background color, matching MOTION_VECTORS/SPATIAL_PROBES above.
-        } else if (pc.viewMode == 3 || pc.viewMode == 4 || pc.viewMode == 5 || pc.viewMode == 6 || pc.viewMode == 7 || pc.viewMode == 16 || pc.viewMode == 17) {
-            // NANITE_INSTANCES/PRIMITIVES/SHADING_BINS/RASTER_BINS/WPO/SUBSTRATE_SLABS/SUBSTRATE_MIXING:
-            // all per-cluster/per-surface visualizations with nothing meaningful to show on a
-            // no-geometry pixel -- leave finalColor at the plain background color, matching
-            // NANITE_TRIANGLES/CLUSTERS above.
+        } else if (pc.viewMode == 19) {
+            // DEBUG_VIEW_WIREFRAME: background reads as the same near-black fill the geometry-side
+            // non-edge pixels use -- silhouette edges themselves are drawn by the geometry side's
+            // own neighbor test (a geometry pixel bordering background flags as an edge there).
+            finalColor = vec3(0.02, 0.02, 0.03);
+        } else if (pc.viewMode == 3 || pc.viewMode == 4 || pc.viewMode == 5 || pc.viewMode == 6 || pc.viewMode == 7 || pc.viewMode == 16 || pc.viewMode == 17
+                   || pc.viewMode == 18 || pc.viewMode == 20 || pc.viewMode == 21) {
+            // NANITE_INSTANCES/PRIMITIVES/SHADING_BINS/RASTER_BINS/WPO/SUBSTRATE_SLABS/SUBSTRATE_MIXING
+            // plus the UE5.8 View Mode parity modes (UNLIT/DETAIL_LIGHTING/LIGHTING_ONLY): all
+            // per-surface visualizations with nothing meaningful to show on a no-geometry pixel --
+            // leave finalColor at the plain background color, matching NANITE_TRIANGLES/CLUSTERS
+            // above.
         } else if (pc.viewMode != 0 && pc.viewMode != 1 && pc.viewMode != 2 && pc.viewMode != 8 && pc.viewMode != 11) {
             // For Lumen / SDF placeholders, render the placeholder color even on background
             finalColor = vec3(1.0, 0.0, 1.0);
@@ -887,6 +952,14 @@ void main() {
         chars[0]=83; chars[1]=85; chars[2]=66; chars[3]=83; chars[4]=84; chars[5]=82; chars[6]=65; chars[7]=84; chars[8]=69; chars[9]=32; chars[10]=83; chars[11]=76; chars[12]=65; chars[13]=66; chars[14]=83; len=15;
     } else if (pc.viewMode == 17) { // "SUBSTRATE MIXING"
         chars[0]=83; chars[1]=85; chars[2]=66; chars[3]=83; chars[4]=84; chars[5]=82; chars[6]=65; chars[7]=84; chars[8]=69; chars[9]=32; chars[10]=77; chars[11]=73; chars[12]=88; chars[13]=73; chars[14]=78; chars[15]=71; len=16;
+    } else if (pc.viewMode == 18) { // "UNLIT"
+        chars[0]=85; chars[1]=78; chars[2]=76; chars[3]=73; chars[4]=84; len=5;
+    } else if (pc.viewMode == 19) { // "WIREFRAME"
+        chars[0]=87; chars[1]=73; chars[2]=82; chars[3]=69; chars[4]=70; chars[5]=82; chars[6]=65; chars[7]=77; chars[8]=69; len=9;
+    } else if (pc.viewMode == 20) { // "DETAIL LIGHTING"
+        chars[0]=68; chars[1]=69; chars[2]=84; chars[3]=65; chars[4]=73; chars[5]=76; chars[6]=32; chars[7]=76; chars[8]=73; chars[9]=71; chars[10]=72; chars[11]=84; chars[12]=73; chars[13]=78; chars[14]=71; len=15;
+    } else if (pc.viewMode == 21) { // "LIGHTING ONLY"
+        chars[0]=76; chars[1]=73; chars[2]=71; chars[3]=72; chars[4]=84; chars[5]=73; chars[6]=78; chars[7]=71; chars[8]=32; chars[9]=79; chars[10]=78; chars[11]=76; chars[12]=89; len=13;
     }
 
     if (len > 0) {

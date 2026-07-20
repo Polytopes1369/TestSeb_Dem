@@ -155,6 +155,27 @@ namespace renderer {
             return 16 /* header bytes -- matches Init()'s own kHeaderBytes */ + static_cast<VkDeviceSize>(kMaxMegaLights) * sizeof(MegaLight);
         }
 
+#ifndef NDEBUG
+        // UE5.8 "MegaLights" debug views (ImGui "View Modes" tab -> Buffer Viewer, see
+        // ClusterRenderPipeline::RecordDebugBufferView's own index table). All three are only
+        // meaningful on a tier that actually runs this pass (config::lumen::_MEGALIGHTS_ENABLE --
+        // on a disabled tier Init() never creates these resources and every handle below is
+        // VK_NULL_HANDLE; the Buffer Viewer call site must guard against exactly that).
+        //
+        // "Overview": the denoised (pre-Composite) MegaLights direct-lighting radiance alone.
+        VkImageView GetDenoisedRadianceView() const { return m_Denoiser.GetOutputView(); }
+        // "Shadow Casters": the RAW radiance image whose alpha channel carries each pixel's
+        // mandatory shadow-ray verdict (0 = lit, 1 = occluded) -- written by
+        // MegaLightsFinalShade.comp's own Debug-only alpha path, see that shader's
+        // debugShadowOcclusion comment.
+        VkImageView GetRawRadianceView() const { return m_RawRadianceView; }
+        // "Light Complexity": the final (post-spatial-reuse) per-pixel reservoir SSBO -- its M
+        // field is the ReSTIR candidate mass behind each pixel's winning light, baked into a
+        // heatmap image by renderer::debug::MegaLightsComplexityViewPass.
+        VkBuffer GetSpatialReservoirBufferHandle() const { return m_SpatialReservoirBuffer.Handle(); }
+        VkDeviceSize GetSpatialReservoirBufferSize() const { return m_SpatialReservoirBuffer.Size(); }
+#endif
+
     private:
         bool InitImpl(VkDevice device, VmaAllocator allocator, VkCommandPool commandPool, VkQueue queue,
             VkExtent2D renderExtent, const ClusterResolvePass& resolvePass,

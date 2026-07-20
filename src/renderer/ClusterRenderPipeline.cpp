@@ -1081,6 +1081,15 @@ bool ClusterRenderPipeline::Init(
   // m_DisplayExtent (one pixel per particle slot, not per screen pixel).
   m_ParticleDebugView.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue);
 
+  // UE5.8 "MegaLights > Light Complexity" view (ImGui "View Modes" tab): backs Buffer Viewer
+  // index 24 -- see debug::MegaLightsComplexityViewPass's own class comment. Sized to
+  // m_RenderExtent (a full-resolution screen-space heatmap over the render-res GBuffer depth,
+  // unlike m_ParticleDebugView's fixed slot grid). Unconditionally Init'd even on tiers whose
+  // config::lumen::_MEGALIGHTS_ENABLE is false -- its own GPU cost is a single small image +
+  // pipeline, and RecordDebugBufferView's case 24 guards the actual bake behind
+  // m_MegaLights.GetLightBufferHandle() != VK_NULL_HANDLE anyway.
+  m_MegaLightsComplexityView.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue, m_RenderExtent);
+
   // PCG editor-tooling roadmap, Phase 7.2 ("PCG Point Cloud Debug Visualization"): backs the "PCG
   // Graph Editor" tab's own point-cloud-visualization toggle -- see debug::PcgPointCloudDebugView's
   // own class comment. Same colorFormat/depthFormat pair m_VegetationScatter/m_WaterForward/
@@ -1440,6 +1449,7 @@ void ClusterRenderPipeline::Shutdown() {
   m_SDFRayMarch.Shutdown();
   m_DebugBufferView.Shutdown();
   m_ParticleDebugView.Shutdown();
+  m_MegaLightsComplexityView.Shutdown();
   m_PcgPointCloudDebugView.Shutdown();
   m_PathTracer.Shutdown(); // UE5.8 gap G10b reference Path Tracer (Debug-only).
   m_GpuProfiler.Shutdown();
@@ -1559,9 +1569,11 @@ void ClusterRenderPipeline::RegenerateFur() {
 
 #ifndef NDEBUG
 // Index->buffer table for the ImGui "Buffer Viewer" dropdown (config::debugview::
-// SELECTED_BUFFER_INDEX). main.cpp's own ImGui::Combo item array MUST list these same 16 entries
+// SELECTED_BUFFER_INDEX). main.cpp's own ImGui::Combo item array MUST list these same 25 entries
 // in this exact order -- there is no shared enum between the two translation units, just this
-// comment as the single source of truth both sides are hand-kept in sync with.
+// comment as the single source of truth both sides are hand-kept in sync with. Entries 16-24 are
+// ALSO driven indirectly by the "View Modes" tab's Lumen/MegaLights combos (main.cpp), which write
+// the same SELECTED_BUFFER_INDEX -- one more reason the numbering here must never be reshuffled.
 //   0  = Off (normal final composite, this function is never called)
 //   1  = Resolve: Direct Color (HDR)
 //   2  = Resolve: World Normal
@@ -1580,6 +1592,24 @@ void ClusterRenderPipeline::RegenerateFur() {
 //   15 = Particles: Alive/Emitter Heatmap (subtask E3 -- see debug::ParticleDebugViewPass's own
 //        class comment; unlike every other entry above, this one BAKES its own source image first
 //        via RecordBake(), since its data lives in a raw SSBO, not a pre-existing image view)
+//   --- UE5.8 "View Modes" ImGui tab (Lumen / MegaLights debug submenus parity) ---
+//   16 = Lumen: Reflection Radiance (ReflectionPass's current temporally-accumulated slot -- UE's
+//        "Reflection View")
+//   17 = Lumen: Surface Cache Albedo    (atlas, rgba8)
+//   18 = Lumen: Surface Cache Normal    (atlas, rgba8, RAW octahedral-encoded RG shown as color --
+//        the UNORM [0,1] encoding can't feed the kOctNormal decode path, which expects the signed
+//        rg16f GBuffer convention)
+//   19 = Lumen: Surface Cache Emissive  (atlas, rgba8)
+//   20 = Lumen: Surface Cache Direct Lighting (atlas, rgba16f HDR)
+//   21 = Lumen: Surface Cache Radiance  (atlas, rgba16f HDR -- what GI traces actually sample)
+//   22 = MegaLights: Overview (denoised pre-Composite direct-lighting radiance alone -- UE's
+//        "MegaLights Overview"); falls back to the Resolve color default on tiers whose
+//        config::lumen::_MEGALIGHTS_ENABLE is false (the pass' resources don't exist there)
+//   23 = MegaLights: Shadow Casters (the raw radiance image's Debug-only ALPHA channel = each
+//        pixel's mandatory shadow-ray verdict, white = occluded -- see MegaLightsFinalShade.comp's
+//        own debugShadowOcclusion comment); same disabled-tier fallback as 22
+//   24 = MegaLights: Light Complexity (BAKES first, like 15 -- debug::MegaLightsComplexityViewPass
+//        counts lights-per-pixel from the light SSBO + GBuffer depth); same disabled-tier fallback
 void ClusterRenderPipeline::RecordDebugBufferView(VkCommandBuffer cmd) {
     VkImageView sourceView = m_Resolve.GetOutputColorView();
     debug::DebugBufferViewPass::VisualizationMode mode = debug::DebugBufferViewPass::VisualizationMode::kTonemap;
@@ -1617,6 +1647,49 @@ void ClusterRenderPipeline::RecordDebugBufferView(VkCommandBuffer cmd) {
                 m_ParticleSystem.GetParticleBufferSizeForDebugView(), ParticleSystemPass::kMaxEmitters);
             sourceView = m_ParticleDebugView.GetOutputView();
             mode = debug::DebugBufferViewPass::VisualizationMode::kPassthrough;
+            break;
+        }
+        // --- UE5.8 "View Modes" ImGui tab entries (16-24) -- see this function's own header
+        // comment table for what each shows and why its visualization mode was chosen. ---
+        case 16: sourceView = m_Reflection.GetCurrentRadianceView(); mode = debug::DebugBufferViewPass::VisualizationMode::kTonemap; break;
+        case 17: sourceView = m_SurfaceCache.GetAlbedoView(); mode = debug::DebugBufferViewPass::VisualizationMode::kPassthrough; break;
+        case 18: sourceView = m_SurfaceCache.GetNormalView(); mode = debug::DebugBufferViewPass::VisualizationMode::kPassthrough; break;
+        case 19: sourceView = m_SurfaceCache.GetEmissiveView(); mode = debug::DebugBufferViewPass::VisualizationMode::kPassthrough; break;
+        case 20: sourceView = m_SurfaceCache.GetDirectLightingView(); mode = debug::DebugBufferViewPass::VisualizationMode::kTonemap; break;
+        case 21: sourceView = m_SurfaceCache.GetRadianceView(); mode = debug::DebugBufferViewPass::VisualizationMode::kTonemap; break;
+        case 22: {
+            // Null on tiers whose config::lumen::_MEGALIGHTS_ENABLE is false (MegaLightsPass::Init
+            // skips creating every GPU resource there) -- fall back to the Resolve color default
+            // instead of binding a VK_NULL_HANDLE view.
+            VkImageView denoisedView = m_MegaLights.GetDenoisedRadianceView();
+            if (denoisedView != VK_NULL_HANDLE) {
+                sourceView = denoisedView;
+                mode = debug::DebugBufferViewPass::VisualizationMode::kTonemap;
+            }
+            break;
+        }
+        case 23: {
+            // Same disabled-tier null-guard rationale as case 22.
+            VkImageView rawView = m_MegaLights.GetRawRadianceView();
+            if (rawView != VK_NULL_HANDLE) {
+                sourceView = rawView;
+                mode = debug::DebugBufferViewPass::VisualizationMode::kAlphaGrayscale;
+            }
+            break;
+        }
+        case 24: {
+            // Bakes first, same convention as case 15 -- and same disabled-tier null-guard as
+            // 22/23 (no light SSBO exists to count against on a MegaLights-disabled tier).
+            // m_FrameScratch.invViewProj was populated by RecordFrameEarly this same frame; the
+            // GBuffer depth was written by [11]'s resolve dispatch, whose trailing barrier's
+            // COMPUTE->COMPUTE scope covers this later read (this codebase's established "a memory
+            // dependency covers every subsequent command" convention, same as case 15's own note).
+            if (m_MegaLights.GetLightBufferHandle() != VK_NULL_HANDLE) {
+                m_MegaLightsComplexityView.RecordBake(cmd, m_MegaLights.GetLightBufferHandle(),
+                    m_MegaLights.GetLightBufferSize(), m_Resolve.GetOutputDepthView(), m_FrameScratch.invViewProj);
+                sourceView = m_MegaLightsComplexityView.GetOutputView();
+                mode = debug::DebugBufferViewPass::VisualizationMode::kPassthrough;
+            }
             break;
         }
         default: break; // Unknown index -- falls back to the Resolve color default set above.
@@ -3141,6 +3214,21 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
 #endif
   }
 
+#ifndef NDEBUG
+  // UE5.8 View Mode parity (ImGui "View Modes" tab): DEBUG_VIEW_UNLIT/DEBUG_VIEW_WIREFRAME replace
+  // m_Resolve's color contents with a deliberately non-lit visualization (see ClusterResolve.comp's
+  // own viewMode 18/19 branches), and that same image is exactly what the final [14] blit displays
+  // for those modes -- so every pass below that additively read-modify-writes lighting INTO it
+  // ([12b1] ScreenProbeGI gather, [12b2] reflections + SSR fallback, [12b3] MegaLights composite)
+  // must be skipped while one of them is active, or the "unlit" image would visibly accumulate
+  // real HDR radiance on top of its debug colors. Skipping the whole blocks (not just each final
+  // composite dispatch) is safe: all three are already built to tolerate being toggled off for
+  // arbitrary stretches by their existing Debug A/B keys ('R'/'X'), and their temporal history/
+  // reservoir state degrades to exactly that same already-handled stale case.
+  const bool debugViewSuppressesLighting =
+      cameraCopy.debugViewMode == DEBUG_VIEW_UNLIT || cameraCopy.debugViewMode == DEBUG_VIEW_WIREFRAME;
+#endif
+
   // =========================================================================================
   // [12b1] F9 (UE5.8 parity roadmap): Screen Space Probe GI -- GIMode::HighQuality's own near-field
   // gather (real Lumen's "Screen Probe Gather"), restored from the tombstoned deletion
@@ -3154,6 +3242,9 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
   {
     bool giModeIsHQ = (config::lumen::GI_MODE == config::lumen::GIMode::HighQuality);
 #ifndef NDEBUG
+    // See debugViewSuppressesLighting's own declaration comment above -- RecordGather() RMWs
+    // m_Resolve's color image, which UNLIT/WIREFRAME need left untouched.
+    giModeIsHQ = giModeIsHQ && !debugViewSuppressesLighting;
     m_GpuProfiler.BeginZone(cmdLate, "ScreenProbeGI");
 #endif
     if (giModeIsHQ) {
@@ -3191,7 +3282,9 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
     m_Reflection.RecordUpdateViewParams(cmdLate, viewProj, prevViewProjForReflection, cameraPositionWorld);
 
 #ifndef NDEBUG
-    bool reflectionsEnabled = m_DebugReflectionsEnabled;
+    // ANDs in !debugViewSuppressesLighting -- see that flag's own declaration comment above
+    // (RecordGather()/RecordSSRFallback() both RMW m_Resolve's color image).
+    bool reflectionsEnabled = m_DebugReflectionsEnabled && !debugViewSuppressesLighting;
 #else
     bool reflectionsEnabled = true;
 #endif
@@ -3251,7 +3344,10 @@ void ClusterRenderPipeline::RecordFrameLate(VkCommandBuffer cmdLate, VkImage swa
   // =========================================================================================
   {
 #ifndef NDEBUG
-    bool megaLightsEnabled = config::lumen::_MEGALIGHTS_ENABLE && m_DebugMegaLightsEnabled;
+    // ANDs in !debugViewSuppressesLighting -- see that flag's own declaration comment above
+    // (the Composite stage RMWs m_Resolve's color image).
+    bool megaLightsEnabled = config::lumen::_MEGALIGHTS_ENABLE && m_DebugMegaLightsEnabled
+        && !debugViewSuppressesLighting;
 #else
     bool megaLightsEnabled = config::lumen::_MEGALIGHTS_ENABLE;
 #endif

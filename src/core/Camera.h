@@ -28,7 +28,18 @@ enum DebugViewMode : uint32_t {
   // the spatially-varying blend (proves it is a non-uniform procedural blend, not a flat average or
   // a hard seam). Non-mixing materials (mixAmount == 0) read solid blue. See ClusterResolve.comp's
   // own viewMode==17 branch.
-  DEBUG_VIEW_SUBSTRATE_MIXING = 17
+  DEBUG_VIEW_SUBSTRATE_MIXING = 17,
+  // UE5.8 viewport "View Mode" parity (ImGui "View Modes" tab, main.cpp) -- the 4 modes below
+  // mirror UE's own Lit-adjacent dropdown entries, all implemented as ClusterResolve.comp
+  // branches. UE's remaining "Reflections" view mode deliberately has NO enum value here: it is
+  // served by the existing Buffer Viewer mechanism instead (renderer::ReflectionPass's radiance
+  // image, exposure-normalized + tonemapped by DebugBufferView.comp -- a raw blit of that
+  // real-lux HDR image would just clip to white), see ClusterRenderPipeline::
+  // RecordDebugBufferView's own index table.
+  DEBUG_VIEW_UNLIT = 18,           // Raw diffuse albedo + F0, no lighting at all.
+  DEBUG_VIEW_WIREFRAME = 19,       // VisBuffer neighbor-ID edge detect (no fixed-function line raster exists in this pipeline).
+  DEBUG_VIEW_DETAIL_LIGHTING = 20, // Neutral 0.18 albedo + fixed roughness -- lighting response over uniform material.
+  DEBUG_VIEW_LIGHTING_ONLY = 21    // Neutral 0.18 albedo, authored roughness kept -- UE's "Lighting Only".
 };
 #endif
 

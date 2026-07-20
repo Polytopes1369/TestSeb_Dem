@@ -161,6 +161,14 @@ void main() {
     }
 
     vec3 radiance = vec3(0.0);
+#ifdef _DEBUG
+    // UE5.8 "MegaLights > Shadow Casters" debug view (ImGui "View Modes" tab): captures the one
+    // mandatory shadow-visibility ray's verdict for this pixel so the raw radiance image's
+    // otherwise-unused alpha channel can carry it out (written at the bottom of this shader --
+    // 0 = fully lit, 1 = occluded by a shadow caster). Debug builds only; Release keeps the
+    // constant-1.0 alpha untouched.
+    float debugShadowOcclusion = 0.0;
+#endif
 
     if (light.lightType == MEGALIGHT_TYPE_RECT) {
         // --- Area (rect) light: LTC analytic specular + stochastic point-on-rect diffuse (G3) ---
@@ -191,6 +199,11 @@ void main() {
         float NdotL = saturate(dot(normal, dirS));
         bool occluded = (NdotL > 0.0 && facing > 0.0) ? TraceShadowRay(biasedOrigin, dirS, max(distS - 2.0e-2, 1.0e-3)) : true;
         float visibility = occluded ? 0.0 : 1.0;
+#ifdef _DEBUG
+        // Only a REAL ray verdict counts as occlusion for the Shadow Casters debug view -- a
+        // grazing/back-facing skip (no ray traced, `occluded` defaulted true) is not a caster.
+        debugShadowOcclusion = (NdotL > 0.0 && facing > 0.0 && occluded) ? 1.0 : 0.0;
+#endif
 
         float distSq = max(distS * distS, 1.0e-4);
         float normalizedDist = saturate(distS / max(light.radius, 1.0e-4));
@@ -224,6 +237,10 @@ void main() {
         // needs no ray (it already contributes zero).
         bool occluded = (NdotL > 0.0 && angular > 0.0) ? TraceShadowRay(biasedOrigin, lightDir, max(dist - 2.0e-2, 1.0e-3)) : true;
         float visibility = occluded ? 0.0 : 1.0;
+#ifdef _DEBUG
+        // Same "real ray verdict only" rule as the rect branch above.
+        debugShadowOcclusion = (NdotL > 0.0 && angular > 0.0 && occluded) ? 1.0 : 0.0;
+#endif
 
         float distSq = max(dist * dist, 1.0e-4);
         float normalizedDist = saturate(dist / max(light.radius, 1.0e-4));
@@ -241,5 +258,12 @@ void main() {
     // No saturate(): g_ShadeRadiance is linear HDR (rgba16f) -- clamping here would defeat the whole
     // point of widening the format, re-introducing the hard-clip renderer::PostProcessPass exists to
     // replace with a soft display-referred curve.
+#ifdef _DEBUG
+    // Alpha carries the shadow-ray verdict for the "MegaLights > Shadow Casters" debug view (see
+    // debugShadowOcclusion's own comment above) -- the downstream A-Trous denoise/Composite chain
+    // never reads this image's alpha, so the channel is free to repurpose in Debug.
+    imageStore(g_ShadeRadiance, pixel, vec4(radiance, debugShadowOcclusion));
+#else
     imageStore(g_ShadeRadiance, pixel, vec4(radiance, 1.0));
+#endif
 }

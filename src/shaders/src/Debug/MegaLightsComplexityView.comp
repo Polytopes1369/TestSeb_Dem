@@ -1,0 +1,94 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+
+// Debug-only (see renderer::debug::MegaLightsComplexityViewPass's own class comment): UE5.8
+// "MegaLights > Light Complexity" view mode parity (ImGui "View Modes" tab). One invocation per
+// pixel, full render resolution: reconstructs the pixel's world position from the GBuffer depth,
+// then counts how many lights of the FULL MegaLights population actually affect that point -- a
+// light "affects" a pixel when the point sits inside its falloff window (dist < light.radius, the
+// exact radius the shading window reaches zero at -- see megalights_ris.glsl's own
+// MegaLightDistanceWindow comment) AND inside its angular shaping (spot cone / photometric profile
+// / rect one-sided facing, the same shared MegaLightAngularShaping every real shading path uses).
+// This is genuinely UE's own Light Complexity semantics (lights-per-pixel overlap count), NOT a
+// reservoir-M visualization: the ReSTIR reservoir's M converges to its temporal age-clamp
+// everywhere in steady state, which would read as a uniform flat color and carry no information.
+//
+// Cost: an O(lightCount) loop per pixel with no shadow rays and no BSDF -- exactly the per-pixel
+// cost profile MegaLights' RIS candidate selection itself was built to avoid for SHADING, but
+// perfectly acceptable for an on-demand Debug-only visualization dispatch (it only runs on the
+// frames where the ImGui Buffer Viewer has this entry selected).
+
+#include "include/math_utils.glsl"
+
+#define MEGALIGHTS_LIGHTS_SET 0
+#define MEGALIGHTS_LIGHTS_BINDING 0
+#include "include/megalights_ris.glsl"
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(rgba8, set = 0, binding = 1) uniform writeonly image2D g_Output;
+
+// Same r32f GBuffer depth image renderer::ClusterResolvePass writes (reversed-Z, 0.0 = background
+// sentinel -- see ClusterResolve.comp's own gbufferDepth comment).
+layout(r32f, set = 0, binding = 2) uniform readonly image2D g_GBufferDepth;
+
+layout(push_constant) uniform ComplexityPC {
+    mat4 invViewProj;
+    uvec2 viewportSize;
+} pc;
+
+// Count at which the heatmap saturates to its hottest stop -- matches UE's own Light Complexity
+// intent of flagging "many overlapping lights" long before the theoretical kMaxMegaLights ceiling.
+const float kComplexitySaturationCount = 8.0;
+
+// Standard cold (few) -> hot (many) 3-stop ramp -- same shape ClusterResolve.comp's
+// DEBUG_VIEW_NANITE_PRIMITIVES density visualization already uses.
+vec3 ComplexityRamp(float t) {
+    vec3 cold = vec3(0.0, 0.15, 1.0);
+    vec3 mid = vec3(0.0, 1.0, 0.0);
+    vec3 hot = vec3(1.0, 0.1, 0.0);
+    return (t < 0.5) ? mix(cold, mid, t * 2.0) : mix(mid, hot, (t - 0.5) * 2.0);
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (pixel.x >= int(pc.viewportSize.x) || pixel.y >= int(pc.viewportSize.y)) {
+        return;
+    }
+
+    float depth = imageLoad(g_GBufferDepth, pixel).r;
+    if (depth <= 0.0) {
+        // Background pixel -- no surface for any light to affect.
+        imageStore(g_Output, pixel, vec4(0.02, 0.02, 0.03, 1.0));
+        return;
+    }
+
+    // Same worldPos reconstruction every MegaLights stage performs from this exact depth image.
+    vec2 ndcXY = ((vec2(pixel) + 0.5) / vec2(pc.viewportSize)) * 2.0 - 1.0;
+    vec4 worldPos4 = pc.invViewProj * vec4(ndcXY, depth, 1.0);
+    vec3 worldPos = worldPos4.xyz / worldPos4.w;
+
+    uint affectingCount = 0u;
+    for (uint i = 0u; i < g_Lights.lightCount; ++i) {
+        MegaLight light = g_Lights.lights[i];
+        vec3 toLight = light.position - worldPos;
+        float dist = length(toLight);
+        if (dist >= light.radius) {
+            continue; // Outside the falloff window -- contributes exactly zero.
+        }
+        vec3 L = toLight / max(dist, 1.0e-4);
+        if (MegaLightAngularShaping(light, L) <= 0.0) {
+            continue; // Outside the spot cone / photometric profile / behind a one-sided rect.
+        }
+        ++affectingCount;
+    }
+
+    vec3 color;
+    if (affectingCount == 0u) {
+        color = vec3(0.06, 0.06, 0.08); // Lit by no MegaLight at all -- near-black, like UE.
+    } else {
+        float t = clamp(float(affectingCount) / kComplexitySaturationCount, 0.0, 1.0);
+        color = ComplexityRamp(t);
+    }
+    imageStore(g_Output, pixel, vec4(color, 1.0));
+}

@@ -31,13 +31,17 @@ layout(std430, set = 0, binding = 2) readonly buffer ExposureStateSSBO {
 } g_Exposure;
 
 layout(push_constant) uniform DebugBufferViewPC {
-    uint visualizationMode; // 0 = passthrough, 1 = grayscale, 2 = octahedral normal, 3 = HDR tonemap.
+    uint visualizationMode; // 0 = passthrough, 1 = grayscale, 2 = octahedral normal, 3 = HDR tonemap, 4 = alpha grayscale.
 } pc;
 
 const uint kModePassthrough = 0u;
 const uint kModeGrayscale = 1u;
 const uint kModeOctNormal = 2u;
 const uint kModeTonemap = 3u;
+// Scalar carried in the ALPHA channel of an otherwise-HDR image (the RGB may be raw real-lux
+// radiance, useless to display directly) -- mirrors DebugBufferViewPass::VisualizationMode::
+// kAlphaGrayscale, used by the MegaLights "Shadow Casters" debug view.
+const uint kModeAlphaGrayscale = 4u;
 
 void main() {
     ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
@@ -64,6 +68,8 @@ void main() {
         // flat white image.
         float exposureMultiplier = 1.0 / (1.2 * exp2(g_Exposure.currentEV100));
         color = ACESFilmicTonemap(raw.rgb * exposureMultiplier);
+    } else if (pc.visualizationMode == kModeAlphaGrayscale) {
+        color = vec3(raw.a);
     } else {
         color = raw.rgb; // kModePassthrough: already display-ready (e.g. albedo).
     }

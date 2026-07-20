@@ -133,6 +133,17 @@ namespace renderer {
         // it, right after RecordGather() -- no cross-frame reprojection needed.
         VkImageView GetHitMaskView() const { return m_HitMaskView; }
 
+#ifndef NDEBUG
+        // UE5.8 "Reflection View" debug entry (ImGui "View Modes" tab -> Buffer Viewer, see
+        // ClusterRenderPipeline::RecordDebugBufferView's own index table): the CURRENT slot's
+        // temporally-accumulated reflection radiance -- the actual specular term RecordGather()
+        // composites, not just the boolean hit mask above. Valid to sample any time after this
+        // frame's RecordTrace()/RecordTemporal() ran (the Buffer Viewer dispatch site runs well
+        // after both); like every other Buffer Viewer candidate, the image lives its whole life in
+        // VK_IMAGE_LAYOUT_GENERAL.
+        VkImageView GetCurrentRadianceView() const { return m_Slots[m_CurrentSlotIndex].radianceView; }
+#endif
+
     private:
         // One ping-pong slot's 3 fields, all sized to `m_RenderExtent` (full resolution, unlike
         // renderer::ScreenProbeGIPass::ProbeSlot's coarser probe-grid sizing).
