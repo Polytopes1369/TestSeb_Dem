@@ -41,7 +41,29 @@ namespace geometry {
     // mesh topology every time now, just numerically different from any pre-fix bake), so only
     // this explicit bump invalidates a stale pre-fix scene.cache; the count-based checks below
     // would otherwise wrongly call it up to date.
-    constexpr uint32_t kGeometryGenerationVersion = 4;
+    // Bumped 4 -> 5: relocated the tree grove (kTreeSpecies's own header comment, VulkanContext.cpp)
+    // from east of the gallery to west -- the old placement was never actually inside the default
+    // camera's frustum. Only worldOffsetX/Z changed (same species shapes, same entity/vertex/index
+    // counts), which the count-based checks below cannot see; the per-mesh bake cache's own
+    // content hash WOULD independently catch this (baked vertex positions differ), but only once
+    // IsCacheUpToDate() actually lets RunVirtualGeometryCacheTest() run at all.
+    // Bumped 5 -> 6: geom_tree_bark.comp/geom_tree_leaves.comp now sample the real terrain-
+    // hydrology mesh-height bake for a tree's vertical placement instead of trusting a flat
+    // CPU-supplied constant (renderer::ProceduralTreePass::Init()'s own header comment) -- fixes
+    // the west grove (relocated in the previous bump) turning out to sit in a low-lying spot the
+    // hydrology sim's initial flood pass left underwater, submerging every tree completely
+    // invisible despite being squarely inside the camera's frustum. Same entity/vertex/index
+    // counts as before (only the baked Y values change), so only this explicit bump catches it.
+    // Bumped 6 -> 7: TerrainHydrology.comp's kModeErodeDeposit now force-drains standing water
+    // (both the ambient rain/evaporation equilibrium AND kModeInit's initial below-sea-level
+    // flood) toward 0 anywhere inside the gallery's erosion-protected radius that ISN'T part of
+    // the authored river/lake channel (RiverChannelMask gate) -- ErosionStrengthAt already kept
+    // that radius from being carved, but never stopped it from flooding, which is what was
+    // actually submerging the west grove (the sampled-height fix in the previous bump was
+    // necessary but not sufficient: it made trees sample the real terrain, and that terrain was
+    // sitting under ~0.4 units of water). Same entity/vertex/index counts, only baked water/mesh-
+    // height values change, so only this explicit bump catches it.
+    constexpr uint32_t kGeometryGenerationVersion = 7;
 
     // Must be called after VulkanContext::GenerateGeometry() has completed (i.e. any time after
     // VulkanContext::Init() returns) so the Vertex/Index SSBOs already hold the live scene's

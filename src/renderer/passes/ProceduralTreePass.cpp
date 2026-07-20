@@ -122,7 +122,8 @@ namespace renderer {
     }
 
     void ProceduralTreePass::Init(VkDevice device, VkCommandPool commandPool, VkQueue queue,
-        VkBuffer vertexBuffer, VkBuffer indexBuffer) {
+        VkBuffer vertexBuffer, VkBuffer indexBuffer,
+        VkImageView hydroMeshHeightView, VkSampler hydroSampler) {
         Shutdown();
 
         m_Device = device;
@@ -132,8 +133,11 @@ namespace renderer {
         // --- Descriptor set layout: binding 0 = shared vertex SSBO, binding 1 = shared index SSBO
         // (both borrowed -- see this class's own header comment for why this pass does not own
         // them), matching geom_tree_bark.comp/geom_tree_leaves.comp's own `binding = 0`/`binding =
-        // 1` writeonly buffer declarations. ---
-        VkDescriptorSetLayoutBinding bindings[2]{};
+        // 1` writeonly buffer declarations. Binding 2 = the terrain-hydrology mesh-height texture
+        // (also borrowed, also matching that shader's own `binding = 2` sampler2D declaration) --
+        // see Init()'s own header-comment parameter docs for why a tree samples this instead of
+        // trusting a flat CPU-supplied ground Y. ---
+        VkDescriptorSetLayoutBinding bindings[3]{};
         bindings[0].binding = 0;
         bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         bindings[0].descriptorCount = 1;
@@ -142,17 +146,24 @@ namespace renderer {
         bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         bindings[1].descriptorCount = 1;
         bindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        bindings[2].binding = 2;
+        bindings[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        bindings[2].descriptorCount = 1;
+        bindings[2].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
         VkDescriptorSetLayoutCreateInfo setLayoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-        setLayoutInfo.bindingCount = 2;
+        setLayoutInfo.bindingCount = 3;
         setLayoutInfo.pBindings = bindings;
         VK_CHECK(vkCreateDescriptorSetLayout(m_Device, &setLayoutInfo, nullptr, &m_SetLayout));
 
-        VkDescriptorPoolSize poolSize{ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 };
+        VkDescriptorPoolSize poolSizes[2] = {
+            { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 },
+            { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1 },
+        };
         VkDescriptorPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
         poolInfo.maxSets = 1;
-        poolInfo.poolSizeCount = 1;
-        poolInfo.pPoolSizes = &poolSize;
+        poolInfo.poolSizeCount = 2;
+        poolInfo.pPoolSizes = poolSizes;
         VK_CHECK(vkCreateDescriptorPool(m_Device, &poolInfo, nullptr, &m_DescriptorPool));
 
         VkDescriptorSetAllocateInfo allocInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
@@ -163,7 +174,8 @@ namespace renderer {
 
         VkDescriptorBufferInfo vertexInfo{ vertexBuffer, 0, VK_WHOLE_SIZE };
         VkDescriptorBufferInfo indexInfo{ indexBuffer, 0, VK_WHOLE_SIZE };
-        VkWriteDescriptorSet writes[2]{};
+        VkDescriptorImageInfo hydroMeshHeightInfo{ hydroSampler, hydroMeshHeightView, VK_IMAGE_LAYOUT_GENERAL };
+        VkWriteDescriptorSet writes[3]{};
         writes[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
         writes[0].dstSet = m_DescriptorSet;
         writes[0].dstBinding = 0;
@@ -176,7 +188,13 @@ namespace renderer {
         writes[1].descriptorCount = 1;
         writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         writes[1].pBufferInfo = &indexInfo;
-        vkUpdateDescriptorSets(m_Device, 2, writes, 0, nullptr);
+        writes[2] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+        writes[2].dstSet = m_DescriptorSet;
+        writes[2].dstBinding = 2;
+        writes[2].descriptorCount = 1;
+        writes[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        writes[2].pImageInfo = &hydroMeshHeightInfo;
+        vkUpdateDescriptorSets(m_Device, 3, writes, 0, nullptr);
 
         // --- Bark pipeline ---
         {

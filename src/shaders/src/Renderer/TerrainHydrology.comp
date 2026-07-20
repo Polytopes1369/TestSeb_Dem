@@ -210,6 +210,21 @@ void main() {
         // Rain + evaporation close the iteration's water budget; the ocean border ring is
         // re-filled to sea level (open boundary -- the sea never drains, bays flood back in).
         water = max(0.0, water * (1.0 - kHydroEvaporation) + kHydroRainPerIteration);
+
+        // The showcase gallery's authored floor must stay dry, not just un-carved: ambient rain
+        // reaches a steady-state equilibrium (rain / evaporation) that floods ANY flat, no-runoff
+        // cell given enough iterations, and kModeInit's own initial flood (anything below sea
+        // level) can separately submerge a low-lying dip in the ambient fbm -- both mechanisms
+        // bypassed `strength` above (it only gates erosion carving, never applied to water at
+        // all). Force water toward 0 wherever we're both outside the river/lake channel
+        // (RiverChannelMask, terrain_noise.glsl -- the one place inside this radius that IS
+        // meant to hold water) AND inside the erosion-protected radius, blending continuously via
+        // the same smoothstep shoulder `strength` already uses so there's no visible ring at the
+        // boundary. This runs every iteration (not a one-shot clamp), so it also drains whatever
+        // kModeInit already flooded there, not just future rain.
+        float wetGate = max(strength, RiverChannelMask(localXZ));
+        water = mix(0.0, water, wetGate);
+
         if (IsOceanBoundary(coord)) {
             water = max(water, kHydroSeaLevelLocal - h);
         }

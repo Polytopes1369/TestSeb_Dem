@@ -1905,25 +1905,38 @@ struct TreeSpeciesRecipe {
   float groveOffsetZ;
 };
 
-// Grove layout: two staggered columns (quincunx) at grove-local X = 0 and 4.5, marching SOUTH
-// (-Z) from the clearing anchor. Deliberately z <= 0 only: the terrain-hydrology river runs down
-// the x == z diagonal from (30, 30) to its lake mouth at (6, 6) with a 5-unit-half-width carved
-// channel (see river_spline.glsl's kRiverControlXZ/kRiverBandInnerHalfWidth), so the old 4-tree
-// row's northern positions (x = 10, z up to +6, as close as 2.8 units from the channel
-// centerline) were already brushing the carve band -- every position below keeps >= 7 units of
-// clearance from the river centerline.
+// Grove layout: two staggered columns (quincunx) at grove-local X = 0 and -3.5, marching NORTH
+// (+Z) from the clearing anchor (kTreeClearingX, VulkanContext::GenerateGeometry's TREES block --
+// now -10.0, WEST of the origin). Placement here is driven by the default camera
+// (main.cpp's `Camera camera({12.3613, 6.5726, 0}, {0, 4, 0})`, 45-degree vertical FOV), verified
+// numerically (camera-space horizontal/vertical angle for every one of these 10 positions stays
+// within ~92% of both frustum half-angles, at both ground level and each species' own canopy
+// height) rather than eyeballed: this grove replaced an EARLIER version placed east of the
+// gallery (X=+10..+14.5, Z=0..-18) that was never actually visible on launch -- that placement
+// put every tree at a shallow forward-depth from the camera (which itself sits at X=+12.36,
+// nearly co-located in X with that old clearing), so even modest vertical/lateral offsets
+// produced huge camera-space angles. West of the origin gives far more forward depth (~22-27
+// units) for the same lateral spread, at the cost of switching sides from the ORIGINAL 4-tree
+// layout's east-side placement (which itself predates the terrain-hydrology river and was never
+// re-verified against the camera after the tree-species/grove-widening change). Min Z (5.0) stays
+// >= 5 world units clear of both the gallery's own row=1 zones (Torus/Tube at world Z=+4, see
+// GridSlot()'s own layout) and the skeletal-animation creature's clearing (kCreatureClearingX
+// =-10, kCreatureClearingZ=0, ~5-unit bind-pose chain length) -- the river itself (terrain-
+// hydrology feature, control points (30,30)..(6,6), all positive X/Z) is trivially clear on this
+// west side regardless of Z, since ClosestPointOnRiverPolyline clamps to the segment's own
+// endpoints rather than an infinite diagonal.
 constexpr std::array<TreeSpeciesRecipe, 10> kTreeSpecies = {{
-    // depth bF  trunkH trunkR lenTap radTap angle  damp  sides leafSz barkMat                              leafMat                               offX  offZ
-    {  4u,   4u, 2.6f,  0.22f, 0.70f, 0.62f, 0.85f, 0.45f, 7u, 0.26f, renderer::kTreeBarkMaterialID,      renderer::kTreeLeafMaterialID,        0.0f,   0.0f }, // oak
-    {  4u,   3u, 3.6f,  0.15f, 0.50f, 0.58f, 1.25f, 0.35f, 6u, 0.20f, renderer::kTreeBarkMaterialID,      renderer::kTreeLeafPineMaterialID,    0.0f,  -4.0f }, // pine
-    {  4u,   3u, 3.2f,  0.10f, 0.66f, 0.55f, 0.42f, 0.55f, 5u, 0.16f, renderer::kTreeBarkBirchMaterialID, renderer::kTreeLeafBirchMaterialID,   0.0f,  -8.0f }, // birch
-    {  5u,   3u, 2.4f,  0.17f, 0.78f, 0.55f, 0.55f, 0.95f, 6u, 0.18f, renderer::kTreeBarkMaterialID,      renderer::kTreeLeafWillowMaterialID,  0.0f, -12.0f }, // willow
-    {  4u,   3u, 3.8f,  0.13f, 0.58f, 0.60f, 0.20f, 0.30f, 6u, 0.17f, renderer::kTreeBarkMaterialID,      renderer::kTreeLeafMaterialID,        0.0f, -16.0f }, // poplar
-    {  4u,   4u, 2.2f,  0.16f, 0.72f, 0.62f, 0.65f, 0.50f, 6u, 0.24f, renderer::kTreeBarkMaterialID,      renderer::kTreeLeafAutumnMaterialID,  4.5f,  -2.0f }, // autumn maple
-    {  3u,   5u, 1.9f,  0.45f, 0.55f, 0.48f, 0.75f, 0.40f, 8u, 0.18f, renderer::kTreeBarkMaterialID,      renderer::kTreeLeafMaterialID,        4.5f,  -6.0f }, // baobab
-    {  1u,   7u, 3.4f,  0.14f, 0.35f, 0.30f, 1.05f, 0.00f, 6u, 0.45f, renderer::kTreeBarkMaterialID,      renderer::kTreeLeafMaterialID,        4.5f, -10.0f }, // palm
-    {  3u,   5u, 0.55f, 0.07f, 0.75f, 0.60f, 0.90f, 0.60f, 5u, 0.20f, renderer::kTreeBarkMaterialID,      renderer::kTreeLeafBirchMaterialID,   4.5f, -14.0f }, // shrub
-    {  5u,   2u, 2.9f,  0.18f, 0.76f, 0.66f, 0.70f, 0.85f, 5u, 0.055f, renderer::kTreeBarkDeadMaterialID, renderer::kTreeLeafDeadMaterialID,    4.5f, -18.0f }, // dead tree
+    // depth bF  trunkH trunkR lenTap radTap angle  damp  sides leafSz barkMat                              leafMat                               offX   offZ
+    {  4u,   4u, 2.6f,  0.22f, 0.70f, 0.62f, 0.85f, 0.45f, 7u, 0.26f, renderer::kTreeBarkMaterialID,      renderer::kTreeLeafMaterialID,        0.0f,   5.0f }, // oak
+    {  4u,   3u, 3.6f,  0.15f, 0.50f, 0.58f, 1.25f, 0.35f, 6u, 0.20f, renderer::kTreeBarkMaterialID,      renderer::kTreeLeafPineMaterialID,    0.0f,   7.0f }, // pine
+    {  4u,   3u, 3.2f,  0.10f, 0.66f, 0.55f, 0.42f, 0.55f, 5u, 0.16f, renderer::kTreeBarkBirchMaterialID, renderer::kTreeLeafBirchMaterialID,   0.0f,   9.0f }, // birch
+    {  5u,   3u, 2.4f,  0.17f, 0.78f, 0.55f, 0.55f, 0.95f, 6u, 0.18f, renderer::kTreeBarkMaterialID,      renderer::kTreeLeafWillowMaterialID,  0.0f,  11.0f }, // willow
+    {  4u,   3u, 3.8f,  0.13f, 0.58f, 0.60f, 0.20f, 0.30f, 6u, 0.17f, renderer::kTreeBarkMaterialID,      renderer::kTreeLeafMaterialID,        0.0f,  13.0f }, // poplar
+    {  4u,   4u, 2.2f,  0.16f, 0.72f, 0.62f, 0.65f, 0.50f, 6u, 0.24f, renderer::kTreeBarkMaterialID,      renderer::kTreeLeafAutumnMaterialID, -3.5f,   6.5f }, // autumn maple
+    {  3u,   5u, 1.9f,  0.45f, 0.55f, 0.48f, 0.75f, 0.40f, 8u, 0.18f, renderer::kTreeBarkMaterialID,      renderer::kTreeLeafMaterialID,       -3.5f,   8.5f }, // baobab
+    {  1u,   7u, 3.4f,  0.14f, 0.35f, 0.30f, 1.05f, 0.00f, 6u, 0.45f, renderer::kTreeBarkMaterialID,      renderer::kTreeLeafMaterialID,       -3.5f,  10.5f }, // palm
+    {  3u,   5u, 0.55f, 0.07f, 0.75f, 0.60f, 0.90f, 0.60f, 5u, 0.20f, renderer::kTreeBarkMaterialID,      renderer::kTreeLeafBirchMaterialID,  -3.5f,  12.5f }, // shrub
+    {  5u,   2u, 2.9f,  0.18f, 0.76f, 0.66f, 0.70f, 0.85f, 5u, 0.055f, renderer::kTreeBarkDeadMaterialID, renderer::kTreeLeafDeadMaterialID,   -3.5f,  14.5f }, // dead tree
 }};
 
 #ifndef NDEBUG
@@ -3212,19 +3225,25 @@ void VulkanContext::GenerateGeometry() {
   // SpeedTree-style trees (renderer::ProceduralTreePass), fulfilling CLAUDE.md's "Arbres (generes
   // par du code style speedtree)" requirement: kTreeVisualCount distinct trees, each two entities
   // (bark + leaves -- see ProceduralTreePass.h's own class comment on why one entity can't hold
-  // both materials), placed in their own small clearing one zone-pitch step east of the 3x3
-  // showcase grid's own col=1 primitives (see GridSlot()'s own comment for that grid's layout) so
-  // they read as a distinct feature area, never overlapping any existing zone, while staying close
-  // enough to land inside the default camera framing. Each tree's bark+leaf pair is generated by
-  // its own scoped ProceduralTreePass instance (Init -> RecordGenerate -> Shutdown, all within this
-  // block) -- see that class's own header comment for why this is a bake-time-only pass, not a
-  // persistent per-frame one like renderer::GlobalSDFPass.
+  // both materials), placed in their own small clearing WEST of the 3x3 showcase grid (see
+  // kTreeSpecies's own header comment, right above BuildEntityData(), for exactly why west and
+  // exactly these coordinates -- verified numerically against the default camera's actual frustum,
+  // not eyeballed: an EARLIER east-side placement here was never actually visible on launch).
+  // Each tree's bark+leaf pair is generated by its own scoped ProceduralTreePass instance
+  // (Init -> RecordGenerate -> Shutdown, all within this block) -- see that class's own header
+  // comment for why this is a bake-time-only pass, not a persistent per-frame one like
+  // renderer::GlobalSDFPass.
   // -------------------------------------------------------------------------
   {
     renderer::ProceduralTreePass treePass;
-    treePass.Init(m_Device, m_CommandPool, m_GraphicsQueue, m_VertexBuffer, m_IndexBuffer);
+    // m_TerrainHydrology.Init() already ran (VulkanContext::Init(), well before GenerateGeometry())
+    // -- see ProceduralTreePass::Init()'s own header comment for why trees sample this same bake.
+    treePass.Init(m_Device, m_CommandPool, m_GraphicsQueue, m_VertexBuffer, m_IndexBuffer,
+                  m_TerrainHydrology.GetMeshHeightView(), m_TerrainHydrology.GetLinearSampler());
 
-    constexpr float kTreeClearingX = 10.0f;  // One zone-pitch step past the gallery's own col=1 (x=4).
+    // See kTreeSpecies's own header comment for the exact camera-frustum verification this value
+    // (and every per-species groveOffsetX/Z) is derived from.
+    constexpr float kTreeClearingX = -10.0f;
     // Matches the terrain/floor's own worldOffsetY (GenerateTerrain()'s -0.8f call-site argument
     // below) -- trees are planted AT ground level, unlike the showcase primitives above (which
     // deliberately float at the gallery's own y=0 "display stage" height, see GridSlot()'s header

@@ -4,6 +4,7 @@
 #include "include/struct_custo.glsl"
 #include "include/math_utils.glsl"
 #include "include/tree_lsystem.glsl"
+#include "include/terrain_hydrology_params.glsl" // kHydroTerrainAnchorWorldY, HydroUVFromLocalXZ.
 
 // Procedurally generates one cross-quad foliage card (2 perpendicular double-sided quads, the
 // standard cheap "leaf cluster" impostor) at the tip of every LEAF-TIER node of the same L-system
@@ -30,6 +31,11 @@ layout(local_size_x = 64) in;
 
 layout(std430, binding = 0) writeonly buffer VertexBuffer { Vertex vertices[]; };
 layout(std430, binding = 1) writeonly buffer IndexBuffer  { uint indices[]; };
+// Terrain-hydrology bake's mesh-height texture -- see geom_tree_bark.comp's own identical
+// declaration comment (same tree, same one ground anchor: this shader must sample the SAME
+// (worldOffsetX, worldOffsetZ) point so a leaf card's tip always agrees with where the bark
+// shader planted this tree's trunk, not a second, independently-sampled height).
+layout(binding = 2) uniform sampler2D g_HydroMeshHeight;
 
 layout(push_constant) uniform TreeLeavesParams
 {
@@ -50,7 +56,7 @@ layout(push_constant) uniform TreeLeavesParams
     uint  vertexOffset;
     uint  indexOffset;
     float worldOffsetX;
-    float worldOffsetY;
+    float worldOffsetY; // Unused for placement -- see this file's own g_HydroMeshHeight comment.
     float worldOffsetZ;
 };
 
@@ -114,6 +120,11 @@ void main()
     TreeNodeState node = DecodeTreeNode(nodeID, seed, depth, branchFactor,
         trunkHeight, trunkRadius, lengthTaper, radiusTaper, branchAngle, pitchDamping);
 
+    // Real ground height at this tree's own planting point -- see g_HydroMeshHeight's own
+    // declaration comment (must match geom_tree_bark.comp's identical sample exactly).
+    float groundY = kHydroTerrainAnchorWorldY +
+        textureLod(g_HydroMeshHeight, HydroUVFromLocalXZ(vec2(worldOffsetX, worldOffsetZ)), 0.0).r;
+
     // Small per-leaf hash (independent stream from tree_lsystem.glsl's own branching jitter, offset
     // by a large odd constant) so neighboring leaf cards on the same tip don't all render at
     // exactly the same size/tilt -- purely cosmetic variety, not part of the branching topology.
@@ -121,7 +132,7 @@ void main()
     float sizeJitter = 0.75 + HashFloat01(lh) * 0.5;
     float tiltJitter = (HashFloat01(HashTree(lh)) - 0.5) * 0.6;
 
-    vec3 tip = node.endPos + vec3(worldOffsetX, worldOffsetY, worldOffsetZ);
+    vec3 tip = node.endPos + vec3(worldOffsetX, groundY, worldOffsetZ);
     float size = leafSize * sizeJitter;
 
     // Two perpendicular planes through the tip, both containing world Y (a simple, cheap "leaf

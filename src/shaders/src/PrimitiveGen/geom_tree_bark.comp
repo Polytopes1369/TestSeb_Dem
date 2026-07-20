@@ -4,6 +4,7 @@
 #include "include/struct_custo.glsl"
 #include "include/math_utils.glsl"
 #include "include/tree_lsystem.glsl"
+#include "include/terrain_hydrology_params.glsl" // kHydroTerrainAnchorWorldY, HydroUVFromLocalXZ.
 
 // Procedurally generates a whole tree's trunk+branch skeleton as a chain of tapered cylinder
 // segments, one per L-system node (see tree_lsystem.glsl's own header comment for the full
@@ -26,6 +27,14 @@ layout(local_size_x = 64) in;
 
 layout(std430, binding = 0) writeonly buffer VertexBuffer { Vertex vertices[]; };
 layout(std430, binding = 1) writeonly buffer IndexBuffer  { uint indices[]; };
+// Terrain-hydrology bake's mesh-height texture -- SAME view/sampler geom_terrain.comp itself
+// samples for the terrain's own vertex Y (see renderer::ProceduralTreePass::Init()'s own header
+// comment). Sampled ONCE per invocation at this tree's own (worldOffsetX, worldOffsetZ) planting
+// point -- NOT per-vertex-XZ -- so every vertex of this tree shares one consistent ground anchor,
+// exactly like the CPU-supplied worldOffsetY constant this replaces used to (a whole tree moving
+// up/down together as one rigid object planted at one point, not each branch independently
+// "grounded").
+layout(binding = 2) uniform sampler2D g_HydroMeshHeight;
 
 layout(push_constant) uniform TreeBarkParams
 {
@@ -45,7 +54,7 @@ layout(push_constant) uniform TreeBarkParams
     uint  vertexOffset;
     uint  indexOffset;
     float worldOffsetX;
-    float worldOffsetY;
+    float worldOffsetY; // Unused for placement -- see this file's own g_HydroMeshHeight comment.
     float worldOffsetZ;
 };
 
@@ -61,6 +70,16 @@ void main()
     }
 
     uint id = gl_GlobalInvocationID.x;
+
+    // Real ground height at this tree's own planting point (see g_HydroMeshHeight's own
+    // declaration comment) -- replaces the flat worldOffsetY constant a caller might otherwise
+    // expect, so the trunk base always meets whatever the terrain/water bake actually put there
+    // (including standing water in a low-lying spot the ambient noise dipped below sea level,
+    // even inside the gallery's erosion-protected radius -- see terrain_hydrology_params.glsl's
+    // own kHydroGalleryRadius comment for why protection from EROSION doesn't also mean
+    // protection from the sim's initial FLOODING pass).
+    float groundY = kHydroTerrainAnchorWorldY +
+        textureLod(g_HydroMeshHeight, HydroUVFromLocalXZ(vec2(worldOffsetX, worldOffsetZ)), 0.0).r;
 
     uint sideColumns = sides + 1u;
     uint vertsPerNode = sideColumns * 2u;
@@ -103,7 +122,7 @@ void main()
         v.meshID = meshID;
         v.materialID = materialID;
 
-        v.position += vec3(worldOffsetX, worldOffsetY, worldOffsetZ);
+        v.position += vec3(worldOffsetX, groundY, worldOffsetZ);
         vertices[vertexOffset + id] = v;
     }
 

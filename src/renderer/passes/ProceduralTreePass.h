@@ -73,6 +73,13 @@ namespace renderer {
             float leafMaterialID = 0.0f;
 
             float worldOffsetX = 0.0f;
+            // Unlike worldOffsetX/Z (used verbatim), the shaders IGNORE this field for the tree's
+            // actual vertical placement -- they sample the real terrain-hydrology mesh-height bake
+            // at (worldOffsetX, worldOffsetZ) instead (see geom_tree_bark.comp's own comment) so a
+            // tree's trunk base always matches the ground actually rendered under it, rather than
+            // assuming a flat plane at some fixed Y. Kept as a field (rather than removed) purely
+            // so RecordGenerate()'s push-constant struct layout stays a plain 1:1 mirror of the
+            // shaders' own TreeBarkParams/TreeLeavesParams -- callers may leave it at its default.
             float worldOffsetY = 0.0f;
             float worldOffsetZ = 0.0f;
         };
@@ -103,11 +110,20 @@ namespace renderer {
         // Creates this pass's own descriptor set layout/pool/set (binding 0 = the shared vertex
         // SSBO, binding 1 = the shared index SSBO -- borrowed handles, not owned; matches
         // GpuGeometryPagePool::GetPhysicalPoolBuffer()'s own "borrowed buffer" convention referenced
-        // in this file's class comment) and both compute pipelines. `vertexBuffer`/`indexBuffer`
-        // must be VulkanContext::GetVertexBuffer()/GetIndexBuffer() -- the SAME shared SSBOs every
-        // other geom_*.comp generator writes into.
+        // in this file's class comment; binding 2 = the terrain-hydrology bake's mesh-height
+        // texture, ALSO borrowed -- see geom_tree_bark.comp/geom_tree_leaves.comp's own comment on
+        // why a tree's vertical placement samples this instead of trusting a flat CPU-supplied
+        // constant) and both compute pipelines. `vertexBuffer`/`indexBuffer` must be
+        // VulkanContext::GetVertexBuffer()/GetIndexBuffer() -- the SAME shared SSBOs every other
+        // geom_*.comp generator writes into. `hydroMeshHeightView`/`hydroSampler` must be
+        // renderer::TerrainHydrologySim::GetMeshHeightView()/GetLinearSampler() -- the SAME bake
+        // geom_terrain.comp itself samples for the terrain's own vertex Y, so a tree's trunk base
+        // always agrees with the ground actually rendered under it (including standing water --
+        // see terrain_hydrology_params.glsl's own header comment on the pipe-model sim, which can
+        // leave low-lying spots flooded even inside the "gallery" erosion-protected radius).
         void Init(VkDevice device, VkCommandPool commandPool, VkQueue queue,
-            VkBuffer vertexBuffer, VkBuffer indexBuffer);
+            VkBuffer vertexBuffer, VkBuffer indexBuffer,
+            VkImageView hydroMeshHeightView, VkSampler hydroSampler);
 
         void Shutdown();
 
