@@ -429,29 +429,39 @@ inline float FILM_GRAIN_RESPONSE_MIDPOINT = 0.5f;
 // corresponding Settings field for one frame when its toggle is false rather than special-casing
 // every shader with a redundant enabled/disabled branch. Not wired into ApplyProfile() (these are
 // live debug/comparison switches, not a hardware-quality tier).
-inline bool BLOOM_ENABLED = true;
+//
+// ALL default to FALSE (2026-07-20, per explicit user request): the engine starts with the whole
+// artistic post-process stack disabled -- ONLY Auto Exposure (EXPOSURE_USE_AUTO above, which stays
+// true) and the tone mapping / display-gamma encode (PostProcessComposite.comp's always-on ACES +
+// DISPLAY_GAMMA path -- it has no toggle by design, an un-tonemapped real-lux HDR frame would be
+// unusable) remain active by default. Every effect below is still re-enableable live from the
+// ImGui "Post FX" tab (or its "All Post FX ON" bulk button); temporal anti-aliasing
+// (config::temporal::ENABLED_BY_DEFAULT) is deliberately NOT part of this stack -- it is
+// image-stability AA, not an artistic camera effect, and MegaLights/ReSTIR per-frame noise relies
+// on its smoothing.
+inline bool BLOOM_ENABLED = false;
 // Separate from BLOOM_ENABLED: zeroes only the ghost/halo/anamorphic-streak terms at the
 // RecordGenerate call site (ClusterRenderPipeline.cpp), leaving the base bloom glow itself under
 // BLOOM_ENABLED's own independent control -- matches UE5.8, where "Lens Flares" is its own Bloom
 // sub-toggle distinct from the base bloom bleed. Lens Dirt needs no separate gate here: its own
 // mask (BloomUpsampleComposite.comp) only ever attenuates the ghost+streak+halo term, so it is
 // already a visual no-op once this toggle zeroes that term.
-inline bool LENS_FLARE_ENABLED = true;
-inline bool CHROMATIC_ABERRATION_ENABLED = true;
-inline bool VIGNETTE_ENABLED = true;
-inline bool HEAT_DISTORTION_ENABLED = true;
-inline bool MOTION_BLUR_ENABLED = true;
-inline bool HEIGHT_FOG_ENABLED = true;
-inline bool GOD_RAYS_ENABLED = true;
-inline bool PANINI_ENABLED = true;
-inline bool SHARPEN_ENABLED = true;
-inline bool FILM_GRAIN_ENABLED = true;
-inline bool WHITE_BALANCE_ENABLED = true;
-inline bool COLOR_CORRECTION_ENABLED = true;
-inline bool DOF_ENABLED = true;
-inline bool AO_ENABLED = true;
-inline bool CONTACT_SHADOW_ENABLED = true;
-inline bool SSR_FALLBACK_ENABLED = true;
+inline bool LENS_FLARE_ENABLED = false;
+inline bool CHROMATIC_ABERRATION_ENABLED = false;
+inline bool VIGNETTE_ENABLED = false;
+inline bool HEAT_DISTORTION_ENABLED = false;
+inline bool MOTION_BLUR_ENABLED = false;
+inline bool HEIGHT_FOG_ENABLED = false;
+inline bool GOD_RAYS_ENABLED = false;
+inline bool PANINI_ENABLED = false;
+inline bool SHARPEN_ENABLED = false;
+inline bool FILM_GRAIN_ENABLED = false;
+inline bool WHITE_BALANCE_ENABLED = false;
+inline bool COLOR_CORRECTION_ENABLED = false;
+inline bool DOF_ENABLED = false;
+inline bool AO_ENABLED = false;
+inline bool CONTACT_SHADOW_ENABLED = false;
+inline bool SSR_FALLBACK_ENABLED = false;
 } // namespace postprocess
 
 // Debug-only (ImGui "Buffer Viewer" tab, main.cpp) -- which intermediate GBuffer/GI buffer to
