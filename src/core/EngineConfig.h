@@ -271,7 +271,7 @@ inline float DISPLAY_GAMMA = 2.2f;
 // hardware-tiered, so not wired into ApplyProfile().
 
 // Bloom
-inline float BLOOM_THRESHOLD = 1.0f;        // Bright-pass threshold, linear HDR luminance.
+inline float BLOOM_THRESHOLD = 15000.0f;        // Bright-pass threshold, linear HDR luminance. Calibrated for real-lux directional light (10,000 lux default): extracts sun disk/sky/specular highlights without smearing diffuse-lit surfaces.
 inline float BLOOM_SOFT_KNEE = 0.5f;
 // Re-enabled (2026-07-18, fix/bloom-hdr-overflow): restored to the original 1.0 pre-workaround
 // default now that the "BloomPass crushes the whole frame to black once the scene reached real
