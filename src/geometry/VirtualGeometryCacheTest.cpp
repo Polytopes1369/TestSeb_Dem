@@ -4,6 +4,7 @@
 #include "geometry/ClusterDAG.h"
 #include "geometry/ClusterFormat.h"
 #include "geometry/EntityMaterialTable.h"
+#include "geometry/MeshBakeCache.h" // Debug-only (self-guarded); every use below is #ifndef NDEBUG.
 #include "geometry/CardGenerator.h"
 #include "geometry/FallbackMeshBuilder.h"
 #include "geometry/GeometryEncoding.h"
@@ -500,6 +501,84 @@ namespace geometry {
             }
         }
 
+#ifndef NDEBUG
+        // --- Per-mesh bake cache (Debug only): per-entity content hashes ------------------------
+        // See MeshBakeCache.h's own header comment for the full design. Hash coverage, in one
+        // deterministic order per entity: [bake parameters], then every one of its triangles (in
+        // allIndices order) as a base-relative index triple plus the 3 referenced vertices' raw
+        // bytes (plus their skin bytes when skeletally animated). Connectivity is hashed RELATIVE
+        // to the entity's own first referenced global vertex index, so an earlier entity growing/
+        // shrinking in the shared SSBO does not shift-invalidate every entity baked after it --
+        // only entities whose OWN bytes changed re-bake.
+        MeshBakeCache meshBakeCache(core::ResolveExeRelativePath("meshbakes"));
+        std::vector<uint64_t> entityContentHashes(entityCount, 0ull);
+        {
+            std::vector<MeshBakeHasher> hashers(entityCount);
+            std::vector<uint32_t> baseVertexIndex(entityCount, 0xFFFFFFFFu);
+            std::vector<uint8_t> isAnimated(entityCount, 0u);
+
+            // Bake parameters first -- everything besides raw geometry that the per-entity bake
+            // consumes (mirrors the BuildClusterDAG/BuildIndexEntry call sites below exactly).
+            for (uint32_t entityIdx = 0; entityIdx < entityCount; ++entityIdx) {
+                uint32_t id = entityData[entityIdx].meshID;
+                if (id >= entityCount) {
+                    continue; // Out-of-range meshID: diagnosed by the histogram above; never cached.
+                }
+                MeshBakeHasher& h = hashers[id];
+                h.FeedU32(kGeometryGenerationVersion);
+                h.FeedU32(entityData[entityIdx].materialID);
+                EntityMaterialProperties props = GetEntityMaterialProperties(entityData[entityIdx].materialID);
+                h.FeedU32(props.maskTextureIndex);
+                h.FeedF32(props.maxWPOAmplitude);
+                uint8_t animated = core::GetFlag(entityData[entityIdx].flags,
+                    core::EntityFlags::IsSkeletallyAnimated) ? 1u : 0u;
+                h.Feed(&animated, sizeof(animated));
+                isAnimated[id] = animated;
+            }
+
+            // Pass 1: each entity's minimum referenced global vertex index (the shift-invariance
+            // base for connectivity hashing -- see the block comment above).
+            for (size_t t = 0; t + 2 < allIndices.size(); t += 3) {
+                uint32_t i0 = allIndices[t + 0];
+                uint32_t i1 = allIndices[t + 1];
+                uint32_t i2 = allIndices[t + 2];
+                uint32_t id = allVertices[i0].meshID;
+                if (id >= entityCount) {
+                    continue;
+                }
+                uint32_t& base = baseVertexIndex[id];
+                base = std::min({ base, i0, i1, i2 });
+            }
+
+            // Pass 2: geometry bytes.
+            for (size_t t = 0; t + 2 < allIndices.size(); t += 3) {
+                uint32_t i0 = allIndices[t + 0];
+                uint32_t i1 = allIndices[t + 1];
+                uint32_t i2 = allIndices[t + 2];
+                uint32_t id = allVertices[i0].meshID;
+                if (id >= entityCount) {
+                    continue;
+                }
+                MeshBakeHasher& h = hashers[id];
+                uint32_t base = baseVertexIndex[id];
+                uint32_t rel[3] = { i0 - base, i1 - base, i2 - base };
+                h.Feed(rel, sizeof(rel));
+                h.Feed(&allVertices[i0], sizeof(renderer::Vertex));
+                h.Feed(&allVertices[i1], sizeof(renderer::Vertex));
+                h.Feed(&allVertices[i2], sizeof(renderer::Vertex));
+                if (isAnimated[id] != 0u && !allVertexSkins.empty()) {
+                    h.Feed(&allVertexSkins[i0], sizeof(ClusterVertexSkin));
+                    h.Feed(&allVertexSkins[i1], sizeof(ClusterVertexSkin));
+                    h.Feed(&allVertexSkins[i2], sizeof(ClusterVertexSkin));
+                }
+            }
+
+            for (uint32_t id = 0; id < entityCount; ++id) {
+                entityContentHashes[id] = hashers[id].state;
+            }
+        }
+#endif // NDEBUG
+
         CacheFileManager cacheManager;
         cacheManager.PurgeExistingCacheFiles(".");
 
@@ -542,6 +621,13 @@ namespace geometry {
             std::vector<ClusterIndexEntry> localIndexEntries;
             std::vector<DAGNodeEntry> localDagEntries;
             std::vector<ClusterData> localClusterData;
+            // Level-0 triangle total. Computed by the bake path (and persisted per-mesh in
+            // Debug) rather than re-derived from `dag` at stitch time: on a Debug cache hit
+            // `dag` stays EMPTY (only the flattened tables are cached/loaded), so any later
+            // consumer keying off dag.nodes would silently see nothing -- which is also why the
+            // stitch loop below gates on localClusterData, never on dag.
+            uint64_t leafTriangleCount = 0;
+            bool loadedFromCache = false; // Debug diagnostics only; always false in Release.
         };
 
         // Pre-sized so each submitted job writes only into its own disjoint results[entityIdx] slot --
@@ -552,10 +638,44 @@ namespace geometry {
             core::LoadingManager dagBuildPool(std::min(kMaxConcurrentDagBuilds, std::max(entityCount, 1u)));
 
             for (uint32_t entityIdx = 0; entityIdx < entityCount; ++entityIdx) {
-                dagBuildPool.Submit([entityIdx, &entityData, &allVertices, &allIndices, &allVertexSkins, &results]() {
+                // Default reference capture (was an explicit list): the Debug-only per-mesh
+                // cache additions below reference meshBakeCache/entityContentHashes/entityCount,
+                // which simply do not exist as names in Release -- a conditional capture list
+                // would be the alternative, and [&] is this codebase's lesser evil (everything
+                // captured outlives dagBuildPool.WaitIdle() below by construction).
+                dagBuildPool.Submit([&, entityIdx]() {
                     EntityResult& res = results[entityIdx];
                     res.meshID = entityData[entityIdx].meshID;
                     EntityMaterialProperties materialProps = GetEntityMaterialProperties(entityData[entityIdx].materialID);
+
+#ifndef NDEBUG
+                    // Per-mesh bake cache fast path (see MeshBakeCache.h): a content-hash hit
+                    // still re-validates the DAG reconstructed from the cached LOCAL table
+                    // before being trusted -- cheap vs. a bake, and a corrupt-but-header-valid
+                    // file then simply falls through to the normal bake below, whose Save()
+                    // overwrites it.
+                    if (res.meshID < entityCount) {
+                        MeshBakeEntry cached;
+                        if (meshBakeCache.TryLoad(res.meshID, entityContentHashes[res.meshID], cached)) {
+                            ClusterDAG reconstructed = ReconstructDAGFromTable(cached.dagEntries);
+                            std::vector<std::string> cachedErrors;
+                            if (ValidateClusterDAG(reconstructed, cachedErrors)) {
+                                res.localIndexEntries = std::move(cached.indexEntries);
+                                res.localDagEntries = std::move(cached.dagEntries);
+                                res.localClusterData = std::move(cached.clusterData);
+                                res.hasFallback = cached.hasFallback;
+                                res.fallbackMeshData = std::move(cached.fallbackMeshData);
+                                res.entityCards = std::move(cached.cards);
+                                res.leafTriangleCount = cached.leafTriangleCount;
+                                res.loadedFromCache = true;
+                                return;
+                            }
+                            LOG_WARNING(std::format(
+                                "[MeshBakeCache] meshID={}: cached entry failed DAG re-validation -- rebaking it.",
+                                res.meshID));
+                        }
+                    }
+#endif
 
                     // Skeletal-animation feature: a core::EntityFlags::IsSkeletallyAnimated entity's
                     // DAG must skip grouping/simplification entirely (forceSingleLevelDAG) and gets
@@ -637,6 +757,34 @@ namespace geometry {
                         dagEntry.parentError = node.parentError;
                         res.localDagEntries.push_back(dagEntry);
                     }
+
+                    // Computed here (not at stitch time) so both the fresh-bake and the Debug
+                    // cache-hit paths hand the stitch loop an identical field -- see this
+                    // member's own declaration comment.
+                    for (const ClusterDAGNode& n : res.dag.nodes) {
+                        if (n.level == 0u) {
+                            res.leafTriangleCount += n.mesh.triangles.size() / 3u;
+                        }
+                    }
+
+#ifndef NDEBUG
+                    // Persist this fresh bake for future runs -- overwrites any stale ("regen"
+                    // dirty case) file for this meshID. Only a fully successful bake is cached:
+                    // a failed/partial one must keep re-baking (and re-reporting its errors)
+                    // every run until fixed.
+                    if (res.success && res.dagErrors.empty() && !res.localClusterData.empty() &&
+                        res.meshID < entityCount) {
+                        MeshBakeEntry toSave;
+                        toSave.indexEntries = res.localIndexEntries;
+                        toSave.dagEntries = res.localDagEntries;
+                        toSave.clusterData = res.localClusterData;
+                        toSave.hasFallback = res.hasFallback;
+                        toSave.fallbackMeshData = res.fallbackMeshData;
+                        toSave.cards = res.entityCards;
+                        toSave.leafTriangleCount = res.leafTriangleCount;
+                        meshBakeCache.Save(res.meshID, entityContentHashes[res.meshID], toSave);
+                    }
+#endif
                 });
             }
 
@@ -647,9 +795,11 @@ namespace geometry {
             dagBuildPool.WaitIdle();
         }
 
-        // Stitch everything sequentially
+        // Stitch everything sequentially. Gates on localClusterData (never on dag.nodes): a
+        // Debug per-mesh cache hit fills only the flattened tables and leaves `dag` empty -- see
+        // EntityResult::leafTriangleCount's own declaration comment.
         for (const auto& res : results) {
-            if (res.dag.nodes.empty()) {
+            if (res.localClusterData.empty()) {
                 LOG_WARNING(std::format(
                     "[GeometryCacheTest] Entity meshID={} produced zero clusters (no matching triangles); skipping.", res.meshID));
                 continue;
@@ -672,18 +822,16 @@ namespace geometry {
                     "[GeometryCacheTest] entity meshID={}: {} surface-cache card(s) generated.",
                     res.meshID, res.entityCards.size()));
 
-                size_t leafTriangleCount = 0;
-                for (const ClusterDAGNode& n : res.dag.nodes) {
-                    if (n.level == 0u) {
-                        leafTriangleCount += n.mesh.triangles.size() / 3u;
-                    }
-                }
-                size_t fallbackTriangleCount = res.fallbackMesh.triangles.size() / 3u;
+                // leafTriangleCount comes precomputed from the bake job (or the per-mesh cache
+                // file on a Debug hit) -- res.dag/res.fallbackMesh are EMPTY on a cache hit, so
+                // the fallback triangle count is read from the persisted fallbackMeshData
+                // instead of the transient FallbackMesh.
+                size_t fallbackTriangleCount = res.fallbackMeshData.indices.size() / 3u;
                 LOG_INFO(std::format(
                     "[GeometryCacheTest] entity meshID={}: fallback mesh {} triangle(s) ({:.2f}% of {} leaf triangle(s)).",
                     res.meshID, fallbackTriangleCount,
-                    100.0f * static_cast<float>(fallbackTriangleCount) / static_cast<float>(std::max<size_t>(1, leafTriangleCount)),
-                    leafTriangleCount));
+                    100.0f * static_cast<float>(fallbackTriangleCount) / static_cast<float>(std::max<uint64_t>(1, res.leafTriangleCount)),
+                    res.leafTriangleCount));
             }
 
             uint32_t baseGlobalID = static_cast<uint32_t>(indexEntries.size());
@@ -691,8 +839,10 @@ namespace geometry {
             // Append cluster data
             clusterData.insert(clusterData.end(), res.localClusterData.begin(), res.localClusterData.end());
 
-            // Build/patch global index entries and DAG entries
-            for (size_t i = 0; i < res.dag.nodes.size(); ++i) {
+            // Build/patch global index entries and DAG entries (bounded by the flattened table,
+            // not dag.nodes -- identical sizes on the fresh-bake path, but dag.nodes is empty on
+            // a Debug per-mesh cache hit).
+            for (size_t i = 0; i < res.localClusterData.size(); ++i) {
                 uint32_t globalID = baseGlobalID + static_cast<uint32_t>(i);
                 
                 ClusterIndexEntry idxEntry = res.localIndexEntries[i];
@@ -771,6 +921,36 @@ namespace geometry {
             LOG_ERROR(std::format("[GeometryCacheTest] WriteCacheFile failed for '{}'.", filePath.string()));
             return false;
         }
+
+#ifndef NDEBUG
+        // --- Per-mesh bake cache bookkeeping: prune "deleted" entries + hit/miss summary --------
+        // Runs only after the consolidated scene.cache write succeeded, single-threaded (the
+        // worker pool was drained above), per PruneStale()'s own contract.
+        {
+            std::vector<uint32_t> liveMeshIDs;
+            liveMeshIDs.reserve(results.size());
+            uint32_t cacheHits = 0;
+            uint32_t rebaked = 0;
+            for (const EntityResult& res : results) {
+                if (res.meshID < entityCount) {
+                    liveMeshIDs.push_back(res.meshID);
+                }
+                if (res.localClusterData.empty()) {
+                    continue;
+                }
+                if (res.loadedFromCache) {
+                    ++cacheHits;
+                } else {
+                    ++rebaked;
+                }
+            }
+            uint32_t pruned = meshBakeCache.PruneStale(liveMeshIDs);
+            LOG_INFO(std::format(
+                "[MeshBakeCache] Per-mesh bake cache: {} entit(ies) loaded from cache, {} "
+                "(re)baked + saved, {} stale file(s) pruned (dir: '{}').",
+                cacheHits, rebaked, pruned, meshBakeCache.Directory().string()));
+        }
+#endif
 
         // --- Read everything back and verify a byte-exact round trip ----------------------------
         bool allPassed = true;
