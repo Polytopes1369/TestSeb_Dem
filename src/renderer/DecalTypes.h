@@ -129,6 +129,18 @@ namespace renderer {
     // shader's own header comment on why metals/emissives are avoided). Exercises all four procedural
     // decal materials plus a deliberate high-priority overlap that demonstrates sort-priority ordering.
     inline DecalSceneData GenerateShowcaseDecals() {
+        // Minimal-scene mode (2026-07-21, matches VulkanContext.cpp's own kMinimalSceneMode --
+        // no shared header exports that constant across translation units today, same convention
+        // ClusterLODSelectionPass.cpp's own kFloorEntityID/kWaterEntityID literals already use):
+        // every decal below is placed relative to the showcase gallery's zone layout (moss/cracks/
+        // hazard-paint on the floor near the old Lumen corner, rust/moss on the two corner walls),
+        // none of which exist in the minimal scene -- they were still projecting onto the new flat
+        // floor plane (which occupies the SAME world-space footprint the old terrain did), showing
+        // up as an incongruous patch of hazard stripes/moss/cracks on otherwise-empty ground.
+        constexpr bool kMinimalSceneMode = true;
+        if (kMinimalSceneMode) {
+            return DecalSceneData{};
+        }
         // Scene anchors, kept in sync with VulkanContext::GenerateGeometry (kFloorTopY / the two wall
         // slot positions). The terrain surface undulates +/- ~0.4 around kFloorTopY, so floor decal
         // boxes are made generously deep (half-depth ~0.8) to fully enclose that variation.

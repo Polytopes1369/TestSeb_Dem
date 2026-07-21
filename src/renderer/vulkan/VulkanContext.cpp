@@ -55,6 +55,22 @@ const std::vector<const char *> validationLayers = {
 
 namespace {
 
+// Minimal-scene mode (2026-07-21): the default scene is now just the UV sphere (slot 4,
+// GenerateGeometry()'s own SPHERE block) and a flat ground plane (kFloorEntityIndex, generated via
+// GeneratePlane instead of GenerateTerrain), lit by the existing always-on sun/sky -- nothing else
+// (the other 11 showcase primitives, the creature, the Lumen-corner walls, water, and the 10-
+// species tree grove) is generated. Shared between BuildEntityData() (floor materialID) and
+// GenerateGeometry() (which meshes actually get dispatched) so the two can never disagree about
+// what the floor is. Every entity this skips keeps its own allocated slot (kEntityCount/
+// kTotalEntityCount and every index derived from them are UNCHANGED) but simply never has any
+// geometry generated for it -- an already-proven-safe path throughout this pipeline (geometry::
+// BuildClusterDAG's own "No triangles matched..." early-return, geometry::
+// VirtualGeometryCacheTest.cpp's "produced zero clusters; skipping" continue, and renderer::
+// GlobalSDFPass's fallback-table-driven bake all already tolerate a zero-geometry entity
+// gracefully), not a new/untested code path -- so the rich showcase scene's own code stays fully
+// intact and easy to bring back (flip this back to false) without re-deriving any of it.
+constexpr bool kMinimalSceneMode = true;
+
 // --- Per-shader Params blocks, mirrored 1:1 from their geom_*.comp
 // UBO/push-constant declarations (all fields are 4-byte scalars, so std140
 // layout == plain C++ struct layout here: no vec3 members means no extra
@@ -2076,7 +2092,12 @@ void VulkanContext::BuildEntityData() {
     // it renders through the normal opaque Nanite path unmodified (see kTerrainMaterialID's own
     // comment).
     if (i == kFloorEntityIndex) {
-      entity.materialID = renderer::kTerrainMaterialID;
+      // Minimal-scene mode: the floor is now a flat GeneratePlane() (GenerateGeometry()'s own
+      // floor block), not the terrain heightfield -- MaterialParameterTable.h's slot 14 ("Floor
+      // (slot 14): neutral matte gray ground") is the exact pre-hydrology floor material this
+      // reverts to; kTerrainMaterialID's biome-blend shading (terrain_shading.glsl) is for a real
+      // heightfield's slope/height variation, which a flat plane doesn't have.
+      entity.materialID = kMinimalSceneMode ? 14u : renderer::kTerrainMaterialID;
       isTransparent = m_MaterialTable.isTransparent[entity.materialID];
     }
     // Skeletal-animation feature: the procedural creature -- stays fully opaque (no exclusion
@@ -2983,7 +3004,11 @@ void VulkanContext::GenerateGeometry() {
 
     // Target parameters to accept and strictly validate:
     // IcoSphere: Radius, Segments, Tetra, Octa, Icosa
-    float Radius = 0.8f;
+    // Minimal-scene mode: shrunk to a visually negligible size rather than skipped outright --
+    // this is kHeroEntityIndex, hard-wired into DebugReadbackGeometrySample() (assumes buffer
+    // offset 0) and renderer::TessellationPass (its own dedicated forward path), so leaving its
+    // generation running (just tiny) is far lower-risk than unwiring either of those.
+    float Radius = kMinimalSceneMode ? 0.001f : 0.8f;
     bool Tetra = false;
     bool Octa = false;
     bool Icosa = true;
@@ -3011,6 +3036,15 @@ void VulkanContext::GenerateGeometry() {
   // header comment for why this is safe.
   // -------------------------------------------------------------------------
   renderer::VulkanUtils::ExecuteOneShotCommands(m_Device, m_CommandPool, m_GraphicsQueue, [&](VkCommandBuffer cmd) {
+  // Minimal-scene mode: every OTHER showcase primitive besides the UV sphere below (Box, Cone,
+  // Torus, Tube, Capsule, Cylinder, TorusKnot, ChamferBox) is skipped entirely -- see
+  // kMinimalSceneMode's own declaration comment for why this is safe. Plane (slot 3, just below)
+  // is NOT in that group: it's one of VulkanContext::kTessellatedEntityIndices/
+  // ClusterRenderPipeline.cpp's kTessellatedEntityIDs = {2, 3, 9} (mirrors kHeroEntityIndex=2's own
+  // "shrink, don't skip" treatment above), and TessellationPass::Init() hard-fails (LOG_ERROR +
+  // return false) if any of those 3 entities has no Fallback Mesh draw range -- i.e. zero baked
+  // geometry there is a startup crash, not a graceful no-op like every other skipped entity.
+  if (!kMinimalSceneMode) {
   // -------------------------------------------------------------------------
   // BOX (slot 0) — 6 compute dispatches, one per cube face, chained onto the
   // same meshID.
@@ -3027,17 +3061,19 @@ void VulkanContext::GenerateGeometry() {
     maths::vec2 slot = gridSlot(1);
     GenerateCone(cmd, 0.7f, 0.35f, 1.4f, m_InstanceRegistry[1].meshID, slot, runningVertexOffset, runningIndexOffset);
   }
+  } // !kMinimalSceneMode (Box/Cone)
 
   // -------------------------------------------------------------------------
-  // PLANE (slot 3 visually)
+  // PLANE (slot 3 visually) — always generated, see this block's own kMinimalSceneMode comment
+  // above (kTessellatedEntityIndices hard requirement, mirrors the icosphere/hero's treatment).
   // -------------------------------------------------------------------------
   {
     maths::vec2 slot = gridSlot(3);
 
     // Target parameters to accept and strictly validate:
     // Plane: Length, Width, LengthSegments, WidthSegments
-    float Length = 1.4f;
-    float Width = 1.4f;
+    float Length = kMinimalSceneMode ? 0.001f : 1.4f;
+    float Width = kMinimalSceneMode ? 0.001f : 1.4f;
 
     GeneratePlane(cmd, Length, Width,
                   m_InstanceRegistry[3].meshID, slot,
@@ -3045,13 +3081,14 @@ void VulkanContext::GenerateGeometry() {
   }
 
   // -------------------------------------------------------------------------
-  // SPHERE / UV sphere (slot 4)
+  // SPHERE / UV sphere (slot 4) — the minimal scene's own sphere. Always generated.
   // -------------------------------------------------------------------------
   {
     maths::vec2 slot = gridSlot(4);
     GenerateSphere(cmd, 0.8f, m_InstanceRegistry[4].meshID, slot, runningVertexOffset, runningIndexOffset);
   }
 
+  if (!kMinimalSceneMode) {
   // -------------------------------------------------------------------------
   // TORUS (slot 5)
   // -------------------------------------------------------------------------
@@ -3119,9 +3156,12 @@ void VulkanContext::GenerateGeometry() {
                      m_InstanceRegistry[8].meshID, slot,
                      runningVertexOffset, runningIndexOffset);
   }
+  } // !kMinimalSceneMode (Torus/Tube/Capsule/Cylinder)
 
   // -------------------------------------------------------------------------
-  // PYRAMID (slot 9) — square (4-sided) flat-shaded pyramid.
+  // PYRAMID (slot 9) — square (4-sided) flat-shaded pyramid. Always generated -- one of
+  // kTessellatedEntityIndices, see the PLANE (slot 3) block's own kMinimalSceneMode comment above
+  // for why this can be shrunk but never fully skipped.
   // -------------------------------------------------------------------------
   {
     maths::vec2 slot = gridSlot(9);
@@ -3129,15 +3169,16 @@ void VulkanContext::GenerateGeometry() {
     // Target parameters to accept and strictly validate:
     // Pyramide: Width, Depth, Height, WidthSegments, DepthSegments,
     // HeightSegments
-    float Width = 1.4f;
-    float Depth = 1.4f;
-    float Height = 1.2f;
+    float Width = kMinimalSceneMode ? 0.001f : 1.4f;
+    float Depth = kMinimalSceneMode ? 0.001f : 1.4f;
+    float Height = kMinimalSceneMode ? 0.001f : 1.2f;
 
     GeneratePyramid(cmd, Width, Depth, Height,
                     m_InstanceRegistry[9].meshID, slot,
                     runningVertexOffset, runningIndexOffset);
   }
 
+  if (!kMinimalSceneMode) {
   // -------------------------------------------------------------------------
   // TORUS KNOT (slot 10) — (p,q) knotted tube.
   // -------------------------------------------------------------------------
@@ -3219,6 +3260,7 @@ void VulkanContext::GenerateGeometry() {
     // 6*sideSegs*ringCount.
     runningIndexOffset += 6u * params.sideSegs * ringCount;
   }
+  } // !kMinimalSceneMode (TorusKnot/ChamferBox)
 
   // -------------------------------------------------------------------------
   // TREES (entities kTreeEntityIndexBase..kTreeEntityIndexBase+kTreeEntityCount-1) -- Procedural
@@ -3234,7 +3276,7 @@ void VulkanContext::GenerateGeometry() {
   // comment for why this is a bake-time-only pass, not a persistent per-frame one like
   // renderer::GlobalSDFPass.
   // -------------------------------------------------------------------------
-  {
+  if (!kMinimalSceneMode) {
     renderer::ProceduralTreePass treePass;
     // m_TerrainHydrology.Init() already ran (VulkanContext::Init(), well before GenerateGeometry())
     // -- see ProceduralTreePass::Init()'s own header comment for why trees sample this same bake.
@@ -3319,7 +3361,7 @@ void VulkanContext::GenerateGeometry() {
   // belly touches the ground -- its idle undulation only sways side-to-side in X/Z, never
   // vertically, so no further ground clearance is needed).
   // -------------------------------------------------------------------------
-  {
+  if (!kMinimalSceneMode) {
     // Placement/radius constants now live as public VulkanContext class constants (kCreatureClearingX
     // /kCreatureGroundY/kCreatureRadiusMin/kCreatureRadiusMax) -- the single source of truth shared
     // with renderer::FurStrandPass (UE5.8 rendering-parity gap G10a), which grows fur strands off this
@@ -3354,7 +3396,7 @@ void VulkanContext::GenerateGeometry() {
   // rotating about a pivot whose Y ALSO equals kWallCenterY keeps the wall's world-space footprint
   // (its X or Z position) exactly pinned at the wall's own slot -- any mismatch between the bake
   // height and the pivot height would shear the wall sideways instead of just standing it up.
-  {
+  if (!kMinimalSceneMode) {
     constexpr float kWallSpan = 3.0f;     // Both baked axes; one becomes wall height after rotation.
     constexpr float kFloorTopY = -0.8f;   // Must match the floor's own worldOffsetY below.
     constexpr float kWallCenterY = kFloorTopY + kWallSpan * 0.5f; // Wall base sits exactly on the floor.
@@ -3405,9 +3447,19 @@ void VulkanContext::GenerateGeometry() {
     // own mesh sidesteps it entirely: 4x coarser (75x75 = 5625 vertices) still reads as a genuine
     // rolling backdrop at this terrain's own small kTerrainAmplitude.
     constexpr float kTerrainVertexSpacing = 4.0f;
-    GenerateTerrain(cmd, 300.0f, 300.0f, m_InstanceRegistry[kFloorEntityIndex].meshID, slot,
-                  runningVertexOffset, runningIndexOffset, -0.8f,
-                  kTerrainVertexSpacing);
+    // Minimal-scene mode: a flat GeneratePlane() instead of the eroded heightfield -- same
+    // footprint/anchor/spacing as GenerateTerrain's own call below (kept for when
+    // kMinimalSceneMode is flipped back off), see BuildEntityData()'s matching floor materialID
+    // override for why this pairs with MaterialParameterTable.h slot 14, not kTerrainMaterialID.
+    if (kMinimalSceneMode) {
+      GeneratePlane(cmd, 300.0f, 300.0f, m_InstanceRegistry[kFloorEntityIndex].meshID, slot,
+                    runningVertexOffset, runningIndexOffset, -0.8f,
+                    kTerrainVertexSpacing);
+    } else {
+      GenerateTerrain(cmd, 300.0f, 300.0f, m_InstanceRegistry[kFloorEntityIndex].meshID, slot,
+                    runningVertexOffset, runningIndexOffset, -0.8f,
+                    kTerrainVertexSpacing);
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -3442,13 +3494,24 @@ void VulkanContext::GenerateGeometry() {
     // terrain-local). 128x128 segments (~4.7-unit spacing): enough to follow coastlines/lake
     // shores; the open sea between them is flat, which QEM simplifies for free. The authored
     // river ribbon (GenerateRiver below) still chains onto this same entity unchanged.
-    constexpr float kWaterSurfaceSpan = 600.0f;   // Mirrors terrain_hydrology_params.glsl's kHydroWaterMeshSpan.
-    constexpr uint32_t kWaterSurfaceSegments = 128u;
+    //
+    // Minimal-scene mode: shrunk to a 2x2-segment, near-zero-span quad rather than skipped
+    // outright -- ClusterRenderPipeline.cpp's own kWaterEntityID hard-fails Init() (LOG_ERROR +
+    // return false) if the water entity has no Fallback Mesh draw range at all, the same
+    // kTessellatedEntityIndices-style hard requirement the PLANE (slot 3)/PYRAMID (slot 9) blocks
+    // above already work around. GenerateRiver below is skipped, not shrunk: its ribbon is
+    // authored directly in river_spline.glsl at a fixed ~55-world-unit path/world position, not
+    // parameterized by this span, so shrinking the water surface alone already removes it from
+    // view -- generating it would just be a full-size, unused mesh.
+    constexpr float kWaterSurfaceSpan = kMinimalSceneMode ? 0.001f : 600.0f;   // Mirrors terrain_hydrology_params.glsl's kHydroWaterMeshSpan.
+    constexpr uint32_t kWaterSurfaceSegments = kMinimalSceneMode ? 2u : 128u;
     constexpr float kTerrainAnchorY = -0.8f;      // Mirrors GenerateTerrain's own call-site worldOffsetY.
     GenerateWaterSurface(cmd, kWaterSurfaceSpan, kWaterSurfaceSegments,
                          m_InstanceRegistry[kWaterEntityIndex].meshID, slot,
                          kTerrainAnchorY, runningVertexOffset, runningIndexOffset);
-    GenerateRiver(m_InstanceRegistry[kWaterEntityIndex].meshID, 96u, 10u, runningVertexOffset, runningIndexOffset);
+    if (!kMinimalSceneMode) {
+      GenerateRiver(m_InstanceRegistry[kWaterEntityIndex].meshID, 96u, 10u, runningVertexOffset, runningIndexOffset);
+    }
   }
 
   // -------------------------------------------------------------------------

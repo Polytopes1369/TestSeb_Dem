@@ -858,11 +858,19 @@ bool ClusterRenderPipeline::Init(
     // Matches VulkanContext::kWaterEntityIndex exactly (the water plane, generated last -- see
     // that class' own comment) -- a plain literal here rather than a cross-file constant
     // reference, same convention kTessellatedEntityIDs above already establishes.
-    constexpr uint32_t kWaterEntityID = 15u;
+    // Corrected 15 -> 36 (2026-07-21): kWaterEntityIndex == kEntityCount - 1, and kEntityCount ==
+    // 17 + kTreeVisualCount*2 -- this literal was never updated when kTreeVisualCount grew from an
+    // earlier, smaller value to 10 (kEntityCount 17+2*4=25 -> 17+2*10=37), so it had been silently
+    // resolving to whatever entity ACTUALLY sat at meshID 15 (a tree leaf entity in the current
+    // 10-species layout) instead of the real water entity -- a genuine pre-existing bug, found
+    // while auditing every kTessellatedEntityIDs-style hardcoded-entity-index literal in this file
+    // for the same staleness risk (see ClusterLODSelectionPass.cpp's own kFloorEntityID, which had
+    // the identical problem and already documented it).
+    constexpr uint32_t kWaterEntityID = 36u;
     const auto& entityRanges = m_SurfaceCache.GetEntityRanges();
     const auto waterRangeIt = entityRanges.find(kWaterEntityID);
     if (waterRangeIt == entityRanges.end()) {
-      LOG_ERROR("[ClusterRenderPipeline] Water entity (meshID=15) has no Fallback Mesh draw range -- cannot initialize WaterForwardPass.");
+      LOG_ERROR(std::format("[ClusterRenderPipeline] Water entity (meshID={}) has no Fallback Mesh draw range -- cannot initialize WaterForwardPass.", kWaterEntityID));
       return false;
     }
     if (!m_WaterForward.Init(createInfo.device, createInfo.allocator, createInfo.commandPool, createInfo.queue,

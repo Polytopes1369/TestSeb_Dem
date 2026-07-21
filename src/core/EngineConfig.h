@@ -532,7 +532,9 @@ struct LocalFogVolumeConfig {
 
 // Master runtime toggle (live ImGui "Volumetric" tab). OFF injects a count of 0 for that frame
 // without touching the uploaded SSBO -- see AtmosVolumetricFogPass::RecordUpdate.
-inline bool ENABLE = true;
+// Minimal-scene mode (2026-07-21): both authored volumes below were placed relative to the
+// showcase gallery/waterfall, neither of which exists in the minimal scene -- off by default.
+inline bool ENABLE = false;
 
 // Two authored showcase volumes (placed relative to the VulkanContext::GridSlot zone gallery,
 // which spans XZ ~[-5, +5] at ground level, and the rivers/waterfalls feature's waterfall base at
@@ -569,8 +571,14 @@ inline float WIND_TURBULENCE_FREQUENCY = 0.15f;
 inline float WIND_TURBULENCE_OCTAVES = 3.0f;
 inline float WIND_TURBULENCE_SCALE = 1.0f;
 inline float WIND_TURBULENCE_ROUGHNESS = 0.5f;
-inline float CLOUD_DENSITY_TARGET = 0.5f; // [0,1] -- unconsumed until Subtask 4 (Volumetric Clouds).
-inline float FOG_DENSITY_TARGET = 0.1f; // [0,1] -- unconsumed until Subtask 3 (Froxel Volumetric Fog).
+// Minimal-scene mode (2026-07-21): both zeroed -- neither pass has its own enable cvar (RecordUpdate
+// runs unconditionally every frame, see renderer::ClusterRenderPipeline), so a zero density target is
+// the way to make clouds/volumetric fog visually absent without touching either pass's own call site.
+// Minimal-scene mode (2026-07-21): both zeroed -- neither pass has its own enable cvar (RecordUpdate
+// runs unconditionally every frame, see renderer::ClusterRenderPipeline), so a zero density target is
+// the way to make clouds/volumetric fog visually absent without touching either pass's own call site.
+inline float CLOUD_DENSITY_TARGET = 0.0f; // [0,1] -- unconsumed until Subtask 4 (Volumetric Clouds).
+inline float FOG_DENSITY_TARGET = 0.0f; // [0,1] -- unconsumed until Subtask 3 (Froxel Volumetric Fog).
 
 // Precipitation feature (rain/snow particle emission tied to the climate simulation, Ubisoft
 // "Atmos"-style) -- 0 = no precipitation at all (no spawn dispatch is even issued, see
@@ -598,7 +606,11 @@ inline float PRECIPITATION_SNOW_WOBBLE_STRENGTH = 0.5f; // m/s -- horizontal sin
 // baseline "centers" the autonomous simulation drifts around, rather than literal per-frame state;
 // the fields below are the simulation's own parameters (front cadence, smoothing, season length/
 // amplitude), all still live ImGui sliders (main.cpp's Volumetric tab). ---
-inline bool DYNAMIC_WEATHER_ENABLED = true; // Master toggle: ON = autonomous drift, OFF = original static-read path (manual sliders take full, literal effect).
+// Minimal-scene mode (2026-07-21): off, so CLOUD_DENSITY_TARGET/FOG_DENSITY_TARGET above are read
+// literally (0.0) every frame instead of being a baseline the autonomous drift wanders away from.
+// Minimal-scene mode (2026-07-21): off, so CLOUD_DENSITY_TARGET/FOG_DENSITY_TARGET above are read
+// literally (0.0) every frame instead of being a baseline the autonomous drift wanders away from.
+inline bool DYNAMIC_WEATHER_ENABLED = false; // Master toggle: ON = autonomous drift, OFF = original static-read path (manual sliders take full, literal effect).
 inline float WEATHER_FRONT_TAU_SECONDS = 45.0f; // Exponential-approach smoothing time constant for weather-front drift (current += (target-current)*(1-exp(-dt/tau))) -- tens of seconds, so fronts are gradual, not per-frame twitchy.
 inline float WEATHER_FRONT_FREQUENCY = 0.015f; // How fast the clear/overcast/stormy blend weights drift, in noise-cycles per simulated second -- low-frequency by design (see AtmosClimatePass.cpp's own AtmosFbm1D), never an obviously-looping sine.
 inline float YEAR_LENGTH_SECONDS = 180.0f; // Simulated seconds per full seasonal cycle (winter->summer->winter) -- default 3 minutes so a demo session can actually observe a season change; a periodic function IS correct here (unlike weather fronts).
@@ -611,7 +623,9 @@ inline float SEASONAL_SUN_ELEVATION_AMPLITUDE_DEGREES = 15.0f; // Peak seasonal 
 // tab); not mirrored into the per-hardware-tier EngineConfig_{Low,...}.h profiles (same rationale as
 // DYNAMIC_WEATHER_ENABLED above: an artistic/visual toggle, not a GPU performance/quality axis this
 // demo's fixed showcase scene needs to scale down for a lower-end profile).
-inline bool FOG_SCREEN_SPACE_SCATTERING_ENABLED = true; // Master toggle -- see renderer::PostProcessPass::Settings::fogScreenSpaceScatteringEnabled.
+// Minimal-scene mode (2026-07-21): off along with the rest of the FX stack.
+// Minimal-scene mode (2026-07-21): off along with the rest of the FX stack.
+inline bool FOG_SCREEN_SPACE_SCATTERING_ENABLED = false; // Master toggle -- see renderer::PostProcessPass::Settings::fogScreenSpaceScatteringEnabled.
 inline float FOG_SCATTER_BLUR_RADIUS_PIXELS = 12.0f; // FogScreenSpaceScattering.comp's own Gaussian kernel half-width, in display-resolution pixels.
 } // namespace atmos
 
@@ -761,7 +775,9 @@ inline EmitterConfig EMITTERS[kMaxEmitters] = {
     // to the original base orange mid-life, cooling to a dim dark red, then fully extinguishing
     // (alpha -> 0) right at death. sizeCurve gives it a quick "pop" to full size followed by a gradual
     // shrink as it burns out, on top of the existing sizeMin/sizeMax per-particle roll below.
-    EmitterConfig{ /*active*/ true, /*position*/ 0.0f, 3.0f, 0.0f, /*spawnRate*/ 200.0f,
+    // Minimal-scene mode (2026-07-21): inactive -- this emitter's position (0,3,0) sits in the
+    // showcase gallery, which no longer exists.
+    EmitterConfig{ /*active*/ false, /*position*/ 0.0f, 3.0f, 0.0f, /*spawnRate*/ 200.0f,
         /*color*/ 1.0f, 0.7f, 0.3f, 1.0f, /*size*/ 0.1f, 0.1f, /*lifetime*/ 2.0f, 4.0f,
         /*gravityY*/ -9.8f, /*bounce*/ 0.4f, /*friction*/ 0.85f, /*drag*/ 0.5f,
         /*spawnShape*/ 0u, /*shapeParam0*/ 0.3f,
@@ -781,7 +797,8 @@ inline EmitterConfig EMITTERS[kMaxEmitters] = {
     // visual regression from this roadmap step. Also carries subtask A3's curl-noise turbulence,
     // enabled by default here as that module's own visible proof-of-feature (see the EMITTERS[] array
     // comment above).
-    EmitterConfig{ /*active*/ true, /*position*/ 4.0f, 2.0f, 2.0f, /*spawnRate*/ 40.0f,
+    // Minimal-scene mode (2026-07-21): inactive -- ditto, gallery-relative position.
+    EmitterConfig{ /*active*/ false, /*position*/ 4.0f, 2.0f, 2.0f, /*spawnRate*/ 40.0f,
         /*color*/ 0.6f, 0.7f, 0.85f, 0.5f, /*size*/ 0.03f, 0.07f, /*lifetime*/ 4.0f, 7.0f,
         /*gravityY*/ -0.2f, /*bounce*/ 0.0f, /*friction*/ 0.0f, /*drag*/ 1.0f,
         /*spawnShape*/ 1u, /*shapeParam0*/ 1.5f,
@@ -793,7 +810,9 @@ inline EmitterConfig EMITTERS[kMaxEmitters] = {
         },
         /*sizeCurve*/ { 1.0f, 1.0f, 1.0f, 1.0f }, /*castShadows*/ true },
     EmitterConfig{},
-    EmitterConfig{ /*active*/ true, /*position*/ 12.0f, -0.6f, 12.0f, /*spawnRate*/ 60.0f,
+    // Minimal-scene mode (2026-07-21): inactive -- this emitter is the river/waterfall mist, and
+    // the water/river feature is skipped in GenerateGeometry() (VulkanContext.cpp).
+    EmitterConfig{ /*active*/ false, /*position*/ 12.0f, -0.6f, 12.0f, /*spawnRate*/ 60.0f,
         /*color*/ 0.85f, 0.92f, 1.0f, 0.65f, /*size*/ 0.18f, 0.40f, /*lifetime*/ 0.8f, 1.7f,
         /*gravityY*/ -0.1f, /*bounce*/ 0.0f, /*friction*/ 0.0f, /*drag*/ 1.0f,
         /*spawnShape*/ 1u, /*shapeParam0*/ 1.2f },
@@ -812,7 +831,10 @@ inline float HEAT_SHIMMER_STRENGTH = 0.02f; // Only applied when HEAT_SHIMMER_EN
 // frame; the density/region/seed knobs are consumed only when the scatter is (re)generated -- the
 // Debug "Vegetation" ImGui tab exposes a Regenerate button that reapplies them at runtime.
 namespace vegetation {
-inline bool ENABLED = true;                  // Master runtime toggle -- skip the per-frame cull+draw entirely.
+// Minimal-scene mode (2026-07-21): off -- the scatter's own placement logic (GRASS/BUSH/ROCK_DENSITY
+// below) samples the terrain heightfield/biome bands, neither of which exist in the minimal scene's
+// flat ground plane.
+inline bool ENABLED = false;                 // Master runtime toggle -- skip the per-frame cull+draw entirely.
 inline bool OCCLUSION_CULL_ENABLED = true;   // Per-instance HZB occlusion test (frustum culling always on).
 inline float REGION_HALF_EXTENT = 45.0f;     // World units -- scatter over the square [-H, +H]^2 around the origin (the terrain is 300x300, but foliage is bounded to the showcase area to stay real-time).
 inline float CELL_SIZE = 0.9f;               // Candidate-cell size (== average instance spacing before jitter/pruning).
@@ -833,7 +855,12 @@ inline bool WIREFRAME = false;               // Debug-only wireframe/bounds visu
 // strands are (re)generated -- the Debug "Fur / Hair" ImGui tab exposes a Regenerate button that
 // reapplies them at runtime.
 namespace fur {
-inline bool ENABLED = true;                  // Master runtime toggle -- skip the per-frame cull+draw entirely.
+// Minimal-scene mode (2026-07-21): off -- strand roots are computed analytically from the
+// creature's bind-pose bone chain (VulkanContext::GetCreatureBakeWorldOffset() etc.), independent
+// of whether the creature's own mesh was actually generated, so leaving this on would draw fur
+// strands floating with no body behind them (the creature entity has zero baked geometry in the
+// minimal scene, see VulkanContext.cpp's own kMinimalSceneMode).
+inline bool ENABLED = false;                 // Master runtime toggle -- skip the per-frame cull+draw entirely.
 inline bool OCCLUSION_CULL_ENABLED = true;   // Per-strand HZB occlusion test (frustum culling always on).
 inline uint32_t STRAND_COUNT = 14000u;       // Strands baked onto the creature (clamped to FurStrandPass::kMaxStrands). Consumed on (re)generate.
 inline float LENGTH = 0.16f;                 // Base strand length, world units. Consumed on (re)generate (via lengthScale baking) + live at draw.

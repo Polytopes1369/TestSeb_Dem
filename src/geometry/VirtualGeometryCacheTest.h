@@ -63,7 +63,13 @@ namespace geometry {
     // necessary but not sufficient: it made trees sample the real terrain, and that terrain was
     // sitting under ~0.4 units of water). Same entity/vertex/index counts, only baked water/mesh-
     // height values change, so only this explicit bump catches it.
-    constexpr uint32_t kGeometryGenerationVersion = 7;
+    // Bumped 7 -> 8: minimal-scene mode (VulkanContext.cpp's own kMinimalSceneMode) -- the default
+    // scene is now just the UV sphere + a flat ground plane; every other showcase primitive, the
+    // creature, walls, water, and the tree grove are no longer generated. Vertex/index/entity
+    // counts DO differ enough for the checks below to already catch this on their own, but bumped
+    // explicitly anyway, matching this file's own established convention for any generation-logic
+    // change (not just the ones the count checks provably miss).
+    constexpr uint32_t kGeometryGenerationVersion = 8;
 
     // Must be called after VulkanContext::GenerateGeometry() has completed (i.e. any time after
     // VulkanContext::Init() returns) so the Vertex/Index SSBOs already hold the live scene's
